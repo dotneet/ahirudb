@@ -103,6 +103,36 @@ fn a_real_column_named_current_date_is_shadowed_by_the_bare_keyword_form() {
 }
 
 #[test]
+fn current_date_works_as_a_join_and_where_condition() {
+    // `CURRENT_DATE`/`CURRENT_TIMESTAMP` は準備時に定数へ置き換わるだけなので、
+    // `WHERE`/`JOIN ON` の任意の式の一部として普通に使える
+    // （新機能同士ではなく、既存の JOIN/WHERE パイプラインとの組み合わせ）。
+    let mut s = Session::new();
+    s.register_bytes_as("t", b"id\n1\n2\n3\n".to_vec(), FormatKind::Csv).unwrap();
+    s.set_now(NOW);
+    let rows = run(
+        &mut s,
+        "SELECT a.id FROM t a JOIN t b ON a.id = b.id \
+         WHERE CURRENT_DATE > CAST('2000-01-01' AS DATE) ORDER BY a.id",
+    );
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn current_timestamp_stays_constant_across_group_by_aggregation() {
+    // 集約後も 1 回だけ評価された同じ値のまま（グループごとに再評価されない）。
+    let mut s = Session::new();
+    s.register_bytes_as("t", b"id,g\n1,a\n2,a\n3,b\n".to_vec(), FormatKind::Csv).unwrap();
+    s.set_now(NOW);
+    let rows =
+        run(&mut s, "SELECT g, count(*), max(CURRENT_TIMESTAMP) FROM t GROUP BY g ORDER BY g");
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert_eq!(r[2], Value::I64(NOW));
+    }
+}
+
+#[test]
 fn a_real_column_named_today_or_now_is_not_shadowed() {
     // `today`/`now` は括弧を伴わない裸の識別子としては特別扱いしない
     // （関数形は `today()`/`now()` のみ対象）。実データの列名との衝突を

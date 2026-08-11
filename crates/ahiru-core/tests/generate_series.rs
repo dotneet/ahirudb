@@ -193,3 +193,76 @@ fn too_many_arguments_is_rejected() {
     let err = db.prepare("SELECT * FROM range(1, 2, 3, 4)", &[]);
     assert_eq!(code_of(err), Some(Code::WrongArgCount));
 }
+
+/// 小数の引数は非対応（`sql::parser::base_rel` は `signed_int_lit` でしか
+/// 引数を読まない）。`duckdb` も `generate_series(BIGINT, ...)` 以外は
+/// オーバーロード解決に失敗して拒否するので、方向性は同じ（エラーの段階が
+/// 構文解析時か束縛時かの違いだけ）。
+#[test]
+fn float_arguments_are_rejected() {
+    let mut db = session_with_dual();
+    let err = db.prepare("SELECT * FROM generate_series(1.5, 5.5)", &[]);
+    assert!(code_of(err).is_some());
+    let err = db.prepare("SELECT * FROM range(1.5)", &[]);
+    assert!(code_of(err).is_some());
+}
+
+// --- キーワードと列名/表名の衝突 -------------------------------------------------
+//
+// `range`/`generate_series` はテーブル関数としては特別扱いされるが、予約語
+// ではない（`base_rel` の doc 参照: 予約語化すると同名の列/表を壊す過去の
+// 事故と同じ理由）。実データにこれらの名前の列や表があっても壊れないことを
+// 確認する。
+
+#[test]
+fn a_real_column_named_range_is_not_shadowed_by_the_table_function() {
+    let mut db = Session::new();
+    db.register_bytes_as("t2", b"range\n7\n".to_vec(), FormatKind::Csv).unwrap();
+    let (_, rows) = run(&mut db, "SELECT range FROM t2");
+    assert_eq!(rows, vec![vec![Value::I64(7)]]);
+    let (_, rows) = run(&mut db, "SELECT t2.range FROM t2");
+    assert_eq!(rows, vec![vec![Value::I64(7)]]);
+}
+
+/// `range`/`generate_series` という名前の実表を登録した場合、`FROM range`
+/// （括弧なし）は表参照として解決される。テーブル関数としての `range(...)`
+/// は必ず `(` を伴うので構文上は衝突しない
+/// （`base_rel` の `if self.is(Tok::LParen)` 分岐参照）。
+#[test]
+fn a_real_table_named_range_is_queryable_by_name() {
+    let mut db = Session::new();
+    db.register_bytes_as("range", b"x\n9\n".to_vec(), FormatKind::Csv).unwrap();
+    let (_, rows) = run(&mut db, "SELECT x FROM range");
+    assert_eq!(rows, vec![vec![Value::I64(9)]]);
+}
+
+// --- 相互作用: 実データとの JOIN -------------------------------------------------
+
+/// `generate_series`/`range` を実表（Parquet）との `JOIN` の片側に使う。
+/// duckdb: SELECT b.id FROM range(3) a JOIN 'basic.parquet' b ON a.range = b.id
+///         ORDER BY b.id
+///
+/// `range` の列は `BIGINT`、`basic.parquet` の `id` は `INTEGER` なので、
+/// `ON` 句をキャスト無しの `a.range = b.id` にすると 0 行になってしまう
+/// （`plan::bind` の等結合キー抽出が異なる整数物理型を単一化していない、
+/// 既知の別件バグ。`query_composition_extra.rs::
+/// join_on_mixed_numeric_key_types_compares_by_value` が詳しく再現・記録
+/// 済みで、`plan::bind` の担当者向けに切り分けてある。ここは
+/// `generate_series`/`range` 自体の不具合ではないので、素直に明示キャスト
+/// で型を揃えて確認する）。
+#[test]
+fn range_can_join_a_real_parquet_table() {
+    let mut db = session_with_dual();
+    db.register_bytes(
+        "basic",
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/basic.parquet"))
+            .unwrap(),
+    )
+    .unwrap();
+    let (_, rows) = run(
+        &mut db,
+        "SELECT b.id FROM range(3) a JOIN basic b ON CAST(a.range AS INTEGER) = b.id \
+         ORDER BY b.id",
+    );
+    assert_eq!(rows, vec![vec![Value::I32(0)], vec![Value::I32(1)], vec![Value::I32(2)]]);
+}

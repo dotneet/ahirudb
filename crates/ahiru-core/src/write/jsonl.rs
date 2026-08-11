@@ -65,6 +65,19 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         Value::I32(x) if ty == Ty::Date => push_date_string(out, *x as i64),
         Value::I32(x) => push_int(out, *x as i128),
         Value::I64(x) if ty == Ty::Timestamp => push_timestamp_string(out, *x),
+        // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
+        // `Value::I128` (`vector/types.rs`'s doc on `Decimal`). This arm was
+        // missing, so a DECIMAL(10,2) value of 12.50 (stored as the I64
+        // 1250) wrote out as the bare number `1250` instead of the string
+        // `"12.50"` — a real round-trip bug found during QA, symmetric with
+        // the `Value::I128` arm below (same reasoning: DECIMAL is written as
+        // a string to avoid JSON-number rounding).
+        Value::I64(x) if matches!(ty, Ty::Decimal { .. }) => {
+            let Ty::Decimal { scale, .. } = ty else { unreachable!() };
+            out.push(b'"');
+            push_decimal(out, *x as i128, scale);
+            out.push(b'"');
+        }
         Value::I64(x) => push_int(out, *x as i128),
         Value::I128(x) => match ty {
             // DECIMAL は JSON の数値だと丸め誤差が乗るので文字列で正確に出す。
@@ -84,6 +97,13 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
             _ => push_int(out, *x),
         },
         Value::F64(x) => push_f64(out, *x),
+        // `Ty::Json` values are already-valid UTF-8 JSON text (`vector::Ty::Json`
+        // doc; Parquet LIST/MAP/nested-STRUCT columns are exposed this way,
+        // DESIGN.md §5). Embed them verbatim so nested arrays/objects come out
+        // as real JSON structure, matching `duckdb`'s `COPY ... (FORMAT JSON)`
+        // (`{"tags":[1,2,3]}`, not `{"tags":"[1,2,3]"}`). Every other Bytes
+        // value (VARCHAR/BLOB) is an opaque string and must be escaped.
+        Value::Bytes(b) if ty == Ty::Json => out.extend_from_slice(b),
         Value::Bytes(b) => push_string(out, b),
     }
 }
@@ -352,6 +372,23 @@ mod tests {
         assert!(lines.is_empty());
     }
 
+    // Regression test for a real round-trip bug found during QA, symmetric
+    // with the one in `write/csv.rs`: DECIMAL with precision <= 18 is
+    // stored as `Value::I64` (`vector/types.rs`'s doc on `Ty::Decimal`),
+    // but the decimal-scaling + string-quoting logic used to live only on
+    // the `Value::I128` arm. A DECIMAL(10,2) column (I64 storage) wrote out
+    // as a bare unscaled JSON number (`1250` instead of the quoted string
+    // `"12.50"`), silently dropping the decimal point.
+    #[test]
+    fn decimal_stored_as_i64_keeps_its_decimal_point() {
+        let lines = run(
+            "SELECT CAST(a AS DECIMAL(10,2)) AS a FROM t",
+            b"a\n12.5\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"a":"12.50"}"#]);
+    }
+
     #[test]
     fn float_and_negative_numbers() {
         let lines =
@@ -366,5 +403,34 @@ mod tests {
     fn float_formatting_saturates_on_extremely_large_finite_values_without_panicking() {
         let lines = run("SELECT a FROM t", b"a\n1e40\n".to_vec(), crate::format::FormatKind::Csv);
         assert_eq!(lines, vec![format!(r#"{{"a":{}.0}}"#, i128::MAX)]);
+    }
+
+    // Regression test for a real bug found during QA: a `Ty::Json` column
+    // (produced by Parquet LIST/MAP/nested-STRUCT columns, DESIGN.md §5) is
+    // physically stored as raw UTF-8 JSON text (`vector/types.rs`'s doc on
+    // `Ty::Json`). The JSONL writer used to treat every `Value::Bytes` as an
+    // opaque string via `push_string` regardless of `ty`, so it re-escaped
+    // already-valid JSON text into a JSON *string*: `"xs":"[1,2,3]"` instead
+    // of the nested value `"xs":[1,2,3]`. Verified against `duckdb`'s own
+    // `COPY ... (FORMAT JSON)`, which embeds LIST/STRUCT columns unescaped
+    // (`{"id":1,"tags":[1,2,3]}`). Fixed by writing `Ty::Json` bytes through
+    // verbatim instead of through `push_string`.
+    #[test]
+    fn json_typed_column_is_embedded_raw_not_double_encoded() {
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/list1.parquet");
+        let bytes = std::fs::read(p).unwrap();
+        let lines =
+            run("SELECT id, xs FROM t WHERE id = 0", bytes, crate::format::FormatKind::Parquet);
+        assert_eq!(lines, vec![r#"{"id":0,"xs":[1,2,3]}"#]);
+    }
+
+    #[test]
+    fn null_json_typed_column_is_still_json_null() {
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/list_varied.parquet");
+        let bytes = std::fs::read(p).unwrap();
+        let lines =
+            run("SELECT id, xs FROM t WHERE id = 0", bytes, crate::format::FormatKind::Parquet);
+        // list_varied.parquet: row 0's list itself is SQL NULL (see nested_files.rs).
+        assert_eq!(lines, vec![r#"{"id":0,"xs":null}"#]);
     }
 }

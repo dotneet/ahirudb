@@ -84,9 +84,14 @@ impl AggKind {
 
     /// `StringAgg` のように 2 個目の引数（区切り文字など）を取りうるか。
     /// 取れる場合、省略時の既定引数を返す。
+    ///
+    /// `string_agg(x)`（区切り文字省略）は DuckDB では `','` がデフォルト
+    /// （`duckdb -c "select string_agg(x) from (values ('p'),('q'),('r')) t(x)"`
+    /// が `p,q,r` になることを実測済み。`group_concat` エイリアスも同じ）。
+    /// 空文字列ではない。
     pub fn optional_arg_default(self) -> Option<&'static [u8]> {
         match self {
-            AggKind::StringAgg => Some(b""),
+            AggKind::StringAgg => Some(b","),
             _ => None,
         }
     }

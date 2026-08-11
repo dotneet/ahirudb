@@ -62,9 +62,18 @@ impl TableSink for CsvSink {
     }
 }
 
-/// カンマ・引用符・改行・CR を含む場合だけ引用符で囲む。
+/// カンマ・引用符・改行・CR を含む場合、または値が空文字列の場合だけ
+/// 引用符で囲む。
+///
+/// 空文字列も引用符で囲むのは意図的: `write_batch` は NULL を「フィールドを
+/// 一切書かない」ことで表す（`crate::format::csv` の読み取り側で「引用符無し
+/// の空フィールドは NULL」という規約と対になっている）。空文字列を無引用の
+/// まま書くと、出力上は NULL と全く同じバイト列（空）になってしまい、この
+/// クレート自身の CSV リーダーで読み返すと空文字列が NULL に化けてしまう
+/// （実際に発見された往復バグ）。`""` と書けば、読み取り側の
+/// 「引用符付きの空＝空文字列」という規約に乗って区別できる。
 fn push_field(out: &mut Vec<u8>, s: &[u8]) {
-    let needs_quote = s.iter().any(|&b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
+    let needs_quote = s.is_empty() || s.iter().any(|&b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
     if !needs_quote {
         out.extend_from_slice(s);
         return;
@@ -86,6 +95,16 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         Value::I32(x) if ty == Ty::Date => push_date(out, *x as i64),
         Value::I32(x) => push_int(out, *x as i128),
         Value::I64(x) if ty == Ty::Timestamp => push_timestamp(out, *x),
+        // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
+        // `Value::I128` (`vector/types.rs`'s doc on `Decimal`: "precision <=
+        // 18 は I64 で保持する"). This arm used to be missing, so a
+        // DECIMAL(10,2) value of 12.50 (stored as the I64 1250) wrote out as
+        // the bare integer `1250` instead of `12.50` — a real round-trip bug
+        // found during QA, symmetric with the `Value::I128` arm below.
+        Value::I64(x) if matches!(ty, Ty::Decimal { .. }) => {
+            let Ty::Decimal { scale, .. } = ty else { unreachable!() };
+            push_decimal(out, *x as i128, scale);
+        }
         Value::I64(x) => push_int(out, *x as i128),
         Value::I128(x) => match ty {
             Ty::Decimal { scale, .. } => push_decimal(out, *x, scale),
@@ -383,5 +402,57 @@ mod tests {
             crate::format::FormatKind::Csv,
         );
         assert_eq!(out, "id\n");
+    }
+
+    // Regression test for a real round-trip bug found during QA: DECIMAL
+    // with precision <= 18 is stored as `Value::I64` (`vector/types.rs`'s
+    // doc on `Ty::Decimal`), but `push_value`'s decimal-scaling logic used
+    // to live only on the `Value::I128` arm. A DECIMAL(10,2) column (I64
+    // storage) wrote out as a bare unscaled integer (`1250` instead of
+    // `12.50`), silently dropping the decimal point.
+    #[test]
+    fn decimal_stored_as_i64_keeps_its_decimal_point() {
+        let out = run_csv(
+            "SELECT CAST(a AS DECIMAL(10,2)) AS a FROM t ORDER BY a",
+            "t",
+            b"a\n12.5\n-1\n0\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "a\n-1.00\n0.00\n12.50\n");
+    }
+
+    // Regression test for a real round-trip bug found during QA: an empty
+    // string (`""` in the source CSV) and a SQL NULL both used to serialize
+    // as an unquoted empty field, which is indistinguishable from NULL when
+    // read back by this crate's own CSV reader (`format::csv`'s
+    // `empty_versus_quoted_empty` treats unquoted-empty as NULL and
+    // quoted-empty as `""`). Fixed by always quoting an empty VARCHAR value
+    // so the writer/reader pair round-trips losslessly, matching how
+    // `duckdb`'s CSV writer also quotes empty strings (verified with the
+    // `duckdb` CLI: `COPY (SELECT '' AS a) TO ...` produces `""`, not an
+    // unquoted empty field).
+    #[test]
+    fn empty_string_and_null_round_trip_distinctly() {
+        let out = run_csv(
+            "SELECT a, b FROM t ORDER BY b",
+            "t",
+            b"a,b\n\"\",1\n,2\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "a,b\n\"\",1\n,2\n");
+
+        // Round-trip: read the exported bytes back with this crate's own
+        // CSV reader and confirm the empty string survived as `""`, not NULL.
+        use crate::format::TableFormat;
+        let src = crate::catalog::Source::from_bytes(out.into_bytes());
+        let mut fmt = crate::format::csv::CsvFormat::new(b',');
+        fmt.resolve(&src).unwrap().unwrap();
+        let cols = fmt.read_split(&src, 0, &[0, 1]).unwrap();
+        assert_eq!(
+            cols[0].value_at(0),
+            Value::Bytes(Vec::new()),
+            "row with b=1: a must be empty string, not NULL"
+        );
+        assert_eq!(cols[0].value_at(1), Value::Null, "row with b=2: a must stay NULL");
     }
 }

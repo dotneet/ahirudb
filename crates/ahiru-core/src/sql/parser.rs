@@ -771,6 +771,21 @@ impl<'a> Parser<'a> {
     }
 
     fn select_body(&mut self) -> Result<SelectStmt> {
+        // `PIVOT`/`UNPIVOT` はこのエンジンでは文の先頭（`stmt`）でしか認識
+        // しない糖衣構文で、展開（`plan::bind::desugar_pivot`/
+        // `desugar_unpivot`）は `Session::prepare` の入り口で対象表の
+        // スキーマを解決したうえで一度だけ行う設計になっている
+        // （`session.rs` の該当コメント参照）。そのため `FROM (PIVOT ...)`
+        // のような派生表・CTE本体・集合演算の項としては使えない
+        // （`duckdb` はこれを許すが、ここでは対応範囲外）。素通しすると
+        // この先で `SELECT` を期待して素の `UnexpectedToken` になり
+        // 原因が分かりにくいので、ここで先に分かりやすい
+        // `UnsupportedFeature` にしておく。
+        ensure!(
+            !self.is_soft_kw(b"pivot") && !self.is_soft_kw(b"unpivot"),
+            UnsupportedFeature,
+            self.pos
+        );
         self.expect_kw(Kw::Select)?;
         let mut st = SelectStmt::empty();
         st.distinct = self.eat_kw(Kw::Distinct)?;
@@ -800,7 +815,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(Kw::From)? {
             st.from = Some(self.parse_from_item()?);
-            st.sample = self.opt_sample_clause()?;
+            st.sample = self.opt_tablesample_clause()?;
         }
         if self.eat_kw(Kw::Where)? {
             st.filter = Some(self.expr()?);
@@ -868,6 +883,16 @@ impl<'a> Parser<'a> {
         // （ここは `ON` を挟まず `LIKE` を予約語にしているのと同じ判断）。
         if self.eat_kw(Kw::Qualify)? {
             st.qualify = Some(self.expr()?);
+        }
+        // `USING SAMPLE` は文末側の独立した句（`opt_using_sample_clause` の
+        // doc 参照）。`FROM` 項目に直接くっつく `TABLESAMPLE` とは受理位置が
+        // 違うので、両方が同時に書かれた場合は二重指定として拒否する
+        // （`duckdb` は両方を順番に適用できるが、このエンジンの `SampleSpec`
+        // は 1 個しか持てない単純化なので、サポート範囲外として明示的に
+        // 拒否する）。
+        if let Some(spec) = self.opt_using_sample_clause()? {
+            ensure!(st.sample.is_none(), UnsupportedFeature, self.pos);
+            st.sample = Some(spec);
         }
         // ORDER BY / LIMIT / OFFSET はここでは読まない。集合演算の右項が
         // 外側の ORDER BY を食ってしまうため、`query_body` 側で一括して扱う。
@@ -1013,8 +1038,13 @@ impl<'a> Parser<'a> {
         } else {
             self.eat_kw(Kw::Asc)?;
         }
-        // 既定は SQL 標準どおり「NULL は最大値扱い」= ASC なら最後、DESC なら最初。
-        let mut nulls_first = desc;
+        // Default matches DuckDB's actual behavior: NULLS LAST regardless of
+        // ASC/DESC (verified against a real `duckdb` CLI) — not the
+        // SQL-standard/PostgreSQL convention of "NULL is the largest value"
+        // (NULLS LAST for ASC, NULLS FIRST for DESC), which this used to
+        // implement and which silently disagreed with the reference
+        // implementation this project cross-checks against.
+        let mut nulls_first = false;
         if self.eat_kw(Kw::Nulls)? {
             if self.eat_kw(Kw::First)? {
                 nulls_first = true;
@@ -1178,19 +1208,33 @@ impl<'a> Parser<'a> {
     // `SAMPLE` 単体（`USING`/`TABLESAMPLE` を伴わない）は文法上どこにも
     // 現れないので、`SAMPLE` という列名が壊れる心配も無い。
 
-    /// `USING SAMPLE <spec>` / `TABLESAMPLE <spec>`。どちらも無ければ `None`。
-    fn opt_sample_clause(&mut self) -> Result<Option<SampleSpec>> {
-        let has_using = self.is_soft_kw(b"using") && self.peek_is_soft_kw(b"sample")?;
-        let has_tablesample = self.is_soft_kw(b"tablesample");
-        if !has_using && !has_tablesample {
+    /// `TABLESAMPLE <body>`。`duckdb` CLI で確認した位置の制約: `TABLESAMPLE`
+    /// は FROM 項目に直接くっつく修飾子で、`FROM t TABLESAMPLE 10% WHERE ...`
+    /// のように必ず `WHERE`/`GROUP BY`/... より前（FROM 項目の直後）に置く。
+    /// `WHERE` の後に置くと `duckdb` も構文エラーになる
+    /// (`duckdb -c "... WHERE ... TABLESAMPLE 10%"` → `syntax error at or near
+    /// "TABLESAMPLE"`) ので、呼び出し元（FROM 項目の直後）でだけ呼ぶ。
+    fn opt_tablesample_clause(&mut self) -> Result<Option<SampleSpec>> {
+        if !self.is_soft_kw(b"tablesample") {
             return Ok(None);
         }
-        if has_using {
-            self.bump()?; // using
-            self.bump()?; // sample
-        } else {
-            self.bump()?; // tablesample
+        self.bump()?; // tablesample
+        Ok(Some(self.sample_body()?))
+    }
+
+    /// `USING SAMPLE <body>`。`TABLESAMPLE` と違い、こちらは文全体に対する
+    /// 独立した句で、`WHERE`/`GROUP BY`/`HAVING`/`WINDOW`/`QUALIFY` の後・
+    /// `ORDER BY` の前に置く（`duckdb` CLI で確認済み: `FROM t USING SAMPLE
+    /// 10% WHERE ...` は構文エラーになるが `FROM t WHERE ... USING SAMPLE
+    /// 10%` は通る）。FROM 項目の直後に `WHERE` 等を挟まず直接書いた場合は
+    /// この関数と `opt_tablesample_clause` のどちらでも同じ位置になるが、
+    /// 呼び出しは常にこちら（文末側、`QUALIFY` の直後）だけで行う。
+    fn opt_using_sample_clause(&mut self) -> Result<Option<SampleSpec>> {
+        if !(self.is_soft_kw(b"using") && self.peek_is_soft_kw(b"sample")?) {
+            return Ok(None);
         }
+        self.bump()?; // using
+        self.bump()?; // sample
         Ok(Some(self.sample_body()?))
     }
 
@@ -3288,9 +3332,10 @@ mod tests {
             sel("SELECT DISTINCT a AS x, b y, t.*, count(*) FROM t WHERE a > 1 GROUP BY a, b HAVING count(*) > 2 ORDER BY a DESC, b ASC NULLS FIRST LIMIT 10 OFFSET 5"),
             "SELECT DISTINCT a AS x, b AS y, t.*, count(*) FROM t WHERE (a > 1i32) \
              GROUP BY a, b HAVING (count(*) > 2i32) \
-             ORDER BY a DESC NULLS FIRST, b ASC NULLS FIRST LIMIT 10 OFFSET 5"
+             ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST LIMIT 10 OFFSET 5"
         );
-        // 既定の NULL 順序は ASC=LAST / DESC=FIRST。
+        // The default NULL order is always LAST, for both ASC and DESC
+        // (matches DuckDB, not the SQL-standard/PostgreSQL convention).
         assert_eq!(sel("SELECT a FROM t ORDER BY a"), "SELECT a FROM t ORDER BY a ASC NULLS LAST");
         assert_eq!(
             sel("SELECT a FROM t ORDER BY a DESC NULLS LAST"),
@@ -3714,7 +3759,7 @@ mod tests {
         );
         assert_eq!(
             ex("rank() OVER (PARTITION BY a ORDER BY b DESC)"),
-            "rank() OVER (PARTITION BY a ORDER BY b DESC NULLS FIRST RANGE)"
+            "rank() OVER (PARTITION BY a ORDER BY b DESC NULLS LAST RANGE)"
         );
         assert_eq!(
             ex("sum(x) OVER (ORDER BY b, c NULLS LAST)"),

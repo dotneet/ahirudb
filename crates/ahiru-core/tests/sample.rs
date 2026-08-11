@@ -307,3 +307,87 @@ fn run_id_with_lazy_io(bytes: &[u8], sql: &str) -> (Vec<i32>, u32) {
     }
     (rows, rounds)
 }
+
+// --- 句の置き場所（`WHERE`/`GROUP BY`/`QUALIFY` との相互作用） ------------------
+//
+// `duckdb` CLI で確認した仕様: `TABLESAMPLE` は FROM 項目に直接くっつく修飾子
+// で必ず `WHERE` より前に置く。`USING SAMPLE` はその逆で文全体の独立した句
+// として `WHERE`/`GROUP BY`/`HAVING`/`WINDOW`/`QUALIFY` の後・`ORDER BY` の
+// 前に置く。両方とも「FROM 項目の直後、かつ他に何も続かない」ときだけ同じ
+// 位置に見えるため、`WHERE` を伴わない既存テストだけではこの違いに気づけ
+// なかった（これが原因で見つかった不具合。`sql::parser::opt_using_sample_clause`
+// / `opt_tablesample_clause` 参照）。
+
+#[test]
+fn using_sample_can_follow_where_group_by_and_qualify() {
+    let mut db = session_with_dual();
+    // WHERE の後。
+    let got = run_x(
+        &mut db,
+        &format!("SELECT range AS x FROM range({N}) WHERE range % 2 = 0 USING SAMPLE 100%"),
+    );
+    assert_eq!(got.len(), (N / 2) as usize);
+}
+
+#[test]
+fn using_sample_right_after_from_is_rejected_when_where_follows() {
+    // `USING SAMPLE` は FROM 項目に直接くっつく修飾子ではないので、
+    // `WHERE` が後に続く形で FROM 項目の直後に書くと構文エラーになる
+    // （`duckdb` も同じ理由で拒否する）。
+    let mut db = session_with_dual();
+    let err = db.prepare(
+        &format!("SELECT range AS x FROM range({N}) USING SAMPLE 10% WHERE range % 2 = 0"),
+        &[],
+    );
+    assert!(code_of(err).is_some());
+}
+
+#[test]
+fn tablesample_after_where_is_rejected() {
+    // 逆に `TABLESAMPLE` は文末側の句としては書けない。
+    let mut db = session_with_dual();
+    let err = db.prepare(
+        &format!("SELECT range AS x FROM range({N}) WHERE range % 2 = 0 TABLESAMPLE 10%"),
+        &[],
+    );
+    assert!(code_of(err).is_some());
+}
+
+#[test]
+fn tablesample_still_works_right_after_from_with_a_following_where() {
+    // `TABLESAMPLE` は今までどおり FROM 項目の直後、`WHERE` より前に置ける
+    // （リグレッション確認: このケースはバグ修正の前から動いていた）。
+    let mut db = session_with_dual();
+    let got = run_x(
+        &mut db,
+        &format!("SELECT range AS x FROM range({N}) TABLESAMPLE 100% WHERE range % 2 = 0"),
+    );
+    assert_eq!(got.len(), (N / 2) as usize);
+}
+
+#[test]
+fn combining_tablesample_and_trailing_using_sample_is_rejected() {
+    // `duckdb` は両方を同時に書くと順番に両方適用するが、このエンジンの
+    // `SampleSpec` は 1 個しか持てない単純化のため、二重指定は明示的に
+    // 拒否する（黙って片方を無視すると気づきにくいバグになるため）。
+    let mut db = session_with_dual();
+    let err = db.prepare(
+        &format!(
+            "SELECT range AS x FROM range({N}) TABLESAMPLE 50% WHERE range % 2 = 0 \
+             USING SAMPLE 100%"
+        ),
+        &[],
+    );
+    assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
+}
+
+#[test]
+fn using_sample_can_follow_group_by_having_before_order_by() {
+    let mut db = session_with_dual();
+    let got = run_x(
+        &mut db,
+        "SELECT range % 3 AS x FROM range(30) GROUP BY range % 3 HAVING count(*) > 0 \
+         USING SAMPLE 100% ORDER BY x",
+    );
+    assert_eq!(got, vec![0, 1, 2]);
+}

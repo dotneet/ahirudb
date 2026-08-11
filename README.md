@@ -6,7 +6,8 @@ DuckDB-WASM weighs tens of MB (roughly 10 MB even after brotli). Rather than
 *shrinking* DuckDB, ahirudb fits the 1 MiB budget by **choosing what to include
 from the start**.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
+See [docs/DESIGN.md](docs/DESIGN.md) for the full design, and
+[docs/sql/README.md](docs/sql/README.md) for the end-user SQL reference.
 
 ## Current size
 

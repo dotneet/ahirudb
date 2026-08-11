@@ -312,3 +312,34 @@ fn column_list_arity_mismatch_is_rejected() {
     );
     assert_eq!(code_of(err), Some(Code::ColumnCountMismatch));
 }
+
+/// The anchor and the recursive term must have the same column count as
+/// each other, independent of whether an explicit column list is given.
+/// Previously this wasn't checked: `coerce_to` (`plan::bind`) silently
+/// truncated the wider side to match the narrower one, so a typo like an
+/// extra SELECT-list column in the recursive term wouldn't fail cleanly —
+/// it would coerce column shapes together and, since the truncation can
+/// throw off whether the recursion actually converges, potentially spin
+/// until the iteration/byte safety cap instead of erroring immediately.
+#[test]
+fn anchor_and_recursive_term_column_count_mismatch_is_rejected() {
+    let mut db = session_with_dual();
+    // Anchor has 1 column, recursive term has 2 — no explicit column list,
+    // so this must be caught by the anchor/recursive-term shape check.
+    let err = db.prepare(
+        "WITH RECURSIVE t(n) AS ( \
+           SELECT 1 FROM dual UNION ALL SELECT n, n+1 FROM t WHERE n < 3 \
+         ) SELECT * FROM t",
+        &[],
+    );
+    assert_eq!(code_of(err), Some(Code::ColumnCountMismatch));
+
+    // And the reverse direction: anchor has 2 columns, recursive term has 1.
+    let err = db.prepare(
+        "WITH RECURSIVE t(n, m) AS ( \
+           SELECT 1, 1 FROM dual UNION ALL SELECT n+1 FROM t WHERE n < 3 \
+         ) SELECT * FROM t",
+        &[],
+    );
+    assert_eq!(code_of(err), Some(Code::ColumnCountMismatch));
+}

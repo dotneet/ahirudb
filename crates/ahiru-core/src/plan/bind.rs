@@ -379,9 +379,20 @@ fn unify_setop_schema(l: &[Field], r: &[Field]) -> Result<Vec<Field>> {
 }
 
 /// 出力スキーマに合わせて射影を挟む。型が既に一致していれば何もしない。
+///
+/// Rejects a column-count mismatch with `ColumnCountMismatch` rather than
+/// silently truncating (`have.len() > want.len()`) or hitting an unrelated
+/// `Internal` error from `column_program`'s out-of-range access
+/// (`have.len() < want.len()`). Without this check, `WITH RECURSIVE` queries
+/// whose anchor and recursive term have different column counts would have
+/// the extra/missing columns silently dropped, which can turn a query that
+/// should fail to converge into one that spins until the iteration cap
+/// (`crates/ahiru-core/src/exec/recursive.rs`) is hit instead of erroring
+/// immediately.
 fn coerce_to(node: Node, want: &[Field]) -> Result<Node> {
     let have = node.schema();
-    if have.len() == want.len() && have.iter().zip(want).all(|(a, b)| a.ty == b.ty) {
+    ensure!(have.len() == want.len(), ColumnCountMismatch);
+    if have.iter().zip(want).all(|(a, b)| a.ty == b.ty) {
         return Ok(node);
     }
     let scope = Scope::from_fields(have.to_vec());
@@ -1843,8 +1854,11 @@ fn build_tree(
                 for c in parts {
                     match equi_key(arena, &joined, lw, c)? {
                         Some((l, r)) => {
-                            left_keys.push(compile(arena, &lscope, params, l)?);
-                            right_keys.push(compile(arena, &rscope, params, r)?);
+                            let lp = compile(arena, &lscope, params, l)?;
+                            let rp = compile(arena, &rscope, params, r)?;
+                            let (lp, rp) = unify_key_types(lp, rp)?;
+                            left_keys.push(lp);
+                            right_keys.push(rp);
                         }
                         None => residual_parts.push(c),
                     }
@@ -2168,6 +2182,25 @@ fn equi_key(
     } else {
         Ok(None)
     }
+}
+
+/// 結合キーの両辺を同じ物理型に揃える。
+///
+/// `equi_key` は左右をそれぞれ独立にコンパイルするため（`WHERE a.k = d.k`
+/// の1本のプログラムとしてコンパイルされる相関等価述語や通常の比較式とは
+/// 違い）、`Ty::unify` による暗黙変換が自動では効かない。揃えないと
+/// `BIGINT` 列と `DOUBLE` 列のように論理的には比較可能な型同士でも物理表現
+/// （`I64` の生ビット列 対 `F64` の生ビット列）が食い違い、ハッシュ結合の
+/// キー比較が常に不一致になって行が消える（クラッシュもエラーも起きない
+/// ぶん、誤りに気付きにくい）。
+fn unify_key_types(l: Program, r: Program) -> Result<(Program, Program)> {
+    if l.result_ty == r.result_ty {
+        return Ok((l, r));
+    }
+    let Some(t) = Ty::unify(l.result_ty, r.result_ty) else {
+        err!(TypeMismatch);
+    };
+    Ok((cast_program(l, t)?, cast_program(r, t)?))
 }
 
 // --- 相関サブクエリの WHERE 分類 ---------------------------------------------
@@ -3375,12 +3408,25 @@ pub fn desugar_pivot(
     // `FILTER (WHERE cond)` 付き集約の仕組み（`Expr::Function.filter`、
     // `exec::agg::Agg.filter`）にそのまま乗るので、集約束縛ロジックには
     // 手を入れていない。
+    //
+    // `IN (...)` に同じ値が 2 回以上現れると（別名の有無に関わらず）
+    // `duckdb` は "The value ... was specified multiple times in the IN
+    // clause" として拒否する（`duckdb -c "PIVOT ... ON category IN
+    // ('a','a') ..."` で確認済み）。ここでチェックしないと、同じ
+    // `FILTER` 条件を持つ列が重複した名前で 2 本できてしまう
+    // （既知の不具合。`star_exclude_replace.rs` の EXCLUDE/REPLACE 重複
+    // チェックや `WINDOW` 句の重複名チェックと同じ判断で、値ベースの
+    // 重複だけを拒む — 別名が衝突しても `duckdb` は `_1` サフィックスで
+    // 自動的にリネームするだけでエラーにしないので、そちらは追わない）。
+    let mut seen_values: Vec<Value> = Vec::with_capacity(in_list.len());
     for (val_expr, alias) in &in_list {
         let lit = match arena.get(*val_expr) {
             Expr::Literal(v) => v.clone(),
             // `TypedLiteral`/式一般は非対応。列名も定数畳み込みも要るため。
             _ => err!(UnsupportedFeature),
         };
+        ensure!(!seen_values.contains(&lit), SyntaxError);
+        seen_values.push(lit.clone());
         let col_name = match alias {
             Some(a) => a.clone(),
             None => pivot_value_to_column_name(&lit)?,

@@ -294,6 +294,78 @@ fn list_reduce_empty_without_initial_is_null_unlike_duckdb() {
 
 // --- 既知の制限: 外側スコープの列は参照できない ----------------------------------
 
+// --- 引数個数・エラー系のエッジケース ------------------------------------------
+
+#[test]
+fn list_transform_rejects_a_lambda_with_the_wrong_param_count() {
+    let mut sess = session_with_basic();
+    // `list_transform` は 1 引数のラムダしか受け付けない。
+    assert_eq!(
+        code_of(sess.prepare("SELECT list_transform(json_array(1,2,3), (x,y) -> x) FROM t", &[])),
+        Some(Code::WrongArgCount)
+    );
+}
+
+#[test]
+fn list_reduce_rejects_a_lambda_with_the_wrong_param_count() {
+    let mut sess = session_with_basic();
+    // `list_reduce` は 2 引数（acc, x）のラムダが必要。
+    assert_eq!(
+        code_of(sess.prepare("SELECT list_reduce(json_array(1,2,3), x -> x) FROM t", &[])),
+        Some(Code::WrongArgCount)
+    );
+}
+
+#[test]
+fn list_filter_rejects_a_lambda_with_the_wrong_param_count() {
+    let mut sess = session_with_basic();
+    assert_eq!(
+        code_of(sess.prepare("SELECT list_filter(json_array(1,2,3), (a,b) -> a) FROM t", &[])),
+        Some(Code::WrongArgCount)
+    );
+}
+
+#[test]
+fn lambda_taking_function_requires_the_lambda_argument() {
+    let mut sess = session_with_basic();
+    // ラムダ引数そのものを省略した呼び出しは引数個数エラー。
+    assert_eq!(
+        code_of(sess.prepare("SELECT list_transform(json_array(1,2,3)) FROM t", &[])),
+        Some(Code::WrongArgCount)
+    );
+    // 余分な引数も同様に拒否される。
+    assert_eq!(
+        code_of(
+            sess.prepare("SELECT list_transform(json_array(1,2,3), x -> x, x -> x) FROM t", &[])
+        ),
+        Some(Code::WrongArgCount)
+    );
+}
+
+#[test]
+fn list_transform_on_a_non_json_argument_is_a_type_error_at_prepare_time() {
+    let mut sess = session_with_basic();
+    // 第 1 引数は JSON（LIST）でなければならない。`5` は整数リテラルで
+    // 型が静的に分かるので、`prepare` 時点で `TypeMismatch` になる
+    // （非配列の JSON 値が実行時に来る `list_transform_non_array_json_is_null`
+    // とは違うケース: あちらは型は JSON だが中身が配列でない場合）。
+    assert_eq!(
+        code_of(sess.prepare("SELECT list_transform(5, x -> x) FROM t", &[])),
+        Some(Code::TypeMismatch)
+    );
+}
+
+// --- ネストしたラムダでのパラメータ隠蔽 ----------------------------------------
+
+#[test]
+fn nested_lambda_params_with_the_same_name_shadow_correctly() {
+    let mut sess = session_with_basic();
+    // 内側のラムダの `x` は外側の `x` を隠す。外側の要素の値に関わらず、
+    // 内側は常に `json_array(9)` を変換した `[9]` を返すはず。
+    let e = "list_transform(json_array(1,2,3), x -> list_transform(json_array(9), x -> x))";
+    assert_eq!(one(&mut sess, e), s("[[9],[9],[9]]"));
+}
+
 #[test]
 fn lambda_body_cannot_reference_outer_scope_columns() {
     let mut sess = session_with_basic();

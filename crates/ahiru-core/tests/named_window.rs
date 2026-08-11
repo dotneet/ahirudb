@@ -142,6 +142,79 @@ fn undefined_named_window_is_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
+/// 同じ `WINDOW` 句の中で同名を 2 回定義すると束縛前（構文解析）の時点で
+/// 拒否される（`duckdb`: "Duplicate window name" 相当のエラー）。
+#[test]
+fn duplicate_window_name_in_the_same_clause_is_rejected() {
+    let mut s = session_with_basic();
+    let err = s.prepare("SELECT sum(score) OVER w FROM t WINDOW w AS (), w AS ()", &[]);
+    assert_eq!(code_of(err), Some(Code::SyntaxError));
+}
+
+/// `WINDOW` を予約語ではなく通常の識別子として使おうとする（列名としての
+/// `window`）と、この構文の文脈依存キーワードとは違い `Kw::Window` は
+/// グローバル予約語なので拒否される（`sql::lexer` のコメント参照。
+/// `QUALIFY` と同じ扱い）。
+#[test]
+fn window_is_a_reserved_word_and_cannot_be_a_bare_column_name() {
+    let mut s = session_with_basic();
+    let err = s.prepare("SELECT window FROM t", &[]);
+    assert!(code_of(err).is_some());
+}
+
+/// `WINDOW` 句が空でも（実際には使わない定義があっても）構文的には許される。
+#[test]
+fn an_unused_named_window_definition_does_not_error() {
+    let mut s = session_with_basic();
+    let rows = run(&mut s, "SELECT id FROM t WHERE id < 2 WINDOW w AS (ORDER BY id) ORDER BY id");
+    assert_eq!(rows, vec![vec![i32(0)], vec![i32(1)]]);
+}
+
+/// 名前付きウィンドウは `WHERE`/`GROUP BY` を経由したフィルタ後の行に対して
+/// 計算される（普通の `OVER (...)` と同じ、通常のウィンドウ関数の意味論の
+/// リグレッション確認）。
+/// duckdb: SELECT id, flag, sum(score) OVER w AS s FROM 'basic.parquet'
+///         WHERE id < 6 AND flag = false WINDOW w AS (ORDER BY id) ORDER BY id
+#[test]
+fn named_window_operates_on_rows_after_the_where_filter() {
+    let mut s = session_with_basic();
+    let rows = run(
+        &mut s,
+        "SELECT id, flag, sum(score) OVER w AS s FROM t \
+         WHERE id < 6 AND flag = false WINDOW w AS (ORDER BY id) ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![i32(1), b(false), f64(1.5)],
+            vec![i32(2), b(false), f64(4.5)],
+            vec![i32(4), b(false), f64(10.5)],
+            vec![i32(5), b(false), f64(18.0)],
+        ]
+    );
+}
+
+/// `WINDOW` 句を経由した結果をさらに外側の `SELECT` で絞り込む（新機能を
+/// サブクエリと組み合わせる）。
+#[test]
+fn named_window_result_can_be_filtered_by_an_outer_query() {
+    let mut s = session_with_basic();
+    let rows = run(
+        &mut s,
+        "SELECT * FROM (SELECT id, sum(score) OVER w AS s FROM t WHERE id < 6 \
+         WINDOW w AS (PARTITION BY flag ORDER BY id)) WHERE s > 4.0 ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![i32(2), f64(4.5)],
+            vec![i32(3), f64(4.5)],
+            vec![i32(4), f64(10.5)],
+            vec![i32(5), f64(18.0)],
+        ]
+    );
+}
+
 /// `WINDOW` 句自体が無くても普通の `OVER (...)` は今までどおり動く
 /// （リグレッション確認）。
 #[test]

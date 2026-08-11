@@ -285,3 +285,114 @@ fn unpivot_incompatible_column_types_is_type_mismatch() {
     let err = sess.prepare("UNPIVOT t ON region, amount INTO NAME k VALUE v", &[]);
     assert_eq!(code_of(err), Some(Code::TypeMismatch));
 }
+
+// --- 発見した不具合の回帰テスト -----------------------------------------------
+
+/// `IN (...)` に同じ値を 2 回書くと、別名の有無に関わらず `duckdb` は
+/// "The value ... was specified multiple times in the IN clause" として
+/// 拒否する（`duckdb -c "PIVOT ... ON category IN ('a','a') ..."` で確認済み）。
+///
+/// 修正前の不具合: このチェックが無く、`PIVOT t ON category IN ('a', 'a')
+/// USING sum(amount) GROUP BY region` が黙って通ってしまい、同じ `FILTER`
+/// 条件を持つ列が `"a"` という同じ名前で 2 本できていた（`plan::bind::
+/// desugar_pivot` に重複検出を追加して修正）。
+#[test]
+fn pivot_rejects_duplicate_values_in_the_in_list() {
+    let mut sess = session_with("pivot_small.parquet");
+    let err =
+        sess.prepare("PIVOT t ON category IN ('a', 'a') USING sum(amount) GROUP BY region", &[]);
+    assert_eq!(code_of(err), Some(Code::SyntaxError));
+    // 別名を付けていても、元の値が重複していれば同じく拒否される
+    // （`duckdb` は別名の衝突自体は `_1` サフィックスで自動リネームするだけ
+    // だが、値そのものの重複は許さない）。
+    let err = sess.prepare(
+        "PIVOT t ON category IN ('a' AS x, 'a' AS y) USING sum(amount) GROUP BY region",
+        &[],
+    );
+    assert_eq!(code_of(err), Some(Code::SyntaxError));
+}
+
+/// 値が異なれば問題なく通る（重複チェックが誤爆していないことの確認）。
+#[test]
+fn pivot_distinct_values_in_the_in_list_are_fine() {
+    let mut sess = session_with("pivot_small.parquet");
+    let rows = run(
+        &mut sess,
+        "PIVOT t ON category IN ('a', 'b') USING sum(amount) GROUP BY region ORDER BY region",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![s("east"), i128(10), i128(20)], vec![s("west"), i128(30), i128(40)],]
+    );
+}
+
+/// `PIVOT`/`UNPIVOT` はこのエンジンでは文の先頭でしか展開されない糖衣構文
+/// なので、派生表（`FROM (PIVOT ...)`）や CTE 本体、集合演算の項としては
+/// 使えない（`plan::bind::desugar_pivot`/`desugar_unpivot` が `Session::
+/// prepare` の入り口で 1 回だけ展開する設計。`session.rs` 参照）。`duckdb`
+/// はこれを許すが、対応範囲外。
+///
+/// 修正前の不具合: このケースは `sql::parser::select_body` が `SELECT` を
+/// 期待するところまで読み進んでから初めて `UnexpectedToken` になっており、
+/// 「`PIVOT` 自体は書けるのになぜ subquery だと構文エラーになるのか」が
+/// 分かりにくかった。`select_body` の先頭で `PIVOT`/`UNPIVOT` を検出し、
+/// 意味の分かる `UnsupportedFeature` を返すように修正した。
+#[test]
+fn pivot_as_a_derived_table_is_a_clear_unsupported_error_not_a_confusing_syntax_error() {
+    let mut sess = session_with("pivot.parquet");
+    let err = sess.prepare(
+        "SELECT * FROM (PIVOT t ON category IN ('a', 'b', 'c') USING sum(amount) \
+         GROUP BY region) WHERE a > 1300",
+        &[],
+    );
+    assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
+}
+
+#[test]
+fn unpivot_as_a_cte_body_is_a_clear_unsupported_error() {
+    let mut sess = session_with("pivot.parquet");
+    let err = sess.prepare(
+        "WITH u AS (UNPIVOT t ON q1, q2, q3, q4 INTO NAME quarter VALUE amt) \
+         SELECT quarter, sum(amt) FROM u GROUP BY quarter",
+        &[],
+    );
+    assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
+}
+
+/// 一方、top-level の `PIVOT`/`UNPIVOT` 自体はリグレッションなく今までどおり
+/// 動く。
+#[test]
+fn top_level_pivot_is_unaffected_by_the_derived_table_check() {
+    let mut sess = session_with("pivot.parquet");
+    let rows = run(
+        &mut sess,
+        "PIVOT t ON category IN ('a', 'b', 'c') USING sum(amount) GROUP BY region \
+         ORDER BY region",
+    );
+    assert_eq!(rows.len(), 4);
+}
+
+/// `PIVOT` の `FROM` は表名だけでなく、`JOIN` を含む任意の派生表でもよい
+/// （`desugar_pivot` は `from` をそのまま `SelectStmt::from` へ渡すだけで、
+/// `UNPIVOT` のように複製する必要が無いため制約が無い）。
+#[test]
+fn pivot_from_accepts_a_derived_table_containing_a_join() {
+    let mut sess = session_with("pivot.parquet");
+    let rows = run(
+        &mut sess,
+        "PIVOT (SELECT t.* FROM t JOIN t AS t2 ON t.id = t2.id) \
+         ON category IN ('a', 'b') USING sum(amount) GROUP BY region ORDER BY region",
+    );
+    assert!(!rows.is_empty());
+}
+
+/// `UNPIVOT` は対象列 1 本ごとに `from` を複製する必要があり（`clone_from_item`
+/// 参照）、`JOIN`/`Subquery` は複製できないプランを持ちうるため明示的に
+/// 拒否する。クラッシュせずクリーンなエラーになることを確認する。
+#[test]
+fn unpivot_from_a_join_is_rejected_cleanly() {
+    let mut sess = session_with("pivot.parquet");
+    let err =
+        sess.prepare("UNPIVOT t JOIN t AS t2 ON t.id = t2.id ON q1, q2 INTO NAME k VALUE v", &[]);
+    assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
+}
