@@ -18,7 +18,7 @@
 //! 1MiB のバイナリ予算でソート済み実行時のマージまで抱えるのは割に合わない
 //! ため、既知の制限として受け入れる。
 
-use crate::exec::rowkey::{encode_key, HashIndex};
+use crate::exec::rowkey::{encode_key, ord_f64, pow10, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
 use crate::expr::Program;
 use crate::plan::{Agg, AggKind};
@@ -30,10 +30,6 @@ use crate::vector::{Batch, Data, PhysType, Ty, Value, Vector, BATCH_SIZE};
 /// ホストが渡す WASM 線形メモリは 32 ビット空間で、実行中はスキャンの
 /// バッファと出力バッチも同居する。集約だけで食い潰さない値として 64MiB。
 const MAX_STATE_BYTES: usize = 64 << 20;
-
-/// エントリ 1 件あたりの `HashIndex` 側のおおよその固定費
-/// （`entries` 12B + `hashes` 8B + バケット分の余裕）。
-const INDEX_OVERHEAD: usize = 32;
 
 /// 実行時に選ぶ更新規則。`AggKind` と入力の物理型から一度だけ決める。
 ///
@@ -244,14 +240,14 @@ impl HashAggregate {
 
     /// おおよそのメモリ使用量。厳密な値は要らない（上限判定にしか使わない）。
     fn mem_used(&self) -> usize {
-        let mut n = self.index.key_bytes() + self.index.len() * INDEX_OVERHEAD;
+        let mut n = self.index.approx_bytes();
         n += self.key_bytes + self.acc_bytes;
         n += self.num_groups() * self.aggs.len() * core::mem::size_of::<State>();
         for d in self.distinct.iter().flatten() {
-            n += d.key_bytes() + d.len() * INDEX_OVERHEAD;
+            n += d.approx_bytes();
         }
         for d in self.mode_freq.iter().flatten() {
-            n += d.key_bytes() + d.len() * INDEX_OVERHEAD;
+            n += d.approx_bytes();
         }
         n
     }
@@ -676,15 +672,6 @@ impl Operator for HashAggregate {
     }
 }
 
-/// 10^scale。`f64::powi` は core に無いので掛け算で作る。
-fn pow10(scale: u8) -> f64 {
-    let mut d = 1.0f64;
-    for _ in 0..scale {
-        d *= 10.0;
-    }
-    d
-}
-
 /// 整数系の 1 値を i128 で取り出す。SUM の桁溢れを避けるため常に広げる。
 fn as_i128(col: &Vector, row: usize) -> Result<i128> {
     Ok(match col.data() {
@@ -713,28 +700,6 @@ fn cmp_at(col: &Vector, row: usize, acc: &Value) -> core::cmp::Ordering {
         (Data::F64(v), Value::F64(x)) => ord_f64(v[row], *x),
         (Data::Bytes(b), Value::Bytes(x)) => b.get(row).cmp(x.as_slice()),
         _ => Ordering::Equal,
-    }
-}
-
-/// NaN を「すべてより大きい」とみなす全順序。
-///
-/// こうすると MAX は他に値が無いときだけ NaN を返し、MIN は NaN 以外を
-/// 優先する（全部 NaN のグループだけ NaN になる）。`rowkey` が NaN を
-/// 1 グループにまとめるのと矛盾しない。
-fn ord_f64(a: f64, b: f64) -> core::cmp::Ordering {
-    use core::cmp::Ordering::*;
-    if a < b {
-        Less
-    } else if a > b {
-        Greater
-    } else if a == b {
-        Equal
-    } else {
-        match (a.is_nan(), b.is_nan()) {
-            (true, true) => Equal,
-            (true, false) => Greater,
-            _ => Less,
-        }
     }
 }
 
@@ -2299,7 +2264,7 @@ mod tests {
         // 838 万値強が要るので、余裕を見て 900 万行を流し込む。
         let mut steps = Vec::new();
         for _ in 0..90 {
-            let vals: Vec<Option<i32>> = (0..100_000).map(|k| Some(k as i32)).collect();
+            let vals: Vec<Option<i32>> = (0..100_000).map(Some).collect();
             steps.push(MockStep::Rows(Batch::new(vec![i32s(&vals)])));
         }
         let op = build(steps, vec![], vec![agg(AggKind::Median, Some(load(Ty::Int, 0)))], None);

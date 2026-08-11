@@ -4,6 +4,7 @@
 //! 依存関係は無い方向にしてある（書き出しが読み取りを呼ぶことはあっても
 //! 逆はない）。数値・文字列のエスケープはこのファイル内で完結させる。
 
+use crate::expr::funcs::civil_from_days;
 use crate::prelude::*;
 use crate::vector::{Batch, Field, Ty, Value};
 use crate::write::TableSink;
@@ -260,19 +261,6 @@ fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {
     for i in (0..n).rev() {
         out.push(buf[i]);
     }
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// JSON 文字列としてエスケープして書く（引用符込み）。

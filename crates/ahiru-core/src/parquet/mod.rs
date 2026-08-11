@@ -135,11 +135,8 @@ impl Compression {
     /// ZSTD は `zstd` フィーチャ（既定で有効）が付いているときだけ内蔵扱い。
     /// 外した場合は旧来どおりホスト委譲（`NeedCodec`）に回る。
     pub fn is_builtin(self) -> bool {
-        match self {
-            Compression::Uncompressed | Compression::Snappy | Compression::Lz4Raw => true,
-            Compression::Zstd => cfg!(feature = "zstd"),
-            _ => false,
-        }
+        matches!(self, Compression::Uncompressed | Compression::Snappy | Compression::Lz4Raw)
+            || (self == Compression::Zstd && cfg!(feature = "zstd"))
     }
 }
 

@@ -15,7 +15,7 @@ use crate::parquet::meta::{decode_page_header, ColumnMetaData, PageHeader};
 use crate::parquet::schema::ColumnDesc;
 use crate::parquet::*;
 use crate::prelude::*;
-use crate::vector::{Bitmap, BytesData, Data, PhysType, Ty, Vector};
+use crate::vector::{Bitmap, Data, PhysType, Ty, Vector};
 
 /// Unix エポック (1970-01-01) のユリウス通日。INT96 の変換に使う。
 const JULIAN_EPOCH: i64 = 2_440_588;
@@ -944,9 +944,6 @@ fn push_codec_page_for(
     ensure!(clen <= buf.len() - hlen, UnexpectedEof, hlen);
     push_codec_page(meta, &hdr, start + hlen as u64, clen, out)
 }
-
-/// `BytesData` を直接触る必要がある箇所のための再エクスポート。
-pub(crate) type _BytesData = BytesData;
 
 #[cfg(test)]
 mod tests {

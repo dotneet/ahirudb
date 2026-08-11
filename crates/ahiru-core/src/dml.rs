@@ -10,45 +10,14 @@
 //! 通し、専用のスカラ評価器は書かない — 型変換・NULL・3 値論理を
 //! `SELECT` と完全に同じ規則にできるうえ、コードサイズも増えない。
 
-use crate::ddl::{count_result, run_query_to_rows};
+use crate::ddl::{count_result, eval_scalar, run_query_to_rows};
 use crate::plan::compile::{cast_program, compile};
 use crate::plan::Scope;
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::session::{Prepared, Session};
 use crate::sql::ast::{ExprArena, ExprId, InsertSource};
-use crate::vector::{Batch, Field, Ty, Value, Vector, BATCH_SIZE};
-
-/// 対象テーブルがインメモリ表であることを確認し、その添字を返す。
-/// ファイルテーブル（読み取り専用）なら `ReadOnlyTable`、どちらにも
-/// 無ければ `TableNotFound`。
-fn mem_index_writable(session: &Session, name: &str) -> Result<usize> {
-    if let Some(i) = session.catalog.mem_index_of(name) {
-        return Ok(i);
-    }
-    if session.catalog.index_of(name).is_some() {
-        err!(ReadOnlyTable);
-    }
-    err!(TableNotFound)
-}
-
-/// 単一の式を空スコープ（列参照なし）でコンパイルし、`target_ty` へ
-/// キャストしたうえで 1 行のバッチに対して評価する。`INSERT ... VALUES`
-/// の各値、および値レベルの型変換（INSERT ... SELECT の列コピー）の両方に使う。
-fn eval_scalar(
-    session: &mut Session,
-    arena: &ExprArena,
-    expr_id: ExprId,
-    params: &[Value],
-    target_ty: Ty,
-) -> Result<Value> {
-    let scope = Scope::new();
-    let prog = compile(arena, &scope, params, expr_id)?;
-    let prog = if prog.result_ty != target_ty { cast_program(prog, target_ty)? } else { prog };
-    let batch = Batch::rows_only(1);
-    let v = session.vm.eval(&prog, &batch)?;
-    Ok(v.value_at(0))
-}
+use crate::vector::{Field, Ty, Value, Vector, BATCH_SIZE};
 
 /// 既に確定している `Value` を対象型へキャストする。`Expr::Literal` として
 /// 包んでから `eval_scalar` に通すことで、CAST の意味論（DECIMAL の
@@ -94,7 +63,7 @@ pub(crate) fn insert(
     source: &InsertSource,
     params: &[Value],
 ) -> Result<Prepared> {
-    let idx = mem_index_writable(session, table)?;
+    let idx = session.catalog.mem_index_writable(table)?;
     let schema = session.catalog.mem_get(idx).unwrap().schema.clone();
     let col_idx = resolve_insert_columns(&schema, columns)?;
 
@@ -143,7 +112,7 @@ pub(crate) fn update(
     filter: Option<ExprId>,
     params: &[Value],
 ) -> Result<Prepared> {
-    let idx = mem_index_writable(session, table)?;
+    let idx = session.catalog.mem_index_writable(table)?;
     let schema = session.catalog.mem_get(idx).unwrap().schema.clone();
     let scope = Scope::from_fields(schema.clone());
 
@@ -216,7 +185,7 @@ pub(crate) fn delete(
     filter: Option<ExprId>,
     params: &[Value],
 ) -> Result<Prepared> {
-    let idx = mem_index_writable(session, table)?;
+    let idx = session.catalog.mem_index_writable(table)?;
     let pred = match filter {
         Some(e) => {
             let schema = session.catalog.mem_get(idx).unwrap().schema.clone();

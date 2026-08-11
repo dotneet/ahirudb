@@ -3,6 +3,7 @@
 //! RFC 4180 準拠。カンマ・引用符・改行を含むフィールドだけを引用符で囲む
 //! （毎回引用符を付けるより出力が小さく、読みやすい）。
 
+use crate::expr::funcs::civil_from_days;
 use crate::prelude::*;
 use crate::vector::{Batch, Field, Ty, Value};
 use crate::write::TableSink;
@@ -272,22 +273,6 @@ fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {
         out.push(b'0');
     }
     out.extend_from_slice(&s);
-}
-
-/// エポックからの日数を civil date に変換する（Howard Hinnant のアルゴリズム）。
-/// `crates/ahiru-cli/src/main.rs` の同名関数と同じ式。表示専用の小さな
-/// コードなので、依存を増やさないためここでも独立して持つ。
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]

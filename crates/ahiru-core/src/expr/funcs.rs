@@ -299,22 +299,8 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         // 糖衣構文として `sql::parser` が展開する。
         "json_extract" => fixed(F_JSON_EXTRACT, &[Json, Varchar], n, 2, Json),
         "json_extract_string" => fixed(F_JSON_EXTRACT_STRING, &[Json, Varchar], n, 2, Varchar),
-        "json_type" => {
-            ensure!((1..=2).contains(&n), WrongArgCount);
-            let mut want = vec![Json];
-            if n == 2 {
-                want.push(Varchar);
-            }
-            Ok((F_JSON_TYPE, want, Varchar))
-        }
-        "json_array_length" => {
-            ensure!((1..=2).contains(&n), WrongArgCount);
-            let mut want = vec![Json];
-            if n == 2 {
-                want.push(Varchar);
-            }
-            Ok((F_JSON_ARRAY_LENGTH, want, BigInt))
-        }
+        "json_type" => json_path_opt(F_JSON_TYPE, n, Varchar),
+        "json_array_length" => json_path_opt(F_JSON_ARRAY_LENGTH, n, BigInt),
         // DuckDB の慣習で LIST/MAP 系の名前を持つが、実体は Ty::Json の
         // 配列/オブジェクト形状を読むだけ（モジュール冒頭 doc の設計判断）。
         "list_extract" | "array_extract" => fixed(F_LIST_EXTRACT, &[Json, BigInt], n, 2, Json),
@@ -406,6 +392,18 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
 fn fixed(id: FuncId, pat: &[Ty], n: usize, lo: usize, ret: Ty) -> Result<(FuncId, Vec<Ty>, Ty)> {
     ensure!(n >= lo && n <= pat.len(), WrongArgCount);
     Ok((id, pat[..n].to_vec(), ret))
+}
+
+/// `f(json)` / `f(json, path)` の 1-2 引数シグネチャ。`json_type`/
+/// `json_array_length` など「対象が JSON 全体かパス指定か」を第 2 引数の
+/// 有無だけで切り替える JSON 関数の共通形。
+fn json_path_opt(id: FuncId, n: usize, ret: Ty) -> Result<(FuncId, Vec<Ty>, Ty)> {
+    ensure!((1..=2).contains(&n), WrongArgCount);
+    let mut want = vec![Ty::Json];
+    if n == 2 {
+        want.push(Ty::Varchar);
+    }
+    Ok((id, want, ret))
 }
 
 /// 数値 1 引数。整数なら `int_id`、それ以外は `flt_id`。
@@ -588,7 +586,8 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
 // --- 行ループの下回り -------------------------------------------------------
 
 /// 行数と各引数の stride。長さ 1 の引数は stride 0（＝定数）。
-fn strides(args: &[&Vector]) -> Result<(usize, Vec<usize>)> {
+/// `expr::regex` からも使う共通ヘルパー（同じ「定数 or 全部同じ長さ」規則）。
+pub(crate) fn strides(args: &[&Vector]) -> Result<(usize, Vec<usize>)> {
     ensure!(!args.is_empty(), WrongArgCount);
     let mut n = 1usize;
     let mut empty = false;
@@ -616,8 +615,8 @@ fn strides(args: &[&Vector]) -> Result<(usize, Vec<usize>)> {
     Ok((n, s))
 }
 
-/// 全引数の validity の AND。NULL 無しなら `None`。
-fn combine(args: &[&Vector], s: &[usize], n: usize) -> Option<Bitmap> {
+/// 全引数の validity の AND。NULL 無しなら `None`。`expr::regex` と共有。
+pub(crate) fn combine(args: &[&Vector], s: &[usize], n: usize) -> Option<Bitmap> {
     if !args.iter().any(|a| a.has_nulls()) {
         return None;
     }
@@ -632,8 +631,9 @@ fn combine(args: &[&Vector], s: &[usize], n: usize) -> Option<Bitmap> {
     Some(m)
 }
 
-/// 行 `i` を NULL にする（遅延確保）。
-fn set_null(m: &mut Option<Bitmap>, i: usize, n: usize) {
+/// 行 `i` を NULL にする（遅延確保）。`expr::kernels`/`expr::regex` にも
+/// 同じ役割の実装がある（それぞれの呼び出しパターンに合わせて独立に持つ）。
+pub(crate) fn set_null(m: &mut Option<Bitmap>, i: usize, n: usize) {
     if m.is_none() {
         *m = Some(Bitmap::ones(n));
     }
@@ -723,6 +723,16 @@ impl<'b> A<'_, 'b> {
             },
             None => 0.0,
         }
+    }
+}
+
+/// `json_type`/`json_array_length` 共通: 第 2 引数（パス）があれば
+/// そのパス位置、無ければドキュメント全体を対象にする。
+fn json_extract_or_whole<'b>(a: &A<'_, 'b>) -> Result<Option<(&'b [u8], crate::json::Kind)>> {
+    if a.n() >= 2 {
+        crate::json::extract(a.bytes(0), a.bytes(1))
+    } else {
+        Ok(Some(crate::json::whole(a.bytes(0))?))
     }
 }
 
@@ -1409,11 +1419,7 @@ fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             };
         }
         F_JSON_TYPE => {
-            let found = if a.n() >= 2 {
-                crate::json::extract(a.bytes(0), a.bytes(1))?
-            } else {
-                Some(crate::json::whole(a.bytes(0))?)
-            };
+            let found = json_extract_or_whole(a)?;
             return match found {
                 Some((span, kind)) => {
                     out.extend_from_slice(crate::json::type_name(kind, span).as_bytes());
@@ -1935,11 +1941,7 @@ fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
             Some(days_from_civil(c.y, c.mo, days_in_month(c.y, c.mo)))
         }
         F_JSON_ARRAY_LENGTH => {
-            let found = if a.n() >= 2 {
-                crate::json::extract(a.bytes(0), a.bytes(1))?
-            } else {
-                Some(crate::json::whole(a.bytes(0))?)
-            };
+            let found = json_extract_or_whole(a)?;
             match found {
                 Some((span, kind)) => Some(crate::json::array_length(span, kind)?),
                 None => None,
@@ -2022,7 +2024,8 @@ fn eval_f64(id: FuncId, a: &A) -> Result<Option<f64>> {
     })
 }
 
-fn f_abs(x: f64) -> f64 {
+/// `expr::kernels` とも共有する実装。
+pub(crate) fn f_abs(x: f64) -> f64 {
     if x < 0.0 {
         -x
     } else {
@@ -2031,10 +2034,12 @@ fn f_abs(x: f64) -> f64 {
 }
 
 /// 0 方向への切り捨て。`f64::trunc` は std 専用なので自前で持つ。
-fn f_trunc(x: f64) -> f64 {
+/// `expr::kernels` とも共有する実装。
+pub(crate) fn f_trunc(x: f64) -> f64 {
     if f_abs(x) < 9_223_372_036_854_775_808.0 {
         (x as i64) as f64
     } else {
+        // 2^63 以上の f64 は既に整数。
         x
     }
 }

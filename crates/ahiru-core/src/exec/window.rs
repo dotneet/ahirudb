@@ -33,7 +33,7 @@
 //!
 //! 溢れ処理は持たない。蓄積が `MAX_BUFFER_BYTES` を超えたら `Oom` を返す。
 
-use crate::exec::rowkey::{encode_key, HashIndex};
+use crate::exec::rowkey::{encode_key, ord_f64, pow10, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
 use crate::plan::{AggKind, SortKey, WindowKind, WindowSpec};
 use crate::prelude::*;
@@ -518,37 +518,12 @@ impl Acc {
     }
 }
 
-/// 10^scale。`f64::powi` は core に無いので掛け算で作る。
-fn pow10(scale: u8) -> f64 {
-    let mut d = 1.0f64;
-    for _ in 0..scale {
-        d *= 10.0;
-    }
-    d
-}
-
 /// 同じ物理型の 2 値の比較。NaN は「すべてより大きい」（`exec::agg` と同じ）。
 fn cmp_val(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::F64(x), Value::F64(y)) => ord_f64(*x, *y),
         // 物理型が食い違う組み合わせは上流のバグ。順序を付けずに等しいとみなす。
         _ => a.partial_cmp_same(b).unwrap_or(Ordering::Equal),
-    }
-}
-
-fn ord_f64(a: f64, b: f64) -> Ordering {
-    if a < b {
-        Ordering::Less
-    } else if a > b {
-        Ordering::Greater
-    } else if a == b {
-        Ordering::Equal
-    } else {
-        match (a.is_nan(), b.is_nan()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            _ => Ordering::Less,
-        }
     }
 }
 

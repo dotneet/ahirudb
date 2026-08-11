@@ -72,7 +72,7 @@ const MAX_VIEW_DEPTH: u32 = 16;
 /// CTE の実体。
 enum CtePlan {
     /// 束縛済みで、まだ取り出されていない。
-    Ready(Node),
+    Ready(Box<Node>),
     /// 再帰 CTE 自身の再帰項を束縛している最中で、自己参照はまだ実プランを
     /// 持たない。参照側は `Node::WorkingTable`（実行時に直前イテレーションの
     /// 新規行へ差し替わる葉）を受け取る（`exec::recursive` 参照）。
@@ -90,7 +90,7 @@ struct CteEntry {
 /// `FromItem::Table` が CTE 名を解決した結果。
 enum ResolvedCte {
     /// 通常の CTE。1 回だけ取り出せる。
-    Plan(Node),
+    Plan(Box<Node>),
     /// 再帰 CTE 本体からの自己参照。実データは持たず、実行時に
     /// `RecursiveCte` オペレータが差し込む。
     WorkingTable,
@@ -174,18 +174,22 @@ fn bind_one_cte(
                 Some(e) => e,
                 None => err!(Internal),
             };
-            entry.plan = CtePlan::Ready(Node::RecursiveCte {
+            entry.plan = CtePlan::Ready(Box::new(Node::RecursiveCte {
                 anchor: Box::new(anchor),
                 recursive_term: Box::new(recursive_term),
                 union_all,
                 schema: out_schema,
-            });
+            }));
             return Ok(());
         }
     }
     let plan = bind_query_in(catalog, arena, &c.query, params, ctes, None)?;
     let schema = apply_cte_columns(plan.root.schema().to_vec(), &c.columns)?;
-    ctes.entries.push(CteEntry { name: c.name.clone(), plan: CtePlan::Ready(plan.root), schema });
+    ctes.entries.push(CteEntry {
+        name: c.name.clone(),
+        plan: CtePlan::Ready(Box::new(plan.root)),
+        schema,
+    });
     Ok(())
 }
 
@@ -368,10 +372,7 @@ fn unify_setop_schema(l: &[Field], r: &[Field]) -> Result<Vec<Field>> {
     ensure!(l.len() == r.len(), TypeMismatch);
     let mut out = Vec::with_capacity(l.len());
     for (a, b) in l.iter().zip(r) {
-        let ty = match crate::vector::Ty::unify(a.ty, b.ty) {
-            Some(t) => t,
-            None => err!(TypeMismatch),
-        };
+        let ty = crate::vector::Ty::unify_or_mismatch(a.ty, b.ty)?;
         // 名前は左を採る（SQL 標準）。
         out.push(Field::new(a.name.clone(), ty, a.nullable || b.nullable));
     }
@@ -467,7 +468,7 @@ fn flatten_from(
                 let (resolved, all) = ctes.resolve(k)?;
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
                 let subplan = match resolved {
-                    ResolvedCte::Plan(node) => node,
+                    ResolvedCte::Plan(node) => *node,
                     // 再帰 CTE 自身の再帰項からの自己参照。実データは持たず、
                     // 実行時に `RecursiveCte` オペレータが直前イテレーションの
                     // 新規行を差し込む（`exec::recursive` 参照）。
@@ -746,16 +747,6 @@ fn resolve_sample_spec(spec: &crate::sql::ast::SampleSpec) -> crate::plan::Sampl
 }
 
 // --- 本体 --------------------------------------------------------------------
-
-pub fn bind_select(
-    catalog: &Catalog,
-    arena: &ExprArena,
-    sel: &SelectStmt,
-    params: &[Value],
-) -> Result<Plan> {
-    let mut ctes = CteScope::default();
-    bind_select_in(catalog, arena, sel, params, &mut ctes, None)
-}
 
 /// `outer_scope` が `Some` のとき、この SELECT は相関サブクエリとして
 /// バインドされる: WHERE の最上位 AND 節にある「外側スコープの式 = 内側の式」
@@ -1049,10 +1040,7 @@ fn bind_select_in(
             for (i, &outer_e) in plan.correlated.iter().enumerate() {
                 let lp = compile(arena, &scope, params, outer_e)?;
                 let rp = column_program(&corr_scope, 1 + i)?;
-                let want = match Ty::unify(lp.result_ty, rp.result_ty) {
-                    Some(t) => t,
-                    None => err!(TypeMismatch),
-                };
+                let want = Ty::unify_or_mismatch(lp.result_ty, rp.result_ty)?;
                 left_keys.push(cast_program(lp, want)?);
                 right_keys.push(cast_program(rp, want)?);
             }
@@ -1956,10 +1944,7 @@ fn build_semijoin(
             let rscope = Scope::from_fields(plan.root.schema().to_vec());
             let rp = column_program(&rscope, 0)?;
             // キーはバイト列に符号化して突き合わせるので、物理型を揃える。
-            let want = match Ty::unify(lp.result_ty, rf.ty) {
-                Some(t) => t,
-                None => err!(TypeMismatch),
-            };
+            let want = Ty::unify_or_mismatch(lp.result_ty, rf.ty)?;
             let mut left_keys = vec![cast_program(lp, want)?];
             let mut right_keys = vec![cast_program(rp, want)?];
             let (corr_left, corr_right) = correlation_keys(arena, scope, params, &plan)?;
@@ -2020,10 +2005,7 @@ fn correlation_keys(
     for (i, &outer_e) in plan.correlated.iter().enumerate() {
         let lp = compile(arena, outer_scope, params, outer_e)?;
         let rp = column_program(&rscope, base + i)?;
-        let want = match Ty::unify(lp.result_ty, rp.result_ty) {
-            Some(t) => t,
-            None => err!(TypeMismatch),
-        };
+        let want = Ty::unify_or_mismatch(lp.result_ty, rp.result_ty)?;
         left_keys.push(cast_program(lp, want)?);
         right_keys.push(cast_program(rp, want)?);
     }
@@ -2197,9 +2179,7 @@ fn unify_key_types(l: Program, r: Program) -> Result<(Program, Program)> {
     if l.result_ty == r.result_ty {
         return Ok((l, r));
     }
-    let Some(t) = Ty::unify(l.result_ty, r.result_ty) else {
-        err!(TypeMismatch);
-    };
+    let t = Ty::unify_or_mismatch(l.result_ty, r.result_ty)?;
     Ok((cast_program(l, t)?, cast_program(r, t)?))
 }
 
@@ -2351,39 +2331,11 @@ fn drop_trailing_columns(node: Node, k: usize) -> Result<Node> {
 
 /// 2 つの `Program` のレジスタ・定数・キャスト表を 1 本に併合し、
 /// `Coalesce(a.result, b.result)` を末尾に足す。`and_programs`（`compile.rs`）
-/// と同じ併合規則だが、末尾の合成演算子だけが違う。
+/// と同じ併合規則（`compile::merge_program_bodies` を共有）だが、末尾の
+/// 合成演算子だけが違う。
 fn coalesce_programs(mut a: Program, b: Program) -> Program {
-    let base = a.num_regs;
-    let kbase = a.consts.len() as u16;
-    let cbase = a.casts.len() as u16;
-    a.consts.extend(b.consts.iter().cloned());
-    a.casts.extend(b.casts.iter().copied());
-    for i in &b.instrs {
-        let mut i2 = *i;
-        i2.dst += base;
-        match i2.op {
-            OpCode::LoadCol => {}
-            OpCode::LoadConst => i2.aux += kbase,
-            OpCode::Cast | OpCode::TryCast => {
-                i2.a += base;
-                i2.aux += cbase;
-            }
-            OpCode::Select => {
-                i2.a += base;
-                i2.b += base;
-                i2.aux += base;
-            }
-            _ => {
-                i2.a += base;
-                i2.b += base;
-            }
-        }
-        a.instrs.push(i2);
-    }
-    a.num_regs = base + b.num_regs;
-    let ra = a.result;
-    let rb = b.result + base;
     let ty = a.result_ty;
+    let (ra, rb) = crate::plan::compile::merge_program_bodies(&mut a, b);
     let dst = a.alloc_reg();
     a.push(Instr::new(OpCode::Coalesce, ty.phys(), dst, ra, rb));
     a.result = dst;
@@ -3564,10 +3516,6 @@ pub fn desugar_unpivot(
 
     Ok(QueryStmt { ctes: Vec::new(), body, order_by, limit, offset })
 }
-
-// 統計の枝刈り判定はフォーマット層にある。既存の呼び出し元のために再エクスポート。
-pub use crate::format::parquet::stat_value;
-pub use crate::format::range_may_match;
 
 #[cfg(test)]
 mod tests {

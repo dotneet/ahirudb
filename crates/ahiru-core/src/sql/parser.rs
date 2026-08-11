@@ -116,11 +116,64 @@ impl<'a> Parser<'a> {
         matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), word))
     }
 
+    /// カレントトークンが単一引用符の文字列リテラルであることを期待して
+    /// 読み進める。`COPY ... TO '<path>'` / `parquet('<path>')` のパス引数
+    /// など、"次は必ず文字列リテラル" という位置で使う。
+    fn string_lit(&mut self) -> Result<String> {
+        let s = match self.cur {
+            Tok::Str(s) => unquote(s, b'\''),
+            _ => err!(UnexpectedToken, self.pos),
+        };
+        self.bump()?;
+        Ok(s)
+    }
+
+    /// 演算子・糖衣構文をプレーンな関数呼び出しノードに desugar する。
+    /// `GLOB`/`->`/`->>`/`SIMILAR TO`/配列リテラル/`EXTRACT` が使う
+    /// `DISTINCT`/`*`/`FILTER` を持たない単純呼び出しの共通形。
+    fn simple_call(&mut self, name: &str, args: Vec<ExprId>) -> ExprId {
+        self.arena.push(Expr::Function {
+            name: name.into(),
+            args,
+            distinct: false,
+            star: false,
+            filter: None,
+        })
+    }
+
+    /// `AS name(col)` 形の単一列エイリアスを読む。`generate_series`/`range`/
+    /// `UNNEST` の FROM 項目に共通する「列名リストは 1 個だけ」という形。
+    fn opt_single_col_alias(&mut self) -> Result<Option<String>> {
+        if self.is(Tok::LParen) {
+            self.bump()?;
+            let col = self.ident()?;
+            self.expect(Tok::RParen)?;
+            Ok(Some(col))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 2 トークン目が文脈依存キーワードに一致するか（`GROUPING SETS` の
     /// `SETS` 判定用。`is_soft_kw` の 2 トークン先読み版）。
     #[inline]
     fn peek_is_soft_kw(&self, word: &[u8]) -> Result<bool> {
         Ok(matches!(self.peek()?, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), word)))
+    }
+
+    /// `peek_is_soft_kw(b"to")` の `to`-対応版。`SIMILAR TO` の 2 トークン目
+    /// 先読みに使う。`to` は `ddl` フィーチャが有効なとき `DDL_KEYWORDS`
+    /// （`ALTER TABLE ... RENAME TO` 用）により `Tok::Kw(Kw::To)` として来る
+    /// ため、`peek_is_soft_kw` だけでは（`Tok::Ident` しか見ないので）
+    /// `ddl` 有効ビルドで `SIMILAR TO` を誤って認識し損ねる
+    /// （`expect_to` の doc コメント参照、同じ二重表現の問題）。
+    #[inline]
+    fn peek_is_to(&self) -> Result<bool> {
+        #[cfg(feature = "ddl")]
+        if matches!(self.peek()?, Tok::Kw(Kw::To)) {
+            return Ok(true);
+        }
+        self.peek_is_soft_kw(b"to")
     }
 
     fn eat(&mut self, t: Tok<'a>) -> Result<bool> {
@@ -546,11 +599,7 @@ impl<'a> Parser<'a> {
             })
         };
         self.expect_to()?;
-        let path = match self.cur {
-            Tok::Str(s) => unquote(s, b'\''),
-            _ => err!(UnexpectedToken, self.pos),
-        };
-        self.bump()?;
+        let path = self.string_lit()?;
         let format = if self.eat(Tok::LParen)? {
             ensure!(self.is_soft_kw(b"format"), UnexpectedToken, self.pos);
             self.bump()?;
@@ -603,19 +652,7 @@ impl<'a> Parser<'a> {
         };
         let (body, bare) = self.set_expr()?;
 
-        let mut order_by = Vec::new();
-        if self.eat_kw(Kw::Order)? {
-            self.expect_kw(Kw::By)?;
-            loop {
-                let it = self.order_item()?;
-                order_by.push(it);
-                if !self.eat(Tok::Comma)? {
-                    break;
-                }
-            }
-        }
-        let limit = if self.eat_kw(Kw::Limit)? { Some(self.uint()?) } else { None };
-        let offset = if self.eat_kw(Kw::Offset)? { Some(self.uint()?) } else { None };
+        let (order_by, limit, offset) = self.order_limit_offset_tail()?;
 
         let mut q = QueryStmt { ctes, body, order_by: Vec::new(), limit: None, offset: None };
         // 末尾の ORDER BY / LIMIT / OFFSET の置き場所は 1 つの規則で決める:
@@ -1114,19 +1151,18 @@ impl<'a> Parser<'a> {
             return Ok(FromItem::Subquery { query: Box::new(query), alias });
         }
         let pos = self.pos;
-        let is_parquet = matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"parquet"));
+        let is_parquet = self.is_soft_kw(b"parquet");
         // `UNNEST` も `parquet(...)` と同じ「非予約語だが `(` が続けば特殊構文」
         // という扱い。予約語化すると同名の列参照を壊す事故が過去にあった
         // （`ROWS`/`RANGE`/`QUALIFY`/`RECURSIVE`）ので踏襲する。
-        let is_unnest = matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"unnest"));
+        let is_unnest = self.is_soft_kw(b"unnest");
         // `RANGE` はウィンドウ枠（`OVER (... RANGE BETWEEN ...)`）でも文脈依存
         // キーワードとして使われるが、そちらは `parse_window` の別の構文位置
         // （`ORDER BY` の直後）でしか見ないので、ここでテーブル関数として
         // 扱っても衝突しない（`is_soft_kw` の呼び出し元がそれぞれ独立している
         // ことを確認済み）。
-        let is_generate_series =
-            matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"generate_series"));
-        let is_range = matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"range"));
+        let is_generate_series = self.is_soft_kw(b"generate_series");
+        let is_range = self.is_soft_kw(b"range");
         let name = self.ident()?;
         if self.is(Tok::LParen) {
             if is_generate_series || is_range {
@@ -1148,15 +1184,7 @@ impl<'a> Parser<'a> {
                     _ => (args[0], args[1], args[2]),
                 };
                 let alias = self.opt_alias()?;
-                // `AS t(x)`。列名リストは 1 個だけ（`UNNEST` と同じ形）。
-                let column_alias = if self.is(Tok::LParen) {
-                    self.bump()?;
-                    let col = self.ident()?;
-                    self.expect(Tok::RParen)?;
-                    Some(col)
-                } else {
-                    None
-                };
+                let column_alias = self.opt_single_col_alias()?;
                 return Ok(FromItem::GenerateSeries {
                     start,
                     stop,
@@ -1171,26 +1199,15 @@ impl<'a> Parser<'a> {
                 let expr = self.expr()?;
                 self.expect(Tok::RParen)?;
                 let alias = self.opt_alias()?;
-                // `AS x(col)`。列名リストは 1 個だけ（`UNNEST` は常に 1 列を
-                // 生む。複数列を返す DuckDB の `UNNEST(struct)` 展開は未対応）。
-                let column_alias = if self.is(Tok::LParen) {
-                    self.bump()?;
-                    let col = self.ident()?;
-                    self.expect(Tok::RParen)?;
-                    Some(col)
-                } else {
-                    None
-                };
+                // `UNNEST` は常に 1 列を生む。複数列を返す DuckDB の
+                // `UNNEST(struct)` 展開は未対応。
+                let column_alias = self.opt_single_col_alias()?;
                 return Ok(FromItem::Unnest { expr, alias, column_alias });
             }
             // テーブル関数は parquet('...') だけ。ほかは v1 の範囲外。
             ensure!(is_parquet, UnsupportedFeature, pos);
             self.bump()?;
-            let path = match self.cur {
-                Tok::Str(s) => unquote(s, b'\''),
-                _ => err!(UnexpectedToken, self.pos),
-            };
-            self.bump()?;
+            let path = self.string_lit()?;
             self.expect(Tok::RParen)?;
             let alias = self.opt_alias()?;
             return Ok(FromItem::Parquet { path, alias });
@@ -1489,18 +1506,12 @@ impl<'a> Parser<'a> {
                 }
                 self.bump()?; // glob
                 let pattern = self.expr_bp(BP_CONCAT)?;
-                lhs = self.arena.push(Expr::Function {
-                    name: "glob".into(),
-                    args: vec![lhs, pattern],
-                    distinct: false,
-                    star: false,
-                    filter: None,
-                });
+                lhs = self.simple_call("glob", vec![lhs, pattern]);
                 continue;
             }
             // `SIMILAR TO` は `LIKE` 同様 `[NOT]` を前置できるので、`predicate()`
             // 側（`Tok::Kw(Kw::Not)` 分岐）にも同じ判定を足してある。
-            if self.is_soft_kw(b"similar") && self.peek_is_soft_kw(b"to")? {
+            if self.is_soft_kw(b"similar") && self.peek_is_to()? {
                 if BP_CMP < min_bp {
                     break;
                 }
@@ -1536,13 +1547,7 @@ impl<'a> Parser<'a> {
                     self.bump()?;
                     let rhs = self.expr_bp(BP_CONCAT + 1)?;
                     let name = if is_text { "json_extract_string" } else { "json_extract" };
-                    lhs = self.arena.push(Expr::Function {
-                        name: name.into(),
-                        args: vec![lhs, rhs],
-                        distinct: false,
-                        star: false,
-                        filter: None,
-                    });
+                    lhs = self.simple_call(name, vec![lhs, rhs]);
                     continue;
                 }
                 // 述語（IS NULL / IN / BETWEEN / LIKE / ILIKE）は比較と同じ強さの後置。
@@ -1604,7 +1609,7 @@ impl<'a> Parser<'a> {
         let negated = self.eat_kw(Kw::Not)?;
         // `SIMILAR` は予約語ではない（`expr_body` 冒頭のコメント参照）ので、
         // 通常の `match self.cur` には乗せられない。ここだけ先に判定する。
-        if self.is_soft_kw(b"similar") && self.peek_is_soft_kw(b"to")? {
+        if self.is_soft_kw(b"similar") && self.peek_is_to()? {
             return self.similar_to(arg, negated);
         }
         let node = match self.cur {
@@ -1693,13 +1698,7 @@ impl<'a> Parser<'a> {
         self.bump()?; // to
         let pattern = self.expr_bp(BP_CONCAT)?;
         ensure!(!self.is(Tok::Kw(Kw::Escape)), UnsupportedFeature, self.pos);
-        let call = self.arena.push(Expr::Function {
-            name: "regexp_full_match".into(),
-            args: vec![arg, pattern],
-            distinct: false,
-            star: false,
-            filter: None,
-        });
+        let call = self.simple_call("regexp_full_match", vec![arg, pattern]);
         if negated {
             Ok(self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: call }))
         } else {
@@ -1796,13 +1795,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RBracket)?;
-        Ok(self.arena.push(Expr::Function {
-            name: "list_value".into(),
-            args,
-            distinct: false,
-            star: false,
-            filter: None,
-        }))
+        Ok(self.simple_call("list_value", args))
     }
 
     /// `INTERVAL '<n> <unit> ...'` / `INTERVAL '<n>' <unit>` /
@@ -1940,13 +1933,7 @@ impl<'a> Parser<'a> {
                         self.arena.push(Expr::Literal(Value::Bytes(part.as_bytes().to_vec())));
                     let ts = self.expr()?;
                     self.expect(Tok::RParen)?;
-                    return Ok(self.arena.push(Expr::Function {
-                        name: String::from("date_part"),
-                        args: vec![part_lit, ts],
-                        distinct: false,
-                        star: false,
-                        filter: None,
-                    }));
+                    return Ok(self.simple_call("date_part", vec![part_lit, ts]));
                 }
             }
         }

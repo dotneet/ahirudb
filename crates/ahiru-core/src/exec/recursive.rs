@@ -66,8 +66,6 @@ const MAX_WORKING_BYTES: usize = 256 << 20;
 /// `UNION`（重複排除）の既出キー集合が使ってよいおおよそのバイト数の上限。
 /// `exec::setop::SetOp`/`exec::mod::DistinctOn` と同じ水準。
 const MAX_SEEN_BYTES: usize = 64 << 20;
-/// エントリ 1 件あたりの `HashIndex` 側のおおよその固定費。
-const SEEN_OVERHEAD: usize = 32;
 
 enum Phase {
     /// アンカーを読んでいる。
@@ -140,7 +138,7 @@ impl RecursiveCte {
                     }
                 }
                 self.keybuf = keybuf;
-                ensure!(seen.key_bytes() + seen.len() * SEEN_OVERHEAD <= MAX_SEEN_BYTES, Oom);
+                ensure!(seen.approx_bytes() <= MAX_SEEN_BYTES, Oom);
                 if sel.is_empty() {
                     return Ok(None);
                 }

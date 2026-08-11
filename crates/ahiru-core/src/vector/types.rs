@@ -177,6 +177,18 @@ impl Ty {
         }
     }
 
+    /// `unify` の結果を `Result` にした版。決められない組み合わせは
+    /// `TypeMismatch` エラーにする。`plan::bind`/`plan::compile` の
+    /// 「型が合わなければ即エラー」という大半の呼び出し site が使う形。
+    /// （`Ty::Json` のように「合わなければ既定型に落とす」特殊な呼び出し site
+    /// はこれを使わず `unify` を直接呼ぶ。）
+    pub fn unify_or_mismatch(a: Ty, b: Ty) -> Result<Ty> {
+        match Ty::unify(a, b) {
+            Some(t) => Ok(t),
+            None => err!(TypeMismatch),
+        }
+    }
+
     /// 二項演算の共通型を決める。決められない組み合わせは `None`。
     pub fn unify(a: Ty, b: Ty) -> Option<Ty> {
         use Ty::*;

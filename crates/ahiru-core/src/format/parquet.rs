@@ -4,7 +4,9 @@
 //! 内側で完結する。実行エンジンからは「統計を持つ分割」に見えるだけ。
 
 use crate::catalog::Source;
-use crate::format::{range_may_match, CodecTask, PruneOp, Pruner, ResolveStep, TableFormat};
+use crate::format::{
+    get_or_internal, range_may_match, CodecTask, PruneOp, Pruner, ResolveStep, TableFormat,
+};
 use crate::parquet::bloom::BloomFilter;
 use crate::parquet::file::{footer_probe_range, parse_footer, ParquetFile};
 use crate::parquet::meta::{
@@ -342,10 +344,9 @@ impl TableFormat for ParquetFormat {
         Ok(())
     }
 
-    /// 論理列 `col` の全物理列チャンクぶん、ホスト委譲が要るページを集めて
-    /// `out` に積む。入れ子列の物理リーフは REPEATED を含みうるので、
-    /// `num_rows` 到達ではなくバッファを使い切ることを終了条件にする
-    /// （`collect_codec_pages_all`）。フラット列は従来どおり行数駆動。
+    /// RowGroup 統計 (min_value/max_value) だけで `pruners` を評価する。
+    /// 統計が無い・型が分からない等、判断できない場合はその pruner を
+    /// スキップする（安全側 = 「絞り込めない」扱い）。
     fn may_match(&self, split: usize, pruners: &[Pruner], projection: &[usize]) -> bool {
         for p in pruners {
             let Some(&col) = projection.get(p.column) else { continue };
@@ -630,11 +631,7 @@ impl TableFormat for ParquetFormat {
             }
             let meta = self.chunk(split, c)?;
             let (start, end) = meta.byte_range();
-            let buf = match src.get(start, (end - start) as usize) {
-                Some(b) => b,
-                // split_ranges が示した範囲は呼び出し側が揃えている約束。
-                None => err!(Internal),
-            };
+            let buf = get_or_internal(src, start, end)?;
             // 展開済みページのキャッシュは `Source` が持つ。内蔵コーデックの
             // ファイルでは一度も引かれない。
             cols.push(read_column_chunk(desc, meta, buf, start, nrows, src)?);
@@ -647,14 +644,6 @@ impl TableFormat for ParquetFormat {
 fn push_codec_tasks(pages: &[CodecPage], out: &mut Vec<CodecTask>) {
     for p in pages {
         out.push(CodecTask { codec: p.codec, offset: p.offset, len: p.len, out_len: p.out_len });
-    }
-}
-
-fn get_or_internal(src: &Source, start: u64, end: u64) -> Result<&[u8]> {
-    match src.get(start, (end - start) as usize) {
-        Some(b) => Ok(b),
-        // split_ranges/index_ranges が示した範囲は呼び出し側が揃えている約束。
-        None => err!(Internal),
     }
 }
 

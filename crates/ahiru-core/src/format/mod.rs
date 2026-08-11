@@ -230,6 +230,18 @@ pub trait TableFormat {
     fn read_split(&self, src: &Source, split: usize, projection: &[usize]) -> Result<Vec<Vector>>;
 }
 
+/// `[start, end)` を `src` から取り出す。呼び出し側（`split_ranges`/
+/// `index_ranges` が示した範囲）は既に `src` に揃っている契約なので、無い
+/// 場合は呼び出し側の契約違反として `Internal` にする（I/O 待ちにはしない）。
+///
+/// 全フォーマットの `read_split`/`codec_tasks` が共通で使う小さなヘルパー。
+pub(crate) fn get_or_internal(src: &Source, start: u64, end: u64) -> Result<&[u8]> {
+    match src.get(start, (end - start) as usize) {
+        Some(b) => Ok(b),
+        None => err!(Internal),
+    }
+}
+
 /// 対応フォーマット。
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]

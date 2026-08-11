@@ -198,11 +198,19 @@ fn interval_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<IntervalOp> {
 /// `WHERE a AND b` は AST の段階で 1 本にまとめてコンパイルできるが、
 /// 述語を分解して一部だけ押し下げたあとに残りを束ね直す場面では、
 /// 既にコンパイル済みのプログラム同士をつなぐ必要がある。
-pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
+/// `lhs`/`rhs` の 2 本の `Program` を 1 本に併合する共通処理。
+///
+/// レジスタ・定数・キャストテーブルの番号を `rhs` 側だけ `lhs` の末尾に
+/// ずらして (`base`/`kbase`/`cbase`)、`rhs.instrs` を `lhs.instrs` に追記する。
+/// 呼び出し側は返った `(結果レジスタ番号, リベース後の rhs 結果レジスタ番号)`
+/// を使って、末尾に自分の演算（`And`/`Coalesce`/...）を 1 命令足すだけでよい。
+///
+/// `lhs.num_regs` はここで `rhs` ぶん増やしてあるので、呼び出し側は
+/// そのまま `lhs.alloc_reg()` を呼んでよい。
+pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg) {
     let base = lhs.num_regs;
     let kbase = lhs.consts.len() as u16;
     let cbase = lhs.casts.len() as u16;
-    ensure!(base as usize + rhs.num_regs as usize <= u16::MAX as usize, LimitExceeded);
 
     lhs.consts.extend(rhs.consts.iter().cloned());
     lhs.casts.extend(rhs.casts.iter().copied());
@@ -231,8 +239,12 @@ pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
         lhs.instrs.push(i2);
     }
     lhs.num_regs = base + rhs.num_regs;
-    let a = lhs.result;
-    let b = rhs.result + base;
+    (lhs.result, rhs.result + base)
+}
+
+pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
+    ensure!(lhs.num_regs as usize + rhs.num_regs as usize <= u16::MAX as usize, LimitExceeded);
+    let (a, b) = merge_program_bodies(&mut lhs, rhs);
     let dst = lhs.alloc_reg();
     lhs.push(Instr::new(OpCode::And, crate::vector::PhysType::Bool, dst, a, b));
     lhs.result = dst;
@@ -370,6 +382,20 @@ impl<'a> Compiler<'a> {
 
     /// `from` 型のレジスタを `to` 型へ揃える。
     fn coerce(&mut self, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
+        self.coerce_with(OpCode::Cast, reg, from, to)
+    }
+
+    /// `TRY_CAST` 用。`coerce` と同じ命令列を組むが `Cast` の代わりに
+    /// `TryCast` を発行する。変換できない組み合わせは実行時にエラーではなく
+    /// 全行 NULL になる（`expr::vm::exec` 参照）。行単位の変換失敗
+    /// （範囲外・パース不能）はどちらの命令でも元々その行だけ NULL になる
+    /// （`kernels::cast` の契約）ので、ここで違いを付ける必要はない。
+    fn try_coerce(&mut self, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
+        self.coerce_with(OpCode::TryCast, reg, from, to)
+    }
+
+    /// `coerce`/`try_coerce` の共通実装。`op` は `Cast`/`TryCast` のどちらか。
+    fn coerce_with(&mut self, op: OpCode, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
         if from == to {
             return Ok(reg);
         }
@@ -380,25 +406,7 @@ impl<'a> Compiler<'a> {
         }
         let aux = self.prog.add_cast(from, to);
         let dst = self.prog.alloc_reg();
-        self.prog.push(Instr::with_aux(OpCode::Cast, from.phys(), dst, reg, 0, aux));
-        Ok(dst)
-    }
-
-    /// `TRY_CAST` 用。`coerce` と同じ命令列を組むが `Cast` の代わりに
-    /// `TryCast` を発行する。変換できない組み合わせは実行時にエラーではなく
-    /// 全行 NULL になる（`expr::vm::exec` 参照）。行単位の変換失敗
-    /// （範囲外・パース不能）はどちらの命令でも元々その行だけ NULL になる
-    /// （`kernels::cast` の契約）ので、ここで違いを付ける必要はない。
-    fn try_coerce(&mut self, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
-        if from == to {
-            return Ok(reg);
-        }
-        if from == Ty::Null {
-            return Ok(self.konst(to, Value::Null));
-        }
-        let aux = self.prog.add_cast(from, to);
-        let dst = self.prog.alloc_reg();
-        self.prog.push(Instr::with_aux(OpCode::TryCast, from.phys(), dst, reg, 0, aux));
+        self.prog.push(Instr::with_aux(op, from.phys(), dst, reg, 0, aux));
         Ok(dst)
     }
 
@@ -413,10 +421,7 @@ impl<'a> Compiler<'a> {
 
     /// 二項演算の両辺を共通型に揃える。
     fn unify_operands(&mut self, lr: Reg, lt: Ty, rr: Reg, rt: Ty) -> Result<(Reg, Reg, Ty)> {
-        let t = match Ty::unify(lt, rt) {
-            Some(t) => t,
-            None => err!(TypeMismatch),
-        };
+        let t = Ty::unify_or_mismatch(lt, rt)?;
         let l = self.coerce(lr, lt, t)?;
         let r = self.coerce(rr, rt, t)?;
         Ok((l, r, t))
@@ -900,10 +905,7 @@ impl<'a> Compiler<'a> {
                 }
             };
             let (vr, vt) = self.expr(v)?;
-            result_ty = match Ty::unify(result_ty, vt) {
-                Some(t) => t,
-                None => err!(TypeMismatch),
-            };
+            result_ty = Ty::unify_or_mismatch(result_ty, vt)?;
             conds.push(cond);
             vals.push((vr, vt));
         }
@@ -911,10 +913,7 @@ impl<'a> Compiler<'a> {
         let else_reg = match else_ {
             Some(e) => {
                 let (er, et) = self.expr(e)?;
-                result_ty = match Ty::unify(result_ty, et) {
-                    Some(t) => t,
-                    None => err!(TypeMismatch),
-                };
+                result_ty = Ty::unify_or_mismatch(result_ty, et)?;
                 Some((er, et))
             }
             None => None,

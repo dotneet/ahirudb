@@ -11,7 +11,7 @@
 //! その 1 セルを NULL にする方が実用上ましだから。
 
 use crate::catalog::Source;
-use crate::format::{ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
+use crate::format::{get_or_internal, ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
@@ -237,11 +237,7 @@ impl TableFormat for CsvFormat {
     fn read_split(&self, src: &Source, split: usize, projection: &[usize]) -> Result<Vec<Vector>> {
         ensure!(self.resolved, Internal);
         let (own_start, own_end, fetch_start, fetch_end) = self.chunk(split)?;
-        let buf = match src.get(fetch_start, (fetch_end - fetch_start) as usize) {
-            Some(b) => b,
-            // split_ranges が示した範囲は呼び出し側が揃えている約束。
-            None => err!(Internal),
-        };
+        let buf = get_or_internal(src, fetch_start, fetch_end)?;
         let ncols = self.schema.len();
 
         // 射影に同じ列が 2 度現れても長さの揃った列を返せるよう、まず重複を

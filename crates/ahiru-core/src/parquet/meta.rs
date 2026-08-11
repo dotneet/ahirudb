@@ -131,7 +131,7 @@ impl ColumnMetaData {
 
 /// `bloom_filter_length` が無い場合に投機取得するバイト数。ヘッダ（数十バイト）
 /// + ビットセット本体を 1 往復で取れるよう、実運用のフィルタサイズより
-/// 十分大きく取ってある。
+///   十分大きく取ってある。
 pub const BLOOM_FILTER_PROBE: u64 = 128 * 1024;
 
 impl ColumnChunk {
@@ -701,42 +701,11 @@ pub fn decode_offset_index(buf: &[u8]) -> Result<OffsetIndex> {
     Ok(oi)
 }
 
-/// `BloomFilterAlgorithm` union。`BLOCK`（フィールド 1、空 struct）だけ対応。
-fn decode_bloom_algorithm(t: &mut Thrift) -> Result<bool> {
-    let mut ok = false;
-    t.enter()?;
-    while let Some((ft, id)) = t.read_field_begin()? {
-        match id {
-            1 => {
-                t.skip(ft)?;
-                ok = true;
-            }
-            _ => t.skip(ft)?,
-        }
-    }
-    t.leave();
-    Ok(ok)
-}
-
-/// `BloomFilterHash` union。`XXHASH`（フィールド 1）だけ対応。
-fn decode_bloom_hash(t: &mut Thrift) -> Result<bool> {
-    let mut ok = false;
-    t.enter()?;
-    while let Some((ft, id)) = t.read_field_begin()? {
-        match id {
-            1 => {
-                t.skip(ft)?;
-                ok = true;
-            }
-            _ => t.skip(ft)?,
-        }
-    }
-    t.leave();
-    Ok(ok)
-}
-
-/// `BloomFilterCompression` union。`UNCOMPRESSED`（フィールド 1）だけ対応。
-fn decode_bloom_compression(t: &mut Thrift) -> Result<bool> {
+/// A Thrift union that only recognizes its field-1 variant (used by
+/// `BloomFilterAlgorithm`/`BLOCK`, `BloomFilterHash`/`XXHASH`, and
+/// `BloomFilterCompression`/`UNCOMPRESSED` — every other variant is
+/// unsupported). Returns whether field 1 was present.
+fn decode_single_variant_union(t: &mut Thrift) -> Result<bool> {
     let mut ok = false;
     t.enter()?;
     while let Some((ft, id)) = t.read_field_begin()? {
@@ -770,9 +739,12 @@ pub fn decode_bloom_filter_header(buf: &[u8]) -> Result<(BloomFilterHeader, usiz
     while let Some((ft, id)) = t.read_field_begin()? {
         match id {
             1 => num_bytes = Some(t.read_i32(ft)?),
-            2 => algo_ok = decode_bloom_algorithm(&mut t)?,
-            3 => hash_ok = decode_bloom_hash(&mut t)?,
-            4 => comp_ok = decode_bloom_compression(&mut t)?,
+            // Field 2: BloomFilterAlgorithm union, BLOCK (variant 1) only.
+            2 => algo_ok = decode_single_variant_union(&mut t)?,
+            // Field 3: BloomFilterHash union, XXHASH (variant 1) only.
+            3 => hash_ok = decode_single_variant_union(&mut t)?,
+            // Field 4: BloomFilterCompression union, UNCOMPRESSED (variant 1) only.
+            4 => comp_ok = decode_single_variant_union(&mut t)?,
             _ => t.skip(ft)?,
         }
     }

@@ -62,6 +62,39 @@ pub fn key_has_null(cols: &[&Vector], row: usize) -> bool {
     cols.iter().any(|c| !c.is_valid(row))
 }
 
+/// 10^scale。`f64::powi` は core に無いので掛け算で作る。
+/// `exec::agg`/`exec::window` の DECIMAL ⇔ f64 変換で共有する。
+pub fn pow10(scale: u8) -> f64 {
+    let mut d = 1.0f64;
+    for _ in 0..scale {
+        d *= 10.0;
+    }
+    d
+}
+
+/// NaN を「すべてより大きい」とみなす全順序。
+///
+/// こうすると MAX は他に値が無いときだけ NaN を返し、MIN は NaN 以外を
+/// 優先する（全部 NaN のグループだけ NaN になる）。`encode_key`/
+/// `canonical_f64` が NaN を 1 グループにまとめるのと矛盾しない。
+/// `exec::agg`/`exec::window` の MIN/MAX 系集約で共有する。
+pub fn ord_f64(a: f64, b: f64) -> core::cmp::Ordering {
+    use core::cmp::Ordering::*;
+    if a < b {
+        Less
+    } else if a > b {
+        Greater
+    } else if a == b {
+        Equal
+    } else {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => Equal,
+            (true, false) => Greater,
+            _ => Less,
+        }
+    }
+}
+
 /// バイト列キー → `u32` 値のオープンアドレッシング表。
 ///
 /// キー本体は 1 本のアリーナに連結して置く。エントリごとに `Vec` を持つと
@@ -106,6 +139,15 @@ impl HashIndex {
     /// 保持しているキーの総バイト数。メモリ上限の判定に使う。
     pub fn key_bytes(&self) -> usize {
         self.keys.len()
+    }
+
+    /// メモリ上限判定用のおおまかな使用バイト数。キー本体（`key_bytes`）に
+    /// エントリ 1 個あたりの固定オーバーヘッド（バケット・ハッシュ・エントリ
+    /// タプル分、32 バイトで概算）を足す。各オペレータの `Oom` 判定が
+    /// 共通で使う見積り式。
+    pub fn approx_bytes(&self) -> usize {
+        const ENTRY_OVERHEAD: usize = 32;
+        self.key_bytes() + self.len() * ENTRY_OVERHEAD
     }
 
     #[inline]

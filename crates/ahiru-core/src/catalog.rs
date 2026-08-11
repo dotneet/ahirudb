@@ -144,6 +144,10 @@ pub struct Table {
     schema: Option<Vec<Field>>,
 }
 
+/// Per-part I/O still needed before `Table::resolve` can finish: `(part index,
+/// offset, len)` triples, one per part still missing bytes.
+type PendingPartReads = Vec<(usize, u64, u64)>;
+
 impl Table {
     /// 全パートのスキーマを解決する。
     ///
@@ -154,7 +158,7 @@ impl Table {
     ///
     /// 全パートが揃った時点でスキーマの互換性を確認し、統一スキーマを 1 度
     /// だけ計算してキャッシュする。
-    pub fn resolve(&mut self) -> Result<core::result::Result<(), Vec<(usize, u64, u64)>>> {
+    pub fn resolve(&mut self) -> Result<core::result::Result<(), PendingPartReads>> {
         let mut need = Vec::new();
         for (i, part) in self.parts.iter_mut().enumerate() {
             match part.format.resolve(&part.source)? {
@@ -285,6 +289,12 @@ pub struct Catalog {
     views: Vec<(String, String)>,
 }
 
+/// 名前の大文字小文字を無視して線形探索する。`index_of`/`mem_index_of`/
+/// `view_index_of` が共有する検索規則（テーブル・ビューを通して同じ）。
+fn find_ci_index<'a>(mut names: impl Iterator<Item = &'a str>, target: &str) -> Option<usize> {
+    names.position(|n| eq_ascii_ci(n.as_bytes(), target.as_bytes()))
+}
+
 impl Catalog {
     pub fn new() -> Self {
         Catalog {
@@ -328,7 +338,7 @@ impl Catalog {
     }
 
     pub fn index_of(&self, name: &str) -> Option<usize> {
-        self.tables.iter().position(|t| eq_ascii_ci(t.name.as_bytes(), name.as_bytes()))
+        find_ci_index(self.tables.iter().map(|t| t.name.as_str()), name)
     }
 
     pub fn get(&self, i: usize) -> Option<&Table> {
@@ -355,7 +365,7 @@ impl Catalog {
 
     #[cfg(feature = "ddl")]
     pub fn mem_index_of(&self, name: &str) -> Option<usize> {
-        self.mem.iter().position(|t| eq_ascii_ci(t.name.as_bytes(), name.as_bytes()))
+        find_ci_index(self.mem.iter().map(|t| t.name.as_str()), name)
     }
 
     #[cfg(feature = "ddl")]
@@ -414,8 +424,8 @@ impl Catalog {
 
     /// 名前が書き込み可能なインメモリ表を指しているか確認し、添字を返す。
     /// ファイルテーブル（読み取り専用）なら `ReadOnlyTable`、どちらにも
-    /// 無ければ `TableNotFound`。`dml::mem_index_writable`（INSERT/UPDATE/
-    /// DELETE）と同じ規則を `ALTER TABLE` からも使う。
+    /// 無ければ `TableNotFound`。`dml::insert`/`update`/`delete` と
+    /// `ALTER TABLE` の両方がこの規則を共有する。
     #[cfg(feature = "ddl")]
     pub fn mem_index_writable(&self, name: &str) -> Result<usize> {
         if let Some(i) = self.mem_index_of(name) {
@@ -511,7 +521,7 @@ impl Catalog {
 
     #[cfg(feature = "ddl")]
     pub fn view_index_of(&self, name: &str) -> Option<usize> {
-        self.views.iter().position(|(n, _)| eq_ascii_ci(n.as_bytes(), name.as_bytes()))
+        find_ci_index(self.views.iter().map(|(n, _)| n.as_str()), name)
     }
 
     /// ビュー本体（`SELECT ...` の生テキスト）。

@@ -42,9 +42,6 @@ use crate::vector::{Batch, PhysType, Vector};
 /// これで足りない入力は集約でも通らない。
 const MAX_STATE_BYTES: usize = 64 << 20;
 
-/// エントリ 1 件あたりの `HashIndex` 側のおおよその固定費。
-const INDEX_OVERHEAD: usize = 32;
-
 enum Phase {
     /// INTERSECT / EXCEPT で、右のキー集合を作っている。
     BuildRight,
@@ -108,11 +105,7 @@ impl SetOp {
 
     /// おおよそのメモリ使用量。上限判定にしか使わない。
     fn mem_used(&self) -> usize {
-        self.index.key_bytes()
-            + self.index.len() * INDEX_OVERHEAD
-            + self.counts.len() * 4
-            + self.seen.key_bytes()
-            + self.seen.len() * INDEX_OVERHEAD
+        self.index.approx_bytes() + self.counts.len() * 4 + self.seen.approx_bytes()
     }
 
     /// 列数と物理型が左右で揃っていることを確かめる。

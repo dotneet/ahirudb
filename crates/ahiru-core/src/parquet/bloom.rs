@@ -132,7 +132,7 @@ impl<'a> BloomFilter<'a> {
     /// `bits.len()` が 0 または 32 の倍数でなければ `None`
     /// （呼び出し側は「使わない」で安全側に倒せる）。
     pub fn new(bits: &'a [u8]) -> Option<Self> {
-        if bits.is_empty() || bits.len() % BLOCK_BYTES != 0 {
+        if bits.is_empty() || !bits.len().is_multiple_of(BLOCK_BYTES) {
             return None;
         }
         Some(BloomFilter { bits })

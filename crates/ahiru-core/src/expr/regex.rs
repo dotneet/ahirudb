@@ -56,6 +56,7 @@
 //! `LIKE` は現状パターンを毎行スキャンしているだけなので、これでも既存水準
 //! より悪化はしない。
 
+use crate::expr::funcs;
 use crate::prelude::*;
 use crate::vector::{Bitmap, BytesData, Data, Ty, Vector};
 
@@ -871,52 +872,6 @@ pub fn is_match(prog: &Program, input: &[u8]) -> Result<bool> {
 // SQL 関数本体（Vector 単位）
 // ============================================================================
 
-/// 行数と各引数の stride。`funcs.rs::strides` と同じ規則（長さ 1 は定数,
-/// それ以外は全部同じ長さでなければならない）だが、他ファイルを触らない
-/// という制約のためここに独立して持つ。
-fn plan(args: &[&Vector]) -> Result<(usize, Vec<usize>)> {
-    ensure!(!args.is_empty(), WrongArgCount);
-    let mut n = 1usize;
-    let mut empty = false;
-    for a in args {
-        let l = a.len();
-        if l == 0 {
-            empty = true;
-        } else if l > n {
-            n = l;
-        }
-    }
-    if empty {
-        n = 0;
-    }
-    let mut s = Vec::with_capacity(args.len());
-    for a in args {
-        s.push(if a.len() == n {
-            1
-        } else if a.len() == 1 {
-            0
-        } else {
-            err!(Internal)
-        });
-    }
-    Ok((n, s))
-}
-
-fn combine(args: &[&Vector], s: &[usize], n: usize) -> Option<Bitmap> {
-    if !args.iter().any(|a| a.has_nulls()) {
-        return None;
-    }
-    let mut m = Bitmap::with_capacity(n);
-    for i in 0..n {
-        let mut ok = true;
-        for (k, a) in args.iter().enumerate() {
-            ok &= a.is_valid(i * s[k]);
-        }
-        m.push(ok);
-    }
-    Some(m)
-}
-
 fn geti(v: &Vector, i: usize) -> i64 {
     match v.data() {
         Data::I64(d) => d.get(i).copied().unwrap_or(0),
@@ -928,8 +883,8 @@ fn geti(v: &Vector, i: usize) -> i64 {
 /// `regexp_matches(str, pattern)`。
 pub fn eval_matches(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 2, WrongArgCount);
-    let (n, s) = plan(args)?;
-    let valid = combine(args, &s, n);
+    let (n, s) = funcs::strides(args)?;
+    let valid = funcs::combine(args, &s, n);
     let live = |i: usize| valid.as_ref().is_none_or(|b| b.get(i));
     let (sv, pv) = (args[0], args[1]);
     let pat_const = s[1] == 0;
@@ -965,8 +920,8 @@ pub fn eval_matches(args: &[&Vector]) -> Result<Vector> {
 /// group 引数そのものが NULL のときだけ。
 pub fn eval_extract(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 2 || args.len() == 3, WrongArgCount);
-    let (n, s) = plan(args)?;
-    let valid = combine(args, &s, n);
+    let (n, s) = funcs::strides(args)?;
+    let valid = funcs::combine(args, &s, n);
     let live = |i: usize| valid.as_ref().is_none_or(|b| b.get(i));
     let (sv, pv) = (args[0], args[1]);
     let pat_const = s[1] == 0;
@@ -1146,8 +1101,8 @@ fn replace_into(prog: &Program, text: &[u8], repl: &[u8], global: bool, out: &mu
 /// `regexp_replace(str, pattern, replacement[, 'g'])`。
 pub fn eval_replace(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 3 || args.len() == 4, WrongArgCount);
-    let (n, s) = plan(args)?;
-    let valid = combine(args, &s, n);
+    let (n, s) = funcs::strides(args)?;
+    let valid = funcs::combine(args, &s, n);
     let live = |i: usize| valid.as_ref().is_none_or(|b| b.get(i));
     let (sv, pv, rv) = (args[0], args[1], args[2]);
     let pat_const = s[1] == 0;

@@ -85,7 +85,7 @@
 //! 走査は再帰せず、入れ子は `MAX_DEPTH` で打ち切る。
 
 use crate::catalog::Source;
-use crate::format::{ResolveStep, TableFormat};
+use crate::format::{get_or_internal, ResolveStep, TableFormat};
 use crate::prelude::*;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
@@ -186,11 +186,7 @@ impl TableFormat for JsonFormat {
     fn read_split(&self, src: &Source, split: usize, projection: &[usize]) -> Result<Vec<Vector>> {
         ensure!(self.resolved, Internal);
         ensure!(split < self.num_splits(), Internal);
-        let buf = match src.get(0, self.total_len as usize) {
-            Some(b) => b,
-            // split_ranges が示した範囲は呼び出し側が揃えている約束。
-            None => err!(Internal),
-        };
+        let buf = get_or_internal(src, 0, self.total_len)?;
 
         let mut names: Vec<&[u8]> = Vec::with_capacity(projection.len());
         let mut builders: Vec<Builder> = Vec::with_capacity(projection.len());

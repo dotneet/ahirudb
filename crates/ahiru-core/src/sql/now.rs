@@ -45,9 +45,7 @@ fn bare_kind(name: &str) -> Option<Kind> {
 /// ので列名との衝突が起きない分、`bare_kind` より広く受け付けてよい。
 fn call_kind(name: &str) -> Option<Kind> {
     let b = name.as_bytes();
-    if eq_ascii_ci(b, b"current_date") {
-        Some(Kind::Date)
-    } else if eq_ascii_ci(b, b"today") {
+    if eq_ascii_ci(b, b"current_date") || eq_ascii_ci(b, b"today") {
         Some(Kind::Date)
     } else if eq_ascii_ci(b, b"current_timestamp") || eq_ascii_ci(b, b"now") {
         Some(Kind::Timestamp)

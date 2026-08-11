@@ -138,9 +138,9 @@ fn add_column(
 }
 
 /// 単一の式を空スコープ（列参照なし）でコンパイルし、`target_ty` へ
-/// キャストしたうえで 1 行のバッチに対して評価する。`dml::insert` の
-/// `eval_scalar`（`INSERT ... VALUES` の値評価）と同じ手口。
-fn eval_scalar(
+/// キャストしたうえで 1 行のバッチに対して評価する。`dml`（`INSERT ...
+/// VALUES` の値評価、値レベルの型変換）とも共有する。
+pub(crate) fn eval_scalar(
     session: &mut Session,
     arena: &ExprArena,
     expr_id: ExprId,

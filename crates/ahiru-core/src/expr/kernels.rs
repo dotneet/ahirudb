@@ -68,16 +68,6 @@ fn combine_validity(a: &Vector, sa: usize, b: &Vector, sb: usize, n: usize) -> O
     Some(m)
 }
 
-/// 行 `i` を NULL にする。ゼロ除算やキャスト失敗の記録用（遅延確保）。
-fn set_null(m: &mut Option<Bitmap>, i: usize, n: usize) {
-    if m.is_none() {
-        *m = Some(Bitmap::ones(n));
-    }
-    if let Some(b) = m {
-        b.set(i, false);
-    }
-}
-
 /// カーネルが作った追加 NULL を入力由来の validity にマージして仕上げる。
 fn finish(ty: Ty, data: Data, validity: Option<Bitmap>, extra: Option<Bitmap>) -> Vector {
     let v = match (validity, extra) {
@@ -120,7 +110,7 @@ macro_rules! int_arith {
                     // Div / Mod。0 除算と MIN / -1 は結果を NULL にする。
                     _ => {
                         if y == 0 || (y == -1 && x == <$t>::MIN) {
-                            set_null(bad, i, n);
+                            funcs::set_null(bad, i, n);
                             0
                         } else if matches!(op, OpCode::Div) {
                             x.wrapping_div(y)
@@ -516,24 +506,6 @@ fn pow10_f64(k: u8) -> f64 {
     r
 }
 
-fn f_abs(x: f64) -> f64 {
-    if x < 0.0 {
-        -x
-    } else {
-        x
-    }
-}
-
-/// 0 方向への切り捨て。`f64::trunc` は std 専用なので自前で持つ。
-fn f_trunc(x: f64) -> f64 {
-    if f_abs(x) < 9_223_372_036_854_775_808.0 {
-        (x as i64) as f64
-    } else {
-        // 2^63 以上の f64 は既に整数。
-        x
-    }
-}
-
 /// 最近接偶数への丸め（銀行丸め）。`core` に `f64::round_ties_even` は無い。
 ///
 /// 浮動小数 → 整数のキャストは切り捨てではなく丸める。SQL 標準は実装依存と
@@ -542,7 +514,7 @@ fn f_trunc(x: f64) -> f64 {
 /// 0 から遠ざける丸めにすると、正の値ばかりのデータで合計が系統的に
 /// 上振れするので、統計処理では偶数丸めの方が望ましい。
 fn f_round(x: f64) -> f64 {
-    let t = f_trunc(x);
+    let t = funcs::f_trunc(x);
     let frac = x - t;
     if frac > 0.5 {
         return t + 1.0;
@@ -725,7 +697,7 @@ pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
     if x < 0.0 {
         out.push(b'-');
     }
-    let v = f_abs(x);
+    let v = funcs::f_abs(x);
     if v == f64::INFINITY {
         out.extend_from_slice(b"Inf");
         return;
@@ -934,7 +906,7 @@ fn cast_str_to_json(a: &Vector, lenient: bool) -> Result<Vector> {
             out.push(s);
         } else if lenient {
             out.push_empty();
-            set_null(&mut bad, i, n);
+            funcs::set_null(&mut bad, i, n);
         } else {
             err!(InvalidCast);
         }
@@ -1005,7 +977,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     }
                 };
                 if !ok {
-                    set_null(&mut bad, i, n);
+                    funcs::set_null(&mut bad, i, n);
                 }
             }
         }
@@ -1041,7 +1013,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     false
                 };
                 if !ok {
-                    set_null(&mut bad, i, n);
+                    funcs::set_null(&mut bad, i, n);
                 }
             }
         }
@@ -1111,7 +1083,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     }
                     None => {
                         push_default(&mut data);
-                        set_null(&mut bad, i, n);
+                        funcs::set_null(&mut bad, i, n);
                     }
                 }
             }
@@ -1134,7 +1106,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     }
                 };
                 if !ok {
-                    set_null(&mut bad, i, n);
+                    funcs::set_null(&mut bad, i, n);
                 }
             }
         }
@@ -1177,7 +1149,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     };
                 }
                 if !ok {
-                    set_null(&mut bad, i, n);
+                    funcs::set_null(&mut bad, i, n);
                 }
             }
         }
@@ -1211,7 +1183,7 @@ pub fn ts_add_interval(a: &Vector, b: &Vector) -> Result<Vector> {
             Some(v) => out.push(v),
             None => {
                 out.push(0);
-                set_null(&mut bad, i, n);
+                funcs::set_null(&mut bad, i, n);
             }
         }
     }

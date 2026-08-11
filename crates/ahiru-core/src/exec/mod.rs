@@ -428,7 +428,6 @@ impl Operator for Filter {
 /// 再開できる（`Filter` と同じ単純さ）。状態（`seen`）はバッチをまたいで
 /// 保持するが、1 バッチぶんの処理は途中で抜けずに丸ごと終える。
 const MAX_DISTINCT_ON_BYTES: usize = 64 << 20;
-const DISTINCT_ON_OVERHEAD: usize = 32;
 
 pub struct DistinctOn {
     input: Box<dyn Operator>,
@@ -468,8 +467,7 @@ impl Operator for DistinctOn {
                     sel.push(phys);
                 }
             }
-            let used = self.seen.key_bytes() + self.seen.len() * DISTINCT_ON_OVERHEAD;
-            ensure!(used <= MAX_DISTINCT_ON_BYTES, Oom);
+            ensure!(self.seen.approx_bytes() <= MAX_DISTINCT_ON_BYTES, Oom);
             if sel.is_empty() {
                 continue;
             }

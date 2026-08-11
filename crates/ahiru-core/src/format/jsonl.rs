@@ -30,7 +30,7 @@
 //! 起こさない。走査は再帰せず、入れ子は `MAX_DEPTH` で打ち切る。
 
 use crate::catalog::Source;
-use crate::format::{ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
+use crate::format::{get_or_internal, ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
 use crate::json::{byte_at, decode_string, kind_of, scan_string, skip_value, skip_ws, Kind};
 use crate::prelude::*;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
@@ -162,9 +162,7 @@ impl TableFormat for JsonlFormat {
         if !self.resolved || self.total_len == 0 {
             return 0;
         }
-        let q = self.total_len / self.split_bytes;
-        let r = if self.total_len.is_multiple_of(self.split_bytes) { 0 } else { 1 };
-        (q + r) as usize
+        self.total_len.div_ceil(self.split_bytes) as usize
     }
 
     fn split_rows(&self, _split: usize) -> Option<u64> {
@@ -192,11 +190,7 @@ impl TableFormat for JsonlFormat {
         ensure!(split < self.num_splits(), Internal);
         let (chunk_start, chunk_end) = self.chunk(split);
         let read_end = chunk_end.saturating_add(TEXT_MAX_RECORD).min(self.total_len);
-        let buf = match src.get(chunk_start, (read_end - chunk_start) as usize) {
-            Some(b) => b,
-            // split_ranges が示した範囲は呼び出し側が揃えている約束。
-            None => err!(Internal),
-        };
+        let buf = get_or_internal(src, chunk_start, read_end)?;
 
         let mut names: Vec<&[u8]> = Vec::with_capacity(projection.len());
         let mut builders: Vec<Builder> = Vec::with_capacity(projection.len());
