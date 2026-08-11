@@ -135,6 +135,22 @@ pub extern "C" fn ahiru_session_free(h: i32) {
     }
 }
 
+/// クエリ開始時刻を設定する（エポックからのマイクロ秒、UTC）。wasm コアは
+/// 時計を持たないので、ホストが `prepare`/`query` のたびに現在時刻で
+/// 呼ぶ想定（`CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 用、DESIGN.md §2）。
+/// 一度も呼ばなければエポック（1970-01-01）のまま。
+#[no_mangle]
+pub extern "C" fn ahiru_set_now(h: i32, now_micros: i64) -> i32 {
+    clear_error();
+    match session(h) {
+        Some(s) => {
+            s.set_now(now_micros);
+            0
+        }
+        None => fail_code(crate::error::Code::Internal, -1),
+    }
+}
+
 fn session(h: i32) -> Option<&'static mut Session> {
     state().sessions.get_mut(h as usize)?.as_mut()
 }

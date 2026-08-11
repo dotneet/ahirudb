@@ -13,8 +13,9 @@ use crate::sql::ast::InsertSource;
 #[cfg(feature = "ddl")]
 use crate::sql::ast::{AlterTableAction, ColumnDef};
 use crate::sql::ast::{
-    BinaryOp, Cte, Expr, ExprArena, ExprId, FromItem, JoinKind, OrderByItem, Parsed, QueryStmt,
-    SelectItem, SelectStmt, SetExpr, SetOp, Stmt, UnaryOp, WindowFrame,
+    BinaryOp, Cte, Expr, ExprArena, ExprId, FromItem, JoinKind, OrderByItem, Parsed, PivotStmt,
+    QueryStmt, SampleMethod, SampleSpec, SelectItem, SelectStmt, SetExpr, SetOp, Stmt, UnaryOp,
+    UnpivotStmt, WindowDef, WindowFrame,
 };
 use crate::sql::lexer::{Kw, Lexer, Tok};
 use crate::vector::{Ty, Value};
@@ -32,6 +33,9 @@ const MAX_DEPTH: u16 = 64;
 /// 連鎖の長さぶんだけ再帰する。深さ上限とは別枠で、文全体を通した通し数として
 /// 数える（入れ子のクエリごとに上限を与えると積で効いてしまうため）。
 const MAX_LINKS: u16 = 64;
+
+/// `Parser::star_modifiers` の戻り値: `(EXCLUDE する列名, REPLACE する (式, 列名))`。
+type StarModifiers = (Vec<String>, Vec<(ExprId, String)>);
 
 // 結合強度。大きいほど強く結合する。
 const BP_OR: u8 = 1;
@@ -161,9 +165,27 @@ impl<'a> Parser<'a> {
             return Ok(Some(self.ident()?));
         }
         match self.cur {
+            // `AS` 無しの裸の別名は、それが実は `USING SAMPLE`/`TABLESAMPLE`
+            // 節の先頭だった場合に食ってしまうと `opt_sample_clause` へ
+            // 二度と辿り着けない（`FROM t USING SAMPLE 10%` のような、ごく
+            // ふつうに書かれる形が壊れる）。`SAMPLE`/`QUALIFY` と同じ「事故に
+            // なりやすい文脈」なので、この 2 語だけはここで先読みして除外する
+            // （引用すれば `AS "using"` 等で常に別名として使える）。
+            Tok::Ident(s) if self.is_using_sample_or_tablesample(s.as_bytes())? => Ok(None),
             Tok::Ident(_) | Tok::QIdent(_) => Ok(Some(self.ident()?)),
             _ => Ok(None),
         }
+    }
+
+    /// `self.cur` が `USING SAMPLE`/`TABLESAMPLE` 節の先頭かどうか。
+    fn is_using_sample_or_tablesample(&self, word: &[u8]) -> Result<bool> {
+        if eq_ascii_ci(word, b"tablesample") {
+            return Ok(true);
+        }
+        if eq_ascii_ci(word, b"using") {
+            return self.peek_is_soft_kw(b"sample");
+        }
+        Ok(false)
     }
 
     /// 非負整数。LIMIT / OFFSET と DECIMAL の精度指定で使う。
@@ -182,6 +204,26 @@ impl<'a> Parser<'a> {
         }
         self.bump()?;
         Ok(v)
+    }
+
+    /// 符号付き整数リテラル 1 個。`generate_series`/`range` の引数と
+    /// `USING SAMPLE ... (method, seed)` のシードで使う。`prefix()` の単項
+    /// マイナス処理と同じく、負号は数値リテラルへ畳んでから範囲を見る
+    /// （`int_literal` は `i32`/`i64`/`i128` の順で収まる型を返す）。
+    fn signed_int_lit(&mut self) -> Result<i64> {
+        let pos = self.pos;
+        let neg = self.eat(Tok::Minus)?;
+        let text = match self.cur {
+            Tok::Int(s) => s,
+            _ => err!(UnexpectedToken, pos),
+        };
+        let v = int_literal(text, neg, pos)?;
+        self.bump()?;
+        match v {
+            Value::I32(x) => Ok(x as i64),
+            Value::I64(x) => Ok(x),
+            _ => err!(NumberOverflow, pos),
+        }
     }
 
     // --- 文 -----------------------------------------------------------------
@@ -224,6 +266,14 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Delete) => self.delete_stmt()?,
             #[cfg(feature = "export")]
             Tok::Kw(Kw::Copy) => self.copy_stmt()?,
+            // `PIVOT`/`UNPIVOT` は予約語にせず、文の先頭というこの文脈でだけ
+            // キーワード扱いする（`ROWS`/`RANGE`/`QUALIFY` を巡る列名破壊
+            // 事故と同じ理由 — 有効な文は必ずここに列挙したキーワードで
+            // 始まるので、先頭が裸の識別子 "pivot"/"unpivot" になるのは
+            // この 2 構文しかなく、`FROM pivot` のような通常の列/表名としての
+            // 利用は一切妨げない）。
+            _ if self.is_soft_kw(b"pivot") => self.pivot_stmt()?,
+            _ if self.is_soft_kw(b"unpivot") => self.unpivot_stmt()?,
             // v1 は上記のみ。その他の未対応の文はここで一括で弾く。
             _ => err!(UnsupportedFeature, self.pos),
         };
@@ -479,7 +529,11 @@ impl<'a> Parser<'a> {
             // 組み立てて、以降はサブクエリ形と同じ経路（`write::copy`）に
             // 流す（`base_rel` の派生表化と同じ発想）。
             let name = self.ident()?;
-            let star = self.arena.push(Expr::Star { qualifier: None });
+            let star = self.arena.push(Expr::Star {
+                qualifier: None,
+                exclude: Vec::new(),
+                replace: Vec::new(),
+            });
             let mut s = SelectStmt::empty();
             s.items.push(SelectItem { expr: star, alias: None });
             s.from = Some(FromItem::Table { name, alias: None });
@@ -695,7 +749,11 @@ impl<'a> Parser<'a> {
         if q.ctes.is_empty() && q.order_by.is_empty() && q.limit.is_none() && q.offset.is_none() {
             return q.body;
         }
-        let star = self.arena.push(Expr::Star { qualifier: None });
+        let star = self.arena.push(Expr::Star {
+            qualifier: None,
+            exclude: Vec::new(),
+            replace: Vec::new(),
+        });
         let mut s = SelectStmt::empty();
         s.items.push(SelectItem { expr: star, alias: None });
         s.from = Some(FromItem::Subquery { query: Box::new(q), alias: None });
@@ -742,6 +800,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(Kw::From)? {
             st.from = Some(self.parse_from_item()?);
+            st.sample = self.opt_sample_clause()?;
         }
         if self.eat_kw(Kw::Where)? {
             st.filter = Some(self.expr()?);
@@ -776,6 +835,30 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(Kw::Having)? {
             st.having = Some(self.expr()?);
+        }
+        // `WINDOW name AS (...), ...`。`GROUP BY`/`ORDER BY` と同格の句
+        // キーワードとして扱う（`Kw::Window` は通常の予約語。`window` を
+        // 一般語として文脈依存にできない理由は `sql::lexer` のコメント参照）。
+        if self.eat_kw(Kw::Window)? {
+            loop {
+                let wname = self.ident()?;
+                let pos = self.pos;
+                ensure!(
+                    !st.windows.iter().any(|(n, _): &(String, WindowDef)| eq_ascii_ci(
+                        n.as_bytes(),
+                        wname.as_bytes()
+                    )),
+                    SyntaxError,
+                    pos
+                );
+                self.expect_kw(Kw::As)?;
+                self.expect(Tok::LParen)?;
+                let def = self.window_def_body()?;
+                st.windows.push((wname, def));
+                if !self.eat(Tok::Comma)? {
+                    break;
+                }
+            }
         }
         // `QUALIFY` は `OVER`/`PARTITION`/`ROWS`/`RANGE` と違い、実データの
         // 列名になり得る一般語ではない（Teradata/SQL:1999 由来の専用語）ので
@@ -823,11 +906,98 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
+    /// `REPLACE`。`ddl` フィーチャ有効時は `CREATE OR REPLACE` 用にすでに
+    /// グローバル予約語（`Kw::Replace`）になっているため、その形も受け付ける。
+    /// 無効時は `EXCLUDE` と同じく綴りだけで判定する文脈依存キーワード
+    /// （実データに `replace`/`exclude` という列名が現れても壊さないため）。
+    #[inline]
+    fn is_star_replace_kw(&self) -> bool {
+        #[cfg(feature = "ddl")]
+        if self.is(Tok::Kw(Kw::Replace)) {
+            return true;
+        }
+        self.is_soft_kw(b"replace")
+    }
+
+    /// `*`/`t.*` の直後に続きうる `EXCLUDE (col, ...)` / `REPLACE (expr AS
+    /// col, ...)`（DuckDB 拡張）。この 2 語は `ROWS`/`RANGE`/`QUALIFY` と同種の
+    /// 「実データにありふれた列名」なので、`*` の直後というこの文脈でだけ
+    /// キーワードとして読む。順序は EXCLUDE → REPLACE 固定（`duckdb` で
+    /// `REPLACE (...) EXCLUDE (...)` の逆順を試すと構文エラーになることを
+    /// 確認済み）。カンマ区切りの複数指定は括弧必須だが、1 個だけなら括弧を
+    /// 省略できる（`duckdb` の挙動に合わせた）。
+    fn star_modifiers(&mut self) -> Result<StarModifiers> {
+        let mut exclude: Vec<String> = Vec::new();
+        if self.is_soft_kw(b"exclude") {
+            self.bump()?;
+            if self.eat(Tok::LParen)? {
+                loop {
+                    let pos = self.pos;
+                    let name = self.ident()?;
+                    ensure!(
+                        !exclude.iter().any(|e| eq_ascii_ci(e.as_bytes(), name.as_bytes())),
+                        SyntaxError,
+                        pos
+                    );
+                    exclude.push(name);
+                    if !self.eat(Tok::Comma)? {
+                        break;
+                    }
+                }
+                self.expect(Tok::RParen)?;
+            } else {
+                exclude.push(self.ident()?);
+            }
+        }
+        let mut replace: Vec<(ExprId, String)> = Vec::new();
+        if self.is_star_replace_kw() {
+            self.bump()?;
+            if self.eat(Tok::LParen)? {
+                loop {
+                    let e = self.expr()?;
+                    self.expect_kw(Kw::As)?;
+                    let pos = self.pos;
+                    let name = self.ident()?;
+                    ensure!(
+                        !replace.iter().any(|(_, n): &(ExprId, String)| eq_ascii_ci(
+                            n.as_bytes(),
+                            name.as_bytes()
+                        )),
+                        SyntaxError,
+                        pos
+                    );
+                    replace.push((e, name));
+                    if !self.eat(Tok::Comma)? {
+                        break;
+                    }
+                }
+                self.expect(Tok::RParen)?;
+            } else {
+                let e = self.expr()?;
+                self.expect_kw(Kw::As)?;
+                let name = self.ident()?;
+                replace.push((e, name));
+            }
+        }
+        // 同じ列を EXCLUDE と REPLACE の両方に置くのは無意味（`duckdb` も
+        // 拒否する）ので、ここで検出する。
+        let pos = self.pos;
+        for (_, name) in &replace {
+            ensure!(
+                !exclude.iter().any(|e| eq_ascii_ci(e.as_bytes(), name.as_bytes())),
+                SyntaxError,
+                pos
+            );
+        }
+        Ok((exclude, replace))
+    }
+
     fn select_item(&mut self) -> Result<SelectItem> {
         // 先頭の `*` だけは式ではなく列挙として扱う。`t.*` は primary 側。
         if self.is(Tok::Star) {
             self.bump()?;
-            let expr = self.arena.push(Expr::Star { qualifier: None });
+            let (exclude, replace) = self.star_modifiers()?;
+            let expr = self.arena.push(Expr::Star { qualifier: None, exclude, replace });
             return Ok(SelectItem { expr, alias: None });
         }
         let expr = self.expr()?;
@@ -919,8 +1089,53 @@ impl<'a> Parser<'a> {
         // という扱い。予約語化すると同名の列参照を壊す事故が過去にあった
         // （`ROWS`/`RANGE`/`QUALIFY`/`RECURSIVE`）ので踏襲する。
         let is_unnest = matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"unnest"));
+        // `RANGE` はウィンドウ枠（`OVER (... RANGE BETWEEN ...)`）でも文脈依存
+        // キーワードとして使われるが、そちらは `parse_window` の別の構文位置
+        // （`ORDER BY` の直後）でしか見ないので、ここでテーブル関数として
+        // 扱っても衝突しない（`is_soft_kw` の呼び出し元がそれぞれ独立している
+        // ことを確認済み）。
+        let is_generate_series =
+            matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"generate_series"));
+        let is_range = matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"range"));
         let name = self.ident()?;
         if self.is(Tok::LParen) {
+            if is_generate_series || is_range {
+                self.bump()?; // '('
+                let mut args = Vec::with_capacity(3);
+                if !self.is(Tok::RParen) {
+                    args.push(self.signed_int_lit()?);
+                    while self.eat(Tok::Comma)? {
+                        args.push(self.signed_int_lit()?);
+                    }
+                }
+                self.expect(Tok::RParen)?;
+                ensure!(!args.is_empty() && args.len() <= 3, WrongArgCount, pos);
+                // `range` は半開区間・単項なら start=0、`generate_series` は
+                // 閉区間・単項なら stop=args[0]（`duckdb` CLI で確認済み）。
+                let (start, stop, step) = match args.len() {
+                    1 => (0, args[0], 1),
+                    2 => (args[0], args[1], 1),
+                    _ => (args[0], args[1], args[2]),
+                };
+                let alias = self.opt_alias()?;
+                // `AS t(x)`。列名リストは 1 個だけ（`UNNEST` と同じ形）。
+                let column_alias = if self.is(Tok::LParen) {
+                    self.bump()?;
+                    let col = self.ident()?;
+                    self.expect(Tok::RParen)?;
+                    Some(col)
+                } else {
+                    None
+                };
+                return Ok(FromItem::GenerateSeries {
+                    start,
+                    stop,
+                    step,
+                    inclusive: is_generate_series,
+                    alias,
+                    column_alias,
+                });
+            }
             if is_unnest {
                 self.bump()?; // '('
                 let expr = self.expr()?;
@@ -954,6 +1169,247 @@ impl<'a> Parser<'a> {
         Ok(FromItem::Table { name, alias })
     }
 
+    // --- SAMPLE ---------------------------------------------------------------
+    //
+    // `SAMPLE`/`USING`/`TABLESAMPLE`/`BERNOULLI`/`SYSTEM`/`RESERVOIR`/`ROWS`/
+    // `PERCENT` はどれも予約語にしない。`ROWS`/`RANGE`/`QUALIFY` の事故
+    // （ファイル冒頭コメント参照）と同じ理由で、`FROM <item>` の直後という
+    // 決まった位置だけで綴りを見て判定する。`duckdb` CLI で確認したところ
+    // `SAMPLE` 単体（`USING`/`TABLESAMPLE` を伴わない）は文法上どこにも
+    // 現れないので、`SAMPLE` という列名が壊れる心配も無い。
+
+    /// `USING SAMPLE <spec>` / `TABLESAMPLE <spec>`。どちらも無ければ `None`。
+    fn opt_sample_clause(&mut self) -> Result<Option<SampleSpec>> {
+        let has_using = self.is_soft_kw(b"using") && self.peek_is_soft_kw(b"sample")?;
+        let has_tablesample = self.is_soft_kw(b"tablesample");
+        if !has_using && !has_tablesample {
+            return Ok(None);
+        }
+        if has_using {
+            self.bump()?; // using
+            self.bump()?; // sample
+        } else {
+            self.bump()?; // tablesample
+        }
+        Ok(Some(self.sample_body()?))
+    }
+
+    /// `<method>(<amount>[unit])` / `(<amount>[unit])` / `<amount>[unit]
+    /// [(<method>, <seed>)]` のいずれか（`duckdb` CLI で確認した 3 通りの形）。
+    fn sample_body(&mut self) -> Result<SampleSpec> {
+        if let Tok::Ident(s) = self.cur {
+            if let Some(method) = sample_method_from_ident(s.as_bytes()) {
+                if self.peek()? == Tok::LParen {
+                    self.bump()?; // method 名
+                    self.bump()?; // '('
+                    let (amount, is_rows) = self.sample_amount()?;
+                    self.expect(Tok::RParen)?;
+                    return Ok(SampleSpec { method, amount, is_rows, seed: None });
+                }
+            }
+        }
+        if self.is(Tok::LParen) {
+            self.bump()?;
+            let (amount, is_rows) = self.sample_amount()?;
+            self.expect(Tok::RParen)?;
+            return Ok(SampleSpec { method: SampleMethod::System, amount, is_rows, seed: None });
+        }
+        let (amount, is_rows) = self.sample_amount()?;
+        // 単位無し（裸の数値）は行数指定として扱う（`duckdb` の実測挙動）。
+        let mut method = if is_rows { SampleMethod::Reservoir } else { SampleMethod::System };
+        let mut seed = None;
+        if self.is(Tok::LParen) {
+            self.bump()?;
+            let m = match self.cur {
+                Tok::Ident(s) => s.as_bytes(),
+                _ => err!(UnexpectedToken, self.pos),
+            };
+            method = match sample_method_from_ident(m) {
+                Some(m) => m,
+                None => err!(UnexpectedToken, self.pos),
+            };
+            self.bump()?;
+            self.expect(Tok::Comma)?;
+            seed = Some(self.signed_int_lit()?);
+            self.expect(Tok::RParen)?;
+        }
+        Ok(SampleSpec { method, amount, is_rows, seed })
+    }
+
+    /// `<数値>['%' | PERCENT | ROWS]`。単位が無ければ行数指定として扱う
+    /// （`duckdb` の実測挙動: `USING SAMPLE 100` は 100 行、`USING SAMPLE
+    /// 0.1` はパーセントではなく行数として解釈される）。
+    fn sample_amount(&mut self) -> Result<(f64, bool)> {
+        let pos = self.pos;
+        let v = match self.cur {
+            Tok::Int(s) => int_literal(s, false, pos)?,
+            Tok::Float(s) => float_literal(s, pos)?,
+            _ => err!(UnexpectedToken, pos),
+        };
+        self.bump()?;
+        let amount = match v {
+            Value::I32(x) => x as f64,
+            Value::I64(x) => x as f64,
+            Value::F64(x) => x,
+            _ => err!(NumberOverflow, pos),
+        };
+        let is_rows = if self.eat(Tok::Percent)? {
+            false
+        } else if self.is_soft_kw(b"percent") {
+            self.bump()?;
+            false
+        } else if self.is_soft_kw(b"rows") {
+            self.bump()?;
+            true
+        } else {
+            true
+        };
+        if is_rows {
+            // `Tok::Int`/`Tok::Float` は符号を含まない（`-` は独立したトークン
+            // なのでここまで来ない）ので、`amount` は常に 0 以上。負の行数を
+            // 拒否するチェックは不要。
+        } else {
+            // `duckdb`: "Sample sample_size ... out of range, must be between 0 and 100"
+            ensure!((0.0..=100.0).contains(&amount), SyntaxError, pos);
+        }
+        Ok((amount, is_rows))
+    }
+
+    // --- PIVOT/UNPIVOT -------------------------------------------------------
+    //
+    // `PIVOT`/`UNPIVOT`/`USING`/`INTO`/`NAME`/`VALUE` はどれも予約語にしない。
+    // 文の先頭（`PIVOT`/`UNPIVOT`）、または各構文の中の決まった位置
+    // （`ON` の直後の `USING`、列リストの直後の `INTO NAME .. VALUE ..`）
+    // でだけ綴りを見て判定する。`ROWS`/`RANGE`/`QUALIFY` を予約語にして
+    // 同名列を壊した過去の事故と同じ理由（`sql::lexer` 冒頭コメント参照）。
+
+    /// `PIVOT <from> ON <on> [IN (...)] USING <agg>[, ...] [GROUP BY <cols>]`。
+    /// `PIVOT` キーワード自体は呼び出し元（`stmt`）が確認済みで、まだ消費
+    /// していない。
+    fn pivot_stmt(&mut self) -> Result<Stmt> {
+        self.bump()?; // PIVOT
+        let from = self.parse_from_item()?;
+        self.expect_kw(Kw::On)?;
+        // `IN (...)` の直前で止めたいので、比較演算子と同じ強さの `IN` 述語を
+        // 飲み込ませない（`BP_CMP + 1` 未満は結合させない）。`ON a, b` の
+        // ような複数列指定は非対応 — カンマが残るので、この後 IN/USING の
+        // どちらにも一致せず自然に構文エラーになる。
+        let on = self.expr_bp(BP_CMP + 1)?;
+        let in_list = if self.eat_kw(Kw::In)? {
+            self.expect(Tok::LParen)?;
+            let mut vals = Vec::new();
+            loop {
+                let e = self.expr()?;
+                let alias = self.opt_alias()?;
+                vals.push((e, alias));
+                if !self.eat(Tok::Comma)? {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+            Some(vals)
+        } else {
+            None
+        };
+        let using = if self.is_soft_kw(b"using") {
+            self.bump()?;
+            let mut items = Vec::new();
+            loop {
+                let expr = self.expr()?;
+                let alias = self.opt_alias()?;
+                items.push(SelectItem { expr, alias });
+                if !self.eat(Tok::Comma)? {
+                    break;
+                }
+            }
+            items
+        } else {
+            // DuckDB と同じく、`USING` 省略時は `count(*)` が既定
+            // （`plan::bind::desugar_pivot` が実際に補う）。
+            Vec::new()
+        };
+        let mut group_by = Vec::new();
+        if self.eat_kw(Kw::Group)? {
+            self.expect_kw(Kw::By)?;
+            loop {
+                group_by.push(self.expr()?);
+                if !self.eat(Tok::Comma)? {
+                    break;
+                }
+            }
+        }
+        let (order_by, limit, offset) = self.order_limit_offset_tail()?;
+        Ok(Stmt::Pivot(Box::new(PivotStmt {
+            from,
+            on,
+            in_list,
+            using,
+            group_by,
+            order_by,
+            limit,
+            offset,
+        })))
+    }
+
+    /// `UNPIVOT <from> ON <col, ...> [INTO NAME <name> VALUE <value>]`。
+    /// `UNPIVOT` キーワード自体は呼び出し元が確認済みで、まだ消費していない。
+    fn unpivot_stmt(&mut self) -> Result<Stmt> {
+        self.bump()?; // UNPIVOT
+        let from = self.parse_from_item()?;
+        self.expect_kw(Kw::On)?;
+        // `(a, b), (c, d)` のような複数列同時畳み込みは非対応。裸の列参照の
+        // カンマ区切りのみ受理する（式や `t.col` も構文上は通ってしまうが、
+        // 展開時（`desugar_unpivot`）に裸の列参照でなければ拒否する）。
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expr()?);
+            if !self.eat(Tok::Comma)? {
+                break;
+            }
+        }
+        let (name_col, value_col) = if self.is_soft_kw(b"into") {
+            self.bump()?;
+            ensure!(self.is_soft_kw(b"name"), UnexpectedToken, self.pos);
+            self.bump()?;
+            let name_col = self.ident()?;
+            ensure!(self.is_soft_kw(b"value"), UnexpectedToken, self.pos);
+            self.bump()?;
+            let value_col = self.ident()?;
+            (name_col, value_col)
+        } else {
+            (String::from("name"), String::from("value"))
+        };
+        let (order_by, limit, offset) = self.order_limit_offset_tail()?;
+        Ok(Stmt::Unpivot(Box::new(UnpivotStmt {
+            from,
+            columns,
+            name_col,
+            value_col,
+            order_by,
+            limit,
+            offset,
+        })))
+    }
+
+    /// 末尾の `ORDER BY <items> [LIMIT n] [OFFSET n]`。`PIVOT`/`UNPIVOT` は
+    /// 集合演算も CTE も持たない単純な文なので、`query_body` の同種の処理
+    /// （こちらは `SetExpr`/`WITH` の分岐まで持つ）を簡略化した専用版。
+    fn order_limit_offset_tail(&mut self) -> Result<(Vec<OrderByItem>, Option<u64>, Option<u64>)> {
+        let mut order_by = Vec::new();
+        if self.eat_kw(Kw::Order)? {
+            self.expect_kw(Kw::By)?;
+            loop {
+                order_by.push(self.order_item()?);
+                if !self.eat(Tok::Comma)? {
+                    break;
+                }
+            }
+        }
+        let limit = if self.eat_kw(Kw::Limit)? { Some(self.uint()?) } else { None };
+        let offset = if self.eat_kw(Kw::Offset)? { Some(self.uint()?) } else { None };
+        Ok((order_by, limit, offset))
+    }
+
     // --- 式 -----------------------------------------------------------------
 
     fn expr(&mut self) -> Result<ExprId> {
@@ -972,6 +1428,41 @@ impl<'a> Parser<'a> {
     fn expr_body(&mut self, min_bp: u8) -> Result<ExprId> {
         let mut lhs = self.prefix()?;
         loop {
+            // `GLOB`/`SIMILAR TO` は ROWS/RANGE/QUALIFY と同じ理由で予約語表
+            // には入れず（ファイル冒頭 `sql/lexer.rs` のコメント参照）、この
+            // 中置演算子の構文位置でだけ綴りを見て判定する。こうすれば
+            // `glob`/`similar` という名前の列も引用符無しでそのまま使える。
+            //
+            // DuckDB は `GLOB` に `NOT` を前置できない（`NOT (x GLOB y)` と
+            // 書く必要がある。`duckdb -c "select 'a' NOT GLOB 'b'"` が構文
+            // エラーになることを確認済み）ので、ここでは `LIKE` と違って
+            // `predicate()` を経由させない。`x NOT GLOB y` は `Tok::Kw(Kw::Not)`
+            // 分岐から `predicate()` に入り、そこに `glob` の腕が無いので
+            // 自然に `UnexpectedToken` になる。
+            if self.is_soft_kw(b"glob") {
+                if BP_CMP < min_bp {
+                    break;
+                }
+                self.bump()?; // glob
+                let pattern = self.expr_bp(BP_CONCAT)?;
+                lhs = self.arena.push(Expr::Function {
+                    name: "glob".into(),
+                    args: vec![lhs, pattern],
+                    distinct: false,
+                    star: false,
+                    filter: None,
+                });
+                continue;
+            }
+            // `SIMILAR TO` は `LIKE` 同様 `[NOT]` を前置できるので、`predicate()`
+            // 側（`Tok::Kw(Kw::Not)` 分岐）にも同じ判定を足してある。
+            if self.is_soft_kw(b"similar") && self.peek_is_soft_kw(b"to")? {
+                if BP_CMP < min_bp {
+                    break;
+                }
+                lhs = self.similar_to(lhs, false)?;
+                continue;
+            }
             let (op, bp) = match self.cur {
                 Tok::Kw(Kw::Or) => (BinaryOp::Or, BP_OR),
                 Tok::Kw(Kw::And) => (BinaryOp::And, BP_AND),
@@ -1067,6 +1558,11 @@ impl<'a> Parser<'a> {
     /// 否定は `Unary::Not` で包まず、各ノードの `negated` に落とす。
     fn predicate(&mut self, arg: ExprId) -> Result<ExprId> {
         let negated = self.eat_kw(Kw::Not)?;
+        // `SIMILAR` は予約語ではない（`expr_body` 冒頭のコメント参照）ので、
+        // 通常の `match self.cur` には乗せられない。ここだけ先に判定する。
+        if self.is_soft_kw(b"similar") && self.peek_is_soft_kw(b"to")? {
+            return self.similar_to(arg, negated);
+        }
         let node = match self.cur {
             Tok::Kw(Kw::Is) => {
                 ensure!(!negated, UnexpectedToken, self.pos);
@@ -1135,6 +1631,38 @@ impl<'a> Parser<'a> {
         Ok(self.arena.push(node))
     }
 
+    /// `[NOT] SIMILAR TO pattern`。DuckDB は `SIMILAR TO` を単に
+    /// `regexp_full_match` への糖衣構文として扱う（`duckdb -c "explain select
+    /// 'a' similar to 'a'"` で確認済み）。SQL 標準の `SIMILAR TO` と違い
+    /// `_`/`%` は特別扱いされず、素の POSIX 風正規表現として渡る。
+    /// このエンジンには `regexp_full_match` という名前の関数は無いが、
+    /// `expr::funcs` 側にこの糖衣構文専用として実装してある
+    /// （新しい正規表現エンジンは書かず、既存の `expr::regex` を
+    /// アンカー付きで再利用する。詳細はそちらのモジュール doc）。
+    ///
+    /// `ESCAPE` 句は DuckDB 自身も「未実装」として拒否する
+    /// （`duckdb -c "select 'a' similar to 'a' escape '\\'"` が
+    /// `Not implemented Error: Custom escape in SIMILAR TO` になることを
+    /// 確認済み）ので、ここでも明示的に拒否する。
+    fn similar_to(&mut self, arg: ExprId, negated: bool) -> Result<ExprId> {
+        self.bump()?; // similar
+        self.bump()?; // to
+        let pattern = self.expr_bp(BP_CONCAT)?;
+        ensure!(!self.is(Tok::Kw(Kw::Escape)), UnsupportedFeature, self.pos);
+        let call = self.arena.push(Expr::Function {
+            name: "regexp_full_match".into(),
+            args: vec![arg, pattern],
+            distinct: false,
+            star: false,
+            filter: None,
+        });
+        if negated {
+            Ok(self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: call }))
+        } else {
+            Ok(call)
+        }
+    }
+
     fn primary(&mut self) -> Result<ExprId> {
         let pos = self.pos;
         let node = match self.cur {
@@ -1185,6 +1713,10 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::RParen)?;
                 return Ok(e);
             }
+            // `[expr, ...]` 配列リテラル。式の開始位置でしか出てこないので、
+            // `expr[i]` のような添字アクセス（今回のスコープ外。ファイル冒頭
+            // `sql/lexer.rs` の `Tok::LBracket` のコメント参照）とは衝突しない。
+            Tok::LBracket => return self.array_literal(),
             Tok::Kw(Kw::Exists) => return self.exists(false),
             Tok::Kw(Kw::Cast) => return self.cast(),
             Tok::Kw(Kw::Case) => return self.case(),
@@ -1197,6 +1729,36 @@ impl<'a> Parser<'a> {
             _ => err!(UnexpectedToken, pos),
         };
         Ok(self.arena.push(node))
+    }
+
+    /// `[expr, expr, ...]`。`list_value(expr, expr, ...)`（`json_array` の
+    /// 別名）へそのまま脱糖する糖衣構文で、意味は完全に同じ。
+    ///
+    /// 空配列 `[]` だけは `list_value()` を経由しない: `list_value`/`json_array`
+    /// の `resolve` は 0 引数を `WrongArgCount` で拒否する設計になっている
+    /// （引数が無いと `call()` が行数を決められないため）ので、代わりに
+    /// JSON の空配列を直接 `TypedLiteral` として埋め込む。`duckdb -c "select
+    /// [], typeof([])"` で `[]` 自体は有効な式であることを確認済み。
+    fn array_literal(&mut self) -> Result<ExprId> {
+        self.bump()?; // '['
+        if self.eat(Tok::RBracket)? {
+            return Ok(self.arena.push(Expr::TypedLiteral(Value::Bytes(b"[]".to_vec()), Ty::Json)));
+        }
+        let mut args = Vec::new();
+        loop {
+            args.push(self.expr()?);
+            if !self.eat(Tok::Comma)? {
+                break;
+            }
+        }
+        self.expect(Tok::RBracket)?;
+        Ok(self.arena.push(Expr::Function {
+            name: "list_value".into(),
+            args,
+            distinct: false,
+            star: false,
+            filter: None,
+        }))
     }
 
     /// `INTERVAL '<n> <unit> ...'` / `INTERVAL '<n>' <unit>` /
@@ -1262,7 +1824,8 @@ impl<'a> Parser<'a> {
         if self.eat(Tok::Dot)? {
             if self.is(Tok::Star) {
                 self.bump()?;
-                return Ok(self.arena.push(Expr::Star { qualifier: Some(name) }));
+                let (exclude, replace) = self.star_modifiers()?;
+                return Ok(self.arena.push(Expr::Star { qualifier: Some(name), exclude, replace }));
             }
             let col = self.ident()?;
             return Ok(self.arena.push(Expr::ColumnRef { qualifier: Some(name), name: col }));
@@ -1353,8 +1916,23 @@ impl<'a> Parser<'a> {
             self.bump()?;
         } else if !self.is(Tok::RParen) {
             distinct = self.eat_kw(Kw::Distinct)?;
+            // ラムダ（`x -> expr` / `(a, b) -> expr`）は `list_transform` /
+            // `list_filter` / `list_reduce` の引数位置でだけ認識する。
+            // `->` は通常 JSON パス演算子の糖衣構文（`json_extract` への
+            // 展開、`expr_body` 参照）なので、他の関数の引数では
+            // 今までどおりその意味のまま残す（`coalesce(doc -> 'a', 'x')` の
+            // ような既存の使い方を壊さないため。duckdb CLI で実測した
+            // 限りでも、`->` がラムダとして解釈されるのは list_transform 等
+            // 「ラムダを受け取ると分かっている関数」の引数位置だけで、
+            // 例えば `coalesce(x -> 5, 3)` は `x` が列として解決できず
+            // `x -> 5` は JSON 演算子のままエラーになる）。
+            let lambda_fn = is_lambda_func(&name);
             loop {
-                let e = self.expr()?;
+                let e = if lambda_fn && self.looks_like_lambda_params()? {
+                    self.lambda_expr()?
+                } else {
+                    self.expr()?
+                };
                 args.push(e);
                 if !self.eat(Tok::Comma)? {
                     break;
@@ -1372,17 +1950,91 @@ impl<'a> Parser<'a> {
             filter = Some(self.expr()?);
             self.expect(Tok::RParen)?;
         }
-        // `OVER` は予約語ではないので、次が `(` のときだけウィンドウ句と見なす。
-        // `SELECT count(*) over FROM t` の `over` は別名のまま通る。名前付き
-        // ウィンドウ（`OVER w`）を諦める代わりに `over` 列を守る判断。
-        if self.is_soft_kw(b"over") && self.peek()? == Tok::LParen {
-            // `f(DISTINCT x) OVER (...)` / `f(...) FILTER (...) OVER (...)` は
-            // 範囲外。無視すると結果が変わるので弾く。
-            ensure!(!distinct, UnsupportedFeature, self.pos);
-            ensure!(filter.is_none(), UnsupportedFeature, self.pos);
-            return self.window(name, args, star);
+        // `OVER` は予約語ではないので、次が `(` か識別子のときだけウィンドウ句
+        // と見なす。`SELECT count(*) over FROM t` の `over` は別名のまま通る
+        // （次が `FROM` などキーワードなら、下の分岐に入らず素通りする）。
+        if self.is_soft_kw(b"over") {
+            match self.peek()? {
+                Tok::LParen => {
+                    // `f(DISTINCT x) OVER (...)` / `f(...) FILTER (...) OVER (...)` は
+                    // 範囲外。無視すると結果が変わるので弾く。
+                    ensure!(!distinct, UnsupportedFeature, self.pos);
+                    ensure!(filter.is_none(), UnsupportedFeature, self.pos);
+                    return self.window(name, args, star);
+                }
+                Tok::Ident(_) | Tok::QIdent(_) => {
+                    // `OVER w`（名前付きウィンドウの参照）。定義の実体は
+                    // `WINDOW` 句にしか無く、SELECT リストの方が構文上先に
+                    // 来るのでここでは名前だけ持たせ、束縛時に
+                    // `SelectStmt::windows` から引く（`plan::bind` 参照）。
+                    ensure!(!distinct, UnsupportedFeature, self.pos);
+                    ensure!(filter.is_none(), UnsupportedFeature, self.pos);
+                    self.bump()?; // OVER
+                    let wname = self.ident()?;
+                    return Ok(self.arena.push(Expr::Window {
+                        name,
+                        args,
+                        star,
+                        window_ref: Some(wname),
+                        partition_by: Vec::new(),
+                        order_by: Vec::new(),
+                        frame: WindowFrame::WholePartition,
+                    }));
+                }
+                _ => {}
+            }
         }
         Ok(self.arena.push(Expr::Function { name, args, distinct, star, filter }))
+    }
+
+    /// 現在位置がラムダの仮引数リストの形（`IDENT ->` または
+    /// `( IDENT [, IDENT]* ) ->`）をしているか。`Lexer` の clone だけで先読みし
+    /// `self` は動かさない（`peek` と同じ流儀）。
+    ///
+    /// 形が違えば `false` を返すだけで構文エラーにはしない（呼び出し側が
+    /// 通常の `expr()` へフォールバックする）。
+    fn looks_like_lambda_params(&self) -> Result<bool> {
+        match self.cur {
+            Tok::Ident(_) => Ok(self.peek()? == Tok::Arrow),
+            Tok::LParen => {
+                let mut lx = self.lex.clone();
+                loop {
+                    match lx.next_token()?.tok {
+                        Tok::Ident(_) => {}
+                        _ => return Ok(false),
+                    }
+                    match lx.next_token()?.tok {
+                        Tok::Comma => continue,
+                        Tok::RParen => return Ok(lx.next_token()?.tok == Tok::Arrow),
+                        _ => return Ok(false),
+                    }
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// `x -> expr` / `(a, b) -> expr`。`looks_like_lambda_params` が `true` を
+    /// 返した直後にだけ呼ぶ。
+    fn lambda_expr(&mut self) -> Result<ExprId> {
+        let mut params = Vec::new();
+        if self.eat(Tok::LParen)? {
+            loop {
+                params.push(self.ident()?);
+                if !self.eat(Tok::Comma)? {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+        } else {
+            params.push(self.ident()?);
+        }
+        self.expect(Tok::Arrow)?;
+        // 本体は通常の式。カンマは引数区切りとして上位ループが見るので
+        // ここでは（`expr_body` に元々カンマの扱いが無いことも合わせて）
+        // 何も特別な下限を与えず読むだけでよい。
+        let body = self.expr()?;
+        Ok(self.arena.push(Expr::Lambda { params, body }))
     }
 
     /// `OVER ( [PARTITION BY ...] [ORDER BY ...] )`。呼び出し時の `cur` は
@@ -1390,6 +2042,22 @@ impl<'a> Parser<'a> {
     fn window(&mut self, name: String, args: Vec<ExprId>, star: bool) -> Result<ExprId> {
         self.bump()?; // OVER
         self.expect(Tok::LParen)?;
+        let def = self.window_def_body()?;
+        Ok(self.arena.push(Expr::Window {
+            name,
+            args,
+            star,
+            window_ref: None,
+            partition_by: def.partition_by,
+            order_by: def.order_by,
+            frame: def.frame,
+        }))
+    }
+
+    /// `[PARTITION BY ...] [ORDER BY ...] )` の共通本体。呼び出し時に開き
+    /// 括弧は消費済みで、閉じ括弧まで読んで消費する。`OVER (...)` の直書きと
+    /// `WINDOW name AS (...)` の名前付き定義の両方から使う。
+    fn window_def_body(&mut self) -> Result<WindowDef> {
         let mut partition_by = Vec::new();
         // `PARTITION` もウィンドウ指定の先頭でだけキーワードとして扱う。
         if self.is_soft_kw(b"partition") {
@@ -1426,7 +2094,7 @@ impl<'a> Parser<'a> {
         } else {
             WindowFrame::RangeUnboundedPreceding
         };
-        Ok(self.arena.push(Expr::Window { name, args, star, partition_by, order_by, frame }))
+        Ok(WindowDef { partition_by, order_by, frame })
     }
 
     fn cast(&mut self) -> Result<ExprId> {
@@ -1522,6 +2190,22 @@ fn cube_sets(cols: Vec<ExprId>, pos: usize) -> Result<Vec<Vec<ExprId>>> {
     Ok(sets)
 }
 
+// --- ラムダ ------------------------------------------------------------------
+
+/// 引数位置の `->` をラムダとして解釈してよい関数名か。
+///
+/// duckdb CLI で実測した限り、ラムダとして解釈されるのは「ラムダを受け取ると
+/// 分かっている関数」の引数位置だけで、他の関数（`coalesce` 等）の引数では
+/// `->` は素通りして通常の JSON パス演算子のままになる（`coalesce(doc -> 'a',
+/// 'x')` は JSON 抽出として解決される一方、`abs(x -> x+1)` はラムダとして
+/// 解釈されて「この関数はラムダを受け取らない」というエラーになる）。
+/// この実装では関数名を固定集合として持つことで同じ区別を再現する。
+fn is_lambda_func(name: &str) -> bool {
+    eq_ascii_ci(name.as_bytes(), b"list_transform")
+        || eq_ascii_ci(name.as_bytes(), b"list_filter")
+        || eq_ascii_ci(name.as_bytes(), b"list_reduce")
+}
+
 // --- リテラル・型名 ---------------------------------------------------------
 
 /// 引用符の中身を展開する。二重化された引用符を 1 個に畳むだけ。
@@ -1571,6 +2255,20 @@ fn float_literal(text: &str, pos: usize) -> Result<Value> {
     match text.parse::<f64>() {
         Ok(v) => Ok(Value::F64(v)),
         Err(_) => err!(NumberOverflow, pos),
+    }
+}
+
+/// `USING SAMPLE`/`TABLESAMPLE` の手法名。一致しなければ `None`
+/// （呼び出し側が「サンプル手法ではなく別の何か」として扱う）。
+fn sample_method_from_ident(word: &[u8]) -> Option<SampleMethod> {
+    if eq_ascii_ci(word, b"bernoulli") {
+        Some(SampleMethod::Bernoulli)
+    } else if eq_ascii_ci(word, b"system") {
+        Some(SampleMethod::System)
+    } else if eq_ascii_ci(word, b"reservoir") {
+        Some(SampleMethod::Reservoir)
+    } else {
+        None
     }
 }
 
@@ -1770,13 +2468,16 @@ mod tests {
         match a.get(id) {
             // ウィンドウ指定は `PARTITION BY .. ORDER BY .. <枠>` の順で出す。
             // 枠は既定値の取り違えを検出したいので必ず描画する。
-            Expr::Window { name, args, star, partition_by, order_by, frame } => {
+            Expr::Window { name, args, star, window_ref, partition_by, order_by, frame } => {
                 let inner = if *star {
                     "*".to_string()
                 } else {
                     let items: Vec<String> = args.iter().map(|i| r(a, *i)).collect();
                     items.join(", ")
                 };
+                if let Some(w) = window_ref {
+                    return format!("{}({}) OVER {}", name, inner, w);
+                }
                 let mut spec: Vec<String> = Vec::new();
                 if !partition_by.is_empty() {
                     let ps: Vec<String> = partition_by.iter().map(|e| r(a, *e)).collect();
@@ -1806,15 +2507,27 @@ mod tests {
             ),
             Expr::Literal(v) => lit(v),
             Expr::IntervalLiteral(v) => format!("INTERVAL({}i128)", v),
+            Expr::TypedLiteral(v, ty) => format!("{v:?}::{}", ty.name()),
             Expr::Param(n) => format!("?{}", n),
             Expr::ColumnRef { qualifier, name } => match qualifier {
                 Some(q) => format!("{}.{}", q, name),
                 None => name.clone(),
             },
-            Expr::Star { qualifier } => match qualifier {
-                Some(q) => format!("{}.*", q),
-                None => "*".to_string(),
-            },
+            Expr::Star { qualifier, exclude, replace } => {
+                let mut s = match qualifier {
+                    Some(q) => format!("{}.*", q),
+                    None => "*".to_string(),
+                };
+                if !exclude.is_empty() {
+                    s.push_str(&format!(" EXCLUDE ({})", exclude.join(", ")));
+                }
+                if !replace.is_empty() {
+                    let items: Vec<String> =
+                        replace.iter().map(|(e, n)| format!("{} AS {}", r(a, *e), n)).collect();
+                    s.push_str(&format!(" REPLACE ({})", items.join(", ")));
+                }
+                s
+            }
             Expr::Unary { op, arg } => {
                 let o = if *op == UnaryOp::Neg { "-" } else { "NOT" };
                 format!("({} {})", o, r(a, *arg))
@@ -1891,6 +2604,14 @@ mod tests {
                 format!("{}({}){}", name, inner, f)
             }
             Expr::Unnest(arg) => format!("UNNEST({})", r(a, *arg)),
+            Expr::Lambda { params, body } => {
+                let p = if params.len() == 1 {
+                    params[0].clone()
+                } else {
+                    format!("({})", params.join(", "))
+                };
+                format!("{} -> {}", p, r(a, *body))
+            }
         }
     }
 
@@ -1970,6 +2691,14 @@ mod tests {
                 };
                 format!("UNNEST({}){}{}", r(a, *expr), alias(al), col)
             }
+            FromItem::GenerateSeries { start, stop, step, inclusive, alias: al, column_alias } => {
+                let col = match column_alias {
+                    Some(c) => format!("({})", c),
+                    None => String::new(),
+                };
+                let name = if *inclusive { "generate_series" } else { "range" };
+                format!("{}({},{},{}){}{}", name, start, stop, step, alias(al), col)
+            }
         }
     }
 
@@ -2014,6 +2743,24 @@ mod tests {
         }
         if let Some(h) = s.having {
             out.push_str(&format!(" HAVING {}", r(a, h)));
+        }
+        if !s.windows.is_empty() {
+            let ws: Vec<String> = s
+                .windows
+                .iter()
+                .map(|(name, def)| {
+                    let mut spec: Vec<String> = Vec::new();
+                    if !def.partition_by.is_empty() {
+                        let ps: Vec<String> = def.partition_by.iter().map(|e| r(a, *e)).collect();
+                        spec.push(format!("PARTITION BY {}", ps.join(", ")));
+                    }
+                    if !def.order_by.is_empty() {
+                        spec.push(format!("ORDER BY {}", order_list(a, &def.order_by)));
+                    }
+                    format!("{} AS ({})", name, spec.join(" "))
+                })
+                .collect();
+            out.push_str(&format!(" WINDOW {}", ws.join(", ")));
         }
         if let Some(q) = s.qualify {
             out.push_str(&format!(" QUALIFY {}", r(a, q)));
@@ -2261,6 +3008,53 @@ mod tests {
         assert_eq!(code("SELECT ilike FROM t"), Code::UnexpectedToken as u16);
     }
 
+    #[test]
+    fn glob_operator_desugars_to_glob_function() {
+        assert_eq!(ex("a GLOB 'x*'"), "glob(a, 'x*')");
+        assert_eq!(ex("a glob 'x*'"), "glob(a, 'x*')");
+        // GLOB も述語と同じ強さ（AND より強く結合する）。
+        assert_eq!(ex("a GLOB 'x' AND b"), "(glob(a, 'x') AND b)");
+        // DuckDB は `NOT GLOB` を書けない（`duckdb -c "select 'a' NOT GLOB
+        // 'b'"` が構文エラーになることを確認済み）。`NOT (x GLOB y)` は
+        // 通常の前置 NOT なので問題なく書ける。
+        assert_eq!(code("SELECT a NOT GLOB 'x'"), Code::UnexpectedToken as u16);
+        assert_eq!(ex("NOT (a GLOB 'x')"), "(NOT glob(a, 'x'))");
+        // `glob` は予約語ではない（ROWS/RANGE/QUALIFY と同じ「文脈依存
+        // キーワード」方式）ので、列名としてそのまま使える。
+        assert_eq!(ex("glob"), "glob");
+        assert_eq!(code("SELECT glob FROM t"), 0);
+    }
+
+    #[test]
+    fn similar_to_desugars_to_regexp_full_match() {
+        assert_eq!(ex("a SIMILAR TO 'x.y'"), "regexp_full_match(a, 'x.y')");
+        assert_eq!(ex("a similar to 'x.y'"), "regexp_full_match(a, 'x.y')");
+        assert_eq!(ex("a NOT SIMILAR TO 'x.y'"), "(NOT regexp_full_match(a, 'x.y'))");
+        // LIKE と同じく述語の強さ（AND より強く結合する）。
+        assert_eq!(ex("a SIMILAR TO 'x' AND b"), "(regexp_full_match(a, 'x') AND b)");
+        // DuckDB 自身も `ESCAPE` 句は「未実装」として拒否する
+        // （`duckdb -c "select 'a' similar to 'a' escape '\\'"` を確認済み）。
+        assert_eq!(code(r"SELECT a SIMILAR TO 'x' ESCAPE '\'"), Code::UnsupportedFeature as u16);
+        // `similar`/`to` はどちらも予約語ではないので、列名としてそのまま
+        // 使える（過去の ROWS/RANGE/QUALIFY の教訓を踏まえた設計）。
+        assert_eq!(ex("similar"), "similar");
+        assert_eq!(code("SELECT similar, glob FROM t"), 0);
+    }
+
+    #[test]
+    fn array_literal_desugars_to_list_value() {
+        assert_eq!(ex("[1, 2, 3]"), "list_value(1i32, 2i32, 3i32)");
+        assert_eq!(ex("['a', 'b']"), "list_value('a', 'b')");
+        assert_eq!(ex("[1 + 1]"), "list_value((1i32 + 1i32))");
+        // 空配列は `list_value()` を経由せず（`resolve` が 0 引数を拒否する
+        // 設計になっているため）、JSON の空配列を直接 TypedLiteral として
+        // 埋め込む。`duckdb -c "select []"` が有効な式であることを確認済み。
+        assert_eq!(ex("[]"), "Bytes([91, 93])::JSON");
+        // 添字アクセス（`expr[i]`）は今回のスコープ外。式の開始位置以外の
+        // `[` は構文エラーになる（`list_value` への糖衣構文と衝突しない）。
+        assert_eq!(code("SELECT a[1]"), Code::UnexpectedToken as u16);
+    }
+
     // --- CASE / CAST / 関数 -------------------------------------------------
 
     #[test]
@@ -2313,6 +3107,33 @@ mod tests {
         assert_eq!(ex("a ->> b = c"), "(json_extract_string(a, b) = c)");
         // `-` の単純な引き算とは区別される。
         assert_eq!(ex("a - b"), "(a - b)");
+    }
+
+    #[test]
+    fn lambda_is_recognized_only_in_list_transform_filter_reduce_arg_position() {
+        // 単一引数は括弧無し。
+        assert_eq!(ex("list_transform(a, x -> x + 1)"), "list_transform(a, x -> (x + 1i32))");
+        // 複数引数は括弧付き。
+        assert_eq!(
+            ex("list_reduce(a, (acc, x) -> acc + x)"),
+            "list_reduce(a, (acc, x) -> (acc + x))"
+        );
+        // 括弧付き単一引数も許す（duckdb と同じ）。
+        assert_eq!(ex("list_filter(a, (x) -> x > 1)"), "list_filter(a, x -> (x > 1i32))");
+        // ネストしたラムダ。
+        assert_eq!(
+            ex("list_transform(a, y -> list_transform(y, x -> x * 2))"),
+            "list_transform(a, y -> list_transform(y, x -> (x * 2i32)))"
+        );
+        // list_filter も同じ扱い。
+        assert_eq!(ex("list_filter(a, x -> x > 5)"), "list_filter(a, x -> (x > 5i32))");
+        // 大文字小文字を区別しない関数名判定。
+        assert_eq!(ex("LIST_TRANSFORM(a, x -> x)"), "LIST_TRANSFORM(a, x -> x)");
+
+        // それ以外の関数の引数位置では `->` は今まで通り JSON パス演算子の
+        // ままで、ラムダとしては解釈されない（duckdb CLI で実測済み:
+        // `coalesce(doc -> 'a', 'x')` は JSON 抽出のまま解決される）。
+        assert_eq!(ex("coalesce(doc -> 'a', x)"), "coalesce(json_extract(doc, 'a'), x)");
     }
 
     #[test]
@@ -2492,6 +3313,50 @@ mod tests {
         );
         // 完全な予約語なので列名としては使えない。
         assert_eq!(code("SELECT qualify FROM t"), Code::UnexpectedToken as u16);
+    }
+
+    #[test]
+    fn star_exclude_replace() {
+        // 基本形。順序は EXCLUDE → REPLACE 固定（`duckdb` で確認済み）。
+        assert_eq!(sel("SELECT * EXCLUDE (b) FROM t"), "SELECT * EXCLUDE (b) FROM t");
+        assert_eq!(
+            sel("SELECT * REPLACE (a + 1 AS a) FROM t"),
+            "SELECT * REPLACE ((a + 1i32) AS a) FROM t"
+        );
+        assert_eq!(
+            sel("SELECT * EXCLUDE (b) REPLACE (a + 1 AS a) FROM t"),
+            "SELECT * EXCLUDE (b) REPLACE ((a + 1i32) AS a) FROM t"
+        );
+        // 逆順（REPLACE の後に EXCLUDE）は `duckdb` と同じく構文エラー。
+        assert_eq!(
+            code("SELECT * REPLACE (a + 1 AS a) EXCLUDE (b) FROM t"),
+            Code::UnexpectedToken as u16
+        );
+        // 1 個だけなら括弧を省略できる（`duckdb` の挙動）。
+        assert_eq!(sel("SELECT * EXCLUDE b FROM t"), "SELECT * EXCLUDE (b) FROM t");
+        assert_eq!(sel("SELECT * REPLACE 1 AS a FROM t"), "SELECT * REPLACE (1i32 AS a) FROM t");
+        // 複数列は括弧必須。
+        assert_eq!(sel("SELECT * EXCLUDE (a, b) FROM t"), "SELECT * EXCLUDE (a, b) FROM t");
+        assert_eq!(
+            sel("SELECT * REPLACE (1 AS a, 2 AS b) FROM t"),
+            "SELECT * REPLACE (1i32 AS a, 2i32 AS b) FROM t"
+        );
+        // `t.*` にも同様に付けられる。
+        assert_eq!(sel("SELECT t.* EXCLUDE (b) FROM t"), "SELECT t.* EXCLUDE (b) FROM t");
+        // 同じ列を EXCLUDE と REPLACE の両方に書くのは無意味なので拒否する。
+        assert_eq!(code("SELECT * EXCLUDE (a) REPLACE (1 AS a) FROM t"), Code::SyntaxError as u16);
+        // EXCLUDE 内の重複、REPLACE 内の重複もそれぞれ拒否する。
+        assert_eq!(code("SELECT * EXCLUDE (a, a) FROM t"), Code::SyntaxError as u16);
+        assert_eq!(code("SELECT * REPLACE (1 AS a, 2 AS a) FROM t"), Code::SyntaxError as u16);
+        // `EXCLUDE` は `*` の直後という文脈でしかキーワードにならない。過去の
+        // ROWS/RANGE/QUALIFY 事故と同種の罠なので、通常の列名・別名として
+        // なお使えることを確認する。`REPLACE` は `ddl` フィーチャが有効だと
+        // `CREATE OR REPLACE` 用に別途グローバル予約語になるため、その場合は
+        // 対象外（`is_star_replace_kw` のコメント参照）。
+        assert_eq!(sel("SELECT exclude FROM t"), "SELECT exclude FROM t");
+        assert_eq!(sel("SELECT a AS exclude FROM t"), "SELECT a AS exclude FROM t");
+        #[cfg(not(feature = "ddl"))]
+        assert_eq!(sel("SELECT exclude, replace FROM t"), "SELECT exclude, replace FROM t");
     }
 
     #[test]
@@ -2864,10 +3729,11 @@ mod tests {
         // `star` と既定枠を AST 上で直接確認する。
         let (a, q) = parsed("SELECT count(*) OVER (), rank() OVER (ORDER BY b) FROM t");
         match a.get(plain(&q).items[0].expr) {
-            Expr::Window { name, args, star, partition_by, order_by, frame } => {
+            Expr::Window { name, args, star, window_ref, partition_by, order_by, frame } => {
                 assert_eq!(name, "count");
                 assert!(args.is_empty());
                 assert!(*star);
+                assert!(window_ref.is_none());
                 assert!(partition_by.is_empty());
                 assert!(order_by.is_empty());
                 assert_eq!(*frame, WindowFrame::WholePartition);
@@ -2972,9 +3838,73 @@ mod tests {
         );
         // DISTINCT 付きのウィンドウ集約も範囲外。
         assert_eq!(code("SELECT count(DISTINCT x) OVER ()"), Code::UnsupportedFeature as u16);
-        // 名前付きウィンドウは括弧が無いので構文エラー。
-        assert_eq!(code("SELECT sum(x) OVER w"), Code::UnexpectedToken as u16);
+        // `OVER w`（名前付き参照）は構文としては通る。定義の有無は束縛時にしか
+        // 分からない（`plan::bind` 側のテスト参照）。
+        assert_eq!(code("SELECT sum(x) OVER w"), 0);
         assert_eq!(code("SELECT sum(x) OVER (PARTITION a)"), Code::UnexpectedToken as u16);
+    }
+
+    #[test]
+    fn named_window_ref_parses() {
+        // `OVER w`（識別子 1 つだけ）は名前付きウィンドウの参照として木に残す。
+        // 実体（PARTITION BY/ORDER BY）は `WINDOW` 句側にあり、ここでは
+        // パーサが名前だけを持たせていることを確認する。
+        assert_eq!(ex("sum(x) OVER w"), "sum(x) OVER w");
+        let (a, q) = parsed("SELECT sum(x) OVER w FROM t");
+        match a.get(plain(&q).items[0].expr) {
+            Expr::Window { name, window_ref, partition_by, order_by, .. } => {
+                assert_eq!(name, "sum");
+                assert_eq!(window_ref.as_deref(), Some("w"));
+                assert!(partition_by.is_empty());
+                assert!(order_by.is_empty());
+            }
+            _ => panic!("ウィンドウ関数ではない"),
+        }
+        // `OVER` の直後が `(` でも識別子でもなければ、今までどおり別名扱い。
+        assert_eq!(sel("SELECT count(*) over FROM t"), "SELECT count(*) AS over FROM t");
+        // ただし `OVER` の直後に識別子が続けば、コンマを挟まない限り名前付き
+        // ウィンドウ参照としてしか解釈できない（別名 + 別の select item は
+        // コンマが要るので、そちらの解釈はそもそも成り立たない）。
+        assert_eq!(sel("SELECT sum(x) over w, y FROM t"), "SELECT sum(x) OVER w, y FROM t");
+    }
+
+    #[test]
+    fn window_clause_named_definitions() {
+        // 単純な名前付きウィンドウ。複数の関数から同じ定義を共有できる。
+        assert_eq!(
+            sel(
+                "SELECT id, sum(x) OVER w, avg(x) OVER w FROM t WINDOW w AS (PARTITION BY id ORDER BY ts)"
+            ),
+            "SELECT id, sum(x) OVER w, avg(x) OVER w FROM t WINDOW w AS (PARTITION BY id ORDER BY ts ASC NULLS LAST)"
+        );
+        // カンマ区切りで複数定義できる。
+        assert_eq!(
+            sel(
+                "SELECT sum(x) OVER w1, rank() OVER w2 FROM t WINDOW w1 AS (PARTITION BY id), w2 AS (ORDER BY x)"
+            ),
+            "SELECT sum(x) OVER w1, rank() OVER w2 FROM t WINDOW w1 AS (PARTITION BY id), w2 AS (ORDER BY x ASC NULLS LAST)"
+        );
+        // 通常の `OVER (...)` 直書きと併用できる。
+        assert_eq!(
+            sel("SELECT sum(x) OVER w, count(*) OVER () FROM t WINDOW w AS (PARTITION BY id)"),
+            "SELECT sum(x) OVER w, count(*) OVER (WHOLE) FROM t WINDOW w AS (PARTITION BY id)"
+        );
+        // `WINDOW` は `GROUP BY`/`HAVING` の後、`QUALIFY`/`ORDER BY` の前。
+        assert_eq!(
+            sel(
+                "SELECT a, sum(x) OVER w FROM t WHERE a > 0 GROUP BY a, x HAVING x > 0 WINDOW w AS (ORDER BY a) QUALIFY sum(x) OVER w > 0 ORDER BY a"
+            ),
+            "SELECT a, sum(x) OVER w FROM t WHERE (a > 0i32) GROUP BY a, x HAVING (x > 0i32) WINDOW w AS (ORDER BY a ASC NULLS LAST) QUALIFY (sum(x) OVER w > 0i32) ORDER BY a ASC NULLS LAST"
+        );
+        // 同じ名前を 2 回定義するのはエラー（`duckdb` も "already defined" として拒否）。
+        assert_eq!(
+            code("SELECT a FROM t WINDOW w AS (ORDER BY a), w AS (ORDER BY a)"),
+            Code::SyntaxError as u16
+        );
+        // `WINDOW` は完全な予約語（`QUALIFY` と同じ判断）なので列名としては使えない。
+        assert_eq!(code("SELECT window FROM t"), Code::UnexpectedToken as u16);
+        // 引用符を付ければ引き続き列名として使える。
+        assert_eq!(sel("SELECT \"window\" FROM t"), "SELECT window FROM t");
     }
 
     // --- サブクエリ式 -------------------------------------------------------
@@ -3455,7 +4385,10 @@ mod tests {
                 assert_eq!(path, "out.csv");
                 let sel = query.as_simple_select().expect("simple select");
                 assert_eq!(sel.items.len(), 1);
-                assert!(matches!(p.arena.get(sel.items[0].expr), Expr::Star { qualifier: None }));
+                assert!(matches!(
+                    p.arena.get(sel.items[0].expr),
+                    Expr::Star { qualifier: None, .. }
+                ));
                 match &sel.from {
                     Some(FromItem::Table { name, alias }) => {
                         assert_eq!(name, "t");

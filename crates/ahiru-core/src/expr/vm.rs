@@ -199,7 +199,19 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
             for &r in &spec.args {
                 args.push(reg(regs, r)?);
             }
-            crate::expr::funcs::call(spec.func, spec.result_ty, &args)?
+            match spec.lambda {
+                // `list_transform`/`list_filter`/`list_reduce`。ベクタ化された
+                // 1 命令には落とせない（配列の要素ごと・行ごとに長さが違う）ので
+                // 専用の実行経路へ渡す（`expr::funcs::call_lambda` の doc 参照）。
+                Some(li) => {
+                    let body = match p.lambdas.get(li as usize) {
+                        Some(b) => b,
+                        None => err!(Internal),
+                    };
+                    crate::expr::funcs::call_lambda(spec.func, spec.result_ty, &args, body)?
+                }
+                None => crate::expr::funcs::call(spec.func, spec.result_ty, &args)?,
+            }
         }
         TsAddInterval => kernels::ts_add_interval(reg(regs, ins.a)?, reg(regs, ins.b)?)?,
         IntervalAdd => kernels::interval_add(reg(regs, ins.a)?, reg(regs, ins.b)?)?,

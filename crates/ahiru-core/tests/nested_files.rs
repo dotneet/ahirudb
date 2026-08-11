@@ -211,7 +211,8 @@ fn list_column_survives_page_pruning_on_a_sibling_column() {
     fmt.resolve(&src).unwrap().unwrap();
 
     let projection = vec![0usize, 1];
-    let pruners = vec![Pruner { column: 0, op: PruneOp::Eq, value: Value::I32(1234) }];
+    let pruners =
+        vec![Pruner { column: 0, op: PruneOp::Eq, value: Value::I32(1234), in_values: Vec::new() }];
 
     assert!(fmt.may_match(0, &pruners, &projection));
     let mut idx_ranges = Vec::new();

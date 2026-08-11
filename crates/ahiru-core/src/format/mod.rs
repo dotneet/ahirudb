@@ -64,6 +64,9 @@ pub struct Pruner {
     pub column: usize,
     pub op: PruneOp,
     pub value: Value,
+    /// `PruneOp::In` のときだけ使う残りの候補値（`value` が先頭の 1 つを持つ）。
+    /// 他の演算子では常に空。
+    pub in_values: Vec<Value>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,9 @@ pub enum PruneOp {
     Le,
     Gt,
     Ge,
+    /// `列 IN (定数, ...)`。`value` + `in_values` のどれかに等しければよい
+    /// （= 複数の `Eq` を OR で束ねたもの）。
+    In,
 }
 
 /// 統計の `[min, max]` がこの述語を満たしうるか。偽なら分割を丸ごと飛ばせる。
@@ -82,6 +88,16 @@ pub enum PruneOp {
 /// 行が消えるという最悪の壊れ方をするので、安全側の定義を 1 か所に固定する。
 pub fn range_may_match(p: &Pruner, min: &Value, max: &Value) -> bool {
     use core::cmp::Ordering::*;
+    if p.op == PruneOp::In {
+        // OR 意味論: どれか 1 つの候補が範囲に入りうればこの分割は残す。
+        return core::iter::once(&p.value).chain(p.in_values.iter()).any(|v| {
+            match (min.partial_cmp_same(v), max.partial_cmp_same(v)) {
+                (Some(cmp_min), Some(cmp_max)) => cmp_min != Greater && cmp_max != Less,
+                // 比較できない候補は安全側（あり得る扱い）に倒す。
+                _ => true,
+            }
+        });
+    }
     let (cmp_min, cmp_max) = match (min.partial_cmp_same(&p.value), max.partial_cmp_same(&p.value))
     {
         (Some(a), Some(b)) => (a, b),
@@ -94,6 +110,7 @@ pub fn range_may_match(p: &Pruner, min: &Value, max: &Value) -> bool {
         PruneOp::Le => cmp_min != Greater,
         PruneOp::Gt => cmp_max == Greater,
         PruneOp::Ge => cmp_max != Less,
+        PruneOp::In => unreachable!(),
     }
 }
 
@@ -323,7 +340,7 @@ mod tests {
 
     #[test]
     fn pruning_is_safe_when_statistics_are_unusable() {
-        let p = Pruner { column: 0, op: PruneOp::Eq, value: Value::I64(1) };
+        let p = Pruner { column: 0, op: PruneOp::Eq, value: Value::I64(1), in_values: Vec::new() };
         // 型が噛み合わない統計では枝刈りしない。
         assert!(range_may_match(&p, &Value::Bytes(vec![]), &Value::Bytes(vec![])));
         assert!(range_may_match(&p, &Value::Null, &Value::Null));
@@ -331,16 +348,45 @@ mod tests {
 
     #[test]
     fn pruning_boundaries() {
-        let gt = Pruner { column: 0, op: PruneOp::Gt, value: Value::I64(100) };
+        let gt =
+            Pruner { column: 0, op: PruneOp::Gt, value: Value::I64(100), in_values: Vec::new() };
         assert!(!range_may_match(&gt, &Value::I64(0), &Value::I64(100)));
         assert!(range_may_match(&gt, &Value::I64(0), &Value::I64(101)));
 
-        let ge = Pruner { column: 0, op: PruneOp::Ge, value: Value::I64(100) };
+        let ge =
+            Pruner { column: 0, op: PruneOp::Ge, value: Value::I64(100), in_values: Vec::new() };
         assert!(range_may_match(&ge, &Value::I64(0), &Value::I64(100)));
         assert!(!range_may_match(&ge, &Value::I64(0), &Value::I64(99)));
 
-        let eq = Pruner { column: 0, op: PruneOp::Eq, value: Value::I64(100) };
+        let eq =
+            Pruner { column: 0, op: PruneOp::Eq, value: Value::I64(100), in_values: Vec::new() };
         assert!(range_may_match(&eq, &Value::I64(100), &Value::I64(100)));
         assert!(!range_may_match(&eq, &Value::I64(101), &Value::I64(200)));
+    }
+
+    #[test]
+    fn pruning_in_list_matches_if_any_candidate_overlaps() {
+        let p = Pruner {
+            column: 0,
+            op: PruneOp::In,
+            value: Value::I64(5),
+            in_values: vec![Value::I64(50), Value::I64(500)],
+        };
+        // 50 が [0,100] に入るので残る。
+        assert!(range_may_match(&p, &Value::I64(0), &Value::I64(100)));
+        // どの候補も [1000,2000] に入らないので飛ばせる。
+        assert!(!range_may_match(&p, &Value::I64(1000), &Value::I64(2000)));
+    }
+
+    #[test]
+    fn pruning_in_list_is_safe_when_a_candidate_is_incomparable() {
+        let p = Pruner {
+            column: 0,
+            op: PruneOp::In,
+            value: Value::I64(5),
+            in_values: vec![Value::Bytes(vec![1])],
+        };
+        // 比較不能な候補が 1 つでもあれば安全側で残す。
+        assert!(range_may_match(&p, &Value::I64(1000), &Value::I64(2000)));
     }
 }

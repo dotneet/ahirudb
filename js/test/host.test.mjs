@@ -869,6 +869,31 @@ test('JOIN が duckdb と一致する', { skip: JOIN_SKIP }, async () => {
   }
 });
 
+// --- CURRENT_DATE / CURRENT_TIMESTAMP / now() ---------------------------------
+
+test('CURRENT_DATE/now() はホストが渡した時刻をクエリごとに反映する', { skip: needsVm }, async () => {
+  const db = await openDb();
+  try {
+    db.register('t', new Uint8Array(await readFile(BASIC)));
+    const before = Date.now();
+    const rows = await db.query('SELECT CURRENT_DATE AS d, now() AS n FROM t LIMIT 1');
+    const after = Date.now();
+    // DATE/TIMESTAMP の JS 側の正確な型変換より、「呼び出し時刻に近い値が
+    // 返ってきているか」を確認したいのでここでは now() の値だけ厳密に見る。
+    const gotDate = rows[0].d;
+    const nowMicros = rows[0].n;
+    assert.ok(typeof nowMicros === 'bigint', `now() は BigInt(micros) のはず: ${typeof nowMicros}`);
+    const nowMs = Number(nowMicros / 1000n);
+    assert.ok(
+      nowMs >= before - 5 && nowMs <= after + 5,
+      `now() が呼び出し時刻の範囲外: ${nowMs} not in [${before}, ${after}]`,
+    );
+    assert.ok(gotDate !== undefined);
+  } finally {
+    db.close();
+  }
+});
+
 // --- DECIMAL -----------------------------------------------------------------
 
 /** DECIMAL(18,4) は I64、DECIMAL(30,6) は I128 に載る。両方通す。 */

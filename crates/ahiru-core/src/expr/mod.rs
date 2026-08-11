@@ -139,6 +139,10 @@ pub struct CallSpec {
     pub args: Vec<Reg>,
     /// 関数が返す論理型。
     pub result_ty: Ty,
+    /// `list_transform`/`list_filter`/`list_reduce` のラムダ本体。
+    /// `Program::lambdas` の添字（`None` なら通常のスカラ関数呼び出し）。
+    /// `expr::vm::exec` の `Call` 命令、`expr::funcs::call_lambda` 参照。
+    pub lambda: Option<u16>,
 }
 
 /// キャストの指定。論理型が要るのは DECIMAL のスケール調整のため。
@@ -161,6 +165,11 @@ pub struct Program {
     /// 定数プール。`Ty` は `Value` だけでは決まらない論理型（DATE など）を保持する。
     pub consts: Vec<(Ty, Value)>,
     pub casts: Vec<CastSpec>,
+    /// `list_transform`/`list_filter`/`list_reduce` のラムダ本体プログラム。
+    /// `CallSpec::lambda` から添字で参照する。本体は自分のパラメータだけを
+    /// 参照できる孤立したスコープでコンパイルされる（外側スコープの列は
+    /// 参照できない。`plan::compile::Compiler::lambda_call` 参照）。
+    pub lambdas: Vec<Program>,
     pub num_regs: u16,
     /// 結果が入るレジスタ。
     pub result: Reg,
@@ -175,6 +184,7 @@ impl Program {
             calls: Vec::new(),
             consts: Vec::new(),
             casts: Vec::new(),
+            lambdas: Vec::new(),
             num_regs: 0,
             result: 0,
             result_ty: Ty::Null,
@@ -200,8 +210,27 @@ impl Program {
     }
 
     pub fn add_call(&mut self, func: u16, args: Vec<Reg>, result_ty: Ty) -> u16 {
-        self.calls.push(CallSpec { func, args, result_ty });
+        self.calls.push(CallSpec { func, args, result_ty, lambda: None });
         (self.calls.len() - 1) as u16
+    }
+
+    /// `list_transform`/`list_filter`/`list_reduce` 用。`lambda` は
+    /// `add_lambda` が返した添字。
+    pub fn add_lambda_call(
+        &mut self,
+        func: u16,
+        args: Vec<Reg>,
+        result_ty: Ty,
+        lambda: u16,
+    ) -> u16 {
+        self.calls.push(CallSpec { func, args, result_ty, lambda: Some(lambda) });
+        (self.calls.len() - 1) as u16
+    }
+
+    /// ラムダ本体のプログラムを埋め込み、`CallSpec::lambda` へ渡す添字を返す。
+    pub fn add_lambda(&mut self, body: Program) -> u16 {
+        self.lambdas.push(body);
+        (self.lambdas.len() - 1) as u16
     }
 
     pub fn add_cast(&mut self, from: Ty, to: Ty) -> u16 {

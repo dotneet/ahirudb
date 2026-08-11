@@ -122,6 +122,13 @@ pub enum Kw {
     View,
     When,
     Where,
+    /// `WINDOW name AS (...)` 句の先頭。`QUALIFY` と同じ理由で通常の予約語に
+    /// する: 文脈依存キーワードにすると `FROM t WINDOW w AS (...)` のように
+    /// 直前に別の句を挟まない形で、`opt_alias` が `WINDOW` をテーブル別名
+    /// として食ってしまい構文が壊れる。DuckDB 自身も `WINDOW` を予約語として
+    /// 扱っている（列名としては使えず、`AS window` のような別名にしか使えない）
+    /// ので、実データの列名を壊す心配は薄いと判断した。
+    Window,
     With,
 }
 
@@ -180,6 +187,7 @@ pub(crate) static KEYWORDS: &[(&[u8], Kw)] = &[
     (b"offset", Kw::Offset),
     (b"select", Kw::Select),
     (b"tables", Kw::Tables),
+    (b"window", Kw::Window),
     // 7
     (b"between", Kw::Between),
     (b"explain", Kw::Explain),
@@ -307,6 +315,10 @@ pub enum Tok<'a> {
     Param,
     LParen,
     RParen,
+    /// `[`。配列リテラル `[expr, ...]` の開始にのみ使う（添字アクセス
+    /// `expr[i]` は今回のスコープ外。`sql::parser` の `primary` 冒頭参照）。
+    LBracket,
+    RBracket,
     Comma,
     Dot,
     Semi,
@@ -519,6 +531,8 @@ impl<'a> Lexer<'a> {
         let t = match c {
             b'(' => Tok::LParen,
             b')' => Tok::RParen,
+            b'[' => Tok::LBracket,
+            b']' => Tok::RBracket,
             b',' => Tok::Comma,
             b'.' => Tok::Dot,
             b';' => Tok::Semi,

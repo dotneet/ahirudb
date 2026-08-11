@@ -384,7 +384,7 @@ impl TableFormat for ParquetFormat {
             if let Some(r) = cc.column_index_range() {
                 out.push(r);
             }
-            if p.op == PruneOp::Eq {
+            if p.op == PruneOp::Eq || p.op == PruneOp::In {
                 if let Ok(meta) = self.chunk(split, col) {
                     if let Some(r) = meta.bloom_filter_probe_range() {
                         out.push(r);
@@ -422,11 +422,12 @@ impl TableFormat for ParquetFormat {
             return Ok(true);
         }
 
-        // 1) Bloom フィルタ: 等号 pruner の値が確実に無いなら分割ごと落とす。
+        // 1) Bloom フィルタ: 等号・IN pruner の値が確実に無いなら分割ごと落とす。
         //    RowGroup 統計の min/max では拾えない「範囲は広いが実際の値は
-        //    疎」なケースを追加で拾える。
+        //    疎」なケースを追加で拾える。IN は「候補のどれかが存在すれば残す」
+        //    という OR 判定になる。
         for p in pruners {
-            if p.op != PruneOp::Eq {
+            if p.op != PruneOp::Eq && p.op != PruneOp::In {
                 continue;
             }
             let Some(&col) = projection.get(p.column) else { continue };
@@ -454,10 +455,23 @@ impl TableFormat for ParquetFormat {
             let type_length =
                 self.file().ok().and_then(|f| f.schema.columns.get(col)).map(|d| d.type_length);
             let Some(type_length) = type_length else { continue };
-            let Some(key) = plain_encode_for_bloom(ptype, type_length, desc_ty, &p.value) else {
-                continue;
-            };
-            if !bf.contains(&key) {
+
+            // 候補全部がエンコードできて、かつ全部フィルタに無いと分かって
+            // 初めて分割を落とせる。1 つでもエンコードできない候補があれば
+            // 「あり得る」扱いにして安全側に倒す。
+            let mut any_maybe_present = false;
+            let mut all_encoded = true;
+            for v in core::iter::once(&p.value).chain(p.in_values.iter()) {
+                let Some(key) = plain_encode_for_bloom(ptype, type_length, desc_ty, v) else {
+                    all_encoded = false;
+                    break;
+                };
+                if bf.contains(&key) {
+                    any_maybe_present = true;
+                    break;
+                }
+            }
+            if all_encoded && !any_maybe_present {
                 return Ok(false);
             }
         }
@@ -919,7 +933,12 @@ mod tests {
         let mut src = resolve_remote(&mut fmt, &bytes);
 
         let projection = vec![0usize, 1]; // id, s
-        let pruners = vec![Pruner { column: 0, op: PruneOp::Eq, value: Value::I32(12345) }];
+        let pruners = vec![Pruner {
+            column: 0,
+            op: PruneOp::Eq,
+            value: Value::I32(12345),
+            in_values: Vec::new(),
+        }];
 
         assert!(fmt.may_match(0, &pruners, &projection));
 
@@ -972,7 +991,12 @@ mod tests {
         let mut src = resolve_remote(&mut fmt, &bytes);
 
         let projection = vec![0usize];
-        let pruners = vec![Pruner { column: 0, op: PruneOp::Eq, value: Value::I32(999_999_999) }];
+        let pruners = vec![Pruner {
+            column: 0,
+            op: PruneOp::Eq,
+            value: Value::I32(999_999_999),
+            in_values: Vec::new(),
+        }];
 
         let mut idx_ranges = Vec::new();
         fmt.index_ranges(0, &pruners, &projection, &mut idx_ranges).unwrap();
@@ -980,6 +1004,72 @@ mod tests {
 
         let keep = fmt.refine_with_index(&src, 0, &pruners, &projection).unwrap();
         assert!(!keep, "an absent value must let the whole split be skipped");
+    }
+
+    #[test]
+    fn in_predicate_skips_the_split_when_every_candidate_is_absent() {
+        // `IN` は複数候補の OR なので、全候補が「無い」と分かって初めて
+        // 分割を落とせる。全候補を範囲外の値にして確認する。
+        let bytes = pagetest_bytes();
+        let mut fmt = ParquetFormat::new();
+        let mut src = resolve_remote(&mut fmt, &bytes);
+
+        let projection = vec![0usize];
+        let pruners = vec![Pruner {
+            column: 0,
+            op: PruneOp::In,
+            value: Value::I32(999_999_999),
+            in_values: vec![Value::I32(999_999_998), Value::I32(-1)],
+        }];
+
+        let mut idx_ranges = Vec::new();
+        fmt.index_ranges(0, &pruners, &projection, &mut idx_ranges).unwrap();
+        fetch_missing(&mut src, &bytes, &idx_ranges);
+
+        let keep = fmt.refine_with_index(&src, 0, &pruners, &projection).unwrap();
+        assert!(!keep, "all candidates absent must let the whole split be skipped");
+    }
+
+    #[test]
+    fn in_predicate_keeps_the_split_when_one_candidate_is_present() {
+        // 候補の 1 つだけが実在する値なら、他が全部無くても分割は残す。
+        let bytes = pagetest_bytes();
+        let mut fmt = ParquetFormat::new();
+        let mut src = resolve_remote(&mut fmt, &bytes);
+
+        let projection = vec![0usize, 1];
+        let pruners = vec![Pruner {
+            column: 0,
+            op: PruneOp::In,
+            value: Value::I32(999_999_999),
+            in_values: vec![Value::I32(12345), Value::I32(-1)],
+        }];
+
+        assert!(fmt.may_match(0, &pruners, &projection));
+
+        let mut idx_ranges = Vec::new();
+        fmt.index_ranges(0, &pruners, &projection, &mut idx_ranges).unwrap();
+        fetch_missing(&mut src, &bytes, &idx_ranges);
+
+        let keep = fmt.refine_with_index(&src, 0, &pruners, &projection).unwrap();
+        assert!(keep, "a present candidate must keep the split");
+
+        let mut data_ranges = Vec::new();
+        fmt.split_ranges(0, &projection, &mut data_ranges).unwrap();
+        let data_bytes = fetch_missing(&mut src, &bytes, &data_ranges);
+
+        let cols = fmt.read_split(&src, 0, &projection).unwrap();
+        let hit = (0..cols[0].len()).find(|&i| cols[0].value_at(i) == Value::I32(12345));
+        let hit = hit.expect("id=12345 must be present in the selected pages");
+        assert_eq!(cols[1].value_at(hit), Value::Bytes(b"v12345".to_vec()));
+
+        let full_id = fmt.chunk(0, 0).unwrap().total_compressed_size as u64;
+        let full_s = fmt.chunk(0, 1).unwrap().total_compressed_size as u64;
+        let full_total = full_id + full_s;
+        assert!(
+            data_bytes * 10 < full_total,
+            "IN pruning should still narrow to page granularity: fetched {data_bytes} of {full_total} bytes total"
+        );
     }
 
     #[test]
@@ -1011,8 +1101,8 @@ mod tests {
         let mut src = resolve_remote(&mut fmt, &bytes);
         let projection = vec![0usize, 1];
         let pruners = vec![
-            Pruner { column: 0, op: PruneOp::Ge, value: Value::I32(12_000) },
-            Pruner { column: 0, op: PruneOp::Le, value: Value::I32(12_010) },
+            Pruner { column: 0, op: PruneOp::Ge, value: Value::I32(12_000), in_values: Vec::new() },
+            Pruner { column: 0, op: PruneOp::Le, value: Value::I32(12_010), in_values: Vec::new() },
         ];
         assert!(fmt.may_match(0, &pruners, &projection));
         let mut idx_ranges = Vec::new();
@@ -1056,7 +1146,12 @@ mod tests {
         }
 
         let projection = vec![0usize];
-        let pruners = vec![Pruner { column: 0, op: PruneOp::Eq, value: Value::I32(12345) }];
+        let pruners = vec![Pruner {
+            column: 0,
+            op: PruneOp::Eq,
+            value: Value::I32(12345),
+            in_values: Vec::new(),
+        }];
         assert!(fmt.may_match(0, &pruners, &projection));
 
         let mut idx_ranges = Vec::new();
@@ -1089,7 +1184,12 @@ mod tests {
         fmt.resolve(&full_src).unwrap().unwrap();
 
         let projection = vec![0usize];
-        let pruners = vec![Pruner { column: 0, op: PruneOp::Eq, value: Value::I32(12345) }];
+        let pruners = vec![Pruner {
+            column: 0,
+            op: PruneOp::Eq,
+            value: Value::I32(12345),
+            in_values: Vec::new(),
+        }];
         let mut idx_ranges = Vec::new();
         fmt.index_ranges(0, &pruners, &projection, &mut idx_ranges).unwrap();
         assert!(!idx_ranges.is_empty());

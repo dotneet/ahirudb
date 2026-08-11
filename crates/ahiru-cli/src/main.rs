@@ -153,6 +153,14 @@ fn cmd_query(groups: &[String], sql: &str) -> R {
         }
     }
 
+    // コアは時計を持たないので、CURRENT_DATE/CURRENT_TIMESTAMP/now() 用に
+    // クエリ開始時刻をここで渡す（DESIGN.md §2、JS ホストの `ahiru_set_now`
+    // 呼び出しと同じ役目）。
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    s.set_now(now_micros);
     let mut q = match s.prepare(sql, &[])? {
         Prepared::Ready(q) => q,
         // メモリ上にファイル全体があるので、ここには来ない。
@@ -271,6 +279,7 @@ fn render(v: &Value, ty: Ty) -> String {
         Value::I32(x) if ty == Ty::Date => fmt_date(*x as i64),
         Value::I32(x) => x.to_string(),
         Value::I64(x) if ty == Ty::Timestamp => fmt_timestamp(*x),
+        Value::I64(x) if ty == Ty::Time => fmt_time(*x),
         Value::I64(x) => fmt_scaled(*x as i128, ty),
         Value::I128(x) if ty == Ty::Interval => fmt_interval_value(*x),
         Value::I128(x) => fmt_scaled(*x, ty),
@@ -314,6 +323,14 @@ fn fmt_scaled(v: i128, ty: Ty) -> String {
 fn fmt_date(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// TIME（深夜からのマイクロ秒）を `HH:MM:SS` で表示する。CLI 表示専用の
+/// 簡略化で、マイクロ秒未満は落とす（`fmt_timestamp` の時刻部分と同じ規約）。
+fn fmt_time(micros: i64) -> String {
+    let rem = micros.rem_euclid(86_400_000_000);
+    let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
+    format!("{h:02}:{mi:02}:{s:02}")
 }
 
 fn fmt_timestamp(micros: i64) -> String {

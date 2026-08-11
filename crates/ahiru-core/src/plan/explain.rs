@@ -149,6 +149,16 @@ fn walk(n: &Node, depth: usize, out: &mut Vec<String>) {
             out.push(line);
             walk(input, depth + 1, out);
         }
+        Node::GenerateSeries { .. } => {
+            line.push_str("GenerateSeries");
+            out.push(line);
+        }
+        Node::Sample { input, spec } => {
+            line.push_str(if spec.is_rows { "Sample  rows=" } else { "Sample  percent=" });
+            push_u64(&mut line, spec.amount as u64);
+            out.push(line);
+            walk(input, depth + 1, out);
+        }
     }
 }
 

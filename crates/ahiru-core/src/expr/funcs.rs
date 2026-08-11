@@ -41,9 +41,10 @@
 //! エポックマイクロ秒を渡す ABI（例: `ahiru_set_now(i64)`）を足すまでは
 //! 未対応のままにする。
 
-use crate::expr::{kernels, regex, OpCode};
+use crate::expr::vm::Vm;
+use crate::expr::{kernels, regex, OpCode, Program};
 use crate::prelude::*;
-use crate::vector::{Bitmap, BytesData, Data, PhysType, Ty, Vector};
+use crate::vector::{Batch, Bitmap, BytesData, Data, PhysType, Ty, Value, Vector};
 
 pub type FuncId = u16;
 
@@ -67,6 +68,8 @@ const F_STRFTIME: FuncId = 13;
 const F_CONCAT: FuncId = 14;
 const F_REGEXP_EXTRACT: FuncId = 15;
 const F_REGEXP_REPLACE: FuncId = 16;
+const F_PRINTF: FuncId = 17;
+const F_FORMAT: FuncId = 18;
 
 // 整数出力（I32 = DATE、I64 = BIGINT / TIMESTAMP）
 const F_LENGTH: FuncId = 20;
@@ -88,6 +91,11 @@ const F_STARTS_WITH: FuncId = 40;
 const F_ENDS_WITH: FuncId = 41;
 const F_CONTAINS: FuncId = 42;
 const F_REGEXP_MATCHES: FuncId = 43;
+const F_GLOB: FuncId = 44;
+/// `SIMILAR TO` の実体。`sql::parser` が `x SIMILAR TO y` をこの名前の
+/// 関数呼び出しへ脱糖する（`Expr::Like` のような専用 AST ノードは増やさず、
+/// 既存の関数呼び出し経路だけで完結させるため）。
+const F_REGEXP_FULL_MATCH: FuncId = 45;
 
 // 浮動小数出力
 const F_ABS_F: FuncId = 50;
@@ -121,6 +129,15 @@ const F_LIST_EXTRACT: FuncId = 84;
 const F_MAP_EXTRACT: FuncId = 85;
 const F_JSON_OBJECT: FuncId = 86;
 const F_JSON_ARRAY: FuncId = 87;
+// `list_transform`/`list_filter`/`list_reduce`。通常のスカラ関数と違い
+// `plan::compile::Compiler::lambda_call` が `resolve`/`call` を経由せず直接
+// この ID を使ってコンパイルする（第 2 引数がラムダで通常の `Ty` を持たない
+// ため）。実行は `call` ではなく `call_lambda`（`expr::vm::exec` の `Call`
+// 命令、`CallSpec::lambda` 参照）。`pub(crate)` なのは `plan::compile` から
+// 直接参照するため。
+pub(crate) const F_LIST_TRANSFORM: FuncId = 88;
+pub(crate) const F_LIST_FILTER: FuncId = 89;
+pub(crate) const F_LIST_REDUCE: FuncId = 91;
 
 // JSON（整数出力）
 const F_JSON_ARRAY_LENGTH: FuncId = 90;
@@ -220,6 +237,30 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "regexp_extract" => fixed(F_REGEXP_EXTRACT, &[Varchar, Varchar, BigInt], n, 2, Varchar),
         "regexp_replace" => {
             fixed(F_REGEXP_REPLACE, &[Varchar, Varchar, Varchar, Varchar], n, 3, Varchar)
+        }
+        // `SIMILAR TO` の脱糖先（`sql::parser::Parser::similar_to`）。パターンは
+        // `^(?:...)$` に包んで `expr::regex` の既存エンジンへそのまま渡す
+        // （対応構文・ステップ数上限はそちらのモジュール doc 参照。新しい
+        // 正規表現エンジンは書かない）。DuckDB もパターン構文としては同じ
+        // ものを使う（`_`/`%` は POSIX 正規表現では特別扱いされない）。
+        "regexp_full_match" => fixed(F_REGEXP_FULL_MATCH, &[Varchar, Varchar], n, 2, Boolean),
+        // `GLOB` 演算子（`sql::parser::expr_body` が脱糖する）。シェルの
+        // グロブパターン（`*` `?` `[...]`）で完全一致するかどうか。対応構文は
+        // `glob_match` のコメント参照。
+        "glob" => fixed(F_GLOB, &[Varchar, Varchar], n, 2, Boolean),
+        // `printf`/`format` は対応する書式指定子の範囲が違う（printf: `%`
+        // 書式、format: `{}` プレースホルダ）ので ID を分ける。1 個目の
+        // 引数（書式文字列）だけ VARCHAR に固定し、残りは元の型のまま渡す
+        // （`json_array`/`greatest` と同じ「型ごとの分岐は実行時に」方針。
+        // 書式文字列は定数とは限らないので、`resolve` の時点では指定子の
+        // 個数も種類も分からない）。対応範囲は `printf_scan`/`format_scan`
+        // のコメント参照。
+        "printf" | "format" => {
+            ensure!(n >= 1, WrongArgCount);
+            let mut want = vec![Varchar];
+            want.extend_from_slice(&args[1..]);
+            let id = if lower == "printf" { F_PRINTF } else { F_FORMAT };
+            Ok((id, want, Varchar))
         }
 
         // --- 数値 -----------------------------------------------------------
@@ -449,6 +490,11 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
         F_REGEXP_MATCHES => return regex::eval_matches(args),
         F_REGEXP_EXTRACT => return regex::eval_extract(args),
         F_REGEXP_REPLACE => return regex::eval_replace(args),
+        // `SIMILAR TO`（`regexp_full_match`）も同じ理由でパターン列のコンパイル
+        // をキャッシュしたいので、専用関数へ渡す（`regexp_full_match_build`
+        // 参照。実体は `regex::eval_matches` とほぼ同じで、パターンをアンカー
+        // で包む点だけが違う）。
+        F_REGEXP_FULL_MATCH => return regexp_full_match_build(args),
         // `json_array`/`json_object` も NULL 引数を読み飛ばさず JSON `null`
         // として埋め込む（`concat` と同じ理由で既定の NULL 伝播から外す）ので
         // 専用関数へ渡す。
@@ -866,6 +912,253 @@ fn json_object_build(args: &[&Vector]) -> Result<Vector> {
 }
 
 // =========================================================================
+// SIMILAR TO（regexp_full_match）
+// =========================================================================
+
+/// パターンを `^(?:...)$` で包む。`SIMILAR TO` は部分一致ではなく完全一致を
+/// 要求する（`duckdb -c "select 'abc' similar to 'a.c', 'Xabc' similar to
+/// 'a.c'"` で確認済み: 前者は true、後者は false）ので、`expr::regex` の
+/// 既存アンカー (`^`/`$`) に載せ替えるだけで済む。新しい正規表現エンジンは
+/// 書かない。
+fn wrap_full_match(pattern: &[u8]) -> Vec<u8> {
+    let mut w = Vec::with_capacity(pattern.len() + 6);
+    w.extend_from_slice(b"^(?:");
+    w.extend_from_slice(pattern);
+    w.extend_from_slice(b")$");
+    w
+}
+
+/// `SIMILAR TO`（`regexp_full_match`）。`regex::eval_matches` とほぼ同じ形
+/// （パターン列が定数ならバッチ内で 1 回だけコンパイルする）だが、包んだ
+/// パターンを渡す点だけが違うので、`expr::regex` 側は一切変更しない。
+/// `regex::compile`/`is_match` が持つステップ数上限（ReDoS 対策）・
+/// パターン長上限は、包んだ後の文字列にもそのままかかる。
+fn regexp_full_match_build(args: &[&Vector]) -> Result<Vector> {
+    ensure!(args.len() == 2, WrongArgCount);
+    let (n, s) = strides(args)?;
+    let valid = combine(args, &s, n);
+    let live = |i: usize| valid.as_ref().is_none_or(|b| b.get(i));
+    let (sv, pv) = (args[0], args[1]);
+    let pat_const = s[1] == 0;
+    let cached = if pat_const && n > 0 && pv.is_valid(0) {
+        Some(regex::compile(&wrap_full_match(pv.bytes().get(0)))?)
+    } else {
+        None
+    };
+    let mut bits = Bitmap::with_capacity(n);
+    for i in 0..n {
+        if !live(i) {
+            bits.push(false);
+            continue;
+        }
+        let compiled;
+        let prog = match &cached {
+            Some(p) => p,
+            None => {
+                compiled = regex::compile(&wrap_full_match(pv.bytes().get(i * s[1])))?;
+                &compiled
+            }
+        };
+        bits.push(regex::is_match(prog, sv.bytes().get(i * s[0]))?);
+    }
+    let mut out = Vector::from_data(Ty::Boolean, Data::Bool(bits), valid);
+    out.compact_validity();
+    Ok(out)
+}
+
+// =========================================================================
+// list_transform / list_filter / list_reduce
+// =========================================================================
+//
+// ラムダ本体は行ごと・配列要素ごとに評価する必要があり、ベクタ化された
+// 1 命令には落とせない。`ddl`/`dml` が「1 行だけのバッチを作って `Vm::eval`
+// に通す」のと同じ発想で、配列の要素数ぶんだけ小さな 1 行バッチを作って
+// `body`（`plan::compile::Compiler::lambda_call` がコンパイル済み）を
+// 繰り返し評価する。
+//
+// パラメータの型は常に `Ty::Json`（`list_extract` の結果と同じ）。JSON の
+// `null` はリスト要素の SQL NULL 表現（`json_array`/`list_value` が NULL
+// 引数をそう埋め込む。モジュール冒頭 doc 参照）なので、そのまま SQL NULL
+// として束縛する。
+
+/// 配列要素 1 個をラムダのパラメータ用の長さ 1 ベクタにする。
+fn lambda_param_vector(span: &[u8], kind: crate::json::Kind) -> Vector {
+    let mut v = Vector::new(Ty::Json);
+    if kind == crate::json::Kind::Null {
+        v.push_null();
+    } else {
+        v.push_value(&Value::Bytes(span.to_vec()));
+    }
+    v
+}
+
+/// `list_transform`/`list_filter`/`list_reduce` の実行本体。`expr::vm::exec`
+/// の `Call` 命令から、`CallSpec::lambda` が `Some` のときだけ呼ばれる
+/// （通常のスカラ関数は `call` のまま）。
+pub fn call_lambda(
+    func: FuncId,
+    result_ty: Ty,
+    args: &[&Vector],
+    body: &Program,
+) -> Result<Vector> {
+    if func == F_LIST_REDUCE {
+        return call_list_reduce(args, result_ty, body);
+    }
+    ensure!(func == F_LIST_TRANSFORM || func == F_LIST_FILTER, Internal);
+    ensure!(args.len() == 1, WrongArgCount);
+    let list = args[0];
+    let n = list.len();
+    let mut out = BytesData::with_capacity(n, n * 8);
+    let mut bad: Option<Bitmap> = None;
+    let mut vm = Vm::new();
+    let mut buf = Vec::new();
+    for i in 0..n {
+        if !list.is_valid(i) {
+            out.push_empty();
+            set_null(&mut bad, i, n);
+            continue;
+        }
+        let elems = match crate::json::array_elements(list.bytes().get(i))? {
+            Some(e) => e,
+            // 配列でない値は SQL NULL（`list_extract` 等、他の list_* 関数の
+            // 非配列に対する寛容な扱いに合わせる）。
+            None => {
+                out.push_empty();
+                set_null(&mut bad, i, n);
+                continue;
+            }
+        };
+        buf.clear();
+        buf.push(b'[');
+        let mut first = true;
+        for (span, kind) in elems {
+            let param = lambda_param_vector(span, kind);
+            let elem_batch = Batch::new(vec![param]);
+            let r = vm.eval(body, &elem_batch)?;
+            match func {
+                F_LIST_TRANSFORM => {
+                    if !first {
+                        buf.push(b',');
+                    }
+                    first = false;
+                    write_json_scalar(&r, 0, &mut buf);
+                }
+                F_LIST_FILTER => {
+                    // 述語は `plan::compile::Compiler::lambda_call` が
+                    // BOOLEAN/NULL であることを検査済み。NULL/FALSE は除外
+                    // （SQL の 3 値論理どおり、duckdb と同じ）。
+                    if r.is_valid(0) && matches!(r.data(), Data::Bool(b) if b.get(0)) {
+                        if !first {
+                            buf.push(b',');
+                        }
+                        first = false;
+                        buf.extend_from_slice(span);
+                    }
+                }
+                _ => err!(Internal),
+            }
+        }
+        buf.push(b']');
+        ensure!(out.data.len() + buf.len() <= u32::MAX as usize, LimitExceeded);
+        out.push(&buf);
+    }
+    let mut v =
+        Vector::from_data(result_ty, Data::Bytes(out), merge(list.validity().cloned(), bad));
+    v.compact_validity();
+    Ok(v)
+}
+
+/// `list_reduce(list, (acc, x) -> expr [, initial])`。
+///
+/// `initial` が無ければ先頭要素を初期アキュムレータにする（duckdb と同じ）。
+/// 空配列かつ `initial` も無い場合、duckdb はエラーにするがこの実装は他の
+/// list_* 関数と同じ「寛容に NULL へ丸める」方針を優先し SQL NULL を返す
+/// （既知の非互換）。累積のどこかで NULL になったら、以降は畳んでも結果が
+/// 変わらないので早期に打ち切る。
+fn call_list_reduce(args: &[&Vector], result_ty: Ty, body: &Program) -> Result<Vector> {
+    ensure!(!args.is_empty() && args.len() <= 2, WrongArgCount);
+    let (n, s) = strides(args)?;
+    let list = args[0];
+    let mut out = BytesData::with_capacity(n, n * 8);
+    let mut bad: Option<Bitmap> = None;
+    let mut vm = Vm::new();
+    let mut buf = Vec::new();
+    for i in 0..n {
+        let li = i * s[0];
+        if !list.is_valid(li) {
+            out.push_empty();
+            set_null(&mut bad, i, n);
+            continue;
+        }
+        let elems = match crate::json::array_elements(list.bytes().get(li))? {
+            Some(e) => e,
+            None => {
+                out.push_empty();
+                set_null(&mut bad, i, n);
+                continue;
+            }
+        };
+        let mut iter = elems.into_iter();
+        let mut acc: Option<Vec<u8>> = if args.len() >= 2 {
+            let init = args[1];
+            let ij = i * s[1];
+            if init.is_valid(ij) {
+                Some(init.bytes().get(ij).to_vec())
+            } else {
+                None
+            }
+        } else {
+            match iter.next() {
+                Some((span, kind)) => {
+                    if kind == crate::json::Kind::Null {
+                        None
+                    } else {
+                        Some(span.to_vec())
+                    }
+                }
+                None => {
+                    out.push_empty();
+                    set_null(&mut bad, i, n);
+                    continue;
+                }
+            }
+        };
+        for (span, kind) in iter {
+            let Some(acc_text) = acc.as_ref() else {
+                // 既に NULL。これ以降どう畳んでも NULL のままなので打ち切る。
+                break;
+            };
+            let mut acc_v = Vector::new(Ty::Json);
+            acc_v.push_value(&Value::Bytes(acc_text.clone()));
+            let x_v = lambda_param_vector(span, kind);
+            let batch = Batch::new(vec![acc_v, x_v]);
+            let r = vm.eval(body, &batch)?;
+            if !r.is_valid(0) {
+                acc = None;
+                break;
+            }
+            buf.clear();
+            write_json_scalar(&r, 0, &mut buf);
+            acc = Some(buf.clone());
+        }
+        match acc {
+            Some(text) => {
+                ensure!(out.data.len() + text.len() <= u32::MAX as usize, LimitExceeded);
+                out.push(&text);
+            }
+            None => {
+                out.push_empty();
+                set_null(&mut bad, i, n);
+            }
+        }
+    }
+    let mut v =
+        Vector::from_data(result_ty, Data::Bytes(out), merge(list.validity().cloned(), bad));
+    v.compact_validity();
+    Ok(v)
+}
+
+// =========================================================================
 // 文字列（Bytes 出力）
 // =========================================================================
 
@@ -1152,9 +1445,296 @@ fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                 None => Ok(false),
             };
         }
+        // NULL 伝播は呼び出し元の `call()`（`live(i)` 判定）に任せる既定どおり
+        // でよいので、`json_array`/`concat` と違い `call()` 直下へバイパス
+        // する必要が無い（可変長引数でも `A` は `args: &[&Vector]` 全体を
+        // 持っているので、`eval_str` の中だけで完結する）。対応する書式指定子
+        // は `printf_scan`/`format_scan` のコメント参照。
+        F_PRINTF => printf_scan(a.bytes(0), a, out)?,
+        F_FORMAT => format_scan(a.bytes(0), a, out)?,
         _ => err!(Internal),
     }
     Ok(true)
+}
+
+/// `printf` の最大精度（`%.<N>f` の `N`）。`kernels::fmt_int` の内部バッファ
+/// は 48 バイトしかないので、これを大きく超える scale を渡すとバッファ
+/// 添字が範囲外になる（=panic）。32 は安全側に十分な余裕を残した値。
+const MAX_PRINTF_PREC: u32 = 32;
+
+/// `printf`/`format` の幅指定の上限。悪意あるクエリが `%<巨大な数字>d` の
+/// ような幅を書いてメモリ・時間を食い潰さないための上限（`repeat`/`lpad`
+/// の `MAX_STR` と同じ動機）。
+const MAX_PRINTF_WIDTH: usize = 1 << 16;
+
+/// `printf(fmt, args...)`。C 由来の `%` 書式のうち、次だけに対応する:
+///
+/// - `%%`  リテラルの `%`
+/// - `%[-][0][<幅>]d`  整数。対応する実引数は BOOLEAN（0/1）・整数型。
+///   浮動小数は 0 方向へ切り捨てる。
+/// - `%[-][0][<幅>][.<精度>]f`  浮動小数点数の固定小数点表記。精度既定 6 桁
+///   （C の `printf` と同じ。`duckdb -c "select printf('%f', 3.5)"` が
+///   `3.500000` になることを確認済み）、`MAX_PRINTF_PREC` まで指定できる。
+/// - `%[-][<幅>]s`  `write_display` と同じ規則で文字列化する。
+///
+/// DuckDB との既知の違い: DuckDB は `%d` に FLOAT を、`%s` に INTEGER を
+/// 渡すとエラーにする（`fmt` ライブラリの型厳格性）が、ここでは実用上の
+/// 都合を優先してどちらも受け付ける（`%s` はどんな対応物理型でも文字列化
+/// する）。`%x`/`%o` などの基数変換、`*` による幅の実引数指定、`%1$d`
+/// 形式の引数番号付けは非対応（`UnsupportedFeature`）。指定子の数より
+/// 実引数が少なければ `WrongArgCount`（DuckDB と同じ。余った実引数は無視
+/// してよい: `duckdb -c "select printf('%d', 1, 2)"` は `1`）。
+fn printf_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
+    let mut ai = 1usize; // args[0] は fmt 自身
+    let mut i = 0usize;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            out.push(fmt[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        ensure!(i < fmt.len(), SyntaxError);
+        if fmt[i] == b'%' {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        let (mut left, mut zero) = (false, false);
+        loop {
+            match fmt.get(i) {
+                Some(b'-') => {
+                    left = true;
+                    i += 1;
+                }
+                Some(b'0') if !zero => {
+                    zero = true;
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        let mut width = 0usize;
+        while let Some(&b) = fmt.get(i) {
+            if !b.is_ascii_digit() {
+                break;
+            }
+            width = (width.saturating_mul(10) + (b - b'0') as usize).min(MAX_PRINTF_WIDTH);
+            i += 1;
+        }
+        let mut prec: u32 = 6;
+        if fmt.get(i) == Some(&b'.') {
+            i += 1;
+            prec = 0;
+            while let Some(&b) = fmt.get(i) {
+                if !b.is_ascii_digit() {
+                    break;
+                }
+                prec = (prec.saturating_mul(10) + (b - b'0') as u32).min(MAX_PRINTF_PREC);
+                i += 1;
+            }
+        }
+        ensure!(i < fmt.len(), SyntaxError);
+        let conv = fmt[i];
+        i += 1;
+        // 未対応の変換文字は、実引数が足りているかより先にチェックする
+        // （`%x` はいくら実引数を積んでも `UnsupportedFeature` であるべき）。
+        ensure!(matches!(conv, b'd' | b'f' | b's'), UnsupportedFeature);
+        ensure!(ai < a.n(), WrongArgCount);
+        let (v, row) = match a.at(ai) {
+            Some(x) => x,
+            None => err!(Internal),
+        };
+        ai += 1;
+        let mut body = Vec::new();
+        match conv {
+            b'd' => {
+                let x = numeric_i64(v, row)?;
+                kernels::fmt_int(x.unsigned_abs() as u128, x < 0, 0, &mut body);
+            }
+            b'f' => {
+                let x = numeric_f64(v, row)?;
+                fmt_fixed(x, prec as u8, &mut body);
+            }
+            b's' => write_display(v, row, &mut body)?,
+            _ => err!(UnsupportedFeature),
+        }
+        pad_field(out, &body, width, left, zero && conv != b's');
+    }
+    Ok(())
+}
+
+/// `format(fmt, args...)`。Python 風の `{}`/`{<n>}` プレースホルダのみ対応
+/// する（`{:.2f}` のような書式ミニ言語は非対応: `UnsupportedFeature`）。
+/// `{{`/`}}` はそれぞれリテラルの `{`/`}` になる
+/// （`duckdb -c "select format('{{literal}}')"` が `{literal}` になることを
+/// 確認済み）。値の文字列化は printf の `%s` と同じ `write_display` を使う
+/// （`format` には型ごとの指定子が無いので常にこれ 1 種類）。
+///
+/// `{}` は出現順に実引数を消費し、`{<n>}` は 0 始まりの明示添字（自動採番
+/// とは独立にカウントする）。指定子が指す実引数が無ければ `WrongArgCount`。
+fn format_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
+    let mut auto_idx = 0usize;
+    let mut i = 0usize;
+    while i < fmt.len() {
+        match fmt[i] {
+            b'{' if fmt.get(i + 1) == Some(&b'{') => {
+                out.push(b'{');
+                i += 2;
+            }
+            b'{' => {
+                i += 1;
+                let start = i;
+                while i < fmt.len() && fmt[i] != b'}' {
+                    ensure!(fmt[i].is_ascii_digit(), UnsupportedFeature);
+                    i += 1;
+                }
+                ensure!(i < fmt.len(), SyntaxError);
+                let idx = if start == i {
+                    let cur = auto_idx;
+                    auto_idx += 1;
+                    cur
+                } else {
+                    parse_format_index(&fmt[start..i])
+                };
+                i += 1; // '}'
+                let ai = idx.saturating_add(1); // args[0] は fmt 自身
+                ensure!(ai < a.n(), WrongArgCount);
+                let (v, row) = match a.at(ai) {
+                    Some(x) => x,
+                    None => err!(Internal),
+                };
+                write_display(v, row, out)?;
+            }
+            b'}' if fmt.get(i + 1) == Some(&b'}') => {
+                out.push(b'}');
+                i += 2;
+            }
+            b'}' => err!(SyntaxError),
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `{<digits>}` の添字部分を読む。桁あふれは飽和させる（後段の
+/// `ai < a.n()` チェックでどのみち `WrongArgCount` になるので、パースの
+/// 時点でオーバーフローを気にする必要は無い）。
+fn parse_format_index(digits: &[u8]) -> usize {
+    let mut v: usize = 0;
+    for &b in digits {
+        v = v.saturating_mul(10).saturating_add((b - b'0') as usize);
+    }
+    v
+}
+
+/// `%d`。BOOLEAN・整数型のみ対応。浮動小数は 0 方向へ切り捨てる
+/// （Rust の `f64 as i64` は範囲外を飽和させるだけで panic しない）。
+fn numeric_i64(v: &Vector, row: usize) -> Result<i64> {
+    Ok(match v.data() {
+        Data::Bool(b) => b.get(row) as i64,
+        Data::I32(d) => d[row] as i64,
+        Data::I64(d) => d[row],
+        Data::F64(d) => d[row] as i64,
+        Data::I128(_) | Data::Bytes(_) => err!(TypeMismatch),
+    })
+}
+
+/// `%f`。BOOLEAN・整数型・浮動小数に対応。
+fn numeric_f64(v: &Vector, row: usize) -> Result<f64> {
+    Ok(match v.data() {
+        Data::Bool(b) => b.get(row) as i64 as f64,
+        Data::I32(d) => d[row] as f64,
+        Data::I64(d) => d[row] as f64,
+        Data::F64(d) => d[row],
+        Data::I128(_) | Data::Bytes(_) => err!(TypeMismatch),
+    })
+}
+
+/// `%s`（printf）・`{}`（format）が使う汎用の文字列化。対応する物理型は
+/// BOOLEAN・整数（I32/I64）・浮動小数（F64）・バイト列（VARCHAR/JSON は
+/// そのまま出す）。DATE/TIME/TIMESTAMP/DECIMAL/INTERVAL/HUGEINT（物理型
+/// I128、または DECIMAL のスケール）は内部表現をそのまま数値として出す
+/// だけで、暦・小数点の変換はしない（範囲を絞る設計判断。カレンダー等の
+/// 表示が要る場合は呼び出し側で `CAST(.. AS VARCHAR)` してから渡すこと）。
+fn write_display(v: &Vector, row: usize, out: &mut Vec<u8>) -> Result<()> {
+    match v.data() {
+        Data::Bool(b) => out.extend_from_slice(if b.get(row) { b"true" } else { b"false" }),
+        Data::I32(d) => kernels::fmt_int(d[row].unsigned_abs() as u128, d[row] < 0, 0, out),
+        Data::I64(d) => kernels::fmt_int(d[row].unsigned_abs() as u128, d[row] < 0, 0, out),
+        Data::F64(d) => kernels::fmt_f64(d[row], out),
+        Data::Bytes(b) => out.extend_from_slice(b.get(row)),
+        Data::I128(_) => err!(UnsupportedFeature),
+    }
+    Ok(())
+}
+
+/// `%f` の固定小数点表記。`10^prec` 倍してから 0 から遠ざける丸めで整数化し
+/// `kernels::fmt_int` に渡す（`fmt_int` が小数点の挿入まで面倒を見てくれる）。
+/// `prec` は呼び出し元（`printf_scan`）が `MAX_PRINTF_PREC` 以下に丸め済み
+/// なので、`fmt_int` 内部バッファ（48 バイト）を溢れさせない。
+fn fmt_fixed(x: f64, prec: u8, out: &mut Vec<u8>) {
+    if x.is_nan() {
+        out.extend_from_slice(b"nan");
+        return;
+    }
+    let neg = x.is_sign_negative();
+    let ax = f_abs(x);
+    if ax.is_infinite() {
+        if neg {
+            out.push(b'-');
+        }
+        out.extend_from_slice(b"inf");
+        return;
+    }
+    let scaled = round_half_up(ax * pow10(prec as u32));
+    // u128 に収まらないほど巨大な値は諦めて簡易表記にフォールバックする
+    // （`fmt_int` へ渡す前に u128 のレンジ内であることを確認しておく）。
+    if scaled >= 1.0e33 {
+        if neg {
+            out.push(b'-');
+        }
+        kernels::fmt_f64(ax, out);
+        return;
+    }
+    kernels::fmt_int(scaled as u128, neg, prec, out);
+}
+
+/// 幅・0 埋め・左寄せを適用する（`%d`/`%f`/`%s` 共通）。`body` は変換済みの
+/// 中身（符号込み）。`%s` は多バイト文字を渡せるので、幅はコードポイント
+/// 単位で数える（`lpad`/`rpad` と同じ判断）。
+fn pad_field(out: &mut Vec<u8>, body: &[u8], width: usize, left: bool, zero: bool) {
+    let len = cp_count(body);
+    if len >= width {
+        out.extend_from_slice(body);
+        return;
+    }
+    let pad_n = width - len;
+    if left {
+        out.extend_from_slice(body);
+        for _ in 0..pad_n {
+            out.push(b' ');
+        }
+    } else if zero {
+        // 符号を残してから 0 を詰める（`-0003` のような形にする）。
+        let (sign, rest): (&[u8], &[u8]) = match body.first() {
+            Some(b'-') | Some(b'+') => (&body[..1], &body[1..]),
+            _ => (&body[..0], body),
+        };
+        out.extend_from_slice(sign);
+        for _ in 0..pad_n {
+            out.push(b'0');
+        }
+        out.extend_from_slice(rest);
+    } else {
+        for _ in 0..pad_n {
+            out.push(b' ');
+        }
+        out.extend_from_slice(body);
+    }
 }
 
 // =========================================================================
@@ -1167,8 +1747,130 @@ fn eval_bool(id: FuncId, a: &A) -> Result<Option<bool>> {
         F_STARTS_WITH => s.len() >= p.len() && &s[..p.len()] == p,
         F_ENDS_WITH => s.len() >= p.len() && &s[s.len() - p.len()..] == p,
         F_CONTAINS => find(s, p).is_some(),
+        // `glob_match` は `like_match` と同じ「直近の `*` を 1 個だけ覚える」
+        // 2 ポインタ法なので、正規表現のようなコンパイル・キャッシュは不要
+        // （呼び出しごとの `call()` 直下バイパスをしなくて済む理由）。
+        F_GLOB => glob_match(s, p),
         _ => err!(Internal),
     }))
+}
+
+/// シェルグロブパターン照合。DuckDB の `GLOB` 演算子と同じ意味（`duckdb`
+/// CLI で以下すべて確認済み）:
+///
+/// - `*` は 0 バイト以上、`?` はちょうど 1 バイトに一致する。
+/// - `[...]` は文字クラス。`[!...]` が否定（`[^...]` は否定にならず、
+///   「文字 `^` を含むクラス」になる。DuckDB もそう）。`a-z` のような範囲、
+///   先頭に置いた `]` はリテラルの `]`（`[]]` は `]` 1 文字に一致）に対応。
+/// - `\` は次の 1 バイトをそのままリテラル化する（`ESCAPE` 句という概念は
+///   無く、常時有効）。
+/// - 閉じ `]` の無い `[` は、それ以降のパターンをまるごと「絶対に一致しない
+///   要素」として扱う（DuckDB も同じ: `'a[bc' GLOB 'a[bc'` ですら false に
+///   なる＝ `[` はリテラルへフォールバックしない）。パニックはしない。
+///
+/// マルチバイト文字は他の文字列関数と違い**バイト単位**で扱う（`regexp`
+/// 系と同じ判断。文字クラスをコードポイント単位にするとコード量が増える
+/// わりに実利が薄い）。
+///
+/// `like_match`（`kernels.rs`）と同じ「直前の `*` の位置を 1 つだけ覚える」
+/// 2 ポインタ法。バックトラックが 1 箇所しか無いので最悪 `O(|s| * |p|)` に
+/// 収まり、`***...*` のような病的なパターンでも指数時間にならない。
+fn glob_match(s: &[u8], p: &[u8]) -> bool {
+    let (mut si, mut pi) = (0usize, 0usize);
+    let (mut star_p, mut star_s) = (usize::MAX, 0usize);
+    loop {
+        if pi < p.len() && p[pi] == b'*' {
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+            continue;
+        }
+        if si < s.len() && pi < p.len() && glob_atom(p, &mut pi, s[si]) {
+            si += 1;
+            continue;
+        }
+        // 直前の `*` に 1 バイト多く食わせて再試行する。`*` が一度も無ければ
+        // 不一致で確定。
+        if si < s.len() && star_p != usize::MAX {
+            star_s += 1;
+            si = star_s;
+            pi = star_p + 1;
+            continue;
+        }
+        break;
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    si == s.len() && pi == p.len()
+}
+
+/// `p[*pi]` から始まる 1 要素（リテラル・`?`・`\x`・`[...]`）が `c` に
+/// 一致するかを判定し、一致・不一致に関わらず `*pi` を要素の直後まで進める。
+/// `*` は呼び出し側（`glob_match`）が先に処理するのでここには来ない。
+fn glob_atom(p: &[u8], pi: &mut usize, c: u8) -> bool {
+    match p[*pi] {
+        b'?' => {
+            *pi += 1;
+            true
+        }
+        // 末尾の `\` はエスケープ対象が無いので、素直にリテラルの `\` として
+        // 扱う（フォールバック。パニックはしない）。
+        b'\\' if *pi + 1 < p.len() => {
+            let want = p[*pi + 1];
+            *pi += 2;
+            want == c
+        }
+        b'[' => glob_class(p, pi, c),
+        lit => {
+            *pi += 1;
+            lit == c
+        }
+    }
+}
+
+/// `p[*pi]`（== `[`）から始まる文字クラスを読み、`c` が属すかを判定して
+/// `*pi` を閉じ `]` の直後まで進める。閉じ `]` が無ければ「常に不一致」を
+/// 返し、`*pi` をパターン末尾まで進める（構造体コメントの通り、DuckDB も
+/// 同じ挙動）。
+fn glob_class(p: &[u8], pi: &mut usize, c: u8) -> bool {
+    let mut i = *pi + 1;
+    let negate = p.get(i) == Some(&b'!');
+    if negate {
+        i += 1;
+    }
+    let members_start = i;
+    // 先頭の `]` はクラスの終端ではなくリテラルメンバとして扱う。
+    if p.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < p.len() && p[i] != b']' {
+        i += 1;
+    }
+    if i >= p.len() {
+        *pi = p.len();
+        return false;
+    }
+    let close = i;
+    *pi = close + 1;
+    let mut hit = false;
+    let mut j = members_start;
+    while j < close {
+        // 先頭・末尾でない `-` は範囲指定（`a-z`）。
+        if p[j] == b'-' && j > members_start && j + 1 < close {
+            let (lo, hi) = (p[j - 1], p[j + 1]);
+            if lo <= c && c <= hi {
+                hit = true;
+            }
+            j += 2;
+        } else {
+            if p[j] == c {
+                hit = true;
+            }
+            j += 1;
+        }
+    }
+    hit != negate
 }
 
 // =========================================================================
@@ -2876,5 +3578,147 @@ mod tests {
         let s = vs(&[Some("abcdefgh")]);
         let k = vi(Ty::BigInt, &[Some(1 << 40)]);
         assert_eq!(code_of(call(id, ret, &[&s, &k])), Some(Code::LimitExceeded));
+    }
+
+    // --- GLOB / SIMILAR TO ---------------------------------------------------
+
+    fn bool_at(v: &Vector, i: usize) -> Option<bool> {
+        v.is_valid(i).then(|| v.bools().get(i))
+    }
+
+    #[test]
+    fn glob_matches_shell_patterns_like_duckdb() {
+        let g = |s: &str, p: &str| {
+            bool_at(&run("glob", &[&vs(&[Some(s)]), &vs(&[Some(p)])]).unwrap(), 0)
+        };
+        // duckdb: 'abc' glob 'a*c' = true, 'abc' glob 'a?c' = true
+        assert_eq!(g("abc", "a*c"), Some(true));
+        assert_eq!(g("abc", "a?c"), Some(true));
+        assert_eq!(g("abc", "ab"), Some(false));
+        // duckdb: 'ABC' glob 'a*c' = false（大小区別する）
+        assert_eq!(g("ABC", "a*c"), Some(false));
+        // duckdb: 'abc' glob 'a[bx]c' = true, 'abc' glob '[!x]bc' = true,
+        // 'abc' glob '[^x]bc' = false（`^` は否定にならずリテラル扱い）
+        assert_eq!(g("abc", "a[bx]c"), Some(true));
+        assert_eq!(g("abc", "[!x]bc"), Some(true));
+        assert_eq!(g("abc", "[^x]bc"), Some(false));
+        // duckdb: 'a]c' glob 'a[]]c' = true（先頭の `]` はリテラル）
+        assert_eq!(g("a]c", "a[]]c"), Some(true));
+        // duckdb: 'a1c' glob 'a[0-9]c' = true
+        assert_eq!(g("a1c", "a[0-9]c"), Some(true));
+        // duckdb: 'a*c' glob 'a\*c' = true, 'abc' glob 'a\*c' = false
+        assert_eq!(g("a*c", "a\\*c"), Some(true));
+        assert_eq!(g("abc", "a\\*c"), Some(false));
+        // duckdb: '' glob '' = true, '' glob '*' = true
+        assert_eq!(g("", ""), Some(true));
+        assert_eq!(g("", "*"), Some(true));
+        // duckdb: 'a[bc' glob 'a[bc' = false（閉じていない `[` は常に不一致）
+        assert_eq!(g("a[bc", "a[bc"), Some(false));
+        // NULL はどちらの引数でも NULL 伝播。
+        let n = run("glob", &[&vs(&[None]), &vs(&[Some("a*")])]).unwrap();
+        assert!(!n.is_valid(0));
+    }
+
+    #[test]
+    fn regexp_full_match_backs_similar_to() {
+        let f = |s: &str, p: &str| {
+            bool_at(&run("regexp_full_match", &[&vs(&[Some(s)]), &vs(&[Some(p)])]).unwrap(), 0)
+        };
+        // duckdb: 'abc' similar to 'a.c' = true、'Xabc' similar to 'a.c' = false
+        // （部分一致ではなく完全一致）。
+        assert_eq!(f("abc", "a.c"), Some(true));
+        assert_eq!(f("Xabc", "a.c"), Some(false));
+        // duckdb: 'a%c' similar to 'a%c' = true, 'aXc' similar to 'a%c' = false
+        // （SIMILAR TO の正規表現方言では `%`/`_` は特別扱いされない）。
+        assert_eq!(f("a%c", "a%c"), Some(true));
+        assert_eq!(f("aXc", "a%c"), Some(false));
+        // duckdb: 'aaa' similar to 'a{1,2}' = false（3 個は範囲外で全体一致しない）。
+        assert_eq!(f("aaa", "a{1,2}"), Some(false));
+        assert_eq!(f("aa", "a{1,2}"), Some(true));
+        // 病的なパターンでもパニックせずエラーを返す
+        // （`expr::regex` の上限をそのまま経由することの確認）。
+        let huge = "a{1001}";
+        assert_eq!(
+            code_of(run("regexp_full_match", &[&vs(&[Some("a")]), &vs(&[Some(huge)])])),
+            Some(Code::LimitExceeded)
+        );
+    }
+
+    // --- printf / format ------------------------------------------------------
+
+    #[test]
+    // 3.14159 は printf の `%.2f` 丸めを確かめるためのテスト値であって
+    // 円周率のつもりではない（clippy::approx_constant の誤検出）。
+    #[allow(clippy::approx_constant)]
+    fn printf_supports_documented_specifiers() {
+        let f = |fmt: &str, args: &[&Vector]| {
+            let fmt_v = vs(&[Some(fmt)]);
+            let tys: Vec<Ty> =
+                core::iter::once(Ty::Varchar).chain(args.iter().map(|a| a.ty())).collect();
+            let (id, want, ret) = resolve("printf", &tys).unwrap();
+            let mut refs: Vec<&Vector> = vec![&fmt_v];
+            refs.extend_from_slice(args);
+            assert_eq!(want, tys);
+            str_at(&call(id, ret, &refs).unwrap(), 0)
+        };
+        let i = vi(Ty::BigInt, &[Some(42)]);
+        let s = vs(&[Some("x")]);
+        let d = vf(&[Some(3.14159)]);
+        // duckdb: printf('%d-%s', 42, 'x') = '42-x'
+        assert_eq!(f("%d-%s", &[&i, &s]), Some("42-x".to_string()));
+        // duckdb: printf('%%') = '%'
+        assert_eq!(f("%%", &[]), Some("%".to_string()));
+        // duckdb: printf('%05d', 3) = '00003'
+        let three = vi(Ty::BigInt, &[Some(3)]);
+        assert_eq!(f("%05d", &[&three]), Some("00003".to_string()));
+        // duckdb: printf('%-5d|', 3) = '3    |'
+        assert_eq!(f("%-5d|", &[&three]), Some("3    |".to_string()));
+        // duckdb: printf('%05d', -3) = '-0003'
+        let neg3 = vi(Ty::BigInt, &[Some(-3)]);
+        assert_eq!(f("%05d", &[&neg3]), Some("-0003".to_string()));
+        // duckdb: printf('%.2f', 3.14159) = '3.14'
+        assert_eq!(f("%.2f", &[&d]), Some("3.14".to_string()));
+        // duckdb: printf('%f', 3.5) = '3.500000'（既定精度 6 桁）
+        let half = vf(&[Some(3.5)]);
+        assert_eq!(f("%f", &[&half]), Some("3.500000".to_string()));
+        // NULL 引数はどれかが NULL なら結果全体が NULL（既定の伝播）。
+        let null_s = vs(&[None]);
+        assert_eq!(f("%s", &[&null_s]), None);
+    }
+
+    #[test]
+    fn printf_rejects_malformed_or_unsupported_specifiers() {
+        let (id, _, ret) = resolve("printf", &[Ty::Varchar]).unwrap();
+        let fmt = vs(&[Some("%")]);
+        assert_eq!(code_of(call(id, ret, &[&fmt])), Some(Code::SyntaxError));
+        let fmt = vs(&[Some("%x")]);
+        assert_eq!(code_of(call(id, ret, &[&fmt])), Some(Code::UnsupportedFeature));
+        // 指定子の数より実引数が少なければ WrongArgCount。
+        let (id, _, ret) = resolve("printf", &[Ty::Varchar]).unwrap();
+        let fmt = vs(&[Some("%d")]);
+        assert_eq!(code_of(call(id, ret, &[&fmt])), Some(Code::WrongArgCount));
+    }
+
+    #[test]
+    fn format_supports_positional_and_auto_placeholders() {
+        let f = |fmt: &str, args: &[&Vector]| {
+            let all = vs(&[Some(fmt)]);
+            let tys: Vec<Ty> =
+                core::iter::once(Ty::Varchar).chain(args.iter().map(|a| a.ty())).collect();
+            let (id, _, ret) = resolve("format", &tys).unwrap();
+            let mut refs: Vec<&Vector> = vec![&all];
+            refs.extend_from_slice(args);
+            str_at(&call(id, ret, &refs).unwrap(), 0)
+        };
+        let i = vi(Ty::BigInt, &[Some(42)]);
+        let s = vs(&[Some("x")]);
+        // duckdb: format('{}-{}', 42, 'x') = '42-x'
+        assert_eq!(f("{}-{}", &[&i, &s]), Some("42-x".to_string()));
+        // duckdb: format('{{literal}}') = '{literal}'
+        assert_eq!(f("{{literal}}", &[]), Some("{literal}".to_string()));
+        // duckdb: format('{1}-{0}', 'a', 'b') = 'b-a'
+        let a = vs(&[Some("a")]);
+        let b = vs(&[Some("b")]);
+        assert_eq!(f("{1}-{0}", &[&a, &b]), Some("b-a".to_string()));
     }
 }

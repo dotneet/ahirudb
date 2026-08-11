@@ -6,8 +6,10 @@
 
 pub mod agg;
 pub mod join;
+pub mod range;
 pub mod recursive;
 pub mod rowkey;
+pub mod sample;
 pub mod setop;
 pub mod sort;
 pub mod unnest;
@@ -148,6 +150,17 @@ fn build_ctx(node: Node, working: Option<&[Batch]>) -> Result<Box<dyn Operator>>
         }
         Node::Unnest { input, expr, elem_ty, .. } => {
             Box::new(unnest::Unnest::new(build_ctx(*input, working)?, expr, elem_ty))
+        }
+        Node::GenerateSeries { start, stop, step, inclusive, .. } => {
+            Box::new(range::GenerateSeries::new(start, stop, step, inclusive))
+        }
+        Node::Sample { input, spec } => {
+            let input = build_ctx(*input, working)?;
+            if spec.is_rows {
+                Box::new(sample::RowSample::new(input, &spec))
+            } else {
+                Box::new(sample::Bernoulli::new(input, &spec))
+            }
         }
     })
 }

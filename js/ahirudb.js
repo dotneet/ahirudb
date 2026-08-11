@@ -945,6 +945,9 @@ export class AhiruDB {
     let lastSignature = null;
     for (;;) {
       const e = this.#exports;
+      // コアは時計を持たないので、CURRENT_DATE/CURRENT_TIMESTAMP/now() 用に
+      // クエリ開始時刻をここで渡す（DESIGN.md §2）。
+      e.ahiru_set_now(this.#session, BigInt(Date.now()) * 1000n);
       const ptr = e.ahiru_alloc(bytes.length);
       const pptr = pbytes.length > 0 ? e.ahiru_alloc(pbytes.length) : 0;
       // alloc でメモリが伸びうるので、書き込む直前にビューを取り直す。

@@ -186,6 +186,34 @@ duckdb -c "COPY (SELECT * FROM range(0,300) t(id)) TO 'hive/year=2024/month=01/p
 duckdb -c "COPY (SELECT * FROM range(300,700) t(id)) TO 'hive/year=2024/month=02/part.parquet' (FORMAT PARQUET);"
 duckdb -c "COPY (SELECT * FROM range(700,1000) t(id)) TO 'hive/year=2025/month=01/part.parquet' (FORMAT PARQUET);"
 
+# --- PIVOT/UNPIVOT ---------------------------------------------------------
+# region × category の小さい表。amount を PIVOT で集約し、q1..q4 を UNPIVOT で
+# 畳み込む。id/region/q1..q4 は「GROUP BY 省略時に自動で残る列」の確認に使う
+# ので、category/amount 以外の列を複数用意してある。
+duckdb -c "
+COPY (SELECT i::INTEGER AS id,
+             (['north','south','east','west'])[1 + i % 4]::VARCHAR AS region,
+             (['a','b','c'])[1 + i % 3]::VARCHAR AS category,
+             (i * 10)::INTEGER AS amount,
+             (i)::INTEGER AS q1,
+             (i * 2)::INTEGER AS q2,
+             (i * 3)::INTEGER AS q3,
+             (i * 4)::INTEGER AS q4
+      FROM range(0, 60) t(i))
+TO 'pivot.parquet' (FORMAT PARQUET);"
+
+# 上と同じ列構成だが手書きできる大きさの版。GROUP BY 自動検出や IN リストの
+# 別名付けなど、出力を目で数えたいテストはこちらを使う。
+duckdb -c "
+COPY (SELECT * FROM (VALUES
+  ('east', 'a', 10),
+  ('east', 'b', 20),
+  ('west', 'a', 30),
+  ('west', 'b', 40),
+  ('west', 'c', 5)
+) AS t(region, category, amount))
+TO 'pivot_small.parquet' (FORMAT PARQUET);"
+
 # --- ページ単位の枝刈り（ColumnIndex/OffsetIndex/Bloom フィルタ）-----------
 # `pagetest.parquet` は DuckDB ではなく pyarrow (parquet-cpp) で生成する。
 # この環境の DuckDB（v1.4.4）は ColumnIndex/OffsetIndex は書くが Bloom

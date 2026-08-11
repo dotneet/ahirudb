@@ -7,7 +7,9 @@ use crate::catalog::{Catalog, Source, TablePart};
 use crate::exec::{build, CodecRequest, ExecContext, IoRequest, Operator, Step, Values};
 use crate::expr::vm::Vm;
 use crate::format::{partitioned::PartitionedFormat, FormatKind, TableFormat};
-use crate::plan::bind::{bind_query, referenced_in_query, resolve_from};
+use crate::plan::bind::{
+    bind_query, desugar_pivot, desugar_unpivot, referenced_in_query, resolve_from,
+};
 use crate::prelude::*;
 use crate::sql::ast::{FromItem, Stmt};
 use crate::sql::parse;
@@ -83,11 +85,25 @@ pub struct Session {
     /// `pub(crate)`: `ddl`/`dml` モジュールが行単位の式評価（VALUES/SET/WHERE）
     /// に使う。クレート外には出さない（既存の ABI/JS 面には影響しない）。
     pub(crate) vm: Vm,
+    /// `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 用のクエリ開始時刻
+    /// （エポックからのマイクロ秒、UTC）。wasm コアは時計を持たないので
+    /// ホストが `set_now` で明示的に渡す。未設定ならエポック（1970-01-01）
+    /// になる — 「時刻を知らないなら黙って嘘をつかず、分かりやすく壊れた
+    /// 値を返す」という他の防御的パース方針と同じ考え方。
+    now_micros: i64,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Session { catalog: Catalog::new(), vm: Vm::new() }
+        Session { catalog: Catalog::new(), vm: Vm::new(), now_micros: 0 }
+    }
+
+    /// クエリ開始時刻を設定する。次回以降の `prepare` で
+    /// `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`CURRENT_TIME`/`now()`/`today()`
+    /// の値として使われる。ホスト（JS/CLI）がクエリのたびに現在時刻で
+    /// 呼ぶ想定（DESIGN.md §2「ホストでできることはホストでやる」）。
+    pub fn set_now(&mut self, now_micros: i64) {
+        self.now_micros = now_micros;
     }
 
     /// ファイル全体をメモリに持つテーブルを登録する。
@@ -189,7 +205,46 @@ impl Session {
 
     /// SQL をプランに落とす。スキーマ未解決ならバイト範囲を要求して戻る。
     pub fn prepare(&mut self, sql: &str, params: &[Value]) -> Result<Prepared> {
-        let parsed = parse(sql)?;
+        let mut parsed = parse(sql)?;
+        // `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 等は束縛前に定数へ
+        // 置き換える（`sql::now` 参照）。SQL標準の「クエリ内で1回だけ評価
+        // する」契約にも自然に一致する。
+        crate::sql::substitute_now(&mut parsed.arena, self.now_micros);
+
+        // `PIVOT`/`UNPIVOT` は構文糖衣なので、通常の `SELECT` へ展開してから
+        // 下の分岐に合流させる（`plan::bind::desugar_pivot`/`desugar_unpivot`
+        // 参照）。展開には（`GROUP BY` 省略時などに）対象表のスキーマが要る
+        // ことがあるので、ここでスキーマ解決 → 展開まで済ませてしまい、
+        // 下の大きな `match &parsed.stmt` には触れずに済ませる
+        // （`Stmt::Pivot`/`Stmt::Unpivot` は `PivotStmt`/`UnpivotStmt` を
+        // 所有権ごと消費するので、`&parsed.stmt` からの借用では作れない —
+        // `mem::replace` で `parsed.stmt` だけを取り出す）。
+        if matches!(parsed.stmt, Stmt::Pivot(_) | Stmt::Unpivot(_)) {
+            let stmt = core::mem::replace(&mut parsed.stmt, Stmt::ShowTables);
+            let q = match stmt {
+                Stmt::Pivot(p) => {
+                    let from_schema = if p.group_by.is_empty() {
+                        match self.describe(&p.from)? {
+                            Ok(f) => f,
+                            Err(io) => return Ok(Prepared::NeedIo(io)),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    desugar_pivot(&mut parsed.arena, *p, &from_schema)?
+                }
+                Stmt::Unpivot(u) => {
+                    let from_schema = match self.describe(&u.from)? {
+                        Ok(f) => f,
+                        Err(io) => return Ok(Prepared::NeedIo(io)),
+                    };
+                    desugar_unpivot(&mut parsed.arena, *u, &from_schema)?
+                }
+                _ => unreachable!(),
+            };
+            return self.prepare_query(&parsed.arena, &q, params);
+        }
+
         match &parsed.stmt {
             Stmt::Select(q) => self.prepare_query(&parsed.arena, q, params),
             // EXPLAIN はプランを組んでからテキストに落とす。実行はしない。
@@ -209,6 +264,9 @@ impl Session {
                 Ok(Prepared::Ready(describe_result(&fields)))
             }
             Stmt::ShowTables => Ok(Prepared::Ready(one_column("name", self.table_names()))),
+            // 上の早期リターンで必ず消費済み（`Stmt::Pivot`/`Stmt::Unpivot` は
+            // 展開してから `prepare_query` に合流するので、ここには来ない）。
+            Stmt::Pivot(_) | Stmt::Unpivot(_) => unreachable!(),
             // DDL/DML は副作用（カタログの変更）を伴う一発実行の文で、
             // Volcano のストリーミング実行には乗らない。`ddl`/`dml` モジュール
             // がここで完結させ、結果は 1 行だけの `Query`（影響行数など）で

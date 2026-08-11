@@ -66,6 +66,15 @@ pub enum Expr {
     /// `Literal` と分けているのは、`Value::I128` だけでは既定の論理型が
     /// `HUGEINT` に決まってしまい `INTERVAL` と区別できないため。
     IntervalLiteral(i128),
+    /// `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 等が束縛前に置き換えられた
+    /// 結果。`Literal` と分けているのは `IntervalLiteral` と同じ理由
+    /// （`Value` の物理表現だけでは論理型を決められない: `Value::I32` は
+    /// 既定で `INTEGER`、`Value::I64` は `BIGINT` になり `DATE`/`TIMESTAMP`
+    /// と区別できない）。クエリ開始時刻はホストから 1 度だけ渡され、
+    /// `Session::prepare` が構文木をこのノードへ置き換えてから束縛する
+    /// （`sql::now::substitute_now` 参照）ので、`plan::compile` 以降は
+    /// 単なる定数として扱うだけでよい。
+    TypedLiteral(Value, Ty),
     /// `?` プレースホルダ。0 始まり。
     Param(u16),
     ColumnRef {
@@ -73,8 +82,15 @@ pub enum Expr {
         name: String,
     },
     /// `*` または `t.*`。SELECT リストでのみ有効。
+    /// `EXCLUDE (col, ...)` / `REPLACE (expr AS col, ...)` は DuckDB 拡張。
+    /// どちらも列名として使われうる一般語なので、パーサは `*`/`t.*` の直後
+    /// という文脈でだけキーワードとして読む（`sql::parser` 参照）。
     Star {
         qualifier: Option<String>,
+        /// 展開結果から除く列名（大小無視で比較）。
+        exclude: Vec<String>,
+        /// 展開結果のうち指定列を式の評価結果に差し替える。列名自体は変わらない。
+        replace: Vec<(ExprId, String)>,
     },
     Unary {
         op: UnaryOp,
@@ -131,11 +147,18 @@ pub enum Expr {
         /// `agg(...) FILTER (WHERE cond)`。集約関数にのみ意味を持つ。
         filter: Option<ExprId>,
     },
-    /// ウィンドウ関数（`f(...) OVER (PARTITION BY .. ORDER BY ..)`）。
+    /// ウィンドウ関数（`f(...) OVER (PARTITION BY .. ORDER BY ..)`、
+    /// または `f(...) OVER w` の名前付き参照）。
     Window {
         name: String,
         args: Vec<ExprId>,
         star: bool,
+        /// `OVER w`（識別子 1 つだけ）の場合に `Some(w)`。このとき
+        /// `partition_by`/`order_by`/`frame` は未使用（空/既定値）のままで、
+        /// 実体は束縛時に `SelectStmt::windows` から `w` を引いて使う
+        /// （`WINDOW` 句は構文上 SELECT リストより後に現れるため、パース時点
+        /// ではまだ定義を知りえない。`plan::bind` 参照）。
+        window_ref: Option<String>,
         partition_by: Vec<ExprId>,
         order_by: Vec<OrderByItem>,
         frame: WindowFrame,
@@ -158,6 +181,20 @@ pub enum Expr {
     /// 集約でも通常のスカラ式でもない特殊な式として `plan::bind` が拾う
     /// （`FILTER`/`QUALIFY` と同じ扱い）。
     Unnest(ExprId),
+    /// `x -> expr` / `(a, b) -> expr`。`list_transform`/`list_filter`/
+    /// `list_reduce` の引数としてのみパーサが生成する
+    /// （`sql::parser::Parser::call` 参照。関数呼び出しの引数位置以外では
+    /// `->` は JSON パス演算子 (`json_extract`) の糖衣構文のまま）。
+    ///
+    /// `params` は本体の中だけで有効な仮引数名で、外側の SQL スコープの列とは
+    /// 独立している。`plan::compile` はラムダ本体を外側とは別の孤立した
+    /// スコープでコンパイルする（`Compiler::lambda_call` の doc 参照）ので、
+    /// 通常の式の位置（`plan::compile::Compiler::expr_inner` の一般経路）に
+    /// 出現した場合はエラーにする。
+    Lambda {
+        params: Vec<String>,
+        body: ExprId,
+    },
 }
 
 /// 式のアリーナ。
@@ -188,6 +225,11 @@ impl ExprArena {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// 全ノードを走査するイテレータ（`sql::now::substitute_now` 用）。
+    pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, Expr> {
+        self.nodes.iter_mut()
     }
 }
 
@@ -248,6 +290,48 @@ pub enum FromItem {
         alias: Option<String>,
         column_alias: Option<String>,
     },
+    /// `generate_series(start, stop[, step])` / `range([start,] stop[, step])`
+    /// テーブル関数。DuckDB は任意の式を引数に取れるが、束縛時定数畳み込みの
+    /// 仕組みが無い（`plan::bind` は列参照が要る式しかコンパイルできない）ので
+    /// v1 はリテラル整数のみを受け付ける（`sql::parser::Parser::signed_int_lit`）。
+    /// `stop` の扱いが 2 関数で違う: `range` は半開区間、`generate_series` は
+    /// 閉区間（`duckdb` CLI で確認済み）。
+    GenerateSeries {
+        start: i64,
+        stop: i64,
+        step: i64,
+        /// `true` なら `generate_series`（`stop` を含む）、`false` なら
+        /// `range`（`stop` を含まない）。
+        inclusive: bool,
+        alias: Option<String>,
+        column_alias: Option<String>,
+    },
+}
+
+/// `USING SAMPLE`/`TABLESAMPLE` のサンプリング手法。
+///
+/// `duckdb` CLI で確認した限り、手法ごとに実際のアルゴリズムが違う
+/// （`SYSTEM` はベクタ単位、`BERNOULLI` は行単位、`RESERVOIR` は行数指定
+/// 専用）が、このエンジンは構文だけ受理して実装は 1 通りに単純化する
+/// （タスクの優先度: パーセント指定 > 行数指定 > 手法の使い分け）。
+/// `plan::bind::resolve_sample_spec` 参照。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SampleMethod {
+    Bernoulli,
+    System,
+    Reservoir,
+}
+
+/// `USING SAMPLE <spec>` / `TABLESAMPLE <spec>` の構文を保持する。
+pub struct SampleSpec {
+    pub method: SampleMethod,
+    /// `is_rows` が `false` なら 0.0..=100.0 のパーセント、`true` なら
+    /// 残す行数（浮動小数のまま持つ。`duckdb` は端数を丸めて受け付ける）。
+    pub amount: f64,
+    pub is_rows: bool,
+    /// `USING SAMPLE 10% (bernoulli, 42)` のような明示シード。省略時は
+    /// 固定の既定値を使う（決定的でよい、というタスクの指示どおり）。
+    pub seed: Option<i64>,
 }
 
 pub struct SelectItem {
@@ -338,6 +422,14 @@ pub enum WindowFrame {
     WholePartition,
 }
 
+/// 名前付きウィンドウ定義（`WINDOW name AS (...)`）の本体。
+/// `Expr::Window` の `partition_by`/`order_by`/`frame` と同じ形。
+pub struct WindowDef {
+    pub partition_by: Vec<ExprId>,
+    pub order_by: Vec<OrderByItem>,
+    pub frame: WindowFrame,
+}
+
 pub struct SelectStmt {
     pub distinct: bool,
     /// `DISTINCT ON (expr, ...)`。空なら未使用。`distinct` とは排他
@@ -353,11 +445,22 @@ pub struct SelectStmt {
     /// 対応するセット集合へ展開済み（`sql::parser` 参照）。
     pub grouping_sets: Option<Vec<Vec<ExprId>>>,
     pub having: Option<ExprId>,
+    /// `WINDOW name AS (...), ...`。名前は定義順のまま保持し、束縛時に
+    /// `OVER name` からこの名前を大小無視で引く（`plan::bind` 参照）。
+    pub windows: Vec<(String, WindowDef)>,
     /// `QUALIFY`。ウィンドウ関数評価後・ORDER BY 前に効くフィルタ。
     pub qualify: Option<ExprId>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// `USING SAMPLE` / `TABLESAMPLE`。`duckdb` CLI で確認した限り、
+    /// 意味的には常に FROM 句の結合結果（フィルタ前）に効く ―― `a JOIN b
+    /// USING SAMPLE 20 ROWS` は結合後 100 行から 20 行選ぶ。構文上は
+    /// WHERE/GROUP BY/HAVING/QUALIFY のどこの後ろにでも置ける柔軟な文法だが
+    /// （`FROM t WHERE x>1 USING SAMPLE 10%` も通る）、ここでは単純化して
+    /// FROM 句の直後・WHERE の直前という 1 箇所だけで受理する
+    /// （`sql::parser::Parser::select_body` 参照）。
+    pub sample: Option<SampleSpec>,
 }
 
 impl SelectStmt {
@@ -371,18 +474,82 @@ impl SelectStmt {
             group_by: Vec::new(),
             grouping_sets: None,
             having: None,
+            windows: Vec::new(),
             qualify: None,
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            sample: None,
         }
     }
+}
+
+/// `PIVOT <from> ON <on> [IN (<値> [AS 別名], ...)] USING <agg>[, ...] [GROUP BY <列, ...>]`
+/// の構文糖衣。
+///
+/// 意味的には「`on` の各値ごとに `agg(...) FILTER (WHERE on = 値)` を作り、
+/// `GROUP BY` 対象列と束ねる」という通常の集約クエリに等価
+/// （`plan::bind::desugar_pivot` 参照）。展開は束縛の直前
+/// （`session::Session::prepare`）に行い、既存の集約束縛ロジックには一切
+/// 手を入れない。
+pub struct PivotStmt {
+    pub from: FromItem,
+    /// `ON` の対象式。DuckDB は `ON a, b` の複数列指定も許すが、v1 は
+    /// 単一の式のみ対応する。
+    pub on: ExprId,
+    /// `IN (値 [AS 別名], ...)`。`None` なら値の自動検出が必要になる。
+    /// 束縛時点ではまだ対象表のスキーマしか読めておらず（実データはまだ
+    /// スキャンしていない）、DISTINCT を取るには本来の意味での実行が要る。
+    /// `no_std`/ストリーミング実行の制約下でそれを二段階クエリとして
+    /// 挟むのは大掛かりな変更になるため、v1 では明示 `IN` のみ対応し、
+    /// 省略時は `desugar_pivot` が `UnsupportedFeature` を返す。
+    pub in_list: Option<Vec<(ExprId, Option<String>)>>,
+    /// `USING agg(expr) [AS 別名], ...`。空なら DuckDB と同じく既定で
+    /// `count(*)`。複数集約関数（`USING sum(a), avg(b)`）は列名決定に式の
+    /// 文字列化が要り（`no_std`/`core::fmt` 禁止のコストが見合わない）、
+    /// v1 では単一集約関数のみ対応（`desugar_pivot` が `UnsupportedFeature`）。
+    pub using: Vec<SelectItem>,
+    /// 明示 `GROUP BY`。空なら「`on`/`using` が参照する列以外の全列」
+    /// （DuckDB の既定と同じ）。
+    pub group_by: Vec<ExprId>,
+    /// 末尾の `ORDER BY`/`LIMIT`/`OFFSET`。展開後の `QueryStmt` にそのまま
+    /// 移す（`plan::bind::desugar_pivot` 参照）。
+    pub order_by: Vec<OrderByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// `UNPIVOT <from> ON <col, ...> [INTO NAME <name> VALUE <value>]` の構文糖衣。
+///
+/// 対象列ごとに 1 本の `SELECT`（対象列以外をそのまま通し、対象列名を文字列
+/// リテラルとして・対象列の値をそのまま出す）を作り `UNION ALL` で束ねる
+/// 展開に等価（`plan::bind::desugar_unpivot` 参照。GROUPING SETS が複数の
+/// `Node::Aggregate` を `Node::SetOp` で束ねたのと同じ発想）。
+pub struct UnpivotStmt {
+    pub from: FromItem,
+    /// `ON` の対象列。DuckDB の `(a, b), (c, d)` のような複数列同時畳み込み
+    /// （1 回の展開で複数の VALUE 列を作る形）は非対応。各要素は修飾子なしの
+    /// 裸の列参照でなければならない。
+    pub columns: Vec<ExprId>,
+    /// `INTO NAME <name_col>`。省略時は `"name"`（DuckDB の既定と同じ）。
+    pub name_col: String,
+    /// `INTO ... VALUE <value_col>`。省略時は `"value"`。
+    pub value_col: String,
+    /// 末尾の `ORDER BY`/`LIMIT`/`OFFSET`。展開後の `QueryStmt` にそのまま
+    /// 移す（`plan::bind::desugar_unpivot` 参照）。
+    pub order_by: Vec<OrderByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
 }
 
 pub enum Stmt {
     Select(Box<QueryStmt>),
     /// `EXPLAIN <query>`
     Explain(Box<QueryStmt>),
+    /// `PIVOT ...`
+    Pivot(Box<PivotStmt>),
+    /// `UNPIVOT ...`
+    Unpivot(Box<UnpivotStmt>),
     /// `DESCRIBE <table>` / `DESCRIBE parquet('...')`
     Describe(FromItem),
     /// `SHOW TABLES`

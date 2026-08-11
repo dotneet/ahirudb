@@ -9,7 +9,7 @@ to violate by accident.
 
 ## Language policy
 
-Write all documentation and code comments in **English** — README files,
+Write all documentation and code comments and commit comment in **English** — README files,
 `docs/`, doc comments, and inline comments in new or edited code.
 
 The existing codebase has a large amount of Japanese in comments and internal

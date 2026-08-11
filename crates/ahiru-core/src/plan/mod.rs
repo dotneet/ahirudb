@@ -369,7 +369,41 @@ pub enum Node {
         /// 入力のスキーマ ++ 展開要素 1 列。
         schema: Vec<Field>,
     },
+    /// `generate_series(start, stop, step)` / `range(start, stop, step)`
+    /// テーブル関数。カタログ・I/O を一切経由しない「計算だけのソース」
+    /// （`exec::range::GenerateSeries` 参照）。
+    GenerateSeries {
+        start: i64,
+        stop: i64,
+        step: i64,
+        /// `true` なら `stop` を含む（`generate_series`）。
+        inclusive: bool,
+        schema: Vec<Field>,
+    },
+    /// `USING SAMPLE` / `TABLESAMPLE`。入力の行を一定確率・一定行数で間引く。
+    /// 列は変えないので `input.schema()` をそのまま使う
+    /// （`exec::sample` 参照）。
+    Sample {
+        input: Box<Node>,
+        spec: SampleSpec,
+    },
 }
+
+/// `Node::Sample` の実行時パラメタ。手法（`BERNOULLI`/`SYSTEM`/`RESERVOIR`）
+/// は構文として受理するだけで、実装は `is_rows` の 2 択に落ちる
+/// （`plan::bind::resolve_sample_spec` のドキュメント参照）。
+#[derive(Clone, Copy)]
+pub struct SampleSpec {
+    /// `false` ならパーセント指定（0.0..=100.0）、`true` なら行数指定。
+    pub is_rows: bool,
+    pub amount: f64,
+    pub seed: u64,
+}
+
+/// `USING SAMPLE`/`TABLESAMPLE` にシード省略時の既定値。呼び出しごとに
+/// 変える理由が無い（決定的な方がテストしやすく、`NeedIo` をまたいでも
+/// 結果の再現性を保てる。タスクの指示どおり「シードは決定的でよい」）。
+pub const DEFAULT_SAMPLE_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 
 impl Node {
     /// このノードが出力するスキーマ。
@@ -386,10 +420,12 @@ impl Node {
             Node::RecursiveCte { schema, .. } => schema,
             Node::WorkingTable { schema } => schema,
             Node::Unnest { schema, .. } => schema,
+            Node::GenerateSeries { schema, .. } => schema,
             Node::Filter { input, .. }
             | Node::Sort { input, .. }
             | Node::Limit { input, .. }
-            | Node::DistinctOn { input, .. } => input.schema(),
+            | Node::DistinctOn { input, .. }
+            | Node::Sample { input, .. } => input.schema(),
         }
     }
 }

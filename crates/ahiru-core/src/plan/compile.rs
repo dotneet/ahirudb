@@ -4,11 +4,12 @@
 //! 明示的な `Cast` 命令を挿入する。実行カーネルが型変換を意識しなくて済むので
 //! カーネル数を増やさずに済む（DESIGN.md §11）。
 
-use crate::expr::{Instr, OpCode, Program, Reg};
+use crate::expr::{funcs, Instr, OpCode, Program, Reg};
 use crate::plan::{AggKind, Scope};
 use crate::prelude::*;
+use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{BinaryOp, Expr, ExprArena, ExprId, UnaryOp};
-use crate::vector::{Ty, Value};
+use crate::vector::{Field, Ty, Value};
 
 /// 式のネスト上限。パーサ側でも制限しているが、二重に守る。
 const MAX_DEPTH: u32 = 64;
@@ -285,6 +286,7 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
     match (arena.get(a), arena.get(b)) {
         (Expr::Literal(x), Expr::Literal(y)) => x == y,
         (Expr::IntervalLiteral(x), Expr::IntervalLiteral(y)) => x == y,
+        (Expr::TypedLiteral(x1, t1), Expr::TypedLiteral(x2, t2)) => x1 == x2 && t1 == t2,
         (Expr::Param(x), Expr::Param(y)) => x == y,
         (
             Expr::ColumnRef { qualifier: q1, name: n1 },
@@ -341,6 +343,15 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
         }
         _ => false,
     }
+}
+
+/// ラムダを引数に取りうる関数名か（`sql::parser::is_lambda_func` と同じ
+/// 固定集合。パーサ側はこの名前の集合の引数位置でだけ `->` をラムダとして
+/// 読み、束縛後にここでも同じ判定で `Compiler::lambda_call` へ振り分ける）。
+fn is_lambda_func(name: &str) -> bool {
+    eq_ascii_ci(name.as_bytes(), b"list_transform")
+        || eq_ascii_ci(name.as_bytes(), b"list_filter")
+        || eq_ascii_ci(name.as_bytes(), b"list_reduce")
 }
 
 impl<'a> Compiler<'a> {
@@ -491,6 +502,7 @@ impl<'a> Compiler<'a> {
             Expr::IntervalLiteral(packed) => {
                 Ok((self.konst(Ty::Interval, Value::I128(*packed)), Ty::Interval))
             }
+            Expr::TypedLiteral(v, ty) => Ok((self.konst(*ty, v.clone()), *ty)),
             Expr::ColumnRef { qualifier, name } => self.column(qualifier.as_deref(), name),
             Expr::Star { .. } => err!(SyntaxError),
             Expr::Param(i) => {
@@ -548,6 +560,10 @@ impl<'a> Compiler<'a> {
             // 場合（`plan::bind::collect_unnests` が検出して先に拒否するので、
             // 実質的にはバインダのバグ検出用の網）。
             Expr::Unnest(_) => err!(UnsupportedFeature),
+            // `list_transform`/`list_filter`/`list_reduce` の第 2 引数としてしか
+            // パーサは生成しない（`sql::parser::Parser::call` 参照）。それ以外の
+            // 位置に来た（＝バグかパーサの取りこぼし）場合はここで弾く。
+            Expr::Lambda { .. } => err!(UnsupportedFeature),
             Expr::Function { name, args, distinct, star, filter } => {
                 // 集約関数はバインダが置き換えてから来る。ここに残っているのは
                 // 集約できない位置（WHERE など）に書かれた場合か、集約の入れ子。
@@ -556,6 +572,9 @@ impl<'a> Compiler<'a> {
                 }
                 // FILTER はスカラ関数には意味を持たない。
                 ensure!(!*distinct && !*star && filter.is_none(), UnsupportedFeature);
+                if is_lambda_func(name) {
+                    return self.lambda_call(name, args);
+                }
                 self.scalar_call(name, args)
             }
         }
@@ -580,6 +599,91 @@ impl<'a> Compiler<'a> {
         let dst = self.prog.alloc_reg();
         self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
         Ok((dst, res))
+    }
+
+    /// `list_transform(list, x -> expr)` / `list_filter(list, x -> expr)` /
+    /// `list_reduce(list, (acc, x) -> expr [, initial])`。
+    ///
+    /// `scalar_call` の一般経路（各引数を `self.expr()` で外側スコープの
+    /// レジスタへコンパイルしてから 1 個の `Call` 命令にまとめる）には乗らない:
+    /// このバイトコード VM はベクタ化実行が前提で「配列の要素ごとに式を評価
+    /// する」処理は行あたり可変長になり形が合わない。そこでラムダ本体だけを
+    /// **別の小さな `Program`** としてコンパイルし `Program::lambdas` に埋め込む。
+    /// 実行時は `expr::funcs::call_lambda` が配列の要素数ぶんだけ
+    /// `Batch::new` + `Vm::eval` を繰り返す（`ddl`/`dml` が 1 行だけのバッチを
+    /// 組んで `Vm::eval` に通すのと同じ発想。`expr::funcs` モジュール冒頭の
+    /// list_transform/list_filter/list_reduce セクション doc も参照）。
+    ///
+    /// **既知の制限**: ラムダ本体は自分のパラメータだけを参照できる。外側の
+    /// SQL スコープの列は参照できない（`list_transform(tags, x -> x ||
+    /// suffix_col)` のように外側列を混ぜる書き方は非対応で `ColumnNotFound`
+    /// になる）。本体は毎回パラメータだけの孤立した `Scope` でコンパイルする
+    /// ため。
+    ///
+    /// パラメータの型は常に `Ty::Json`（`list_extract` の結果と同じ、配列
+    /// 要素はすべて動的型付けの JSON 値として表現される）。このエンジンでは
+    /// `Ty::Json` は他のどの型とも `Ty::unify` しない（`vector::types` の doc
+    /// 参照）ため、本体でパラメータに算術・比較を行うには
+    /// `CAST(CAST(x AS VARCHAR) AS INTEGER)` のように一度 VARCHAR を経由して
+    /// 明示的に変換する必要がある（`list_extract` の結果に対する既存の制限と
+    /// 同じで、ラムダ固有の制約ではない）。
+    fn lambda_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
+        let is_reduce = eq_ascii_ci(name.as_bytes(), b"list_reduce");
+        let func = if eq_ascii_ci(name.as_bytes(), b"list_transform") {
+            funcs::F_LIST_TRANSFORM
+        } else if eq_ascii_ci(name.as_bytes(), b"list_filter") {
+            funcs::F_LIST_FILTER
+        } else if is_reduce {
+            funcs::F_LIST_REDUCE
+        } else {
+            err!(FunctionNotFound)
+        };
+        ensure!(args.len() == 2 || (is_reduce && args.len() == 3), WrongArgCount);
+
+        // 第 1 引数（リスト）は通常どおり外側スコープでコンパイルする。
+        let (list_reg, list_ty) = self.expr(args[0])?;
+        ensure!(matches!(list_ty, Ty::Json | Ty::Null), TypeMismatch);
+        let list_reg =
+            if list_ty == Ty::Null { self.konst(Ty::Json, Value::Null) } else { list_reg };
+
+        let (params, body) = match self.arena.get(args[1]) {
+            Expr::Lambda { params, body } => (params.clone(), *body),
+            // パーサは `list_transform` 等の第 2 引数をラムダ構文
+            // （`x -> expr` / `(a, b) -> expr`）としてしか読まないので、他の
+            // 式（列参照など）が来るのは構文エラー。
+            _ => err!(SyntaxError),
+        };
+        let want_params = if is_reduce { 2 } else { 1 };
+        ensure!(params.len() == want_params, WrongArgCount);
+
+        // `list_reduce` の第 3 引数（初期値）。省略時はリストの先頭要素を使う
+        // （`expr::funcs::call_list_reduce` 参照）。第 1 引数と同様、Ty::Json
+        // でなければならない（`to_json(...)` 等で明示的に変換して渡す）。
+        let mut call_args = vec![list_reg];
+        if args.len() == 3 {
+            let (init_reg, init_ty) = self.expr(args[2])?;
+            ensure!(matches!(init_ty, Ty::Json | Ty::Null), TypeMismatch);
+            let init_reg =
+                if init_ty == Ty::Null { self.konst(Ty::Json, Value::Null) } else { init_reg };
+            call_args.push(init_reg);
+        }
+
+        // 本体は「パラメータだけ」の孤立したスコープでコンパイルする
+        // （このメソッドの doc の「既知の制限」参照）。
+        let fields: Vec<Field> =
+            params.iter().map(|p| Field::new(p.clone(), Ty::Json, true)).collect();
+        let param_scope = Scope::from_fields(fields);
+        let body_prog = compile_with_subs(self.arena, &param_scope, self.params, &[], body)?;
+        if func == funcs::F_LIST_FILTER {
+            ensure!(matches!(body_prog.result_ty, Ty::Boolean | Ty::Null), TypeMismatch);
+        }
+
+        let result_ty = Ty::Json;
+        let li = self.prog.add_lambda(body_prog);
+        let aux = self.prog.add_lambda_call(func, call_args, result_ty, li);
+        let dst = self.prog.alloc_reg();
+        self.prog.push(Instr::with_aux(OpCode::Call, result_ty.phys(), dst, 0, 0, aux));
+        Ok((dst, result_ty))
     }
 
     fn column(&mut self, qualifier: Option<&str>, name: &str) -> Result<(Reg, Ty)> {
@@ -1151,5 +1255,129 @@ mod tests {
         let p = compile(&a, &cols(), &[], id).unwrap();
         assert_eq!(p.result_ty, Ty::Interval);
         assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalNeg));
+    }
+
+    // --- ラムダ: list_transform / list_filter / list_reduce -------------------
+
+    fn json_lit(a: &mut ExprArena, text: &str) -> ExprId {
+        let s = a.push(Expr::Literal(Value::Bytes(text.as_bytes().to_vec())));
+        a.push(Expr::Cast { arg: s, ty: Ty::Json, try_: false })
+    }
+
+    fn func_call(a: &mut ExprArena, name: &str, args: Vec<ExprId>) -> ExprId {
+        a.push(Expr::Function {
+            name: name.into(),
+            args,
+            distinct: false,
+            star: false,
+            filter: None,
+        })
+    }
+
+    #[test]
+    fn list_transform_compiles_to_a_lambda_call_instruction() {
+        let mut a = ExprArena::new();
+        let list = json_lit(&mut a, "[1,2,3]");
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        let lambda = a.push(Expr::Lambda { params: vec!["x".into()], body: x });
+        let id = func_call(&mut a, "list_transform", vec![list, lambda]);
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Json);
+        let call = p.instrs.iter().find(|i| i.op == OpCode::Call).unwrap();
+        let spec = &p.calls[call.aux as usize];
+        assert_eq!(spec.func, crate::expr::funcs::F_LIST_TRANSFORM);
+        assert!(spec.lambda.is_some());
+        assert_eq!(p.lambdas.len(), 1);
+    }
+
+    #[test]
+    fn list_filter_requires_a_boolean_lambda_body() {
+        let mut a = ExprArena::new();
+        let list = json_lit(&mut a, "[1,2,3]");
+        // 本体が `x`（Ty::Json）そのものなので BOOLEAN にならない。
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        let lambda = a.push(Expr::Lambda { params: vec!["x".into()], body: x });
+        let id = func_call(&mut a, "list_filter", vec![list, lambda]);
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::TypeMismatch));
+    }
+
+    #[test]
+    fn list_filter_accepts_a_boolean_lambda_body() {
+        let mut a = ExprArena::new();
+        let list = json_lit(&mut a, "[1,2,3]");
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        let one = json_lit(&mut a, "1");
+        let pred = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: x, rhs: one });
+        let lambda = a.push(Expr::Lambda { params: vec!["x".into()], body: pred });
+        let id = func_call(&mut a, "list_filter", vec![list, lambda]);
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Json);
+    }
+
+    #[test]
+    fn lambda_body_cannot_see_outer_scope_columns() {
+        // 既知の制限: ラムダ本体は自分のパラメータだけを参照できる
+        // （`Compiler::lambda_call` の doc 参照）。`id` は外側スコープの列で
+        // パラメータではないので `ColumnNotFound` になる。
+        let mut a = ExprArena::new();
+        let list = json_lit(&mut a, "[1,2,3]");
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        let outer = a.push(Expr::ColumnRef { qualifier: None, name: "id".into() });
+        let body = a.push(Expr::Binary { op: BinaryOp::Add, lhs: x, rhs: outer });
+        let lambda = a.push(Expr::Lambda { params: vec!["x".into()], body });
+        let id = func_call(&mut a, "list_transform", vec![list, lambda]);
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::ColumnNotFound));
+    }
+
+    #[test]
+    fn list_transform_rejects_wrong_lambda_param_count() {
+        let mut a = ExprArena::new();
+        let list = json_lit(&mut a, "[1,2,3]");
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        // list_transform はパラメータ 1 個のラムダしか受け付けない。
+        let lambda = a.push(Expr::Lambda { params: vec!["x".into(), "y".into()], body: x });
+        let id = func_call(&mut a, "list_transform", vec![list, lambda]);
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::WrongArgCount));
+    }
+
+    #[test]
+    fn list_reduce_needs_two_lambda_params() {
+        let mut a = ExprArena::new();
+        let list = json_lit(&mut a, "[1,2,3]");
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        let lambda = a.push(Expr::Lambda { params: vec!["x".into()], body: x });
+        let id = func_call(&mut a, "list_reduce", vec![list, lambda]);
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::WrongArgCount));
+    }
+
+    #[test]
+    fn list_reduce_accepts_two_params_and_an_optional_initial_value() {
+        let mut a = ExprArena::new();
+        let list = json_lit(&mut a, "[1,2,3]");
+        let acc = a.push(Expr::ColumnRef { qualifier: None, name: "acc".into() });
+        let lambda = a.push(Expr::Lambda { params: vec!["acc".into(), "x".into()], body: acc });
+        let id = func_call(&mut a, "list_reduce", vec![list, lambda]);
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Json);
+
+        // 第 3 引数（初期値）付きも受け付ける。
+        let mut a2 = ExprArena::new();
+        let list2 = json_lit(&mut a2, "[1,2,3]");
+        let acc2 = a2.push(Expr::ColumnRef { qualifier: None, name: "acc".into() });
+        let lambda2 = a2.push(Expr::Lambda { params: vec!["acc".into(), "x".into()], body: acc2 });
+        let init = json_lit(&mut a2, "0");
+        let id2 = func_call(&mut a2, "list_reduce", vec![list2, lambda2, init]);
+        let p2 = compile(&a2, &cols(), &[], id2).unwrap();
+        assert_eq!(p2.result_ty, Ty::Json);
+    }
+
+    #[test]
+    fn lambda_as_a_bare_expression_is_unsupported() {
+        // パーサは list_transform 等の第 2 引数としてしかラムダを作らないが、
+        // `plan::compile` 側も念のため通常の式位置に来た場合を拒否する。
+        let mut a = ExprArena::new();
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        let id = a.push(Expr::Lambda { params: vec!["x".into()], body: x });
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::UnsupportedFeature));
     }
 }

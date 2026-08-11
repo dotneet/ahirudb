@@ -93,7 +93,12 @@ impl PartitionedFormat {
             let Some(&col) = projection.get(p.column) else { continue };
             if col < inner_n {
                 if let Some(pos) = inner_proj.iter().position(|&c| c == col) {
-                    inner_pruners.push(Pruner { column: pos, op: p.op, value: p.value.clone() });
+                    inner_pruners.push(Pruner {
+                        column: pos,
+                        op: p.op,
+                        value: p.value.clone(),
+                        in_values: p.in_values.clone(),
+                    });
                 }
             } else {
                 let (_, v) = &self.partition_cols[col - inner_n];
