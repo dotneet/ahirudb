@@ -70,10 +70,12 @@ const PHYS_BYTES = 5;
 const TYPE_NAMES = [
   'NULL', 'BOOLEAN', 'TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT',
   'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL',
-  'VARCHAR', 'BLOB', 'DATE', 'TIME', 'TIMESTAMP', 'INTERVAL', 'JSON',
+  'VARCHAR', 'BLOB', 'DATE', 'TIME', 'TIMESTAMP', 'INTERVAL', 'JSON', 'UUID',
+  'TIMESTAMPTZ',
 ];
 const TY_DECIMAL = 13;
 const TY_VARCHAR = 14;
+const TY_UUID = 21;
 
 /** 隣接判定のしきい値。この幅未満の穴は「読んだ方が安い」として結合する。 */
 const COALESCE_GAP = 1024 * 1024;
@@ -92,6 +94,23 @@ export function timestampToDate(micros) {
 /** DATE（エポックからの日数, number）を UTC の `Date` にする。 */
 export function dateToDate(days) {
   return new Date(Number(days) * 86400000);
+}
+
+/**
+ * TIMESTAMPTZ（エポックからの UTC マイクロ秒, BigInt）を `Date` にする。
+ * 物理表現は TIMESTAMP と同一（このエンジンにセッションタイムゾーンの
+ * 概念は無く、値は常に UTC の瞬間を表す）なので `timestampToDate` の別名。
+ */
+export const timestamptzToDate = timestampToDate;
+
+/** 16 バイトを `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` にする。 */
+function formatUuid(bytes) {
+  let s = '';
+  for (let i = 0; i < 16; i++) {
+    if (i === 4 || i === 6 || i === 8 || i === 10) s += '-';
+    s += bytes[i].toString(16).padStart(2, '0');
+  }
+  return s;
 }
 
 // --- レンジキャッシュ ---------------------------------------------------------
@@ -554,8 +573,15 @@ export function decodeBatch(u8, schema, copy = true) {
       for (let i = 0; i < numRows; i++) {
         const s = offsets[i];
         const e = offsets[i + 1];
-        // VARCHAR は UTF-8 文字列、それ以外（BLOB）はバイト列のまま返す。
-        values[i] = ty === TY_VARCHAR ? textDecoder.decode(data.subarray(s, e)) : data.slice(s, e);
+        // VARCHAR は UTF-8 文字列、UUID はハイフン付き 16 進文字列、
+        // それ以外（BLOB）はバイト列のまま返す。
+        if (ty === TY_VARCHAR) {
+          values[i] = textDecoder.decode(data.subarray(s, e));
+        } else if (ty === TY_UUID) {
+          values[i] = formatUuid(data.subarray(s, e));
+        } else {
+          values[i] = data.slice(s, e);
+        }
       }
       columns.push({ name: field?.name ?? `col${c}`, type: field?.type ?? 'BLOB', typeCode: ty, physType: phys, values, valid });
       continue;

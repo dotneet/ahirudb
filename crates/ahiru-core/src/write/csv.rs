@@ -96,6 +96,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         Value::I32(x) if ty == Ty::Date => push_date(out, *x as i64),
         Value::I32(x) => push_int(out, *x as i128),
         Value::I64(x) if ty == Ty::Timestamp => push_timestamp(out, *x),
+        Value::I64(x) if ty == Ty::Timestamptz => push_timestamptz(out, *x),
         // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
         // `Value::I128` (`vector/types.rs`'s doc on `Decimal`: "precision <=
         // 18 は I64 で保持する"). This arm used to be missing, so a
@@ -116,6 +117,16 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
             _ => push_int(out, *x),
         },
         Value::F64(x) => push_f64(out, *x),
+        Value::Bytes(b) if ty == Ty::Uuid => {
+            // UUID の物理表現は生の 16 バイトなので、テキスト化してから
+            // 引用要否を判定する（ハイフンを含むがカンマ/引用符/改行は
+            // 含まないので、実際には常に無引用で書ける）。
+            let mut hex = Vec::with_capacity(36);
+            if let Ok(raw) = <[u8; 16]>::try_from(b.as_slice()) {
+                crate::expr::funcs::fmt_uuid(&raw, &mut hex);
+            }
+            push_field(out, &hex);
+        }
         Value::Bytes(b) => push_field(out, b),
     }
 }
@@ -247,6 +258,11 @@ fn push_timestamp(out: &mut Vec<u8>, micros: i64) {
     push_padded(out, rem / 60_000_000 % 60, 2);
     out.push(b':');
     push_padded(out, rem / 1_000_000 % 60, 2);
+}
+
+fn push_timestamptz(out: &mut Vec<u8>, micros: i64) {
+    push_timestamp(out, micros);
+    out.extend_from_slice(b"+00");
 }
 
 fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {

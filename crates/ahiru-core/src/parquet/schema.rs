@@ -430,7 +430,11 @@ fn map_logical(l: LogicalType) -> Result<(Ty, Option<TimeUnit>)> {
     use LogicalType as L;
     Ok(match l {
         L::String | L::Enum | L::Json => (Ty::Varchar, None),
-        L::Bson | L::Uuid => (Ty::Blob, None),
+        L::Bson => (Ty::Blob, None),
+        // UUID の物理表現は FLBA(16) の生バイト列で、`Ty::Blob` と同じ
+        // `Bytes` 系だが、テキスト表示・パースがハイフン付き 16 進形式に
+        // なる点だけ異なる（`Ty::Uuid` の doc 参照）。
+        L::Uuid => (Ty::Uuid, None),
         L::Decimal { scale, precision } => {
             ensure!((1..=38).contains(&precision), UnsupportedType);
             ensure!((0..=precision).contains(&scale), UnsupportedType);
@@ -438,7 +442,14 @@ fn map_logical(l: LogicalType) -> Result<(Ty, Option<TimeUnit>)> {
         }
         L::Date => (Ty::Date, None),
         L::Time { unit, .. } => (Ty::Time, Some(unit)),
-        L::Timestamp { unit, .. } => (Ty::Timestamp, Some(unit)),
+        // `utc` (`isAdjustedToUTC`) が真なら、この列は既に UTC の瞬間を表す
+        // タイムスタンプ（`Ty::Timestamptz`）。偽ならタイムゾーン無しの素の
+        // 日時（`Ty::Timestamp`）。レガシーな `ConvertedType` 経路
+        // （`map_converted`）にはこのビットが無いので、そちらは常に
+        // `Ty::Timestamp` のままにしてある。
+        L::Timestamp { unit, utc } => {
+            (if utc { Ty::Timestamptz } else { Ty::Timestamp }, Some(unit))
+        }
         L::Integer { bit_width, signed } => (int_ty(bit_width, signed)?, None),
         L::Unknown => (Ty::Null, None),
         // LIST / MAP は「REPEATED を含む部分木」の入口として build_nested_node
@@ -575,8 +586,29 @@ mod tests {
         e.converted_type = Some(ConvertedType::TimestampMillis);
         e.logical = Some(LogicalType::Timestamp { utc: true, unit: TimeUnit::Nanos });
         let c = resolve_column(&e).unwrap();
-        assert_eq!(c.ty, Ty::Timestamp);
+        // `logical` wins over `converted_type` (which would have produced
+        // plain `Ty::Timestamp` with no way to signal `isAdjustedToUTC`).
+        // `logical`'s `utc: true` additionally means this resolves to
+        // `Ty::Timestamptz`, not `Ty::Timestamp`.
+        assert_eq!(c.ty, Ty::Timestamptz);
         assert_eq!(c.time_unit, Some(TimeUnit::Nanos));
+    }
+
+    #[test]
+    fn timestamp_without_utc_flag_stays_plain_timestamp() {
+        let mut e = elem("t", Some(PType::Int64), Repetition::Optional);
+        e.logical = Some(LogicalType::Timestamp { utc: false, unit: TimeUnit::Micros });
+        let c = resolve_column(&e).unwrap();
+        assert_eq!(c.ty, Ty::Timestamp);
+    }
+
+    #[test]
+    fn uuid_logical_type_maps_to_ty_uuid() {
+        let mut e = elem("u", Some(PType::FixedLenByteArray), Repetition::Optional);
+        e.type_length = Some(16);
+        e.logical = Some(LogicalType::Uuid);
+        let c = resolve_column(&e).unwrap();
+        assert_eq!(c.ty, Ty::Uuid);
     }
 
     #[test]

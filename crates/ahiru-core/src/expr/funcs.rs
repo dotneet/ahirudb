@@ -2601,6 +2601,120 @@ pub(crate) fn parse_time(s: &[u8]) -> Option<i64> {
     }
 }
 
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]+00`。物理表現は `Ty::Timestamp` と同じ
+/// UTC マイクロ秒だが、値が既に UTC の瞬間であることを明示するため
+/// DuckDB と同じ `+00` サフィックスを付ける（このエンジンにセッション
+/// タイムゾーンの概念は無いので、常に UTC で表示する）。
+pub(crate) fn fmt_timestamptz(us: i64, out: &mut Vec<u8>) {
+    fmt_timestamp(us, out);
+    out.extend_from_slice(b"+00");
+}
+
+/// `[+-]HH[:MM]` または `Z` のタイムゾーンオフサットを読む。
+/// マイクロ秒単位のオフセット（東が正）を返す。読めなければ `None`
+/// （呼び出し側は「オフセット無し」＝ UTC 扱いにフォールバックする）。
+fn scan_offset(s: &[u8], i: usize) -> Option<(i64, usize)> {
+    match s.get(i) {
+        Some(b'Z') | Some(b'z') => Some((0, i + 1)),
+        Some(&sign @ (b'+' | b'-')) => {
+            let (h, j) = scan(s, i + 1, 1, 2)?;
+            let (m, j) = if s.get(j) == Some(&b':') { scan(s, j + 1, 2, 2)? } else { (0, j) };
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let micros = (h * 3600 + m * 60) * 1_000_000;
+            Some((if sign == b'-' { -micros } else { micros }, j))
+        }
+        _ => None,
+    }
+}
+
+/// VARCHAR → TIMESTAMPTZ。日付・時刻部分は `parse_timestamp` と同じ形式
+/// （`YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]]`）に、任意でタイムゾーンオフセット
+/// （`Z` または `[+-]HH[:MM]`）を続けられる。オフセット無しは UTC とみなす
+/// （セッションタイムゾーンが無いため。`sql::now` の `CURRENT_TIMESTAMP` と
+/// 同じ簡略化）。オフセットは「その地域の壁時計時刻」を UTC の瞬間へ
+/// 正規化するために引く（例: `12:00+09` は UTC で `03:00`）。
+pub(crate) fn parse_timestamptz(s: &[u8]) -> Option<i64> {
+    let s = trim_ws(s);
+    let (d, i) = scan_date(s)?;
+    let base = d.checked_mul(US_PER_DAY)?;
+    if i == s.len() {
+        return Some(base);
+    }
+    if s[i] != b' ' && s[i] != b'T' && s[i] != b't' {
+        return None;
+    }
+    let (t, j) = scan_time(s, i + 1)?;
+    let local = base.checked_add(t)?;
+    if j == s.len() {
+        return Some(local);
+    }
+    let (offset, k) = scan_offset(s, j)?;
+    if k != s.len() {
+        return None;
+    }
+    local.checked_sub(offset)
+}
+
+fn hex_digit(n: u8) -> u8 {
+    if n < 10 {
+        b'0' + n
+    } else {
+        b'a' + (n - 10)
+    }
+}
+
+fn hex_value(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// UUID → `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`（小文字、RFC 4122 のバイト順）。
+pub(crate) fn fmt_uuid(bytes: &[u8; 16], out: &mut Vec<u8>) {
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push(b'-');
+        }
+        out.push(hex_digit(b >> 4));
+        out.push(hex_digit(b & 0xF));
+    }
+}
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` → 16 バイト。大文字小文字は
+/// 区別しない。ハイフンの位置まで厳密に見る（DuckDB もこの形式のみ受理する）。
+pub(crate) fn parse_uuid(s: &[u8]) -> Option<[u8; 16]> {
+    let s = trim_ws(s);
+    if s.len() != 36 {
+        return None;
+    }
+    for (i, &c) in s.iter().enumerate() {
+        let want_dash = matches!(i, 8 | 13 | 18 | 23);
+        if want_dash != (c == b'-') {
+            return None;
+        }
+    }
+    let mut out = [0u8; 16];
+    let mut oi = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        if s[i] == b'-' {
+            i += 1;
+            continue;
+        }
+        let hi = hex_value(s[i])?;
+        let lo = hex_value(*s.get(i + 1)?)?;
+        out[oi] = (hi << 4) | lo;
+        oi += 1;
+        i += 2;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -145,6 +145,11 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
                 funcs::fmt_timestamp(x, &mut b);
                 JsonValue::Str(b)
             }
+            Ty::Timestamptz => {
+                let mut b = Vec::new();
+                funcs::fmt_timestamptz(x, &mut b);
+                JsonValue::Str(b)
+            }
             _ => int_like_to_json(ty, x as i128),
         },
         Value::I128(x) => int_like_to_json(ty, x),
@@ -160,6 +165,13 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
         }
         Value::Bytes(b) => match ty {
             Ty::Varchar => JsonValue::Str(b),
+            Ty::Uuid => {
+                let mut h = Vec::new();
+                if let Ok(raw) = <[u8; 16]>::try_from(b.as_slice()) {
+                    funcs::fmt_uuid(&raw, &mut h);
+                }
+                JsonValue::Str(h)
+            }
             // BLOB は JSON に直接の対応が無いので 16 進文字列にする。
             _ => {
                 let mut h = Vec::new();

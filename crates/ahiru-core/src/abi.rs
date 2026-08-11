@@ -687,6 +687,8 @@ fn ty_code(t: crate::vector::Ty) -> u32 {
         Timestamp => 18,
         Interval => 19,
         Json => 20,
+        Uuid => 21,
+        Timestamptz => 22,
     }
 }
 

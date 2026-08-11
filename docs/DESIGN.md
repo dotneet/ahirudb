@@ -567,10 +567,10 @@ types** — this is the main lever against kernel explosion (§11).
 |---|---|
 | BOOLEAN | `Bool` (bitmap) |
 | TINYINT / SMALLINT / INTEGER / DATE / TIME | `I32` |
-| BIGINT / TIMESTAMP / DECIMAL(p≤18) | `I64` |
+| BIGINT / TIMESTAMP / TIMESTAMPTZ / DECIMAL(p≤18) | `I64` |
 | FLOAT / DOUBLE | `F64` |
-| VARCHAR / BLOB | `Bytes` (offset + data buffers) |
-| DECIMAL(p>18) / UUID / HUGEINT / **INTERVAL** | `I128` |
+| VARCHAR / BLOB / UUID | `Bytes` (offset + data buffers) |
+| DECIMAL(p>18) / HUGEINT / **INTERVAL** | `I128` |
 
 - Execution kernels are written **only against the 6 physical types**;
   logical type stays around purely as scale/display metadata.

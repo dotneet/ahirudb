@@ -2162,6 +2162,17 @@ impl<'a> Parser<'a> {
             ensure!((1..=38).contains(&p) && s <= p, InvalidCast, pos);
             return Ok(Ty::Decimal { precision: p as u8, scale: s as u8 });
         }
+        // SQL 標準の綴り `TIMESTAMP WITH TIME ZONE`。単語 `timestamptz`
+        // （`TYPES` 表）が普段使いの短縮形、こちらは標準準拠のための別綴り。
+        // `WITH` はここでは常に CTE ではなくこの構文の意味しかありえない
+        // 位置（型名の直後）なので、先読み無しでそのまま食ってよい。
+        if ty == Ty::Timestamp && self.eat_kw(Kw::With)? {
+            ensure!(self.is_soft_kw(b"time"), InvalidCast, pos);
+            self.bump()?;
+            ensure!(self.is_soft_kw(b"zone"), InvalidCast, pos);
+            self.bump()?;
+            return Ok(Ty::Timestamptz);
+        }
         Ok(ty)
     }
 
@@ -2334,7 +2345,9 @@ static TYPES: &[(&[u8], Ty)] = &[
     (b"time", Ty::Time),
     (b"timestamp", Ty::Timestamp),
     (b"datetime", Ty::Timestamp),
+    (b"timestamptz", Ty::Timestamptz),
     (b"json", Ty::Json),
+    (b"uuid", Ty::Uuid),
 ];
 
 fn lookup_type(name: &[u8]) -> Option<Ty> {

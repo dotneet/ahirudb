@@ -279,11 +279,13 @@ fn render(v: &Value, ty: Ty) -> String {
         Value::I32(x) if ty == Ty::Date => fmt_date(*x as i64),
         Value::I32(x) => x.to_string(),
         Value::I64(x) if ty == Ty::Timestamp => fmt_timestamp(*x),
+        Value::I64(x) if ty == Ty::Timestamptz => format!("{}+00", fmt_timestamp(*x)),
         Value::I64(x) if ty == Ty::Time => fmt_time(*x),
         Value::I64(x) => fmt_scaled(*x as i128, ty),
         Value::I128(x) if ty == Ty::Interval => fmt_interval_value(*x),
         Value::I128(x) => fmt_scaled(*x, ty),
         Value::F64(x) => x.to_string(),
+        Value::Bytes(b) if ty == Ty::Uuid => fmt_uuid(b),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             Ok(s) => s.to_string(),
             Err(_) => format!("<{} bytes>", b.len()),
@@ -339,6 +341,22 @@ fn fmt_timestamp(micros: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
     format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// 16 バイトの UUID を `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` にする。
+/// 長さが 16 でない値（本来起き得ない）は 16 進のまま表示する。
+fn fmt_uuid(b: &[u8]) -> String {
+    let Ok(b): Result<[u8; 16], _> = b.try_into() else {
+        return b.iter().map(|x| format!("{x:02x}")).collect();
+    };
+    let mut s = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {

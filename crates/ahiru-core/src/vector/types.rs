@@ -57,6 +57,20 @@ pub enum Ty {
     Time,
     /// エポックからのマイクロ秒 (I64)。
     Timestamp,
+    /// `Timestamp` と物理表現は同一（エポックからの UTC マイクロ秒、I64）。
+    /// 違いは論理的な意味づけだけ: この値は既に UTC の瞬間を表す
+    /// （Parquet の `TIMESTAMP` 論理型の `isAdjustedToUTC = true` に対応）のに対し、
+    /// `Timestamp` は「タイムゾーン無しの素の日時」を表す
+    /// （`isAdjustedToUTC = false`、または注釈自体が無い場合）。
+    /// このエンジンにセッションタイムゾーンの概念は無いので、`VARCHAR` から
+    /// キャストする際にオフセット付き（`+09:00`/`Z` 等）の文字列を UTC マイクロ秒へ
+    /// 正規化する以外は、`Timestamp` と同じ扱いになる。
+    Timestamptz,
+    /// UUID（16 バイトの生値、`Bytes` に収める）。RFC 4122 のバイト順で持ち、
+    /// 表示・パースだけが `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` 形式のハイフン
+    /// 付き 16 進テキストとの相互変換を行う（`VARCHAR`/`BLOB` と違い、テキスト表現
+    /// と物理表現が異なる唯一の `Bytes` 系論理型）。
+    Uuid,
     /// 月 (i32) / 日 (i32) / マイクロ秒 (i64) を 1 個の I128 に詰めて持つ
     /// （`pack_interval`）。DuckDB / PostgreSQL と同じ 3 成分モデル。
     Interval,
@@ -101,7 +115,7 @@ impl Ty {
         match self {
             Boolean => PhysType::Bool,
             Null | TinyInt | SmallInt | Int | UTinyInt | USmallInt | Date => PhysType::I32,
-            BigInt | UInt | Time | Timestamp => PhysType::I64,
+            BigInt | UInt | Time | Timestamp | Timestamptz => PhysType::I64,
             HugeInt | UBigInt | Interval => PhysType::I128,
             Decimal { precision, .. } => {
                 if precision <= 18 {
@@ -111,7 +125,7 @@ impl Ty {
                 }
             }
             Float | Double => PhysType::F64,
-            Varchar | Blob | Json => PhysType::Bytes,
+            Varchar | Blob | Json | Uuid => PhysType::Bytes,
         }
     }
 
@@ -143,7 +157,7 @@ impl Ty {
     }
 
     pub fn is_temporal(self) -> bool {
-        matches!(self, Ty::Date | Ty::Time | Ty::Timestamp)
+        matches!(self, Ty::Date | Ty::Time | Ty::Timestamp | Ty::Timestamptz)
     }
 
     pub fn is_interval(self) -> bool {
@@ -167,13 +181,17 @@ impl Ty {
             Date => 10,
             Time => 11,
             Timestamp => 12,
-            Varchar => 13,
-            Blob => 14,
+            Timestamptz => 13,
+            Varchar => 14,
+            Blob => 15,
             // 他のどの型とも暗黙変換しない（DATE/TIMESTAMP との加減算は
             // `plan::compile` が `Ty::unify` を経由しない専用経路で扱う）。
-            Interval => 15,
+            Interval => 16,
             // JSON も同様に他の型と暗黙変換しない。
-            Json => 16,
+            Json => 17,
+            // UUID も同様に他のどの型とも暗黙変換しない
+            // （`Bytes` 物理型を共有する VARCHAR/BLOB とも、下の専用ルールでしか揃えない）。
+            Uuid => 18,
         }
     }
 
@@ -222,6 +240,19 @@ impl Ty {
         if matches!((a, b), (Date, Timestamp) | (Timestamp, Date)) {
             return Some(Timestamp);
         }
+        // TIMESTAMPTZ が絡む比較は TIMESTAMPTZ に寄せる（DATE/TIMESTAMP は
+        // 「タイムゾーン無し」なので、より情報量の多い TIMESTAMPTZ 側に揃える。
+        // DuckDB も DATE/TIMESTAMP と TIMESTAMPTZ の比較を許し、TIMESTAMPTZ に
+        // 寄せる）。
+        if matches!(
+            (a, b),
+            (Date, Timestamptz)
+                | (Timestamptz, Date)
+                | (Timestamp, Timestamptz)
+                | (Timestamptz, Timestamp)
+        ) {
+            return Some(Timestamptz);
+        }
         if matches!((a, b), (Varchar, Blob) | (Blob, Varchar)) {
             return Some(Blob);
         }
@@ -251,8 +282,10 @@ impl Ty {
             Date => "DATE",
             Time => "TIME",
             Timestamp => "TIMESTAMP",
+            Timestamptz => "TIMESTAMPTZ",
             Interval => "INTERVAL",
             Json => "JSON",
+            Uuid => "UUID",
         }
     }
 }

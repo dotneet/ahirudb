@@ -39,11 +39,11 @@ wouldn't actually enforce the budget). CI fails if it exceeds 1 MiB.
 **SQL**
 - Joins: `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS`, non-equi, correlated and uncorrelated subqueries (`EXISTS` / `IN` / scalar), `UNNEST` (in the `SELECT` list and, implicitly lateral, in `FROM`)
 - Aggregation: `GROUP BY` / `HAVING` / `DISTINCT` / `FILTER (WHERE ...)`, `GROUPING SETS` / `ROLLUP` / `CUBE`, statistical aggregates (`stddev`, `variance`, `median`, `mode`, `approx_count_distinct`), `string_agg` / `array_agg`
-- Window functions with `ROWS`/`RANGE` frames, `QUALIFY`
+- Window functions (fixed default frame, chosen automatically from `ORDER BY` presence; no explicit `ROWS`/`RANGE BETWEEN` bounds), `QUALIFY`
 - `WITH` (CTEs, including `WITH RECURSIVE`), `UNION` / `INTERSECT` / `EXCEPT`
 - `DISTINCT ON`, `ILIKE`, `TRY_CAST`, `IIF`, regular expressions (`regexp_matches` / `regexp_extract` / `regexp_replace`)
 - `JSON` type with path operators (`->`, `->>`, `json_extract`, `json_type`, `json_array_length`, `json_object`, `json_array`, `list_extract`, `map_extract`, ...) — `LIST`/`MAP` values share this same representation
-- `DATE` / `TIME` / `TIMESTAMP` / `INTERVAL` arithmetic, `DECIMAL` with correct scale propagation
+- `DATE` / `TIME` / `TIMESTAMP` / `TIMESTAMPTZ` / `INTERVAL` arithmetic, `DECIMAL` with correct scale propagation, `UUID`
 - `DESCRIBE`, `SHOW TABLES`, `EXPLAIN`
 
 **Write path (opt-in, off by default — see [DESIGN.md §16](docs/DESIGN.md))**

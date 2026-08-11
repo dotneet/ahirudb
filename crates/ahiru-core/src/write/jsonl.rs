@@ -66,6 +66,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         Value::I32(x) if ty == Ty::Date => push_date_string(out, *x as i64),
         Value::I32(x) => push_int(out, *x as i128),
         Value::I64(x) if ty == Ty::Timestamp => push_timestamp_string(out, *x),
+        Value::I64(x) if ty == Ty::Timestamptz => push_timestamptz_string(out, *x),
         // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
         // `Value::I128` (`vector/types.rs`'s doc on `Decimal`). This arm was
         // missing, so a DECIMAL(10,2) value of 12.50 (stored as the I64
@@ -105,6 +106,16 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         // (`{"tags":[1,2,3]}`, not `{"tags":"[1,2,3]"}`). Every other Bytes
         // value (VARCHAR/BLOB) is an opaque string and must be escaped.
         Value::Bytes(b) if ty == Ty::Json => out.extend_from_slice(b),
+        // UUID's physical representation is the raw 16 bytes; render as the
+        // usual hyphenated hex text, not the opaque escaped-string form used
+        // for VARCHAR/BLOB.
+        Value::Bytes(b) if ty == Ty::Uuid => {
+            let mut hex = Vec::with_capacity(36);
+            if let Ok(raw) = <[u8; 16]>::try_from(b.as_slice()) {
+                crate::expr::funcs::fmt_uuid(&raw, &mut hex);
+            }
+            push_string(out, &hex);
+        }
         Value::Bytes(b) => push_string(out, b),
     }
 }
@@ -237,6 +248,14 @@ fn push_timestamp_string(out: &mut Vec<u8>, micros: i64) {
     out.push(b':');
     push_padded(out, rem / 1_000_000 % 60, 2);
     out.push(b'"');
+}
+
+fn push_timestamptz_string(out: &mut Vec<u8>, micros: i64) {
+    // `push_timestamp_string` already writes the closing quote; splice the
+    // `+00` suffix in before it rather than duplicating the date/time body.
+    push_timestamp_string(out, micros);
+    out.truncate(out.len() - 1);
+    out.extend_from_slice(b"+00\"");
 }
 
 fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {

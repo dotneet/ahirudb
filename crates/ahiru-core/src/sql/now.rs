@@ -57,9 +57,10 @@ fn call_kind(name: &str) -> Option<Kind> {
 }
 
 /// `arena` 内の該当ノードを `now_micros`（エポックからのマイクロ秒、UTC）
-/// を使った定数に置き換える。DuckDB の `CURRENT_TIMESTAMP`/`now()` は
-/// `TIMESTAMP WITH TIME ZONE` を返すが、このエンジンにタイムゾーン型は
-/// 無いので `Ty::Timestamp`（UTC のマイクロ秒）に落とす簡略化をしている。
+/// を使った定数に置き換える。DuckDB の `CURRENT_TIMESTAMP`/`now()` と同じく
+/// `Ty::Timestamptz` を返す（物理表現は `Ty::Timestamp` と同一の UTC
+/// マイクロ秒だが、`now_micros` は元々ホストの壁時計から得た UTC の瞬間
+/// なので、意味的にも `Timestamptz` の方が正確）。
 pub fn substitute_now(arena: &mut ExprArena, now_micros: i64) {
     let date_days = now_micros.div_euclid(MICROS_PER_DAY) as i32;
     let time_micros = now_micros.rem_euclid(MICROS_PER_DAY);
@@ -76,7 +77,7 @@ pub fn substitute_now(arena: &mut ExprArena, now_micros: i64) {
         if let Some(kind) = kind {
             *node = match kind {
                 Kind::Date => Expr::TypedLiteral(Value::I32(date_days), Ty::Date),
-                Kind::Timestamp => Expr::TypedLiteral(Value::I64(now_micros), Ty::Timestamp),
+                Kind::Timestamp => Expr::TypedLiteral(Value::I64(now_micros), Ty::Timestamptz),
                 Kind::Time => Expr::TypedLiteral(Value::I64(time_micros), Ty::Time),
             };
         }
@@ -121,7 +122,7 @@ mod tests {
         ));
         assert!(matches!(
             literal_of("SELECT CURRENT_TIMESTAMP", T),
-            Expr::TypedLiteral(Value::I64(t), Ty::Timestamp) if t == T
+            Expr::TypedLiteral(Value::I64(t), Ty::Timestamptz) if t == T
         ));
     }
 
@@ -129,7 +130,7 @@ mod tests {
     fn call_forms_become_typed_literals() {
         assert!(matches!(
             literal_of("SELECT now()", T),
-            Expr::TypedLiteral(Value::I64(t), Ty::Timestamp) if t == T
+            Expr::TypedLiteral(Value::I64(t), Ty::Timestamptz) if t == T
         ));
         assert!(matches!(
             literal_of("SELECT today()", T),

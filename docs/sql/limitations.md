@@ -20,8 +20,6 @@ user-visible effect.
 - **Transactions** (`BEGIN`/`COMMIT`/`ROLLBACK`)
 - **`ATTACH`** (attaching another database file)
 - **Named parameters** — only positional `?` placeholders are supported
-- **`UUID` as a first-class type** — no `CAST(... AS UUID)`; a Parquet
-  column with the UUID logical annotation is read as raw text instead
 - Hashing/fuzzy-match functions commonly found in DuckDB: `md5`, `sha256`,
   `levenshtein`, `jaro`, `soundex`, `uuid()`, `random()`
 - `now()` / `current_timestamp` / `current_date` as ordinary **scalar
@@ -77,6 +75,16 @@ user-visible effect.
   documents that differ only in whitespace (`'{"a": 1}'` vs `'{"a":1}'`)
   compare unequal. Only `=`/`<>` are defined on `JSON`; ordering comparisons
   (`<`, `>`, ...) are a type error.
+- **`TIMESTAMPTZ` has no session timezone concept.** A `CAST(... AS
+  TIMESTAMPTZ)` literal with no explicit offset (`+HH`, `+HH:MM`, or `Z`) is
+  assumed to already be UTC, rather than being interpreted in a configured
+  session timezone the way DuckDB does. See
+  [types.md](types.md#timestamptz).
+- **`CAST(... AS UUID)` of malformed text becomes `NULL`, not an error** —
+  matching this engine's existing convention for `DATE`/`TIME`/`TIMESTAMP`
+  parse failures, but different from DuckDB, which raises a hard error on
+  plain `CAST` (only `TRY_CAST` returns `NULL` there). See
+  [types.md](types.md#uuid).
 
 ## No spilling
 

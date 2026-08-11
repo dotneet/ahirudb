@@ -595,8 +595,13 @@ fn int_conv(from: Ty, to: Ty) -> Result<(i128, i128, bool)> {
     use Ty::*;
     if from.is_temporal() || to.is_temporal() {
         return Ok(match (from, to) {
-            (Date, Timestamp) => (MICROS_PER_DAY, 1, false),
-            (Timestamp, Date) => (1, MICROS_PER_DAY, true),
+            (Date, Timestamp) | (Date, Timestamptz) => (MICROS_PER_DAY, 1, false),
+            (Timestamp, Date) | (Timestamptz, Date) => (1, MICROS_PER_DAY, true),
+            // `Timestamp` と `Timestamptz` は物理表現が完全に同じ（UTC の
+            // マイクロ秒）なので、値はそのまま素通しでよい
+            // (`Ty::unify` が `Date`/`Timestamp` を `Timestamptz` に寄せた
+            // ときの片側キャストがここを通る)。
+            (Timestamp, Timestamptz) | (Timestamptz, Timestamp) => (1, 1, false),
             // 時刻系と整数は生値のまま。BOOLEAN や DECIMAL との変換は意味が無い。
             (f, t)
                 if (f.is_temporal() && t.is_integer()) || (f.is_integer() && t.is_temporal()) =>
@@ -914,6 +919,31 @@ fn cast_str_to_json(a: &Vector, lenient: bool) -> Result<Vector> {
     Ok(finish(Ty::Json, Data::Bytes(out), a.validity().cloned(), bad))
 }
 
+/// `VARCHAR → UUID`。行単位のパース失敗は `DATE`/`TIME`/`TIMESTAMP` と同じ
+/// 慣習でその行だけ NULL にする（`CAST`/`TRY_CAST` の両方、`lenient` に
+/// 関わらず）。`VARCHAR → JSON` だけがこの慣習の例外であり（`cast_str_to_json`
+/// の doc 参照）、UUID はそちらには倣わない。
+fn cast_str_to_uuid(a: &Vector) -> Result<Vector> {
+    let n = a.len();
+    let sv = a.bytes();
+    let mut out = BytesData::with_capacity(n, n * 16);
+    let mut bad: Option<Bitmap> = None;
+    for i in 0..n {
+        if !a.is_valid(i) {
+            out.push_empty();
+            continue;
+        }
+        match funcs::parse_uuid(sv.get(i)) {
+            Some(bytes) => out.push(&bytes),
+            None => {
+                out.push_empty();
+                funcs::set_null(&mut bad, i, n);
+            }
+        }
+    }
+    Ok(finish(Ty::Uuid, Data::Bytes(out), a.validity().cloned(), bad))
+}
+
 /// `Cast`。実装していない組み合わせは黙って壊れた値を返さず `InvalidCast`。
 /// 行単位の変換失敗（範囲外・パース不能）はエラーにせず、その行だけ NULL。
 ///
@@ -961,6 +991,32 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         let mut out = a.clone();
         out.retype(to);
         return Ok(out);
+    }
+    // UUID も同じ理由で個別に弾く: 対応するのは VARCHAR ↔ UUID のみ。
+    // 物理表現は VARCHAR/BLOB と同じ `Bytes` だが、UUID のテキスト表現
+    // （ハイフン付き 16 進）は生バイト列とは異なるので、汎用の `(Fam::Str,
+    // Fam::Str)` の単純コピーには乗せられない（`BLOB ↔ UUID` は非対応の
+    // まま `InvalidCast` にする。生バイトを扱いたければ `BLOB` 経由ではなく
+    // 素直に `UUID` を使う、という設計判断）。
+    if to == Ty::Uuid {
+        ensure!(from == Ty::Varchar, InvalidCast);
+        return cast_str_to_uuid(a);
+    }
+    if from == Ty::Uuid {
+        ensure!(to == Ty::Varchar, InvalidCast);
+        let sv = a.bytes();
+        let mut data = Data::with_capacity(PhysType::Bytes, n);
+        let mut buf = Vec::new();
+        if let Data::Bytes(d) = &mut data {
+            for i in 0..n {
+                buf.clear();
+                if let Ok(raw) = <[u8; 16]>::try_from(sv.get(i)) {
+                    funcs::fmt_uuid(&raw, &mut buf);
+                }
+                d.push(&buf);
+            }
+        }
+        return Ok(finish(to, data, a.validity().cloned(), None));
     }
     let src = a.data();
     let mut data = Data::with_capacity(to.phys(), n);
@@ -1043,6 +1099,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                         match from {
                             Ty::Date => funcs::fmt_date(y, &mut buf),
                             Ty::Time => funcs::fmt_time(y, &mut buf),
+                            Ty::Timestamptz => funcs::fmt_timestamptz(y, &mut buf),
                             _ => funcs::fmt_timestamp(y, &mut buf),
                         }
                     } else {
@@ -1096,6 +1153,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                 let v = match to {
                     Ty::Date => funcs::parse_date(b),
                     Ty::Time => funcs::parse_time(b),
+                    Ty::Timestamptz => funcs::parse_timestamptz(b),
                     _ => funcs::parse_timestamp(b),
                 };
                 let ok = match v {

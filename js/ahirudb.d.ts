@@ -5,7 +5,8 @@
 export type AhiruTypeName =
   | 'NULL' | 'BOOLEAN' | 'TINYINT' | 'SMALLINT' | 'INTEGER' | 'BIGINT' | 'HUGEINT'
   | 'UTINYINT' | 'USMALLINT' | 'UINTEGER' | 'UBIGINT' | 'FLOAT' | 'DOUBLE'
-  | 'DECIMAL' | 'VARCHAR' | 'BLOB' | 'DATE' | 'TIME' | 'TIMESTAMP';
+  | 'DECIMAL' | 'VARCHAR' | 'BLOB' | 'DATE' | 'TIME' | 'TIMESTAMP' | 'INTERVAL'
+  | 'JSON' | 'UUID' | 'TIMESTAMPTZ';
 
 /** 物理型。実行カーネルが扱う 6 種（vector/types.rs）。0=Bool 1=I32 2=I64 3=F64 4=I128 5=Bytes */
 export type PhysType = 0 | 1 | 2 | 3 | 4 | 5;
@@ -14,11 +15,12 @@ export type PhysType = 0 | 1 | 2 | 3 | 4 | 5;
  * 行の値。
  * - BOOLEAN → boolean
  * - INTEGER 系（物理 I32）→ number
- * - BIGINT / TIME / TIMESTAMP（物理 I64）→ bigint（マイクロ秒など生の値）
+ * - BIGINT / TIME / TIMESTAMP / TIMESTAMPTZ（物理 I64）→ bigint（マイクロ秒など生の値）
  * - HUGEINT（物理 I128）→ bigint
  * - FLOAT / DOUBLE → number
  * - DECIMAL → string（precision/scale を適用済み。number にすると桁が落ちる）
  * - VARCHAR → string、BLOB → Uint8Array
+ * - UUID → string（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` 形式）
  * - NULL は null（validity ビットマップを尊重する）
  */
 export type AhiruValue = boolean | number | bigint | string | Uint8Array | null;
@@ -169,6 +171,8 @@ export declare function errorMessage(code: number): string;
 export declare function timestampToDate(micros: bigint | number): Date;
 /** DATE（エポックからの日数）を Date にする。 */
 export declare function dateToDate(days: number): Date;
+/** TIMESTAMPTZ（エポックからの UTC マイクロ秒）を Date にする。`timestampToDate` の別名。 */
+export declare const timestamptzToDate: typeof timestampToDate;
 
 /** 近接するレンジを結合する（既定のしきい値は 1 MiB）。 */
 export declare function coalesceRanges(
