@@ -13,6 +13,9 @@ dependencies = [
 [[package]]
 name = "ahiru-core"
 version = "0.1.0"
+dependencies = [
+ "ahiru-zstd",
+]
 
 [[package]]
 name = "ahiru-zstd"

@@ -1,8 +1,12 @@
 //! 圧縮コーデック。
 //!
-//! wasm コアが内蔵するのは SNAPPY と LZ4_RAW だけ。どちらもデコーダが小さく
-//! (合計 12 KB 見込み)、呼び出し頻度が高いため。GZIP はホストの
-//! `DecompressionStream` に、ZSTD は別 wasm モジュールに委譲する
+//! wasm コアが内蔵するのは SNAPPY・LZ4_RAW・ZSTD（`zstd` フィーチャ、既定で
+//! 有効）。ZSTD デコーダは `ahiru-zstd` を素の Rust ライブラリとしてリンク
+//! しているだけで、展開結果自体はここに含めていない（13 KB 程度で 1 MiB
+//! 予算への影響が小さいため、別 wasm モジュールに分ける手間に見合わない
+//! と判断した）。GZIP だけはホストの `DecompressionStream` に委譲する
+//! （ブラウザ/Node に既にあるものをわざわざ内蔵する理由が無いため）。
+//! `zstd` フィーチャを外せば ZSTD もホスト委譲（`NeedCodec`）に戻る
 //! （DESIGN.md §6）。
 //!
 //! 入力はネットワーク由来で信用できない。宣言された長さ・オフセットは一切
@@ -35,8 +39,26 @@ pub fn decompress(codec: Compression, src: &[u8], out_len: usize) -> Result<Vec<
             lz4_raw_decompress(src, out_len, &mut out)?;
             Ok(out)
         }
+        #[cfg(feature = "zstd")]
+        Compression::Zstd => ahiru_zstd::decompress(src, out_len).map_err(map_zstd_err),
         _ => err!(UnsupportedCodec),
     }
+}
+
+/// `ahiru-zstd` のエラーコードをこのクレートのものへ落とす。位置情報は
+/// 持たない（`ahiru-zstd` はバイト位置を追跡していない）ので `Error::new`
+/// を使う。展開結果が宣言サイズを超える／入力が途中で尽きる、以外は
+/// すべて「構造が壊れている」の一括りにする（このファイル冒頭の
+/// エラーコードの使い分け方針と同じ）。
+#[cfg(feature = "zstd")]
+fn map_zstd_err(e: ahiru_zstd::Error) -> Error {
+    use ahiru_zstd::Error as Z;
+    let code = match e {
+        Z::UnexpectedEof => Code::UnexpectedEof,
+        Z::LimitExceeded => Code::LimitExceeded,
+        _ => Code::BadCompressedData,
+    };
+    Error::new(code)
 }
 
 /// `out` の末尾から `offset` バイト戻った位置を `len` バイト複製する。
@@ -214,6 +236,11 @@ mod tests {
 
     const SNAPPY_HELLO: &str = "2b1468656c6c6f2046060048776f726c642c2068656c6c6f20776f726c6421";
     const LZ4_HELLO: &str = "6e68656c6c6f20060063776f726c642c190060776f726c6421";
+    // `zstd` CLI で `hello()` と同じ文字列を圧縮したもの
+    // （`printf '...' | zstd -q -c | xxd -p`）。
+    #[cfg(feature = "zstd")]
+    const ZSTD_HELLO: &str =
+        "28b52ffd0458dd00009068656c6c6f20776f726c642c776f726c642102003cb312af140157c1b30b";
     const SNAPPY_RUN: &str = concat!(
         "88270061fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe",
         "0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100fe0100",
@@ -861,10 +888,26 @@ mod tests {
         let l = decompress(Compression::Lz4Raw, &hex(LZ4_HELLO), 43).unwrap();
         assert!(l == hello());
 
+        // ZSTD は `zstd` フィーチャが付いていれば内蔵で展開する。
+        // 空バイト列はそもそも妥当な ZSTD フレームではないので、
+        // 「委譲が要る」ではなく「壊れた入力」のエラーになる。
+        #[cfg(feature = "zstd")]
+        {
+            let z = decompress(Compression::Zstd, &hex(ZSTD_HELLO), 43).unwrap();
+            assert_eq!(z, hello());
+            assert_ne!(
+                code(decompress(Compression::Zstd, b"", 0).unwrap_err()),
+                Code::UnsupportedCodec as u16,
+                "内蔵しているので UnsupportedCodec にはならないはず"
+            );
+        }
+        // `zstd` を外した構成では旧来どおりホスト委譲（UnsupportedCodec）に戻る。
+        #[cfg(not(feature = "zstd"))]
         assert_eq!(
             code(decompress(Compression::Zstd, b"", 0).unwrap_err()),
             Code::UnsupportedCodec as u16
         );
+        // GZIP は `zstd` の有無に関わらず常にホスト委譲。
         assert_eq!(
             code(decompress(Compression::Gzip, b"", 0).unwrap_err()),
             Code::UnsupportedCodec as u16

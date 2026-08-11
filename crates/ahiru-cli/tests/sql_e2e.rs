@@ -320,10 +320,12 @@ e2e!(derived_tables, "tests/data/basic.parquet", [
     "SELECT max(s.m) FROM (SELECT name, max(big) AS m FROM t GROUP BY name) AS s",
 ]);
 
-// ZSTD は別 wasm モジュールに委譲する（DESIGN.md §6）。CLI では `ahiru-zstd`
-// を直接リンクしてその役目を果たす。GZIP と同じ 1 本の経路を通る。
+// ZSTD は `ahiru-core` の既定フィーチャ（`zstd`）に含まれ、コアが内蔵で
+// 展開する（DESIGN.md §6）。CLI 側は `ahiru-zstd` を直接リンクしているが、
+// これは `zstd` フィーチャを外した場合のホスト委譲フォールバック用で、
+// 既定ビルドでは経由しない。
 e2e!(
-    zstd_via_host_codec_delegation,
+    zstd_is_decompressed_by_the_core,
     "tests/data/zstd2.parquet",
     [
         "SELECT id, s, f FROM t ORDER BY id LIMIT 5",

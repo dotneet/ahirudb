@@ -131,8 +131,15 @@ impl Compression {
     /// wasm コアに内蔵しているコーデックか。
     /// 内蔵していないものはホスト（JS の DecompressionStream や別 wasm
     /// モジュール）に展開を委譲する。DESIGN.md §6 を参照。
+    ///
+    /// ZSTD は `zstd` フィーチャ（既定で有効）が付いているときだけ内蔵扱い。
+    /// 外した場合は旧来どおりホスト委譲（`NeedCodec`）に回る。
     pub fn is_builtin(self) -> bool {
-        matches!(self, Compression::Uncompressed | Compression::Snappy | Compression::Lz4Raw)
+        match self {
+            Compression::Uncompressed | Compression::Snappy | Compression::Lz4Raw => true,
+            Compression::Zstd => cfg!(feature = "zstd"),
+            _ => false,
+        }
     }
 }
 

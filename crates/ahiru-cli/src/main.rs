@@ -190,8 +190,10 @@ fn cmd_query(groups: &[String], sql: &str) -> R {
                 }
             }
             QueryStep::NeedIo(_) => return Err("unexpected io request".into()),
-            // コーデック委譲。wasm では JS が `DecompressionStream` と
-            // `ahiru-zstd.wasm` で処理する部分を、CLI ではここで肩代わりする。
+            // コーデック委譲。ZSTD は `ahiru-core` の既定フィーチャに含まれる
+            // ようになったので、通常はここまで来ない（コア側で内蔵展開される）。
+            // 残るのは GZIP（コアが意図的に内蔵していない。DESIGN.md §6）と、
+            // `zstd` フィーチャを外してビルドした場合の ZSTD だけ。
             QueryStep::NeedCodec(reqs) => {
                 for r in reqs {
                     let src = source_bytes(&sources, r.table, r.part, r.offset, r.len)?;
@@ -226,7 +228,9 @@ fn source_bytes(
 
 /// ホスト側のコーデック。
 ///
-/// - ZSTD は `ahiru-zstd` を直接リンクする（wasm では別モジュール）。
+/// - ZSTD は `ahiru-zstd` を直接リンクする。`ahiru-core` の既定ビルドは
+///   ZSTD を内蔵している（`zstd` フィーチャ）ので、通常はここまで来ない。
+///   `--no-default-features` 相当で `zstd` を外した場合のフォールバック。
 /// - GZIP はシステムの `gzip` に投げる。CLI は開発用なので外部プロセスで十分。
 ///   wasm では `DecompressionStream('gzip')` が同じ役目を果たす。
 fn decompress_host(

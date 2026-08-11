@@ -17,7 +17,7 @@ WASM 1MB 以内で動く、Parquet を直接クエリできる軽量 SQL エン�
 
 ### 前提（明示的な仮定）
 
-- **1MB は raw `.wasm` 単体**とする。ランタイムで後から取得する任意モジュール（zstd デコーダ等）は別勘定。
+- **1MB は raw `.wasm` 単体**とする。ランタイムで後から取得する任意モジュール（`ahiru-zstd`。`zstd` フィーチャを外した opt-out 構成でのみ使う）は別勘定。ZSTD は実測 13 KB 程度と分かったため、既定では別モジュールにせずコア本体（1MB 予算の内側）に含めている（§6）。
 - 主ターゲットは**ブラウザ**。Node / Deno / Cloudflare Workers でも同一バイナリが動くこと。
 - **読み取り専用**。INSERT / UPDATE / DELETE / トランザクションは対象外。
 - 単一スレッド。SharedArrayBuffer（COOP/COEP）に依存しない。
@@ -89,6 +89,11 @@ flowchart TB
 ## 3. サイズ予算
 
 ### 実測値（2026-08-11 時点）
+
+> この表は初期実装（Parquet コアのみ）時点のスナップショット。以降 SQL 機能
+> （集約・ウィンドウ・CTE・JSON 型・DDL/DML 等）と ZSTD の内蔵化を大量に
+> 追加しており、現在の実測値は README.md の "Current size" と
+> `./scripts/size.sh` を参照。
 
 `./scripts/size.sh` の出力。`wasm-opt` は未適用。
 
@@ -328,10 +333,19 @@ for (;;) {
 
 ### コーデック委譲プロトコル
 
-内蔵しないコーデック（GZIP / ZSTD）は、I/O と同じ「止めて要求する」形で
-ホストに委譲する。`ahiru_query_step` が `STATUS_NEED_CODEC` を返し、
-`{table, codec, offset, len, out_len}` の列を渡す。ホストは展開して
-`ahiru_provide_codec` で返し、ループを続ける。
+> **更新（2026-08-11 以降）**: ZSTD は実測 13 KB 程度（予算比 1.3%）に収まる
+> ことが分かったため、別モジュールに分ける手間に見合わないと判断し、
+> `ahiru-core` に `zstd` フィーチャ（既定で有効）としてライブラリ直接リンク
+> する形に変えた。以下の「内蔵しないコーデック」の説明は GZIP のみに適用
+> される（ZSTD は `zstd` フィーチャを明示的に外したときだけこの経路を通る）。
+> 別モジュールとしての `ahiru-zstd` 自体はそのオプトアウト時の代替として
+> 引き続きビルドできる（`crates/ahiru-zstd/Cargo.toml` の `standalone`
+> フィーチャ、`scripts/size.sh` 参照）。
+
+内蔵しないコーデック（既定では GZIP のみ。`zstd` を外した場合は ZSTD も）は、
+I/O と同じ「止めて要求する」形でホストに委譲する。`ahiru_query_step` が
+`STATUS_NEED_CODEC` を返し、`{table, codec, offset, len, out_len}` の列を
+渡す。ホストは展開して `ahiru_provide_codec` で返し、ループを続ける。
 
 **成立の鍵は、必要な展開作業が分割の開始時点で確定すること。** ページヘッダは
 圧縮されないので、バイトさえ揃えばページ境界を全部走査できる（`collect_codec_pages`）。
@@ -349,19 +363,25 @@ i32 ahiru_provide_codec(i32 h, u32 table, u64 offset, u32 len, ptr data, usize d
 **圧縮バイトは直前の `NEED_IO` で既に届いている**ので、ホストは再取得しない。
 `offset`/`len` は要求と完全一致させる（キャッシュのキーでもある）。
 
-GZIP と ZSTD が同じ経路を通るのが要点で、ホスト側だけが違いを知っている:
+既定構成でホスト委譲が要るのは GZIP だけ、というのが今の要点
+（ホスト側だけが違いを知っている、という設計自体は変わらない）:
 
 | コーデック | ホスト側の処理 | wasm コアの追加バイト |
 |---|---|---|
 | SNAPPY / LZ4_RAW | （内蔵） | 12 KB |
+| ZSTD | （内蔵、`zstd` フィーチャ） | 約 13 KB |
 | GZIP | `DecompressionStream('gzip')` | **0** |
-| ZSTD | `ahiru-zstd.wasm` を遅延ロード | **0**（別モジュール） |
+
+`zstd` を明示的に外した構成では ZSTD もホスト委譲に戻り、上の「別モジュール」
+の表と同じ経路（`ahiru-zstd.wasm` の遅延ロード）を使う。
 
 ### キャッシュ
 
 - レンジ LRU キャッシュは **JS 側**に置く。Cache API / IndexedDB を使えるうえ、WASM のバイトを消費しない。
-- GZIP は `DecompressionStream('gzip')` に委譲（追加 0 バイト）。
-- ZSTD は `ahiru-zstd.wasm`（約 90 KB、初回必要時のみ動的ロード）に分離。core は「このバッファを codec X で展開して」という要求を返すだけ。
+- GZIP は `DecompressionStream('gzip')` に委譲（追加 0 バイト）。ブラウザ/Node に
+  既にあるものをコアに重複して持つ理由が無いため、これだけは意図的にホスト委譲のまま。
+- ZSTD は既定でコアに内蔵する（`zstd` フィーチャ、約 13 KB）。`zstd` を外せば
+  `ahiru-zstd.wasm`（別モジュール、初回必要時のみ動的ロード）への委譲に戻る。
 - SNAPPY と LZ4_RAW はデコーダ実装が小さく（合計 12 KB）呼び出し頻度が高いので内蔵する。
 
 ---
@@ -548,7 +568,8 @@ ahirudb/
 │   │   ├── exec/         # operators, hashtable, sort
 │   │   ├── expr/         # bytecode VM, kernels
 │   │   └── abi/          # wasm export 境界
-│   ├── ahiru-zstd/       # 別 wasm（動的ロード）
+│   ├── ahiru-zstd/       # ahiru-core に既定でリンクされる（`zstd` フィーチャ）。
+│   │                     # opt-out 時のみ別 wasm として単独ビルド可（`standalone`）
 │   └── ahiru-cli/        # ネイティブビルド。デバッグ/テスト用
 ├── js/                   # ahirudb npm パッケージ（ホスト層）
 ├── tests/
@@ -589,7 +610,7 @@ TPC-H SF1（Parquet）と NYC Taxi の一部を基準にし、**duckdb-wasm と�
 | リスク | 影響 | 対処 |
 |--------|------|------|
 | **カーネル爆発でサイズ超過** | 高 | §11 の 5 対策。予備 274 KB。それでも超えたら削減順序: DELTA encoding → I128 → 日時関数 → `FULL JOIN` |
-| ZSTD が実質必須で別ロードが煩わしい | 中 | 初回クエリ時に自動フェッチ + キャッシュ。`ahiru-core-zstd.wasm`（同梱版、約 1.1 MB）も並行配布し、選択可能にする |
+| ~~ZSTD が実質必須で別ロードが煩わしい~~ | ~~中~~ | **解決済み（2026-08-11）**: 実測で ZSTD デコーダが約 13 KB（見積り 1.1 MB は大幅な過大見積りだった）と判明したため、同梱版を別配布するのではなく `zstd` フィーチャとして既定でコアに含めることにした（§6）。オプトアウトしたいときだけ別モジュール（`ahiru-zstd`、`standalone` フィーチャ）に切り出せる |
 | ネスト型（LIST/STRUCT）非対応 | 中 | v1 は明示エラー。実データでは頻出するので v2 の最優先候補。repetition/definition level のデコーダは約 25 KB の見込み |
 | Rust の `no_std` 縛りが開発速度を落とす | 中 | ネイティブビルド（`ahiru-cli`）では `std` を許可し、`#[cfg]` で切り替え。テストは std 側で書く |
 | メモリ上限超過（大きな結合・集約） | 中 | スピルは実装しない。上限超過を明示エラーで返し、ドキュメントに限界を書く |

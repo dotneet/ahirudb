@@ -46,17 +46,28 @@ measure() { # $1=ラベル, $2=フィーチャ
   printf '%-24s %10s %10s %7.1f%%\n' "$1" "$SIZE" "$gz" "$(echo "100*$SIZE/$LIMIT" | bc -l)"
 }
 
-# 配布の基準となる構成（Parquet のみ）を最後に測って OUT に残す。
-measure "parquet + csv" "csv";           CSV_SIZE=$SIZE
-measure "parquet + jsonl" "jsonl";       JSONL_SIZE=$SIZE
-measure "parquet + csv + jsonl" "csv,jsonl"; ALL_SIZE=$SIZE
-measure "parquet のみ (既定)" "";        BASE_SIZE=$SIZE
+# ZSTD は既定で内蔵する（`zstd` フィーチャ、13 KB 程度で予算への影響が
+# 小さいため別モジュールに分ける理由が無いと判断した。DESIGN.md §6）。
+# 配布の基準となる構成（Parquet + ZSTD が既定）を最後に測って OUT に残す。
+# `NOZSTD_SIZE` は増分を出すためだけの比較用なので、OUT を上書きしないよう
+# 「既定」構成より先に測る。
+measure "parquet のみ (zstd 無し)" "";       NOZSTD_SIZE=$SIZE
+measure "parquet + csv" "zstd,csv";           CSV_SIZE=$SIZE
+measure "parquet + jsonl" "zstd,jsonl";       JSONL_SIZE=$SIZE
+measure "parquet + csv + jsonl" "zstd,csv,jsonl"; ALL_SIZE=$SIZE
+measure "parquet のみ (既定)" "zstd";        BASE_SIZE=$SIZE
 cp target/size-probe.wasm "$OUT"
 
-# ZSTD は別モジュール。コアの予算には数えないが、実際に配る総量は見えるようにする。
+# ZSTD は既定でコアに内蔵する（`zstd` フィーチャ、上の測定に含まれている）。
+# `zstd` を外した構成向けの旧来の委譲経路（ahiru-zstd を別 wasm モジュールと
+# して単独ビルドし、ホストが初回要求時に読み込む）も、opt-out した場合の
+# 代替として引き続きビルドできることだけ確認しておく。
+# `crate-type` は既定で rlib のみ（`ahiru-core` への依存時に cdylib まで
+# ビルドしてリンクエラーになるのを避けるため）なので、単独ビルドでは
+# `cargo rustc --crate-type cdylib` で明示的に上書きする。
 ZSTD_OUT=target/ahiru-zstd.wasm
-if cargo build --profile wasm --target wasm32-unknown-unknown -p ahiru-zstd \
-     --no-default-features >/dev/null 2>&1; then
+if cargo rustc --profile wasm --target wasm32-unknown-unknown -p ahiru-zstd \
+     --no-default-features --features standalone -- --crate-type cdylib >/dev/null 2>&1; then
   cp target/wasm32-unknown-unknown/wasm/ahiru_zstd.wasm "$ZSTD_OUT"
   if command -v wasm-opt >/dev/null 2>&1; then
     wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory \
@@ -65,12 +76,13 @@ if cargo build --profile wasm --target wasm32-unknown-unknown -p ahiru-zstd \
   fi
   ZSIZE=$(wc -c < "$ZSTD_OUT" | tr -d ' ')
   ZGZ=$(gzip -9 -c "$ZSTD_OUT" | wc -c | tr -d ' ')
-  printf '%-24s %10s %10s %8s\n' "ahiru-zstd (別モジュール)" "$ZSIZE" "$ZGZ" "予算外"
+  printf '%-24s %10s %10s %8s\n' "ahiru-zstd (opt-out 時の代替)" "$ZSIZE" "$ZGZ" "参考"
 fi
 
 echo
 printf 'csv の追加分   : %+d bytes\n' "$((CSV_SIZE - BASE_SIZE))"
 printf 'jsonl の追加分 : %+d bytes\n' "$((JSONL_SIZE - BASE_SIZE))"
+printf 'zstd の追加分  : %+d bytes\n' "$((BASE_SIZE - NOZSTD_SIZE))"
 printf '全部入り       : %d bytes (%.1f%% of %d)\n' \
   "$ALL_SIZE" "$(echo "100*$ALL_SIZE/$LIMIT" | bc -l)" "$LIMIT"
 echo

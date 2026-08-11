@@ -12,16 +12,20 @@ use core::cell::UnsafeCell;
 use core::ptr;
 
 /// wasm + no_std ビルドでのみグローバルアロケータを差し替える。
-#[cfg(all(target_arch = "wasm32", not(feature = "std")))]
+/// `standalone`（このクレート単独が wasm モジュールのトップレベルである
+/// とき）でしか定義しない。`ahiru-core` にライブラリとしてリンクされる
+/// ときは `ahiru-core` 側のアロケータと重複してしまうため。
+#[cfg(all(target_arch = "wasm32", not(feature = "std"), feature = "standalone"))]
 #[global_allocator]
 static ALLOC: ZstdAlloc = ZstdAlloc;
 
-/// no_std ビルドのパニックハンドラ。
+/// no_std ビルドのパニックハンドラ。`standalone` 時のみ（理由は上記
+/// アロケータと同じ）。
 ///
 /// `panic = "abort"` なので巻き戻しは無い。メッセージを組み立てると
 /// `core::fmt` がリンクされるので、何も見ずに trap する。エラーは全て
 /// `Result` で返す設計なので、ここに来るのはバグかメモリ枯渇のみ。
-#[cfg(all(target_arch = "wasm32", not(feature = "std"), not(test)))]
+#[cfg(all(target_arch = "wasm32", not(feature = "std"), not(test), feature = "standalone"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     core::arch::wasm32::unreachable()

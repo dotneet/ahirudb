@@ -10,12 +10,18 @@ crate-type = ["rlib", "cdylib"]
 [features]
 # ネイティブ開発・テスト時のみ std を有効化する。
 # wasm ビルドは --no-default-features で no_std + Parquet のみになる。
-default = ["std", "csv", "jsonl"]
-std = []
+default = ["std", "csv", "jsonl", "zstd"]
+std = ["ahiru-zstd?/std"]
 # 追加フォーマットはフィーチャで切る。Parquet だけの配布物を最小に保つため
 # （DESIGN.md §3 のサイズ予算）。
 csv = []
 jsonl = []
+# ZSTD 展開を `ahiru-zstd` をライブラリとしてリンクして内蔵する。
+# 展開結果が 13 KB 程度（1 MiB 予算の 1.3%）に収まるため、GZIP/ZSTD を
+# 常にホスト委譲していた旧設計から変更し、既定で内蔵にしてある
+# （DESIGN.md §6）。外すと従来どおりホスト（JS の別 wasm モジュール読み込み）
+# に委譲する経路にフォールバックする。
+zstd = ["dep:ahiru-zstd"]
 
 # --- 更新系（オプトアウト可能） ------------------------------------------
 # 既定で無効。読み取り専用の Source モデル（DESIGN.md §6, §15）には一切
@@ -37,6 +43,11 @@ dml = ["ddl"]
 
 [dependencies]
 # 依存クレートは原則ゼロ。追加時は wasm サイズの実測値を PR に添付すること。
+# ahiru-zstd は唯一の例外（ワークスペース内クレート、`zstd` フィーチャで
+# 切れる）。`standalone` は付けない — `ahiru-core` 側のグローバルアロケータ/
+# パニックハンドラ/wasm ABI と重複するのを避けるため（両クレートの
+# `rt.rs`/`lib.rs` のコメント参照）。
+ahiru-zstd = { path = "../ahiru-zstd", default-features = false, optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

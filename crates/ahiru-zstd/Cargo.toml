@@ -5,13 +5,30 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+# `cdylib` は既定で持たせない。Cargo は依存クレートでも `[lib]` に
+# 並んだ crate-type を全部ビルドしてしまうため、`ahiru-core` がこれを
+# ライブラリとして（`rlib` として）リンクするだけのつもりでも、
+# `cdylib`（wasm モジュール単独リンク）まで同時にビルドしようとして
+# アロケータ/パニックハンドラの重複無し状態でリンクに失敗する
+# （`standalone` フィーチャ参照）。単独 wasm モジュールとしてビルドする
+# ときは `scripts/size.sh` が `cargo rustc --crate-type cdylib` で
+# 明示的に上書きする。
+crate-type = ["rlib"]
 
 [features]
 # ネイティブ開発・テスト時のみ std を有効化する。
 # wasm 配布は --no-default-features で no_std になる。
 default = ["std"]
 std = []
+# `ahiru-core` がこのクレートをライブラリとしてリンクする（既定の配布経路、
+# DESIGN.md §6）ときは無効のままにする。グローバルアロケータ・パニック
+# ハンドラ・wasm ABI 入口（`abi` モジュール）はどれも「単独の wasm モジュール
+# として自分がトップレベルである」ことを前提にしており、`ahiru-core` 側も
+# 同じものを定義しているため、両方リンクすると重複定義でリンクエラーになる。
+# `zstd` フィーチャを外して `ahiru-core` から独立させ、旧来どおりホストが
+# 別読み込みする配布形にしたいときだけ、このクレートを単独ビルドする側で
+# 有効にする（`scripts/size.sh` 参照）。
+standalone = []
 
 [dependencies]
 # 依存クレートゼロ。サイドモジュールはコアより更に小さく保つ（DESIGN.md §6）。

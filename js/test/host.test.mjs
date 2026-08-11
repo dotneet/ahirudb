@@ -72,6 +72,33 @@ const FORMAT_SKIP = (() => {
   }
 })();
 
+/**
+ * ZSTD は既定でコアに内蔵する（`zstd` フィーチャ、DESIGN.md §6）ので、
+ * `target/ahiru-core.wasm` に対するクエリはコーデック委譲（`NEED_CODEC`）を
+ * 経由しない。ホスト側の委譲・キャッシュ溢れ耐性はそれ自体テストしたい
+ * 挙動なので、`zstd` を外したコアを別に用意してそちらだけに向ける。
+ */
+const NOZSTD_WASM = process.env.AHIRU_WASM_NOZSTD ?? join(ROOT, 'target/ahiru-core-nozstd.wasm');
+const NOZSTD_SKIP = (() => {
+  try {
+    execFileSync(
+      'cargo',
+      // prettier-ignore
+      ['build', '--profile', 'wasm', '--target', 'wasm32-unknown-unknown',
+       '-p', 'ahiru-core', '--no-default-features'],
+      { cwd: ROOT, stdio: 'ignore' },
+    );
+    copyFileSync(join(ROOT, 'target/wasm32-unknown-unknown/wasm/ahiru_core.wasm'), NOZSTD_WASM);
+    return false;
+  } catch {
+    return existsSync(NOZSTD_WASM)
+      ? false
+      : `zstd 無しの wasm がありません。cargo build --profile wasm ` +
+          `--target wasm32-unknown-unknown -p ahiru-core --no-default-features ` +
+          `して ${NOZSTD_WASM} に置くか、AHIRU_WASM_NOZSTD を指定してください`;
+  }
+})();
+
 async function openFullDb(options = {}) {
   return AhiruDB.init({ wasmUrl: FULL_WASM, ...options });
 }
@@ -944,8 +971,21 @@ test('GZIP はレンジ取得経路でも追加 fetch なしで展開できる',
 
 const ZSTD_PARQUET = join(ROOT, 'tests/data/zstd.parquet');
 
-test('ZSTD はモジュール未指定なら ZSTD と名指しで落ちる', { skip: needsVm }, async () => {
-  const db = await openDb();
+test('ZSTD は既定のコアだけで（サイドモジュール無しで）展開される', { skip: needsVm }, async () => {
+  const db = await openDb(); // 既定の target/ahiru-core.wasm。zstdUrl は渡さない。
+  try {
+    db.register('z', new Uint8Array(await readFile(ZSTD_PARQUET)));
+    assert.deepEqual(
+      numeric(await db.query('SELECT * FROM z LIMIT 5')),
+      numeric(duck(`SELECT * FROM '${ZSTD_PARQUET}' LIMIT 5`)),
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('ZSTD はモジュール未指定なら ZSTD と名指しで落ちる', { skip: NOZSTD_SKIP || needsVm }, async () => {
+  const db = await AhiruDB.init({ wasmUrl: NOZSTD_WASM });
   try {
     db.register('z', new Uint8Array(await readFile(ZSTD_PARQUET)));
     await assert.rejects(
@@ -962,15 +1002,23 @@ test('ZSTD はモジュール未指定なら ZSTD と名指しで落ちる', { s
   }
 });
 
-/** ZSTD サイドモジュール（crates/ahiru-zstd）。まだ実装中なら skip。 */
+/**
+ * ZSTD サイドモジュール（crates/ahiru-zstd）。既定では `ahiru-core` に
+ * ライブラリとしてリンクされる（`zstd` フィーチャ）ので、単独の wasm
+ * モジュールとしては `standalone` フィーチャを明示し、`crate-type` も
+ * `cdylib` に明示的に上書きしてビルドする必要がある
+ * （`crates/ahiru-zstd/Cargo.toml` 参照。既定は `rlib` のみ）。
+ * `zstd` フィーチャを外したコアでの委譲経路のテスト専用。
+ */
 const ZSTD_WASM = join(ROOT, 'target/wasm32-unknown-unknown/wasm/ahiru_zstd.wasm');
 const ZSTD_SKIP = await (async () => {
   try {
     execFileSync(
       'cargo',
       // prettier-ignore
-      ['build', '--profile', 'wasm', '--target', 'wasm32-unknown-unknown',
-       '-p', 'ahiru-zstd', '--no-default-features'],
+      ['rustc', '--profile', 'wasm', '--target', 'wasm32-unknown-unknown',
+       '-p', 'ahiru-zstd', '--no-default-features', '--features', 'standalone',
+       '--', '--crate-type', 'cdylib'],
       { cwd: ROOT, stdio: 'ignore' },
     );
   } catch {
@@ -986,8 +1034,8 @@ const ZSTD_SKIP = await (async () => {
         '公開されればこの skip は自動で外れる。';
 })();
 
-test('ZSTD はサイドモジュールで展開される', { skip: ZSTD_SKIP || needsVm }, async () => {
-  const db = await openDb({ zstdUrl: ZSTD_WASM });
+test('ZSTD はサイドモジュールで展開される', { skip: ZSTD_SKIP || NOZSTD_SKIP || needsVm }, async () => {
+  const db = await AhiruDB.init({ wasmUrl: NOZSTD_WASM, zstdUrl: ZSTD_WASM });
   try {
     db.register('z', new Uint8Array(await readFile(ZSTD_PARQUET)));
     assert.deepEqual(
@@ -1162,7 +1210,12 @@ async function scanTwiceWithTinyCache(path, options = {}) {
   const file = new Uint8Array(await readFile(path));
   const f = fakeFetcher(file);
   // 控えもキャッシュも実質ゼロ。毎回どこかが捨てられる状態にする。
-  const db = await openDb({ fetch: f.fetchImpl, cacheSize: 4096, ...options });
+  const db = await AhiruDB.init({
+    wasmUrl: WASM,
+    fetch: f.fetchImpl,
+    cacheSize: 4096,
+    ...options,
+  });
   try {
     db.register('t', f.url);
     const first = await db.query('SELECT id FROM t');
@@ -1183,8 +1236,11 @@ test('控えを溢れさせても GZIP を読み切れる', { skip: needsVm }, a
   assert.equal(first[first.length - 1].id, 119999);
 });
 
-test('控えを溢れさせても ZSTD を読み切れる', { skip: ZSTD_SKIP || needsVm }, async () => {
-  const { first, second } = await scanTwiceWithTinyCache(BIG_ZSTD, { zstdUrl: ZSTD_WASM });
+test('控えを溢れさせても ZSTD を読み切れる', { skip: ZSTD_SKIP || NOZSTD_SKIP || needsVm }, async () => {
+  const { first, second } = await scanTwiceWithTinyCache(BIG_ZSTD, {
+    wasmUrl: NOZSTD_WASM,
+    zstdUrl: ZSTD_WASM,
+  });
   assert.equal(first.length, 120000);
   assert.deepEqual(first, second);
   assert.equal(first[first.length - 1].id, 119999);

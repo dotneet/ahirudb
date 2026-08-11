@@ -39,7 +39,11 @@ mod xxh64;
 
 pub mod rt;
 
-#[cfg(target_arch = "wasm32")]
+// wasm ABI 入口（`ahiru_zstd_*` エクスポート関数）は、このクレートが単独の
+// wasm モジュールとして配布されるとき（`standalone`）だけ要る。`ahiru-core`
+// にライブラリとしてリンクされるときは `ahiru-core` 自身の ABI だけを
+// 公開したいので、ここは含めない。
+#[cfg(all(target_arch = "wasm32", feature = "standalone"))]
 pub mod abi;
 
 /// クレート内で共通に使う import。

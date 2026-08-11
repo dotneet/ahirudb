@@ -20,7 +20,7 @@ const db = await AhiruDB.init({
   wasmUrl: '/ahiru-core.wasm',
   memoryLimit: 512 * 1024 * 1024, // wasm heap cap; exceeding it raises E501
   cache: 'memory',                // "memory" | "cache-api" | "none" | a custom implementation
-  zstdUrl: '/ahiru-zstd.wasm',    // only needed when reading files that use ZSTD
+  zstdUrl: '/ahiru-zstd.wasm',    // only needed if ahiru-core.wasm was built without the `zstd` feature
 });
 
 // register() does no I/O. Fetching the total length and reading the footer
@@ -132,16 +132,20 @@ along with a list of `{table, offset, len}`, and the host is expected to:
 
 ### Codec delegation
 
-The core has neither GZIP nor ZSTD built in — that omission is exactly why the
-core stays small (DESIGN.md §6). When the engine hits a codec it doesn't
-support internally, it returns `NEED_CODEC` with a list of
-`{table, codec, offset, len, out_len}`. The host then:
+ZSTD is decompressed by the core itself by default (feature `zstd`, ~13 KB —
+small enough that splitting it into a separate module wasn't worth the extra
+round-trip; DESIGN.md §6). GZIP stays delegated to the host on purpose, since
+the browser/Node already ship a decompressor for it at zero extra bytes.
+When the engine hits a codec it doesn't handle internally, it returns
+`NEED_CODEC` with a list of `{table, codec, offset, len, out_len}`. The host then:
 
 - **GZIP** … uses `DecompressionStream('gzip')`. Available in both browsers
   and Node 18+, so it costs zero extra bytes.
-- **ZSTD** … loads `crates/ahiru-zstd` as a separate wasm module **on first
-  request** (via `zstdUrl` / `zstdBinary` / `zstdModule`). If none is
-  configured, it raises E201 naming ZSTD specifically.
+- **ZSTD** … only reaches the host at all if `ahiru-core.wasm` was built with
+  the `zstd` feature turned off. In that case the host loads
+  `crates/ahiru-zstd` as a separate wasm module **on first request** (via
+  `zstdUrl` / `zstdBinary` / `zstdModule`). If none is configured, it raises
+  E201 naming ZSTD specifically.
 - **Anything else** (BROTLI, etc.) … E201, "unsupported compression codec".
 
 The compressed block was already fetched by the preceding `NEED_IO`, so
@@ -209,8 +213,11 @@ file, it wouldn't actually exercise projection pushdown).
 
 CSV / JSONL tests need a wasm build with `--features csv,jsonl`; the test
 suite builds `target/ahiru-core-full.wasm` automatically (override with
-`AHIRU_WASM_FULL`). ZSTD tests build and use `crates/ahiru-zstd`. If either
-isn't available, the corresponding tests are skipped.
+`AHIRU_WASM_FULL`). The ZSTD *delegation* tests (the opt-out fallback path)
+need a core built with `--no-default-features` (i.e. without `zstd`) plus the
+separate `ahiru-zstd` side module; the suite builds both automatically
+(override the core with `AHIRU_WASM_NOZSTD`). If any of these builds isn't
+available, the corresponding tests are skipped.
 
 > On Node 24, `node --test js/test/` (passing a directory) doesn't work.
 > Use a glob as shown above, or run `node --test` with no arguments.

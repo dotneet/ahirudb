@@ -142,10 +142,27 @@ fn uncompressed_pages_are_read_without_a_codec() {
     assert_eq!(cols[0].value_at(4999), Value::I32(4999));
 }
 
+// duckdb -c "SELECT count(*) FROM 'zstd.parquet'" -> 5000
+// duckdb -c "DESCRIBE SELECT * FROM 'zstd.parquet'" -> id INTEGER のみ、0..4999
+
+/// `zstd` フィーチャ（既定で有効）が付いていれば、ZSTD 圧縮ページはコアが
+/// その場で展開できる。ホストへの委譲（`NeedCodec`）は経由しない。
+#[cfg(feature = "zstd")]
 #[test]
-fn zstd_is_rejected_with_a_clear_code_until_the_side_module_lands() {
-    // ZSTD は別 wasm モジュールに委譲する設計（DESIGN.md §6）。まだ配線が無いので
-    // 「未対応」と明示的に言えることを確認する。黙って壊れるより良い。
+fn zstd_pages_are_decompressed_by_the_core_when_the_feature_is_on() {
+    let bytes = data("zstd.parquet");
+    let (_, cols) = read_all(&bytes);
+    assert_eq!(cols[0].len(), 5000);
+    for i in 0..5000usize {
+        assert_eq!(cols[0].value_at(i), Value::I32(i as i32), "row {i}");
+    }
+}
+
+/// `zstd` を外した構成では、旧来どおりホスト委譲が必要という明確な
+/// `UnsupportedCodec` になる（黙って壊れるより良い）。
+#[cfg(not(feature = "zstd"))]
+#[test]
+fn zstd_is_rejected_with_a_clear_code_when_the_feature_is_off() {
     let bytes = data("zstd.parquet");
     let f = open_bytes(&bytes).expect("フッタは非圧縮なので読める");
     let rg = &f.meta.row_groups[0];
