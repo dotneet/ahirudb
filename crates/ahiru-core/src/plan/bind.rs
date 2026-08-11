@@ -24,7 +24,7 @@ use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{
     BinaryOp, Cte, Expr, ExprArena, ExprId, FromItem, JoinKind, OrderByItem, Parsed, QueryStmt,
-    SelectStmt, SetExpr, SetOp, Stmt, WindowDef, WindowFrame,
+    SelectStmt, SetExpr, SetOp, Stmt, UnaryOp, WindowDef, WindowFrame,
 };
 use crate::vector::{Field, Ty, Value};
 
@@ -258,7 +258,7 @@ fn set_expr_references(e: &SetExpr, name: &str) -> bool {
 fn from_item_references(f: &FromItem, name: &str) -> bool {
     match f {
         FromItem::Table { name: n, .. } => eq_ascii_ci(n.as_bytes(), name.as_bytes()),
-        FromItem::Parquet { .. } => false,
+        FromItem::File { .. } => false,
         FromItem::Subquery { query, .. } => set_expr_references(&query.body, name),
         FromItem::Join { left, right, .. } => {
             from_item_references(left, name) || from_item_references(right, name)
@@ -508,10 +508,16 @@ fn flatten_from(
             }
             err!(TableNotFound)
         }
-        FromItem::Parquet { path, alias } => {
-            // `parquet('...')` はパスをテーブル名として登録済みであることを期待する。
-            // ホストが URL をそのまま名前にして登録するので、SQL からは
-            // `FROM parquet('https://…')` と書ける。
+        // `parquet(...)`/`read_parquet(...)`/`read_csv[_auto](...)`/
+        // `read_json[_auto](...)`/bare `'path'` (see `FromItem::File` doc).
+        // All resolve the same way: `path` must already be registered as a
+        // table name (the host registers the URL/path verbatim, so SQL can
+        // write e.g. `FROM parquet('https://…')` or `FROM read_csv('a.csv')`
+        // once the host has registered a table under that exact string).
+        // `format` is intentionally not consulted here — it only records
+        // which surface syntax was used; this engine cannot re-dispatch
+        // parsing at bind time (see `FromItem::File` doc for why).
+        FromItem::File { path, alias, .. } => {
             let i = match catalog.index_of(path) {
                 Some(i) => i,
                 None => err!(TableNotFound),
@@ -1071,6 +1077,40 @@ fn bind_select_in(
         }
         scope.push(None, Field::new(label.clone(), ty, true));
         subs.push(Substitution { expr: *id, column: col, structural: false });
+    }
+
+    // `>`/`<`/`>=`/`<=` を伴う `ANY`/`ALL`（非相関のみ）。`= ANY`/`<> ALL` は
+    // `is_semijoin_predicate` 経由で下の `semijoins` ループが処理するので、
+    // ここには来ない（`collect_quantified_comparisons` の doc 参照）。
+    // スカラサブクエリと同じ「結合で 1 列足して `Substitution` で差し替える」
+    // パターンなので、位置は独立（`semijoins`/`leftover` より前ならどこでもよい）。
+    let mut quantifieds: Vec<ExprId> = Vec::new();
+    for item in &sel.items {
+        collect_quantified_comparisons(arena, item.expr, &mut quantifieds, 0)?;
+    }
+    for e in [sel.filter, sel.having].into_iter().flatten() {
+        collect_quantified_comparisons(arena, e, &mut quantifieds, 0)?;
+    }
+    for e in &sel.group_by {
+        collect_quantified_comparisons(arena, *e, &mut quantifieds, 0)?;
+    }
+    for o in &sel.order_by {
+        collect_quantified_comparisons(arena, o.expr, &mut quantifieds, 0)?;
+    }
+    for (n, id) in quantifieds.iter().enumerate() {
+        let (op, arg, all, q) = match arena.get(*id) {
+            Expr::QuantifiedComparison { op, arg, all, query } => (*op, *arg, *all, query.as_ref()),
+            _ => err!(Internal),
+        };
+        node = build_quantified_comparison(
+            catalog, arena, params, ctes, node, &scope, &subs, n, op, arg, all, q,
+        )?;
+        let out_field = match node.schema().last() {
+            Some(f) => f.clone(),
+            None => err!(Internal),
+        };
+        scope.push(None, out_field);
+        subs.push(Substitution { expr: *id, column: scope.len() - 1, structural: false });
     }
 
     for c in semijoins {
@@ -1934,53 +1974,83 @@ fn build_semijoin(
                 schema,
             })
         }
-        Expr::InSubquery { arg, query, negated } => {
-            let plan = bind_query_in(catalog, arena, query, params, ctes, Some(scope))?;
-            let k = plan.correlated.len();
-            ensure!(plan.root.schema().len() - k == 1, TypeMismatch);
-            let rf = plan.root.schema()[0].clone();
-
-            let lp = compile_with_subs(arena, scope, params, subs, *arg)?;
-            let rscope = Scope::from_fields(plan.root.schema().to_vec());
-            let rp = column_program(&rscope, 0)?;
-            // キーはバイト列に符号化して突き合わせるので、物理型を揃える。
-            let want = Ty::unify_or_mismatch(lp.result_ty, rf.ty)?;
-            let mut left_keys = vec![cast_program(lp, want)?];
-            let mut right_keys = vec![cast_program(rp, want)?];
-            let (corr_left, corr_right) = correlation_keys(arena, scope, params, &plan)?;
-            left_keys.extend(corr_left);
-            right_keys.extend(corr_right);
-
-            // `NOT IN` は右に NULL が 1 つでもあると三値論理で結果が空になる。
-            // 通常の反結合ではこの意味を再現できないので、NULL 対応版
-            // （右に NULL キーが 1 つでもあれば無条件に空を返す）を使う。
-            // `AntiNullAware` は「右全体に NULL があるか」を見る実装
-            // （相関キーごとにスコープされていない）なので、相関がある場合に
-            // そのまま使うと、ある外側行の相関先に NULL があるだけで無関係な
-            // 別の外側行の結果まで空になりかねない。相関キーごとに絞った
-            // null 対応判定を行う実行系のプリミティブが無い以上、相関
-            // `NOT IN` は安全に評価できない（対象列の NULL 可能性を束縛時に
-            // 正確に判定する手段も無い: SELECT リストの出力列は常に
-            // `nullable = true` として扱われるため）。誤った結果を返すより
-            // 明確に拒否する。
-            ensure!(!(*negated && k > 0), UnsupportedFeature);
-            let kind = match (*negated, rf.nullable) {
-                (false, _) => JoinKind::Semi,
-                (true, false) => JoinKind::Anti,
-                (true, true) => JoinKind::AntiNullAware,
-            };
-            Ok(Node::Join {
-                left: Box::new(left),
-                right: Box::new(plan.root),
-                kind,
-                left_keys,
-                right_keys,
-                residual: None,
-                schema,
-            })
+        Expr::InSubquery { arg, query, negated } => build_in_style_semijoin(
+            catalog, arena, params, ctes, left, scope, subs, schema, *arg, query, *negated,
+        ),
+        // `= ANY (SELECT ...)` / `<> ALL (SELECT ...)` は `IN`/`NOT IN` と
+        // 意味的に全く同じ（`is_semijoin_predicate` の doc 参照）。他の演算子・
+        // `SOME`/`ALL` の組み合わせはここには来ない（`is_semijoin_predicate` が
+        // 弾いている）。
+        Expr::QuantifiedComparison { op, arg, all: _, query } => {
+            let negated = matches!(op, BinaryOp::Ne);
+            build_in_style_semijoin(
+                catalog, arena, params, ctes, left, scope, subs, schema, *arg, query, negated,
+            )
         }
         _ => err!(Internal),
     }
+}
+
+/// `x [NOT] IN (SELECT ...)` 形の半結合・反結合を組み立てる。`InSubquery` と
+/// `= ANY` / `<> ALL` に書き換わった `QuantifiedComparison` の両方から呼ばれる
+/// 共通実装（`build_semijoin` 参照）。
+#[allow(clippy::too_many_arguments)]
+fn build_in_style_semijoin(
+    catalog: &Catalog,
+    arena: &ExprArena,
+    params: &[Value],
+    ctes: &mut CteScope,
+    left: Node,
+    scope: &Scope,
+    subs: &[Substitution],
+    schema: Vec<Field>,
+    arg: ExprId,
+    query: &QueryStmt,
+    negated: bool,
+) -> Result<Node> {
+    let plan = bind_query_in(catalog, arena, query, params, ctes, Some(scope))?;
+    let k = plan.correlated.len();
+    ensure!(plan.root.schema().len() - k == 1, TypeMismatch);
+    let rf = plan.root.schema()[0].clone();
+
+    let lp = compile_with_subs(arena, scope, params, subs, arg)?;
+    let rscope = Scope::from_fields(plan.root.schema().to_vec());
+    let rp = column_program(&rscope, 0)?;
+    // キーはバイト列に符号化して突き合わせるので、物理型を揃える。
+    let want = Ty::unify_or_mismatch(lp.result_ty, rf.ty)?;
+    let mut left_keys = vec![cast_program(lp, want)?];
+    let mut right_keys = vec![cast_program(rp, want)?];
+    let (corr_left, corr_right) = correlation_keys(arena, scope, params, &plan)?;
+    left_keys.extend(corr_left);
+    right_keys.extend(corr_right);
+
+    // `NOT IN` は右に NULL が 1 つでもあると三値論理で結果が空になる。
+    // 通常の反結合ではこの意味を再現できないので、NULL 対応版
+    // （右に NULL キーが 1 つでもあれば無条件に空を返す）を使う。
+    // `AntiNullAware` は「右全体に NULL があるか」を見る実装
+    // （相関キーごとにスコープされていない）なので、相関がある場合に
+    // そのまま使うと、ある外側行の相関先に NULL があるだけで無関係な
+    // 別の外側行の結果まで空になりかねない。相関キーごとに絞った
+    // null 対応判定を行う実行系のプリミティブが無い以上、相関
+    // `NOT IN` は安全に評価できない（対象列の NULL 可能性を束縛時に
+    // 正確に判定する手段も無い: SELECT リストの出力列は常に
+    // `nullable = true` として扱われるため）。誤った結果を返すより
+    // 明確に拒否する。
+    ensure!(!(negated && k > 0), UnsupportedFeature);
+    let kind = match (negated, rf.nullable) {
+        (false, _) => JoinKind::Semi,
+        (true, false) => JoinKind::Anti,
+        (true, true) => JoinKind::AntiNullAware,
+    };
+    Ok(Node::Join {
+        left: Box::new(left),
+        right: Box::new(plan.root),
+        kind,
+        left_keys,
+        right_keys,
+        residual: None,
+        schema,
+    })
 }
 
 /// `plan.correlated` の各項目に対応する結合キー `(left, right)` の組を作る。
@@ -2010,6 +2080,247 @@ fn correlation_keys(
         right_keys.push(cast_program(rp, want)?);
     }
     Ok((left_keys, right_keys))
+}
+
+// --- 量化比較（ANY/ALL/SOME、`>`/`<`/`>=`/`<=` 側） --------------------------
+//
+// `= ANY`/`<> ALL` は `IN`/`NOT IN` と同じ半結合に書き換わる
+// （`is_semijoin_predicate`/`build_semijoin` 参照）。残りの 8 通り
+// （`<`/`<=`/`>`/`>=` × `ANY`/`ALL`）は「一致する行があるか」ではなく
+// 「集合全体との比較」なので半結合には落ちない。代わりに `duckdb` の内部
+// 書き換え（`SELECT 5 > ALL(...)` を EXPLAIN すると `NOT (5 <= ANY(...))`
+// になることを実測済み）にならい、`x <op> ALL (q)` を
+// `NOT (x <negate(op)> ANY (q))` として `ANY` 側 1 通りに帰着させる。
+//
+// `x <op> ANY (q)` 自体は `MIN`/`MAX` に単純に置き換えるだけでは正しくない
+// （空集合・NULL の三値論理が絡む。`ANY` の空集合は常に `FALSE`、`ALL` の
+// 空集合は常に `TRUE`、という SQL 標準の落とし穴。モジュールを担当した際に
+// `duckdb` CLI の実測で以下の恒真式を確認した）:
+//
+//   x <op> ANY (q) ==
+//     CASE
+//       WHEN COUNT(*) = 0        THEN FALSE  -- 空集合
+//       WHEN x IS NULL           THEN NULL   -- x が NULL なら全行 UNKNOWN
+//       WHEN x <op> extreme(q)   THEN TRUE   -- 非 NULL の実測値だけで判定できる
+//       WHEN COUNT(col) < COUNT(*) THEN NULL -- 非 NULL では負けたが NULL 行がある
+//       ELSE FALSE
+//     END
+//
+// ここで `extreme` は `op` が `>`/`>=` なら `MIN(col)`、`<`/`<=` なら
+// `MAX(col)`（「最も倒しやすい候補」に x を挑ませれば十分、という考え方。
+// `x > ANY(q)` は「q のどれか 1 つより大きい」なので、最小値より大きければ
+// 必ず存在する）。3 番目の分岐は `extreme` が NULL（＝非 NULL 行が無い）なら
+// 比較自体が NULL になり自然に素通りするので、`COUNT(col) > 0` を別途
+// 確認する必要は無い。
+//
+// **対応範囲**: 非相関サブクエリのみ。内側のクエリが外側スコープの列を
+// 参照する場合は `UnsupportedFeature` で明確に拒否する（DESIGN.md 冒頭の
+// 「黙って壊れるより明確に拒否する」方針）。相関対応は決定的に複雑になる
+// （x は外側行ごとに変わるが、`extreme`/`COUNT` は現状 1 度だけ計算する
+// 設計なので、相関キーごとの集約に一般化する追加実装が要る）ため、今回は
+// 対応を見送った。詳細は `tests/any_all_subquery.rs` のテスト・
+// 最終報告を参照。
+// `= ALL (q)`/`<> ANY (q)` も同じ理由で対応を見送っている
+// （`collect_quantified_comparisons` の doc 参照）:
+// この形は「集合の要素がちょうど 1 通りに揃っているか」を問う形で、
+// `MIN`/`MAX` 一発にも半結合にも帰着しない。
+
+/// `x <op> ANY (q)` の書き換えに使う `(MAX を使うか, 比較演算子)` を選ぶ。
+/// `op` は必ず `Lt`/`Le`/`Gt`/`Ge` のいずれか（呼び出し元で保証）。
+fn quantified_any_extreme(op: BinaryOp) -> (bool, BinaryOp) {
+    match op {
+        BinaryOp::Gt => (false, BinaryOp::Gt), // MIN(q) より大きいか
+        BinaryOp::Ge => (false, BinaryOp::Ge), // MIN(q) 以上か
+        BinaryOp::Lt => (true, BinaryOp::Lt),  // MAX(q) より小さいか
+        BinaryOp::Le => (true, BinaryOp::Le),  // MAX(q) 以下か
+        _ => unreachable!("caller only passes order comparisons"),
+    }
+}
+
+/// 論理否定した比較演算子（`x <op> y` の否定が `x <negate(op)> y` になる方。
+/// 左右を入れ替える `BinaryOp::swapped` とは別物）。
+/// `x <op> ALL (q)` を `NOT (x <negate(op)> ANY (q))` に落とすために使う。
+fn negate_comparison(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Gt => BinaryOp::Le,
+        BinaryOp::Le => BinaryOp::Gt,
+        BinaryOp::Lt => BinaryOp::Ge,
+        BinaryOp::Ge => BinaryOp::Lt,
+        _ => unreachable!("caller only passes order comparisons"),
+    }
+}
+
+/// 合成した合成名（`__qc{idx}_{suffix}`）。`Scope::resolve` は無修飾で全列を
+/// 探すので、ユーザーの列名との衝突を避けるため接頭辞を付ける
+/// （既存の `subqN` ラベルと同じ割り切り。完全な衝突回避ではないが、この
+/// 接頭辞を実際の列名に使う SQL はまず無い）。
+fn quantified_label(idx: usize, suffix: &str) -> String {
+    let mut s = String::from("__qc");
+    push_u32(&mut s, idx as u32);
+    s.push('_');
+    s.push_str(suffix);
+    s
+}
+
+/// `>`/`<`/`>=`/`<=` を伴う量化比較 1 個を、`COUNT(*)`/`COUNT(col)`/
+/// `MIN` か `MAX` の 3 集約 1 行と、それを外側の各行に付ける（キー無しの）
+/// `LEFT JOIN` へ書き換える。集約は `GROUP BY` 無しなので、`q` が空でも
+/// 必ず 1 行返る（`exec::agg` の `empty_input_ungrouped_emits_one_row` と
+/// 同じ前提。COUNT は 0、`MIN`/`MAX` は NULL になる）ので、`q` が空集合の
+/// ときの分岐もこの 1 行の値だけで CASE 式が正しく判定できる。
+///
+/// 結合後、3 集約列と x の値を読む小さな `CASE` 式（モジュール冒頭の式）を
+/// 別の一時 `ExprArena`（このサブクエリの計算専用。外側の `arena` とは無関係）
+/// で組み立て、既存の `compile()` にそのまま通す（比較演算子の型ディスパッチ
+/// や `CASE`/`IS NULL` の意味論を再実装しない）。最後に中間列（x・3 集約列）
+/// を落として、元の列 + 結果の 1 列だけを残す。
+#[allow(clippy::too_many_arguments)]
+fn build_quantified_comparison(
+    catalog: &Catalog,
+    arena: &ExprArena,
+    params: &[Value],
+    ctes: &mut CteScope,
+    node: Node,
+    scope: &Scope,
+    subs: &[Substitution],
+    idx: usize,
+    op: BinaryOp,
+    arg: ExprId,
+    all: bool,
+    query: &QueryStmt,
+) -> Result<Node> {
+    let plan = bind_query_in(catalog, arena, query, params, ctes, Some(scope))?;
+    // 相関サブクエリは対応範囲外（モジュール冒頭の doc 参照）。
+    ensure!(plan.correlated.is_empty(), UnsupportedFeature);
+    ensure!(plan.root.schema().len() == 1, TypeMismatch);
+    let col_ty = plan.root.schema()[0].ty;
+
+    // `ALL` は `NOT (x <negate(op)> ANY (q))` として `ANY` 側の書き換えに帰着させる。
+    let (want_max, cmp_op, wrap_not) = if all {
+        let (wm, co) = quantified_any_extreme(negate_comparison(op));
+        (wm, co, true)
+    } else {
+        let (wm, co) = quantified_any_extreme(op);
+        (wm, co, false)
+    };
+
+    let rscope = Scope::from_fields(plan.root.schema().to_vec());
+    let col_prog = column_program(&rscope, 0)?;
+    let aggs = vec![
+        Agg {
+            kind: AggKind::CountStar,
+            arg: None,
+            distinct: false,
+            name: "cnt".into(),
+            separator: Vec::new(),
+            filter: None,
+        },
+        Agg {
+            kind: AggKind::Count,
+            arg: Some(col_prog.clone()),
+            distinct: false,
+            name: "nonnull".into(),
+            separator: Vec::new(),
+            filter: None,
+        },
+        Agg {
+            kind: if want_max { AggKind::Max } else { AggKind::Min },
+            arg: Some(col_prog),
+            distinct: false,
+            name: "extreme".into(),
+            separator: Vec::new(),
+            filter: None,
+        },
+    ];
+    let agg_schema = vec![
+        Field::new(quantified_label(idx, "cnt"), Ty::BigInt, false),
+        Field::new(quantified_label(idx, "nonnull"), Ty::BigInt, false),
+        Field::new(quantified_label(idx, "extreme"), col_ty, true),
+    ];
+    let agg_node = Node::Aggregate {
+        input: Box::new(plan.root),
+        groups: Vec::new(),
+        aggs,
+        schema: agg_schema,
+        having: None,
+    };
+
+    // x の値を計算し、既存の列すべての後ろに 1 列足す。
+    let cur_scope = Scope::from_fields(node.schema().to_vec());
+    let orig_len = cur_scope.len();
+    let x_prog = compile_with_subs(arena, scope, params, subs, arg)?;
+    let x_ty = x_prog.result_ty;
+    let x_name = quantified_label(idx, "x");
+    let mut exprs = Vec::with_capacity(orig_len + 1);
+    for i in 0..orig_len {
+        exprs.push(column_program(&cur_scope, i)?);
+    }
+    exprs.push(x_prog);
+    let mut ext_schema = cur_scope.fields().to_vec();
+    ext_schema.push(Field::new(x_name, x_ty, true));
+    let node = Node::Project { input: Box::new(node), exprs, schema: ext_schema };
+
+    // 集約 1 行をキー無し（＝クロス結合相当）の LEFT JOIN で全行に付ける。
+    let mut full_schema = node.schema().to_vec();
+    full_schema.extend_from_slice(agg_node.schema());
+    let node = Node::Join {
+        left: Box::new(node),
+        right: Box::new(agg_node),
+        kind: JoinKind::Left,
+        left_keys: Vec::new(),
+        right_keys: Vec::new(),
+        residual: None,
+        schema: full_schema,
+    };
+
+    // 結合後のスキーマ全体を指す一時スコープ上で、CASE 式を組み立てて
+    // コンパイルする。末尾 4 列が [x, cnt, nonnull, extreme]。
+    let combined_scope = Scope::from_fields(node.schema().to_vec());
+    let len = combined_scope.len();
+    ensure!(len >= 4, Internal);
+    let (x_i, cnt_i, nonnull_i, extreme_i) = (len - 4, len - 3, len - 2, len - 1);
+
+    let mut fa = ExprArena::new();
+    let col_ref = |fa: &mut ExprArena, i: usize| {
+        fa.push(Expr::ColumnRef { qualifier: None, name: combined_scope.fields()[i].name.clone() })
+    };
+    let x_ref = col_ref(&mut fa, x_i);
+    let cnt_ref = col_ref(&mut fa, cnt_i);
+    let nonnull_ref = col_ref(&mut fa, nonnull_i);
+    let extreme_ref = col_ref(&mut fa, extreme_i);
+    let zero = fa.push(Expr::Literal(Value::I64(0)));
+    let cnt_eq0 = fa.push(Expr::Binary { op: BinaryOp::Eq, lhs: cnt_ref, rhs: zero });
+    let x_isnull = fa.push(Expr::IsNull { arg: x_ref, negated: false });
+    let cmp = fa.push(Expr::Binary { op: cmp_op, lhs: x_ref, rhs: extreme_ref });
+    let nonnull_lt_cnt = fa.push(Expr::Binary { op: BinaryOp::Lt, lhs: nonnull_ref, rhs: cnt_ref });
+    let v_false_empty = fa.push(Expr::Literal(Value::Bool(false)));
+    let v_null_x = fa.push(Expr::Literal(Value::Null));
+    let v_true = fa.push(Expr::Literal(Value::Bool(true)));
+    let v_null_has_null = fa.push(Expr::Literal(Value::Null));
+    let v_false_else = fa.push(Expr::Literal(Value::Bool(false)));
+    let case_id = fa.push(Expr::Case {
+        operand: None,
+        whens: vec![
+            (cnt_eq0, v_false_empty),
+            (x_isnull, v_null_x),
+            (cmp, v_true),
+            (nonnull_lt_cnt, v_null_has_null),
+        ],
+        else_: Some(v_false_else),
+    });
+    let result_id =
+        if wrap_not { fa.push(Expr::Unary { op: UnaryOp::Not, arg: case_id }) } else { case_id };
+    let formula = compile(&fa, &combined_scope, params, result_id)?;
+
+    // 中間列（x・cnt・nonnull・extreme）は落とし、元の列 + 結果の 1 列だけ残す。
+    let mut exprs2 = Vec::with_capacity(orig_len + 1);
+    for i in 0..orig_len {
+        exprs2.push(column_program(&combined_scope, i)?);
+    }
+    exprs2.push(formula);
+    let mut out_schema = combined_scope.fields()[..orig_len].to_vec();
+    out_schema.push(Field::new(quantified_label(idx, "result"), Ty::Boolean, true));
+    Ok(Node::Project { input: Box::new(node), exprs: exprs2, schema: out_schema })
 }
 
 // --- 述語の分解 --------------------------------------------------------------
@@ -2050,7 +2361,10 @@ fn contains_subquery(arena: &ExprArena, id: ExprId, depth: u32) -> bool {
     }
     if matches!(
         arena.get(id),
-        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
+        Expr::ScalarSubquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedComparison { .. }
     ) {
         return true;
     }
@@ -2064,9 +2378,21 @@ fn contains_subquery(arena: &ExprArena, id: ExprId, depth: u32) -> bool {
     found
 }
 
-/// 述語そのものが `EXISTS` / `IN (SELECT)` か。半結合に書き換えられる形。
+/// 述語そのものが `EXISTS` / `IN (SELECT)` か（半結合に書き換えられる形）。
+/// `= ANY (SELECT ...)` / `<> ALL (SELECT ...)` は意味的に `IN`/`NOT IN` と
+/// 全く同じなので、ここでも同じ半結合として扱う（`build_semijoin` 参照）。
+/// `>`/`<`/`>=`/`<=` を伴う量化比較（それ以外の `QuantifiedComparison`）は
+/// 半結合には書き換えられない（集合全体との比較なので「一致する行が
+/// あるか」だけを見る半結合の形に落ちない）。`bind_select_in` 側の
+/// `collect_quantified_comparisons` が別経路で処理する。
 fn is_semijoin_predicate(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.get(id), Expr::Exists { .. } | Expr::InSubquery { .. })
+    match arena.get(id) {
+        Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::QuantifiedComparison { op, all, .. } => {
+            matches!((op, all), (BinaryOp::Eq, false) | (BinaryOp::Ne, true))
+        }
+        _ => false,
+    }
 }
 
 /// 式の中のスカラサブクエリを集める。
@@ -2085,6 +2411,37 @@ fn collect_scalar_subqueries(
     }
     let d = depth + 1;
     each_child(arena, id, &mut |c| collect_scalar_subqueries(arena, c, out, d))
+}
+
+/// 式の中の「集約経由の量化比較」（`>`/`<`/`>=`/`<=` を伴う `ANY`/`ALL`）を
+/// 集める。`= ANY`/`<> ALL` は `is_semijoin_predicate` 経由で別に処理される
+/// ので、ここでは拾わない（そのまま残ると `build_quantified_comparison` が
+/// `MIN`/`MAX` に頼れない演算子で呼ばれてしまう）。`= ALL`/`<> ANY`
+/// （どちらも半結合にも `MIN`/`MAX` にも書き換えられない、対応範囲外の
+/// 組み合わせ）もここでは拾わない: `bind_select_in` のどの経路にも
+/// 引っかからず素通しし、最終的に `plan::compile` の網
+/// （`Expr::QuantifiedComparison { .. } => err!(UnsupportedFeature)`）に
+/// 落ちて明確なエラーになる。
+fn collect_quantified_comparisons(
+    arena: &ExprArena,
+    id: ExprId,
+    out: &mut Vec<ExprId>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    if let Expr::QuantifiedComparison { op, .. } = arena.get(id) {
+        if matches!(op, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge)
+            && !out.contains(&id)
+        {
+            out.push(id);
+        }
+    }
+    // `arg` はこの式と同じスコープに属する（`InSubquery` と違って `query` を
+    // 持たない代わりに、`arg` の中にさらに別の量化比較が入れ子になりうる:
+    // 例 `(a > ANY (q1)) = (b < ANY (q2))`）ので、一致した後も必ず子を辿る
+    // （`each_child` は `QuantifiedComparison` については `arg` だけを渡す）。
+    let d = depth + 1;
+    each_child(arena, id, &mut |c| collect_quantified_comparisons(arena, c, out, d))
 }
 
 /// 修飾子の無い列参照ノードを (ノードの ExprId, 名前) の組で集める。
@@ -2898,6 +3255,9 @@ fn each_child(
         // サブクエリの中の式は別スコープで解決するので、ここでは辿らない。
         Expr::ScalarSubquery(_) | Expr::Exists { .. } => {}
         Expr::InSubquery { arg, .. } => f(*arg)?,
+        // `query` 側は `InSubquery` と同じ理由で辿らない。`arg` だけが
+        // このクエリのスコープに属する式。
+        Expr::QuantifiedComparison { arg, .. } => f(*arg)?,
         Expr::Unnest(arg) => f(*arg)?,
         // ラムダ本体はパラメータだけを参照でき、外側スコープの列は参照
         // できない（`plan::compile::Compiler::lambda_call` 参照）。ここで
@@ -3108,7 +3468,7 @@ pub fn resolve_from(catalog: &Catalog, from: &FromItem) -> Result<usize> {
             Some(i) => Ok(i),
             None => err!(TableNotFound),
         },
-        FromItem::Parquet { path, .. } => match catalog.index_of(path) {
+        FromItem::File { path, .. } => match catalog.index_of(path) {
             Some(i) => Ok(i),
             None => err!(TableNotFound),
         },
@@ -3185,7 +3545,7 @@ fn referenced_tables_at(
             }
             None => err!(TableNotFound),
         },
-        FromItem::Parquet { path, .. } => match catalog.index_of(path) {
+        FromItem::File { path, .. } => match catalog.index_of(path) {
             Some(i) => {
                 push(i);
                 Ok(())
@@ -3420,7 +3780,7 @@ const MAX_PIVOT_VALUES: usize = 128;
 /// `UNPIVOT` で同時に畳み込める対象列数の上限。
 const MAX_UNPIVOT_COLUMNS: usize = 128;
 
-/// `FromItem` を複製する。PIVOT/UNPIVOT の `from` は `Table`/`Parquet` に
+/// `FromItem` を複製する。PIVOT/UNPIVOT の `from` は `Table`/`File` に
 /// しか対応しない（`UNPIVOT` は対象列数ぶん同じ `from` を複製して
 /// `UNION ALL` の各枝に配る必要があり、`Subquery`/`Join` はプラン
 /// （`Node`）を複製できないため単純にコピーできない。`plan::bind::resolve_from`
@@ -3430,8 +3790,8 @@ fn clone_from_item(f: &FromItem) -> Result<FromItem> {
         FromItem::Table { name, alias } => {
             Ok(FromItem::Table { name: name.clone(), alias: alias.clone() })
         }
-        FromItem::Parquet { path, alias } => {
-            Ok(FromItem::Parquet { path: path.clone(), alias: alias.clone() })
+        FromItem::File { path, format, alias } => {
+            Ok(FromItem::File { path: path.clone(), format: *format, alias: alias.clone() })
         }
         // データを持たない計算だけのソースなので、他の派生表と違って複製に
         // 実コストが無い。

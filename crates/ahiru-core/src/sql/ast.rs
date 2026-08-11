@@ -4,6 +4,7 @@
 //! （DESIGN.md §7）。確保回数が減り、`Drop` の再帰も消えるので、
 //! コードサイズと実行速度の両方に効く。
 
+use crate::format::FormatKind;
 use crate::prelude::*;
 use crate::vector::{Ty, Value};
 
@@ -176,6 +177,24 @@ pub enum Expr {
         query: Box<QueryStmt>,
         negated: bool,
     },
+    /// `x <op> ANY (SELECT ...)` / `x <op> ALL (SELECT ...)` / `x <op> SOME (SELECT ...)`.
+    /// `SOME` is parsed as an alias of `ANY` (`all: false`); the parser does not
+    /// keep the original spelling since the two are fully equivalent in DuckDB.
+    /// `op` is always one of the six comparison operators
+    /// (`=`/`<>`/`<`/`<=`/`>`/`>=`; see `sql::parser::Parser::expr_body`, the
+    /// quantified-comparison lookahead only fires right after one of those
+    /// tokens). `plan::bind` desugars `= ANY`/`<> ALL` into `InSubquery`
+    /// (exactly equivalent to `IN`/`NOT IN`) and the remaining `<`/`<=`/`>`/`>=`
+    /// combinations into a `MIN`/`MAX`-based aggregate comparison, restricted to
+    /// non-correlated subqueries; `= ALL`/`<> ANY` are rejected as
+    /// `UnsupportedFeature` (see `plan::bind` module doc for the full rationale).
+    QuantifiedComparison {
+        op: BinaryOp,
+        arg: ExprId,
+        /// `true` for `ALL`, `false` for `ANY`/`SOME`.
+        all: bool,
+        query: Box<QueryStmt>,
+    },
     /// `UNNEST(expr)`。SELECT リストにのみ書ける（FROM 句の `UNNEST` は
     /// `FromItem::Unnest`）。対象は `Ty::Json`（配列）でなければならない。
     /// 集約でも通常のスカラ式でもない特殊な式として `plan::bind` が拾う
@@ -265,9 +284,28 @@ pub enum FromItem {
         name: String,
         alias: Option<String>,
     },
-    /// `parquet('...')` によるインライン参照。
-    Parquet {
+    /// An inline reference to a file-backed table, written as a table
+    /// function (`parquet('...')`, `read_parquet('...')`, `read_csv('...')`,
+    /// `read_csv_auto('...')`, `read_json('...')`, `read_json_auto('...')`)
+    /// or as a bare string literal (`FROM 'path'`, format inferred from the
+    /// extension via `format::FormatKind::detect`).
+    ///
+    /// All forms resolve identically: `plan::bind::flatten_from` looks up
+    /// `path` verbatim in the `Catalog` (`Catalog::index_of`), exactly like
+    /// the original `parquet(...)` did. The host is responsible for having
+    /// registered a table under that exact name/path string beforehand
+    /// (`Session::register*`) — this engine is `no_std` and has no
+    /// filesystem access of its own (see docs/sql/data-sources.md). `format`
+    /// therefore does *not* re-dispatch parsing at query time; it only
+    /// records which surface syntax was used (for diagnostics/pretty
+    /// printing). Named CSV/JSON options (`delim=`, `header=`, ...) and glob
+    /// expansion are intentionally unsupported for the same reason — both
+    /// would require re-parsing bytes against a different format at bind
+    /// time, which is a host-side (`Catalog`-mutating) operation this read
+    /// path does not have.
+    File {
         path: String,
+        format: FormatKind,
         alias: Option<String>,
     },
     Subquery {

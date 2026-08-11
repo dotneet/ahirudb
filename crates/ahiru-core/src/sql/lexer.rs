@@ -315,8 +315,10 @@ pub enum Tok<'a> {
     Param,
     LParen,
     RParen,
-    /// `[`。配列リテラル `[expr, ...]` の開始にのみ使う（添字アクセス
-    /// `expr[i]` は今回のスコープ外。`sql::parser` の `primary` 冒頭参照）。
+    /// `[`。式の先頭では配列リテラル `[expr, ...]` の開始、`primary_atom()`
+    /// の結果に後置で続くときは添字アクセス `expr[i]`/スライス `expr[i:j]`
+    /// （`sql::parser` の `primary`/`postfix_ops`/`subscript` 参照）。位置で
+    /// 区別できるので、レキサ側は同じトークンのままでよい。
     LBracket,
     RBracket,
     Comma,
@@ -342,6 +344,8 @@ pub enum Tok<'a> {
     Ge,
     /// `::`（`CAST(expr AS ty)` の糖衣構文）
     ColonColon,
+    /// 単独の `:`。添字スライス `expr[i:j]`（境界省略可）の区切りにのみ使う。
+    Colon,
     /// `^` または `**`（べき乗）
     Pow,
     /// `&`（ビット単位 AND、整数のみ）
@@ -580,7 +584,7 @@ impl<'a> Lexer<'a> {
                 if eat(b':') {
                     Tok::ColonColon
                 } else {
-                    err!(UnexpectedToken, start)
+                    Tok::Colon
                 }
             }
             // `==` は `=` の別名。

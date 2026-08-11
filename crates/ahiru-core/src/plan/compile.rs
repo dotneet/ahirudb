@@ -557,7 +557,17 @@ impl<'a> Compiler<'a> {
             // ウィンドウ関数とサブクエリはバインダが専用ノードに書き換えてから
             // 来る。ここに残っているのは、書ける位置ではないところに書かれた場合。
             Expr::Window { .. } => err!(UnsupportedFeature),
-            Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+            // `QuantifiedComparison` is either desugared away by the binder
+            // (`= ANY`/`<> ALL` into `InSubquery`, `<`/`<=`/`>`/`>=` ANY/ALL
+            // into a `MIN`/`MAX`-based `CASE` expression, see
+            // `plan::bind::build_quantified_comparison`) or rejected at bind
+            // time (correlated subquery, or the unsupported `= ALL`/`<> ANY`
+            // combination). What's left here is either a binder bug or a
+            // position the binder doesn't scan (e.g. inside a `Lambda` body).
+            Expr::ScalarSubquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedComparison { .. } => {
                 err!(UnsupportedFeature)
             }
             // `UNNEST` もバインダが `Node::Unnest` + `Substitution` に書き換えて

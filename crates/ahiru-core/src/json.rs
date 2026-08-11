@@ -538,6 +538,58 @@ pub(crate) fn list_index(doc: &[u8], idx: i64) -> Result<Option<&[u8]>> {
     }
 }
 
+/// `list_slice` の本体。1 始まり、両端含む、負数は末尾から。`list_index`
+/// （`list_extract`）と違って範囲外は **NULL にせず切り詰める**（DuckDB の
+/// `expr[i:j]` 構文と同じ規則。`duckdb -c "select [1,2,3,4,5][10:20],
+/// [1,2,3,4,5][-10:3]"` が `[]`/`[1, 2, 3]` を返すことで確認済み ——
+/// 完全に範囲外なら空配列、一部だけはみ出すなら残った部分だけ返す）。
+/// 非配列は `None`（呼び出し元で SQL NULL）。
+///
+/// 戻り値は `doc` 内の半開区間 `(lo, hi)`。`doc[lo..hi]` を `[` `]` で
+/// 包めば結果になる（`lo == hi` は空配列 `[]` を意味する）。配列要素は
+/// 連続したバイト列なので、要素ごとに書き出し直さずこの区間をまるごと
+/// コピーするだけで済む（`nth_element`/`skip_value` を先頭要素・末尾要素の
+/// 位置決めにだけ使う）。
+pub(crate) fn list_slice(doc: &[u8], start: i64, end: i64) -> Result<Option<(usize, usize)>> {
+    let arr_start = skip_ws(doc, 0);
+    if byte_at(doc, arr_start)? != b'[' {
+        return Ok(None);
+    }
+    let count = count_elements(doc, arr_start)?;
+    // 空配列の書き出し先（`[` の直後、`]` の手前の空白終わり）。
+    let empty_at = skip_ws(doc, arr_start + 1);
+    if count == 0 {
+        return Ok(Some((empty_at, empty_at)));
+    }
+    // 1 始まり・両端含む区間へ正規化してからクランプする。0 は 1 として
+    // 扱う（`duckdb -c "select [1,2,3,4,5][0:2]"` が `[1,2,3,4,5][1:2]` と
+    // 同じ `[1, 2]` を返すことで確認済み）。負数は `saturating_add` で
+    // オーバーフローを避ける（信用できない入力からの巨大な負の添字対策）。
+    let norm = |v: i64| -> i64 {
+        if v == 0 {
+            1
+        } else if v < 0 {
+            count.saturating_add(v).saturating_add(1)
+        } else {
+            v
+        }
+    };
+    let s = norm(start).max(1);
+    let e = norm(end).min(count);
+    if s > e {
+        return Ok(Some((empty_at, empty_at)));
+    }
+    // クランプ後の s/e は必ず [1, count] 内に収まるので、`nth_element` は
+    // 常に `Some` を返す（0 始まりへ変換してから渡す）。
+    let (Some(lo), Some(hi_start)) =
+        (nth_element(doc, arr_start, s - 1)?, nth_element(doc, arr_start, e - 1)?)
+    else {
+        err!(Internal)
+    };
+    let hi = skip_value(doc, hi_start)?;
+    Ok(Some((lo, hi)))
+}
+
 /// `map_extract` の本体。直接のメンバ名検索（パス構文は使わない）。
 /// 非オブジェクト・キー無しは `None`。
 pub(crate) fn map_get<'a>(doc: &'a [u8], key: &[u8]) -> Result<Option<&'a [u8]>> {
@@ -768,6 +820,39 @@ mod tests {
         assert_eq!(list_index(b"[10,20,30]", 0).unwrap(), None);
         assert_eq!(list_index(b"[10,20,30]", 100).unwrap(), None);
         assert_eq!(list_index(b"{\"a\":1}", 1).unwrap(), None);
+    }
+
+    fn slice(doc: &str, start: i64, end: i64) -> Option<String> {
+        list_slice(doc.as_bytes(), start, end).unwrap().map(|(lo, hi)| {
+            let mut out = String::from("[");
+            out.push_str(&doc[lo..hi]);
+            out.push(']');
+            out
+        })
+    }
+
+    #[test]
+    fn list_slice_clamps_out_of_range_instead_of_nulling() {
+        // duckdb -c "select [1,2,3,4,5][2:3]" -> [2, 3]
+        assert_eq!(slice("[1,2,3,4,5]", 2, 3).as_deref(), Some("[2,3]"));
+        // duckdb -c "select [1,2,3,4,5][-2:-1]" -> [4, 5]
+        assert_eq!(slice("[1,2,3,4,5]", -2, -1).as_deref(), Some("[4,5]"));
+        // duckdb -c "select [1,2,3,4,5][10:20]" -> []  (fully out of range: empty, not NULL)
+        assert_eq!(slice("[1,2,3,4,5]", 10, 20).as_deref(), Some("[]"));
+        // duckdb -c "select [1,2,3,4,5][-10:3]" -> [1, 2, 3] (start clamps up to 1)
+        assert_eq!(slice("[1,2,3,4,5]", -10, 3).as_deref(), Some("[1,2,3]"));
+        // duckdb -c "select [1,2,3,4,5][3:1]" -> [] (start past end)
+        assert_eq!(slice("[1,2,3,4,5]", 3, 1).as_deref(), Some("[]"));
+        // duckdb -c "select [1,2,3,4,5][0:2]" -> [1, 2] (0 behaves like 1)
+        assert_eq!(slice("[1,2,3,4,5]", 0, 2).as_deref(), Some("[1,2]"));
+        // duckdb -c "select [][1:2]" -> []
+        assert_eq!(slice("[]", 1, 2).as_deref(), Some("[]"));
+        // Non-array base -> None (caller turns this into SQL NULL).
+        assert_eq!(list_slice(b"{\"a\":1}", 1, 2).unwrap(), None);
+        // Omitted-bound sentinels used by the parser desugaring.
+        // duckdb -c "select [1,2,3,4,5][:3], [1,2,3,4,5][2:]" -> [1,2,3] / [2,3,4,5]
+        assert_eq!(slice("[1,2,3,4,5]", 1, 3).as_deref(), Some("[1,2,3]"));
+        assert_eq!(slice("[1,2,3,4,5]", 2, i64::MAX).as_deref(), Some("[2,3,4,5]"));
     }
 
     #[test]

@@ -155,6 +155,13 @@ pub(crate) const F_LIST_REDUCE: FuncId = 91;
 // JSON（整数出力）
 const F_JSON_ARRAY_LENGTH: FuncId = 90;
 
+/// `list_slice`/`array_slice`、`expr[i:j]` の脱糖先。92 を選んだのは
+/// 84-91 が既に埋まっていて（上記）、かつ `F_PART_BASE`（下記、100）以上は
+/// 日付部分抽出専用に予約されているため — `eval_int`/`eval_str` などの
+/// 冒頭で `id >= F_PART_BASE` を日付部分抽出とみなす特別扱いがあるので、
+/// 100 以上の番号を汎用関数に使うと衝突する。
+const F_LIST_SLICE: FuncId = 92;
+
 /// `year()` などの略記。ID に part 番号を埋め込み、`date_part` と同じ
 /// 抽出関数へ合流させる（関数ごとに ID を分けても中身は 1 本）。
 const F_PART_BASE: FuncId = 100;
@@ -323,6 +330,10 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         // DuckDB の慣習で LIST/MAP 系の名前を持つが、実体は Ty::Json の
         // 配列/オブジェクト形状を読むだけ（モジュール冒頭 doc の設計判断）。
         "list_extract" | "array_extract" => fixed(F_LIST_EXTRACT, &[Json, BigInt], n, 2, Json),
+        // `expr[i:j]`（`sql::parser::Parser::subscript`）の脱糖先。両端含む、
+        // 1 始まり、負数は末尾から、範囲外は `list_extract` と違い NULL では
+        // なく切り詰める（`crate::json::list_slice` のモジュール doc 参照）。
+        "list_slice" | "array_slice" => fixed(F_LIST_SLICE, &[Json, BigInt, BigInt], n, 3, Json),
         "map_extract" => fixed(F_MAP_EXTRACT, &[Json, Varchar], n, 2, Json),
         "to_json" => {
             ensure!(n == 1, WrongArgCount);
@@ -1456,6 +1467,18 @@ fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             return match crate::json::list_index(a.bytes(0), a.int(1))? {
                 Some(span) => {
                     out.extend_from_slice(span);
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
+        F_LIST_SLICE => {
+            let doc = a.bytes(0);
+            return match crate::json::list_slice(doc, a.int(1), a.int(2))? {
+                Some((lo, hi)) => {
+                    out.push(b'[');
+                    out.extend_from_slice(&doc[lo..hi]);
+                    out.push(b']');
                     Ok(true)
                 }
                 None => Ok(false),

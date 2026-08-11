@@ -76,14 +76,34 @@ fn array_literal_is_sugar_for_list_value() {
 }
 
 #[test]
-fn array_literal_only_at_expression_start() {
+fn subscript_on_a_non_json_column_binds_fine_but_fails_at_execution() {
+    // `expr[i]` is no longer scope-limited to array literals — it now
+    // desugars to `list_extract(expr, i)` for any `expr` (see
+    // `sql::parser::Parser::subscript`, added alongside this test's rename).
+    // `id` is `Ty::Int`, and `list_extract`'s first parameter is `Ty::Json`,
+    // so the call still needs an implicit Int -> Json coercion. That
+    // coercion is *not* rejected at bind time — `plan::compile::Compiler::
+    // coerce` unconditionally emits a `Cast` instruction without checking
+    // in advance whether the specific (from, to) pair is even a legal cast
+    // (this is pre-existing behavior of the generic function-argument
+    // coercion path, not something this change introduced). The rejection
+    // instead happens at the `Cast` kernel, which only allows VARCHAR <->
+    // JSON (`expr::kernels::cast_impl`), i.e. at *execution* time.
     let mut sess = session_with_basic();
-    // 添字アクセス `expr[i]` は今回のスコープ外。列名の直後の `[` は
-    // 配列リテラルとして解釈されず、構文エラーになる。
-    assert_eq!(
-        code_of(sess.prepare("SELECT id[1] FROM t", &[]).map(|_| ())),
-        Some(Code::UnexpectedToken)
-    );
+    assert_eq!(code_of(sess.prepare("SELECT id[1] FROM t", &[]).map(|_| ())), None);
+    let mut q = match sess.prepare("SELECT id[1] AS x FROM t", &[]).unwrap() {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("unexpected NeedIo"),
+    };
+    let err = loop {
+        match sess.step(&mut q) {
+            Ok(QueryStep::Batch(_)) => continue,
+            Ok(QueryStep::Done) => panic!("expected a runtime error, got a result"),
+            Ok(QueryStep::NeedIo(_)) | Ok(QueryStep::NeedCodec(_)) => panic!("unexpected NeedIo"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.code, Code::InvalidCast);
 }
 
 // --- printf / format ----------------------------------------------------------

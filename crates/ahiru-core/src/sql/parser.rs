@@ -6,6 +6,7 @@
 //! 再帰は必ず `MAX_DEPTH` で頭打ちにする。wasm ではスタック枯渇が
 //! 回復不能なトラップになるため、深い入力は必ずエラーとして返す。
 
+use crate::format::FormatKind;
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 #[cfg(feature = "dml")]
@@ -183,6 +184,51 @@ impl<'a> Parser<'a> {
             return Ok(true);
         }
         self.peek_is_soft_kw(b"to")
+    }
+
+    /// `is_soft_kw(b"into")` の `into`-対応版。`UNPIVOT ... INTO NAME ...` の
+    /// `INTO` 判定に使う。`into` は `dml` フィーチャが有効なとき
+    /// `INSERT INTO` 用に別途グローバル予約されている（`DML_KEYWORDS`）ので、
+    /// `is_soft_kw` だけでは（`Tok::Ident` しか見ないので）`dml` 有効ビルドで
+    /// `UNPIVOT ... INTO` を誤って認識し損ねる（`expect_to`/`peek_is_to` の
+    /// doc コメント参照、同じ二重表現の問題）。
+    fn is_into(&self) -> bool {
+        #[cfg(feature = "dml")]
+        if self.is(Tok::Kw(Kw::Into)) {
+            return true;
+        }
+        self.is_soft_kw(b"into")
+    }
+
+    /// `self.cur` が比較演算子であるという前提で、その直後が
+    /// `ANY|ALL|SOME (` の並びかどうかを、何も消費せずに判定する。
+    /// `Some(true)` = `ALL`、`Some(false)` = `ANY`/`SOME`、`None` = 量化比較
+    /// ではない（呼び出し側は通常の中置演算子として扱う）。
+    ///
+    /// `(` まで見てから確定させるのは、`ANY`/`SOME` を予約語にしていない
+    /// ため（`is_soft_kw` の doc、ファイル冒頭 `sql/lexer.rs` の
+    /// ROWS/RANGE/QUALIFY 事故のコメント参照）: `x > any` のように `any` が
+    /// ただの列名の場合を、`x > ANY (SELECT ...)` と取り違えないようにする。
+    /// `lex` を複製して 2 トークン先読みするだけで `self` の位置は動かさない
+    /// （`peek`/`peek_is_soft_kw` と同じ流儀）。
+    fn peek_quantifier(&self) -> Result<Option<bool>> {
+        let mut lx = self.lex.clone();
+        let t1 = lx.next_token()?.tok;
+        let all = match t1 {
+            Tok::Kw(Kw::All) => true,
+            Tok::Ident(s)
+                if eq_ascii_ci(s.as_bytes(), b"any") || eq_ascii_ci(s.as_bytes(), b"some") =>
+            {
+                false
+            }
+            _ => return Ok(None),
+        };
+        let t2 = lx.next_token()?.tok;
+        if t2 == Tok::LParen {
+            Ok(Some(all))
+        } else {
+            Ok(None)
+        }
     }
 
     fn eat(&mut self, t: Tok<'a>) -> Result<bool> {
@@ -1159,8 +1205,39 @@ impl<'a> Parser<'a> {
             let alias = self.opt_alias()?;
             return Ok(FromItem::Subquery { query: Box::new(query), alias });
         }
+        // `FROM 'path'`: 裸の文字列リテラルによるファイル参照
+        // （`duckdb -c "SELECT * FROM 'x.csv'"` で構文を確認済み）。
+        // フォーマットは拡張子から推定する（`FormatKind::detect`、既存の
+        // Hive/multi-file 登録と同じ規則）。解決経路は下の `parquet(...)`/
+        // `read_csv(...)` 等とまったく同じ（`FromItem::File` の doc 参照）。
+        if let Tok::Str(s) = self.cur {
+            let path = unquote(s, b'\'');
+            self.bump()?;
+            let format = FormatKind::detect(&path);
+            let alias = self.opt_alias()?;
+            return Ok(FromItem::File { path, format, alias });
+        }
         let pos = self.pos;
         let is_parquet = self.is_soft_kw(b"parquet");
+        let is_read_parquet = self.is_soft_kw(b"read_parquet");
+        // CSV/JSON テーブル関数。`duckdb` CLI で確認した限り、`read_csv` と
+        // `read_csv_auto`（`read_json`/`read_json_auto` も同様）は 1 引数の
+        // 基本形では同じ結果になるので、この v1 では両方を同じ扱いにする
+        // （named オプション引数は非対応 — `FromItem::File` の doc 参照）。
+        // `csv`/`jsonl` フィーチャが無効なビルドでは該当フォーマットの読み取り
+        // 自体が存在しないので、構文としても認識しない（未対応の soft
+        // keyword は下の `ensure!` に落ちて `UnsupportedFeature` になる —
+        // `ddl`/`dml`/`export` の文が feature 無効時に同じ経路へ落ちるのと
+        // 同じパターン）。Parquet は常に使えるので `parquet`/`read_parquet`
+        // はフィーチャ判定なし。
+        #[cfg(feature = "csv")]
+        let is_read_csv = self.is_soft_kw(b"read_csv") || self.is_soft_kw(b"read_csv_auto");
+        #[cfg(not(feature = "csv"))]
+        let is_read_csv = false;
+        #[cfg(feature = "jsonl")]
+        let is_read_json = self.is_soft_kw(b"read_json") || self.is_soft_kw(b"read_json_auto");
+        #[cfg(not(feature = "jsonl"))]
+        let is_read_json = false;
         // `UNNEST` も `parquet(...)` と同じ「非予約語だが `(` が続けば特殊構文」
         // という扱い。予約語化すると同名の列参照を壊す事故が過去にあった
         // （`ROWS`/`RANGE`/`QUALIFY`/`RECURSIVE`）ので踏襲する。
@@ -1213,13 +1290,26 @@ impl<'a> Parser<'a> {
                 let column_alias = self.opt_single_col_alias()?;
                 return Ok(FromItem::Unnest { expr, alias, column_alias });
             }
-            // テーブル関数は parquet('...') だけ。ほかは v1 の範囲外。
-            ensure!(is_parquet, UnsupportedFeature, pos);
+            // ファイルテーブル関数: parquet/read_parquet/read_csv[_auto]/
+            // read_json[_auto]。すべて 1 引数（パス文字列のみ）で、
+            // 名前付きオプション引数（`delim=`, `header=`, ...）や複数引数・
+            // glob 展開は非対応（`FromItem::File` の doc 参照。フォーマットの
+            // 実体は登録時にホストが決めるため、この読み取り専用の束縛経路では
+            // 再ディスパッチできない）。
+            let is_file_fn = is_parquet || is_read_parquet || is_read_csv || is_read_json;
+            ensure!(is_file_fn, UnsupportedFeature, pos);
             self.bump()?;
             let path = self.string_lit()?;
             self.expect(Tok::RParen)?;
             let alias = self.opt_alias()?;
-            return Ok(FromItem::Parquet { path, alias });
+            let format = if is_parquet || is_read_parquet {
+                FormatKind::Parquet
+            } else if is_read_csv {
+                FormatKind::Csv
+            } else {
+                FormatKind::Json
+            };
+            return Ok(FromItem::File { path, format, alias });
         }
         let alias = self.opt_alias()?;
         Ok(FromItem::Table { name, alias })
@@ -1437,7 +1527,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let (name_col, value_col) = if self.is_soft_kw(b"into") {
+        let (name_col, value_col) = if self.is_into() {
             self.bump()?;
             ensure!(self.is_soft_kw(b"name"), UnexpectedToken, self.pos);
             self.bump()?;
@@ -1498,6 +1588,31 @@ impl<'a> Parser<'a> {
     fn expr_body(&mut self, min_bp: u8) -> Result<ExprId> {
         let mut lhs = self.prefix()?;
         loop {
+            // `x <op> ANY|ALL|SOME (SELECT ...)`。比較演算子の直後にだけ現れる
+            // 量化比較で、比較と同じ強さの中置演算子として扱う。`ALL` は既存の
+            // 予約語（`UNION ALL` 等）だが、`ANY`/`SOME` は `glob`/`similar` と
+            // 同様に予約語表に入れていない（列名としても使えるように）ので、
+            // ここで 2 トークン先読みして `(` まで確認してから確定させる
+            // （`x > any_col` のような普通の列参照を誤認しないため。
+            // `peek_quantifier` の doc 参照）。
+            if let Some(op) = comparison_binop(self.cur) {
+                if BP_CMP >= min_bp {
+                    if let Some(all) = self.peek_quantifier()? {
+                        self.bump()?; // 比較演算子
+                        self.bump()?; // ANY/ALL/SOME
+                        self.expect(Tok::LParen)?;
+                        let query = self.query_stmt()?;
+                        self.expect(Tok::RParen)?;
+                        lhs = self.arena.push(Expr::QuantifiedComparison {
+                            op,
+                            arg: lhs,
+                            all,
+                            query: Box::new(query),
+                        });
+                        continue;
+                    }
+                }
+            }
             // `GLOB`/`SIMILAR TO` は ROWS/RANGE/QUALIFY と同じ理由で予約語表
             // には入れず（ファイル冒頭 `sql/lexer.rs` のコメント参照）、この
             // 中置演算子の構文位置でだけ綴りを見て判定する。こうすれば
@@ -1842,22 +1957,41 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `primary_atom()` に続けて、任意個の postfix `::type` を畳み込む。
-    /// `::` は前置演算子より強く結合する（`duckdb -c "select -1::varchar"` が
-    /// `-(1::VARCHAR)` と解釈されて型エラーになることで確認済み: 単項 `-` が
-    /// `expr_bp(BP_UNARY)` 経由でここへ辿り着く前に、`primary_atom` の結果へ
-    /// 先に `::` が畳み込まれている必要がある）。`primary_atom` の分岐の
+    /// `primary_atom()` に続けて、任意個の postfix `::type` / `[i]` /
+    /// `[i:j]` を、現れた順に畳み込む。いずれも前置演算子より強く結合する
+    /// （`duckdb -c "select -1::varchar"` が `-(1::VARCHAR)` と解釈されて
+    /// 型エラーになることで確認済み。添字も同様: `duckdb -c "select
+    /// -[1,2,3][1]"` は `-(list[1])` になる）。`primary_atom` の分岐の
     /// 大半は結果を `self.arena.push` する前に早期 `return` するので、
     /// この処理はその外側に置く必要がある（内側に置くと `(expr)::ty` や
-    /// `col::ty` などほとんどの実用例を取りこぼす）。
+    /// `col::ty`、`(expr)[i]` などほとんどの実用例を取りこぼす）。
+    ///
+    /// 2 つの後置演算子は好きな順に交互に書ける（DuckDB と同じ、実測済み）:
+    /// `duckdb -c "select [1,2,3][1]::varchar"` は「先に添字、後にキャスト」
+    /// （`CAST(list[1] AS VARCHAR)`）、`duckdb -c "select ([1,2,3]::json)[1]"`
+    /// は「先にキャスト、後に添字」になる。そのため 1 つのループで両方を
+    /// 交互に受け付ける。
     fn primary(&mut self) -> Result<ExprId> {
-        let node = self.primary_atom()?;
-        self.cast_postfix(node)
+        let mut node = self.primary_atom()?;
+        loop {
+            if self.eat(Tok::ColonColon)? {
+                let ty = self.type_name()?;
+                node = self.arena.push(Expr::Cast { arg: node, ty, try_: false });
+            } else if self.is(Tok::LBracket) {
+                node = self.subscript(node)?;
+            } else {
+                break;
+            }
+        }
+        Ok(node)
     }
 
-    /// 任意個の後置 `::type` を `node` へ畳み込む。`primary`（大半の式）と
-    /// `prefix` の負数リテラル即畳み込み経路（`primary_atom` を経由しない
-    /// ため別途ここを呼ぶ必要がある）の両方から使う。
+    /// 任意個の後置 `::type` を `node` へ畳み込む。`prefix` の負数リテラル
+    /// 即畳み込み経路（`primary_atom`/`primary` を経由しないため別途ここを
+    /// 呼ぶ必要がある）専用。`-5[1]` は DuckDB でも構文エラーになる
+    /// （`duckdb -c "select -5[1]"` で確認済み）ので、この経路は `::` だけ
+    /// 畳み込めばよく、`[i]`/`[i:j]` は付けない（`primary` 側のループとは
+    /// 意図的に別実装）。
     fn cast_postfix(&mut self, mut node: ExprId) -> Result<ExprId> {
         while self.eat(Tok::ColonColon)? {
             let ty = self.type_name()?;
@@ -1916,9 +2050,11 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::RParen)?;
                 return Ok(e);
             }
-            // `[expr, ...]` 配列リテラル。式の開始位置でしか出てこないので、
-            // `expr[i]` のような添字アクセス（今回のスコープ外。ファイル冒頭
-            // `sql/lexer.rs` の `Tok::LBracket` のコメント参照）とは衝突しない。
+            // `[expr, ...]` 配列リテラル。ここ（`primary_atom`）に来るのは
+            // `[` が式の**先頭**にあるときだけ。`expr[i]`/`expr[i:j]` の添字
+            // アクセス・スライスは `primary_atom` の結果に**後置**で続く形
+            // なので、`primary`/`postfix_ops`（この関数の外）が別途処理する
+            // （ファイル冒頭 `sql/lexer.rs` の `Tok::LBracket` のコメント参照）。
             Tok::LBracket => return self.array_literal(),
             Tok::Kw(Kw::Exists) => return self.exists(false),
             Tok::Kw(Kw::Cast) => return self.cast(),
@@ -1956,6 +2092,56 @@ impl<'a> Parser<'a> {
         }
         self.expect(Tok::RBracket)?;
         Ok(self.simple_call("list_value", args))
+    }
+
+    /// `base[i]`（添字アクセス）/ `base[i:j]`（スライス、両端省略可）。
+    /// `primary`（この関数の呼び出し元）の後置ループから、`[` を見た時点で
+    /// 呼ばれる。`self.cur` はまだ `[` を指している。
+    ///
+    /// `expr[i]` は `list_extract(expr, i)`（DuckDB と同じく 1 始まり、
+    /// 範囲外は NULL、負数は末尾から: `duckdb -c "select [1,2,3][1],
+    /// [1,2,3][-1], [1,2,3][10]"` で `1`/`3`/`NULL` を確認済み。この
+    /// エンジンの `list_extract` は既にこの規則で実装済み — `crate::json::
+    /// list_index` 参照）、`expr[i:j]` は `list_slice(expr, i, j)`
+    /// （両端含む。境界の詳しい規則は `list_slice` の doc 参照）へ脱糖する。
+    ///
+    /// 開始/終了はそれぞれ省略できる（`duckdb -c "select [1,2,3,4,5][:3],
+    /// [1,2,3,4,5][2:]"` で `[1,2,3]`/`[2,3,4,5]` を確認済み、つまり
+    /// `[:3]` == `[1:3]`、`[2:]` == 末尾まで）。省略した境界はそれぞれ
+    /// リテラル `1` / `i64::MAX` に脱糖し、`list_slice` 側でクランプする
+    /// （SQL `NULL` には脱糖しない — `duckdb -c "select list_slice([1,2,3],
+    /// NULL, 3)"` が `NULL` を返すことから、`NULL` 境界は「省略」ではなく
+    /// 「結果も NULL」を意味することが分かる。混同すると `[:3]` が NULL に
+    /// なってしまう）。
+    fn subscript(&mut self, base: ExprId) -> Result<ExprId> {
+        self.bump()?; // '['
+                      // `[:j]`: 開始省略。`[:]`（両方省略）にもここで対応する必要がある
+                      // ——`]` が直後に来る場合、続けて `self.expr()` を呼ぶと `]` を式の
+                      // 先頭として読もうとして構文エラーになる。
+        if self.eat(Tok::Colon)? {
+            let end = if self.is(Tok::RBracket) {
+                self.arena.push(Expr::Literal(Value::I64(i64::MAX)))
+            } else {
+                self.expr()?
+            };
+            self.expect(Tok::RBracket)?;
+            let start = self.arena.push(Expr::Literal(Value::I64(1)));
+            return Ok(self.simple_call("list_slice", vec![base, start, end]));
+        }
+        let first = self.expr()?;
+        if self.eat(Tok::Colon)? {
+            // `[i:]`: 終了省略。`[i:j]`: 両方指定。
+            let end = if self.is(Tok::RBracket) {
+                self.arena.push(Expr::Literal(Value::I64(i64::MAX)))
+            } else {
+                self.expr()?
+            };
+            self.expect(Tok::RBracket)?;
+            return Ok(self.simple_call("list_slice", vec![base, first, end]));
+        }
+        // `[i]`: 添字アクセス。
+        self.expect(Tok::RBracket)?;
+        Ok(self.simple_call("list_extract", vec![base, first]))
     }
 
     /// `INTERVAL '<n> <unit> ...'` / `INTERVAL '<n>' <unit>` /
@@ -2408,6 +2594,22 @@ fn is_lambda_func(name: &str) -> bool {
         || eq_ascii_ci(name.as_bytes(), b"list_reduce")
 }
 
+/// `self.cur` が比較演算子トークンなら対応する `BinaryOp` を返す。
+/// `x <op> ANY|ALL|SOME (SELECT ...)` の量化比較を認識するための、
+/// `expr_body` の中置ループ・`peek_quantifier` 共通の判定
+/// （6 種類の比較演算子だけが `ANY`/`ALL`/`SOME` を続けられる）。
+fn comparison_binop(t: Tok<'_>) -> Option<BinaryOp> {
+    match t {
+        Tok::Eq => Some(BinaryOp::Eq),
+        Tok::Ne => Some(BinaryOp::Ne),
+        Tok::Lt => Some(BinaryOp::Lt),
+        Tok::Le => Some(BinaryOp::Le),
+        Tok::Gt => Some(BinaryOp::Gt),
+        Tok::Ge => Some(BinaryOp::Ge),
+        _ => None,
+    }
+}
+
 // --- リテラル・型名 ---------------------------------------------------------
 
 /// 引用符の中身を展開する。二重化された引用符を 1 個に畳むだけ。
@@ -2709,6 +2911,13 @@ mod tests {
                 if *negated { " NOT" } else { "" },
                 query_str(a, query)
             ),
+            Expr::QuantifiedComparison { op, arg, all, query } => format!(
+                "({} {} {} ({}))",
+                r(a, *arg),
+                op_name(*op),
+                if *all { "ALL" } else { "ANY" },
+                query_str(a, query)
+            ),
             Expr::Literal(v) => lit(v),
             Expr::IntervalLiteral(v) => format!("INTERVAL({}i128)", v),
             Expr::TypedLiteral(v, ty) => format!("{v:?}::{}", ty.name()),
@@ -2867,7 +3076,14 @@ mod tests {
         }
         match f {
             FromItem::Table { name, alias: al } => format!("{}{}", name, alias(al)),
-            FromItem::Parquet { path, alias: al } => format!("parquet('{}'){}", path, alias(al)),
+            FromItem::File { path, format, alias: al } => {
+                let fn_name = match format {
+                    FormatKind::Csv | FormatKind::Tsv => "read_csv",
+                    FormatKind::Json | FormatKind::Jsonl => "read_json",
+                    FormatKind::Parquet | FormatKind::Auto => "parquet",
+                };
+                format!("{}('{}'){}", fn_name, path, alias(al))
+            }
             FromItem::Subquery { query, alias: al } => {
                 format!("({}){}", query_str(a, query), alias(al))
             }
@@ -3318,9 +3534,58 @@ mod tests {
         // 設計になっているため）、JSON の空配列を直接 TypedLiteral として
         // 埋め込む。`duckdb -c "select []"` が有効な式であることを確認済み。
         assert_eq!(ex("[]"), "Bytes([91, 93])::JSON");
-        // 添字アクセス（`expr[i]`）は今回のスコープ外。式の開始位置以外の
-        // `[` は構文エラーになる（`list_value` への糖衣構文と衝突しない）。
-        assert_eq!(code("SELECT a[1]"), Code::UnexpectedToken as u16);
+    }
+
+    // --- 添字アクセス / スライス（`primary`/`subscript`） -----------------------
+
+    #[test]
+    fn subscript_desugars_to_list_extract() {
+        // `expr[i]` は `list_extract(expr, i)` への糖衣構文。式の先頭の `[`
+        // （配列リテラル）とは位置で区別される（`primary_atom` 冒頭のコメント
+        // 参照）。
+        assert_eq!(ex("a[1]"), "list_extract(a, 1i32)");
+        assert_eq!(ex("a[-1]"), "list_extract(a, -1i32)");
+        // 添字自体が任意の式でよい。
+        assert_eq!(ex("a[b + 1]"), "list_extract(a, (b + 1i32))");
+        // 入れ子でも破綻しない: `duckdb -c "select [[1,2],[3,4]][1]"` の構文と
+        // 同じ形が壊れないことを確認済み。
+        assert_eq!(
+            ex("[[1, 2], [3, 4]][1]"),
+            "list_extract(list_value(list_value(1i32, 2i32), list_value(3i32, 4i32)), 1i32)"
+        );
+        assert_eq!(ex("a[1][2]"), "list_extract(list_extract(a, 1i32), 2i32)");
+    }
+
+    #[test]
+    fn slice_desugars_to_list_slice_with_omittable_bounds() {
+        // `expr[i:j]` は `list_slice(expr, i, j)` への糖衣構文。
+        assert_eq!(ex("a[2:3]"), "list_slice(a, 2i32, 3i32)");
+        // 開始省略は `1`、終了省略は `i64::MAX` に脱糖する（`subscript` の
+        // doc コメント参照。SQL NULL には脱糖しない — `list_slice` 自身は
+        // 引数 NULL を NULL 伝播で処理するので、NULL に脱糖すると `[:3]` が
+        // NULL になってしまう）。
+        assert_eq!(ex("a[:3]"), "list_slice(a, 1i64, 3i32)");
+        assert_eq!(ex("a[2:]"), format!("list_slice(a, 2i32, {}i64)", i64::MAX));
+        assert_eq!(ex("a[:]"), format!("list_slice(a, 1i64, {}i64)", i64::MAX));
+    }
+
+    #[test]
+    fn postfix_cast_and_subscript_interleave_left_to_right() {
+        // `[1,2,3][1]::varchar` は「先に添字、後にキャスト」
+        // （`duckdb -c "select [1,2,3][1]::varchar"` で確認済み）。
+        assert_eq!(ex("a[1]::varchar"), "CAST(list_extract(a, 1i32) AS VARCHAR)");
+        // `a::json[1]` は「先にキャスト、後に添字」
+        // （`duckdb -c "select [1,2,3]::json[1]"` で確認済み。この構文は
+        // DuckDB では ARRAY 型リテラル `json[1]` と紛れるが、この実装に
+        // 固定長 ARRAY 型は無いので `a::json` の後置添字として一意に読める）。
+        assert_eq!(ex("a::json[1]"), "list_extract(CAST(a AS JSON), 1i32)");
+        // 単項 `-` より強く結合する: `duckdb -c "select -[1,2,3][1]"` は
+        // `-(list[1])` になる。
+        assert_eq!(ex("-a[1]"), "(- list_extract(a, 1i32))");
+        // 前置の負数リテラル即畳み込み経路（`prefix`）は添字までは畳まない
+        // （`duckdb -c "select -5[1]"` が構文エラーになることで確認済み。
+        // `cast_postfix` の doc コメント参照）。
+        assert_eq!(code("SELECT -5[1]"), Code::UnexpectedToken as u16);
     }
 
     // --- CASE / CAST / 関数 -------------------------------------------------
@@ -4228,6 +4493,28 @@ mod tests {
     }
 
     #[test]
+    fn quantified_comparison_subquery() {
+        // `ANY`/`SOME` は同じ意味（`all: false`）でパースされる。
+        assert_eq!(ex("x = ANY (SELECT a FROM t)"), "(x = ANY (SELECT a FROM t))");
+        assert_eq!(ex("x = SOME (SELECT a FROM t)"), "(x = ANY (SELECT a FROM t))");
+        assert_eq!(ex("x <> ALL (SELECT a FROM t)"), "(x != ALL (SELECT a FROM t))");
+        assert_eq!(ex("x > ANY (SELECT a FROM t)"), "(x > ANY (SELECT a FROM t))");
+        assert_eq!(ex("x >= ALL (SELECT a FROM t)"), "(x >= ALL (SELECT a FROM t))");
+        assert_eq!(ex("x < SOME (SELECT a FROM t)"), "(x < ANY (SELECT a FROM t))");
+        assert_eq!(ex("x <= ALL (SELECT a FROM t)"), "(x <= ALL (SELECT a FROM t))");
+        // 述語と同じ強さ（AND より強く結合する）。
+        assert_eq!(
+            ex("a = 1 AND x > ANY (SELECT a FROM t)"),
+            "((a = 1i32) AND (x > ANY (SELECT a FROM t)))"
+        );
+        // `any`/`some` は予約語ではないので、`(` を伴わなければ普通の列名。
+        assert_eq!(ex("x > any"), "(x > any)");
+        assert_eq!(ex("x > some"), "(x > some)");
+        // `ALL` は既存の予約語のままで、UNION ALL 等と衝突しない。
+        assert_eq!(ex("(SELECT 1 UNION ALL SELECT 2)"), "((SELECT 1i32 UNION ALL SELECT 2i32))");
+    }
+
+    #[test]
     fn other_statements() {
         let p = parse("EXPLAIN SELECT 1").expect("parse");
         assert!(matches!(p.stmt, Stmt::Explain(_)));
@@ -4696,5 +4983,142 @@ mod tests {
         assert_eq!(code("COPY (SELECT 1) TO"), Code::UnexpectedToken as u16);
         assert_eq!(code("COPY (SELECT 1)"), Code::UnexpectedToken as u16);
         assert_eq!(code("COPY (SELECT 1) TO out.csv"), Code::UnexpectedToken as u16);
+    }
+
+    // --- ファイルテーブル関数 / 裸のパスリテラル (`FromItem::File`) -----------
+    //
+    // 実際の解決（`catalog.index_of` によるパス完全一致の名前引き）は
+    // `plan::bind::flatten_from` の担当なので、ここではパース結果の AST の形
+    // （`FromItem::File` の `path`/`format`/`alias`）とラウンドトリップ文字列
+    // だけを確認する。挙動は `duckdb` CLI で確認済み（doc コメント参照）。
+
+    fn from_item(sql: &str) -> (ExprArena, FromItem) {
+        let p = parse(sql).expect("parse failed");
+        match p.stmt {
+            Stmt::Select(q) => match q.body {
+                SetExpr::Select(s) => (p.arena, s.from.expect("no FROM")),
+                _ => panic!("not a plain SELECT"),
+            },
+            _ => panic!("not a SELECT"),
+        }
+    }
+
+    #[test]
+    fn bare_string_literal_from_infers_format_from_extension() {
+        let (a, f) = from_item("SELECT * FROM 'data.parquet'");
+        assert!(matches!(&f, FromItem::File { path, format, alias }
+            if path == "data.parquet" && *format == FormatKind::Parquet && alias.is_none()));
+        assert_eq!(from_str(&a, &f), "parquet('data.parquet')");
+
+        // 未知の拡張子は既存の `FormatKind::detect` の既定どおり Parquet 扱い。
+        let (_, f) = from_item("SELECT * FROM 'data.bin'");
+        assert!(matches!(&f, FromItem::File { format, .. } if *format == FormatKind::Parquet));
+
+        #[cfg(feature = "csv")]
+        {
+            let (_, f) = from_item("SELECT * FROM 'data.csv'");
+            assert!(matches!(&f, FromItem::File { format, .. } if *format == FormatKind::Csv));
+            let (_, f) = from_item("SELECT * FROM 'data.tsv'");
+            assert!(matches!(&f, FromItem::File { format, .. } if *format == FormatKind::Tsv));
+        }
+        #[cfg(feature = "jsonl")]
+        {
+            let (_, f) = from_item("SELECT * FROM 'data.jsonl'");
+            assert!(matches!(&f, FromItem::File { format, .. } if *format == FormatKind::Jsonl));
+            let (_, f) = from_item("SELECT * FROM 'data.json'");
+            assert!(matches!(&f, FromItem::File { format, .. } if *format == FormatKind::Json));
+        }
+    }
+
+    #[test]
+    fn bare_string_literal_from_accepts_alias() {
+        let (_, f) = from_item("SELECT * FROM 'data.parquet' AS p");
+        assert!(matches!(&f, FromItem::File { alias: Some(a), .. } if a == "p"));
+        // `AS` 無しの裸別名も通常どおり許す（`opt_alias` を共有しているため）。
+        let (_, f) = from_item("SELECT * FROM 'data.parquet' p");
+        assert!(matches!(&f, FromItem::File { alias: Some(a), .. } if a == "p"));
+    }
+
+    #[test]
+    fn read_parquet_is_an_alias_for_parquet() {
+        let (a, f) = from_item("SELECT * FROM read_parquet('data.parquet')");
+        assert!(matches!(&f, FromItem::File { path, format, .. }
+            if path == "data.parquet" && *format == FormatKind::Parquet));
+        // 両方とも同じ形に落ちるので、ラウンドトリップの見た目は `parquet(...)`
+        // へ正規化される（`from_str` の doc 参照）。
+        assert_eq!(from_str(&a, &f), "parquet('data.parquet')");
+    }
+
+    #[cfg(feature = "csv")]
+    #[test]
+    fn read_csv_and_read_csv_auto_parse_the_same_way() {
+        for func in ["read_csv", "read_csv_auto"] {
+            let sql = format!("SELECT * FROM {func}('a.csv') AS x");
+            let (a, f) = from_item(&sql);
+            assert!(matches!(&f, FromItem::File { path, format, alias: Some(al) }
+                if path == "a.csv" && *format == FormatKind::Csv && al == "x"));
+            assert_eq!(from_str(&a, &f), "read_csv('a.csv') AS x");
+        }
+    }
+
+    #[cfg(feature = "jsonl")]
+    #[test]
+    fn read_json_and_read_json_auto_parse_the_same_way() {
+        for func in ["read_json", "read_json_auto"] {
+            let sql = format!("SELECT * FROM {func}('a.json') AS x");
+            let (a, f) = from_item(&sql);
+            assert!(matches!(&f, FromItem::File { path, format, alias: Some(al) }
+                if path == "a.json" && *format == FormatKind::Json && al == "x"));
+            assert_eq!(from_str(&a, &f), "read_json('a.json') AS x");
+        }
+    }
+
+    /// `csv` フィーチャが無効なビルドでは `read_csv`/`read_csv_auto` という
+    /// 綴りそのものを認識しない（構文レベルで falls through して
+    /// `UnsupportedFeature` になる — `ddl`/`dml`/`export` の文が feature 無効時
+    /// に同じ経路へ落ちるのと同じパターン。`base_rel` の doc コメント参照）。
+    /// Parquet は常に使えるので影響しない。
+    #[cfg(not(feature = "csv"))]
+    #[test]
+    fn read_csv_is_unsupported_without_the_csv_feature() {
+        assert_eq!(code("SELECT * FROM read_csv('a.csv')"), Code::UnsupportedFeature as u16);
+        assert_eq!(code("SELECT * FROM read_csv_auto('a.csv')"), Code::UnsupportedFeature as u16);
+        // 拡張子検出だけの裸リテラルはパース自体は通る（実解決は
+        // `plan::bind` 側でのカタログ引きに委ねる）。
+        assert!(parse("SELECT * FROM 'a.csv'").is_ok());
+        assert!(parse("SELECT * FROM parquet('a.parquet')").is_ok());
+    }
+
+    #[cfg(not(feature = "jsonl"))]
+    #[test]
+    fn read_json_is_unsupported_without_the_jsonl_feature() {
+        assert_eq!(code("SELECT * FROM read_json('a.json')"), Code::UnsupportedFeature as u16);
+        assert_eq!(code("SELECT * FROM read_json_auto('a.json')"), Code::UnsupportedFeature as u16);
+    }
+
+    /// 名前付きオプション引数・複数ファイル引数は v1 の範囲外
+    /// （`FromItem::File` の doc コメント参照）。1 引数以外はすべて構文エラー。
+    #[test]
+    fn file_table_functions_reject_more_than_one_positional_argument() {
+        assert_eq!(
+            code("SELECT * FROM parquet('a.parquet', 'b.parquet')"),
+            Code::UnexpectedToken as u16
+        );
+        #[cfg(feature = "csv")]
+        assert_eq!(
+            code("SELECT * FROM read_csv('a.csv', delim=',')"),
+            Code::UnexpectedToken as u16
+        );
+        assert_eq!(code("SELECT * FROM parquet()"), Code::UnexpectedToken as u16);
+    }
+
+    /// 未知の関数名は他のテーブル関数と同じく `UnsupportedFeature`。
+    #[test]
+    fn unknown_table_function_name_is_unsupported() {
+        assert_eq!(
+            code("SELECT * FROM read_parquet_auto('a.parquet')"),
+            Code::UnsupportedFeature as u16
+        );
+        assert_eq!(code("SELECT * FROM nonsense_fn('a.parquet')"), Code::UnsupportedFeature as u16);
     }
 }
