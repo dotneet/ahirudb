@@ -62,13 +62,39 @@ SELECT DISTINCT name FROM t WHERE name GLOB 'name_[01]' ORDER BY name;
 -- SIMILAR TO (SQL regex, anchored to the whole string)
 SELECT DISTINCT name FROM t WHERE name SIMILAR TO 'name_[0-1]' ORDER BY name;
 
+-- ~ / !~ (infix): same as SIMILAR TO, a shorter spelling for a full-string
+-- regex match. Prefix ~ (no left-hand operand) is unrelated -- bitwise NOT.
+SELECT DISTINCT name FROM t WHERE name ~ 'name_[0-1]' ORDER BY name;
+SELECT DISTINCT name FROM t WHERE name !~ 'name_[0-1]' ORDER BY name;
+
 -- IS [NOT] NULL, CASE, COALESCE, IIF
 SELECT IIF(flag, 'yes', 'no') FROM t LIMIT 3;
+
+-- IS [NOT] DISTINCT FROM: NULL-safe equality/inequality (never UNKNOWN,
+-- always TRUE/FALSE -- NULL is treated as equal to NULL and unequal to
+-- anything else)
+SELECT a, b FROM (VALUES (1,1), (1,2), (1,NULL), (NULL,NULL)) x(a,b)
+  WHERE a IS DISTINCT FROM b;
+
+-- :: cast shorthand for CAST(... AS ...). Binds tighter than unary
+-- operators: -1::VARCHAR is -(1::VARCHAR), i.e. '-1', not (-1)::VARCHAR
+-- misread as negating text.
+SELECT '42'::INTEGER, (1 + 2)::VARCHAR;
+
+-- ^ / ** (power, always returns DOUBLE; left-associative: 2^3^2 = 64, not
+-- 512), and the bitwise operators & | << >> and prefix ~ (integer only)
+SELECT 2 ^ 10, 2 ** 10;
+SELECT 5 & 3, 5 | 2, 1 << 4, 16 >> 2, ~5;
 ```
 
 `IN`/`BETWEEN` predicates against literal values are also what drives
 RowGroup/page/Bloom-filter pruning on Parquet scans — see
 [data-sources.md](data-sources.md#parquet-coverage).
+
+A shift by a negative amount or by more than 63 bits returns `NULL` rather
+than erroring (DuckDB itself raises an error there) — consistent with how
+this engine already treats other undefined integer arithmetic (division by
+zero, etc.; see [types.md](types.md#null-and-three-valued-logic)).
 
 ## Joins
 

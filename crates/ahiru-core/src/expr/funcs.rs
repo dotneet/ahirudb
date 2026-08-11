@@ -118,6 +118,19 @@ const F_NULLIF: FuncId = 72;
 const F_GREATEST: FuncId = 73;
 const F_LEAST: FuncId = 74;
 
+// ビット演算（`&`/`|`/`<<`/`>>`/前置 `~` の糖衣構文先。`sql::parser` 参照）。
+// BIGINT 固定（他の数値関数の「HUGEINT/DECIMAL も丸める」簡略化と同じ理由、
+// `num_ty` の doc 参照）。
+//
+// `F_PART_BASE`（100）以上は `eval_int` が `date_part` 用の動的オフセットと
+// して奪ってしまう（`id - F_PART_BASE` を part 番号として読む）ので、
+// その手前の空き番号を使う。
+const F_BIT_AND: FuncId = 62;
+const F_BIT_OR: FuncId = 63;
+const F_BIT_SHL: FuncId = 64;
+const F_BIT_SHR: FuncId = 65;
+const F_BIT_NOT: FuncId = 66;
+
 // JSON（Bytes 出力）。`json_object`/`json_array` は引数の個数が可変で、
 // かつ NULL 引数を読み飛ばさず JSON `null` として埋め込む必要があるため、
 // `call` の行ループ（`eval_str`）の外、`F_CONCAT` などと同じ場所で処理する。
@@ -292,6 +305,12 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         // DuckDB の `log(x)` は常用対数。2 引数の `log(b, x)` は未対応。
         "log" | "log10" => fixed(F_LOG10, &[Double], n, 1, Double),
         "pow" | "power" => fixed(F_POW, &[Double, Double], n, 2, Double),
+        // `&`/`|`/`<<`/`>>`/前置 `~` の糖衣構文先（`sql::parser` 参照）。
+        "bit_and" => fixed(F_BIT_AND, &[BigInt, BigInt], n, 2, BigInt),
+        "bit_or" => fixed(F_BIT_OR, &[BigInt, BigInt], n, 2, BigInt),
+        "bit_shift_left" => fixed(F_BIT_SHL, &[BigInt, BigInt], n, 2, BigInt),
+        "bit_shift_right" => fixed(F_BIT_SHR, &[BigInt, BigInt], n, 2, BigInt),
+        "bit_not" => fixed(F_BIT_NOT, &[BigInt], n, 1, BigInt),
 
         // --- JSON -------------------------------------------------------
         // パス構文・既知の制限は `crate::json` のモジュール doc を参照。
@@ -1918,6 +1937,13 @@ fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
                 Some(x % y)
             }
         }
+        F_BIT_AND => Some(a.int(0) & a.int(1)),
+        F_BIT_OR => Some(a.int(0) | a.int(1)),
+        // シフト量が負、または語幅（64）以上は未定義。NULL にする
+        // （ゼロ除算と同じ「未定義演算は NULL」の方針）。
+        F_BIT_SHL => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shl(n)),
+        F_BIT_SHR => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shr(n)),
+        F_BIT_NOT => Some(!a.int(0)),
         F_DATE_PART => match part_id(a.bytes(0)) {
             Some(p) => date_part(p, a.int(1)),
             None => err!(TypeMismatch),

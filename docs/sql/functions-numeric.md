@@ -62,3 +62,29 @@ you're using `nullif` to catch `NULL` inputs specifically (it won't).
 See [types.md](types.md#rounding-and-floating-point-conventions) for the
 project-wide rounding and overflow conventions (float→integer cast
 rounding, `DECIMAL` scale reduction, integer overflow wraparound).
+
+## Bitwise (BIGINT only)
+
+```sql
+SELECT 5 & 3;       -- 1   (bit_and)
+SELECT 5 | 2;       -- 7   (bit_or)
+SELECT 1 << 4;      -- 16  (bit_shift_left)
+SELECT 16 >> 2;     -- 4   (bit_shift_right)
+SELECT ~5;          -- -6  (bit_not, prefix)
+```
+
+The operators are sugar over the named functions (`bit_and(a,b)`,
+`bit_or(a,b)`, `bit_shift_left(a,b)`, `bit_shift_right(a,b)`, `bit_not(a)`),
+which can also be called directly. All operate on `BIGINT` (64-bit); other
+numeric input is cast to `BIGINT` first, matching this engine's usual
+"collapse to one working width" simplification for math functions (see the
+`log`/`sqrt` notes above). A shift amount that's negative or ≥ 64 returns
+`NULL` rather than erroring (DuckDB raises an error there instead — the
+same "prefer NULL over erroring mid-scan" divergence as `sqrt` above).
+
+Operator precedence: `&`/`|`/`<<`/`>>` bind tighter than comparison
+operators but looser than `+`/`-` (so `1 + 2 & 3` is `(1 + 2) & 3`, and
+`1 & 2 = 0` is `(1 & 2) = 0`). Prefix `~` and infix `~`/`!~` share the same
+token but never conflict — `~x` (nothing before it) is always bitwise NOT;
+`x ~ y`/`x !~ y` (an operand before it) is always the regex-match operator
+documented in [queries.md](queries.md#where-operators-and-predicates).

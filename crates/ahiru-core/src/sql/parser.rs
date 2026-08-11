@@ -42,10 +42,19 @@ const BP_OR: u8 = 1;
 const BP_AND: u8 = 2;
 const BP_NOT: u8 = 3;
 const BP_CMP: u8 = 4;
-const BP_CONCAT: u8 = 5;
-const BP_ADD: u8 = 6;
-const BP_MUL: u8 = 7;
-const BP_UNARY: u8 = 8;
+// `&`/`|`/`<<`/`>>`。比較より強く、`||`/算術より弱い
+// （`duckdb` CLI で `1 + 2 & 3` = `(1 + 2) & 3`、`1 & 2 = 0` = `(1 & 2) = 0`
+// を確認済み）。4 つの演算子間の相対順位までは実測していないので、
+// 単純に 1 段にまとめてある。
+const BP_BITWISE: u8 = 5;
+const BP_CONCAT: u8 = 6;
+const BP_ADD: u8 = 7;
+const BP_MUL: u8 = 8;
+// `^`/`**`。`duckdb` CLI で `2 + 3^2` = `2 + (3^2)`、`-2^2` = `(-2)^2` を
+// 確認済み（`*`/`/` より強く、単項 `-` より弱い）。左結合
+// （`2^3^2` = `(2^3)^2` = 64、右結合の `512` にはならない）。
+const BP_POW: u8 = 9;
+const BP_UNARY: u8 = 10;
 
 pub fn parse(sql: &str) -> Result<Parsed> {
     let mut p = Parser::new(sql)?;
@@ -1533,6 +1542,78 @@ impl<'a> Parser<'a> {
                 Tok::Star => (BinaryOp::Mul, BP_MUL),
                 Tok::Slash => (BinaryOp::Div, BP_MUL),
                 Tok::Percent => (BinaryOp::Mod, BP_MUL),
+                // `&`/`|`/`<<`/`>>`/`^`/`**` も `->`/`->>` と同じく新しい
+                // `BinaryOp` を増やさず、既存のスカラ関数呼び出しへの糖衣構文
+                // として展開する（`bit_and`/`bit_or`/`bit_shift_left`/
+                // `bit_shift_right`/`pow` は `expr::funcs` に既存、または
+                // このコミットで新設。カーネルを増やさない、という
+                // DESIGN.md §11 の方針の適用）。
+                Tok::Amp => {
+                    if BP_BITWISE < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    lhs = self.simple_call("bit_and", vec![lhs, rhs]);
+                    continue;
+                }
+                Tok::Pipe => {
+                    if BP_BITWISE < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    lhs = self.simple_call("bit_or", vec![lhs, rhs]);
+                    continue;
+                }
+                Tok::Shl => {
+                    if BP_BITWISE < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    lhs = self.simple_call("bit_shift_left", vec![lhs, rhs]);
+                    continue;
+                }
+                Tok::Shr => {
+                    if BP_BITWISE < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    lhs = self.simple_call("bit_shift_right", vec![lhs, rhs]);
+                    continue;
+                }
+                // 左結合（`duckdb` の `2^3^2` = `(2^3)^2` を確認済み、BP 定数の
+                // doc 参照）なので、通常の演算子と同じく `expr_bp(bp + 1)` で
+                // 右辺を読む。
+                Tok::Pow => {
+                    if BP_POW < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let rhs = self.expr_bp(BP_POW + 1)?;
+                    lhs = self.simple_call("pow", vec![lhs, rhs]);
+                    continue;
+                }
+                // 中置の `~`/`!~`。前置の `~`（ビット単位 NOT）は `prefix()` が
+                // 別に処理するので、ここに来るのは必ず中置（正規表現一致）。
+                // `SIMILAR TO` と同じ関数に展開する（`similar_to` の doc 参照）。
+                Tok::Tilde | Tok::NotTilde => {
+                    if BP_CMP < min_bp {
+                        break;
+                    }
+                    let negate = self.cur == Tok::NotTilde;
+                    self.bump()?;
+                    let rhs = self.expr_bp(BP_CMP + 1)?;
+                    let call = self.simple_call("regexp_full_match", vec![lhs, rhs]);
+                    lhs = if negate {
+                        self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: call })
+                    } else {
+                        call
+                    };
+                    continue;
+                }
                 // `->`/`->>` は新しい BinaryOp を増やさず、`json_extract`/
                 // `json_extract_string` 呼び出しへの糖衣構文として展開する
                 // （`expr::funcs` の型解決・実行にそのまま乗る）。
@@ -1577,10 +1658,15 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 // 負の整数はリテラル 1 個に畳む。そうしないと
                 // -9223372036854775808 のように正側へ収まらない値が書けない。
+                // このリテラルは `primary_atom` を経由しないので、後置 `::`
+                // をここでも自分で畳み込む（`primary` の doc 参照。
+                // `-1::VARCHAR` が `(-1)::VARCHAR` になることを
+                // `duckdb -c "select -1::varchar"` で確認済み）。
                 if let Tok::Int(text) = self.cur {
                     let v = int_literal(text, true, self.pos)?;
                     self.bump()?;
-                    return Ok(self.arena.push(Expr::Literal(v)));
+                    let node = self.arena.push(Expr::Literal(v));
+                    return self.cast_postfix(node);
                 }
                 let arg = self.expr_bp(BP_UNARY)?;
                 Ok(self.arena.push(Expr::Unary { op: UnaryOp::Neg, arg }))
@@ -1598,6 +1684,14 @@ impl<'a> Parser<'a> {
                 }
                 let arg = self.expr_bp(BP_NOT)?;
                 Ok(self.arena.push(Expr::Unary { op: UnaryOp::Not, arg }))
+            }
+            // 前置の `~`（ビット単位 NOT）。中置の `~`/`!~`（正規表現一致）は
+            // `expr_body` の中置ループ側が処理する（同じトークンだが位置で
+            // 意味が決まる。`-` の前置/中置と同じパターン）。
+            Tok::Tilde => {
+                self.bump()?;
+                let arg = self.expr_bp(BP_UNARY)?;
+                Ok(self.simple_call("bit_not", vec![arg]))
             }
             _ => self.primary(),
         }
@@ -1617,6 +1711,17 @@ impl<'a> Parser<'a> {
                 ensure!(!negated, UnexpectedToken, self.pos);
                 self.bump()?;
                 let neg = self.eat_kw(Kw::Not)?;
+                // `DISTINCT`/`FROM` はどちらも既存の予約語（`Kw::Distinct`/
+                // `Kw::From`）なので、`similar`/`glob` のような文脈依存判定は
+                // 要らない。ただし `IS DISTINCT` だけで終わる文はここには
+                // 存在しない（`FROM` が必ず続く）ので、2 トークン先読みで
+                // 確定させてから消費する。
+                if self.is(Tok::Kw(Kw::Distinct)) && self.peek()? == Tok::Kw(Kw::From) {
+                    self.bump()?; // distinct
+                    self.bump()?; // from
+                    let rhs = self.expr_bp(BP_CMP + 1)?;
+                    return Ok(self.distinct_from(arg, rhs, neg));
+                }
                 // v1 は IS [NOT] NULL のみ。IS TRUE などは範囲外。
                 if !self.is(Tok::Kw(Kw::Null)) {
                     err!(UnsupportedFeature, self.pos);
@@ -1706,7 +1811,62 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `[NOT] DISTINCT FROM`。NULL 同士は等しいとみなす等価比較（`=` と違い
+    /// 3 値論理の `UNKNOWN` を経由しない、常に `TRUE`/`FALSE` の等価判定）。
+    /// 専用のカーネル・`Expr` バリアントは増やさず、既存の `IS NULL`/`AND`/
+    /// `OR`/`=` の組み合わせへ展開する:
+    ///   `a IS NOT DISTINCT FROM b` ≡
+    ///     `(a IS NULL AND b IS NULL) OR (a IS NOT NULL AND b IS NOT NULL AND a = b)`
+    ///   `a IS DISTINCT FROM b` ≡ `NOT (上式)`
+    /// （`(a IS NULL AND b IS NULL) OR a = b` のような一見同等の短い式は、
+    /// 片方だけ NULL のとき `a = b` が `NULL` になり `OR` の結果も `NULL` に
+    /// 引きずられてしまう ―― ここでは常に `TRUE`/`FALSE` だけを返す必要が
+    /// あるので、両辺とも非 NULL であることを明示的に確認してから `=` へ
+    /// 委ねる形にしてある）。
+    fn distinct_from(&mut self, l: ExprId, r: ExprId, same: bool) -> ExprId {
+        let l_null = self.arena.push(Expr::IsNull { arg: l, negated: false });
+        let r_null = self.arena.push(Expr::IsNull { arg: r, negated: false });
+        let both_null =
+            self.arena.push(Expr::Binary { op: BinaryOp::And, lhs: l_null, rhs: r_null });
+        let l_nn = self.arena.push(Expr::IsNull { arg: l, negated: true });
+        let r_nn = self.arena.push(Expr::IsNull { arg: r, negated: true });
+        let nn = self.arena.push(Expr::Binary { op: BinaryOp::And, lhs: l_nn, rhs: r_nn });
+        let eq = self.arena.push(Expr::Binary { op: BinaryOp::Eq, lhs: l, rhs: r });
+        let both_nn_and_eq = self.arena.push(Expr::Binary { op: BinaryOp::And, lhs: nn, rhs: eq });
+        let same_value =
+            self.arena.push(Expr::Binary { op: BinaryOp::Or, lhs: both_null, rhs: both_nn_and_eq });
+        if same {
+            same_value
+        } else {
+            self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: same_value })
+        }
+    }
+
+    /// `primary_atom()` に続けて、任意個の postfix `::type` を畳み込む。
+    /// `::` は前置演算子より強く結合する（`duckdb -c "select -1::varchar"` が
+    /// `-(1::VARCHAR)` と解釈されて型エラーになることで確認済み: 単項 `-` が
+    /// `expr_bp(BP_UNARY)` 経由でここへ辿り着く前に、`primary_atom` の結果へ
+    /// 先に `::` が畳み込まれている必要がある）。`primary_atom` の分岐の
+    /// 大半は結果を `self.arena.push` する前に早期 `return` するので、
+    /// この処理はその外側に置く必要がある（内側に置くと `(expr)::ty` や
+    /// `col::ty` などほとんどの実用例を取りこぼす）。
     fn primary(&mut self) -> Result<ExprId> {
+        let node = self.primary_atom()?;
+        self.cast_postfix(node)
+    }
+
+    /// 任意個の後置 `::type` を `node` へ畳み込む。`primary`（大半の式）と
+    /// `prefix` の負数リテラル即畳み込み経路（`primary_atom` を経由しない
+    /// ため別途ここを呼ぶ必要がある）の両方から使う。
+    fn cast_postfix(&mut self, mut node: ExprId) -> Result<ExprId> {
+        while self.eat(Tok::ColonColon)? {
+            let ty = self.type_name()?;
+            node = self.arena.push(Expr::Cast { arg: node, ty, try_: false });
+        }
+        Ok(node)
+    }
+
+    fn primary_atom(&mut self) -> Result<ExprId> {
         let pos = self.pos;
         let node = match self.cur {
             Tok::Int(t) => {
@@ -3086,6 +3246,70 @@ mod tests {
     }
 
     #[test]
+    fn distinct_from_desugars_to_null_safe_equality() {
+        assert_eq!(
+            ex("a IS DISTINCT FROM b"),
+            "(NOT (((a IS NULL) AND (b IS NULL)) OR (((a IS NOT NULL) AND (b IS NOT NULL)) AND (a = b))))"
+        );
+        assert_eq!(
+            ex("a IS NOT DISTINCT FROM b"),
+            "(((a IS NULL) AND (b IS NULL)) OR (((a IS NOT NULL) AND (b IS NOT NULL)) AND (a = b)))"
+        );
+        // `distinct`/`from` はどちらも既存の予約語なので、列名としては
+        // 引用符が要る（`similar`/`glob`/`to` のような文脈依存キーワードでは
+        // ない）。
+        assert_eq!(code(r#"SELECT "distinct" FROM t"#), 0);
+    }
+
+    #[test]
+    fn cast_shorthand_desugars_to_cast() {
+        assert_eq!(ex("x::INTEGER"), "CAST(x AS INTEGER)");
+        assert_eq!(ex("'42'::INTEGER"), "CAST('42' AS INTEGER)");
+        // `::` は前置演算子より強く結合する（`duckdb -c "select -1::varchar"`
+        // が `-(1::VARCHAR)` と解釈されて型エラーになることで確認済み）。
+        assert_eq!(ex("-1::VARCHAR"), "CAST(-1i32 AS VARCHAR)");
+        assert_eq!(ex("(1 + 2)::VARCHAR"), "CAST((1i32 + 2i32) AS VARCHAR)");
+        // 連続適用も畳み込める。
+        assert_eq!(ex("x::INTEGER::VARCHAR"), "CAST(CAST(x AS INTEGER) AS VARCHAR)");
+    }
+
+    #[test]
+    fn power_operator_desugars_to_pow() {
+        assert_eq!(ex("2 ^ 10"), "pow(2i32, 10i32)");
+        assert_eq!(ex("2 ** 10"), "pow(2i32, 10i32)");
+        // 左結合（`duckdb -c "select 2^3^2"` = 64 を確認済み。BP_POW の doc
+        // 参照）。
+        assert_eq!(ex("2 ^ 3 ^ 2"), "pow(pow(2i32, 3i32), 2i32)");
+        // `*`/`/` より強く、単項 `-` より弱い。
+        assert_eq!(ex("2 + 3 ^ 2"), "(2i32 + pow(3i32, 2i32))");
+        assert_eq!(ex("-2 ^ 2"), "pow(-2i32, 2i32)");
+    }
+
+    #[test]
+    fn bitwise_operators_desugar_to_bit_functions() {
+        assert_eq!(ex("a & b"), "bit_and(a, b)");
+        assert_eq!(ex("a | b"), "bit_or(a, b)");
+        assert_eq!(ex("a << b"), "bit_shift_left(a, b)");
+        assert_eq!(ex("a >> b"), "bit_shift_right(a, b)");
+        assert_eq!(ex("~a"), "bit_not(a)");
+        // `&`/`|` は比較より強く、`+`/`-` より弱い（`duckdb -c "select 1 + 2 &
+        // 3"` = `(1 + 2) & 3`、`duckdb -c "select 1 & 2 = 0"` = `(1 & 2) = 0`
+        // を確認済み）。
+        assert_eq!(ex("1 + 2 & 3"), "bit_and((1i32 + 2i32), 3i32)");
+        assert_eq!(ex("1 & 2 = 0"), "(bit_and(1i32, 2i32) = 0i32)");
+    }
+
+    #[test]
+    fn tilde_operators_desugar_to_regexp_full_match() {
+        // 中置の `~`/`!~`（正規表現一致）。前置の `~`（ビット単位 NOT）は
+        // 上の `bitwise_operators_desugar_to_bit_functions` で確認済み ――
+        // 同じトークンだが式の途中か先頭かで意味が変わる（`-` と同じ
+        // パターン、`prefix`/`expr_body` の doc 参照）。
+        assert_eq!(ex("a ~ 'x.y'"), "regexp_full_match(a, 'x.y')");
+        assert_eq!(ex("a !~ 'x.y'"), "(NOT regexp_full_match(a, 'x.y'))");
+    }
+
+    #[test]
     fn array_literal_desugars_to_list_value() {
         assert_eq!(ex("[1, 2, 3]"), "list_value(1i32, 2i32, 3i32)");
         assert_eq!(ex("['a', 'b']"), "list_value('a', 'b')");
@@ -4054,7 +4278,9 @@ mod tests {
         assert_eq!(code("WITH x (a) AS (SELECT 1) SELECT 1"), Code::UnsupportedFeature as u16);
         assert_eq!(code("SELECT 1 UNION"), Code::UnexpectedToken as u16);
         assert_eq!(code("SELECT 1 INTERSECT 2"), Code::UnexpectedToken as u16);
-        assert_eq!(code("SELECT a & b"), Code::UnexpectedToken as u16);
+        // `a & b` used to be a syntax error before `&` became the bitwise-AND
+        // operator (see `bitwise_operators_desugar_to_bit_functions` below).
+        assert_eq!(code("SELECT a &"), Code::UnexpectedToken as u16);
     }
 
     #[test]

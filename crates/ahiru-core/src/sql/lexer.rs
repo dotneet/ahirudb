@@ -340,6 +340,23 @@ pub enum Tok<'a> {
     Le,
     Gt,
     Ge,
+    /// `::`（`CAST(expr AS ty)` の糖衣構文）
+    ColonColon,
+    /// `^` または `**`（べき乗）
+    Pow,
+    /// `&`（ビット単位 AND、整数のみ）
+    Amp,
+    /// `|`（ビット単位 OR、整数のみ。`||` は別途 `Concat`）
+    Pipe,
+    /// `<<`（左シフト、整数のみ）
+    Shl,
+    /// `>>`（右シフト、整数のみ）
+    Shr,
+    /// `~`。前置なら整数のビット単位 NOT、中置なら正規表現一致
+    /// （`regexp_full_match` への糖衣構文、`SIMILAR TO` と同じ）。
+    Tilde,
+    /// `!~`（`~` の否定、`NOT (a ~ b)` の糖衣構文）
+    NotTilde,
 }
 
 /// トークンと、その先頭の入力バイト位置。位置はそのままエラー報告に使う。
@@ -536,7 +553,13 @@ impl<'a> Lexer<'a> {
             b',' => Tok::Comma,
             b'.' => Tok::Dot,
             b';' => Tok::Semi,
-            b'*' => Tok::Star,
+            b'*' => {
+                if eat(b'*') {
+                    Tok::Pow
+                } else {
+                    Tok::Star
+                }
+            }
             b'+' => Tok::Plus,
             b'-' => {
                 if eat(b'>') {
@@ -552,6 +575,14 @@ impl<'a> Lexer<'a> {
             b'/' => Tok::Slash,
             b'%' => Tok::Percent,
             b'?' => Tok::Param,
+            b'^' => Tok::Pow,
+            b':' => {
+                if eat(b':') {
+                    Tok::ColonColon
+                } else {
+                    err!(UnexpectedToken, start)
+                }
+            }
             // `==` は `=` の別名。
             b'=' => {
                 eat(b'=');
@@ -560,15 +591,21 @@ impl<'a> Lexer<'a> {
             b'!' => {
                 if eat(b'=') {
                     Tok::Ne
+                } else if eat(b'~') {
+                    Tok::NotTilde
                 } else {
                     err!(UnexpectedToken, start)
                 }
             }
+            b'~' => Tok::Tilde,
+            b'&' => Tok::Amp,
             b'<' => {
                 if eat(b'=') {
                     Tok::Le
                 } else if eat(b'>') {
                     Tok::Ne
+                } else if eat(b'<') {
+                    Tok::Shl
                 } else {
                     Tok::Lt
                 }
@@ -576,6 +613,8 @@ impl<'a> Lexer<'a> {
             b'>' => {
                 if eat(b'=') {
                     Tok::Ge
+                } else if eat(b'>') {
+                    Tok::Shr
                 } else {
                     Tok::Gt
                 }
@@ -584,7 +623,7 @@ impl<'a> Lexer<'a> {
                 if eat(b'|') {
                     Tok::Concat
                 } else {
-                    err!(UnexpectedToken, start)
+                    Tok::Pipe
                 }
             }
             _ => err!(UnexpectedToken, start),
