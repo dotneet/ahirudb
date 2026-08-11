@@ -16,6 +16,7 @@
 //! メッセージ文字列は JS 側のテーブルで組み立てる。これだけで wasm から
 //! 20 KB 前後のメッセージ文字列を追い出せる。
 
+use alloc::string::ToString;
 use core::cell::UnsafeCell;
 
 use crate::exec::IoRequest;
@@ -204,12 +205,17 @@ pub unsafe extern "C" fn ahiru_register_as(
 
 /// 取得したバイト列をセッションに渡す。
 ///
+/// `part` は複数ファイルテーブルの何ファイル目かを指す。単一ファイルの
+/// テーブル（`ahiru_register` / `ahiru_register_as` で登録したもの）は常に 0。
+/// `ahiru_io_requests` が返した要求の `part` フィールドをそのまま渡すこと。
+///
 /// # Safety
 /// `data` は `len` バイトの有効な領域を指していること。
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_provide(
     h: i32,
     table: u32,
+    part: u32,
     offset: u64,
     data: *const u8,
     len: usize,
@@ -217,7 +223,7 @@ pub unsafe extern "C" fn ahiru_provide(
     clear_error();
     let bytes = unsafe { slice(data, len) }.to_vec();
     match session(h) {
-        Some(s) => match s.provide(table as usize, offset, bytes) {
+        Some(s) => match s.provide(table as usize, part as usize, offset, bytes) {
             Ok(()) => 0,
             Err(e) => fail(e, -1),
         },
@@ -227,6 +233,7 @@ pub unsafe extern "C" fn ahiru_provide(
 
 /// ホストが展開した圧縮ブロックを渡す。`offset` と `len` は
 /// `STATUS_NEED_CODEC` で返した要求のものと一致していなければならない。
+/// `part` の意味は `ahiru_provide` と同じ。
 ///
 /// # Safety
 /// `data` は `data_len` バイトの有効な領域を指していること。
@@ -234,6 +241,7 @@ pub unsafe extern "C" fn ahiru_provide(
 pub unsafe extern "C" fn ahiru_provide_codec(
     h: i32,
     table: u32,
+    part: u32,
     offset: u64,
     len: u32,
     data: *const u8,
@@ -242,8 +250,56 @@ pub unsafe extern "C" fn ahiru_provide_codec(
     clear_error();
     let bytes = unsafe { slice(data, data_len) }.to_vec();
     match session(h) {
-        Some(s) => match s.provide_decoded(table as usize, offset, len, bytes) {
+        Some(s) => match s.provide_decoded(table as usize, part as usize, offset, len, bytes) {
             Ok(()) => 0,
+            Err(e) => fail(e, -1),
+        },
+        None => fail_code(crate::error::Code::Internal, -1),
+    }
+}
+
+/// 複数ファイルを 1 論理テーブルとして登録する。返り値はテーブル添字。
+///
+/// ホストがレンジ取得で供給する前提（`ahiru_register_as` と同じ）。各パート
+/// のパスはフォーマット自動判定と Hive パーティション列の抽出
+/// （`year=2024/month=01/...` のようなディレクトリ）の両方に使われる。
+///
+/// ワイヤ形式（`files`）: `decode_params` と同じ「長さ接頭辞 + 可変長エントリ」
+/// の形にしてある。
+/// ```text
+/// [count:u32] { path_len:u32, path_bytes, total_len:u64 } ...
+/// ```
+///
+/// # Safety
+/// `name` は `name_len` バイトの有効な UTF-8、`files` は `files_len` バイトの
+/// 上記形式のデータを指していること。
+#[no_mangle]
+pub unsafe extern "C" fn ahiru_register_multi(
+    h: i32,
+    name: *const u8,
+    name_len: usize,
+    files: *const u8,
+    files_len: usize,
+    format: u32,
+) -> i32 {
+    clear_error();
+    let name_bytes = unsafe { slice(name, name_len) };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return fail_code(crate::error::Code::Internal, -1),
+    };
+    let kind = match format_kind(format) {
+        Ok(k) => k,
+        Err(e) => return fail(e, -1),
+    };
+    let files_buf = unsafe { slice(files, files_len) };
+    let files = match decode_multi_files(files_buf) {
+        Ok(f) => f,
+        Err(e) => return fail(e, -1),
+    };
+    match session(h) {
+        Some(s) => match s.register_multi_remote(name, files, kind) {
+            Ok(i) => i as i32,
             Err(e) => fail(e, -1),
         },
         None => fail_code(crate::error::Code::Internal, -1),
@@ -381,18 +437,50 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-/// コーデック展開要求の列。`[count][{table,codec,offset,len,out_len}...]`
+/// コーデック展開要求の列。`[count][{table,part,codec,offset,len,out_len}...]`
 fn encode_codec(reqs: &[crate::exec::CodecRequest]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + reqs.len() * 24);
+    let mut out = Vec::with_capacity(4 + reqs.len() * 28);
     put_u32(&mut out, reqs.len() as u32);
     for r in reqs {
         put_u32(&mut out, r.table as u32);
+        put_u32(&mut out, r.part as u32);
         put_u32(&mut out, r.codec as u32);
         put_u64(&mut out, r.offset);
         put_u32(&mut out, r.len);
         put_u32(&mut out, r.out_len);
     }
     out
+}
+
+/// `[count:u32]{ path_len:u32, path_bytes, total_len:u64 }...` を読む。
+/// `decode_params` と同じ「長さ接頭辞 + 可変長エントリ」の形。
+fn decode_multi_files(buf: &[u8]) -> Result<Vec<(String, u64)>> {
+    ensure!(buf.len() >= 4, UnexpectedEof);
+    let n = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // ファイル数の上限は `decode_params` のパラメータ数上限と同じ考え方
+    // （壊れた/悪意ある入力で巨大確保を強いられないようにする）。
+    ensure!(n <= 4096, LimitExceeded);
+    let mut pos = 4usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        ensure!(buf.len() - pos >= 4, UnexpectedEof);
+        let path_len =
+            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        pos += 4;
+        ensure!(buf.len() - pos >= path_len, UnexpectedEof);
+        let path = match core::str::from_utf8(&buf[pos..pos + path_len]) {
+            Ok(s) => s.to_string(),
+            Err(_) => err!(Internal),
+        };
+        pos += path_len;
+        ensure!(buf.len() - pos >= 8, UnexpectedEof);
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&buf[pos..pos + 8]);
+        let total_len = u64::from_le_bytes(a);
+        pos += 8;
+        out.push((path, total_len));
+    }
+    Ok(out)
 }
 
 /// パラメータ列を読む。`[count][{tag}{payload}...]`
@@ -448,12 +536,13 @@ fn decode_params(buf: &[u8]) -> Result<Vec<crate::vector::Value>> {
     Ok(out)
 }
 
-/// I/O 要求の列。`[count][{table,offset,len}...]`
+/// I/O 要求の列。`[count][{table,part,offset,len}...]`
 fn encode_io(io: &[IoRequest]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + io.len() * 20);
+    let mut out = Vec::with_capacity(4 + io.len() * 24);
     put_u32(&mut out, io.len() as u32);
     for r in io {
         put_u32(&mut out, r.table as u32);
+        put_u32(&mut out, r.part as u32);
         put_u64(&mut out, r.offset);
         put_u64(&mut out, r.len);
     }
@@ -580,6 +669,8 @@ fn ty_code(t: crate::vector::Ty) -> u32 {
         Date => 16,
         Time => 17,
         Timestamp => 18,
+        Interval => 19,
+        Json => 20,
     }
 }
 
@@ -588,3 +679,88 @@ const _: () = {
     assert!(PhysType::Bool as u32 == 0);
     assert!(PhysType::Bytes as u32 == 5);
 };
+
+// このモジュールは `#[cfg(target_arch = "wasm32")]` でしか組み込まれない
+// （`lib.rs` 参照）ので、これらのテストはネイティブの `cargo test` では
+// 実行されない。wasm32 向けにテストランナーを用意したときに有効になる。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `decode_multi_files` の逆関数。テスト専用のエンコーダ。
+    fn encode_multi_files(files: &[(&str, u64)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u32(&mut out, files.len() as u32);
+        for (path, total_len) in files {
+            put_u32(&mut out, path.len() as u32);
+            out.extend_from_slice(path.as_bytes());
+            put_u64(&mut out, *total_len);
+        }
+        out
+    }
+
+    #[test]
+    fn multi_files_wire_format_round_trips() {
+        let files = [("a.parquet", 100u64), ("year=2024/b.parquet", 200), ("", 0)];
+        let buf = encode_multi_files(&files);
+        let decoded = decode_multi_files(&buf).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], ("a.parquet".to_string(), 100));
+        assert_eq!(decoded[1], ("year=2024/b.parquet".to_string(), 200));
+        assert_eq!(decoded[2], ("".to_string(), 0));
+    }
+
+    #[test]
+    fn multi_files_empty_list_round_trips() {
+        let buf = encode_multi_files(&[]);
+        assert_eq!(decode_multi_files(&buf).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn multi_files_truncated_buffer_is_rejected() {
+        let mut buf = encode_multi_files(&[("a.parquet", 100)]);
+        buf.truncate(buf.len() - 1);
+        assert!(decode_multi_files(&buf).is_err());
+    }
+
+    #[test]
+    fn ahiru_register_multi_registers_all_parts() {
+        let h = ahiru_session_new();
+        let name = b"t";
+        let files = encode_multi_files(&[
+            ("data/year=2024/month=01/a.parquet", 100),
+            ("data/year=2024/month=02/b.parquet", 200),
+        ]);
+        let idx = unsafe {
+            ahiru_register_multi(
+                h,
+                name.as_ptr(),
+                name.len(),
+                files.as_ptr(),
+                files.len(),
+                0, // Auto
+            )
+        };
+        assert!(idx >= 0, "register_multi failed: last_error={}", ahiru_last_error());
+
+        let s = session(h).unwrap();
+        let t = s.catalog.get(idx as usize).unwrap();
+        assert_eq!(t.parts.len(), 2);
+        assert_eq!(t.parts[0].path, "data/year=2024/month=01/a.parquet");
+
+        ahiru_session_free(h);
+    }
+
+    #[test]
+    fn ahiru_register_multi_rejects_garbage_wire_data() {
+        let h = ahiru_session_new();
+        let name = b"t";
+        let garbage = [0xFFu8; 3]; // count フィールドすら読めない長さ
+        let idx = unsafe {
+            ahiru_register_multi(h, name.as_ptr(), name.len(), garbage.as_ptr(), garbage.len(), 0)
+        };
+        assert_eq!(idx, -1);
+        assert_ne!(ahiru_last_error(), 0);
+        ahiru_session_free(h);
+    }
+}

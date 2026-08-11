@@ -6,11 +6,12 @@
 
 pub mod bind;
 pub mod compile;
+pub mod explain;
 pub mod scope;
 
 use crate::expr::Program;
 use crate::prelude::*;
-use crate::sql::ast::JoinKind;
+use crate::sql::ast::{ExprId, JoinKind};
 use crate::vector::{Field, Ty};
 
 // 枝刈り述語はフォーマット層との契約なので `format` 側に置いてある。
@@ -28,6 +29,23 @@ pub enum AggKind {
     Min,
     Max,
     Avg,
+    /// 標本標準偏差（`stddev` / `stddev_samp`）。
+    StdDev,
+    /// 標本分散（`variance` / `var_samp`）。
+    Variance,
+    /// 連続分布の中央値（線形補間）。`quantile_cont(x, 0.5)` と同じ。
+    Median,
+    /// 最頻値。同数が複数あれば最初に見つかったものを返す（実装依存だが
+    /// DuckDB も同じ立場）。
+    Mode,
+    /// 近似個数（実装は v1 では厳密カウントでよい。将来 HyperLogLog に
+    /// 差し替える余地として名前だけ分けてある）。
+    ApproxCountDistinct,
+    /// カンマ等の区切り文字で連結する。第 2 引数は区切り文字（既定は空文字）。
+    StringAgg,
+    /// 値を集めて JSON 風のテキストにする。LIST 型が無いための代替表現
+    /// （DESIGN.md のネスト型の扱いと同じ判断）。
+    ArrayAgg,
 }
 
 impl AggKind {
@@ -37,7 +55,7 @@ impl AggKind {
     /// 出力スキーマと実データの型がずれ、結果の読み出しが静かに壊れる。
     pub fn result_ty(self, input: Ty) -> Result<Ty> {
         Ok(match self {
-            AggKind::CountStar | AggKind::Count => Ty::BigInt,
+            AggKind::CountStar | AggKind::Count | AggKind::ApproxCountDistinct => Ty::BigInt,
             // 整数の合計は 64 ビットで溢れやすいので 128 ビットに広げる。
             AggKind::Sum => match input {
                 t if t.is_integer() => Ty::HugeInt,
@@ -48,18 +66,29 @@ impl AggKind {
                 Ty::Null => Ty::HugeInt,
                 _ => err!(TypeMismatch),
             },
-            AggKind::Avg => match input {
+            AggKind::Avg | AggKind::StdDev | AggKind::Variance | AggKind::Median => match input {
                 t if t.is_numeric() || t == Ty::Null => Ty::Double,
                 _ => err!(TypeMismatch),
             },
-            // MIN/MAX は入力型をそのまま返す。比較さえできればよい。
-            AggKind::Min | AggKind::Max => input,
+            // MIN/MAX/MODE は入力型をそのまま返す。
+            AggKind::Min | AggKind::Max | AggKind::Mode => input,
+            AggKind::StringAgg => Ty::Varchar,
+            AggKind::ArrayAgg => Ty::Varchar,
         })
     }
 
     /// 引数を取らない集約か。
     pub fn is_nullary(self) -> bool {
         self == AggKind::CountStar
+    }
+
+    /// `StringAgg` のように 2 個目の引数（区切り文字など）を取りうるか。
+    /// 取れる場合、省略時の既定引数を返す。
+    pub fn optional_arg_default(self) -> Option<&'static [u8]> {
+        match self {
+            AggKind::StringAgg => Some(b""),
+            _ => None,
+        }
     }
 
     /// 名前から引く。大文字小文字は区別しない。
@@ -74,20 +103,41 @@ impl AggKind {
             Some(AggKind::Min)
         } else if eq_ascii_ci(n, b"max") {
             Some(AggKind::Max)
-        } else if eq_ascii_ci(n, b"avg") {
+        } else if eq_ascii_ci(n, b"avg") || eq_ascii_ci(n, b"mean") {
             Some(AggKind::Avg)
+        } else if eq_ascii_ci(n, b"stddev") || eq_ascii_ci(n, b"stddev_samp") {
+            Some(AggKind::StdDev)
+        } else if eq_ascii_ci(n, b"variance") || eq_ascii_ci(n, b"var_samp") {
+            Some(AggKind::Variance)
+        } else if eq_ascii_ci(n, b"median") {
+            Some(AggKind::Median)
+        } else if eq_ascii_ci(n, b"mode") {
+            Some(AggKind::Mode)
+        } else if eq_ascii_ci(n, b"approx_count_distinct") {
+            Some(AggKind::ApproxCountDistinct)
+        } else if eq_ascii_ci(n, b"string_agg") || eq_ascii_ci(n, b"group_concat") {
+            Some(AggKind::StringAgg)
+        } else if eq_ascii_ci(n, b"array_agg") || eq_ascii_ci(n, b"list") {
+            Some(AggKind::ArrayAgg)
         } else {
             None
         }
     }
 }
 
+#[derive(Clone)]
 pub struct Agg {
     pub kind: AggKind,
     /// `COUNT(*)` では `None`。
     pub arg: Option<Program>,
     pub distinct: bool,
     pub name: String,
+    /// `string_agg(x, sep)` の区切り文字。定数リテラルのみ許す
+    /// （行ごとに変わる区切り文字は実用上ほぼ無く、実行を単純に保てる）。
+    pub separator: Vec<u8>,
+    /// `agg(...) FILTER (WHERE cond)`。集約前の入力スコープで評価する
+    /// BOOLEAN 式。偽・NULL の行はこの集約の更新から除外する。
+    pub filter: Option<Program>,
 }
 
 impl Agg {
@@ -101,12 +151,80 @@ impl Agg {
     }
 }
 
+/// ウィンドウ関数の種類。
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub enum WindowKind {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    /// 集約のウィンドウ版（`sum(x) OVER (...)`）。
+    Agg(AggKind),
+}
+
+impl WindowKind {
+    pub fn from_name(name: &str) -> Option<WindowKind> {
+        use crate::rt::hash::eq_ascii_ci;
+        let n = name.as_bytes();
+        if eq_ascii_ci(n, b"row_number") {
+            Some(WindowKind::RowNumber)
+        } else if eq_ascii_ci(n, b"rank") {
+            Some(WindowKind::Rank)
+        } else if eq_ascii_ci(n, b"dense_rank") {
+            Some(WindowKind::DenseRank)
+        } else if eq_ascii_ci(n, b"lag") {
+            Some(WindowKind::Lag)
+        } else if eq_ascii_ci(n, b"lead") {
+            Some(WindowKind::Lead)
+        } else if eq_ascii_ci(n, b"first_value") {
+            Some(WindowKind::FirstValue)
+        } else if eq_ascii_ci(n, b"last_value") {
+            Some(WindowKind::LastValue)
+        } else {
+            AggKind::from_name(name).map(WindowKind::Agg)
+        }
+    }
+
+    /// 引数を取らない関数か。
+    pub fn is_nullary(self) -> bool {
+        matches!(self, WindowKind::RowNumber | WindowKind::Rank | WindowKind::DenseRank)
+    }
+}
+
+/// 1 つのウィンドウ関数呼び出し。
+#[derive(Clone)]
+pub struct WindowSpec {
+    pub kind: WindowKind,
+    /// 関数の引数。`row_number()` は空、`lag(x, n, d)` は 3 個まで。
+    pub args: Vec<Program>,
+    pub partition_by: Vec<Program>,
+    pub order_by: Vec<SortKey>,
+    pub frame: crate::sql::ast::WindowFrame,
+    pub result_ty: crate::vector::Ty,
+    pub name: String,
+}
+
+/// 集合演算。
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Clone)]
 pub struct SortKey {
     pub expr: Program,
     pub desc: bool,
     pub nulls_first: bool,
 }
 
+#[derive(Clone)]
 pub struct ScanSpec {
     /// カタログ上のテーブル添字。
     pub table: usize,
@@ -118,8 +236,32 @@ pub struct ScanSpec {
     pub pruners: Vec<Pruner>,
 }
 
+/// `catalog::MemTable`（インメモリ表）のスキャン。`ddl` フィーチャ専用。
+///
+/// 常に全列を出す（射影プッシュダウンはしない）。CTE/派生表の `Rel` と同じ
+/// 扱いで、必要な列だけを選ぶのは上位の `Project` に任せる —
+/// メモリ上に全データがあるので、Parquet の「読むバイト数を減らす」最適化
+/// が効く場面がそもそも無い。
+#[cfg(feature = "ddl")]
+#[derive(Clone)]
+pub struct MemScanSpec {
+    /// `Catalog::mem_get` に渡す添字（ファイルテーブルの `table` とは
+    /// 別の添字空間）。
+    pub table: usize,
+    pub schema: Vec<Field>,
+}
+
+/// `Clone` は GROUPING SETS 対応で要る: FROM/WHERE まで束ねたプラン木を
+/// グルーピングセットの数だけ複製し、それぞれに別の `Node::Aggregate` を
+/// 被せて `Node::SetOp`（UNION ALL）で束ねる（`plan::bind` 参照）。複製する
+/// のは実行前の命令列であって実データではないが、結果として実行時には
+/// 同じ入力をセットの数だけスキャンし直すことになる。実行オペレータ
+/// （`exec/`）を増やさずに済む方を優先した割り切り。
+#[derive(Clone)]
 pub enum Node {
     Scan(Box<ScanSpec>),
+    #[cfg(feature = "ddl")]
+    MemScan(Box<MemScanSpec>),
     Filter {
         input: Box<Node>,
         pred: Program,
@@ -156,10 +298,76 @@ pub enum Node {
         /// 左のスキーマ、続いて右のスキーマ。
         schema: Vec<Field>,
     },
+    /// ウィンドウ関数。出力は入力の列に続けてウィンドウ列を並べる。
+    Window {
+        input: Box<Node>,
+        windows: Vec<WindowSpec>,
+        schema: Vec<Field>,
+    },
+    /// 集合演算。左右のスキーマは列数と型が一致していなければならない。
+    SetOp {
+        left: Box<Node>,
+        right: Box<Node>,
+        op: SetOpKind,
+        /// `UNION ALL` のように重複を残すか。
+        all: bool,
+        schema: Vec<Field>,
+    },
     Limit {
         input: Box<Node>,
         limit: Option<u64>,
         offset: u64,
+    },
+    /// `DISTINCT ON (keys)`。入力の並び順で最初に見た行だけをキーごとに通す
+    /// ストリーミングフィルタ。呼び出し側が `ORDER BY` で希望の並びを先に
+    /// 確定させておく（DESIGN.md の「既存インフラの再利用」方針）。
+    DistinctOn {
+        input: Box<Node>,
+        keys: Vec<Program>,
+    },
+    /// `WITH RECURSIVE name AS (anchor UNION [ALL] recursive_term)`。
+    ///
+    /// アンカーを 1 度だけ読み切って初期の作業集合にし、それを入力に
+    /// `recursive_term` を繰り返し実行して新規行が無くなるまで積み増す
+    /// （不動点反復）。`recursive_term` の中にある自己参照は
+    /// `Node::WorkingTable` として現れ、実行オペレータ
+    /// （`exec::recursive::RecursiveCte`）がイテレーションごとに直前の
+    /// 新規行を差し込んで再構築する（`plan::bind::split_recursive_cte`
+    /// 参照）。
+    RecursiveCte {
+        anchor: Box<Node>,
+        recursive_term: Box<Node>,
+        /// `UNION ALL` なら重複を残す。`UNION` ならアンカー・全イテレーションを
+        /// 通して重複排除する。
+        union_all: bool,
+        schema: Vec<Field>,
+    },
+    /// `RecursiveCte` の `recursive_term` の中で自分自身を参照する箇所。
+    ///
+    /// 論理プラン上はスキーマだけを持つ葉で、実データは持たない。
+    /// `exec::build` から素で（`RecursiveCte` の外側で）組み立てられることは
+    /// バインダのバグなので `Internal` エラーになる。
+    WorkingTable {
+        schema: Vec<Field>,
+    },
+    /// `UNNEST`。入力の 1 行を、`expr`（`Ty::Json` の配列）の要素数ぶんの行に
+    /// 展開する（1 行 → N 行の set-returning オペレータ）。入力の他の列は
+    /// そのまま複製する。SELECT リストの `UNNEST(x)` と FROM 句の
+    /// `UNNEST(x) AS t(c)`（暗黙 LATERAL）はどちらもこのノードに落ちる
+    /// （`plan::bind` 参照）。
+    Unnest {
+        input: Box<Node>,
+        /// 展開対象の配列を入力行に対して評価する式。結果型は必ず `Ty::Json`。
+        expr: Program,
+        /// 展開後の要素列の宣言型。全行・全要素を通して常にこの型で出す
+        /// （`plan::bind::narrow_unnest_elem_ty` が静的に安全と判定できた
+        /// ときだけ `Ty::Json` 以外に絞り込む。実データを見ないと判定でき
+        /// ない一般のケース、たとえばテーブルの JSON 列そのものを対象に
+        /// する場合は `Ty::Json` のまま。実行側は宣言された型に厳密に
+        /// 従う ―― 値が型と食い違えば NULL にする、決してパニックしない）。
+        elem_ty: Ty,
+        /// 入力のスキーマ ++ 展開要素 1 列。
+        schema: Vec<Field>,
     },
 }
 
@@ -168,16 +376,28 @@ impl Node {
     pub fn schema(&self) -> &[Field] {
         match self {
             Node::Scan(s) => &s.schema,
+            #[cfg(feature = "ddl")]
+            Node::MemScan(s) => &s.schema,
             Node::Project { schema, .. } => schema,
             Node::Aggregate { schema, .. } => schema,
             Node::Join { schema, .. } => schema,
-            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } => {
-                input.schema()
-            }
+            Node::Window { schema, .. } => schema,
+            Node::SetOp { schema, .. } => schema,
+            Node::RecursiveCte { schema, .. } => schema,
+            Node::WorkingTable { schema } => schema,
+            Node::Unnest { schema, .. } => schema,
+            Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::DistinctOn { input, .. } => input.schema(),
         }
     }
 }
 
 pub struct Plan {
     pub root: Node,
+    /// 相関サブクエリの場合、`root` のスキーマ末尾に付加された相関キー列に
+    /// 対応する外側スコープ側の式（`plan::bind` の相関検出結果）。
+    /// 非相関なら空で、`root` に余分な列は無い。
+    pub correlated: Vec<ExprId>,
 }

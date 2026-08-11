@@ -1,0 +1,387 @@
+//! CSV 書き出し（`export` フィーチャ）。
+//!
+//! RFC 4180 準拠。カンマ・引用符・改行を含むフィールドだけを引用符で囲む
+//! （毎回引用符を付けるより出力が小さく、読みやすい）。
+
+use crate::prelude::*;
+use crate::vector::{Batch, Field, Ty, Value};
+use crate::write::TableSink;
+
+pub struct CsvSink {
+    out: Vec<u8>,
+    /// ヘッダ行を書いたか。
+    began: bool,
+}
+
+impl CsvSink {
+    pub fn new() -> Self {
+        CsvSink { out: Vec::new(), began: false }
+    }
+}
+
+impl Default for CsvSink {
+    fn default() -> Self {
+        CsvSink::new()
+    }
+}
+
+impl TableSink for CsvSink {
+    fn begin(&mut self, schema: &[Field]) -> Result<()> {
+        for (i, f) in schema.iter().enumerate() {
+            if i > 0 {
+                self.out.push(b',');
+            }
+            push_field(&mut self.out, f.name.as_bytes());
+        }
+        self.out.push(b'\n');
+        self.began = true;
+        Ok(())
+    }
+
+    fn write_batch(&mut self, schema: &[Field], batch: &Batch) -> Result<()> {
+        ensure!(self.began, Internal);
+        let n = batch.num_rows();
+        for r in 0..n {
+            for (i, (c, f)) in batch.cols.iter().zip(schema).enumerate() {
+                if i > 0 {
+                    self.out.push(b',');
+                }
+                if !c.is_valid(r) {
+                    // 空フィールドが NULL。CSV に NULL の標準表現は無い。
+                    continue;
+                }
+                push_value(&mut self.out, &c.value_at(r), f.ty);
+            }
+            self.out.push(b'\n');
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Vec<u8>> {
+        Ok(core::mem::take(&mut self.out))
+    }
+}
+
+/// カンマ・引用符・改行・CR を含む場合だけ引用符で囲む。
+fn push_field(out: &mut Vec<u8>, s: &[u8]) {
+    let needs_quote = s.iter().any(|&b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
+    if !needs_quote {
+        out.extend_from_slice(s);
+        return;
+    }
+    out.push(b'"');
+    for &b in s {
+        if b == b'"' {
+            out.push(b'"');
+        }
+        out.push(b);
+    }
+    out.push(b'"');
+}
+
+fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
+    match v {
+        Value::Null => {}
+        Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+        Value::I32(x) if ty == Ty::Date => push_date(out, *x as i64),
+        Value::I32(x) => push_int(out, *x as i128),
+        Value::I64(x) if ty == Ty::Timestamp => push_timestamp(out, *x),
+        Value::I64(x) => push_int(out, *x as i128),
+        Value::I128(x) => match ty {
+            Ty::Decimal { scale, .. } => push_decimal(out, *x, scale),
+            Ty::Interval => {
+                let (months, days, micros) = crate::vector::unpack_interval(*x);
+                crate::vector::fmt_interval(months, days, micros, out);
+            }
+            _ => push_int(out, *x),
+        },
+        Value::F64(x) => push_f64(out, *x),
+        Value::Bytes(b) => push_field(out, b),
+    }
+}
+
+fn push_int(out: &mut Vec<u8>, v: i128) {
+    if v < 0 {
+        out.push(b'-');
+    }
+    let mut buf = [0u8; 40];
+    let mut n = 0usize;
+    let mut u = v.unsigned_abs();
+    loop {
+        buf[n] = b'0' + (u % 10) as u8;
+        n += 1;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    for i in (0..n).rev() {
+        out.push(buf[i]);
+    }
+}
+
+fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
+    if scale == 0 {
+        push_int(out, v);
+        return;
+    }
+    let scale = scale as usize;
+    let neg = v < 0;
+    if neg {
+        out.push(b'-');
+    }
+    let digits = {
+        let mut buf = [0u8; 40];
+        let mut n = 0usize;
+        let mut u = v.unsigned_abs();
+        loop {
+            buf[n] = b'0' + (u % 10) as u8;
+            n += 1;
+            u /= 10;
+            if u == 0 {
+                break;
+            }
+        }
+        buf[..n].iter().rev().copied().collect::<Vec<u8>>()
+    };
+    if digits.len() <= scale {
+        out.push(b'0');
+        out.push(b'.');
+        for _ in 0..(scale - digits.len()) {
+            out.push(b'0');
+        }
+        out.extend_from_slice(&digits);
+    } else {
+        let split = digits.len() - scale;
+        out.extend_from_slice(&digits[..split]);
+        out.push(b'.');
+        out.extend_from_slice(&digits[split..]);
+    }
+}
+
+/// `core` に浮動小数の書式化が無いので手で組む。指数部を持たない範囲では
+/// 単純な整数部+小数部で足りる（DuckDB の CSV 出力も基本この形）。
+fn push_f64(out: &mut Vec<u8>, v: f64) {
+    if v.is_nan() {
+        out.extend_from_slice(b"NaN");
+        return;
+    }
+    if v.is_infinite() {
+        out.extend_from_slice(if v > 0.0 { b"Infinity" } else { b"-Infinity" });
+        return;
+    }
+    if v == 0.0 {
+        out.extend_from_slice(if v.is_sign_negative() { b"-0.0" } else { b"0.0" });
+        return;
+    }
+    let neg = v < 0.0;
+    let mut x = if neg { -v } else { v };
+    if neg {
+        out.push(b'-');
+    }
+    // 整数部。`trunc()` は core に無い（libm 依存）ので `as i128` の
+    // 飽和・ゼロ方向丸めキャストで代用する。
+    let ip = x as i128;
+    push_int(out, ip);
+    out.push(b'.');
+    // `ip` が i128 の範囲外で飽和した場合（v の絶対値が i128::MAX 超）、
+    // `x - ip as f64` は [0,1) に収まらない巨大な残差になる。そのまま桁
+    // 抽出すると `x as u8` が 255 に飽和し、`b'0' + d` で u8 加算オーバー
+    // フロー（デバッグ panic、release ビルドでは不正なバイトの書き込み）
+    // になる。飽和したら小数部の抽出自体を諦める。
+    if ip == i128::MAX || ip == i128::MIN {
+        out.push(b'0');
+    } else {
+        x -= ip as f64;
+        // 小数部は最大 15 桁まで。末尾 0 は 1 桁残して落とす。
+        let mut digits = Vec::with_capacity(15);
+        for _ in 0..15 {
+            x *= 10.0;
+            let d = x as u8;
+            digits.push(b'0' + d);
+            x -= d as f64;
+        }
+        while digits.len() > 1 && *digits.last().unwrap() == b'0' {
+            digits.pop();
+        }
+        out.extend_from_slice(&digits);
+    }
+}
+
+fn push_date(out: &mut Vec<u8>, days: i64) {
+    let (y, m, d) = civil_from_days(days);
+    push_padded(out, y, 4);
+    out.push(b'-');
+    push_padded(out, m as i64, 2);
+    out.push(b'-');
+    push_padded(out, d as i64, 2);
+}
+
+fn push_timestamp(out: &mut Vec<u8>, micros: i64) {
+    let days = micros.div_euclid(86_400_000_000);
+    let rem = micros.rem_euclid(86_400_000_000);
+    push_date(out, days);
+    out.push(b' ');
+    push_padded(out, rem / 3_600_000_000, 2);
+    out.push(b':');
+    push_padded(out, rem / 60_000_000 % 60, 2);
+    out.push(b':');
+    push_padded(out, rem / 1_000_000 % 60, 2);
+}
+
+fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {
+    let s = {
+        let mut buf = [0u8; 20];
+        let mut n = 0usize;
+        let neg = v < 0;
+        let mut u = v.unsigned_abs();
+        loop {
+            buf[n] = b'0' + (u % 10) as u8;
+            n += 1;
+            u /= 10;
+            if u == 0 {
+                break;
+            }
+        }
+        let mut v: Vec<u8> = buf[..n].iter().rev().copied().collect();
+        if neg {
+            v.insert(0, b'-');
+        }
+        v
+    };
+    for _ in 0..width.saturating_sub(s.len()) {
+        out.push(b'0');
+    }
+    out.extend_from_slice(&s);
+}
+
+/// エポックからの日数を civil date に変換する（Howard Hinnant のアルゴリズム）。
+/// `crates/ahiru-cli/src/main.rs` の同名関数と同じ式。表示専用の小さな
+/// コードなので、依存を増やさないためここでも独立して持つ。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Session;
+    use crate::write::export_all;
+
+    fn run_csv(sql: &str, table: &str, bytes: Vec<u8>, kind: crate::format::FormatKind) -> String {
+        let mut s = Session::new();
+        s.register_bytes_as(table, bytes, kind).unwrap();
+        let mut sink = CsvSink::new();
+        let out = export_all(&mut s, sql, &[], &mut sink).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn header_and_rows() {
+        let out = run_csv(
+            "SELECT id, name FROM t ORDER BY id",
+            "t",
+            b"id,name\n1,alice\n2,bob\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "id,name\n1,alice\n2,bob\n");
+    }
+
+    #[test]
+    fn quotes_fields_that_need_it() {
+        let out = run_csv(
+            "SELECT name FROM t",
+            "t",
+            b"name\n\"a,b\"\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "name\n\"a,b\"\n");
+    }
+
+    #[test]
+    fn embedded_quote_is_doubled() {
+        let out = run_csv(
+            "SELECT name FROM t",
+            "t",
+            b"name\n\"a\"\"b\"\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "name\n\"a\"\"b\"\n");
+    }
+
+    #[test]
+    fn null_is_empty_field() {
+        let out = run_csv(
+            "SELECT a, b FROM t",
+            "t",
+            b"a,b\n1,\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "a,b\n1,\n");
+    }
+
+    #[test]
+    fn integer_and_float_formatting() {
+        let out = run_csv(
+            "SELECT a, b FROM t",
+            "t",
+            b"a,b\n-5,-1.5\n0,0.0\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "a,b\n-5,-1.5\n0,0.0\n");
+    }
+
+    #[test]
+    fn interval_is_formatted_as_text() {
+        let out = run_csv(
+            "SELECT INTERVAL '1 month 3 days 1 hour 2 minutes 3 seconds' AS iv FROM t LIMIT 1",
+            "t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "iv\n1 month 3 days 01:02:03\n");
+    }
+
+    #[test]
+    fn float_formatting_handles_small_fraction_and_trailing_zero_trim() {
+        let out = run_csv(
+            "SELECT a FROM t",
+            "t",
+            b"a\n0.1\n100.0\n-0.5\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "a\n0.1\n100.0\n-0.5\n");
+    }
+
+    // `push_f64` は core に指数表記の書式化が無いので整数部+小数部の固定小数点
+    // でしか書けない（ファイル冒頭のコメント参照）。整数部が i128 の範囲を
+    // 超える巨大な有限値では `as i128` が飽和し、`i128::MAX` 相当の整数部を
+    // 出す。DECIMAL/DOUBLE の通常データでここに達することはまず無いが、
+    // 「何が起きるか」を固定して将来の変更で無自覚に壊れないようにする。
+    #[test]
+    fn float_formatting_saturates_on_extremely_large_finite_values() {
+        let out =
+            run_csv("SELECT a FROM t", "t", b"a\n1e40\n".to_vec(), crate::format::FormatKind::Csv);
+        assert_eq!(out, format!("a\n{}.0\n", i128::MAX));
+    }
+
+    #[test]
+    fn empty_result_still_writes_header() {
+        let out = run_csv(
+            "SELECT id FROM t WHERE id > 100",
+            "t",
+            b"id\n1\n2\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "id\n");
+    }
+}

@@ -1,166 +1,185 @@
-# ahirudb — JS ホスト層
+# ahirudb — JS host layer
 
-`ahiru-core.wasm` を駆動する ES モジュール。**依存ゼロ・ビルド不要**で、ブラウザと
-Node 18+ の両方でそのまま動く。
+An ES module that drives `ahiru-core.wasm`. **Zero dependencies, no build step** —
+it runs as-is in both the browser and Node 18+.
 
 ```
 js/
-  ahirudb.js     本体（IO ループ / 結果デコード / キャッシュ）
-  errors.js      エラーコード表（crates/ahiru-core/src/error.rs と 1:1）
-  ahirudb.d.ts   型定義
-  test/          node --test 用のテスト
+  ahirudb.js     Core (IO loop / result decoding / caching)
+  errors.js      Error code table (kept 1:1 with crates/ahiru-core/src/error.rs)
+  ahirudb.d.ts   Type definitions
+  test/          Tests for node --test
 ```
 
-## 使い方
+## Usage
 
 ```js
 import { AhiruDB, timestampToDate } from './js/ahirudb.js';
 
 const db = await AhiruDB.init({
   wasmUrl: '/ahiru-core.wasm',
-  memoryLimit: 512 * 1024 * 1024, // wasm ヒープの上限。超えたら E501
-  cache: 'memory',                // "memory" | "cache-api" | "none" | 自前の実装
-  zstdUrl: '/ahiru-zstd.wasm',    // ZSTD を含むファイルを読むときだけ必要
+  memoryLimit: 512 * 1024 * 1024, // wasm heap cap; exceeding it raises E501
+  cache: 'memory',                // "memory" | "cache-api" | "none" | a custom implementation
+  zstdUrl: '/ahiru-zstd.wasm',    // only needed when reading files that use ZSTD
 });
 
-// 登録では I/O しない。総バイト長の取得もフッタ読みも初回クエリまで遅延する。
+// register() does no I/O. Fetching the total length and reading the footer
+// are both deferred until the first query.
 db.register('trips', 'https://example.com/trips.parquet'); // HTTP Range
 db.register('local', bytes);                               // Uint8Array / ArrayBuffer
 db.register('picked', fileFromInputElement);               // Blob / File
 db.register('logs.csv', csvBytes);                         // CSV / TSV / JSONL
 
-// 1) 全件取得
+// 1) Fetch all rows
 const rows = await db.query('SELECT id, name FROM trips LIMIT 5');
 // -> [{ id: 0, name: 'name_0' }, ...]
 
-// 2) パラメータバインド（SQL に値を埋め込まない）
+// 2) Bind parameters (never interpolate values into SQL)
 await db.query('SELECT * FROM trips WHERE vendor = ? AND fare > ?', ['VTS', 100]);
 
-// 3) ストリーミング（列指向のバッチ、既定 2048 行）
+// 3) Streaming (columnar batches, 2048 rows by default)
 for await (const batch of db.stream('SELECT id, score FROM trips')) {
-  batch.numRows;            // 行数
+  batch.numRows;            // row count
   batch.column('score');    // Float64Array
-  batch.isNull('score', 3); // validity ビットマップを見る
-  batch.toRows();           // プレーンなオブジェクトの配列
+  batch.isNull('score', 3); // inspect the validity bitmap
+  batch.toRows();           // array of plain objects
 }
 
 db.close();
 ```
 
-`registerParquet` は `register` の別名（Parquet 以外も登録できる）。
+`registerParquet` is an alias for `register` (it can register formats other than Parquet too).
 
-`FROM parquet('https://…/a.parquet')` と書いた場合、そのパスは自動的に同名の
-テーブルとして登録される（`plan/bind.rs` の `resolve_from` がそういう約束）。
-これは Parquet 用の入口で、CSV / JSONL は `register(name, src, { format })` で
-登録してから素の識別子で参照する。
+Writing `FROM parquet('https://…/a.parquet')` automatically registers that path
+as a table of the same name (this is a contract of `resolve_from` in
+`plan/bind.rs`). That's the entry point for Parquet specifically; CSV / JSONL
+must be registered first via `register(name, src, { format })` and then
+referenced by their plain identifier.
 
-### フォーマット
+### Format
 
-`format` を渡せばそれが使われる（`ahiru_register_as`）。渡さなければ
-**登録名の拡張子**からエンジンが推定する（`format::FormatKind::detect`）。
+Passing `format` uses it directly (`ahiru_register_as`). If omitted, the engine
+infers it **from the extension of the registered name** (`format::FormatKind::detect`).
 
 ```js
-db.register('logs', bytes, { format: 'csv' }); // 名前は素の識別子でよい
+db.register('logs', bytes, { format: 'csv' }); // the name can be a plain identifier
 await db.query('SELECT * FROM logs');
 
-db.register('logs.csv', bytes);                // 拡張子に任せる
-await db.query('SELECT * FROM "logs.csv"');    // SQL 側は引用符付きで参照する
+db.register('logs.csv', bytes);                // let the extension decide
+await db.query('SELECT * FROM "logs.csv"');    // reference it quoted on the SQL side
 ```
 
-`format` は `parquet` / `csv` / `tsv` / `jsonl`。拡張子と食い違っていても
-明示指定が優先される（名前と読み方を切り離せることがこのオプションの目的なので、
-そこを検査で塞がない）。綴りを間違えた場合だけ E409 で落とす — Auto に
-落とすと Parquet として読まれ、`BadMagic` になって原因が分からなくなるため。
+`format` accepts `parquet` / `csv` / `tsv` / `jsonl`. An explicit value takes
+priority even if it disagrees with the extension (decoupling the name from how
+it's read is the whole point of this option, so we don't validate that away).
+Only a misspelled value fails, with E409 — falling back to Auto would read it
+as Parquet and fail with an opaque `BadMagic` instead.
 
-拡張子推定は `.csv` / `.tsv` / `.tab` / `.jsonl` / `.ndjson`、それ以外は Parquet。
-CSV と JSONL は wasm 側のフィーチャ（`--features csv,jsonl`）で切れるので、
-既定の配布ビルドには入っていない。入っていないビルドに登録すると E409 になる。
+Extension-based detection recognizes `.csv` / `.tsv` / `.tab` / `.jsonl` /
+`.ndjson`; anything else is treated as Parquet. CSV and JSONL are gated behind
+wasm-side features (`--features csv,jsonl`), so they aren't present in the
+default distribution build. Registering them against a build that lacks the
+feature raises E409.
 
-### パラメータ
+### Parameters
 
-`null` / `boolean` / `number` / `bigint` / `string` / `Uint8Array` を渡せる。
-安全な整数と `bigint` は I64、それ以外の `number` は F64 として送る。
-`Date` は受け取らない（マイクロ秒との換算を暗黙にやると桁の間違いに気づけない）。
-TIMESTAMP と比べるなら `BigInt(d.getTime()) * 1000n` を渡す。
+Accepted types: `null` / `boolean` / `number` / `bigint` / `string` / `Uint8Array`.
+Safe integers and `bigint` are sent as I64; other `number` values as F64.
+`Date` is not accepted (implicitly converting to microseconds would hide
+off-by-a-magnitude bugs). To compare against a TIMESTAMP, pass
+`BigInt(d.getTime()) * 1000n`.
 
-## 値のマッピング
+## Value mapping
 
-| 論理型 | JS |
+| Logical type | JS |
 |---|---|
 | BOOLEAN | `boolean` |
 | TINYINT / SMALLINT / INTEGER / DATE | `number` |
-| BIGINT / TIME / TIMESTAMP | `bigint`（TIMESTAMP はエポックからのマイクロ秒） |
+| BIGINT / TIME / TIMESTAMP | `bigint` (TIMESTAMP is microseconds since epoch) |
 | HUGEINT / UBIGINT | `bigint` |
 | FLOAT / DOUBLE | `number` |
-| DECIMAL | `string`（precision/scale 適用済み。例 `"1.0050"`） |
-| VARCHAR | `string`（UTF-8 デコード済み） |
+| DECIMAL | `string` (precision/scale already applied, e.g. `"1.0050"`) |
+| VARCHAR | `string` (already UTF-8 decoded) |
 | BLOB | `Uint8Array` |
 | NULL | `null` |
 
-DECIMAL を `number` にすると 18 桁を超えたところで丸まる。桁を落とさないために
-文字列で返している。近似でよければ `Number(row.amount)` すればよい。
+Converting DECIMAL to `number` rounds once it exceeds 18 digits, so it's
+returned as a string to avoid losing precision. If an approximation is fine,
+just do `Number(row.amount)`.
 
-TIMESTAMP を `Date` にするヘルパを同梱している。ミリ秒精度に丸まる点に注意。
+A helper for turning TIMESTAMP into a `Date` is included; note it rounds down
+to millisecond precision.
 
 ```js
 timestampToDate(row.d);  // BigInt(micros) -> Date
-dateToDate(row.day);     // DATE(日数)     -> Date
+dateToDate(row.day);     // DATE(days)     -> Date
 ```
 
-## I/O とキャッシュ
+## I/O and caching
 
-エンジンは決してブロックしない。バイトが足りなくなると `NEED_IO` と
-`{table, offset, len}` の列を返してくるので、ホストは次をやる。
+The engine never blocks. When it runs out of bytes, it returns `NEED_IO`
+along with a list of `{table, offset, len}`, and the host is expected to:
 
-1. **結合** — 隙間が 1 MiB 未満のレンジは 1 本にまとめる。100 KB の穴を挟んだ
-   400 KB × 2 回より、900 KB を 1 回取る方が速い。エンジンが RowGroup 単位で要求を
-   まとめて返すのはこのためなので、1 本ずつ投げてその意図を潰さない。
-2. **並列取得** — 結合後のレンジは `Promise.all` でまとめて取る。URL なら
-   `Range: bytes=start-end`、メモリ / Blob なら slice。
-3. **供給** — `ahiru_provide` で渡してループを続ける。同じ要求が繰り返され、かつ
-   1 バイトも増えていない場合はライブロックとみなして `E504` を投げる。
+1. **Coalesce** — merge ranges whose gap is under 1 MiB. Fetching 900 KB once
+   beats two 400 KB fetches around a 100 KB gap. The engine already batches
+   requests per RowGroup for this reason, so don't defeat that by firing them
+   off one at a time.
+2. **Fetch in parallel** — fetch the coalesced ranges together with
+   `Promise.all`. For a URL, use `Range: bytes=start-end`; for memory/Blob, slice.
+3. **Supply** — hand the bytes back via `ahiru_provide` and continue the loop.
+   If the same request repeats with zero bytes gained, that's treated as a
+   livelock and raises `E504`.
 
-### コーデック委譲
+### Codec delegation
 
-コアは GZIP と ZSTD を持たない。持たせないことがコアが小さい理由そのもの
-（DESIGN.md §6）。内蔵しないコーデックに当たるとエンジンは `NEED_CODEC` を返し、
-`{table, codec, offset, len, out_len}` を並べてくる。ホストは:
+The core has neither GZIP nor ZSTD built in — that omission is exactly why the
+core stays small (DESIGN.md §6). When the engine hits a codec it doesn't
+support internally, it returns `NEED_CODEC` with a list of
+`{table, codec, offset, len, out_len}`. The host then:
 
-- **GZIP** … `DecompressionStream('gzip')`。ブラウザにも Node 18+ にもあるので
-  追加バイトはゼロ。
-- **ZSTD** … `crates/ahiru-zstd` を別 wasm として**初回要求時に**読み込む
-  （`zstdUrl` / `zstdBinary` / `zstdModule`）。指定が無ければ ZSTD と名指しで
-  E201 を投げる。
-- それ以外（BROTLI など） … E201「unsupported compression codec」。
+- **GZIP** … uses `DecompressionStream('gzip')`. Available in both browsers
+  and Node 18+, so it costs zero extra bytes.
+- **ZSTD** … loads `crates/ahiru-zstd` as a separate wasm module **on first
+  request** (via `zstdUrl` / `zstdBinary` / `zstdModule`). If none is
+  configured, it raises E201 naming ZSTD specifically.
+- **Anything else** (BROTLI, etc.) … E201, "unsupported compression codec".
 
-圧縮ブロックは直前の `NEED_IO` で取得済みなので、**展開のために取り直しはしない**。
-そのために取得済みバイトの控えをテーブルごとに持つ（上限は `cacheSize`、超えたら
-古い順に捨てて、必要になったらキャッシュから取り直す）。一度も取っていない範囲を
-要求されたら、黙って取りに行かずエンジン側の不整合として E900 を投げる。
+The compressed block was already fetched by the preceding `NEED_IO`, so
+**decompression never re-fetches it**. To make that possible, a per-table
+cache of already-fetched bytes is kept (bounded by `cacheSize`; oldest entries
+are evicted first and re-fetched from source if needed again). If a range that
+was never fetched is requested, the host does not silently fetch it — that's
+treated as an engine-side inconsistency and raises E900.
 
-キャッシュは `(source, offset, len)` の完全一致キー。`"memory"` は容量上限付きの
-LRU（既定 64 MiB、`cacheSize` で変更可）。`MemoryCache` のインスタンスを直接渡せば
-複数の `AhiruDB` で共有できる（この場合 `close()` では消さない）。`"cache-api"` は
-現状メモリ実装に縮退する。
+The cache key is an exact match on `(source, offset, len)`. `"memory"` is a
+capacity-bounded LRU (64 MiB by default, adjustable via `cacheSize`). Passing
+a `MemoryCache` instance directly lets multiple `AhiruDB` instances share one
+(in that case `close()` does not clear it). `"cache-api"` currently falls back
+to the in-memory implementation.
 
-## wasm メモリの扱い（実装時の注意）
+## Handling wasm memory (implementation notes)
 
-`ahiru_alloc` / `ahiru_provide` は wasm のヒープを伸ばすことがあり、伸びた瞬間に
-既存の `TypedArray` ビューは detach する。壊れ方が静かなので方針を固定してある。
+`ahiru_alloc` / `ahiru_provide` can grow the wasm heap, and growth detaches any
+existing `TypedArray` views at that instant. Since that failure mode is silent,
+the following rules are fixed policy:
 
-- `memory.buffer` へのビューは wasm 呼び出しをまたいで保持しない。呼び出し直後に
-  `new Uint8Array(memory.buffer)` で取り直す。
-- `ahiru_out_ptr()` のバッファは次の `ahiru_query_step` / `ahiru_schema` で作り直される。
-  値を後で使うなら、次の呼び出しの前に JS 側へ移し終えていること。
-- `query()` は行オブジェクトへその場で詰め替えるのでコピーを省く。`stream()` は
-  バッチを呼び出し側に渡すため、列バッファを必ずコピーしてから yield する。
-- 結果バッファは 4 バイト境界しか保証されない。8 バイト境界に乗らない
-  `Float64Array` / `BigInt64Array` の列は、ビューではなくコピーの上に作る。
+- Never hold a view into `memory.buffer` across a wasm call. Re-create it with
+  `new Uint8Array(memory.buffer)` immediately after the call returns.
+- The buffer behind `ahiru_out_ptr()` is overwritten by the next
+  `ahiru_query_step` / `ahiru_schema` call. If you need the value later, copy
+  it out to the JS side before the next call.
+- `query()` copies data straight into row objects as it goes, so no separate
+  copy step is needed. `stream()` hands batches to the caller, so column
+  buffers are always copied before being yielded.
+- Result buffers are only guaranteed to be 4-byte aligned. For `Float64Array` /
+  `BigInt64Array` columns that don't happen to land on an 8-byte boundary,
+  build them over a copy rather than a view.
 
-## エラー
+## Errors
 
-wasm はコード（数値）しか返さない。メッセージは `errors.js` の表で組み立てる。
-これだけで wasm から 20 KB 前後の文字列を追い出せる（DESIGN.md §10）。
+wasm only ever returns a numeric code; messages are assembled from the table
+in `errors.js`. That alone keeps roughly 20 KB of strings out of wasm
+(DESIGN.md §10).
 
 ```js
 try {
@@ -168,36 +187,38 @@ try {
 } catch (e) {
   e.code;    // 301
   e.message; // "[E301] unexpected token"
-  e.sql;     // 実行しようとした SQL
+  e.sql;     // the SQL that was being executed
 }
 ```
 
-`errors.js` は `crates/ahiru-core/src/error.rs` の `Code` と `message()` の写しなので、
-**必ず両方を同時に直すこと**。ずれたらテスト（`errors.js は error.rs …`）が落ちる。
+`errors.js` mirrors `Code` and `message()` from
+`crates/ahiru-core/src/error.rs`, so **always update both together**. If they
+drift apart, the test (`errors.js は error.rs …`) fails.
 
-## テスト
+## Tests
 
 ```sh
-./scripts/size.sh          # target/ahiru-core.wasm を作る
+./scripts/size.sh          # builds target/ahiru-core.wasm
 node --test 'js/test/*.test.mjs'
 ```
 
-値の正解は `duckdb` CLI から取っている（インストール済みであること）。
-レンジ取得のテストは、`duckdb` で生成した 2 MB ほどの Parquet を一時ディレクトリに
-置いて使う（64 KiB のフッタ投機取得だけでファイル全体が読めてしまうと、
-射影プッシュダウンの検証にならないため）。
+Expected values come from the `duckdb` CLI (must be installed). The
+range-fetch tests use a ~2 MB Parquet file generated by DuckDB, placed in a
+temp directory (if a 64 KiB speculative footer fetch could read the whole
+file, it wouldn't actually exercise projection pushdown).
 
-CSV / JSONL のテストには `--features csv,jsonl` 入りの wasm が要る。テストが
-`target/ahiru-core-full.wasm` を自動でビルドする（`AHIRU_WASM_FULL` で差し替え可）。
-ZSTD のテストは `crates/ahiru-zstd` をビルドして使う。どちらも用意できなければ
-そのテストだけ skip される。
+CSV / JSONL tests need a wasm build with `--features csv,jsonl`; the test
+suite builds `target/ahiru-core-full.wasm` automatically (override with
+`AHIRU_WASM_FULL`). ZSTD tests build and use `crates/ahiru-zstd`. If either
+isn't available, the corresponding tests are skipped.
 
-> Node 24 では `node --test js/test/`（ディレクトリ指定）が動かない。
-> 上のように glob で渡すか、引数なしの `node --test` を使う。
+> On Node 24, `node --test js/test/` (passing a directory) doesn't work.
+> Use a glob as shown above, or run `node --test` with no arguments.
 
-## 制限
+## Limitations
 
-- BROTLI / LZO / LZ4（フレーム付き）は展開しない（E201 でコーデック名を出す）。
-  委譲の口はコアにあるので、対応を足すときは JS だけの変更で済む。
-- SQL のテーブル関数は `parquet('...')` だけ。CSV / JSONL をパス指定で直接
-  参照する構文は無いので、`register` してから名前で引く。
+- BROTLI / LZO / framed LZ4 are not decompressed (E201 names the codec). The
+  delegation hook lives in the core, so adding support only requires a JS-side change.
+- `parquet('...')` is the only SQL table function. There's no syntax for
+  referencing CSV / JSONL directly by path — register them first and look them
+  up by name.

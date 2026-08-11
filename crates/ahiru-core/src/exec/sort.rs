@@ -334,7 +334,9 @@ fn append(dst: &mut Vector, src: &Vector) -> Result<()> {
 }
 
 /// ベクタ 1 本のおおよそのバイト数。上限判定用なので厳密でなくてよい。
-fn vector_bytes(v: &Vector) -> usize {
+/// `exec::recursive` も再帰 CTE の作業テーブルのバイト数上限判定に使う
+/// （メモリ見積もりのロジックを 2 か所に増やさないため）。
+pub(crate) fn vector_bytes(v: &Vector) -> usize {
     let n = v.len();
     let body = match v.data() {
         Data::Bool(_) => n / 8 + 1,

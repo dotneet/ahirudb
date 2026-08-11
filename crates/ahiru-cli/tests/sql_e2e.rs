@@ -286,6 +286,31 @@ e2e!(
     ]
 );
 
+// ページ単位の枝刈り（ColumnIndex/OffsetIndex/Bloom フィルタ）。
+// pagetest.parquet は pyarrow (parquet-cpp) が ColumnIndex/OffsetIndex/Bloom
+// フィルタ付きで書いた、id が 0..50000 の昇順・小さいページのファイル
+// （DuckDB のこの環境の版は Bloom フィルタを書けないので pyarrow を使った。
+// `scripts/gen-testdata.sh` にどちらでどう作ったかを記している）。
+// DuckDB はこのファイルを読めるので、結果の正しさはいつも通り突き合わせる。
+// 「実際にページ単位で絞り込めているか」自体は
+// `crates/ahiru-core/src/format/parquet.rs` の
+// `selective_equality_predicate_reads_a_small_fraction_of_the_column` が見る。
+e2e!(
+    page_level_pruning,
+    "tests/data/pagetest.parquet",
+    [
+        "SELECT id, s FROM t WHERE id = 12345",
+        "SELECT id, s FROM t WHERE id = 0",
+        "SELECT id, s FROM t WHERE id = 49999",
+        "SELECT count(*) FROM t WHERE id = 999999999",
+        "SELECT id FROM t WHERE id > 49990 ORDER BY id",
+        "SELECT id FROM t WHERE id < 5 ORDER BY id",
+        "SELECT id, s FROM t WHERE id BETWEEN 12340 AND 12345 ORDER BY id",
+        "SELECT count(*) FROM t",
+        "SELECT sum(id) FROM t",
+    ]
+);
+
 // 結合。DuckDB 側でもファイル参照に別名を付ける必要があるので、
 // クエリには常に明示的な別名を書く。
 // FROM 句の派生表。集約結果をさらに絞り込む形。
@@ -330,6 +355,114 @@ e2e_multi!(join_with_dimension, ["tests/data/basic.parquet", "tests/data/dim.par
     "SELECT d.nid, count(*) FROM t AS f JOIN t2 AS d ON f.name = d.label GROUP BY d.nid ORDER BY d.nid",
     "SELECT f.id, d.w FROM t AS f JOIN t2 AS d ON f.name = d.label WHERE f.id < 5 ORDER BY f.id",
 ]);
+
+// --- SQL 糖衣構文（FILTER / QUALIFY / ILIKE / TRY_CAST / IIF / DISTINCT ON） ---
+
+e2e!(
+    filter_clause,
+    "tests/data/basic.parquet",
+    [
+        "SELECT count(*) FILTER (WHERE id > 500) FROM t",
+        "SELECT count(*) FILTER (WHERE id > 500), count(*) FROM t",
+        "SELECT flag, count(*) FILTER (WHERE big IS NOT NULL) FROM t GROUP BY flag ORDER BY flag",
+        "SELECT sum(id) FILTER (WHERE flag), sum(id) FILTER (WHERE NOT flag) FROM t",
+        // 全行が条件に落ちる集約は SUM が NULL、COUNT(*) が 0 になる。
+        "SELECT count(*) FILTER (WHERE id > 100000), sum(id) FILTER (WHERE id > 100000) FROM t",
+        // FILTER 無しの集約と混在しても互いに影響しない。
+        "SELECT count(*), count(*) FILTER (WHERE flag) FROM t GROUP BY name ORDER BY name LIMIT 5",
+    ]
+);
+
+e2e!(
+    qualify_clause,
+    "tests/data/basic.parquet",
+    [
+        // ウィンドウ関数をそのまま QUALIFY に書く形。
+        // ウィンドウ関数は行を並べ替えないので、出力順を突き合わせるには
+        // 明示的な ORDER BY が要る（QUALIFY 自体は並びに関与しない）。
+        "SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id DESC) <= 3 ORDER BY id DESC",
+        // SELECT の別名を QUALIFY から参照する形。
+        "SELECT id, flag, row_number() OVER (PARTITION BY flag ORDER BY id) AS rn FROM t QUALIFY rn <= 2 ORDER BY flag, id",
+        "SELECT id, flag, rank() OVER (PARTITION BY flag ORDER BY id) AS rk FROM t QUALIFY rk = 1 ORDER BY flag",
+    ]
+);
+
+e2e!(
+    ilike_predicate,
+    "tests/data/basic.parquet",
+    [
+        "SELECT id FROM t WHERE name ILIKE 'NAME_1' ORDER BY id",
+        "SELECT id FROM t WHERE name ILIKE 'Name_1%' ORDER BY id LIMIT 20",
+        "SELECT id FROM t WHERE name NOT ILIKE 'NAME_1%' ORDER BY id LIMIT 5",
+    ]
+);
+
+e2e!(
+    try_cast_expr,
+    "tests/data/basic.parquet",
+    [
+        // 数字でない文字列は CAST ならエラーだが TRY_CAST は NULL。
+        "SELECT TRY_CAST(name AS INTEGER) FROM t ORDER BY id LIMIT 5",
+        // 変換できる場合は普通の CAST と同じ結果になる。
+        "SELECT TRY_CAST(CAST(id AS VARCHAR) AS INTEGER) FROM t ORDER BY id LIMIT 5",
+        "SELECT TRY_CAST(big AS VARCHAR) FROM t ORDER BY id LIMIT 5",
+    ]
+);
+
+e2e!(
+    distinct_on_clause,
+    "tests/data/basic.parquet",
+    [
+        // 各 flag グループで id が最大の行だけを残す。
+        "SELECT DISTINCT ON (flag) flag, id FROM t ORDER BY flag, id DESC",
+        // ON に無い列（`*` の一部）も普通に出力される。
+        "SELECT DISTINCT ON (flag) * FROM t ORDER BY flag, id",
+    ]
+);
+
+/// `ORDER BY` を省略した `DISTINCT ON` は「到着順で最初の行」を残す。
+/// DuckDB も同じ規則だが、どちらを「到着順の先頭」とみなすかはスキャンの
+/// 実装依存（ページ読み出し順など）で、別エンジン同士を突き合わせる意味が
+/// 無い。ここでは行数（= ON キーの種類数）と、返る値が実在するグループの
+/// 値であることだけ確認する。
+#[test]
+fn distinct_on_without_order_by_keeps_first_arrival_per_key() {
+    let files = ["tests/data/basic.parquet"];
+    let rows = body(run_ahiru(&files, "SELECT DISTINCT ON (flag) flag FROM t"));
+    let mut vals: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+    vals.sort_unstable();
+    assert_eq!(vals, vec!["false", "true"], "flag は 2 値なので 2 行になるはず: {rows:?}");
+}
+
+/// `IIF` は `CASE WHEN` への脱糖なので、この環境の DuckDB に `iif` が
+/// 無くても等価な `CASE WHEN` と突き合わせれば検証できる。
+#[test]
+fn iif_desugars_like_case_when() {
+    if !duckdb_available() {
+        eprintln!("duckdb が無いので飛ばす");
+        return;
+    }
+    let cases = [
+        (
+            "SELECT id, IIF(flag, 'yes', 'no') FROM t ORDER BY id LIMIT 10",
+            "SELECT id, CASE WHEN flag THEN 'yes' ELSE 'no' END FROM t ORDER BY id LIMIT 10",
+        ),
+        (
+            "SELECT IIF(id < 5, id, -1) FROM t ORDER BY id LIMIT 10",
+            "SELECT CASE WHEN id < 5 THEN id ELSE -1 END FROM t ORDER BY id LIMIT 10",
+        ),
+        (
+            "SELECT IIF(big IS NULL, 0, big) FROM t ORDER BY id LIMIT 10",
+            "SELECT CASE WHEN big IS NULL THEN 0 ELSE big END FROM t ORDER BY id LIMIT 10",
+        ),
+    ];
+    let files = ["tests/data/basic.parquet"];
+    for (ahiru_sql, duckdb_sql) in cases {
+        let a = body(run_ahiru(&files, ahiru_sql));
+        let d = body(run_duckdb(&files, duckdb_sql));
+        assert_eq!(a, d, "IIF: {ahiru_sql}\nCASE WHEN: {duckdb_sql}");
+    }
+}
 
 #[test]
 fn table_name_replacement_respects_word_boundaries() {

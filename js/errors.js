@@ -44,6 +44,9 @@ export const Code = Object.freeze({
   NOT_GROUPED: 408,
   UNSUPPORTED_FEATURE: 409,
   DUPLICATE_TABLE: 410,
+  COLUMN_COUNT_MISMATCH: 411,
+  READ_ONLY_TABLE: 412,
+  DUPLICATE_COLUMN: 413,
 
   // 5xx: 実行時
   OOM: 500,
@@ -51,6 +54,7 @@ export const Code = Object.freeze({
   DIVIDE_BY_ZERO: 502,
   VALUE_OUT_OF_RANGE: 503,
   IO_FAILED: 504,
+  RECURSION_LIMIT_EXCEEDED: 505,
 
   // 9xx: 内部矛盾（バグ）
   INTERNAL: 900,
@@ -69,7 +73,9 @@ const MESSAGES = Object.freeze({
   200: 'unsupported parquet encoding',
   201: 'unsupported compression codec',
   202: 'unsupported parquet type',
-  203: 'nested types (LIST/MAP/STRUCT) are not supported',
+  // LIST/MAP/STRUCT 自体は対応済み（Dremel 組み立て、または STRUCT のドット
+  // 区切りフラット化）。壊れた/敵対的なスキーマの検出時だけこのコードになる。
+  203: 'malformed or oversized nested parquet schema',
   204: 'encrypted parquet files are not supported',
   300: 'syntax error',
   301: 'unexpected token',
@@ -87,11 +93,15 @@ const MESSAGES = Object.freeze({
   408: 'column must appear in GROUP BY',
   409: 'unsupported SQL feature',
   410: 'table already registered',
+  411: 'number of values does not match number of columns',
+  412: 'table is read-only (not created by CREATE TABLE)',
+  413: 'column already exists',
   500: 'out of memory',
   501: 'resource limit exceeded',
   502: 'division by zero',
   503: 'value out of range',
   504: 'io failed',
+  505: 'recursive CTE exceeded the maximum number of iterations',
   900: 'internal error',
 });
 

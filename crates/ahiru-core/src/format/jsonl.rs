@@ -31,6 +31,7 @@
 
 use crate::catalog::Source;
 use crate::format::{ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
+use crate::json::{byte_at, decode_string, kind_of, scan_string, skip_value, skip_ws, Kind};
 use crate::prelude::*;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
@@ -39,10 +40,6 @@ pub const SAMPLE_BYTES: u64 = 256 * 1024;
 
 /// スキーマ推論に使う最大行数。これ以上見ても型はまず変わらない。
 pub const SAMPLE_LINES: usize = 1000;
-
-/// 値の入れ子の上限。これを超える入力は `NestingTooDeep`。
-/// 32 なのは、開いているコンテナ種別を `u32` のビットスタックで持てるから。
-const MAX_DEPTH: u32 = 32;
 
 /// 推論で作る列数の上限。キーが行ごとに違う病的な入力で
 /// 無制限に確保しないための歯止め。
@@ -350,7 +347,7 @@ fn infer(m: &Member<'_>) -> Inf {
             }
         }
         // 入れ子は生 JSON テキストとして VARCHAR に載せる（モジュール doc 参照）。
-        Kind::Nested => Inf::Varchar,
+        Kind::Object | Kind::Array => Inf::Varchar,
     }
 }
 
@@ -472,16 +469,9 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
 }
 
 // --- JSON 走査 --------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Null,
-    Bool,
-    Num,
-    Str,
-    /// 配列またはオブジェクト。
-    Nested,
-}
+// トークナイザそのもの（`byte_at`/`skip_ws`/`skip_value` 等）は
+// `crate::json` にある。ここに残るのは NDJSON の 1 行 1 オブジェクトを
+// 前提にした「トップレベルオブジェクトのメンバを順に返す」反復子だけ。
 
 #[derive(Clone, Copy)]
 struct Member<'a> {
@@ -559,16 +549,6 @@ impl<'a> Members<'a> {
     }
 }
 
-fn kind_of(c: u8) -> Kind {
-    match c {
-        b'{' | b'[' => Kind::Nested,
-        b'"' => Kind::Str,
-        b't' | b'f' => Kind::Bool,
-        b'n' => Kind::Null,
-        _ => Kind::Num,
-    }
-}
-
 /// メンバのキーをバイト列として得る。エスケープ付きだけ `scratch` に復号する。
 fn member_key<'k>(m: &Member<'k>, scratch: &'k mut Vec<u8>) -> Result<&'k [u8]> {
     if !m.key_escaped {
@@ -577,220 +557,6 @@ fn member_key<'k>(m: &Member<'k>, scratch: &'k mut Vec<u8>) -> Result<&'k [u8]> 
     scratch.clear();
     decode_string(m.key, scratch)?;
     Ok(scratch)
-}
-
-/// `b[i]` から始まる値 1 つを読み飛ばし、その直後の位置を返す。
-///
-/// 再帰しない。開いているコンテナの種別は `u32` のビットスタックで持ち、
-/// 深さは `MAX_DEPTH` で頭打ちにする（`u32` のビット数と一致させてある）。
-fn skip_value(b: &[u8], start: usize) -> Result<usize> {
-    let mut i = start;
-    // ビット 1 = オブジェクト、0 = 配列。最下位ビットが現在のコンテナ。
-    let mut stack: u32 = 0;
-    let mut depth: u32 = 0;
-
-    'value: loop {
-        i = skip_ws(b, i);
-        let c = byte_at(b, i)?;
-        if c == b'{' || c == b'[' {
-            let obj = c == b'{';
-            ensure!(depth < MAX_DEPTH, NestingTooDeep, i);
-            stack = (stack << 1) | obj as u32;
-            depth += 1;
-            i = skip_ws(b, i + 1);
-            let n = byte_at(b, i)?;
-            if (obj && n == b'}') || (!obj && n == b']') {
-                // 空コンテナ。値を 1 つ消費したものとして下の閉じ処理へ落ちる。
-                i += 1;
-                stack >>= 1;
-                depth -= 1;
-            } else {
-                if obj {
-                    i = skip_member_key(b, i)?;
-                }
-                continue 'value;
-            }
-        } else {
-            i = skip_scalar(b, i)?;
-        }
-
-        // 値を 1 つ消費した。区切り／閉じ括弧を処理する。
-        loop {
-            if depth == 0 {
-                return Ok(i);
-            }
-            i = skip_ws(b, i);
-            let c = byte_at(b, i)?;
-            let obj = stack & 1 == 1;
-            match c {
-                b',' => {
-                    i += 1;
-                    if obj {
-                        i = skip_member_key(b, skip_ws(b, i))?;
-                    }
-                    continue 'value;
-                }
-                b'}' if obj => {
-                    i += 1;
-                    stack >>= 1;
-                    depth -= 1;
-                }
-                b']' if !obj => {
-                    i += 1;
-                    stack >>= 1;
-                    depth -= 1;
-                }
-                _ => err!(SyntaxError, i),
-            }
-        }
-    }
-}
-
-/// `"key" :` を読み飛ばし、値の開始位置を返す。
-fn skip_member_key(b: &[u8], i: usize) -> Result<usize> {
-    let i = skip_ws(b, i);
-    ensure!(byte_at(b, i)? == b'"', SyntaxError, i);
-    let (_, _, ni) = scan_string(b, i)?;
-    let ni = skip_ws(b, ni);
-    ensure!(byte_at(b, ni)? == b':', SyntaxError, ni);
-    Ok(ni + 1)
-}
-
-fn skip_scalar(b: &[u8], i: usize) -> Result<usize> {
-    match byte_at(b, i)? {
-        b'"' => Ok(scan_string(b, i)?.2),
-        b't' => skip_lit(b, i, b"true"),
-        b'f' => skip_lit(b, i, b"false"),
-        b'n' => skip_lit(b, i, b"null"),
-        _ => scan_number(b, i),
-    }
-}
-
-fn skip_lit(b: &[u8], i: usize, w: &[u8]) -> Result<usize> {
-    let e = i + w.len();
-    ensure!(b.len() >= e, UnexpectedEof, i);
-    ensure!(&b[i..e] == w, SyntaxError, i);
-    Ok(e)
-}
-
-fn scan_number(b: &[u8], start: usize) -> Result<usize> {
-    let mut i = start;
-    if b.get(i) == Some(&b'-') {
-        i += 1;
-    }
-    let d0 = i;
-    while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
-        i += 1;
-    }
-    ensure!(i > d0, SyntaxError, start);
-    if b.get(i) == Some(&b'.') {
-        i += 1;
-        let f0 = i;
-        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
-            i += 1;
-        }
-        ensure!(i > f0, SyntaxError, start);
-    }
-    if matches!(b.get(i), Some(b'e') | Some(b'E')) {
-        i += 1;
-        if matches!(b.get(i), Some(b'+') | Some(b'-')) {
-            i += 1;
-        }
-        let e0 = i;
-        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
-            i += 1;
-        }
-        ensure!(i > e0, SyntaxError, start);
-    }
-    Ok(i)
-}
-
-/// `b[i]` は `"`。`(本体, エスケープ有無, 閉じ引用符の次)` を返す。
-fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
-    let mut j = i + 1;
-    let mut esc = false;
-    loop {
-        match byte_at(b, j)? {
-            b'"' => return Ok((&b[i + 1..j], esc, j + 1)),
-            b'\\' => {
-                // 次の 1 バイトは必ず消費する。`\"` を終端と誤認しないため。
-                byte_at(b, j + 1)?;
-                esc = true;
-                j += 2;
-            }
-            _ => j += 1,
-        }
-    }
-}
-
-/// 文字列本体のエスケープを展開して UTF-8 として `out` に書く。
-fn decode_string(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
-    let mut i = 0;
-    while i < body.len() {
-        let c = body[i];
-        if c != b'\\' {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let e = byte_at(body, i)?;
-        i += 1;
-        match e {
-            b'"' => out.push(b'"'),
-            b'\\' => out.push(b'\\'),
-            b'/' => out.push(b'/'),
-            b'b' => out.push(0x08),
-            b'f' => out.push(0x0c),
-            b'n' => out.push(b'\n'),
-            b'r' => out.push(b'\r'),
-            b't' => out.push(b'\t'),
-            b'u' => {
-                let hi = hex4(body, i)?;
-                i += 4;
-                let cp = if (0xD800..0xDC00).contains(&hi) {
-                    // 上位サロゲート。直後が下位サロゲートなら結合する。
-                    match (body.get(i), body.get(i + 1)) {
-                        (Some(b'\\'), Some(b'u')) => match hex4(body, i + 2) {
-                            Ok(lo) if (0xDC00..0xE000).contains(&lo) => {
-                                i += 6;
-                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                            }
-                            // 対になっていない上位サロゲートはエラーにせず
-                            // U+FFFD に潰す（壊れた入力で行ごと失いたくない）。
-                            _ => 0xFFFD,
-                        },
-                        _ => 0xFFFD,
-                    }
-                } else if (0xDC00..0xE000).contains(&hi) {
-                    // 単独の下位サロゲート。
-                    0xFFFD
-                } else {
-                    hi
-                };
-                let ch = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-            }
-            _ => err!(SyntaxError, i),
-        }
-    }
-    Ok(())
-}
-
-fn hex4(b: &[u8], i: usize) -> Result<u32> {
-    let mut v = 0u32;
-    for k in 0..4 {
-        let c = byte_at(b, i + k)?;
-        let d = match c {
-            b'0'..=b'9' => (c - b'0') as u32,
-            b'a'..=b'f' => (c - b'a' + 10) as u32,
-            b'A'..=b'F' => (c - b'A' + 10) as u32,
-            _ => err!(SyntaxError, i + k),
-        };
-        v = (v << 4) | d;
-    }
-    Ok(v)
 }
 
 // --- 数値・日時 --------------------------------------------------------------
@@ -924,20 +690,7 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
 }
 
 // --- バイト列ユーティリティ ---------------------------------------------------
-
-fn byte_at(b: &[u8], i: usize) -> Result<u8> {
-    match b.get(i) {
-        Some(&c) => Ok(c),
-        None => err!(UnexpectedEof, i),
-    }
-}
-
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
-    while matches!(b.get(i), Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')) {
-        i += 1;
-    }
-    i
-}
+// `byte_at`/`skip_ws` は `crate::json` のものをそのまま使う（上の import）。
 
 /// UTF-8 BOM があれば読み飛ばす。
 fn skip_bom(b: &[u8]) -> usize {
@@ -1426,6 +1179,7 @@ mod tests {
 
     #[test]
     fn deeply_nested_input_hits_the_depth_cap() {
+        use crate::json::MAX_DEPTH;
         let mut text = String::from("{\"a\":");
         let deep = MAX_DEPTH as usize + 1;
         for _ in 0..deep {

@@ -4,6 +4,7 @@
 //! 「開発とテストはネイティブ、サイズ計測だけ wasm」という分担にしている
 //! （DESIGN.md §12）。
 
+use std::collections::HashMap;
 use std::process::ExitCode;
 
 use ahiru_core::parquet::file::open_bytes;
@@ -18,7 +19,11 @@ fn usage() -> ExitCode {
   ahiru query  <file>... <sql>  SQL を実行 (テーブル名は t, t2, t3, ... とファイル名)
 
 対応フォーマット: .parquet / .csv / .tsv / .jsonl / .ndjson
-拡張子から自動判別する。"
+拡張子から自動判別する。
+
+複数ファイルを 1 テーブルとして束ねたいときは、`+` で連結して 1 引数にする
+(手元確認用の簡易記法。実際のパスに `+` を含むファイルは指定できない):
+  ahiru query a.parquet+b.parquet+c.parquet 'SELECT count(*) FROM t'"
     );
     ExitCode::from(2)
 }
@@ -76,7 +81,7 @@ fn cmd_schema(path: &str) -> R {
             if f.nullable { "NULL" } else { "NOT NULL" }
         );
     }
-    println!("splits: {}", t.format.num_splits());
+    println!("splits: {}", t.num_splits());
 
     // Parquet だけは物理配置まで見たいので、追加で内訳を出す。
     if kind == FormatKind::Parquet {
@@ -115,26 +120,37 @@ fn cmd_dump(path: &str, limit: usize) -> R {
     cmd_query(&[path.to_string()], &sql)
 }
 
-fn cmd_query(paths: &[String], sql: &str) -> R {
+fn cmd_query(groups: &[String], sql: &str) -> R {
     let mut s = Session::new();
-    // コーデック委譲で元バイトを引くため、テーブル添字をキーに控えておく。
-    // 登録は同名なら置き換わるので、添字は register の返り値から取る。
-    let mut sources: Vec<Option<Vec<u8>>> = Vec::new();
-    let remember = |sources: &mut Vec<Option<Vec<u8>>>, idx: usize, b: &[u8]| {
-        if sources.len() <= idx {
-            sources.resize(idx + 1, None);
-        }
-        sources[idx] = Some(b.to_vec());
-    };
-    for (i, path) in paths.iter().enumerate() {
-        let bytes = std::fs::read(path)?;
+    // コーデック委譲で元バイトを引くため、(テーブル添字, パート添字) をキーに
+    // 控えておく。登録は同名なら置き換わるので、添字は register の返り値から
+    // 取る。単一ファイルのテーブルは常にパート 0。
+    let mut sources: HashMap<(usize, usize), Vec<u8>> = HashMap::new();
+
+    for (i, group) in groups.iter().enumerate() {
         // 1 つ目が `t`、2 つ目以降が `t2`, `t3`, ...。
         let name = if i == 0 { String::from("t") } else { format!("t{}", i + 1) };
-        let a = s.register_bytes_as(&name, bytes.clone(), FormatKind::detect(path))?;
-        remember(&mut sources, a, &bytes);
-        // ファイル名でも参照できるようにしておく（`parquet('...')` 用）。
-        let b = s.register_bytes(path, bytes.clone())?;
-        remember(&mut sources, b, &bytes);
+        // `+` で連結された引数は 1 論理テーブルとして束ねる（usage 参照）。
+        let paths: Vec<&str> = group.split('+').collect();
+        if paths.len() == 1 {
+            let path = paths[0];
+            let bytes = std::fs::read(path)?;
+            let a = s.register_bytes_as(&name, bytes.clone(), FormatKind::detect(path))?;
+            sources.insert((a, 0), bytes.clone());
+            // ファイル名でも参照できるようにしておく（`parquet('...')` 用）。
+            let b = s.register_bytes(path, bytes.clone())?;
+            sources.insert((b, 0), bytes);
+        } else {
+            let mut files = Vec::with_capacity(paths.len());
+            for path in &paths {
+                files.push((path.to_string(), std::fs::read(path)?));
+            }
+            let kind = FormatKind::detect(paths[0]);
+            let a = s.register_multi_bytes(&name, files.clone(), kind)?;
+            for (p, (_, bytes)) in files.into_iter().enumerate() {
+                sources.insert((a, p), bytes);
+            }
+        }
     }
 
     let mut q = match s.prepare(sql, &[])? {
@@ -142,6 +158,17 @@ fn cmd_query(paths: &[String], sql: &str) -> R {
         // メモリ上にファイル全体があるので、ここには来ない。
         Prepared::NeedIo(_) => return Err("unexpected io request".into()),
     };
+    // `COPY (SELECT ...) TO 'path'`: `ahiru-core` は no_std でファイルシステムに
+    // 触れられないので、実ファイルへの書き込みはここ（ネイティブの CLI）が
+    // 引き受ける。`ahiru-core` 側はバイト列と書き込み先パスを `Query` に
+    // 載せて返すところまでを担う（`ahiru_core::write` モジュール doc、
+    // `ahiru_core::session::Query::copy_result` 参照）。
+    if let Some(c) = q.copy.take() {
+        let n = c.data.len();
+        std::fs::write(&c.path, &c.data)?;
+        eprintln!("(copied {n} bytes to {})", c.path);
+        return Ok(());
+    }
     let types: Vec<Ty> = q.schema.iter().map(|f| f.ty).collect();
     let names: Vec<&str> = q.schema.iter().map(|f| f.name.as_str()).collect();
     println!("{}", names.join("\t"));
@@ -167,9 +194,9 @@ fn cmd_query(paths: &[String], sql: &str) -> R {
             // `ahiru-zstd.wasm` で処理する部分を、CLI ではここで肩代わりする。
             QueryStep::NeedCodec(reqs) => {
                 for r in reqs {
-                    let src = source_bytes(&sources, r.table, r.offset, r.len)?;
+                    let src = source_bytes(&sources, r.table, r.part, r.offset, r.len)?;
                     let out = decompress_host(r.codec, src, r.out_len as usize)?;
-                    s.provide_decoded(r.table, r.offset, r.len, out)?;
+                    s.provide_decoded(r.table, r.part, r.offset, r.len, out)?;
                 }
             }
             QueryStep::Done => break,
@@ -180,15 +207,15 @@ fn cmd_query(paths: &[String], sql: &str) -> R {
 }
 
 fn source_bytes(
-    sources: &[Option<Vec<u8>>],
+    sources: &HashMap<(usize, usize), Vec<u8>>,
     table: usize,
+    part: usize,
     offset: u64,
     len: u32,
 ) -> Result<&[u8], String> {
     let b = sources
-        .get(table)
-        .and_then(|o| o.as_ref())
-        .ok_or_else(|| String::from("unknown table for codec request"))?;
+        .get(&(table, part))
+        .ok_or_else(|| String::from("unknown table/part for codec request"))?;
     let s = offset as usize;
     let e = s + len as usize;
     if e > b.len() {
@@ -240,14 +267,43 @@ fn render(v: &Value, ty: Ty) -> String {
         Value::I32(x) if ty == Ty::Date => fmt_date(*x as i64),
         Value::I32(x) => x.to_string(),
         Value::I64(x) if ty == Ty::Timestamp => fmt_timestamp(*x),
-        Value::I64(x) => x.to_string(),
-        Value::I128(x) => x.to_string(),
+        Value::I64(x) => fmt_scaled(*x as i128, ty),
+        Value::I128(x) if ty == Ty::Interval => fmt_interval_value(*x),
+        Value::I128(x) => fmt_scaled(*x, ty),
         Value::F64(x) => x.to_string(),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             Ok(s) => s.to_string(),
             Err(_) => format!("<{} bytes>", b.len()),
         },
     }
+}
+
+fn fmt_interval_value(packed: i128) -> String {
+    let (months, days, micros) = ahiru_core::vector::unpack_interval(packed);
+    let mut out = Vec::new();
+    ahiru_core::vector::fmt_interval(months, days, micros, &mut out);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// DECIMAL はスケール付きの整数で保持しているので、表示時に小数点を入れる。
+fn fmt_scaled(v: i128, ty: Ty) -> String {
+    let scale = match ty {
+        Ty::Decimal { scale, .. } => scale as usize,
+        _ => return v.to_string(),
+    };
+    if scale == 0 {
+        return v.to_string();
+    }
+    let neg = v < 0;
+    let digits = v.unsigned_abs().to_string();
+    // 整数部が無い場合（0.05 など）は先頭に 0 を補う。
+    let padded = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale - digits.len() + 1), digits)
+    } else {
+        digits
+    };
+    let split = padded.len() - scale;
+    format!("{}{}.{}", if neg { "-" } else { "" }, &padded[..split], &padded[split..])
 }
 
 /// エポックからの日数を `YYYY-MM-DD` にする。civil_from_days アルゴリズム。

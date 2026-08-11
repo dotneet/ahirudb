@@ -15,9 +15,23 @@ use crate::rt::hash::eq_ascii_ci;
 /// 型名（INTEGER / VARCHAR など）はここに入れない。予約語にすると同名の
 /// 列が書けなくなるうえ、表が伸びてコードサイズに響くため、CAST の型名は
 /// 識別子として受けてパーサ側で引く。
+///
+/// 同じ理由で `OVER` / `PARTITION` / `ROWS` / `RANGE` もここには入れない。
+/// 列名はデータファイル由来で利用者が選べないため、ありふれた語を予約語に
+/// すると引用符無しでは参照できない列ができてしまう。これらはウィンドウ指定
+/// の中でだけ意味を持つ文脈依存キーワードとして、パーサが綴りで照合する。
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum Kw {
+    // --- ddl/dml: `sql/parser.rs` の CREATE/INSERT/UPDATE/DELETE/ALTER 系
+    // でのみ予約する語。基本語彙とは別枠にしてあるのは、フィーチャが OFF の
+    // 間はこれらを普通の識別子（列名など）として使えるようにするため
+    // （`KEYWORDS`/`DDL_KEYWORDS`/`DML_KEYWORDS` のコメント参照）。
+    #[cfg(feature = "ddl")]
+    Add,
+    All,
+    #[cfg(feature = "ddl")]
+    Alter,
     And,
     As,
     Asc,
@@ -25,13 +39,32 @@ pub enum Kw {
     By,
     Case,
     Cast,
+    #[cfg(feature = "ddl")]
+    Column,
+    // `export` フィーチャでのみ予約する語（`COPY (<query>) TO ...`）。
+    // 文の先頭でしか出現しない一発実行文のキーワードなので、`Create`/`Drop`
+    // など DDL の統語頭語と同じ扱いでよい（`TO`/`FORMAT` はここには入れない
+    // — ファイル冒頭のコメント参照。`sql/parser.rs` の `copy_stmt` が
+    // 文脈依存キーワードとして綴りで照合する）。
+    #[cfg(feature = "export")]
+    Copy,
+    #[cfg(feature = "ddl")]
+    Create,
     Cross,
+    #[cfg(feature = "ddl")]
+    Default,
+    #[cfg(feature = "dml")]
+    Delete,
     Desc,
     Describe,
     Distinct,
+    #[cfg(feature = "ddl")]
+    Drop,
     Else,
     End,
     Escape,
+    Except,
+    Exists,
     Explain,
     False,
     First,
@@ -39,8 +72,16 @@ pub enum Kw {
     Full,
     Group,
     Having,
+    #[cfg(feature = "ddl")]
+    If,
+    Ilike,
     In,
     Inner,
+    #[cfg(feature = "dml")]
+    Insert,
+    Intersect,
+    #[cfg(feature = "dml")]
+    Into,
     Is,
     Join,
     Last,
@@ -55,14 +96,33 @@ pub enum Kw {
     Or,
     Order,
     Outer,
+    Qualify,
+    #[cfg(feature = "ddl")]
+    Rename,
+    #[cfg(feature = "ddl")]
+    Replace,
     Right,
     Select,
+    #[cfg(feature = "dml")]
+    Set,
     Show,
+    #[cfg(feature = "ddl")]
+    Table,
     Tables,
     Then,
+    #[cfg(feature = "ddl")]
+    To,
     True,
+    Union,
+    #[cfg(feature = "dml")]
+    Update,
+    #[cfg(feature = "dml")]
+    Values,
+    #[cfg(feature = "ddl")]
+    View,
     When,
     Where,
+    With,
 }
 
 /// 予約語表。**(長さ, 小文字化した先頭バイト) の昇順**に並べること。
@@ -76,6 +136,7 @@ pub(crate) static KEYWORDS: &[(&[u8], Kw)] = &[
     (b"on", Kw::On),
     (b"or", Kw::Or),
     // 3
+    (b"all", Kw::All),
     (b"and", Kw::And),
     (b"asc", Kw::Asc),
     (b"end", Kw::End),
@@ -96,20 +157,25 @@ pub(crate) static KEYWORDS: &[(&[u8], Kw)] = &[
     (b"then", Kw::Then),
     (b"true", Kw::True),
     (b"when", Kw::When),
+    (b"with", Kw::With),
     // 5
     (b"cross", Kw::Cross),
     (b"false", Kw::False),
     (b"first", Kw::First),
     (b"group", Kw::Group),
+    (b"ilike", Kw::Ilike),
     (b"inner", Kw::Inner),
     (b"limit", Kw::Limit),
     (b"nulls", Kw::Nulls),
     (b"order", Kw::Order),
     (b"outer", Kw::Outer),
     (b"right", Kw::Right),
+    (b"union", Kw::Union),
     (b"where", Kw::Where),
     // 6
     (b"escape", Kw::Escape),
+    (b"except", Kw::Except),
+    (b"exists", Kw::Exists),
     (b"having", Kw::Having),
     (b"offset", Kw::Offset),
     (b"select", Kw::Select),
@@ -117,10 +183,52 @@ pub(crate) static KEYWORDS: &[(&[u8], Kw)] = &[
     // 7
     (b"between", Kw::Between),
     (b"explain", Kw::Explain),
+    (b"qualify", Kw::Qualify),
     // 8
     (b"describe", Kw::Describe),
     (b"distinct", Kw::Distinct),
+    // 9
+    (b"intersect", Kw::Intersect),
 ];
+
+/// `ddl` フィーチャでのみ予約する語（CREATE TABLE / CREATE VIEW / DROP TABLE /
+/// ALTER TABLE 系）。`KEYWORDS` と別表にしてあるのは、フィーチャが OFF の
+/// ビルドではこれらを従来どおり普通の識別子（列名など）として使えるように
+/// するため。昇順制約は `KEYWORDS` と同じ。
+#[cfg(feature = "ddl")]
+static DDL_KEYWORDS: &[(&[u8], Kw)] = &[
+    (b"if", Kw::If),
+    (b"to", Kw::To),
+    (b"add", Kw::Add),
+    (b"drop", Kw::Drop),
+    (b"view", Kw::View),
+    (b"alter", Kw::Alter),
+    (b"table", Kw::Table),
+    (b"column", Kw::Column),
+    (b"create", Kw::Create),
+    (b"rename", Kw::Rename),
+    (b"default", Kw::Default),
+    (b"replace", Kw::Replace),
+];
+
+/// `dml` フィーチャでのみ予約する語（INSERT / UPDATE / DELETE 系）。
+/// `dml` は `ddl` を暗黙に含む（Cargo.toml）ので、`DDL_KEYWORDS` も同時に
+/// 有効になる。
+#[cfg(feature = "dml")]
+static DML_KEYWORDS: &[(&[u8], Kw)] = &[
+    (b"set", Kw::Set),
+    (b"into", Kw::Into),
+    (b"delete", Kw::Delete),
+    (b"insert", Kw::Insert),
+    (b"update", Kw::Update),
+    (b"values", Kw::Values),
+];
+
+/// `export` フィーチャでのみ予約する語（`COPY (<query>) TO ...`）。
+/// `ddl`/`dml` とは独立のフィーチャなので別表にしてある
+/// （`export` だけを有効にしたビルドでも `COPY` を予約できるように）。
+#[cfg(feature = "export")]
+static EXPORT_KEYWORDS: &[(&[u8], Kw)] = &[(b"copy", Kw::Copy)];
 
 /// 探索キー: 長さと小文字化した先頭バイトを 1 語に詰めたもの。
 #[inline]
@@ -129,29 +237,51 @@ fn kw_key(name: &[u8]) -> u32 {
     ((name.len() as u32) << 8) | (name[0] | 0x20) as u32
 }
 
-/// 予約語を引く。予約語でなければ `None`。
-///
-/// 文字列比較の連鎖を避けるため、まず (長さ, 先頭バイト) で二分探索して
-/// 候補の区間を求め、その中（高々数個）だけを大小無視で比較する。
-pub fn keyword(s: &[u8]) -> Option<Kw> {
-    if s.len() < 2 || s.len() > 8 {
-        return None;
-    }
+/// `table` を (長さ, 先頭バイト) で二分探索し、候補区間だけ大小無視で比較する。
+/// `keyword`/`keyword_in` の共通実装。`table` は `kw_key` の昇順であること。
+fn keyword_in(table: &[(&[u8], Kw)], s: &[u8]) -> Option<Kw> {
     let key = kw_key(s);
-    let (mut lo, mut hi) = (0usize, KEYWORDS.len());
+    let (mut lo, mut hi) = (0usize, table.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if kw_key(KEYWORDS[mid].0) < key {
+        if kw_key(table[mid].0) < key {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-    while lo < KEYWORDS.len() && kw_key(KEYWORDS[lo].0) == key {
-        if eq_ascii_ci(KEYWORDS[lo].0, s) {
-            return Some(KEYWORDS[lo].1);
+    while lo < table.len() && kw_key(table[lo].0) == key {
+        if eq_ascii_ci(table[lo].0, s) {
+            return Some(table[lo].1);
         }
         lo += 1;
+    }
+    None
+}
+
+/// 予約語を引く。予約語でなければ `None`。
+///
+/// 文字列比較の連鎖を避けるため、まず (長さ, 先頭バイト) で二分探索して
+/// 候補の区間を求め、その中（高々数個）だけを大小無視で比較する。
+pub fn keyword(s: &[u8]) -> Option<Kw> {
+    // 表に載る語長は 2..=9（最長は INTERSECT）。
+    if s.len() < 2 || s.len() > 9 {
+        return None;
+    }
+    if let Some(k) = keyword_in(KEYWORDS, s) {
+        return Some(k);
+    }
+    #[cfg(feature = "ddl")]
+    if let Some(k) = keyword_in(DDL_KEYWORDS, s) {
+        return Some(k);
+    }
+    #[cfg(feature = "dml")]
+    if let Some(k) = keyword_in(DML_KEYWORDS, s) {
+        return Some(k);
+    }
+    #[cfg(feature = "export")]
+    if let Some(k) = keyword_in(EXPORT_KEYWORDS, s) {
+        return Some(k);
     }
     None
 }
@@ -188,6 +318,10 @@ pub enum Tok<'a> {
     Percent,
     /// `||`
     Concat,
+    /// `->`（JSON パス抽出。`json_extract` の糖衣構文）
+    Arrow,
+    /// `->>`（JSON パス抽出・テキスト化。`json_extract_string` の糖衣構文）
+    LongArrow,
     Eq,
     Ne,
     Lt,
@@ -203,6 +337,9 @@ pub struct Token<'a> {
     pub pos: usize,
 }
 
+/// `Clone` は 2 トークン目の先読み用。借用と添字だけなので複製は無確保で、
+/// 複製側を進めても本体の位置は動かない（`Parser::peek`）。
+#[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a str,
     pos: usize,
@@ -387,7 +524,17 @@ impl<'a> Lexer<'a> {
             b';' => Tok::Semi,
             b'*' => Tok::Star,
             b'+' => Tok::Plus,
-            b'-' => Tok::Minus,
+            b'-' => {
+                if eat(b'>') {
+                    if eat(b'>') {
+                        Tok::LongArrow
+                    } else {
+                        Tok::Arrow
+                    }
+                } else {
+                    Tok::Minus
+                }
+            }
             b'/' => Tok::Slash,
             b'%' => Tok::Percent,
             b'?' => Tok::Param,

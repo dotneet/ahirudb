@@ -9,7 +9,10 @@ name = "ahiru"
 path = "src/main.rs"
 
 [dependencies]
-ahiru-core = { path = "../ahiru-core", features = ["std"] }
+# `export`: COPY (SELECT ...) TO 'x.csv'/'x.jsonl' を CLI からも使えるように
+# する。ファイルへの実書き込みは `ahiru-core` ではなくここ（`main.rs`）が
+# 行う（`ahiru-core` は no_std でファイルシステムに触れられないため）。
+ahiru-core = { path = "../ahiru-core", features = ["std", "export"] }
 # ZSTD は wasm では別モジュールとして遅延ロードするが、ネイティブ CLI では
 # 直接リンクしてよい（サイズ制約はコアの .wasm にしか掛からない）。
 # こうすることでコーデック委譲プロトコル自体を CLI で通しで検証できる。

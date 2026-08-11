@@ -19,7 +19,9 @@
 //! 結果の validity = 入力の validity の AND だが、`AND`/`OR` だけは三値論理の
 //! ため値と validity を同時に決める必要がある。
 
+pub mod funcs;
 pub mod kernels;
+pub mod regex;
 pub mod vm;
 
 use crate::prelude::*;
@@ -90,6 +92,11 @@ pub enum OpCode {
 
     /// dst = キャスト表[aux] に従って a を変換。
     Cast,
+    /// `TRY_CAST`。`Cast` と同じキャスト表を使うが、変換できない組み合わせ
+    /// （`kernels::cast` がエラーを返す場合）はエラーにせず全行 NULL にする。
+    /// 行単位の変換失敗（範囲外・パース不能）は `Cast` と同じくその行だけ
+    /// NULL になる（`kernels::cast` 自体の契約）。
+    TryCast,
 
     /// dst = a LIKE b。ty は Bytes。
     Like,
@@ -102,6 +109,36 @@ pub enum OpCode {
 
     /// dst = a が NULL なら b、そうでなければ a。
     Coalesce,
+
+    /// スカラ関数呼び出し。`aux` は `Program::calls` の添字。
+    ///
+    /// 引数はレジスタ番号の可変長リストなので、`a`/`b` には収まらない。
+    /// 命令を可変長にすると VM のループが複雑になるため、引数リストだけを
+    /// 別表に逃がしている。
+    Call,
+
+    // INTERVAL 演算。a・b の物理型が異なる（TIMESTAMP は I64、INTERVAL は
+    // I128）ため、`arith` の物理型 1 種前提のテーブルには乗せられず専用に
+    // 分けてある。カレンダー演算（月末クランプ）が要るのも他の算術と違う点。
+    /// dst(I64) = a(TIMESTAMP, I64) + b(INTERVAL, I128)。DATE は呼び出し側が
+    /// TIMESTAMP へキャストしてから渡す。
+    TsAddInterval,
+    /// dst(I128) = a(INTERVAL) + b(INTERVAL)。フィールドごとの加算。
+    IntervalAdd,
+    /// dst(I128) = a(INTERVAL) の符号反転。`Sub`/単項 `-` はこれと
+    /// `IntervalAdd`/`TsAddInterval` の組み合わせに展開する。
+    IntervalNeg,
+    /// dst(I128) = a(INTERVAL) * b(BIGINT)。フィールドごとの乗算。
+    IntervalMul,
+}
+
+/// スカラ関数呼び出しの引数。
+#[derive(Clone)]
+pub struct CallSpec {
+    pub func: u16,
+    pub args: Vec<Reg>,
+    /// 関数が返す論理型。
+    pub result_ty: Ty,
 }
 
 /// キャストの指定。論理型が要るのは DECIMAL のスケール調整のため。
@@ -112,8 +149,15 @@ pub struct CastSpec {
 }
 
 /// コンパイル済みの式。
+///
+/// `Clone` は GROUPING SETS 対応で要る: 同じグルーピング列や集約の式を、
+/// グルーピングセットの数だけ作る `Node::Aggregate` それぞれに複製して積む
+/// （入力スコープはどのセットでも同じなのでレジスタ割り当てはそのまま使い回せる）。
+#[derive(Clone)]
 pub struct Program {
     pub instrs: Vec<Instr>,
+    /// スカラ関数呼び出しの引数表。
+    pub calls: Vec<CallSpec>,
     /// 定数プール。`Ty` は `Value` だけでは決まらない論理型（DATE など）を保持する。
     pub consts: Vec<(Ty, Value)>,
     pub casts: Vec<CastSpec>,
@@ -128,6 +172,7 @@ impl Program {
     pub fn new() -> Self {
         Program {
             instrs: Vec::new(),
+            calls: Vec::new(),
             consts: Vec::new(),
             casts: Vec::new(),
             num_regs: 0,
@@ -152,6 +197,11 @@ impl Program {
         }
         self.consts.push((ty, v));
         (self.consts.len() - 1) as u16
+    }
+
+    pub fn add_call(&mut self, func: u16, args: Vec<Reg>, result_ty: Ty) -> u16 {
+        self.calls.push(CallSpec { func, args, result_ty });
+        (self.calls.len() - 1) as u16
     }
 
     pub fn add_cast(&mut self, from: Ty, to: Ty) -> u16 {

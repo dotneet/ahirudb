@@ -4,10 +4,12 @@
 //! `thrift` (バイト列 → Thrift) → `meta` (Thrift → メタデータ構造体) →
 //! `reader` (メタデータ + ページ → ベクタ) と流れる。
 
+pub mod bloom;
 pub mod codec;
 pub mod encoding;
 pub mod file;
 pub mod meta;
+pub mod nested;
 pub mod reader;
 pub mod schema;
 pub mod thrift;

@@ -38,11 +38,11 @@ const STATUS_NEED_CODEC = 4;
 /** 結果バッファ先頭のマジック "AHR1"。 */
 const RESULT_MAGIC = 0x41485231;
 
-/** `encode_io` の 1 要素: table:u32 + offset:u64 + len:u64。 */
-const IO_REQUEST_SIZE = 20;
+/** `encode_io` の 1 要素: table:u32 + part:u32 + offset:u64 + len:u64。 */
+const IO_REQUEST_SIZE = 24;
 
-/** `encode_codec` の 1 要素: table:u32 + codec:u32 + offset:u64 + len:u32 + out_len:u32。 */
-const CODEC_REQUEST_SIZE = 24;
+/** `encode_codec` の 1 要素: table:u32 + part:u32 + codec:u32 + offset:u64 + len:u32 + out_len:u32。 */
+const CODEC_REQUEST_SIZE = 28;
 
 /** Parquet の Compression enum（parquet/mod.rs）。内蔵しないものだけ名前を持つ。 */
 const CODEC_NAMES = {
@@ -70,7 +70,7 @@ const PHYS_BYTES = 5;
 const TYPE_NAMES = [
   'NULL', 'BOOLEAN', 'TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT',
   'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL',
-  'VARCHAR', 'BLOB', 'DATE', 'TIME', 'TIMESTAMP',
+  'VARCHAR', 'BLOB', 'DATE', 'TIME', 'TIMESTAMP', 'INTERVAL', 'JSON',
 ];
 const TY_DECIMAL = 13;
 const TY_VARCHAR = 14;
@@ -321,7 +321,14 @@ export function coalesceRanges(ranges, gap = COALESCE_GAP, totalLen = Infinity) 
 
 // --- ワイヤ形式のデコード -----------------------------------------------------
 
-/** `encode_io`: [count:u32][{table:u32, offset:u64, len:u64}...] */
+/**
+ * `encode_io`: [count:u32][{table:u32, part:u32, offset:u64, len:u64}...]
+ *
+ * `part` は複数ファイルテーブル（`ahiru_register_multi`）の何ファイル目かを
+ * 指す。単一ファイル登録（`ahiru_register`/`ahiru_register_as`）は常に 0。
+ * `ahiru_provide` を呼ぶときにそのまま渡し戻す必要がある — `table` だけでは
+ * バイトオフセットの基準となるファイルを一意に決められない。
+ */
 export function decodeIoRequests(u8) {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const n = dv.getUint32(0, true);
@@ -330,14 +337,18 @@ export function decodeIoRequests(u8) {
     const p = 4 + i * IO_REQUEST_SIZE;
     out.push({
       table: dv.getUint32(p, true),
-      offset: Number(dv.getBigUint64(p + 4, true)),
-      len: Number(dv.getBigUint64(p + 12, true)),
+      part: dv.getUint32(p + 4, true),
+      offset: Number(dv.getBigUint64(p + 8, true)),
+      len: Number(dv.getBigUint64(p + 16, true)),
     });
   }
   return out;
 }
 
-/** `encode_codec`: [count:u32][{table:u32, codec:u32, offset:u64, len:u32, out_len:u32}...] */
+/**
+ * `encode_codec`: [count:u32][{table:u32, part:u32, codec:u32, offset:u64, len:u32, out_len:u32}...]
+ * `part` の意味は `decodeIoRequests` と同じ。
+ */
 export function decodeCodecRequests(u8) {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const n = dv.getUint32(0, true);
@@ -346,10 +357,11 @@ export function decodeCodecRequests(u8) {
     const p = 4 + i * CODEC_REQUEST_SIZE;
     out.push({
       table: dv.getUint32(p, true),
-      codec: dv.getUint32(p + 4, true),
-      offset: Number(dv.getBigUint64(p + 8, true)),
-      len: dv.getUint32(p + 16, true),
-      outLen: dv.getUint32(p + 20, true),
+      part: dv.getUint32(p + 4, true),
+      codec: dv.getUint32(p + 8, true),
+      offset: Number(dv.getBigUint64(p + 12, true)),
+      len: dv.getUint32(p + 20, true),
+      outLen: dv.getUint32(p + 24, true),
     });
   }
   return out;
@@ -1001,6 +1013,7 @@ export class AhiruDB {
     const rc = e.ahiru_provide_codec(
       this.#session,
       req.table,
+      req.part,
       BigInt(req.offset),
       req.len,
       ptr,
@@ -1051,16 +1064,21 @@ export class AhiruDB {
    * 戻り値は次回の比較用シグネチャ。
    */
   async #pump(requests, lastSignature, sql) {
-    const signature = requests.map((r) => `${r.table}/${r.offset}+${r.len}`).join(',');
+    const signature = requests.map((r) => `${r.table}.${r.part}/${r.offset}+${r.len}`).join(',');
 
+    // `table` だけでは複数ファイルテーブルの何ファイル目かを区別できない
+    // （オフセットはファイルごとに独立した空間）ので、`table:part` の複合
+    // キーで束ねる。単一ファイル登録では常に part=0 なので、今まで通りの
+    // 挙動のまま複数ファイルにも安全に拡張できる。
     const jobs = [];
-    for (const [table, list] of groupBy(requests, (r) => r.table)) {
+    for (const [key, list] of groupBy(requests, (r) => `${r.table}:${r.part}`)) {
+      const [table, part] = key.split(':').map(Number);
       const rec = this.#byIndex.get(table);
       if (rec === undefined) {
         throw new AhiruError(Code.INTERNAL, { sql, detail: `unknown table index ${table}` });
       }
       for (const r of coalesceRanges(list, COALESCE_GAP, rec.size)) {
-        jobs.push({ rec, table, offset: r.offset, len: r.len });
+        jobs.push({ rec, table, part, offset: r.offset, len: r.len });
       }
     }
 
@@ -1069,10 +1087,15 @@ export class AhiruDB {
 
     let provided = 0;
     for (let i = 0; i < jobs.length; i++) {
-      const { rec, table, offset } = jobs[i];
-      provided += this.#provide(table, offset, buffers[i], sql);
+      const { rec, table, part, offset } = jobs[i];
+      provided += this.#provide(table, part, offset, buffers[i], sql);
       // 遠隔供給元だけ控えを持つ。コーデック委譲で圧縮ブロックを求められたとき、
       // ここから切り出せれば取り直さずに済む（メモリ供給元は slice で足りる）。
+      //
+      // JS 側の登録 API（`register`/`registerParquet`）は今のところ 1 テーブル
+      // = 1 ファイルなので `part` は常に 0 であり、`rec` が単一の控えを持つ
+      // ことと矛盾しない。複数ファイル登録（`ahiru_register_multi`）を JS から
+      // 使えるようにするときは、この控えをファイルごとに分ける必要がある。
       if (rec.source.cacheable !== false && !rec.resident.some((c) => c.offset === offset)) {
         rec.resident.push({ offset, bytes: buffers[i] });
         rec.fetched.push({ offset, len: buffers[i].byteLength });
@@ -1111,14 +1134,14 @@ export class AhiruDB {
   }
 
   /** 取得したバイト列を wasm に渡す。渡した長さを返す。 */
-  #provide(table, offset, bytes, sql) {
+  #provide(table, part, offset, bytes, sql) {
     if (bytes.byteLength === 0) return 0;
     const e = this.#exports;
     const ptr = e.ahiru_alloc(bytes.byteLength);
     if (ptr === 0) throw new AhiruError(Code.OOM, { sql });
     // alloc でメモリが伸びた可能性があるので、ここで必ず取り直す。
     new Uint8Array(this.#memory.buffer).set(bytes, ptr);
-    const rc = e.ahiru_provide(this.#session, table, BigInt(offset), ptr, bytes.byteLength);
+    const rc = e.ahiru_provide(this.#session, table, part, BigInt(offset), ptr, bytes.byteLength);
     e.ahiru_free(ptr, bytes.byteLength);
     if (rc !== 0) throw this.#lastError(sql);
     return bytes.byteLength;

@@ -21,7 +21,8 @@ build_one() { # $1=フィーチャ, $2=出力先
   cargo build "${args[@]}" >/dev/null 2>&1
   cp target/wasm32-unknown-unknown/wasm/ahiru_core.wasm "$out"
   if command -v wasm-opt >/dev/null 2>&1; then
-    wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory -o "$out.opt" "$out"
+    wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory \
+    --enable-nontrapping-float-to-int -o "$out.opt" "$out"
     mv "$out.opt" "$out"
   fi
 }
@@ -59,6 +60,7 @@ if cargo build --profile wasm --target wasm32-unknown-unknown -p ahiru-zstd \
   cp target/wasm32-unknown-unknown/wasm/ahiru_zstd.wasm "$ZSTD_OUT"
   if command -v wasm-opt >/dev/null 2>&1; then
     wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory \
+      --enable-nontrapping-float-to-int \
       -o "$ZSTD_OUT.opt" "$ZSTD_OUT" && mv "$ZSTD_OUT.opt" "$ZSTD_OUT"
   fi
   ZSIZE=$(wc -c < "$ZSTD_OUT" | tr -d ' ')

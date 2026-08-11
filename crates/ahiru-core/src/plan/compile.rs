@@ -96,6 +96,102 @@ pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
     Ok(p)
 }
 
+/// DATE の加減算の結果型を決める。返り値の `bool` は左右を入れ替えるべきか。
+///
+/// - `DATE + 整数` / `整数 + DATE` → DATE（日数を足す）
+/// - `DATE - 整数` → DATE
+/// - `DATE - DATE` → 日数（DuckDB は INTEGER を返す）
+///
+/// TIMESTAMP と整数の加減算は DuckDB でもエラーなので受け付けない
+/// （単位が秒なのかマイクロ秒なのか決められないため）。
+fn date_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, bool)> {
+    use BinaryOp::*;
+    match (op, lt, rt) {
+        (Add, Ty::Date, r) if r.is_integer() => Some((Ty::Date, false)),
+        // `1 + DATE` は交換して DATE を左に持ってくる。
+        (Add, l, Ty::Date) if l.is_integer() => Some((Ty::Date, true)),
+        (Sub, Ty::Date, r) if r.is_integer() => Some((Ty::Date, false)),
+        (Sub, Ty::Date, Ty::Date) => Some((Ty::BigInt, false)),
+        _ => None,
+    }
+}
+
+/// DECIMAL が絡む乗除の型を決める。該当しなければ `None`。
+///
+/// 加減算は「スケールを揃えてから足す」で正しいので通常の共通型経路でよいが、
+/// **乗算はスケールが足し算になる**（`1.25 * 2.5 = 3.125`: s=2 と s=3 で s=5）。
+/// 共通型に揃えてから掛けると、スケールが 2 倍ずれた値が返ってしまう。
+/// カーネルは生の整数として掛けるだけなので、正しいスケールを持つ結果型を
+/// ここで決め、両辺は**スケールを変えずに**物理幅だけ広げる。
+///
+/// 除算は DuckDB と同じく DOUBLE に落とす。整数除算のままだとスケールが
+/// 引き算になり、桁が足りずにほとんどの場合 0 になってしまう。
+fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, Ty, Ty)> {
+    if !matches!(op, BinaryOp::Mul | BinaryOp::Div) {
+        return None;
+    }
+    // どちらかが DECIMAL でなければ通常経路。
+    if !matches!(lt, Ty::Decimal { .. }) && !matches!(rt, Ty::Decimal { .. }) {
+        return None;
+    }
+    // 浮動小数が混ざったら DOUBLE に倒す（DuckDB と同じ）。
+    if matches!(lt, Ty::Float | Ty::Double) || matches!(rt, Ty::Float | Ty::Double) {
+        return Some((Ty::Double, Ty::Double, Ty::Double));
+    }
+    let (p1, s1) = lt.as_decimal()?;
+    let (p2, s2) = rt.as_decimal()?;
+    if op == BinaryOp::Div {
+        return Some((Ty::Double, Ty::Double, Ty::Double));
+    }
+    // 乗算: precision は足し算、scale も足し算。
+    let res = Ty::decimal(p1.saturating_add(p2), s1.saturating_add(s2));
+    let (rp, _) = res.as_decimal()?;
+    // 両辺は scale を保ったまま、結果と同じ物理幅へ広げる。
+    Some((Ty::decimal(rp, s1), Ty::decimal(rp, s2), res))
+}
+
+/// DATE/TIMESTAMP ± INTERVAL, INTERVAL ± INTERVAL, INTERVAL * 整数 の形を
+/// 認識する。該当しなければ `None`（＝ 通常の `Ty::unify` 経路へ）。
+///
+/// `Ty::unify` に載せない理由は `date_arith` と同じ: INTERVAL は他のどの型
+/// とも広さの順序を持たないので、共通型への昇格という発想自体が合わない。
+enum IntervalOp {
+    /// `swap`: 左右を入れ替えるか（`INTERVAL + DATE` の形）。
+    /// `negate_b`: 先に INTERVAL 側を符号反転するか（`- INTERVAL` の形）。
+    TsInterval {
+        swap: bool,
+        negate_b: bool,
+    },
+    IntervalInterval {
+        negate_b: bool,
+    },
+    /// `swap`: 整数が左に来ているか（`3 * INTERVAL`）。
+    IntervalMul {
+        swap: bool,
+    },
+}
+
+fn interval_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<IntervalOp> {
+    use BinaryOp::*;
+    let temporal = |t: Ty| matches!(t, Ty::Date | Ty::Timestamp);
+    match (op, lt, rt) {
+        (Add, l, Ty::Interval) if temporal(l) => {
+            Some(IntervalOp::TsInterval { swap: false, negate_b: false })
+        }
+        (Add, Ty::Interval, r) if temporal(r) => {
+            Some(IntervalOp::TsInterval { swap: true, negate_b: false })
+        }
+        (Sub, l, Ty::Interval) if temporal(l) => {
+            Some(IntervalOp::TsInterval { swap: false, negate_b: true })
+        }
+        (Add, Ty::Interval, Ty::Interval) => Some(IntervalOp::IntervalInterval { negate_b: false }),
+        (Sub, Ty::Interval, Ty::Interval) => Some(IntervalOp::IntervalInterval { negate_b: true }),
+        (Mul, Ty::Interval, r) if r.is_integer() => Some(IntervalOp::IntervalMul { swap: false }),
+        (Mul, l, Ty::Interval) if l.is_integer() => Some(IntervalOp::IntervalMul { swap: true }),
+        _ => None,
+    }
+}
+
 /// 2 つのプログラムを `AND` で束ねる。
 ///
 /// `WHERE a AND b` は AST の段階で 1 本にまとめてコンパイルできるが、
@@ -116,7 +212,7 @@ pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
         match i2.op {
             OpCode::LoadCol => {}
             OpCode::LoadConst => i2.aux += kbase,
-            OpCode::Cast => {
+            OpCode::Cast | OpCode::TryCast => {
                 i2.a += base;
                 i2.aux += cbase;
             }
@@ -141,6 +237,22 @@ pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
     lhs.result = dst;
     lhs.result_ty = Ty::Boolean;
     Ok(lhs)
+}
+
+/// 既にコンパイル済みのプログラムの結果を別の型へ変換する。
+/// 集合演算で左右の列型を揃えるときに使う。
+pub fn cast_program(mut p: Program, to: Ty) -> Result<Program> {
+    if p.result_ty == to {
+        return Ok(p);
+    }
+    let from = p.result_ty;
+    let aux = p.add_cast(from, to);
+    let src = p.result;
+    let dst = p.alloc_reg();
+    p.push(Instr::with_aux(OpCode::Cast, from.phys(), dst, src, 0, aux));
+    p.result = dst;
+    p.result_ty = to;
+    Ok(p)
 }
 
 /// 2 つの式が構造的に等しいか。`GROUP BY` 式と SELECT 中の部分式の照合に使う。
@@ -172,6 +284,7 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
     };
     match (arena.get(a), arena.get(b)) {
         (Expr::Literal(x), Expr::Literal(y)) => x == y,
+        (Expr::IntervalLiteral(x), Expr::IntervalLiteral(y)) => x == y,
         (Expr::Param(x), Expr::Param(y)) => x == y,
         (
             Expr::ColumnRef { qualifier: q1, name: n1 },
@@ -183,7 +296,9 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
         (Expr::Binary { op: o1, lhs: l1, rhs: r1 }, Expr::Binary { op: o2, lhs: l2, rhs: r2 }) => {
             o1 == o2 && eq(l1, l2) && eq(r1, r2)
         }
-        (Expr::Cast { arg: a1, ty: t1 }, Expr::Cast { arg: a2, ty: t2 }) => t1 == t2 && eq(a1, a2),
+        (Expr::Cast { arg: a1, ty: t1, try_: y1 }, Expr::Cast { arg: a2, ty: t2, try_: y2 }) => {
+            t1 == t2 && y1 == y2 && eq(a1, a2)
+        }
         (Expr::IsNull { arg: a1, negated: n1 }, Expr::IsNull { arg: a2, negated: n2 }) => {
             n1 == n2 && eq(a1, a2)
         }
@@ -201,9 +316,9 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
                 && l1.iter().zip(l2).all(|(x, y)| eq(x, y))
         }
         (
-            Expr::Like { arg: a1, pattern: p1, negated: n1, escape: e1 },
-            Expr::Like { arg: a2, pattern: p2, negated: n2, escape: e2 },
-        ) => n1 == n2 && e1 == e2 && eq(a1, a2) && eq(p1, p2),
+            Expr::Like { arg: a1, pattern: p1, negated: n1, escape: e1, ci: c1 },
+            Expr::Like { arg: a2, pattern: p2, negated: n2, escape: e2, ci: c2 },
+        ) => n1 == n2 && e1 == e2 && c1 == c2 && eq(a1, a2) && eq(p1, p2),
         (
             Expr::Case { operand: o1, whens: w1, else_: e1 },
             Expr::Case { operand: o2, whens: w2, else_: e2 },
@@ -214,11 +329,12 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
                 && w1.iter().zip(w2).all(|((c1, v1), (c2, v2))| eq(c1, c2) && eq(v1, v2))
         }
         (
-            Expr::Function { name: n1, args: a1, distinct: d1, star: s1 },
-            Expr::Function { name: n2, args: a2, distinct: d2, star: s2 },
+            Expr::Function { name: n1, args: a1, distinct: d1, star: s1, filter: f1 },
+            Expr::Function { name: n2, args: a2, distinct: d2, star: s2, filter: f2 },
         ) => {
             d1 == d2
                 && s1 == s2
+                && eq_opt(f1, f2)
                 && crate::rt::hash::eq_ascii_ci(n1.as_bytes(), n2.as_bytes())
                 && a1.len() == a2.len()
                 && a1.iter().zip(a2).all(|(x, y)| eq(x, y))
@@ -257,6 +373,33 @@ impl<'a> Compiler<'a> {
         Ok(dst)
     }
 
+    /// `TRY_CAST` 用。`coerce` と同じ命令列を組むが `Cast` の代わりに
+    /// `TryCast` を発行する。変換できない組み合わせは実行時にエラーではなく
+    /// 全行 NULL になる（`expr::vm::exec` 参照）。行単位の変換失敗
+    /// （範囲外・パース不能）はどちらの命令でも元々その行だけ NULL になる
+    /// （`kernels::cast` の契約）ので、ここで違いを付ける必要はない。
+    fn try_coerce(&mut self, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
+        if from == to {
+            return Ok(reg);
+        }
+        if from == Ty::Null {
+            return Ok(self.konst(to, Value::Null));
+        }
+        let aux = self.prog.add_cast(from, to);
+        let dst = self.prog.alloc_reg();
+        self.prog.push(Instr::with_aux(OpCode::TryCast, from.phys(), dst, reg, 0, aux));
+        Ok(dst)
+    }
+
+    /// `ILIKE` 用に `lower(x)` を 1 引数呼び出しとして発行する。
+    fn lower_reg(&mut self, r: Reg) -> Result<Reg> {
+        let (id, _want, res) = crate::expr::funcs::resolve("lower", &[Ty::Varchar])?;
+        let aux = self.prog.add_call(id, vec![r], res);
+        let dst = self.prog.alloc_reg();
+        self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+        Ok(dst)
+    }
+
     /// 二項演算の両辺を共通型に揃える。
     fn unify_operands(&mut self, lr: Reg, lt: Ty, rr: Reg, rt: Ty) -> Result<(Reg, Reg, Ty)> {
         let t = match Ty::unify(lt, rt) {
@@ -266,6 +409,65 @@ impl<'a> Compiler<'a> {
         let l = self.coerce(lr, lt, t)?;
         let r = self.coerce(rr, rt, t)?;
         Ok((l, r, t))
+    }
+
+    /// `interval_arith` が認識した形をバイトコードへ落とす。
+    fn compile_interval_op(
+        &mut self,
+        kind: IntervalOp,
+        lr: Reg,
+        lt: Ty,
+        rr: Reg,
+        rt: Ty,
+    ) -> Result<(Reg, Ty)> {
+        match kind {
+            IntervalOp::TsInterval { swap, negate_b } => {
+                let (ts_r, ts_t, iv_r) = if swap { (rr, rt, lr) } else { (lr, lt, rr) };
+                // DATE は先に TIMESTAMP へ寄せる。DuckDB も DATE ± INTERVAL は
+                // TIMESTAMP を返す（INTERVAL が時刻成分を持ちうるため）。
+                let ts_r = self.coerce(ts_r, ts_t, Ty::Timestamp)?;
+                let iv_r = if negate_b {
+                    self.emit(OpCode::IntervalNeg, Ty::Interval, iv_r, 0)
+                } else {
+                    iv_r
+                };
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::new(
+                    OpCode::TsAddInterval,
+                    crate::vector::PhysType::I64,
+                    dst,
+                    ts_r,
+                    iv_r,
+                ));
+                Ok((dst, Ty::Timestamp))
+            }
+            IntervalOp::IntervalInterval { negate_b } => {
+                let b =
+                    if negate_b { self.emit(OpCode::IntervalNeg, Ty::Interval, rr, 0) } else { rr };
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::new(
+                    OpCode::IntervalAdd,
+                    crate::vector::PhysType::I128,
+                    dst,
+                    lr,
+                    b,
+                ));
+                Ok((dst, Ty::Interval))
+            }
+            IntervalOp::IntervalMul { swap } => {
+                let (iv_r, n_r, n_t) = if swap { (rr, lr, lt) } else { (lr, rr, rt) };
+                let n_r = self.coerce(n_r, n_t, Ty::BigInt)?;
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::new(
+                    OpCode::IntervalMul,
+                    crate::vector::PhysType::I128,
+                    dst,
+                    iv_r,
+                    n_r,
+                ));
+                Ok((dst, Ty::Interval))
+            }
+        }
     }
 
     fn expr(&mut self, id: ExprId) -> Result<(Reg, Ty)> {
@@ -286,6 +488,9 @@ impl<'a> Compiler<'a> {
                 let ty = v.default_ty();
                 Ok((self.konst(ty, v.clone()), ty))
             }
+            Expr::IntervalLiteral(packed) => {
+                Ok((self.konst(Ty::Interval, Value::I128(*packed)), Ty::Interval))
+            }
             Expr::ColumnRef { qualifier, name } => self.column(qualifier.as_deref(), name),
             Expr::Star { .. } => err!(SyntaxError),
             Expr::Param(i) => {
@@ -298,9 +503,13 @@ impl<'a> Compiler<'a> {
             }
             Expr::Unary { op, arg } => self.unary(*op, *arg),
             Expr::Binary { op, lhs, rhs } => self.binary(*op, *lhs, *rhs),
-            Expr::Cast { arg, ty } => {
+            Expr::Cast { arg, ty, try_ } => {
                 let (r, from) = self.expr(*arg)?;
-                Ok((self.coerce(r, from, *ty)?, *ty))
+                if *try_ {
+                    Ok((self.try_coerce(r, from, *ty)?, *ty))
+                } else {
+                    Ok((self.coerce(r, from, *ty)?, *ty))
+                }
             }
             Expr::IsNull { arg, negated } => {
                 let (r, _) = self.expr(*arg)?;
@@ -311,27 +520,66 @@ impl<'a> Compiler<'a> {
             }
             Expr::Between { arg, low, high, negated } => self.between(*arg, *low, *high, *negated),
             Expr::InList { arg, list, negated } => self.in_list(*arg, list.clone(), *negated),
-            Expr::Like { arg, pattern, negated, escape } => {
+            Expr::Like { arg, pattern, negated, escape, ci } => {
                 ensure!(escape.is_none(), UnsupportedFeature);
                 let (a, at) = self.expr(*arg)?;
                 let (p, pt) = self.expr(*pattern)?;
-                let a = self.coerce(a, at, Ty::Varchar)?;
-                let p = self.coerce(p, pt, Ty::Varchar)?;
+                let mut a = self.coerce(a, at, Ty::Varchar)?;
+                let mut p = self.coerce(p, pt, Ty::Varchar)?;
+                // ILIKE は大小文字を無視する。専用カーネルは持たず、`lower()` を
+                // 両辺にかけてから通常の LIKE に落とす（upper/lower と同じ
+                // ASCII 限定の制限をそのまま継承する）。
+                if *ci {
+                    a = self.lower_reg(a)?;
+                    p = self.lower_reg(p)?;
+                }
                 let dst = self.emit(OpCode::Like, Ty::Varchar, a, p);
                 Ok((self.maybe_not(dst, *negated), Ty::Boolean))
             }
             Expr::Case { operand, whens, else_ } => self.case(*operand, whens.clone(), *else_),
-            Expr::Function { name, args, distinct, star } => {
-                let _ = (args, distinct, star);
+            // ウィンドウ関数とサブクエリはバインダが専用ノードに書き換えてから
+            // 来る。ここに残っているのは、書ける位置ではないところに書かれた場合。
+            Expr::Window { .. } => err!(UnsupportedFeature),
+            Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                err!(UnsupportedFeature)
+            }
+            // `UNNEST` もバインダが `Node::Unnest` + `Substitution` に書き換えて
+            // から来る。ここに残っているのは書ける位置ではないところに書かれた
+            // 場合（`plan::bind::collect_unnests` が検出して先に拒否するので、
+            // 実質的にはバインダのバグ検出用の網）。
+            Expr::Unnest(_) => err!(UnsupportedFeature),
+            Expr::Function { name, args, distinct, star, filter } => {
                 // 集約関数はバインダが置き換えてから来る。ここに残っているのは
                 // 集約できない位置（WHERE など）に書かれた場合か、集約の入れ子。
                 if AggKind::from_name(name).is_some() {
                     err!(NotAggregate);
                 }
-                // スカラ関数は v1 では未提供。
-                err!(FunctionNotFound)
+                // FILTER はスカラ関数には意味を持たない。
+                ensure!(!*distinct && !*star && filter.is_none(), UnsupportedFeature);
+                self.scalar_call(name, args)
             }
         }
+    }
+
+    /// スカラ関数呼び出し。型検査と引数の変換はここで済ませ、実行時には
+    /// 変換済みのベクタだけを渡す。
+    fn scalar_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
+        let mut regs = Vec::with_capacity(args.len());
+        let mut tys = Vec::with_capacity(args.len());
+        for a in args {
+            let (r, t) = self.expr(*a)?;
+            regs.push(r);
+            tys.push(t);
+        }
+        let (id, want, res) = crate::expr::funcs::resolve(name, &tys)?;
+        ensure!(want.len() == regs.len(), WrongArgCount);
+        for i in 0..regs.len() {
+            regs[i] = self.coerce(regs[i], tys[i], want[i])?;
+        }
+        let aux = self.prog.add_call(id, regs, res);
+        let dst = self.prog.alloc_reg();
+        self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+        Ok((dst, res))
     }
 
     fn column(&mut self, qualifier: Option<&str>, name: &str) -> Result<(Reg, Ty)> {
@@ -351,8 +599,12 @@ impl<'a> Compiler<'a> {
     }
 
     /// 置き換え指示に一致する式なら、その入力列を読むだけにする。
+    ///
+    /// **後から追加した指示を優先する**（逆順に走査する）。同じ式に対して
+    /// 「スカラサブクエリの列」と「集約後のグループ列」の両方が登録されうるが、
+    /// 集約より上では後者が正しいため。
     fn substitute(&mut self, id: ExprId) -> Option<Result<(Reg, Ty)>> {
-        for s in self.subs {
+        for s in self.subs.iter().rev() {
             let hit = if s.structural { expr_eq(self.arena, s.expr, id) } else { s.expr == id };
             if hit {
                 return Some(self.load_col(s.column));
@@ -365,6 +617,9 @@ impl<'a> Compiler<'a> {
         let (r, t) = self.expr(arg)?;
         match op {
             UnaryOp::Neg => {
+                if t == Ty::Interval {
+                    return Ok((self.emit(OpCode::IntervalNeg, Ty::Interval, r, 0), Ty::Interval));
+                }
                 ensure!(t.is_numeric() || t == Ty::Null, TypeMismatch);
                 Ok((self.emit(OpCode::Neg, t, r, 0), t))
             }
@@ -392,9 +647,49 @@ impl<'a> Compiler<'a> {
             return Ok((self.emit(OpCode::Concat, Ty::Varchar, l, r), Ty::Varchar));
         }
 
+        // DATE と整数の加減算は日数として扱う（DuckDB と同じ）。
+        // `unify(Date, Int)` は None なので、共通型経路には乗らない。
+        if let Some((res, swap)) = date_arith(op, lt, rt) {
+            let (l, r) = if swap { (rr, lr) } else { (lr, rr) };
+            let code = if op == BinaryOp::Add { OpCode::Add } else { OpCode::Sub };
+            // DATE も INTEGER も物理型は I32 なので、演算自体に変換は要らない。
+            let dst = self.prog.alloc_reg();
+            self.prog.push(Instr::new(code, crate::vector::PhysType::I32, dst, l, r));
+            // 日数差は DuckDB が BIGINT を返すので合わせる。値は同じだが、
+            // 型が違うと上位の型解決がずれる。
+            if res == Ty::BigInt {
+                return Ok((self.coerce(dst, Ty::Int, Ty::BigInt)?, Ty::BigInt));
+            }
+            return Ok((dst, res));
+        }
+
+        // DECIMAL の乗除はスケールが変わるので、共通型に揃える経路には乗せない。
+        if let Some((lcast, rcast, res)) = decimal_arith(op, lt, rt) {
+            let l = self.coerce(lr, lt, lcast)?;
+            let r = self.coerce(rr, rt, rcast)?;
+            let code = if op == BinaryOp::Mul { OpCode::Mul } else { OpCode::Div };
+            return Ok((self.emit(code, res, l, r), res));
+        }
+
+        // DATE/TIMESTAMP ± INTERVAL, INTERVAL ± INTERVAL, INTERVAL * 整数。
+        if let Some(kind) = interval_arith(op, lt, rt) {
+            return self.compile_interval_op(kind, lr, lt, rr, rt);
+        }
+
         let (l, r, t) = self.unify_operands(lr, lt, rr, rt)?;
 
         if op.is_comparison() {
+            // 大小比較は月・日・マイクロ秒の相対的な重みが定義できない
+            // （1 か月は 28〜31 日のどれとも比較しうる）ので、順序比較は
+            // 未対応のまま明示的にエラーにする。等価比較はビットパターンの
+            // 一致で正しく判定できるので許す。
+            // JSON も INTERVAL と同じ理由（大小の順序が定義できない）で
+            // 等価比較のみ許す。等価はバイト列一致で判定するので、キー順序や
+            // 空白の違いだけで不一致になりうる（DuckDB のような正規化比較は
+            // 行わない、v1 の既知の制限）。
+            if t == Ty::Interval || t == Ty::Json {
+                ensure!(matches!(op, BinaryOp::Eq | BinaryOp::Ne), TypeMismatch);
+            }
             let code = match op {
                 BinaryOp::Eq => OpCode::Eq,
                 BinaryOp::Ne => OpCode::Ne,
@@ -679,5 +974,182 @@ mod tests {
             id = a.push(Expr::Binary { op: BinaryOp::Add, lhs: id, rhs: r });
         }
         assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::ExpressionTooDeep));
+    }
+
+    // --- ILIKE / TRY_CAST -------------------------------------------------------
+
+    #[test]
+    fn ilike_lowers_both_sides_before_the_like_kernel() {
+        let mut a = ExprArena::new();
+        let arg = a.push(Expr::ColumnRef { qualifier: None, name: "name".into() });
+        let pattern = a.push(Expr::Literal(Value::Bytes(b"A%".to_vec())));
+        let id = a.push(Expr::Like { arg, pattern, negated: false, escape: None, ci: true });
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Boolean);
+        // `lower()` の呼び出しが 2 回（両辺）、その後に Like が 1 回。
+        assert_eq!(p.calls.len(), 2);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::Like));
+        // ILIKE でない通常の LIKE は lower() を呼ばない。
+        let id2 = a.push(Expr::Like { arg, pattern, negated: false, escape: None, ci: false });
+        let p2 = compile(&a, &cols(), &[], id2).unwrap();
+        assert!(p2.calls.is_empty());
+    }
+
+    #[test]
+    fn try_cast_emits_try_cast_opcode_not_cast() {
+        let mut a = ExprArena::new();
+        let arg = a.push(Expr::ColumnRef { qualifier: None, name: "name".into() });
+        let id = a.push(Expr::Cast { arg, ty: Ty::Int, try_: true });
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::TryCast));
+        assert!(!p.instrs.iter().any(|i| i.op == OpCode::Cast));
+
+        let id2 = a.push(Expr::Cast { arg, ty: Ty::Int, try_: false });
+        let p2 = compile(&a, &cols(), &[], id2).unwrap();
+        assert!(p2.instrs.iter().any(|i| i.op == OpCode::Cast));
+        assert!(!p2.instrs.iter().any(|i| i.op == OpCode::TryCast));
+    }
+
+    #[test]
+    fn filter_on_a_non_aggregate_function_is_rejected() {
+        // FILTER はスカラ関数呼び出しには意味を持たない。集約置換前にここへ
+        // 来た（＝集約できない位置に書かれた）場合と同じ経路でも弾かれる。
+        let mut a = ExprArena::new();
+        let arg = a.push(Expr::ColumnRef { qualifier: None, name: "id".into() });
+        let cond = a.push(Expr::Literal(Value::Bool(true)));
+        let id = a.push(Expr::Function {
+            name: "abs".into(),
+            args: vec![arg],
+            distinct: false,
+            star: false,
+            filter: Some(cond),
+        });
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::UnsupportedFeature));
+    }
+
+    // --- INTERVAL -------------------------------------------------------------
+
+    fn date_col() -> Scope {
+        Scope::from_fields(vec![
+            Field::new("d", Ty::Date, false),
+            Field::new("ts", Ty::Timestamp, false),
+        ])
+    }
+
+    fn interval_lit(a: &mut ExprArena, months: i32, days: i32, micros: i64) -> ExprId {
+        a.push(Expr::IntervalLiteral(crate::vector::pack_interval(months, days, micros)))
+    }
+
+    #[test]
+    fn date_plus_interval_promotes_to_timestamp() {
+        let mut a = ExprArena::new();
+        let d = a.push(Expr::ColumnRef { qualifier: None, name: "d".into() });
+        let iv = interval_lit(&mut a, 0, 3, 0);
+        let id = a.push(Expr::Binary { op: BinaryOp::Add, lhs: d, rhs: iv });
+        let p = compile(&a, &date_col(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Timestamp);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::TsAddInterval));
+        // DATE → TIMESTAMP への暗黙キャストが挟まる。
+        assert!(p.casts.iter().any(|c| c.from == Ty::Date && c.to == Ty::Timestamp));
+    }
+
+    #[test]
+    fn timestamp_minus_interval_negates_then_adds() {
+        let mut a = ExprArena::new();
+        let ts = a.push(Expr::ColumnRef { qualifier: None, name: "ts".into() });
+        let iv = interval_lit(&mut a, 1, 0, 0);
+        let id = a.push(Expr::Binary { op: BinaryOp::Sub, lhs: ts, rhs: iv });
+        let p = compile(&a, &date_col(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Timestamp);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalNeg));
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::TsAddInterval));
+    }
+
+    #[test]
+    fn interval_plus_date_is_swapped() {
+        let mut a = ExprArena::new();
+        let d = a.push(Expr::ColumnRef { qualifier: None, name: "d".into() });
+        let iv = interval_lit(&mut a, 0, 1, 0);
+        let id = a.push(Expr::Binary { op: BinaryOp::Add, lhs: iv, rhs: d });
+        let p = compile(&a, &date_col(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Timestamp);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::TsAddInterval));
+    }
+
+    #[test]
+    fn interval_add_and_mul_compile() {
+        let mut a = ExprArena::new();
+        let i1 = interval_lit(&mut a, 1, 0, 0);
+        let i2 = interval_lit(&mut a, 0, 3, 0);
+        let add = a.push(Expr::Binary { op: BinaryOp::Add, lhs: i1, rhs: i2 });
+        let p = compile(&a, &cols(), &[], add).unwrap();
+        assert_eq!(p.result_ty, Ty::Interval);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalAdd));
+
+        let n = a.push(Expr::Literal(Value::I32(2)));
+        let mul = a.push(Expr::Binary { op: BinaryOp::Mul, lhs: i1, rhs: n });
+        let p = compile(&a, &cols(), &[], mul).unwrap();
+        assert_eq!(p.result_ty, Ty::Interval);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalMul));
+
+        // `n * INTERVAL` も同じ経路（左右入れ替え）。
+        let mul2 = a.push(Expr::Binary { op: BinaryOp::Mul, lhs: n, rhs: i1 });
+        let p = compile(&a, &cols(), &[], mul2).unwrap();
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalMul));
+    }
+
+    #[test]
+    fn interval_ordering_comparison_is_rejected_but_equality_is_not() {
+        let mut a = ExprArena::new();
+        let i1 = interval_lit(&mut a, 1, 0, 0);
+        let i2 = interval_lit(&mut a, 0, 30, 0);
+        let lt = a.push(Expr::Binary { op: BinaryOp::Lt, lhs: i1, rhs: i2 });
+        assert_eq!(code_of(compile(&a, &cols(), &[], lt)), Some(Code::TypeMismatch));
+
+        let eq = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: i1, rhs: i2 });
+        let p = compile(&a, &cols(), &[], eq).unwrap();
+        assert_eq!(p.result_ty, Ty::Boolean);
+    }
+
+    #[test]
+    fn json_ordering_comparison_is_rejected_but_equality_is_not() {
+        // JSON も INTERVAL と同じ理由で大小比較を拒否する。
+        // JSON は他のどの型とも `Ty::unify` しない（モジュール doc 参照）ので、
+        // 比較相手も明示的に JSON へ CAST してから渡す。
+        let scope = Scope::from_fields(vec![Field::new("doc", Ty::Json, true)]);
+        let mut a = ExprArena::new();
+        let doc = a.push(Expr::ColumnRef { qualifier: None, name: "doc".into() });
+        let lit_str = a.push(Expr::Literal(Value::Bytes(b"{}".to_vec())));
+        let lit = a.push(Expr::Cast { arg: lit_str, ty: Ty::Json, try_: false });
+        let lt = a.push(Expr::Binary { op: BinaryOp::Lt, lhs: doc, rhs: lit });
+        assert_eq!(code_of(compile(&a, &scope, &[], lt)), Some(Code::TypeMismatch));
+
+        let eq = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: doc, rhs: lit });
+        let p = compile(&a, &scope, &[], eq).unwrap();
+        assert_eq!(p.result_ty, Ty::Boolean);
+    }
+
+    #[test]
+    fn cast_to_json_is_generic_cast_opcode_no_special_compile_path() {
+        // JSON への CAST は他の型と同じ経路（`Expr::Cast` → `Cast`/`TryCast`
+        // opcode）を通るだけで、compile.rs 側に特別な分岐は要らない
+        // （検証は `expr::kernels::cast` にある）。
+        let scope = Scope::from_fields(vec![Field::new("s", Ty::Varchar, true)]);
+        let mut a = ExprArena::new();
+        let s = a.push(Expr::ColumnRef { qualifier: None, name: "s".into() });
+        let cast = a.push(Expr::Cast { arg: s, ty: Ty::Json, try_: false });
+        let p = compile(&a, &scope, &[], cast).unwrap();
+        assert_eq!(p.result_ty, Ty::Json);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::Cast));
+    }
+
+    #[test]
+    fn unary_neg_on_interval_uses_dedicated_kernel() {
+        let mut a = ExprArena::new();
+        let iv = interval_lit(&mut a, 1, 2, 3);
+        let id = a.push(Expr::Unary { op: UnaryOp::Neg, arg: iv });
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Interval);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalNeg));
     }
 }

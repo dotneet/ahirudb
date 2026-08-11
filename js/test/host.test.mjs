@@ -884,16 +884,18 @@ test('DECIMAL は precision/scale を適用した文字列で返る', { skip: ne
 // --- コーデック委譲 ----------------------------------------------------------
 
 test('decodeCodecRequests は要求列を読む', () => {
-  const buf = new Uint8Array(4 + 24);
+  // encode_codec: [count:u32][{table:u32, part:u32, codec:u32, offset:u64, len:u32, out_len:u32}...]
+  const buf = new Uint8Array(4 + 28);
   const dv = new DataView(buf.buffer);
   dv.setUint32(0, 1, true);
   dv.setUint32(4, 3, true); // table
-  dv.setUint32(8, 6, true); // codec = ZSTD
-  dv.setBigUint64(12, 123456n, true);
-  dv.setUint32(20, 777, true);
-  dv.setUint32(24, 4096, true);
+  dv.setUint32(8, 0, true); // part
+  dv.setUint32(12, 6, true); // codec = ZSTD
+  dv.setBigUint64(16, 123456n, true);
+  dv.setUint32(24, 777, true);
+  dv.setUint32(28, 4096, true);
   assert.deepEqual(decodeCodecRequests(buf), [
-    { table: 3, codec: 6, offset: 123456, len: 777, outLen: 4096 },
+    { table: 3, part: 0, codec: 6, offset: 123456, len: 777, outLen: 4096 },
   ]);
 });
 

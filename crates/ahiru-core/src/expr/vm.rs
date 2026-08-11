@@ -169,6 +169,42 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
             let spec = p.casts[c];
             kernels::cast(spec.from, spec.to, reg(regs, ins.a)?)?
         }
+        TryCast => {
+            let c = ins.aux as usize;
+            ensure!(c < p.casts.len(), Internal);
+            let spec = p.casts[c];
+            let src = reg(regs, ins.a)?;
+            match kernels::try_cast(spec.from, spec.to, src) {
+                Ok(v) => v,
+                // 組み合わせ自体が変換不能（`InvalidCast` 等）。行単位の失敗は
+                // `kernels::cast` がエラーにせず NULL を返すので、ここに来るのは
+                // 「その型ペアはそもそも変換できない」場合だけ。エラーを伝播
+                // せず、全行 NULL のベクタに落とす。
+                Err(_) => {
+                    let n = src.len();
+                    let mut out = Vector::new(spec.to);
+                    for _ in 0..n {
+                        out.push_null();
+                    }
+                    out
+                }
+            }
+        }
+        Call => {
+            let c = ins.aux as usize;
+            ensure!(c < p.calls.len(), Internal);
+            let spec = &p.calls[c];
+            // 引数は別表にあるので、レジスタから参照を集めてから渡す。
+            let mut args = Vec::with_capacity(spec.args.len());
+            for &r in &spec.args {
+                args.push(reg(regs, r)?);
+            }
+            crate::expr::funcs::call(spec.func, spec.result_ty, &args)?
+        }
+        TsAddInterval => kernels::ts_add_interval(reg(regs, ins.a)?, reg(regs, ins.b)?)?,
+        IntervalAdd => kernels::interval_add(reg(regs, ins.a)?, reg(regs, ins.b)?)?,
+        IntervalNeg => kernels::interval_neg(reg(regs, ins.a)?)?,
+        IntervalMul => kernels::interval_mul(reg(regs, ins.a)?, reg(regs, ins.b)?)?,
         Like => kernels::like(reg(regs, ins.a)?, reg(regs, ins.b)?)?,
         Concat => {
             let a = reg(regs, ins.a)?;
@@ -796,12 +832,119 @@ mod tests {
         let src = col(Ty::Null, &[None]);
         let r = cast_of(Ty::Null, Ty::Varchar, src).unwrap();
         assert!(!r.is_valid(0));
-        // 日付の文字列化・TIME との相互変換は未実装。黙って壊さずエラーにする。
-        let e = cast_of(Ty::Date, Ty::Varchar, col(Ty::Date, &[Some(Value::I32(0))]));
-        assert_eq!(code_of(e), Some(Code::InvalidCast));
+        // 日付の文字列化は funcs のフォーマッタで実装済み。
+        let r = cast_of(Ty::Date, Ty::Varchar, col(Ty::Date, &[Some(Value::I32(0))])).unwrap();
+        assert_eq!(r.bytes().get(0), b"1970-01-01");
+        // DATE ↔ TIME は意味が無いので未対応のまま。黙って壊さずエラーにする。
         let e = cast_of(Ty::Date, Ty::Time, col(Ty::Date, &[Some(Value::I32(0))]));
         assert_eq!(code_of(e), Some(Code::InvalidCast));
         let e = cast_of(Ty::Timestamp, Ty::Double, col(Ty::Timestamp, &[Some(Value::I64(0))]));
+        assert_eq!(code_of(e), Some(Code::InvalidCast));
+    }
+
+    // --- TRY_CAST -------------------------------------------------------------
+
+    fn try_cast_of(from: Ty, to: Ty, v: Vector) -> Result<Vector> {
+        let mut p = Program::new();
+        let r0 = p.alloc_reg();
+        let r1 = p.alloc_reg();
+        p.push(Instr::with_aux(OpCode::LoadCol, from.phys(), r0, 0, 0, 0));
+        let ci = p.add_cast(from, to);
+        p.push(Instr::with_aux(OpCode::TryCast, from.phys(), r1, r0, 0, ci));
+        p.result = r1;
+        p.result_ty = to;
+        let batch = Batch::new(vec![v]);
+        Vm::new().eval(&p, &batch)
+    }
+
+    #[test]
+    fn try_cast_succeeds_like_cast_when_the_conversion_works() {
+        let r = try_cast_of(Ty::Int, Ty::BigInt, ints(&[7, -7])).unwrap();
+        assert_eq!(r.i64s(), &[7, -7]);
+        let r = try_cast_of(Ty::Varchar, Ty::Int, bytes(&[b"123"])).unwrap();
+        assert_eq!(i32s_of(&r), vec![123]);
+    }
+
+    #[test]
+    fn try_cast_turns_row_level_parse_failure_into_null() {
+        // 通常の CAST でも「行単位」の変換失敗（数値として読めない文字列）は
+        // 元々エラーにせず NULL にする（`kernels::cast` の契約）。TRY_CAST でも
+        // 同じ挙動になることを確かめる。
+        let r = try_cast_of(Ty::Varchar, Ty::Int, bytes(&[b"abc", b"42"])).unwrap();
+        assert!(!r.is_valid(0), "'abc' は整数として読めないので NULL");
+        assert_eq!(r.i32s()[1], 42);
+    }
+
+    #[test]
+    fn try_cast_turns_unsupported_combination_into_null_instead_of_erroring() {
+        // 通常の CAST ならエラーになる組み合わせ（`cast_identity_and_unsupported`
+        // 参照）。TRY_CAST はエラーを伝播せず、行数ぶんの NULL に落とす。
+        let r = try_cast_of(
+            Ty::Timestamp,
+            Ty::Double,
+            col(Ty::Timestamp, &[Some(Value::I64(0)), None]),
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(!r.is_valid(0));
+        assert!(!r.is_valid(1));
+        assert_eq!(r.ty(), Ty::Double);
+
+        let e = cast_of(Ty::Timestamp, Ty::Double, col(Ty::Timestamp, &[Some(Value::I64(0))]));
+        assert_eq!(
+            code_of(e),
+            Some(Code::InvalidCast),
+            "普通の CAST は同じ組み合わせでエラーのまま"
+        );
+    }
+
+    // --- VARCHAR ⇄ JSON -------------------------------------------------------
+
+    #[test]
+    fn cast_varchar_to_json_validates_and_json_to_varchar_passes_through() {
+        // duckdb: CAST('{"a":1}' AS JSON) は成功し、CAST('not json' AS JSON) は
+        // Conversion Error になる（TRY_CAST は NULL）。
+        let r =
+            cast_of(Ty::Varchar, Ty::Json, bytes(&[br#"{"a":1}"#, b"[1,2]", b"\"x\""])).unwrap();
+        assert_eq!(r.ty(), Ty::Json);
+        assert_eq!(r.bytes().get(0), br#"{"a":1}"#);
+        assert_eq!(r.bytes().get(1), b"[1,2]");
+
+        // 通常の CAST は不正な JSON をその場でエラーにする（他の型と違い、
+        // 行単位の失敗を NULL に丸めない例外。`kernels::cast_str_to_json` の
+        // doc 参照）。
+        let e = cast_of(Ty::Varchar, Ty::Json, bytes(&[b"not json"]));
+        assert_eq!(code_of(e), Some(Code::InvalidCast));
+
+        // TRY_CAST はその行だけ NULL にし、他の妥当な行は活かす。
+        let r = try_cast_of(Ty::Varchar, Ty::Json, bytes(&[br#"{"a":1}"#, b"not json"])).unwrap();
+        assert_eq!(r.ty(), Ty::Json);
+        assert!(r.is_valid(0));
+        assert_eq!(r.bytes().get(0), br#"{"a":1}"#);
+        assert!(!r.is_valid(1));
+
+        // JSON → VARCHAR はテキストをそのまま返す（検証済みなので失敗しない）。
+        let j = col(Ty::Json, &[Some(Value::Bytes(br#"{"a":1}"#.to_vec())), None]);
+        let back = cast_of(Ty::Json, Ty::Varchar, j).unwrap();
+        assert_eq!(back.ty(), Ty::Varchar);
+        assert_eq!(back.bytes().get(0), br#"{"a":1}"#);
+        assert!(!back.is_valid(1));
+
+        // NULL 行は検証をすり抜けて NULL のまま（空文字列は不正な JSON だが
+        // NULL 行なので CAST はエラーにならない）。
+        let r = cast_of(Ty::Varchar, Ty::Json, col(Ty::Varchar, &[None])).unwrap();
+        assert!(!r.is_valid(0));
+    }
+
+    #[test]
+    fn json_only_casts_with_varchar_and_blob_are_rejected() {
+        // BLOB ⇄ JSON、数値 → JSON などは非対応（`to_json` 関数を使うべき、
+        // という設計判断。モジュール doc 参照）。
+        let e = cast_of(Ty::Blob, Ty::Json, bytes(&[b"{}"]));
+        assert_eq!(code_of(e), Some(Code::InvalidCast));
+        let e = cast_of(Ty::Json, Ty::Blob, col(Ty::Json, &[Some(Value::Bytes(b"{}".to_vec()))]));
+        assert_eq!(code_of(e), Some(Code::InvalidCast));
+        let e = cast_of(Ty::Int, Ty::Json, ints(&[1]));
         assert_eq!(code_of(e), Some(Code::InvalidCast));
     }
 

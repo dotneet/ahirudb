@@ -17,6 +17,24 @@ std = []
 csv = []
 jsonl = []
 
+# --- 更新系（オプトアウト可能） ------------------------------------------
+# 既定で無効。読み取り専用の Source モデル（DESIGN.md §6, §15）には一切
+# 触れない設計にしてある。フィーチャを外せば該当コードごと wasm から
+# 消える（scripts/size.sh が構成ごとの増分を毎回報告する）。
+#
+# - export          : COPY (SELECT ...) TO 'x.csv'/'x.jsonl'
+# - export-parquet  : 同、Parquet 出力（Thrift シリアライザが要るぶん重い）
+# - ddl             : CREATE TABLE / CREATE TABLE AS / DROP TABLE / CREATE VIEW
+#                      （読み取り専用の Source モデルとは別系統の、可変な
+#                      インメモリテーブルにのみ効く。メモリ上のみ、非永続）
+# - dml             : INSERT / UPDATE / DELETE。`ddl` が作るインメモリ
+#                      テーブルにしか効かないので `ddl` を暗黙に含む
+#                      （DESIGN.md §16「DDL/DML の設計」参照）。
+export = []
+export-parquet = ["export"]
+ddl = []
+dml = ["ddl"]
+
 [dependencies]
 # 依存クレートは原則ゼロ。追加時は wasm サイズの実測値を PR に添付すること。
 

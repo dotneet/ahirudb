@@ -16,6 +16,27 @@
 //!
 //! ビルド側はメモリに全部載せる。溢れをディスクに逃がす仕組みは持たない
 //! （既知の制限）。代わりに `MAX_BUILD_BYTES` で頭打ちにして `Oom` を返す。
+//!
+//! ## Semi / Anti
+//!
+//! `IN (SELECT)` / `EXISTS` の書き換え先。出力は**左の列だけ**で、左の 1 行は
+//! 高々 1 回しか出ない。探索の仕組みは共有し、候補ペアを返さずに一致ビット
+//! （`Probe::matched`）だけ立てて、バッチ末尾のドレインで Semi は一致行を、
+//! Anti は未一致行をまとめて出す。
+//!
+//! NULL キーの左行はどのビルド行とも一致しないので、Semi では消え Anti では
+//! 残る。`Anti` は素直に「一致が無ければ出す」だけを行い、SQL の 3 値論理は
+//! 見ない（`NOT EXISTS` の意味論）。
+//!
+//! `NOT IN (SELECT ...)` はこれとは別物で、`AntiNullAware` を使う。DuckDB で
+//! 確かめた 3 値論理は次のとおり:
+//!
+//! - 右のキーに NULL が 1 つでもあれば、どの左行との比較も UNKNOWN。**結果は
+//!   空**（`2 NOT IN (1, NULL)` は真ではなく UNKNOWN）。
+//! - 左のキーが NULL の行は、右が空でない限り UNKNOWN なので出さない。
+//! - 右が空なら `x NOT IN ()` は左が NULL でも真。**全行**を出す。
+//!
+//! どちらを使うかはバインダが決める。オペレータは渡された `kind` に従うだけ。
 
 use crate::exec::rowkey::{encode_key, key_has_null, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
@@ -68,9 +89,15 @@ pub struct HashJoin {
     left_types: Vec<Ty>,
     right_types: Vec<Ty>,
 
-    /// `kind` はこの 2 つのフラグにしか効かないので、そのまま持たずに畳む。
-    /// 未一致の左行を NULL 拡張して出すか（LEFT / FULL）。
+    /// `kind` はこれらのフラグにしか効かないので、そのまま持たずに畳む。
+    /// 未一致の左行を出すか（LEFT / FULL は NULL 拡張、ANTI は左列だけ）。
     emit_unmatched_left: bool,
+    /// 一致した左行を（結合ペアではなく）1 回だけ出すか（SEMI）。
+    emit_matched_left: bool,
+    /// 出力が左の列だけか（SEMI / ANTI / ANTI NULL AWARE）。
+    left_only: bool,
+    /// `NOT IN` の 3 値論理を再現するか（ANTI NULL AWARE）。
+    null_aware: bool,
     /// 未一致のビルド行を NULL 拡張して出すか（RIGHT / FULL）。
     emit_unmatched_right: bool,
 
@@ -86,6 +113,8 @@ pub struct HashJoin {
     next: Vec<u32>,
     /// ビルド行ごとの一致フラグ。RIGHT/FULL のときだけ確保する。
     build_matched: Bitmap,
+    /// ビルド側のキーに NULL を含む行があったか。ANTI NULL AWARE でだけ使う。
+    build_has_null: bool,
     /// `encode_key` の書き込み先。行ごとに確保しないよう使い回す。
     keybuf: Vec<u8>,
     probe: Option<Probe>,
@@ -116,7 +145,15 @@ impl HashJoin {
             residual,
             left_types,
             right_types,
-            emit_unmatched_left: matches!(kind, JoinKind::Left | JoinKind::Full),
+            // ANTI は「一致しなかった左行」を出すので LEFT と同じ側に置く。
+            // 違いは右の列を並べないことだけ（`left_only`）。
+            emit_unmatched_left: matches!(
+                kind,
+                JoinKind::Left | JoinKind::Full | JoinKind::Anti | JoinKind::AntiNullAware
+            ),
+            emit_matched_left: kind == JoinKind::Semi,
+            left_only: kind.is_semi(),
+            null_aware: kind == JoinKind::AntiNullAware,
             emit_unmatched_right: matches!(kind, JoinKind::Right | JoinKind::Full),
             phase: Phase::Building,
             build_cols,
@@ -125,6 +162,7 @@ impl HashJoin {
             index: HashIndex::new(),
             next: Vec::new(),
             build_matched: Bitmap::new(),
+            build_has_null: false,
             keybuf: Vec::new(),
             probe: None,
             drain: 0,
@@ -172,6 +210,9 @@ impl HashJoin {
                 // NULL を含むキーは何とも一致しない（SQL の `=` は NULL 安全でない）
                 // ので表に入れない。行自体は残るので OUTER の未一致ドレインには出る。
                 if key_has_null(&refs, r) {
+                    // `NOT IN` だけは「右に NULL があるかどうか」自体が答えを
+                    // 変えるので、見たことを覚えておく。
+                    self.build_has_null = true;
                     continue;
                 }
                 encode_key(&refs, r, &mut self.keybuf);
@@ -231,6 +272,14 @@ impl HashJoin {
             let rows = p.batch.num_rows();
             let refs: Vec<&Vector> = p.keys.iter().collect();
             while lidx.len() < BATCH_SIZE && p.row < rows {
+                // SEMI / ANTI は「一致が 1 つでもあるか」しか要らない。一致が
+                // 確定した左行は残りのチェーンを辿らずに打ち切る。`matched` は
+                // residual を通ったペアでしか立たないので早すぎることはない。
+                if self.left_only && p.matched.get(p.row) {
+                    p.row += 1;
+                    p.cursor = None;
+                    continue;
+                }
                 let cur = match p.cursor {
                     Some(c) => c,
                     None => {
@@ -244,6 +293,14 @@ impl HashJoin {
                             }
                         } else if key_has_null(&refs, p.row) {
                             // 探索側も同じ。NULL キーはどのビルド行とも一致しない。
+                            //
+                            // ただし `NOT IN` では「NULL NOT IN (空でない集合)」が
+                            // UNKNOWN なので、この左行も返してはいけない。一致した
+                            // ことにしてドレインの対象から外す（右が空なら
+                            // `NULL NOT IN ()` は真なので、そのときだけ出す）。
+                            if self.null_aware && self.build_rows > 0 {
+                                p.matched.set(p.row, true);
+                            }
                             NONE
                         } else {
                             encode_key(&refs, p.row, &mut self.keybuf);
@@ -279,15 +336,21 @@ impl HashJoin {
                     Some(p) => p,
                     None => err!(Internal),
                 };
-                assemble(
-                    &p.batch.cols,
-                    &self.left_types,
-                    Some(&lidx),
-                    &self.build_cols,
-                    &self.right_types,
-                    Some(&ridx),
-                    lidx.len(),
-                )
+                // SEMI / ANTI はこのバッチを返さない。residual を見ないなら
+                // 組み立てる必要すら無いので行数だけの器で済ませる。
+                if self.left_only && self.residual.is_none() {
+                    Batch::rows_only(lidx.len())
+                } else {
+                    assemble(
+                        &p.batch.cols,
+                        &self.left_types,
+                        Some(&lidx),
+                        &self.build_cols,
+                        &self.right_types,
+                        Some(&ridx),
+                        lidx.len(),
+                    )
+                }
             };
             // residual は「一致した」と数える**前**に適用する。キーは合ったが
             // residual で落ちたペアは一致ではないので、OUTER ではその左行を
@@ -324,6 +387,11 @@ impl HashJoin {
                     }
                 }
             }
+            // SEMI / ANTI は結合ペアを返さない。一致ビットだけ立てて、出力は
+            // 下のドレインでまとめて行う（左行は高々 1 回）。
+            if self.left_only {
+                return Ok(None);
+            }
             match keep {
                 // 候補が全滅した。空バッチは返さず次の塊へ進む。
                 Some(sel) if sel.is_empty() => return Ok(None),
@@ -333,16 +401,19 @@ impl HashJoin {
             return Ok(Some(Step::Ready(out)));
         }
 
-        // --- 候補を出し切った。LEFT/FULL は未一致の左行を NULL 拡張する ------
+        // --- 候補を出し切った。左行そのものを出す段 --------------------------
+        // LEFT/FULL は未一致行を NULL 拡張、ANTI は未一致行を左列だけ、
+        // SEMI は一致行を左列だけ。拾う条件は「一致ビット == emit_matched_left」
+        // の 1 本にまとまる。
         let mut idx: Vec<u32> = Vec::new();
-        if self.emit_unmatched_left {
+        if self.emit_unmatched_left || self.emit_matched_left {
             let p = match self.probe.as_mut() {
                 Some(p) => p,
                 None => err!(Internal),
             };
             let rows = p.batch.num_rows();
             while p.drain < rows && idx.len() < BATCH_SIZE {
-                if !p.matched.get(p.drain) {
+                if p.matched.get(p.drain) == self.emit_matched_left {
                     idx.push(p.drain as u32);
                 }
                 p.drain += 1;
@@ -358,7 +429,8 @@ impl HashJoin {
                 &self.left_types,
                 Some(&idx),
                 &self.build_cols,
-                &self.right_types,
+                // SEMI / ANTI の出力は左のスキーマだけ。
+                if self.left_only { &[] } else { &self.right_types },
                 None,
                 idx.len(),
             ))));
@@ -382,7 +454,13 @@ impl Operator for HashJoin {
                         if self.emit_unmatched_right {
                             self.build_matched = Bitmap::zeros(self.build_rows);
                         }
-                        self.phase = Phase::Probing;
+                        // `NOT IN` で右のキーに NULL があれば、どの左行との比較も
+                        // UNKNOWN になり結果は空。左を 1 行も引かずに終わる。
+                        self.phase = if self.null_aware && self.build_has_null {
+                            Phase::Done
+                        } else {
+                            Phase::Probing
+                        };
                     }
                     // NeedIo / NeedCodec。作りかけのハッシュ表を保ったまま抜ける。
                     other => return Ok(other),
@@ -1176,6 +1254,350 @@ mod tests {
             let mut j = join1(Vec::new(), Vec::new(), kind);
             assert!(run(&mut j).rows.is_empty(), "{kind:?}");
         }
+    }
+
+    // --- SEMI / ANTI --------------------------------------------------------
+
+    /// 出力は左のスキーマだけ。右の列は 1 本も付かない。
+    #[test]
+    fn semi_and_anti_emit_left_columns_only() {
+        let left = || vec![ready(vec![ints(&[Some(1), Some(2)]), strs(&[Some("a"), Some("b")])])];
+        let right = || vec![ready(vec![ints(&[Some(1)]), ints(&[Some(9)])])];
+        let mk = |kind| {
+            HashJoin::new(
+                Mock::script(left()),
+                Mock::script(right()),
+                kind,
+                vec![col_prog(0, Ty::Int)],
+                vec![col_prog(0, Ty::Int)],
+                None,
+                vec![Ty::Int, Ty::Varchar],
+                vec![Ty::Int, Ty::Int],
+            )
+            .unwrap()
+        };
+        let got = run(&mut mk(JoinKind::Semi));
+        assert_eq!(got.rows.len(), 1);
+        assert_eq!(got.rows[0].len(), 2, "左の 2 列だけ");
+        assert_eq!(got.rows[0][0].as_i64(), Some(1));
+        assert_eq!(got.rows[0][1].as_bytes(), Some(&b"a"[..]));
+
+        let got = run(&mut mk(JoinKind::Anti));
+        assert_eq!(got.rows.len(), 1);
+        assert_eq!(got.rows[0].len(), 2);
+        assert_eq!(got.rows[0][0].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn semi_and_anti_with_no_match_and_one_match() {
+        // 右に無い / 1 つだけある。
+        let l = || vec![ints1(&[Some(1), Some(2), Some(3)])];
+        let r = || vec![ints1(&[Some(2)])];
+        assert_eq!(norm(&run(&mut join1(l(), r(), JoinKind::Semi)).rows), vec![vec![Some(2)]]);
+        assert_eq!(
+            norm(&run(&mut join1(l(), r(), JoinKind::Anti)).rows),
+            vec![vec![Some(1)], vec![Some(3)]]
+        );
+
+        // 右が空なら SEMI は 0 行、ANTI は全行。
+        assert!(run(&mut join1(l(), Vec::new(), JoinKind::Semi)).rows.is_empty());
+        assert_eq!(run(&mut join1(l(), Vec::new(), JoinKind::Anti)).rows.len(), 3);
+        // 左が空ならどちらも 0 行。
+        assert!(run(&mut join1(Vec::new(), r(), JoinKind::Semi)).rows.is_empty());
+        assert!(run(&mut join1(Vec::new(), r(), JoinKind::Anti)).rows.is_empty());
+    }
+
+    /// 一致が何個あっても左行は**ちょうど 1 回**しか出ない。
+    #[test]
+    fn semi_emits_a_left_row_at_most_once_with_many_matches() {
+        let many: Vec<Option<i32>> = (0..BATCH_SIZE + 500).map(|_| Some(7)).collect();
+        let got = run(&mut join1(
+            vec![ints1(&[Some(7), Some(7), Some(8)])],
+            vec![ready(vec![ints(&many)])],
+            JoinKind::Semi,
+        ));
+        assert_eq!(norm(&got.rows), vec![vec![Some(7)], vec![Some(7)]], "左の 2 行が 1 回ずつ");
+        assert_eq!(got.batches, 1);
+
+        // ANTI 側も同じ入力で「一致しない 8 だけ」。
+        let many: Vec<Option<i32>> = (0..BATCH_SIZE + 500).map(|_| Some(7)).collect();
+        let got = run(&mut join1(
+            vec![ints1(&[Some(7), Some(7), Some(8)])],
+            vec![ready(vec![ints(&many)])],
+            JoinKind::Anti,
+        ));
+        assert_eq!(norm(&got.rows), vec![vec![Some(8)]]);
+    }
+
+    /// 一致した左行が BATCH_SIZE を超えてもドレインが分割されるだけ。
+    #[test]
+    fn semi_drain_spans_multiple_batches() {
+        let many: Vec<Option<i32>> = (0..BATCH_SIZE as i32 + 10).map(Some).collect();
+        let got = run(&mut join1(
+            vec![ready(vec![ints(&many)])],
+            vec![ready(vec![ints(&many)])],
+            JoinKind::Semi,
+        ));
+        assert_eq!(got.rows.len(), BATCH_SIZE + 10);
+        assert!(got.batches >= 2);
+    }
+
+    /// NULL キーの左行はどのビルド行とも一致しない。SEMI では消え ANTI では残る。
+    /// `NOT IN` の「右に NULL があれば 1 行も返さない」規則はバインダの責務で、
+    /// ここには無い。
+    #[test]
+    fn null_keys_are_dropped_by_semi_and_kept_by_anti() {
+        let l = || vec![ints1(&[None, Some(1), Some(2)])];
+        let r = || vec![ints1(&[None, Some(1)])];
+        assert_eq!(norm(&run(&mut join1(l(), r(), JoinKind::Semi)).rows), vec![vec![Some(1)]]);
+        assert_eq!(
+            norm(&run(&mut join1(l(), r(), JoinKind::Anti)).rows),
+            vec![vec![None], vec![Some(2)]],
+            "右に NULL があっても ANTI は素直に未一致行を返す"
+        );
+    }
+
+    /// residual で唯一の一致が落ちたら、SEMI はその左行を出さず ANTI は出す。
+    #[test]
+    fn residual_that_kills_the_only_match_flips_semi_and_anti() {
+        let mk = |kind| {
+            // 左 (key, v) / 右 (key, w)、residual: 左の v < 右の w
+            HashJoin::new(
+                Mock::script(vec![ready(vec![
+                    ints(&[Some(1), Some(2)]),
+                    ints(&[Some(100), Some(0)]),
+                ])]),
+                Mock::script(vec![ready(vec![
+                    ints(&[Some(1), Some(2)]),
+                    ints(&[Some(5), Some(5)]),
+                ])]),
+                kind,
+                vec![col_prog(0, Ty::Int)],
+                vec![col_prog(0, Ty::Int)],
+                // 結合後スキーマ: 0=左key 1=左v 2=右key 3=右w
+                Some(cmp_prog(1, 3, Ty::Int, OpCode::Lt)),
+                vec![Ty::Int, Ty::Int],
+                vec![Ty::Int, Ty::Int],
+            )
+            .unwrap()
+        };
+        // key=1 は 100 < 5 が偽なので一致なし、key=2 は 0 < 5 で一致。
+        assert_eq!(
+            norm(&run(&mut mk(JoinKind::Semi)).rows),
+            vec![vec![Some(2), Some(0)]],
+            "residual で落ちた左行は SEMI から消える"
+        );
+        assert_eq!(
+            norm(&run(&mut mk(JoinKind::Anti)).rows),
+            vec![vec![Some(1), Some(100)]],
+            "同じ行が ANTI では残る"
+        );
+    }
+
+    /// 等値キーを持たない SEMI（相関 EXISTS の書き換え先）。ネストループ +
+    /// residual でも一致ビットの立ち方は同じ。
+    #[test]
+    fn non_equi_semi_and_anti() {
+        let mk = |kind| {
+            HashJoin::new(
+                Mock::script(vec![ints1(&[Some(1), Some(50)])]),
+                Mock::script(vec![ints1(&[Some(2), Some(9)])]),
+                kind,
+                Vec::new(),
+                Vec::new(),
+                Some(cmp_prog(0, 1, Ty::Int, OpCode::Lt)),
+                vec![Ty::Int],
+                vec![Ty::Int],
+            )
+            .unwrap()
+        };
+        assert_eq!(norm(&run(&mut mk(JoinKind::Semi)).rows), vec![vec![Some(1)]]);
+        assert_eq!(norm(&run(&mut mk(JoinKind::Anti)).rows), vec![vec![Some(50)]]);
+    }
+
+    /// SEMI / ANTI でも中断は素通しで、結果は中断なしと一致する。
+    #[test]
+    fn semi_and_anti_survive_need_io_and_need_codec() {
+        let l = || vec![ints1(&[Some(1), Some(2)]), ints1(&[Some(3), Some(1)])];
+        let r = || vec![ints1(&[Some(1), Some(3)]), ints1(&[Some(1), Some(9)])];
+        for kind in [JoinKind::Semi, JoinKind::Anti] {
+            let clean = run(&mut join1(l(), r(), kind));
+            let noisy = run(&mut join1(
+                vec![
+                    Step::NeedIo,
+                    ints1(&[Some(1), Some(2)]),
+                    Step::NeedCodec,
+                    ints1(&[Some(3), Some(1)]),
+                    Step::NeedIo,
+                ],
+                vec![
+                    ints1(&[Some(1), Some(3)]),
+                    Step::NeedCodec,
+                    Step::NeedIo,
+                    ints1(&[Some(1), Some(9)]),
+                ],
+                kind,
+            ));
+            assert!(noisy.interrupts >= 5, "中断がそのまま伝わっていない");
+            assert_eq!(norm(&noisy.rows), norm(&clean.rows), "{kind:?}");
+        }
+        // 中身も確認。左 1,2,3,1 に対し右は 1,3,1,9。
+        assert_eq!(
+            norm(&run(&mut join1(l(), r(), JoinKind::Semi)).rows),
+            vec![vec![Some(1)], vec![Some(1)], vec![Some(3)]]
+        );
+        assert_eq!(norm(&run(&mut join1(l(), r(), JoinKind::Anti)).rows), vec![vec![Some(2)]]);
+    }
+
+    // --- ANTI NULL AWARE（`NOT IN (SELECT ...)`）----------------------------
+    //
+    // 期待値はすべて DuckDB で確認したもの:
+    //   NULL NOT IN (空)      → 真   （行が残る）
+    //   x    NOT IN (空)      → 真
+    //   NULL NOT IN (非空)    → UNKNOWN（行は消える）
+    //   x    NOT IN (…NULL…)  → UNKNOWN（どの行も消える）
+
+    /// 右のキーに NULL があれば、一致しない左行があっても結果は空。
+    #[test]
+    fn null_aware_anti_is_empty_when_build_side_has_a_null_key() {
+        let got = run(&mut join1(
+            vec![ints1(&[Some(1), Some(2), Some(3)])],
+            vec![ints1(&[Some(1), None])],
+            JoinKind::AntiNullAware,
+        ));
+        assert!(got.rows.is_empty(), "2 と 3 は一致しないが UNKNOWN なので出ない");
+        // 素の ANTI は同じ入力で 2 行返す（違いがここに出る）。
+        let plain = run(&mut join1(
+            vec![ints1(&[Some(1), Some(2), Some(3)])],
+            vec![ints1(&[Some(1), None])],
+            JoinKind::Anti,
+        ));
+        assert_eq!(norm(&plain.rows), vec![vec![Some(2)], vec![Some(3)]]);
+    }
+
+    /// 右に NULL が無ければ素の ANTI と同じ。
+    #[test]
+    fn null_aware_anti_matches_plain_anti_without_nulls() {
+        let l = || vec![ints1(&[Some(1), Some(2)]), ints1(&[Some(3), Some(1)])];
+        let r = || vec![ints1(&[Some(1), Some(9)])];
+        let plain = run(&mut join1(l(), r(), JoinKind::Anti));
+        let aware = run(&mut join1(l(), r(), JoinKind::AntiNullAware));
+        assert_eq!(norm(&aware.rows), norm(&plain.rows));
+        assert_eq!(norm(&aware.rows), vec![vec![Some(2)], vec![Some(3)]]);
+    }
+
+    /// 左のキーが NULL の行は、右が空でなければ落ちる。
+    #[test]
+    fn null_aware_anti_drops_left_rows_with_null_keys() {
+        let got = run(&mut join1(
+            vec![ints1(&[None, Some(2), Some(1)])],
+            vec![ints1(&[Some(1)])],
+            JoinKind::AntiNullAware,
+        ));
+        assert_eq!(norm(&got.rows), vec![vec![Some(2)]], "NULL の左行は UNKNOWN");
+        // 素の ANTI は NULL の左行を残す。
+        let plain = run(&mut join1(
+            vec![ints1(&[None, Some(2), Some(1)])],
+            vec![ints1(&[Some(1)])],
+            JoinKind::Anti,
+        ));
+        assert_eq!(norm(&plain.rows), vec![vec![None], vec![Some(2)]]);
+    }
+
+    /// 右が空なら `NOT IN ()` は常に真。左の NULL 行も含めて全行返す。
+    #[test]
+    fn null_aware_anti_with_empty_build_side_emits_every_left_row() {
+        let got =
+            run(&mut join1(vec![ints1(&[None, Some(2)])], Vec::new(), JoinKind::AntiNullAware));
+        assert_eq!(norm(&got.rows), vec![vec![None], vec![Some(2)]]);
+        // 0 行のバッチしか来ない場合も「右は空」。
+        let got = run(&mut join1(
+            vec![ints1(&[None, Some(2)])],
+            vec![ints1(&[])],
+            JoinKind::AntiNullAware,
+        ));
+        assert_eq!(got.rows.len(), 2);
+    }
+
+    /// 複合キーでは片方の列が NULL でも「キーに NULL がある」。
+    #[test]
+    fn null_aware_anti_looks_at_every_key_column() {
+        let left = vec![ready(vec![ints(&[Some(1), Some(2)]), ints(&[Some(10), Some(20)])])];
+        let right = vec![ready(vec![ints(&[Some(9)]), ints(&[None])])];
+        let ty = vec![Ty::Int, Ty::Int];
+        let got = run(&mut join(left, right, JoinKind::AntiNullAware, 2, ty.clone(), ty));
+        assert!(got.rows.is_empty(), "右のキーに NULL があるので空");
+    }
+
+    /// 短絡しても `Done` に到達する（ぶら下がらない）。左は 1 行も引かない。
+    #[test]
+    fn null_aware_anti_short_circuit_terminates_without_reading_the_left() {
+        let mut j = HashJoin::new(
+            // 左を引いてしまったら分かるように、台本を Ready で埋めておく。
+            Mock::script(vec![ints1(&[Some(1)]), ints1(&[Some(2)])]),
+            Mock::script(vec![ints1(&[None])]),
+            JoinKind::AntiNullAware,
+            vec![col_prog(0, Ty::Int)],
+            vec![col_prog(0, Ty::Int)],
+            None,
+            vec![Ty::Int],
+            vec![Ty::Int],
+        )
+        .unwrap();
+        let mut cat = Catalog::new();
+        let mut vm = Vm::new();
+        for _ in 0..3 {
+            let mut ctx =
+                ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
+            assert!(matches!(j.next(&mut ctx).unwrap(), Step::Done));
+        }
+    }
+
+    /// 中断を挟んでも判定が変わらない。
+    #[test]
+    fn null_aware_anti_survives_interrupts() {
+        let l = || vec![ints1(&[Some(1), Some(2)]), ints1(&[None, Some(3)])];
+        let r = || vec![ints1(&[Some(1)]), ints1(&[Some(9)])];
+        let clean = run(&mut join1(l(), r(), JoinKind::AntiNullAware));
+        let noisy = run(&mut join1(
+            vec![
+                Step::NeedIo,
+                ints1(&[Some(1), Some(2)]),
+                Step::NeedCodec,
+                ints1(&[None, Some(3)]),
+            ],
+            vec![ints1(&[Some(1)]), Step::NeedCodec, Step::NeedIo, ints1(&[Some(9)])],
+            JoinKind::AntiNullAware,
+        ));
+        assert!(noisy.interrupts >= 4);
+        assert_eq!(norm(&noisy.rows), norm(&clean.rows));
+        assert_eq!(norm(&clean.rows), vec![vec![Some(2)], vec![Some(3)]]);
+
+        // 右の NULL が 2 バッチ目に来る場合も短絡すること。
+        let got = run(&mut join1(
+            vec![Step::NeedIo, ints1(&[Some(2)])],
+            vec![ints1(&[Some(1)]), Step::NeedIo, ints1(&[None])],
+            JoinKind::AntiNullAware,
+        ));
+        assert!(got.rows.is_empty());
+    }
+
+    /// residual で唯一の一致が落ちれば、NULL 対応 ANTI でも左行は残る。
+    #[test]
+    fn null_aware_anti_respects_the_residual() {
+        let mut j = HashJoin::new(
+            Mock::script(vec![ready(vec![ints(&[Some(1)]), ints(&[Some(100)])])]),
+            Mock::script(vec![ready(vec![ints(&[Some(1)]), ints(&[Some(5)])])]),
+            JoinKind::AntiNullAware,
+            vec![col_prog(0, Ty::Int)],
+            vec![col_prog(0, Ty::Int)],
+            Some(cmp_prog(1, 3, Ty::Int, OpCode::Lt)),
+            vec![Ty::Int, Ty::Int],
+            vec![Ty::Int, Ty::Int],
+        )
+        .unwrap();
+        let got = run(&mut j);
+        assert_eq!(norm(&got.rows), vec![vec![Some(1), Some(100)]]);
     }
 
     #[test]

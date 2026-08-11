@@ -47,6 +47,14 @@ pub enum Code {
     NotGrouped = 408,
     UnsupportedFeature = 409,
     DuplicateTable = 410,
+    /// INSERT の値の個数が列の個数と合わない（`ddl`/`dml`）。
+    ColumnCountMismatch = 411,
+    /// Parquet/CSV/JSONL 由来の読み取り専用テーブルに DDL/DML を試みた
+    /// （`ddl`/`dml`）。
+    ReadOnlyTable = 412,
+    /// `ALTER TABLE ... ADD COLUMN`/`RENAME COLUMN` の結果、列名が同一表内で
+    /// 重複する（`ddl`）。
+    DuplicateColumn = 413,
 
     // 5xx: 実行時
     Oom = 500,
@@ -54,6 +62,10 @@ pub enum Code {
     DivideByZero = 502,
     ValueOutOfRange = 503,
     IoFailed = 504,
+    /// `WITH RECURSIVE` の不動点反復が上限回数に達した（`exec::recursive`
+    /// の `MAX_RECURSIVE_ITERATIONS`）。終端しない再帰 CTE を有限時間で
+    /// 確実に止めるための安全弁。
+    RecursionLimitExceeded = 505,
 
     // 9xx: 内部矛盾（バグ）
     Internal = 900,
@@ -132,7 +144,11 @@ impl Error {
             UnsupportedEncoding => "unsupported parquet encoding",
             UnsupportedCodec => "unsupported compression codec",
             UnsupportedType => "unsupported parquet type",
-            UnsupportedNested => "nested types (LIST/MAP/STRUCT) are not supported",
+            // LIST/MAP/STRUCT 自体は対応済み（parquet::nested の Dremel 組み立て、
+            // または STRUCT のドット区切りフラット化）。ここに来るのは、壊れた/
+            // 敵対的なスキーマ（子数と実要素数の不一致、物理型を持たないリーフ、
+            // リーフ数の上限超過など）を検出したときだけ。
+            UnsupportedNested => "malformed or oversized nested parquet schema",
             EncryptionUnsupported => "encrypted parquet files are not supported",
             SyntaxError => "syntax error",
             UnexpectedToken => "unexpected token",
@@ -150,11 +166,15 @@ impl Error {
             NotGrouped => "column must appear in GROUP BY",
             UnsupportedFeature => "unsupported SQL feature",
             DuplicateTable => "table already registered",
+            ColumnCountMismatch => "number of values does not match number of columns",
+            ReadOnlyTable => "table is read-only (not created by CREATE TABLE)",
+            DuplicateColumn => "column already exists",
             Oom => "out of memory",
             LimitExceeded => "resource limit exceeded",
             DivideByZero => "division by zero",
             ValueOutOfRange => "value out of range",
             IoFailed => "io failed",
+            RecursionLimitExceeded => "recursive CTE exceeded the maximum number of iterations",
             Internal => "internal error",
         }
     }

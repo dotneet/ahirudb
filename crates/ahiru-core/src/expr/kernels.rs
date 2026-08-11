@@ -17,9 +17,11 @@
 //! validity の AND で、値の中身は NULL 行では意味を持たない。例外は三値論理の
 //! `AND`/`OR`（`logic`）とゼロ除算（値と同時に NULL を立てる）。
 
-use crate::expr::OpCode;
+use crate::expr::{funcs, OpCode};
 use crate::prelude::*;
-use crate::vector::{Bitmap, BytesData, Data, PhysType, Ty, Vector};
+use crate::vector::{
+    pack_interval, unpack_interval, Bitmap, BytesData, Data, PhysType, Ty, Vector,
+};
 
 /// 1 日のマイクロ秒。DATE(I32,日) ↔ TIMESTAMP(I64,マイクロ秒)。
 const MICROS_PER_DAY: i128 = 86_400_000_000;
@@ -685,7 +687,7 @@ fn rescale_i128(x: i128, mul: i128, div: i128, floor: bool) -> Option<i128> {
 }
 
 /// 符号なし絶対値 + スケールで 10 進表記する。`format!` は使えない（サイズ）。
-fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
+pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
     let mut buf = [0u8; 48];
     let mut k = 0usize;
     if u == 0 {
@@ -715,7 +717,7 @@ fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
 
 /// f64 の 10 進表記。最短往復表現（Ryu/Grisu）はサイズが重いので採らず、
 /// 15 桁に丸めて末尾 0 を落とす近似表記にする。
-fn fmt_f64(x: f64, out: &mut Vec<u8>) {
+pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
     if x.is_nan() {
         out.extend_from_slice(b"NaN");
         return;
@@ -907,9 +909,60 @@ fn parse_bool(s: &[u8]) -> Option<bool> {
     }
 }
 
+/// `VARCHAR → JSON`。各行を `crate::json::validate` で検証する。
+///
+/// ここだけ他の CAST と違い、行単位の失敗の扱いが `CAST`/`TRY_CAST` で
+/// 分かれる: `lenient == false`（通常の `CAST`）は不正な JSON をエラーに
+/// する（DuckDB の実測 `CAST('not json' AS JSON)` がエラーになる挙動に
+/// 合わせた）。`lenient == true`（`TRY_CAST`）はその行だけ NULL にする
+/// （他の型の TRY_CAST・行単位パース失敗と同じ規則に揃える）。
+/// 他の CAST 全般は「行単位の失敗は常に NULL、CAST/TRY_CAST で差が無い」
+/// 設計だが、JSON はドキュメント全体が壊れているかどうかの 2 値しか
+/// 無いため、DuckDB の実際の挙動に寄せてここだけ例外にした。
+fn cast_str_to_json(a: &Vector, lenient: bool) -> Result<Vector> {
+    let n = a.len();
+    let sv = a.bytes();
+    let mut out = BytesData::with_capacity(n, sv.data.len());
+    let mut bad: Option<Bitmap> = None;
+    for i in 0..n {
+        if !a.is_valid(i) {
+            out.push_empty();
+            continue;
+        }
+        let s = sv.get(i);
+        if crate::json::validate(s).is_ok() {
+            out.push(s);
+        } else if lenient {
+            out.push_empty();
+            set_null(&mut bad, i, n);
+        } else {
+            err!(InvalidCast);
+        }
+    }
+    Ok(finish(Ty::Json, Data::Bytes(out), a.validity().cloned(), bad))
+}
+
 /// `Cast`。実装していない組み合わせは黙って壊れた値を返さず `InvalidCast`。
 /// 行単位の変換失敗（範囲外・パース不能）はエラーにせず、その行だけ NULL。
+///
+/// `VARCHAR → JSON` だけは例外で、行単位の失敗（妥当な JSON でない）を
+/// `TRY_CAST` のときだけ NULL にする（他の型と違い、通常の `CAST` は
+/// エラーにする。DuckDB の実際の挙動に合わせた意図的な例外。詳細は
+/// [`try_cast`] の doc を参照）。
 pub fn cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
+    cast_impl(from, to, a, false)
+}
+
+/// `TRY_CAST`。ほとんどの型では [`cast`] と完全に同じ（行単位の変換失敗は
+/// どのみち `cast` がエラーにせず NULL にする契約のため）。唯一の違いは
+/// `VARCHAR → JSON` の行単位検証: `CAST` は不正な JSON をエラーにするが、
+/// `TRY_CAST` はその行だけ NULL にする（型ペア自体が非対応の場合は従来どおり
+/// `expr::vm` 側が catch して全行 NULL に落とす）。
+pub fn try_cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
+    cast_impl(from, to, a, true)
+}
+
+fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
     ensure!(a.data().phys() == from.phys(), TypeMismatch);
     let n = a.len();
     if from == to {
@@ -921,6 +974,20 @@ pub fn cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
         for _ in 0..n {
             out.push_null();
         }
+        return Ok(out);
+    }
+    // JSON は fam() だと VARCHAR/BLOB と同じ Bytes 系に丸められてしまうので、
+    // 汎用の (Fam, Fam) マッチに乗せる前に個別に弾く。対応するのは
+    // VARCHAR ↔ JSON のみ（BLOB や数値・日時からの CAST は非対応のまま
+    // `InvalidCast` にする。`to_json` 関数を使うべき、という設計判断）。
+    if to == Ty::Json {
+        ensure!(from == Ty::Varchar, InvalidCast);
+        return cast_str_to_json(a, lenient);
+    }
+    if from == Ty::Json {
+        ensure!(to == Ty::Varchar, InvalidCast);
+        let mut out = a.clone();
+        out.retype(to);
         return Ok(out);
     }
     let src = a.data();
@@ -989,21 +1056,27 @@ pub fn cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
             }
         }
         (Fam::Int, Fam::Str) => {
-            // DATE/TIMESTAMP の文字列化は日付フォーマッタが要るので未対応。
-            ensure!(!from.is_temporal(), InvalidCast);
             let scale = dec_scale(from);
             let is_bool = from == Ty::Boolean;
             let mut buf = Vec::new();
             if let Data::Bytes(d) = &mut data {
                 for i in 0..n {
                     let x = load_i128(src, i);
+                    buf.clear();
                     if is_bool {
-                        d.push(if x != 0 { &b"true"[..] } else { &b"false"[..] });
+                        buf.extend_from_slice(if x != 0 { &b"true"[..] } else { &b"false"[..] });
+                    } else if from.is_temporal() {
+                        // 日付の書式化は funcs 側に置く（パーサと対で使うため）。
+                        let y = x as i64;
+                        match from {
+                            Ty::Date => funcs::fmt_date(y, &mut buf),
+                            Ty::Time => funcs::fmt_time(y, &mut buf),
+                            _ => funcs::fmt_timestamp(y, &mut buf),
+                        }
                     } else {
-                        buf.clear();
                         fmt_int(x.unsigned_abs(), x < 0, scale, &mut buf);
-                        d.push(&buf);
                     }
+                    d.push(&buf);
                 }
             }
         }
@@ -1043,8 +1116,29 @@ pub fn cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
                 }
             }
         }
+        (Fam::Str, Fam::Int) if to.is_temporal() => {
+            // 読めない文字列はエラーにせず、その行だけ NULL（数値パースと同じ）。
+            let sv = a.bytes();
+            for i in 0..n {
+                let b = sv.get(i);
+                let v = match to {
+                    Ty::Date => funcs::parse_date(b),
+                    Ty::Time => funcs::parse_time(b),
+                    _ => funcs::parse_timestamp(b),
+                };
+                let ok = match v {
+                    Some(y) => store_i128(&mut data, y as i128),
+                    None => {
+                        push_default(&mut data);
+                        false
+                    }
+                };
+                if !ok {
+                    set_null(&mut bad, i, n);
+                }
+            }
+        }
         (Fam::Str, Fam::Int) => {
-            ensure!(!to.is_temporal(), InvalidCast);
             let scale = dec_scale(to) as i32;
             let is_bool = to == Ty::Boolean;
             let sv = a.bytes();
@@ -1095,6 +1189,76 @@ fn push_f64(d: &mut Data, f: f64) {
     if let Data::F64(v) = d {
         v.push(f);
     }
+}
+
+// --- INTERVAL 演算 -----------------------------------------------------------
+// 物理型は 3 つとも I128 系だが、フィールド境界を跨ぐ桁上がりを起こしては
+// いけない（`1 month + 3 days` は `4 ...` にはならない）ので、生の i128
+// 二進演算では表現できない。専用カーネルにしてある理由はこれ。
+
+/// TIMESTAMP(I64, マイクロ秒) + INTERVAL(I128)。DATE は呼び出し側が
+/// TIMESTAMP へキャストしてから渡す（DuckDB も DATE ± INTERVAL は
+/// TIMESTAMP を返す）。
+pub fn ts_add_interval(a: &Vector, b: &Vector) -> Result<Vector> {
+    ensure!(a.data().phys() == PhysType::I64 && b.data().phys() == PhysType::I128, TypeMismatch);
+    let (n, sa, sb) = strides2(a.len(), b.len())?;
+    let (av, bv) = (a.i64s(), b.i128s());
+    let mut out = Vec::with_capacity(n);
+    let mut bad = None;
+    for i in 0..n {
+        let (months, days, micros) = unpack_interval(bv[i * sb]);
+        match funcs::add_interval_to_ts(av[i * sa], months, days, micros) {
+            Some(v) => out.push(v),
+            None => {
+                out.push(0);
+                set_null(&mut bad, i, n);
+            }
+        }
+    }
+    Ok(finish(Ty::Timestamp, Data::I64(out), combine_validity(a, sa, b, sb, n), bad))
+}
+
+/// INTERVAL ± INTERVAL。フィールドごとの加算（繰り上がりなし。DuckDB も
+/// `1 month + 3 days` は `1 month 3 days` のまま正規化しない）。
+pub fn interval_add(a: &Vector, b: &Vector) -> Result<Vector> {
+    ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I128, TypeMismatch);
+    let (n, sa, sb) = strides2(a.len(), b.len())?;
+    let (av, bv) = (a.i128s(), b.i128s());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let (m1, d1, u1) = unpack_interval(av[i * sa]);
+        let (m2, d2, u2) = unpack_interval(bv[i * sb]);
+        out.push(pack_interval(m1.wrapping_add(m2), d1.wrapping_add(d2), u1.wrapping_add(u2)));
+    }
+    Ok(finish(Ty::Interval, Data::I128(out), combine_validity(a, sa, b, sb, n), None))
+}
+
+/// INTERVAL の符号反転。フィールドごとに反転する（生の 128bit 二の補数の
+/// 反転は桁境界を跨いで壊れるため使えない）。
+pub fn interval_neg(a: &Vector) -> Result<Vector> {
+    ensure!(a.data().phys() == PhysType::I128, TypeMismatch);
+    let mut out = Vec::with_capacity(a.len());
+    for &packed in a.i128s() {
+        let (m, d, u) = unpack_interval(packed);
+        out.push(pack_interval(m.wrapping_neg(), d.wrapping_neg(), u.wrapping_neg()));
+    }
+    Ok(finish(Ty::Interval, Data::I128(out), a.validity().cloned(), None))
+}
+
+/// INTERVAL * BIGINT。フィールドごとの乗算（繰り上がりなし。DuckDB と同じ）。
+pub fn interval_mul(a: &Vector, b: &Vector) -> Result<Vector> {
+    ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I64, TypeMismatch);
+    let (n, sa, sb) = strides2(a.len(), b.len())?;
+    let (av, bv) = (a.i128s(), b.i64s());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let (m, d, u) = unpack_interval(av[i * sa]);
+        let k = bv[i * sb];
+        let m = (m as i64).wrapping_mul(k) as i32;
+        let d = (d as i64).wrapping_mul(k) as i32;
+        out.push(pack_interval(m, d, u.wrapping_mul(k)));
+    }
+    Ok(finish(Ty::Interval, Data::I128(out), combine_validity(a, sa, b, sb, n), None))
 }
 
 #[cfg(test)]
@@ -1179,5 +1343,109 @@ mod tests {
         assert_eq!(parse_dec(b"abc"), None);
         assert_eq!(parse_dec(b"1.2.3"), None);
         assert_eq!(parse_dec(b"1e"), None);
+    }
+
+    // --- INTERVAL -------------------------------------------------------------
+
+    fn ivec(vals: &[(i32, i32, i64)]) -> Vector {
+        let mut v = Vector::new(Ty::Interval);
+        for &(m, d, u) in vals {
+            v.push_value(&crate::vector::Value::I128(pack_interval(m, d, u)));
+        }
+        v
+    }
+
+    fn tsvec(vals: &[i64]) -> Vector {
+        let mut v = Vector::new(Ty::Timestamp);
+        for &x in vals {
+            v.push_value(&crate::vector::Value::I64(x));
+        }
+        v
+    }
+
+    #[test]
+    fn ts_add_interval_is_calendar_aware() {
+        // 2024-01-31 00:00:00 + 1 month → 2024-02-29（うるう年、月末クランプ）。
+        let jan31 = funcs::days_from_civil(2024, 1, 31) * 86_400_000_000;
+        let a = tsvec(&[jan31]);
+        let b = ivec(&[(1, 0, 0)]);
+        let r = ts_add_interval(&a, &b).unwrap();
+        assert_eq!(r.ty(), Ty::Timestamp);
+        assert_eq!(r.i64s()[0], funcs::days_from_civil(2024, 2, 29) * 86_400_000_000);
+    }
+
+    #[test]
+    fn interval_add_sub_do_not_carry_across_fields() {
+        let a = ivec(&[(1, 0, 0)]);
+        let b = ivec(&[(0, 3, 0)]);
+        let r = interval_add(&a, &b).unwrap();
+        assert_eq!(unpack_interval(r.i128s()[0]), (1, 3, 0));
+
+        let neg = interval_neg(&b).unwrap();
+        assert_eq!(unpack_interval(neg.i128s()[0]), (0, -3, 0));
+    }
+
+    #[test]
+    fn interval_mul_scales_every_field() {
+        let a = ivec(&[(1, 3, 3_600_000_000)]);
+        let mut k = Vector::new(Ty::BigInt);
+        k.push_value(&crate::vector::Value::I64(2));
+        let r = interval_mul(&a, &k).unwrap();
+        assert_eq!(unpack_interval(r.i128s()[0]), (2, 6, 7_200_000_000));
+    }
+
+    // 「整数は wrapping。オーバーフローで panic させない」という設計
+    // （このファイル冒頭の `int_arith!` のコメント参照）は INTERVAL の
+    // フィールドごとの演算にも一貫して適用されている。この境界での
+    // wrapping 挙動をここで固定しておく。
+    #[test]
+    fn interval_neg_of_i32_min_stays_negative_due_to_two_s_complement_wraparound() {
+        // i32::MIN.wrapping_neg() == i32::MIN（正の i32::MAX+1 は表現できない）。
+        // 通常の整数 Neg カーネルと同じ、意図された wrapping 挙動。
+        let a = ivec(&[(i32::MIN, i32::MIN, i64::MIN)]);
+        let r = interval_neg(&a).unwrap();
+        assert_eq!(unpack_interval(r.i128s()[0]), (i32::MIN, i32::MIN, i64::MIN));
+    }
+
+    #[test]
+    fn interval_add_wraps_on_months_and_days_overflow() {
+        let a = ivec(&[(i32::MAX, i32::MAX, 0)]);
+        let b = ivec(&[(1, 1, 0)]);
+        let r = interval_add(&a, &b).unwrap();
+        assert_eq!(unpack_interval(r.i128s()[0]), (i32::MIN, i32::MIN, 0));
+    }
+
+    #[test]
+    fn interval_mul_wraps_without_double_truncation_of_the_multiplier() {
+        // 乗算は i64 の中間精度で行ってから i32 へ切り詰める
+        // （`(m as i64).wrapping_mul(k) as i32`）。k 自体を先に i32 へ
+        // 切り詰めてから掛けるわけではないので、大きな k でも最終結果の
+        // 下位 32bit は一貫して同じ値になる（二重の切り詰めにはならない）。
+        let a = ivec(&[(1_000_000, 0, 0)]);
+        let mut k = Vector::new(Ty::BigInt);
+        k.push_value(&crate::vector::Value::I64(10_000));
+        let r = interval_mul(&a, &k).unwrap();
+        let expect_months = ((1_000_000i64).wrapping_mul(10_000) as i32, 0, 0);
+        assert_eq!(unpack_interval(r.i128s()[0]), expect_months);
+    }
+
+    #[test]
+    fn interval_mul_wraps_on_micros_overflow() {
+        let a = ivec(&[(0, 0, i64::MAX)]);
+        let mut k = Vector::new(Ty::BigInt);
+        k.push_value(&crate::vector::Value::I64(2));
+        let r = interval_mul(&a, &k).unwrap();
+        assert_eq!(unpack_interval(r.i128s()[0]), (0, 0, i64::MAX.wrapping_mul(2)));
+    }
+
+    #[test]
+    fn ts_add_interval_propagates_nulls() {
+        let mut a = Vector::new(Ty::Timestamp);
+        a.push_null();
+        a.push_value(&crate::vector::Value::I64(0));
+        let b = ivec(&[(0, 1, 0), (0, 1, 0)]);
+        let r = ts_add_interval(&a, &b).unwrap();
+        assert!(!r.is_valid(0));
+        assert!(r.is_valid(1));
     }
 }

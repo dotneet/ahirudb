@@ -1,54 +1,63 @@
 # ahirudb
 
-WASM 1MB 以内で動く、Parquet を直接クエリできる軽量 SQL エンジン。
+A lightweight SQL engine that queries Parquet directly, built to run in under 1 MiB of WASM.
 
-DuckDB-WASM は数十 MB（brotli 後でも約 10 MB）ある。ahirudb は「DuckDB を小さく
-する」のではなく、**最初から入れる機能を選ぶ**ことで 1 MiB の予算に収める。
+DuckDB-WASM weighs tens of MB (roughly 10 MB even after brotli). Rather than
+*shrinking* DuckDB, ahirudb fits the 1 MiB budget by **choosing what to include
+from the start**.
 
-設計の全体像は [docs/DESIGN.md](docs/DESIGN.md) を参照。
+See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
 
-## 現在のサイズ
+## Current size
 
-| 構成 | raw | gzip -9 | 予算比 |
+| Configuration | raw | gzip -9 | of budget |
 |---|---:|---:|---:|
-| `ahiru-core.wasm`（Parquet のみ） | 224.5 KiB | 93.5 KiB | 21.9% |
-| `ahiru-core.wasm`（+ CSV + JSONL） | 250.2 KiB | 104.4 KiB | **24.4%** |
-| `ahiru-zstd.wasm`（別モジュール） | 17.8 KiB | 8.3 KiB | 予算外 |
+| `ahiru-core.wasm` (Parquet only) | 377.4 KiB | 169.0 KiB | 36.9% |
+| `ahiru-core.wasm` (+ CSV + JSONL) | 404.9 KiB | 181.1 KiB | **39.5%** |
+| `ahiru-zstd.wasm` (separate module) | 13.3 KiB | 6.9 KiB | outside budget |
 
-`wasm-opt` 未適用の値。適用すればさらに 2〜3 割縮む見込み。
+Figures include `wasm-opt`. The `ddl`/`dml`/`export` write-path features are
+opt-in and excluded from these default numbers — see [DESIGN.md §16](docs/DESIGN.md).
 
-`./scripts/size.sh` で計測する。構成ごとの内訳と、CSV / JSONL を足したときの
-増分も出る。ゲートは**全部入りの構成**で判定する（配布構成を絞れば通る、では
-守れていないため）。1 MiB を超えたら CI が落ちる。
+Measured with `./scripts/size.sh`, which reports a breakdown per configuration
+and the incremental cost of adding CSV / JSONL. The gate is judged on the
+**fully-loaded configuration** (passing only with a trimmed distribution
+wouldn't actually enforce the budget). CI fails if it exceeds 1 MiB.
 
-## 実装状況
+## Supported features
 
-| 領域 | 状態 |
-|---|---|
-| フォーマット抽象化（`TableFormat`） | 完了 |
-| Thrift Compact / Parquet メタデータ | 完了 |
-| スキーマ解決（論理型・変換型・INT96・DECIMAL） | 完了（ネスト型は明示的に非対応） |
-| ページデコーダ（PLAIN / RLE / 辞書 / DELTA 系） | 完了 |
-| 圧縮（UNCOMPRESSED / SNAPPY / LZ4_RAW） | 完了 |
-| 圧縮（GZIP はホスト委譲 / ZSTD は別モジュール） | 完了（コーデック委譲プロトコル） |
-| SQL トークナイザ / Pratt パーサ | 完了 |
-| バインダ・射影プッシュダウン・統計プルーニング | 完了 |
-| 式バイトコード VM・カーネル | 完了 |
-| Scan / Filter / Project / Limit | 完了 |
-| CSV / TSV | 完了（フィーチャ `csv`） |
-| JSONL | 完了（フィーチャ `jsonl`） |
-| 集約（GROUP BY / HAVING / DISTINCT） | 完了 |
-| ソート（ORDER BY / Top-N） | 完了 |
-| 結合（INNER / LEFT / RIGHT / FULL / CROSS / 非等値） | 完了 |
-| wasm ABI | 完了 |
-| JS ホスト層 | 完了（Node/ブラウザ、レンジ取得・キャッシュ・コーデック委譲） |
-| ZSTD 別モジュール（`ahiru-zstd`） | 完了（17.8 KiB、遅延ロード） |
-| FROM 句の派生表 | 完了 |
-| スカラ関数 / ウィンドウ関数 | 未着手 |
+**Formats (read)**
+- Parquet — Thrift Compact metadata, PLAIN / RLE / dictionary / DELTA page encodings, UNCOMPRESSED / SNAPPY / LZ4_RAW natively, GZIP via host delegation, ZSTD via a separate lazily-loaded module
+- CSV / TSV (feature `csv`), JSONL/NDJSON (feature `jsonl`), single-document JSON arrays (`read_json`/`read_json_auto`-style)
+- glob / multi-file tables, Hive-style partition directories (`year=2024/month=01/...`), automatically exposed and filterable as virtual columns
+- Nested Parquet columns (`STRUCT`, `LIST`, `MAP`) — `STRUCT` is flattened into dotted column names where possible; `LIST`/`MAP` (and `STRUCT` containing them) are exposed as a `JSON`-typed column
+- Pushdown: projection pushdown, statistics-based RowGroup pruning, page-level pruning via ColumnIndex/OffsetIndex, Split Block Bloom Filters
 
-## 使い方（ネイティブ CLI）
+**SQL**
+- Joins: `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS`, non-equi, correlated and uncorrelated subqueries (`EXISTS` / `IN` / scalar), `UNNEST` (in the `SELECT` list and, implicitly lateral, in `FROM`)
+- Aggregation: `GROUP BY` / `HAVING` / `DISTINCT` / `FILTER (WHERE ...)`, `GROUPING SETS` / `ROLLUP` / `CUBE`, statistical aggregates (`stddev`, `variance`, `median`, `mode`, `approx_count_distinct`), `string_agg` / `array_agg`
+- Window functions with `ROWS`/`RANGE` frames, `QUALIFY`
+- `WITH` (CTEs, including `WITH RECURSIVE`), `UNION` / `INTERSECT` / `EXCEPT`
+- `DISTINCT ON`, `ILIKE`, `TRY_CAST`, `IIF`, regular expressions (`regexp_matches` / `regexp_extract` / `regexp_replace`)
+- `JSON` type with path operators (`->`, `->>`, `json_extract`, `json_type`, `json_array_length`, `json_object`, `json_array`, `list_extract`, `map_extract`, ...) — `LIST`/`MAP` values share this same representation
+- `DATE` / `TIME` / `TIMESTAMP` / `INTERVAL` arithmetic, `DECIMAL` with correct scale propagation
+- `DESCRIBE`, `SHOW TABLES`, `EXPLAIN`
 
-開発とテストはネイティブで回す。wasm 越しのデバッグは効率が悪いため。
+**Write path (opt-in, off by default — see [DESIGN.md §16](docs/DESIGN.md))**
+- `CREATE TABLE` / `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`) / `DROP TABLE`, `CREATE VIEW` / `DROP VIEW` — feature `ddl`, effective only on in-memory tables created this way, never on file-backed tables
+- `INSERT` / `UPDATE` / `DELETE` — feature `dml`
+- `COPY (SELECT ...) TO 'file' (FORMAT csv|jsonl)` and the underlying `TableSink`/`export_all` API — feature `export`. The core never touches a filesystem itself; `ahiru-cli` performs the actual file write
+
+**Runtime**
+- wasm ABI + split-boundary I/O barrier (the engine never blocks; it returns the exact byte ranges it needs and resumes when they're supplied)
+- JS host layer (Node and browser): range-request coalescing, LRU byte caching, codec delegation (GZIP via `DecompressionStream`, ZSTD via `ahiru-zstd`)
+- Native `ahiru-cli` for development, testing, and scripting
+
+**Known gaps**: `PIVOT`/`UNPIVOT`, `ASOF JOIN`, general `LATERAL` (beyond `UNNEST`), `CREATE MACRO`, sequences/constraints, transactions, `ATTACH`, named parameters. See [docs/DESIGN.md §15](docs/DESIGN.md) for the full list of intentional limitations.
+
+## Usage (native CLI)
+
+Development and testing run natively; debugging through wasm is inefficient.
 
 ```bash
 cargo run -p ahiru-cli -- schema tests/data/basic.parquet
@@ -62,42 +71,44 @@ cargo run -p ahiru-cli -- dump tests/data/basic.parquet 10
 cargo run -p ahiru-cli -- query tests/data/basic.parquet "SELECT name, count(*) c FROM t GROUP BY name ORDER BY c DESC"
 ```
 
-複数ファイルを渡すと `t`, `t2`, ... として結合できる。
+Passing multiple files binds them as `t`, `t2`, ... so they can be joined.
 
 ```bash
 cargo run -p ahiru-cli -- query tests/data/small_a.parquet tests/data/small_b.parquet "SELECT a.k, b.w FROM t AS a LEFT JOIN t2 AS b ON a.k = b.k ORDER BY a.k"
 ```
 
-## テスト
+## Tests
 
 ```bash
 cargo test
 ```
 
-テストデータは DuckDB CLI で生成している。
+Test data is generated with the DuckDB CLI.
 
-SQL のエンドツーエンドテスト（`crates/ahiru-cli/tests/sql_e2e.rs`）は**期待値を
-書かず、同じクエリを DuckDB でも実行して突き合わせる**。手で書いた期待値は
-書き間違いがそのまま仕様になってしまうし、クエリを増やすたびに手計算が要る。
-DuckDB を参照実装として使えば、クエリを 1 行足すだけで検証が増える。
-DuckDB が入っていない環境では該当テストを飛ばす。
+The SQL end-to-end tests (`crates/ahiru-cli/tests/sql_e2e.rs`) **don't hardcode
+expected values — the same query is run against DuckDB and the results are
+compared**. Hand-written expected values would silently turn a typo into the
+spec, and every new query would need its expectation computed by hand. Using
+DuckDB as the reference implementation means adding one line adds one more
+verified case. On environments without DuckDB installed, those tests are skipped.
 
-## サイズ計測
+## Size measurement
 
 ```bash
 ./scripts/size.sh
 ```
 
-`wasm-opt`（binaryen）と `twiggy` が入っていれば、最適化後のサイズと関数ごとの
-内訳も出る。
+With `wasm-opt` (binaryen) and `twiggy` installed, it also reports the
+optimized size and a function-by-function breakdown.
 
-## 制限
+## Limitations
 
-意図的に残している制限は [docs/DESIGN.md §15](docs/DESIGN.md) にまとめてある。
-要点だけ挙げると、スピルしない（上限超過は明示エラー）、ネスト型は非対応、
-スカラ関数とウィンドウ関数は未実装。丸めの取り決め（浮動小数→整数は偶数丸め、
-DECIMAL のスケール縮小は 0 から遠ざかる丸め）も同じ節に書いてある。
+Intentional limitations are catalogued in [docs/DESIGN.md §15](docs/DESIGN.md).
+In short: no spilling (exceeding the memory budget is a hard error), and the
+gaps listed under "Known gaps" above. Rounding conventions (float-to-integer
+uses round-half-to-even; DECIMAL scale reduction rounds away from zero) are in
+the same section.
 
-## ライセンス
+## License
 
-MIT OR Apache-2.0
+MIT

@@ -85,16 +85,10 @@ pub fn read_column_chunk(
 
         match hdr.ptype {
             PageType::DictionaryPage => {
-                let d = hdr.dict_page.as_ref().ok_or(err_at(Code::BadPageHeader, pos))?;
-                let n = check_count(d.num_values)?;
-                let page = decompress(meta.codec, raw, hdr.uncompressed_page_size, raw_off, cache)?;
-                let mut v = Vector::with_capacity(desc.ty, n);
-                decode_plain(desc, &page, n, &mut v)?;
-                ensure!(v.len() == n, BadCompressedData, pos);
-                dict = Some(v);
+                dict = Some(decode_dictionary_page(desc, meta, &hdr, raw, raw_off, cache)?);
             }
-            PageType::DataPage => {
-                rows_done += read_data_page_v1(
+            _ => {
+                rows_done += decode_one_page(
                     desc,
                     meta,
                     &hdr,
@@ -106,21 +100,6 @@ pub fn read_column_chunk(
                     cache,
                 )?;
             }
-            PageType::DataPageV2 => {
-                rows_done += read_data_page_v2(
-                    desc,
-                    meta,
-                    &hdr,
-                    raw,
-                    raw_off,
-                    dict.as_ref(),
-                    &mut out,
-                    &mut validity,
-                    cache,
-                )?;
-            }
-            // 実際には書かれないページ種別。読み飛ばす。
-            PageType::IndexPage => {}
         }
     }
 
@@ -133,11 +112,130 @@ pub fn read_column_chunk(
     Ok(out)
 }
 
-fn err_at(code: Code, pos: usize) -> Error {
+/// ページヘッダに応じてデータページ (v1/v2) を 1 枚デコードし、追加した行数を
+/// 返す。`IndexPage` は実際には書かれない種別なので何もしない。辞書ページは
+/// 呼び出し側が別扱いする（デコード結果を後続ページが参照するため）。
+#[allow(clippy::too_many_arguments)]
+fn decode_one_page(
+    desc: &ColumnDesc,
+    meta: &ColumnMetaData,
+    hdr: &PageHeader,
+    raw: &[u8],
+    raw_off: u64,
+    dict: Option<&Vector>,
+    out: &mut Vector,
+    validity: &mut Option<Bitmap>,
+    cache: &dyn PageCache,
+) -> Result<usize> {
+    match hdr.ptype {
+        PageType::DataPage => {
+            read_data_page_v1(desc, meta, hdr, raw, raw_off, dict, out, validity, cache)
+        }
+        PageType::DataPageV2 => {
+            read_data_page_v2(desc, meta, hdr, raw, raw_off, dict, out, validity, cache)
+        }
+        // 実際には書かれないページ種別。読み飛ばす。
+        PageType::IndexPage => Ok(0),
+        PageType::DictionaryPage => err!(BadPageHeader),
+    }
+}
+
+pub(crate) fn decode_dictionary_page(
+    desc: &ColumnDesc,
+    meta: &ColumnMetaData,
+    hdr: &PageHeader,
+    raw: &[u8],
+    raw_off: u64,
+    cache: &dyn PageCache,
+) -> Result<Vector> {
+    let d = hdr.dict_page.as_ref().ok_or(err_at(Code::BadPageHeader, 0))?;
+    let n = check_count(d.num_values)?;
+    let page = decompress(meta.codec, raw, hdr.uncompressed_page_size, raw_off, cache)?;
+    let mut v = Vector::with_capacity(desc.ty, n);
+    decode_plain(desc, &page, n, &mut v)?;
+    ensure!(v.len() == n, BadCompressedData, 0);
+    Ok(v)
+}
+
+/// ページ選択によって絞り込まれた、非連続なページ集合だけを読み、
+/// `(値ベクタ, 各行の RowGroup 内絶対行番号)` を返す。
+///
+/// `read_column_chunk` が「列チャンク全体が 1 本の連続バイト列」を前提に
+/// ヘッダを逐次走査するのに対し、こちらは `OffsetIndex` が示す個々のページの
+/// バイト範囲を呼び出し側（`format::parquet`）が個別に取得済みである前提で、
+/// 各ページを独立にデコードする。ページ境界は行境界と一致する
+/// （v1 はフラットスキーマのみなので 1 ページ = 連続した行の集まり）ため、
+/// `first_row_index` から各行の絶対位置をそのまま導出できる。
+///
+/// `dict_buf` は辞書ページの `(ページヘッダ込みの生バイト列, ファイル上の
+/// 開始オフセット)`。`pages` は `(ページヘッダ込みの生バイト列, 開始
+/// オフセット, そのページの先頭行の RowGroup 内絶対行番号)` を行番号昇順で
+/// 並べたもの。
+pub fn read_selected_pages(
+    desc: &ColumnDesc,
+    meta: &ColumnMetaData,
+    dict_buf: Option<(&[u8], u64)>,
+    pages: &[(&[u8], u64, i64)],
+    cache: &dyn PageCache,
+) -> Result<(Vector, Vec<u64>)> {
+    let mut dict: Option<Vector> = None;
+    if let Some((buf, start)) = dict_buf {
+        ensure!(!buf.is_empty(), UnexpectedEof, 0);
+        let (hdr, hlen) = decode_page_header(buf)?;
+        ensure!(hdr.ptype == PageType::DictionaryPage, BadPageHeader, 0);
+        let clen = hdr.compressed_page_size as usize;
+        ensure!(clen <= buf.len() - hlen, UnexpectedEof, hlen);
+        let raw = &buf[hlen..hlen + clen];
+        let raw_off = start + hlen as u64;
+        dict = Some(decode_dictionary_page(desc, meta, &hdr, raw, raw_off, cache)?);
+    }
+
+    let cap = pages.len().max(1);
+    let mut out = Vector::with_capacity(desc.ty, cap);
+    let mut validity = if desc.max_def_level > 0 { Some(Bitmap::with_capacity(cap)) } else { None };
+    let mut abs_rows: Vec<u64> = Vec::with_capacity(cap);
+
+    for &(buf, start, first_row) in pages {
+        ensure!(!buf.is_empty(), UnexpectedEof, 0);
+        ensure!(first_row >= 0, BadPageHeader, 0);
+        let (hdr, hlen) = decode_page_header(buf)?;
+        ensure!(hdr.ptype != PageType::DictionaryPage, BadPageHeader, 0);
+        let clen = hdr.compressed_page_size as usize;
+        ensure!(clen <= buf.len() - hlen, UnexpectedEof, hlen);
+        let raw = &buf[hlen..hlen + clen];
+        let raw_off = start + hlen as u64;
+        let before = out.len();
+        decode_one_page(
+            desc,
+            meta,
+            &hdr,
+            raw,
+            raw_off,
+            dict.as_ref(),
+            &mut out,
+            &mut validity,
+            cache,
+        )?;
+        let added = out.len() - before;
+        for k in 0..added {
+            abs_rows.push(first_row as u64 + k as u64);
+        }
+    }
+
+    if let Some(v) = validity {
+        debug_assert_eq!(v.len(), out.len());
+        out.set_validity(Some(v));
+        out.compact_validity();
+    }
+    ensure!(abs_rows.len() == out.len(), Internal, 0);
+    Ok((out, abs_rows))
+}
+
+pub(crate) fn err_at(code: Code, pos: usize) -> Error {
     Error::at(code, pos)
 }
 
-fn check_count(n: i32) -> Result<usize> {
+pub(crate) fn check_count(n: i32) -> Result<usize> {
     ensure!(n >= 0 && (n as usize) <= MAX_PAGE_VALUES, BadPageHeader);
     Ok(n as usize)
 }
@@ -146,7 +244,7 @@ fn check_count(n: i32) -> Result<usize> {
 ///
 /// 内蔵していないコーデックはホストに委譲済みのはずなので、キャッシュから引く。
 /// 引けなければ呼び出し順序の誤り（`codec_pages` で要求を出していない）。
-fn decompress<'a>(
+pub(crate) fn decompress<'a>(
     codec: Compression,
     raw: &'a [u8],
     out_len: i32,
@@ -255,7 +353,7 @@ fn read_data_page_v2(
     Ok(n)
 }
 
-fn check_len(v: i32) -> Result<usize> {
+pub(crate) fn check_len(v: i32) -> Result<usize> {
     ensure!(v >= 0, BadPageHeader);
     Ok(v as usize)
 }
@@ -299,7 +397,7 @@ fn decode_and_append(
 }
 
 /// エンコーディングに応じて密な値列を作る。
-fn decode_dense(
+pub(crate) fn decode_dense(
     desc: &ColumnDesc,
     enc: Encoding,
     data: &[u8],
@@ -692,7 +790,7 @@ fn append_scattered(
     Ok(())
 }
 
-fn append_all(out: &mut Vector, src: &Vector, n: usize) -> Result<()> {
+pub(crate) fn append_all(out: &mut Vector, src: &Vector, n: usize) -> Result<()> {
     ensure!(src.len() == n, BadCompressedData);
     match (out.data_mut(), src.data()) {
         (Data::I32(o), Data::I32(s)) => o.extend_from_slice(s),
@@ -737,27 +835,7 @@ pub fn collect_codec_pages(
         ensure!(clen <= buf.len() - pos, UnexpectedEof, pos);
         let raw_off = chunk_start + pos as u64;
 
-        // v2 はレベルが非圧縮で先頭に載るので、その分を除いた範囲だけを委譲する。
-        let (off, len, out_len) = match (&hdr.data_page_v2, hdr.ptype) {
-            (Some(dp), PageType::DataPageV2) => {
-                let skip = check_len(dp.repetition_levels_byte_length)?
-                    + check_len(dp.definition_levels_byte_length)?;
-                ensure!(skip <= clen, BadPageHeader);
-                if !dp.is_compressed {
-                    (0, 0, 0)
-                } else {
-                    (
-                        raw_off + skip as u64,
-                        (clen - skip) as u32,
-                        (hdr.uncompressed_page_size as usize).saturating_sub(skip) as u32,
-                    )
-                }
-            }
-            _ => (raw_off, clen as u32, hdr.uncompressed_page_size.max(0) as u32),
-        };
-        if len > 0 {
-            out.push(CodecPage { codec: meta.codec, offset: off, len, out_len });
-        }
+        push_codec_page(meta, &hdr, raw_off, clen, out)?;
 
         match hdr.ptype {
             PageType::DataPage => {
@@ -771,6 +849,100 @@ pub fn collect_codec_pages(
         pos += clen;
     }
     Ok(())
+}
+
+/// `collect_codec_pages` の入れ子列向け版。REPEATED 列は 1 ページの値数が
+/// 行数と一致しない（配列の要素数ぶん増減する）ので、`num_rows` 到達では
+/// なく「列チャンクのバイト列を使い切ったか」でループを終える。
+pub fn collect_codec_pages_all(
+    meta: &ColumnMetaData,
+    buf: &[u8],
+    chunk_start: u64,
+    out: &mut Vec<CodecPage>,
+) -> Result<()> {
+    if meta.codec.is_builtin() {
+        return Ok(());
+    }
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let (hdr, hlen) = decode_page_header(&buf[pos..])?;
+        pos += hlen;
+        let clen = hdr.compressed_page_size as usize;
+        ensure!(clen <= buf.len().saturating_sub(pos), UnexpectedEof, pos);
+        let raw_off = chunk_start + pos as u64;
+        push_codec_page(meta, &hdr, raw_off, clen, out)?;
+        pos += clen;
+    }
+    Ok(())
+}
+
+/// 1 ページぶんのヘッダから、必要ならホスト委譲エントリを `out` に積む。
+/// `collect_codec_pages`（連続バッファの逐次走査）と
+/// `collect_codec_pages_selected`（ページ選択後の非連続バッファ群）の
+/// 両方が共有する本体部分。
+fn push_codec_page(
+    meta: &ColumnMetaData,
+    hdr: &PageHeader,
+    raw_off: u64,
+    clen: usize,
+    out: &mut Vec<CodecPage>,
+) -> Result<()> {
+    // v2 はレベルが非圧縮で先頭に載るので、その分を除いた範囲だけを委譲する。
+    let (off, len, out_len) = match (&hdr.data_page_v2, hdr.ptype) {
+        (Some(dp), PageType::DataPageV2) => {
+            let skip = check_len(dp.repetition_levels_byte_length)?
+                + check_len(dp.definition_levels_byte_length)?;
+            ensure!(skip <= clen, BadPageHeader);
+            if !dp.is_compressed {
+                (0, 0, 0)
+            } else {
+                (
+                    raw_off + skip as u64,
+                    (clen - skip) as u32,
+                    (hdr.uncompressed_page_size as usize).saturating_sub(skip) as u32,
+                )
+            }
+        }
+        _ => (raw_off, clen as u32, hdr.uncompressed_page_size.max(0) as u32),
+    };
+    if len > 0 {
+        out.push(CodecPage { codec: meta.codec, offset: off, len, out_len });
+    }
+    Ok(())
+}
+
+/// ページ選択後の非連続なページ集合から、ホストに展開を委譲すべきページを
+/// 列挙する。`collect_codec_pages` のページ選択版。`dict` は辞書ページの
+/// `(生バイト列, 開始オフセット)`、`pages` は各データページの同じ組。
+pub fn collect_codec_pages_selected(
+    meta: &ColumnMetaData,
+    dict: Option<(&[u8], u64)>,
+    pages: &[(&[u8], u64)],
+    out: &mut Vec<CodecPage>,
+) -> Result<()> {
+    if meta.codec.is_builtin() {
+        return Ok(());
+    }
+    if let Some((buf, start)) = dict {
+        push_codec_page_for(meta, buf, start, out)?;
+    }
+    for &(buf, start) in pages {
+        push_codec_page_for(meta, buf, start, out)?;
+    }
+    Ok(())
+}
+
+fn push_codec_page_for(
+    meta: &ColumnMetaData,
+    buf: &[u8],
+    start: u64,
+    out: &mut Vec<CodecPage>,
+) -> Result<()> {
+    ensure!(!buf.is_empty(), UnexpectedEof, 0);
+    let (hdr, hlen) = decode_page_header(buf)?;
+    let clen = hdr.compressed_page_size as usize;
+    ensure!(clen <= buf.len() - hlen, UnexpectedEof, hlen);
+    push_codec_page(meta, &hdr, start + hlen as u64, clen, out)
 }
 
 /// `BytesData` を直接触る必要がある箇所のための再エクスポート。
@@ -811,6 +983,9 @@ mod tests {
             ptype: PType::Int96,
             type_length: 0,
             time_unit: None,
+            phys_cols: Vec::new(),
+            leaves: Vec::new(),
+            nested: None,
         };
         let mut v = Vector::with_capacity(Ty::Timestamp, 2);
         decode_plain(&desc, &data, 2, &mut v).unwrap();
@@ -827,6 +1002,9 @@ mod tests {
             ptype: PType::Int32,
             type_length: 0,
             time_unit: None,
+            phys_cols: Vec::new(),
+            leaves: Vec::new(),
+            nested: None,
         };
         let mut v = Vector::with_capacity(Ty::UInt, 2);
         // -1i32 は u32 では 4294967295。
@@ -844,6 +1022,9 @@ mod tests {
             ptype: PType::Int64,
             type_length: 0,
             time_unit: Some(TimeUnit::Millis),
+            phys_cols: Vec::new(),
+            leaves: Vec::new(),
+            nested: None,
         };
         let mut v = Vector::with_capacity(Ty::Timestamp, 2);
         push_i64_values(&desc, &[1, 1_700_000_000_000], &mut v).unwrap();
@@ -891,6 +1072,9 @@ mod tests {
             ptype: PType::ByteArray,
             type_length: 0,
             time_unit: None,
+            phys_cols: Vec::new(),
+            leaves: Vec::new(),
+            nested: None,
         };
         // 長さ 100 を宣言しているが実データは 2 バイトしかない。
         let data = [100u8, 0, 0, 0, b'a', b'b'];

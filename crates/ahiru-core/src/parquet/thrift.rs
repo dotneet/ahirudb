@@ -143,6 +143,17 @@ impl<'a> Thrift<'a> {
         Ok(self.byte()? as i8)
     }
 
+    /// list/set 要素としての BOOL。構造体フィールドの BOOL と違い、要素の
+    /// 型ヘッダ（`read_list_begin` が返す `etype`）は全要素で共通の
+    /// `BOOL_TRUE` 固定値であり、真偽は運ばない。各要素は独立した 1 バイト
+    /// として書かれ、値が `BOOL_TRUE`（1）かどうかで真偽を判定する
+    /// （Thrift Compact Protocol の仕様、`TCompactProtocol.writeBoolean`
+    /// のフィールド外パス）。`read_bool(ftype)` をリスト要素に使うと
+    /// 「常に true・0 バイト消費」になってしまうので分けてある。
+    pub fn read_bool_elem(&mut self) -> Result<bool> {
+        Ok(self.byte()? == ttype::BOOL_TRUE)
+    }
+
     pub fn read_i16(&mut self, _ftype: u8) -> Result<i16> {
         let v = self.zigzag()?;
         ensure!(v >= i16::MIN as i64 && v <= i16::MAX as i64, BadThrift, self.pos);
@@ -229,8 +240,20 @@ impl<'a> Thrift<'a> {
             }
             ttype::LIST | ttype::SET => {
                 let (et, n) = self.read_list_begin(MAX_SKIP_LIST)?;
-                for _ in 0..n {
-                    self.skip_inner(et, depth + 1)?;
+                // list/set の要素としての bool は、struct フィールドと違って
+                // ヘッダのニブルに詰め込まれず 1 要素 1 バイトで並ぶ
+                // （`read_bool_elem` と同じ仕様）。`skip_inner` の BOOL アームは
+                // 「struct フィールドのヘッダに値が埋め込まれているので追加の
+                // バイトは無い」という前提なので、ここで素通しすると読み飛ばす
+                // べきバイト数を静かに間違え、以降のパース全体がずれる。
+                if et == ttype::BOOL_TRUE || et == ttype::BOOL_FALSE {
+                    for _ in 0..n {
+                        self.byte()?;
+                    }
+                } else {
+                    for _ in 0..n {
+                        self.skip_inner(et, depth + 1)?;
+                    }
                 }
             }
             ttype::MAP => {
@@ -239,9 +262,21 @@ impl<'a> Thrift<'a> {
                     ensure!(n <= MAX_SKIP_LIST, LimitExceeded, self.pos);
                     let kv = self.byte()?;
                     let (kt, vt) = (kv >> 4, kv & 0x0f);
+                    // list/set と同じ理由: map の要素としての bool（キー・バリュー
+                    // どちらでも）は struct フィールドのようにヘッダへ埋め込まれず
+                    // 1 要素 1 バイトで並ぶ。`skip_inner` の BOOL アームへそのまま
+                    // 渡すと 0 バイト読み飛ばし扱いになり、以降のパース位置がずれる。
+                    let skip_one = |t: &mut Self, ty: u8, depth: usize| -> Result<()> {
+                        if ty == ttype::BOOL_TRUE || ty == ttype::BOOL_FALSE {
+                            t.byte()?;
+                            Ok(())
+                        } else {
+                            t.skip_inner(ty, depth)
+                        }
+                    };
                     for _ in 0..n {
-                        self.skip_inner(kt, depth + 1)?;
-                        self.skip_inner(vt, depth + 1)?;
+                        skip_one(self, kt, depth + 1)?;
+                        skip_one(self, vt, depth + 1)?;
                     }
                 }
             }
@@ -260,3 +295,98 @@ impl<'a> Thrift<'a> {
 
 /// `skip` 中のリスト長上限。
 const MAX_SKIP_LIST: usize = 1 << 24;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_bool_elem_consumes_one_byte_per_element() {
+        // BOOLEAN_TRUE(1), BOOLEAN_FALSE(2), BOOLEAN_TRUE(1) の 3 要素。
+        let buf = [1u8, 2, 1];
+        let mut t = Thrift::new(&buf);
+        assert!(t.read_bool_elem().unwrap());
+        assert!(!t.read_bool_elem().unwrap());
+        assert!(t.read_bool_elem().unwrap());
+        assert_eq!(t.pos(), 3);
+    }
+
+    #[test]
+    fn read_bool_elem_treats_any_non_true_tag_as_false() {
+        // 仕様上は 1/2 以外は現れないはずだが、0 のような値でも false 側に
+        // 倒す（== BOOL_TRUE だけを true とみなす）ことをここで固定する。
+        let buf = [0u8];
+        let mut t = Thrift::new(&buf);
+        assert!(!t.read_bool_elem().unwrap());
+    }
+
+    #[test]
+    fn skip_inner_treats_bool_list_elements_as_one_byte_each() {
+        // list<bool> の 3 要素を skip し、直後のフィールドが正しく読めることで
+        // 消費バイト数がずれていないことを確認する。struct フィールドの bool は
+        // ヘッダのニブルに値が埋め込まれるが、list/set の要素はそうではなく
+        // 1 要素 1 バイトを占める（`read_bool_elem` と同じ仕様）。ここを
+        // 素通しして 0 バイトとして扱うと、後続のフィールドが全部ずれて読める。
+        let mut buf = Vec::new();
+        // フィールド 1: list<bool> 3 要素。
+        // フィールドヘッダ: delta=1, type=LIST(9) -> 0x19
+        buf.push(0x19);
+        // リストヘッダ: size=3, elem_type=BOOL_TRUE(1) -> (3<<4)|1 = 0x31
+        buf.push(0x31);
+        buf.extend_from_slice(&[1u8, 2, 1]); // 3 要素ぶんの生バイト
+                                             // フィールド 2: I32 の値 42（delta=1, type=I32(5) -> 0x15、zigzag(42)=84）
+        buf.push(0x15);
+        buf.push(84);
+        buf.push(0); // STOP
+
+        let mut t = Thrift::new(&buf);
+        t.enter().unwrap();
+        let (ft1, id1) = t.read_field_begin().unwrap().unwrap();
+        assert_eq!(id1, 1);
+        t.skip(ft1).unwrap();
+        let (ft2, id2) = t.read_field_begin().unwrap().unwrap();
+        assert_eq!(id2, 2);
+        assert_eq!(
+            t.read_i32(ft2).unwrap(),
+            42,
+            "list<bool> を skip した後の読み取り位置がずれている"
+        );
+        assert!(t.read_field_begin().unwrap().is_none());
+        t.leave();
+    }
+
+    #[test]
+    fn skip_inner_treats_bool_map_key_and_value_elements_as_one_byte_each() {
+        // map<bool, bool> の 2 エントリを skip し、直後のフィールドが正しく
+        // 読めることを確認する回帰テスト。list/set と同じ穴が map のキー・
+        // バリューにも独立して存在していた（キー側だけ、バリュー側だけ、
+        // という壊れ方もありうるので両方を bool にして一度に確認する）。
+        let mut buf = Vec::new();
+        // フィールド 1: map<bool,bool> 2 エントリ。
+        // フィールドヘッダ: delta=1, type=MAP(11) -> 0x1B
+        buf.push(0x1B);
+        buf.push(0x02); // マップサイズ = 2
+                        // kv 型ニブル: kt=vt=BOOL_TRUE(1) -> (1<<4)|1 = 0x11
+        buf.push(0x11);
+        buf.extend_from_slice(&[1u8, 2, 2, 1]); // key1,val1,key2,val2 の生バイト
+                                                // フィールド 2: I32 の値 42（delta=1, type=I32(5) -> 0x15、zigzag(42)=84）
+        buf.push(0x15);
+        buf.push(84);
+        buf.push(0); // STOP
+
+        let mut t = Thrift::new(&buf);
+        t.enter().unwrap();
+        let (ft1, id1) = t.read_field_begin().unwrap().unwrap();
+        assert_eq!(id1, 1);
+        t.skip(ft1).unwrap();
+        let (ft2, id2) = t.read_field_begin().unwrap().unwrap();
+        assert_eq!(id2, 2);
+        assert_eq!(
+            t.read_i32(ft2).unwrap(),
+            42,
+            "map<bool,bool> を skip した後の読み取り位置がずれている"
+        );
+        assert!(t.read_field_begin().unwrap().is_none());
+        t.leave();
+    }
+}

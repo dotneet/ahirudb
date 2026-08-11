@@ -629,7 +629,135 @@ DuckDB に合わせてある。両者で挙動が割れやすいので明示し�
 
 ---
 
-## 16. 未決事項（要判断）
+## 16. 更新系（DDL/DML）の設計 — オプトアウト可能
+
+読み取り専用のコアとは独立に、書き出し・DDL・DML を Cargo フィーチャで
+段階的に足せるようにしてある。**既定ではすべて無効**で、フィーチャを
+外せば該当コードごと wasm から消える。「全部入りで動くものをフラグで
+削る」のではなく、「最初から無いものをフラグで足す」設計にしてあるのが
+このエンジン全体の方針（DESIGN.md 冒頭）と同じ理由による。
+
+| フィーチャ | 内容 | 状態 |
+|---|---|---|
+| `export` | `TableSink` トレイト、CSV/JSONL 書き出し | 実装済み |
+| `export-parquet` | 同、Parquet 出力（Thrift シリアライザが要る） | 未実装 |
+| `ddl` | `CREATE TABLE` / `CREATE TABLE AS` / `DROP TABLE` / `CREATE VIEW` / `DROP VIEW`（メモリ上のみ） | 実装済み |
+| `dml` | `INSERT` / `UPDATE` / `DELETE`（`ddl` を暗黙に含む） | 実装済み |
+
+### なぜ 4 つに割るのか
+
+一枚岩の「write フィーチャ」にすると、安く切れる部分と切れない部分が
+混ざる。特に **`dml` だけは他の 3 つと性質が違う**。
+
+`export`/`ddl` は「読み取り結果をどう外に出すか」の話で、読み取り側の
+不変条件（`Source` は一度入ったバイトが書き換わらない、分割境界でしか
+I/O を待たない）に一切触れずに実装できる。実際 `export` はセッションの
+既存の公開 API（`prepare`/`step`）を外側から叩くだけの新規モジュール
+（`src/write/`）として実装しており、`catalog.rs` や `format::TableFormat`
+には指 1 本触れていない。
+
+一方 `dml`（特に `UPDATE`/`DELETE`）は「読み取ったデータを書き換える」話
+で、`Source` の不変性そのものと衝突する。これを筋よく実現する唯一の道は、
+**Parquet ファイルの読み取り経路とは完全に別系統の、可変なインメモリ
+テーブル**を新設し、DML はそちらにしか効かないと明確に線を引くこと。
+`CREATE TABLE t (...)` で作った表はこのインメモリ表になり、
+`parquet('...')` で参照した表は今まで通り読み取り専用のまま、という
+棲み分けにした（実装済み。以下）。
+
+### `export` の実装（`src/write/`）
+
+```rust
+pub trait TableSink {
+    fn begin(&mut self, schema: &[Field]) -> Result<()>;
+    fn write_batch(&mut self, schema: &[Field], batch: &Batch) -> Result<()>;
+    fn finish(&mut self) -> Result<Vec<u8>>;
+}
+
+pub fn export_all(session: &mut Session, sql: &str, params: &[Value], sink: &mut dyn TableSink) -> Result<Vec<u8>>;
+```
+
+読み取り側の `TableFormat`（`Batch` を produce する）と対称に、書き出し側
+は `Batch` を consume するだけの薄いトレイトにしてある。`export_all` は
+`Session::prepare`/`Session::step` という既存の公開 API を呼ぶだけなので、
+`export` フィーチャを丸ごと外しても読み取り側のコードは 1 行も変わらない
+（= オプトアウトが安全である根拠）。
+
+**v1 の制限**: `export_all` は非再開設計。実行中に `NEED_IO`/`NEED_CODEC`
+が発生すると `IoFailed` で失敗する。全データがメモリ上にある場合（CLI
+利用、または JS 側が事前にテーブルを完全に取得済みの場合）にしか使えない。
+読み取りエンジンの中核である「バイトが足りなければ止めて要求を返す」設計
+（§6）と同じ形の再開可能な書き出し ABI は、`ahiru_query_step` と対になる
+`ahiru_export_step` のようなものが要るため、フォローアップとする。
+
+**未配線**: SQL の `COPY (SELECT ...) TO 'x.csv'` 構文、および wasm ABI
+からの呼び出し口（`ahiru_export_csv` 相当）。前者は `sql::ast::Stmt` に
+新しいバリアントを足して `Session::prepare` のディスパッチに 1 行足すだけ
+で済むはずだが、`catalog.rs`/`session.rs` が別の変更（複数ファイル対応）
+と同時に進行中だったため、今回は Rust API（`write::export_all` を直接
+呼ぶ）までの実装に留めた。
+
+### `ddl`/`dml` の実装
+
+**インメモリテーブル（`catalog::MemTable`）**: `Catalog` に、ファイル由来の
+`Vec<Table>` とは完全に独立した `Vec<MemTable>`（`#[cfg(feature = "ddl")]`）
+を追加した。`MemTable` は行指向（`rows: Vec<Vec<Value>>`）— DML が行単位の
+更新・削除中心であることを優先し、列指向にはしていない（このエンジンの
+最適化の主戦場である「大きな Parquet を速く読む」話には効かない領域なので、
+単純さを優先した）。名前解決は `Catalog::index_of`（ファイル）とは別枠の
+`mem_index_of`/`view_index_of` を新設し、既存の `Table`/`TablePart`/`Source`
+の型・意味は 1 行も変えていない。
+
+**ビュー**は AST ではなく `(名前, クエリ本体の生 SQL)` として `Catalog` に
+保持する。参照されるたびに `plan::bind::flatten_from` が再パース・再束縛
+する設計で、`ExprArena`/`QueryStmt` を `Catalog` に持たせずに済む（`catalog`
+を `sql::ast` に依存させたくないため）。無限再帰（ビューが自分自身や別の
+ビューを再帰的に参照するケース）は `CteScope::view_depth` カウンタで
+`MAX_VIEW_DEPTH` に頭打ちにしてある。
+
+**Scan との統合**: `plan::Node` に `MemScan`、`exec` に対応する `MemScan`
+オペレータを追加した。`Scan`（Parquet/CSV/JSONL 用）とは別のオペレータに
+分けたのは、`MemScan` が原理的に `NeedIo`/`NeedCodec` を返さないことを型で
+保証したかったため — `MemTable` は既にメモリ上にあるので、分割境界バリア
+（§6）は端から必要ない。`FROM memtable` は、CTE・派生表と同じ「`Rel` に
+`subplan: Some(Node::MemScan(..))` を持たせる」仕組みにそのまま乗せてあり、
+`plan::bind` の SELECT 側の構造（`flatten_from`/`push_table_rel` 等）は
+新しい分岐を足しただけで、既存の処理は変えていない。
+
+**DDL/DML の実行**: `CREATE TABLE`/`DROP TABLE`/`CREATE VIEW`/`DROP VIEW`/
+`INSERT`/`UPDATE`/`DELETE` はいずれも副作用を伴う一発実行の文であり、
+Volcano のストリーミング実行（`Session::step`）には乗らない。`Session::prepare`
+の中で完結させ、影響行数を 1 行 1 列（`count`）の `Query` として返す
+（`SHOW TABLES`/`DESCRIBE` が使う「あらかじめ確定した 1 バッチを返す」
+`exec::Values` と同じ手口）。新規モジュール `src/ddl.rs`/`src/dml.rs`
+（`export`/`write` と同じくオプトアウト可能な薄いモジュール）にまとめた。
+
+行の値評価（`INSERT ... VALUES` の各値、`UPDATE ... SET`、`WHERE`）は
+専用のスカラ評価器を書かず、既存のバイトコード VM（`expr::vm::Vm`）を
+そのまま使う。`MemTable::batch` で行を最大 `BATCH_SIZE` 行の `Batch` に
+変換し、`Vm::eval`/`eval_filter` に通す — 型変換（`plan::compile::cast_program`）
+・NULL・3 値論理を `SELECT` と完全に同じ規則で扱えるうえ、コードサイズも
+増えない。`UPDATE` の `SET` は DuckDB と同じ同時代入セマンティクス（各 SET
+式は更新前の行に対して評価する）。
+
+**`CREATE TABLE AS SELECT` / `INSERT ... SELECT` は非再開設計**: `export_all`
+と同じ理由・同じ制約。ソースクエリの実行中に `NEED_IO`/`NEED_CODEC` が
+発生すると `IoFailed` で失敗する。全データがメモリ上にある場合にしか
+使えない（`src/ddl.rs::run_query_to_rows` のドキュメント参照）。
+
+**読み取り専用テーブルへの防御**: `INSERT`/`UPDATE`/`DELETE` の対象が
+ファイル由来のテーブルだったときは `ReadOnlyTable` エラーで拒否する
+（`dml::mem_index_writable`）。`CREATE TABLE`/`CREATE VIEW` がファイル
+テーブルと同名の場合も `DuplicateTable` で拒否する。
+
+**テスト**: `crates/ahiru-core/tests/ddl_dml.rs` に、CREATE TABLE → INSERT →
+SELECT → UPDATE → SELECT → DELETE → SELECT → DROP TABLE の一連の流れ、
+CTAS・INSERT SELECT・CREATE VIEW の組み合わせ、読み取り専用テーブルへの
+DML 拒否、`CREATE TABLE`/`IF NOT EXISTS`/`OR REPLACE` の衝突検査を
+統合テストとして持たせてある。
+
+---
+
+## 17. 未決事項（要判断）
 
 1. **1MB は raw か gzip か。** 本書は raw ≤ 1 MiB を前提にした。gzip 後 1 MB でよいなら実質 3 MB 相当の予算になり、ウィンドウ関数やネスト型を v1 に入れられる。
 2. **実行環境の優先度。** ブラウザ最優先で設計したが、Cloudflare Workers 等のエッジが主戦場なら、起動時間（コンパイルキャッシュ）とレンジ IO の設計を寄せる余地がある。

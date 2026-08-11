@@ -278,6 +278,62 @@ mod tests {
         assert_ne!(key(&[&v], 0), key(&[&v], 2));
     }
 
+    // DECIMAL(precision>18)/HUGEINT/UBIGINT/INTERVAL は物理表現がすべて
+    // `Data::I128` に統一されている（`Ty::phys`）。エンコード自体はどの
+    // 論理型でも同じコードパスを通るので、物理型レベルで確認すれば十分。
+    fn vec_i128(ty: Ty, vals: &[Option<i128>]) -> Vector {
+        let mut v = Vector::new(ty);
+        for x in vals {
+            match x {
+                Some(x) => v.push_value(&Value::I128(*x)),
+                None => v.push_null(),
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn i128_keys_distinguish_sign_and_magnitude() {
+        let a = vec_i128(
+            Ty::HugeInt,
+            &[Some(1), Some(1), Some(-1), Some(i128::MAX), Some(i128::MIN), Some(0)],
+        );
+        // 同値は同キー。
+        assert_eq!(key(&[&a], 0), key(&[&a], 1));
+        // 符号違い・境界値はすべて異なるキーになる（総当たりで確認）。
+        let n = 6;
+        for i in 0..n {
+            for j in 0..n {
+                if (i == 0 && j == 1) || (i == 1 && j == 0) {
+                    continue; // vals[0] == vals[1] == 1 なので除外（両方向とも）。
+                }
+                if i != j {
+                    assert_ne!(
+                        key(&[&a], i),
+                        key(&[&a], j),
+                        "行 {i} と {j} は異なる値なのにキーが衝突した"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn i128_null_is_distinguished_from_zero() {
+        let a = vec_i128(Ty::HugeInt, &[None, None, Some(0)]);
+        assert_eq!(key(&[&a], 0), key(&[&a], 1), "NULL 同士は同じグループ");
+        assert_ne!(key(&[&a], 0), key(&[&a], 2), "NULL と 0 は別グループ");
+    }
+
+    #[test]
+    fn i128_composite_key_with_null_in_another_column() {
+        // DECIMAL(38,0) 列 + INTEGER 列の複合キーで、DECIMAL 側が同値でも
+        // 他方の NULL/非 NULL で別グループになることを確認する。
+        let dec = vec_i128(Ty::decimal(38, 0), &[Some(100), Some(100)]);
+        let other = vec_i32(&[None, Some(0)]);
+        assert_ne!(key(&[&dec, &other], 0), key(&[&dec, &other], 1));
+    }
+
     #[test]
     fn key_null_detection() {
         let a = vec_i32(&[Some(1), None]);

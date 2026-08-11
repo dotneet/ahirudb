@@ -18,6 +18,8 @@ pub mod rt;
 
 pub mod vector;
 
+pub mod json;
+
 pub mod parquet;
 
 pub mod catalog;
@@ -33,6 +35,15 @@ pub mod expr;
 pub mod exec;
 
 pub mod session;
+
+// 更新系はすべてオプトアウト可能。既定では無効（DESIGN.md §16）。
+#[cfg(feature = "export")]
+pub mod write;
+
+#[cfg(feature = "ddl")]
+pub mod ddl;
+#[cfg(feature = "dml")]
+pub mod dml;
 
 #[cfg(target_arch = "wasm32")]
 pub mod abi;

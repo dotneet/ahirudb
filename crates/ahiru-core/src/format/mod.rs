@@ -22,14 +22,31 @@
 //! 減らせる**ため。行指向フォーマットは射影を渡されても全バイトを読むしかない
 //! が、`read_split` 側で不要な列の変換を省ける。この 2 段階を 1 つの引数で
 //! 表現しておくと、呼び出し側はフォーマットの性質を知らずに済む。
+//!
+//! ## ページ単位の絞り込みが独立したフックである理由
+//!
+//! `may_match`（RowGroup 統計）は追加の I/O 無しで判定できるが、ページ単位の
+//! 絞り込み（Parquet の ColumnIndex/OffsetIndex/Bloom フィルタ）はそれ自体が
+//! 別バイト範囲の取得を要る。`split_ranges` の入力（射影・pruners）だけでは
+//! 「どのバイトが要るか」を確定できず、`index_ranges` → I/O →
+//! `refine_with_index`（デコードしてページを選ぶ）→ `split_ranges`
+//! （選ばれたページだけのバイト範囲を返す）という追加の 1 往復が要る。
+//! 既定実装は「該当バイト無し」なので、対応しないフォーマット（CSV/JSONL）は
+//! 1 行も変更せずに以前の「分割 = 1 回の I/O 判定」のままで動く。
 
 pub mod parquet;
+pub mod partitioned;
 
 #[cfg(feature = "csv")]
 pub mod csv;
 
 #[cfg(feature = "jsonl")]
 pub mod jsonl;
+
+// トップレベルが 1 個の JSON 配列/オブジェクトのファイル。JSONL と近縁の
+// フォーマットなので、専用の Cargo フィーチャは増やさず `jsonl` に相乗りする。
+#[cfg(feature = "jsonl")]
+pub mod json;
 
 use crate::catalog::Source;
 use crate::prelude::*;
@@ -40,6 +57,9 @@ use crate::vector::{Field, Value, Vector};
 ///
 /// `WHERE` から抽出できた `列 <op> 定数` の形だけを持つ。
 /// `column` は**射影後の列番号**（= スキャン出力での位置）を指す。
+/// `Clone` は `Node::Aggregate`（延いては `Node`）の複製に要る
+/// （GROUPING SETS でグルーピングセットの数だけ入力プランを複製するため）。
+#[derive(Clone)]
 pub struct Pruner {
     pub column: usize,
     pub op: PruneOp,
@@ -150,6 +170,41 @@ pub trait TableFormat {
         true
     }
 
+    /// ページ単位の絞り込み（ColumnIndex/OffsetIndex/Bloom フィルタ）に使う
+    /// バイト範囲を `out` に積む。`may_match`（RowGroup 統計、追加 I/O 無し）
+    /// で判定しきれない場合に、`split_ranges` より前に追加で 1 往復するための
+    /// フック。
+    ///
+    /// 該当データが無い（対応しない、または pruners が使えない）フォーマット
+    /// は既定実装のまま何も積まなくてよい。積まれなければ後続の
+    /// `refine_with_index` は既定実装のまま `true` を返すだけになり、
+    /// 実質的に「ページ単位の絞り込みは無効」という以前の挙動と完全に一致する。
+    fn index_ranges(
+        &self,
+        _split: usize,
+        _pruners: &[Pruner],
+        _projection: &[usize],
+        _out: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `index_ranges` が要求したバイトが揃った後に呼ぶ。ページ選択の結果
+    /// （どのページを読むか）を内部にキャッシュしてよい（`&mut self`）。
+    ///
+    /// 戻り値 `false` はこの分割を丸ごと読み飛ばせることを意味する
+    /// （Bloom フィルタでの否定、またはどのページも統計上一致し得ない場合）。
+    /// 既定実装は常に `true`（絞り込みなし = 元の全列チャンク取得のまま）。
+    fn refine_with_index(
+        &mut self,
+        _src: &Source,
+        _split: usize,
+        _pruners: &[Pruner],
+        _projection: &[usize],
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
     /// 分割を復号して列ベクタを返す。
     ///
     /// 返す列は `projection` と同じ順・同じ個数で、すべて同じ長さでなければ
@@ -170,6 +225,9 @@ pub enum FormatKind {
     Tsv,
     /// 1 行 1 JSON オブジェクト（NDJSON）。
     Jsonl,
+    /// ファイル全体が 1 個の JSON 値（トップレベル配列、またはオブジェクト
+    /// 単体）。`read_json`/`read_json_auto` 相当（`format::json` 参照）。
+    Json,
 }
 
 impl FormatKind {
@@ -192,6 +250,8 @@ impl FormatKind {
             FormatKind::Tsv
         } else if eq_ascii_ci(e, b"jsonl") || eq_ascii_ci(e, b"ndjson") {
             FormatKind::Jsonl
+        } else if eq_ascii_ci(e, b"json") {
+            FormatKind::Json
         } else {
             FormatKind::Parquet
         }
@@ -216,6 +276,8 @@ pub fn make(kind: FormatKind, name: &str) -> Result<Box<dyn TableFormat>> {
         FormatKind::Tsv => Ok(Box::new(csv::CsvFormat::new(b'\t'))),
         #[cfg(feature = "jsonl")]
         FormatKind::Jsonl => Ok(Box::new(jsonl::JsonlFormat::new())),
+        #[cfg(feature = "jsonl")]
+        FormatKind::Json => Ok(Box::new(json::JsonFormat::new())),
         #[allow(unreachable_patterns)]
         _ => err!(UnsupportedFeature),
     }
@@ -244,6 +306,8 @@ mod tests {
         assert_eq!(FormatKind::detect("a.tsv"), FormatKind::Tsv);
         assert_eq!(FormatKind::detect("a.jsonl"), FormatKind::Jsonl);
         assert_eq!(FormatKind::detect("a.ndjson"), FormatKind::Jsonl);
+        assert_eq!(FormatKind::detect("a.json"), FormatKind::Json);
+        assert_eq!(FormatKind::detect("a.JSON"), FormatKind::Json);
         // 拡張子が無い・未知のものは Parquet 扱い。
         assert_eq!(FormatKind::detect("data"), FormatKind::Parquet);
         assert_eq!(FormatKind::detect("a.bin"), FormatKind::Parquet);
