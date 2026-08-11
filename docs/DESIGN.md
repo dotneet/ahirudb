@@ -515,8 +515,14 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
 - Aggregates: `COUNT`/`COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
   `stddev`/`variance`/`median`/`mode`/`approx_count_distinct`, `string_agg`,
   `array_agg`, `FILTER (WHERE ...)` on any aggregate
-- Window functions with `ROWS`/`RANGE` frames, both inline `OVER (...)` and
-  named `WINDOW w AS (...)` / `OVER w`
+- Window functions, both inline `OVER (...)` and named `WINDOW w AS (...)` /
+  `OVER w`, with a fixed default frame chosen automatically from whether
+  `ORDER BY` is present (`RANGE UNBOUNDED PRECEDING` to current row if so,
+  the whole partition if not) — matching the frame the SQL standard would
+  pick as the default. An explicit `ROWS`/`RANGE BETWEEN ...` frame is
+  **not** supported and is rejected at parse time with `UnsupportedFeature`
+  rather than silently substituting the default and changing the query's
+  meaning (`sql::parser::window_def_body`)
 - Scalar functions: string (`length`/`substring`/`upper`/`lower`/`trim`/
   `replace`/`concat`/`split_part`/`starts_with`/`lpad`/`rpad`/`repeat`/
   `reverse`/`instr`/...), numeric (`abs`/`round`/`floor`/`ceil`/`sqrt`/
@@ -841,7 +847,7 @@ order beyond what the project needed at the time — collectively this is
 what used to be labeled "M8, not started":
 
 - Scalar function library (string/numeric/date-time), `printf`/`format`
-- Window functions (`ROWS`/`RANGE` frames, `QUALIFY`, named `WINDOW`)
+- Window functions (fixed default frame only, see §7; `QUALIFY`, named `WINDOW`)
 - `WITH` (including `WITH RECURSIVE`), `UNION`/`INTERSECT`/`EXCEPT`
 - Correlated and uncorrelated subqueries (`EXISTS`, `IN`, scalar)
 - `GROUPING SETS`/`ROLLUP`/`CUBE`, statistical aggregates, `string_agg`/`array_agg`

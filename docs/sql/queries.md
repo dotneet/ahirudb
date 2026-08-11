@@ -268,7 +268,16 @@ Dedicated window functions: `row_number()`, `rank()`, `dense_rank()`,
 `lag(x[, offset[, default]])`, `lead(x[, offset[, default]])`,
 `first_value(x)`, `last_value(x)`. Any aggregate function (`sum`, `avg`,
 `count`, `min`, `max`, `stddev`, ...) can also be used as a window function
-via `agg(...) OVER (...)`. `ROWS`/`RANGE` frame clauses are supported;
+via `agg(...) OVER (...)`.
+
+The frame is always the standard default, chosen automatically from whether
+`ORDER BY` is present: `RANGE UNBOUNDED PRECEDING` (through the current row)
+if it is, the whole partition if it isn't. **An explicit `ROWS`/`RANGE
+BETWEEN ...` frame is not supported** — it's rejected at parse time rather
+than silently substituting the default, since that would change the query's
+result. If you need a specific frame, restructure the query with a subquery
+or `LIMIT`/aggregation instead of relying on `OVER (... ROWS BETWEEN ...)`.
+
 `QUALIFY` filters on the *result* of a window function without needing to
 wrap the query in a subquery:
 

@@ -39,6 +39,12 @@ user-visible effect.
   `UnsupportedFeature` at prepare time) — use `LIKE`/`ILIKE` without an
   `ESCAPE` clause, or use `GLOB`/`SIMILAR TO`/`regexp_matches` instead if
   you need to match a literal `%`/`_`.
+- **Window function frames** are always the standard default (`RANGE
+  UNBOUNDED PRECEDING` through the current row if the window has an `ORDER
+  BY`, the whole partition if it doesn't), chosen automatically — there is
+  no support for an explicit `ROWS`/`RANGE BETWEEN ...` frame. It's rejected
+  at parse time rather than silently substituting the default, since that
+  would change the result. See [queries.md](queries.md#window-functions).
 - **`PIVOT ... ON x`** requires an explicit `IN (...)` value list.
   DuckDB's auto-detect-distinct-values form (`PIVOT t ON x USING agg(y)`
   with no `IN`) is not supported — enumerate the pivot values yourself.
