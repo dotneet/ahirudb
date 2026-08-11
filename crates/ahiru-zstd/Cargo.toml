@@ -1,0 +1,20 @@
+[package]
+name = "ahiru-zstd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# ネイティブ開発・テスト時のみ std を有効化する。
+# wasm 配布は --no-default-features で no_std になる。
+default = ["std"]
+std = []
+
+[dependencies]
+# 依存クレートゼロ。サイドモジュールはコアより更に小さく保つ（DESIGN.md §6）。
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"

@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: install duckdb (SQL の期待値を突き合わせる参照実装)
+        run: |
+          curl -sSL -o duckdb.zip https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip
+          unzip -o duckdb.zip -d /usr/local/bin
+          chmod +x /usr/local/bin/duckdb
+          duckdb -version
+
+      - name: test
+        run: cargo test --all
+
+  # サイズは「最後に測る目標」ではなく「毎 PR で守る制約」なので、
+  # 独立したジョブにしてハードゲートにする（DESIGN.md §11）。
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install binaryen and twiggy
+        run: |
+          sudo apt-get update && sudo apt-get install -y binaryen
+          cargo install twiggy --locked || true
+
+      - name: measure
+        id: measure
+        run: |
+          ./scripts/size.sh | tee size-report.txt
+          echo "size=$(wc -c < target/ahiru-core.wasm | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: size-report
+          path: size-report.txt
+
+      # サイズ回帰を必ず可視化する。1 PR あたり +5 KB を超えたら
+      # 理由を PR 本文に書く運用にする。
+      - name: comment size on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = '## wasm size\n\n```\n' +
+              fs.readFileSync('size-report.txt', 'utf8').slice(0, 60000) + '\n```';
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/size.sh
+      - run: node --test js/test/

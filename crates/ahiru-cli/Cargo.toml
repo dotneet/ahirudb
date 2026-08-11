@@ -1,0 +1,16 @@
+[package]
+name = "ahiru-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ahiru"
+path = "src/main.rs"
+
+[dependencies]
+ahiru-core = { path = "../ahiru-core", features = ["std"] }
+# ZSTD は wasm では別モジュールとして遅延ロードするが、ネイティブ CLI では
+# 直接リンクしてよい（サイズ制約はコアの .wasm にしか掛からない）。
+# こうすることでコーデック委譲プロトコル自体を CLI で通しで検証できる。
+ahiru-zstd = { path = "../ahiru-zstd", features = ["std"] }

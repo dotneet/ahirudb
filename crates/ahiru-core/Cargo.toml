@@ -1,0 +1,24 @@
+[package]
+name = "ahiru-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# ネイティブ開発・テスト時のみ std を有効化する。
+# wasm ビルドは --no-default-features で no_std + Parquet のみになる。
+default = ["std", "csv", "jsonl"]
+std = []
+# 追加フォーマットはフィーチャで切る。Parquet だけの配布物を最小に保つため
+# （DESIGN.md §3 のサイズ予算）。
+csv = []
+jsonl = []
+
+[dependencies]
+# 依存クレートは原則ゼロ。追加時は wasm サイズの実測値を PR に添付すること。
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"

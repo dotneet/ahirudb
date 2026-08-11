@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/ahiru-core", "crates/ahiru-cli", "crates/ahiru-zstd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dotneet/ahirudb"
+
+# ネイティブ開発用。テストとデバッグはここで回す。
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# WASM 配布用。サイズ最優先。
+# cargo build --profile wasm --target wasm32-unknown-unknown -p ahiru-core --no-default-features
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
