@@ -365,6 +365,46 @@ fn decimal_plus_decimal_widens_precision_and_matches_scale() {
     assert_eq!(got, Some(Value::I64(24645)));
 }
 
+/// `HUGEINT` は 39 桁ないと端まで表せない。10 進パーサが 38 桁で打ち切って
+/// 残りを指数へ逃がしていた頃は、上限が `…105720` に丸まった値として
+/// **黙って** 通っていた（範囲外の `…105728` すら同じ値で受理していた）。
+#[test]
+fn hugeint_string_cast_is_exact_at_the_i128_boundaries() {
+    let mut sess = session_with_basic();
+    // duckdb: CAST('170141183460469231731687303715884105727' AS HUGEINT)
+    //         -> 170141183460469231731687303715884105727
+    assert_eq!(
+        one(&mut sess, "CAST('170141183460469231731687303715884105727' AS HUGEINT)"),
+        Value::I128(i128::MAX)
+    );
+    assert_eq!(
+        one(&mut sess, "CAST('-170141183460469231731687303715884105728' AS HUGEINT)"),
+        Value::I128(i128::MIN)
+    );
+    // 範囲外は NULL。duckdb は CAST でエラー / TRY_CAST で NULL、この
+    // エンジンは常に NULL 側に倒す（docs/sql/types.md の変換方針）。
+    // 丸めた値を返すのは「黙って桁が化ける」ので不可。
+    assert_eq!(
+        one(&mut sess, "CAST('170141183460469231731687303715884105728' AS HUGEINT)"),
+        Value::Null
+    );
+    assert_eq!(
+        one(&mut sess, "CAST('-170141183460469231731687303715884105729' AS HUGEINT)"),
+        Value::Null
+    );
+    // 38 桁までは元から正確だった。回帰していないことを押さえる。
+    assert_eq!(
+        one(&mut sess, "CAST('12345678901234567890123456789012345678' AS HUGEINT)"),
+        Value::I128(12345678901234567890123456789012345678)
+    );
+    // 浮動小数点は仮数の外なので、桁あふれしても近似値を返し続ける
+    // （duckdb: 1e50）。整数側の NULL 化を巻き込んでいないこと。
+    assert_eq!(
+        one(&mut sess, "CAST('99999999999999999999999999999999999999999999999999' AS DOUBLE)"),
+        Value::F64(1e50)
+    );
+}
+
 #[test]
 fn integer_division_and_mod_by_zero_are_null_not_errors() {
     // docs/DESIGN.md §15: "Integer division-by-zero and MIN / -1 return

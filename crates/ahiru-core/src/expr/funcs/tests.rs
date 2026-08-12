@@ -1,3 +1,7 @@
+// `civil_from_days` の再エクスポートは `export` フィーチャ有りのときだけ
+// （消費側が `write::csv`/`write::jsonl` しか無いため）。ここは実装元から
+// 直接取って、フィーチャの有無に関わらずテストが通るようにする。
+use super::datetime::civil_from_days;
 use super::numeric::{f_exp, f_ln, f_pow, f_sqrt};
 use super::*;
 use crate::error::code_of;

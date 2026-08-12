@@ -273,6 +273,9 @@ mod tests {
         assert_eq!(crate::error::code_of(r), Some(Code::ColumnCountMismatch));
     }
 
+    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
+    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    #[cfg(feature = "csv")]
     #[test]
     fn insert_into_file_table_is_read_only() {
         let mut s = Session::new();

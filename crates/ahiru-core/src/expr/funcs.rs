@@ -792,9 +792,11 @@ pub(crate) use datetime::{
     add_interval_to_ts, days_from_civil, fmt_date, fmt_time, fmt_timestamp, fmt_timestamptz,
     fmt_uuid, parse_date, parse_time, parse_timestamp, parse_timestamptz, parse_uuid,
 };
-// Only `write::csv`/`write::jsonl` (both gated on `export`) reach this one;
-// every other caller of `datetime::*` above is unconditional.
-#[cfg(feature = "export")]
+// これだけは `write::csv`/`write::jsonl` からしか使われない。`write` 自体が
+// `export` 付きのときだけ存在し、その中の csv/jsonl は更にそれぞれの
+// フィーチャで切られるので、両方を満たすときだけ再エクスポートする
+// （`export` 単体だとどちらのシンクも無く、未使用の警告になる）。
+#[cfg(all(feature = "export", any(feature = "csv", feature = "jsonl")))]
 pub(crate) use datetime::civil_from_days;
 pub use lambda::call_lambda;
 pub(crate) use numeric::{f_abs, f_trunc};

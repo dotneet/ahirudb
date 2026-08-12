@@ -75,6 +75,7 @@ const TYPE_NAMES = [
 ];
 const TY_DECIMAL = 13;
 const TY_VARCHAR = 14;
+const TY_INTERVAL = 19;
 const TY_JSON = 20;
 const TY_UUID = 21;
 
@@ -103,6 +104,25 @@ export function dateToDate(days) {
  * 概念は無く、値は常に UTC の瞬間を表す）なので `timestampToDate` の別名。
  */
 export const timestamptzToDate = timestampToDate;
+
+/**
+ * INTERVAL の物理表現（月 / 日 / マイクロ秒を 1 個の i128 に詰めたもの）を
+ * `{ months, days, micros }` に開く。`vector::types` の `unpack_interval`
+ * と同じ計算なので、あちらを変えたらここも変えること。
+ *
+ * 3 成分を別々に持つのは DuckDB / PostgreSQL と同じモデルで、月と日を
+ * マイクロ秒に潰さないのは「1 か月」の長さが基準日に依存するため
+ * （`pack_interval` の doc 参照）。したがってこの 3 つを 1 個の数値に
+ * まとめて返すことはできない。
+ */
+export function unpackInterval(packed) {
+  const v = BigInt(packed);
+  return {
+    months: Number(BigInt.asIntN(32, v >> 96n)),
+    days: Number(BigInt.asIntN(32, (v >> 64n) & 0xffffffffn)),
+    micros: BigInt.asIntN(64, v),
+  };
+}
 
 /** 16 バイトを `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` にする。 */
 function formatUuid(bytes) {
@@ -628,6 +648,13 @@ export function decodeBatch(u8, schema, copy = true) {
       const scaled = new Array(numRows);
       for (let i = 0; i < numRows; i++) scaled[i] = scaleDecimal(values[i], scale);
       values = scaled;
+    } else if (ty === TY_INTERVAL) {
+      // 詰めたままの i128 は数値として意味を持たない（月が 2^96 の位に居る）
+      // ので、3 成分に開いて返す。DECIMAL と同じ「物理表現のままでは使えない
+      // 型はここで直す」扱い。
+      const parts = new Array(numRows);
+      for (let i = 0; i < numRows; i++) parts[i] = unpackInterval(values[i]);
+      values = parts;
     }
     columns.push({
       name: field?.name ?? `col${c}`,

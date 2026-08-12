@@ -126,6 +126,9 @@ function formatCell(v) {
   if (v === null || v === undefined) return 'NULL';
   if (typeof v === 'bigint') return v.toString();
   if (v instanceof Uint8Array) return `<${v.length} bytes>`;
+  // INTERVAL は { months, days, micros } で返る（js/ahirudb.js の
+  // unpackInterval）。既定の String() だと [object Object] になる。
+  if (v !== null && typeof v === 'object') return JSON.stringify(v, (_, x) => (typeof x === 'bigint' ? x.toString() : x));
   return String(v);
 }
 

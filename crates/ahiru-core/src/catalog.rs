@@ -895,6 +895,9 @@ mod tests {
         assert!(t.resolve().unwrap().is_ok());
     }
 
+    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
+    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    #[cfg(feature = "csv")]
     #[test]
     fn single_part_register_is_unchanged() {
         let mut c = Catalog::new();
@@ -992,6 +995,9 @@ mod tests {
     }
 
     #[cfg(feature = "ddl")]
+    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
+    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    #[cfg(feature = "csv")]
     #[test]
     fn mem_rename_table_allows_case_only_change_but_rejects_real_collisions() {
         let (mut c, i) = mem_catalog_with_two_rows();

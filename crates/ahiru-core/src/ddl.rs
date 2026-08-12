@@ -265,6 +265,9 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
+    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    #[cfg(feature = "csv")]
     #[test]
     fn create_table_as_select_materializes_rows() {
         let mut s = Session::new();
@@ -487,6 +490,9 @@ mod tests {
         );
     }
 
+    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
+    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    #[cfg(feature = "csv")]
     #[test]
     fn alter_table_on_file_backed_table_is_read_only() {
         let mut s = Session::new();

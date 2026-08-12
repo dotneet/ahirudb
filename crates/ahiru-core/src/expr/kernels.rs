@@ -781,7 +781,17 @@ pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
 }
 
 /// `mant * 10^exp` として 10 進数を読む。読めなければ `None`（＝ NULL）。
-fn parse_dec(s: &[u8]) -> Option<(i128, i32)> {
+///
+/// 3 つめの返り値は「整数部の桁を仮数に収めきれずに捨てたか」。捨てた場合
+/// `mant * 10^exp` は元の値を丸めたものになるので、正確さが要る整数系の
+/// キャストはそれを見て NULL に倒す（丸めた値をそのまま返すと
+/// `CAST('…105727' AS HUGEINT)` が `…105720` に化ける）。浮動小数点は
+/// もともと仮数の精度しか持たないので無視してよい。
+///
+/// 仮数は**負の側に積む**。`i128::MIN` の絶対値は正の `i128` では表せないため、
+/// 正の側に積むと下限ちょうどの値
+/// （`-170141183460469231731687303715884105728`）だけ読めなくなる。
+fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
     let mut lo = 0usize;
     let mut hi = s.len();
     while lo < hi && (s[lo] == b' ' || s[lo] == b'\t') {
@@ -797,18 +807,21 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32)> {
         neg = s[i] == b'-';
         i += 1;
     }
+    // 負の側に積む（関数の doc 参照）。
     let mut mant: i128 = 0;
     let mut exp: i32 = 0;
-    let mut ndig = 0u32;
+    let mut inexact = false;
     let mut seen = false;
     while i < s.len() && s[i].is_ascii_digit() {
         seen = true;
-        if ndig < 38 {
-            mant = mant * 10 + (s[i] - b'0') as i128;
-            ndig += 1;
-        } else {
-            // 桁あふれ分は指数へ逃がす（精度は落ちる）。
-            exp += 1;
+        let d = (s[i] - b'0') as i128;
+        match mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
+            Some(m) => mant = m,
+            // 仮数に入らない桁は指数へ逃がす（精度は落ちるので inexact）。
+            None => {
+                exp += 1;
+                inexact = true;
+            }
         }
         i += 1;
     }
@@ -816,9 +829,11 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32)> {
         i += 1;
         while i < s.len() && s[i].is_ascii_digit() {
             seen = true;
-            if ndig < 38 {
-                mant = mant * 10 + (s[i] - b'0') as i128;
-                ndig += 1;
+            let d = (s[i] - b'0') as i128;
+            // 小数部の末尾を落としても整数としての値は変わらないので、
+            // ここでは inexact を立てない（整数キャストの結果に影響しない）。
+            if let Some(m) = mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
+                mant = m;
                 exp -= 1;
             }
             i += 1;
@@ -851,7 +866,22 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32)> {
     if i != s.len() {
         return None;
     }
-    Some((if neg { -mant } else { mant }, exp))
+    let mant = if neg {
+        mant
+    } else {
+        match mant.checked_neg() {
+            Some(m) => m,
+            // `+|i128::MIN|` ちょうど。正の側には収まらないので 1 桁だけ
+            // 指数へ逃がす（inexact なので整数キャストは NULL になり、
+            // 浮動小数点では f64 の精度に対して差が出ない）。
+            None => {
+                inexact = true;
+                exp += 1;
+                -(mant / 10)
+            }
+        }
+    };
+    Some((mant, exp, inexact))
 }
 
 /// `m * 10^e`。2 進分解で掛けるので、10 を e 回掛けるより誤差が小さい。
@@ -1131,7 +1161,8 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             let sv = a.bytes();
             for i in 0..n {
                 match parse_dec(sv.get(i)) {
-                    Some((m, e)) => {
+                    // 仮数からあふれた桁は f64 の精度の外なので無視してよい。
+                    Some((m, e, _)) => {
                         let mut f = scale_f64(m as f64, e);
                         if to == Ty::Float {
                             f = f as f32 as f64;
@@ -1183,9 +1214,15 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                 if !ok {
                     // BOOLEAN でも 'true'/'false' 以外は数値として読み、0 以外を真とする。
                     ok = match parse_dec(b) {
-                        Some((m, e)) => {
+                        Some((m, e, inexact)) => {
                             let k = e + scale;
-                            let y = if k >= 0 {
+                            // 整数部の桁を落としていたら丸めた値しか無い。
+                            // 範囲外と同じ扱いで NULL にする（丸めた値を返すと
+                            // 桁が黙って化ける）。DuckDB は CAST でエラー、
+                            // TRY_CAST で NULL。このエンジンは常に NULL 側。
+                            let y = if inexact {
+                                None
+                            } else if k >= 0 {
                                 pow10_i128(k as u32).and_then(|p| m.checked_mul(p))
                             } else if -k > 38 {
                                 Some(0)
@@ -1364,15 +1401,43 @@ mod tests {
 
     #[test]
     fn parse_dec_forms() {
-        assert_eq!(parse_dec(b"123"), Some((123, 0)));
-        assert_eq!(parse_dec(b" -12.5 "), Some((-125, -1)));
-        assert_eq!(parse_dec(b"+1e3"), Some((1, 3)));
-        assert_eq!(parse_dec(b".5"), Some((5, -1)));
-        assert_eq!(parse_dec(b"1E-2"), Some((1, -2)));
+        assert_eq!(parse_dec(b"123"), Some((123, 0, false)));
+        assert_eq!(parse_dec(b" -12.5 "), Some((-125, -1, false)));
+        assert_eq!(parse_dec(b"+1e3"), Some((1, 3, false)));
+        assert_eq!(parse_dec(b".5"), Some((5, -1, false)));
+        assert_eq!(parse_dec(b"1E-2"), Some((1, -2, false)));
         assert_eq!(parse_dec(b""), None);
         assert_eq!(parse_dec(b"abc"), None);
         assert_eq!(parse_dec(b"1.2.3"), None);
         assert_eq!(parse_dec(b"1e"), None);
+    }
+
+    /// i128 の端。仮数を負の側に積んでいるので下限ちょうども正確に読める。
+    /// 39 桁を 38 桁で打ち切っていた頃は上限が `…105720` に丸まっていた。
+    #[test]
+    fn parse_dec_i128_boundaries() {
+        assert_eq!(
+            parse_dec(b"170141183460469231731687303715884105727"),
+            Some((i128::MAX, 0, false))
+        );
+        assert_eq!(
+            parse_dec(b"-170141183460469231731687303715884105728"),
+            Some((i128::MIN, 0, false))
+        );
+        // 上限 +1 / 下限 -1 は仮数に収まらない。丸めた値は返るが inexact が立ち、
+        // 整数キャスト側はそれを見て NULL にする。
+        let (_, _, inexact) = parse_dec(b"170141183460469231731687303715884105728").unwrap();
+        assert!(inexact);
+        let (_, _, inexact) = parse_dec(b"-170141183460469231731687303715884105729").unwrap();
+        assert!(inexact);
+        // 38 桁までは元から正確。
+        assert_eq!(
+            parse_dec(b"12345678901234567890123456789012345678"),
+            Some((12345678901234567890123456789012345678, 0, false))
+        );
+        // 小数部を落とすのは整数としての値に影響しないので inexact にしない。
+        let long_frac = b"1.000000000000000000000000000000000000000000000005";
+        assert_eq!(parse_dec(long_frac).map(|(_, _, x)| x), Some(false));
     }
 
     // --- INTERVAL -------------------------------------------------------------

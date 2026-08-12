@@ -106,6 +106,7 @@ off-by-a-magnitude bugs). To compare against a TIMESTAMP, pass
 | DECIMAL | `string` (precision/scale already applied, e.g. `"1.0050"`) |
 | VARCHAR | `string` (already UTF-8 decoded) |
 | JSON | `string` (raw JSON text, not parsed — call `JSON.parse()` yourself if you want an object/array back) |
+| INTERVAL | `{ months: number, days: number, micros: bigint }` |
 | BLOB | `Uint8Array` |
 | NULL | `null` |
 

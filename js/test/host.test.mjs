@@ -23,6 +23,7 @@ import {
   detectFormat,
   encodeParams,
   timestampToDate,
+  unpackInterval,
 } from '../ahirudb.js';
 import { Code, errorMessage } from '../errors.js';
 
@@ -948,6 +949,56 @@ test('JSON 型は生テキストの string で返る（デコード済み文字�
     for await (const b of db.stream("SELECT json_array(1, 2) AS l FROM range(1)")) {
       assert.equal(b.schema[0].type, 'JSON');
     }
+  } finally {
+    db.close();
+  }
+});
+
+test('INTERVAL は 3 成分に開いて返る（詰めたままの i128 にしない）', { skip: needsVm }, async () => {
+  const db = await openDb();
+  try {
+    const rows = await db.query(
+      "SELECT INTERVAL '1' MONTH AS mo, INTERVAL '3' DAY AS d," +
+        " INTERVAL '90' MINUTE AS t, INTERVAL '1 year 2 months 3 days' AS mix FROM range(1)",
+    );
+    // 詰めたままだと month は 2^96 の位に居るので、生の BigInt には意味が無い。
+    assert.deepEqual(rows[0].mo, { months: 1, days: 0, micros: 0n });
+    assert.deepEqual(rows[0].d, { months: 0, days: 3, micros: 0n });
+    assert.deepEqual(rows[0].t, { months: 0, days: 0, micros: 5400000000n });
+    assert.deepEqual(rows[0].mix, { months: 14, days: 3, micros: 0n });
+    for await (const b of db.stream("SELECT INTERVAL '1' DAY AS d FROM range(1)")) {
+      assert.equal(b.schema[0].type, 'INTERVAL');
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test('unpackInterval は負の成分も符号付きで取り出す', () => {
+  // pack_interval(months, days, micros) と同じ詰め方を JS 側で組んで往復させる。
+  const pack = (months, days, micros) =>
+    (BigInt.asUintN(32, BigInt(months)) << 96n) |
+    (BigInt.asUintN(32, BigInt(days)) << 64n) |
+    BigInt.asUintN(64, BigInt(micros));
+  assert.deepEqual(unpackInterval(pack(-1, -2, -3)), { months: -1, days: -2, micros: -3n });
+  assert.deepEqual(unpackInterval(pack(0, 0, 0)), { months: 0, days: 0, micros: 0n });
+  assert.deepEqual(unpackInterval(pack(2147483647, -2147483648, -1)), {
+    months: 2147483647,
+    days: -2147483648,
+    micros: -1n,
+  });
+});
+
+test('HUGEINT は i128 の端まで正確に返る', { skip: needsVm }, async () => {
+  const db = await openDb();
+  try {
+    // 10 進パーサが 38 桁で打ち切っていた頃は `…105720` に丸まっていた。
+    const rows = await db.query(
+      "SELECT CAST('170141183460469231731687303715884105727' AS HUGEINT) AS mx," +
+        " CAST('-170141183460469231731687303715884105728' AS HUGEINT) AS mn FROM range(1)",
+    );
+    assert.equal(rows[0].mx, 170141183460469231731687303715884105727n);
+    assert.equal(rows[0].mn, -170141183460469231731687303715884105728n);
   } finally {
     db.close();
   }
