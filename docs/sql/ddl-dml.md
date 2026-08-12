@@ -14,10 +14,10 @@ removes its code from the build entirely (this is what keeps the default
 | `ddl` | `CREATE`/`ALTER`/`DROP TABLE`, `CREATE`/`DROP VIEW` | — |
 | `dml` | `INSERT`/`UPDATE`/`DELETE` | `ddl` |
 | `export` | `COPY (SELECT ...) TO 'path' (FORMAT csv\|jsonl)` | — |
-| `export-parquet` | Same, for Parquet output | `export`, not yet implemented |
+| `export-parquet` | Same, for Parquet output | `export` |
 
-The native `ahiru-cli` binary enables `export` by default; `ddl`/`dml` must
-be turned on explicitly:
+The native `ahiru-cli` binary enables `export` and `export-parquet` by
+default; `ddl`/`dml` must be turned on explicitly:
 
 ```bash
 cargo run -p ahiru-cli --features ahiru-core/ddl,ahiru-core/dml -- \
@@ -133,12 +133,38 @@ fixed depth limit.
 COPY (SELECT a, b FROM t) TO 'out.csv';
 COPY (SELECT a FROM t) TO 'out.txt' (FORMAT csv);
 COPY (SELECT a FROM t) TO 'out.jsonl' (FORMAT jsonl);
+COPY (SELECT a FROM t) TO 'out.parquet';
+COPY (SELECT a FROM t) TO 'out.bin' (FORMAT parquet);
 COPY t TO 'out.csv';   -- shorthand for COPY (SELECT * FROM t) TO 'out.csv'
 ```
 
 `FORMAT` defaults to whatever `path`'s extension implies, and is
-case-insensitive when given explicitly. Parquet output (`FORMAT parquet`)
-is not implemented yet.
+case-insensitive when given explicitly. As on the read side, an extension
+that isn't recognised (including no extension at all) means Parquet.
+
+### Parquet output
+
+Requires the `export-parquet` feature (on by default in the native CLI,
+opt-in for wasm builds). The writer is deliberately plain: one uncompressed
+`PLAIN`-encoded data page per column per row group, RLE definition levels,
+122,880 rows per row group, and no dictionary, statistics, page index, or
+bloom filters. Those are all optional parts of the format, so the output is
+readable anywhere (there are DuckDB cross-checks in
+`crates/ahiru-cli/tests/copy.rs`) — it is just larger and less prunable
+than what a full-featured writer would produce.
+
+SQL types map to their natural Parquet types, with two deliberate
+exceptions:
+
+- **INTERVAL** is written as text (`1 year 2 months 3 days 01:02:03`, the
+  same rendering the CSV/JSONL exports use), not as the legacy FLBA(12)
+  `INTERVAL` type, which cannot represent signed components. It reads back
+  as `VARCHAR`.
+- **HUGEINT** is written as `DECIMAL(38, 0)`, since Parquet has no 128-bit
+  integer type. Values keep their exact value but read back as `DECIMAL`.
+
+The full table is in the module doc of
+`crates/ahiru-core/src/write/parquet/mod.rs`.
 
 The engine core itself never touches a filesystem (it's `no_std`) — `COPY`
 runs the query to completion in memory and hands the resulting bytes plus

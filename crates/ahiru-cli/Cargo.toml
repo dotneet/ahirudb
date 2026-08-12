@@ -9,10 +9,13 @@ name = "ahiru"
 path = "src/main.rs"
 
 [dependencies]
-# `export`: COPY (SELECT ...) TO 'x.csv'/'x.jsonl' を CLI からも使えるように
-# する。ファイルへの実書き込みは `ahiru-core` ではなくここ（`main.rs`）が
-# 行う（`ahiru-core` は no_std でファイルシステムに触れられないため）。
-ahiru-core = { path = "../ahiru-core", features = ["std", "export"] }
+# `export` / `export-parquet`: COPY (SELECT ...) TO 'x.csv'/'x.jsonl'/'x.parquet'
+# を CLI からも使えるようにする。ファイルへの実書き込みは `ahiru-core` では
+# なくここ（`main.rs`）が行う（`ahiru-core` は no_std でファイルシステムに
+# 触れられないため）。Parquet 書き出しは wasm では容量の都合でオプトインだが、
+# ネイティブ CLI にはサイズ制約が無いので既定で入れる（DuckDB との相互運用を
+# `tests/copy.rs` で通しで検証するためにも必要）。
+ahiru-core = { path = "../ahiru-core", features = ["std", "export", "export-parquet"] }
 # ZSTD は wasm では別モジュールとして遅延ロードするが、ネイティブ CLI では
 # 直接リンクしてよい（サイズ制約はコアの .wasm にしか掛からない）。
 # こうすることでコーデック委譲プロトコル自体を CLI で通しで検証できる。

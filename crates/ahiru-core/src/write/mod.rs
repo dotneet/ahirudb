@@ -22,6 +22,8 @@
 pub mod csv;
 #[cfg(feature = "jsonl")]
 pub mod jsonl;
+#[cfg(feature = "export-parquet")]
+pub mod parquet;
 
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
@@ -37,6 +39,8 @@ pub enum ExportFormat {
     Csv,
     #[cfg(feature = "jsonl")]
     Jsonl,
+    #[cfg(feature = "export-parquet")]
+    Parquet,
 }
 
 /// 書き出し先。`Batch` を受け取ってバイト列に変換するだけの薄い抽象。
@@ -119,10 +123,11 @@ fn export_query(
 
 /// `Stmt::Copy` の実行本体。`Session::prepare` から呼ばれる。
 ///
-/// フォーマットは明示指定（`FORMAT csv|jsonl|json`）があればそれを、
-/// 無ければ `path` の拡張子から `format::FormatKind::detect` で推定する。
-/// 書き出せるのは CSV / JSONL のみ（Parquet 書き出しは v1 では未実装なので、
-/// 拡張子が Parquet 相当に解決されたら `UnsupportedFeature`）。
+/// The format comes from an explicit `FORMAT csv|jsonl|json|parquet` when
+/// given, and otherwise from the extension of `path` via
+/// `format::FormatKind::detect`. Which formats can actually be written
+/// depends on the enabled features (`csv`, `jsonl`, `export-parquet`);
+/// anything else is `UnsupportedFeature`.
 ///
 /// **ファイルには書かない**: 結果は `Query::copy_result` に包んで返す。
 /// 実際に `path` へ書き込むのは呼び出し側（ネイティブなら `ahiru-cli`）の
@@ -147,6 +152,11 @@ pub(crate) fn copy(
             let mut sink = jsonl::JsonlSink::new();
             export_query(session, arena, query, params, &mut sink)?
         }
+        #[cfg(feature = "export-parquet")]
+        ExportFormat::Parquet => {
+            let mut sink = parquet::ParquetSink::new();
+            export_query(session, arena, query, params, &mut sink)?
+        }
     };
     Ok(Prepared::Ready(Query::copy_result(path.to_owned(), data)))
 }
@@ -160,8 +170,7 @@ fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
         // なく改行区切りの JSON を書く（実測して確認済み）ので、読み取り側の
         // 「1 ファイル 1 JSON 値」の `Json` とは書き出し側で意味が分かれる
         // ことになるが、他に書き出し用の JSON 配列シンクを持たない v1 では
-        // これが妥当な対応先。拡張子が Parquet 相当（未知の拡張子を含む）に
-        // 解決された場合は書き出しに対応するシンクが無いので明示的に断る。
+        // これが妥当な対応先。
         None => match crate::format::FormatKind::detect(path) {
             #[cfg(feature = "csv")]
             crate::format::FormatKind::Csv | crate::format::FormatKind::Tsv => {
@@ -171,8 +180,12 @@ fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
             crate::format::FormatKind::Jsonl | crate::format::FormatKind::Json => {
                 Ok(ExportFormat::Jsonl)
             }
-            // `Parquet`（未知の拡張子の既定含む）は書き出し用のシンクを
-            // 持たないので明示的に断る。
+            // `detect` resolves both `.parquet` and any unknown extension
+            // to `Parquet`, mirroring the read side. Without
+            // `export-parquet` there is no sink for it, so say so rather
+            // than quietly picking some other format.
+            #[cfg(feature = "export-parquet")]
+            crate::format::FormatKind::Parquet => Ok(ExportFormat::Parquet),
             _ => err!(UnsupportedFeature),
         },
     }
@@ -187,6 +200,10 @@ fn format_by_name(name: &str) -> Result<ExportFormat> {
     #[cfg(feature = "jsonl")]
     if eq_ascii_ci(name.as_bytes(), b"jsonl") || eq_ascii_ci(name.as_bytes(), b"json") {
         return Ok(ExportFormat::Jsonl);
+    }
+    #[cfg(feature = "export-parquet")]
+    if eq_ascii_ci(name.as_bytes(), b"parquet") {
+        return Ok(ExportFormat::Parquet);
     }
     err!(UnsupportedFeature)
 }
@@ -306,8 +323,11 @@ mod tests {
         assert_eq!(String::from_utf8(r.data).unwrap(), "id,name\n2,b\n1,a\n");
     }
 
+    /// Without `export-parquet` there is no Parquet sink, so both the
+    /// extension route and the explicit `FORMAT parquet` route have to say
+    /// so instead of quietly falling back to some other format.
     #[test]
-    #[cfg(feature = "csv")]
+    #[cfg(all(feature = "csv", not(feature = "export-parquet")))]
     fn copy_unsupported_format_is_rejected() {
         let mut s = Session::new();
         s.register_bytes_as("t", b"id\n1\n".to_vec(), crate::format::FormatKind::Csv).unwrap();
@@ -315,6 +335,18 @@ mod tests {
         assert_eq!(crate::error::code_of(r), Some(crate::error::Code::UnsupportedFeature));
 
         let r = s.prepare("COPY (SELECT id FROM t) TO 'out.csv' (FORMAT parquet)", &[]);
+        assert_eq!(crate::error::code_of(r), Some(crate::error::Code::UnsupportedFeature));
+    }
+
+    /// A format name no build ever supports is rejected whatever features
+    /// are on (the `export-parquet` counterpart of the test above, which
+    /// can no longer use `parquet` as its example).
+    #[test]
+    #[cfg(feature = "csv")]
+    fn copy_unknown_format_name_is_rejected() {
+        let mut s = Session::new();
+        s.register_bytes_as("t", b"id\n1\n".to_vec(), crate::format::FormatKind::Csv).unwrap();
+        let r = s.prepare("COPY (SELECT id FROM t) TO 'out.csv' (FORMAT orc)", &[]);
         assert_eq!(crate::error::code_of(r), Some(crate::error::Code::UnsupportedFeature));
     }
 

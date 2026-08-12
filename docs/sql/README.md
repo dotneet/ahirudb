@@ -28,17 +28,17 @@ cargo run -p ahiru-cli -- query tests/data/small_a.parquet tests/data/small_b.pa
   "SELECT a.k, b.w FROM t AS a LEFT JOIN t2 AS b ON a.k = b.k ORDER BY a.k"
 ```
 
-From JS (browser/Node/Workers), via the `ahirudb` npm package:
+From JS (browser or Node 18+), via the dependency-free ES module in `js/`:
 
 ```js
-import { AhiruDB } from "ahirudb";
+import { AhiruDB } from "./js/ahirudb.js";
 
 const db = await AhiruDB.init({ wasmUrl: "/ahiru-core.wasm" });
 db.register("trips", "https://example.com/trips.parquet");
 const rows = await db.query("SELECT vendor, count(*) c FROM trips GROUP BY 1 ORDER BY c DESC");
 ```
 
-See [DESIGN.md §10](../DESIGN.md) for the full JS API (streaming results,
+See [js/README.md](../../js/README.md) for the full JS API (streaming results,
 parameter binding, custom byte sources, memory limits).
 
 ## Pages

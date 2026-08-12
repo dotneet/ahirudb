@@ -494,7 +494,7 @@ WITH [RECURSIVE] cte_name [(cols...)] AS (<query>), ... <query>
 PIVOT <rel> ON <expr> [IN (...)] [USING agg(expr)] [GROUP BY ...]
 UNPIVOT <rel> ON (col, ...) INTO NAME n VALUE v
 DESCRIBE <rel>   SHOW TABLES   EXPLAIN <query>
-COPY (<query>) TO '<path>' (FORMAT csv|jsonl)                       -- feature `export`
+COPY (<query>) TO '<path>' (FORMAT csv|jsonl|parquet)                -- feature `export` / `export-parquet`
 CREATE [OR REPLACE] TABLE t (...) [AS SELECT ...]                    -- feature `ddl`, in-memory only
 ALTER TABLE t ADD|DROP|RENAME COLUMN ... | RENAME TO ...              -- feature `ddl`, in-memory only
 DROP TABLE t   CREATE [OR REPLACE] VIEW v AS <query>   DROP VIEW v    -- feature `ddl`
@@ -956,7 +956,7 @@ matches the philosophy of the rest of the engine (§1).
 | Feature | Content | Status |
 |---|---|---|
 | `export` | `TableSink` trait, CSV/JSONL export, `COPY (SELECT ...) TO` | Implemented |
-| `export-parquet` | Same, for Parquet output (needs a Thrift serializer) | Not implemented |
+| `export-parquet` | Same, for Parquet output (adds a Thrift serializer; implies `export`) | Implemented |
 | `ddl` | `CREATE TABLE`/`CREATE TABLE AS`/`DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`), `CREATE VIEW`/`DROP VIEW` (in-memory only) | Implemented |
 | `dml` | `INSERT`/`UPDATE`/`DELETE` (implies `ddl`) | Implemented |
 
@@ -1009,6 +1009,18 @@ SQL grammar (see §7). The core itself never touches a filesystem — writing
 the actual bytes to disk is `ahiru-cli`'s job (`crates/ahiru-cli/tests/copy.rs`
 covers this), keeping the `export`/`write` module itself filesystem-free and
 consistent with the core's "the host does I/O" stance (§1).
+
+`export-parquet` adds a `ParquetSink` behind the same `TableSink` trait
+(`src/write/parquet/`), with its own Thrift *serializer* mirroring the
+read-side `parquet::thrift` deserializer. It writes the deliberately plain
+subset of the format — uncompressed `PLAIN` data pages (v1), RLE definition
+levels, one page per column per row group, no dictionary/statistics/page
+index/bloom filter — which costs ~7 KB of wasm on top of `export`. Every
+omitted part is optional in the format, so DuckDB and this crate's own
+reader both accept the output; it is simply bigger and less prunable than a
+tuned writer's. Unlike the other sinks it has to buffer a row group's worth
+of rows before emitting anything, because Parquet stores each column
+contiguously within a row group.
 
 ### `ddl`/`dml`
 

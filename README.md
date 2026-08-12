@@ -1,127 +1,113 @@
 # ahirudb
 
-A lightweight SQL engine that queries Parquet directly, built to run in under 1 MiB of WASM.
+**A SQL engine that queries Parquet, CSV, and JSON directly — in the browser,
+in under 1 MiB of WebAssembly.**
 
-DuckDB-WASM weighs tens of MB (roughly 10 MB even after brotli). Rather than
-*shrinking* DuckDB, ahirudb fits the 1 MiB budget by **choosing what to include
-from the start**.
+Point it at a `.parquet` URL and run SQL against it. Only the byte ranges the
+query actually needs are fetched, over HTTP Range requests, and nothing is
+uploaded anywhere — the engine runs in the tab.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the full design, and
-[docs/sql/README.md](docs/sql/README.md) for the end-user SQL reference.
+```js
+import { AhiruDB } from './js/ahirudb.js';
 
-## Current size
+const db = await AhiruDB.init({ wasmUrl: '/ahiru-core.wasm' });
+db.register('trips', 'https://example.com/trips.parquet');   // no I/O yet
 
-| Configuration | raw | gzip -9 | of budget |
+await db.query('SELECT vendor, count(*) c FROM trips GROUP BY 1 ORDER BY c DESC');
+```
+
+DuckDB-WASM is the obvious alternative and a far more complete database, but it
+weighs tens of MB (roughly 10 MB even after brotli) — enough that shipping it
+on a page is a decision, not a detail. Rather than *shrinking* DuckDB, ahirudb
+fits a 1 MiB budget by **choosing what to include from the start**, and still
+covers a practically DuckDB-shaped subset of SQL: joins, window functions,
+recursive CTEs, correlated subqueries, `GROUPING SETS`, `PIVOT`/`UNPIVOT`,
+JSON path operators, lambdas, regular expressions.
+
+| Build | raw | gzip -9 | of 1 MiB budget |
 |---|---:|---:|---:|
-| `ahiru-core.wasm` (Parquet only, default) | 390.5 KiB | 174.0 KiB | 38.1% |
-| `ahiru-core.wasm` (+ CSV + JSONL) | 418.0 KiB | 185.5 KiB | **40.8%** |
+| Parquet only, ZSTD included (default) | 450.3 KiB | 197.9 KiB | 44.0% |
+| Plus CSV + JSONL + JSON (everything read-side) | 477.9 KiB | 209.8 KiB | **46.7%** |
 
-Figures include `wasm-opt`. ZSTD decompression is linked directly into
-`ahiru-core.wasm` and included in these numbers (feature `zstd`, on by
-default — see "Compression" below). The `ddl`/`dml`/`export` write-path
-features are opt-in and excluded from these default numbers — see
-[DESIGN.md §16](docs/DESIGN.md).
+Measured by [`./scripts/size.sh`](scripts/size.sh) with `wasm-opt`. CI fails the
+build if the fully-loaded configuration exceeds 1 MiB.
 
-Measured with `./scripts/size.sh`, which reports a breakdown per configuration
-and the incremental cost of adding CSV / JSONL. The gate is judged on the
-**fully-loaded configuration** (passing only with a trimmed distribution
-wouldn't actually enforce the budget). CI fails if it exceeds 1 MiB.
-
-## Supported features
-
-**Formats (read)**
-- Parquet — Thrift Compact metadata, PLAIN / RLE / dictionary / DELTA page encodings. Compression: UNCOMPRESSED / SNAPPY / LZ4_RAW / ZSTD are all decompressed by the core itself (feature `zstd`, on by default — see [DESIGN.md §6](docs/DESIGN.md)); GZIP is delegated to the host's own decompressor (`DecompressionStream` in the browser/Node), since duplicating something the host already has for free isn't worth the bytes
-- CSV / TSV (feature `csv`), JSONL/NDJSON (feature `jsonl`), single-document JSON arrays (`read_json`/`read_json_auto`-style)
-- glob / multi-file tables, Hive-style partition directories (`year=2024/month=01/...`), automatically exposed and filterable as virtual columns
-- Nested Parquet columns (`STRUCT`, `LIST`, `MAP`) — `STRUCT` is flattened into dotted column names where possible; `LIST`/`MAP` (and `STRUCT` containing them) are exposed as a `JSON`-typed column
-- Pushdown: projection pushdown, statistics-based RowGroup pruning, page-level pruning via ColumnIndex/OffsetIndex, Split Block Bloom Filters
-
-**SQL**
-- Joins: `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS`, non-equi, correlated and uncorrelated subqueries (`EXISTS` / `IN` / scalar), `UNNEST` (in the `SELECT` list and, implicitly lateral, in `FROM`)
-- Aggregation: `GROUP BY` / `HAVING` / `DISTINCT` / `FILTER (WHERE ...)`, `GROUPING SETS` / `ROLLUP` / `CUBE`, statistical aggregates (`stddev`, `variance`, `median`, `mode`, `approx_count_distinct`), `string_agg` / `array_agg`
-- Window functions (fixed default frame, chosen automatically from `ORDER BY` presence; no explicit `ROWS`/`RANGE BETWEEN` bounds), `QUALIFY`
-- `WITH` (CTEs, including `WITH RECURSIVE`), `UNION` / `INTERSECT` / `EXCEPT`
-- `DISTINCT ON`, `ILIKE`, `TRY_CAST`, `IIF`, regular expressions (`regexp_matches` / `regexp_extract` / `regexp_replace`)
-- `JSON` type with path operators (`->`, `->>`, `json_extract`, `json_type`, `json_array_length`, `json_object`, `json_array`, `list_extract`, `map_extract`, ...) — `LIST`/`MAP` values share this same representation
-- `DATE` / `TIME` / `TIMESTAMP` / `TIMESTAMPTZ` / `INTERVAL` arithmetic, `DECIMAL` with correct scale propagation, `UUID`
-- `DESCRIBE`, `SHOW TABLES`, `EXPLAIN`
-
-**Write path (opt-in, off by default — see [DESIGN.md §16](docs/DESIGN.md))**
-- `CREATE TABLE` / `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`) / `DROP TABLE`, `CREATE VIEW` / `DROP VIEW` — feature `ddl`, effective only on in-memory tables created this way, never on file-backed tables
-- `INSERT` / `UPDATE` / `DELETE` — feature `dml`
-- `COPY (SELECT ...) TO 'file' (FORMAT csv|jsonl)` and the underlying `TableSink`/`export_all` API — feature `export`. The core never touches a filesystem itself; `ahiru-cli` performs the actual file write
-
-**Runtime**
-- wasm ABI + split-boundary I/O barrier (the engine never blocks; it returns the exact byte ranges it needs and resumes when they're supplied)
-- JS host layer (Node and browser): range-request coalescing, LRU byte caching, GZIP delegation via `DecompressionStream`. (ZSTD delegation to a separate `ahiru-zstd.wasm` module is also still supported, as a fallback for builds with the `zstd` core feature turned off.)
-- Native `ahiru-cli` for development, testing, and scripting
-
-**Known gaps**: `PIVOT`/`UNPIVOT`, `ASOF JOIN`, general `LATERAL` (beyond `UNNEST`), `CREATE MACRO`, sequences/constraints, transactions, `ATTACH`, named parameters. See [docs/DESIGN.md §15](docs/DESIGN.md) for the full list of intentional limitations.
-
-## Browser demo
+## Try it
 
 ```bash
 ./scripts/demo.sh
 ```
 
-Builds a Parquet + CSV + JSONL + ZSTD `.wasm` and opens a local page
-(`demo/`) where you can run SQL against the bundled sample files or your own
-`.parquet`/`.csv`/`.jsonl` — entirely in the tab, no server-side query
-execution. See [js/README.md](js/README.md) for the JS host API it's built on.
+Builds the wasm binary and opens a local page where you can query the bundled
+sample files — or drop in your own `.parquet`/`.csv`/`.jsonl`, which never
+leaves the browser.
 
-## Usage (native CLI)
-
-Development and testing run natively; debugging through wasm is inefficient.
+Or from the native CLI, no wasm involved:
 
 ```bash
-cargo run -p ahiru-cli -- schema tests/data/basic.parquet
+cargo run -p ahiru-cli -- query tests/data/basic.parquet \
+  "SELECT name, count(*) c FROM t GROUP BY name ORDER BY c DESC"
 ```
 
-```bash
-cargo run -p ahiru-cli -- dump tests/data/basic.parquet 10
-```
+## What you get
 
-```bash
-cargo run -p ahiru-cli -- query tests/data/basic.parquet "SELECT name, count(*) c FROM t GROUP BY name ORDER BY c DESC"
-```
+**Reads what you already have.** Parquet (PLAIN / RLE / dictionary / DELTA
+encodings; SNAPPY / LZ4_RAW / ZSTD decompressed in-core, GZIP delegated to the
+host's `DecompressionStream`), CSV / TSV, JSONL / NDJSON, single-document JSON.
+Globs and multi-file tables, Hive-partitioned directories (`year=2024/month=01/`)
+exposed as filterable virtual columns, and nested `STRUCT` / `LIST` / `MAP`
+columns.
 
-Passing multiple files binds them as `t`, `t2`, ... so they can be joined.
+**Reads as little as possible.** Projection pushdown, statistics-based RowGroup
+pruning, page-level pruning via ColumnIndex/OffsetIndex, and Split Block Bloom
+Filters — so a selective query over a large remote file fetches a handful of
+ranges rather than the file.
 
-```bash
-cargo run -p ahiru-cli -- query tests/data/small_a.parquet tests/data/small_b.parquet "SELECT a.k, b.w FROM t AS a LEFT JOIN t2 AS b ON a.k = b.k ORDER BY a.k"
-```
+**SQL that covers real work.** All join types (plus non-equi and correlated
+subqueries), `GROUP BY`/`HAVING`/`GROUPING SETS`/`ROLLUP`/`CUBE`, window
+functions and `QUALIFY`, `WITH RECURSIVE`, set operations, `PIVOT`/`UNPIVOT`,
+`UNNEST`, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`/`DECIMAL`/`UUID` with correct
+semantics, and a `JSON` type with path operators. Verified against DuckDB:
+the end-to-end tests run each query through both engines and compare.
 
-## Tests
+**Runs anywhere JS does.** A zero-dependency, no-build-step ES module drives the
+wasm core in the browser and in Node 18+, with range coalescing, LRU byte
+caching, parameter binding, and streaming columnar batches. A native CLI covers
+scripting and development.
 
-```bash
-cargo test
-```
+**Writes, if you ask for it.** `CREATE TABLE`/`INSERT`/`UPDATE`/`DELETE` and
+`COPY ... TO` (CSV, JSONL, and Parquet) exist as opt-in Cargo features, the
+DDL/DML ones operating on in-memory tables only. They're off by default and
+compiled out entirely, so the read-only distribution pays nothing for them.
 
-Test data is generated with the DuckDB CLI.
+**Limitations are explicit.** No spilling (exceeding the memory cap is a clean
+error, never a wrong or partial result), no `ASOF JOIN`, no general `LATERAL`,
+no transactions, no explicit window frames. The full list, along with the
+places where behavior deliberately differs from DuckDB, is in
+[docs/sql/limitations.md](docs/sql/limitations.md).
 
-The SQL end-to-end tests (`crates/ahiru-cli/tests/sql_e2e.rs`) **don't hardcode
-expected values — the same query is run against DuckDB and the results are
-compared**. Hand-written expected values would silently turn a typo into the
-spec, and every new query would need its expectation computed by hand. Using
-DuckDB as the reference implementation means adding one line adds one more
-verified case. On environments without DuckDB installed, those tests are skipped.
+## How it works
 
-## Size measurement
+The one idea worth knowing up front: **the engine never blocks on I/O**. When
+it needs bytes it doesn't have, it returns the exact ranges it wants and
+suspends; the host fetches them however it likes and resumes it. That's what
+lets the same core run against an HTTP URL, a `File` picked in a form, or a
+local path, without the engine knowing which — and without a threads-and-async
+runtime inside the wasm budget.
 
-```bash
-./scripts/size.sh
-```
+The rest of the budget is held by the same kind of deliberate choice: `no_std`
+with no `core::fmt`, six physical types instead of a general type system, error
+*codes* in wasm with the message strings living in the JS host, and optional
+features that compile out completely.
 
-With `wasm-opt` (binaryen) and `twiggy` installed, it also reports the
-optimized size and a function-by-function breakdown.
+## Documentation
 
-## Limitations
-
-Intentional limitations are catalogued in [docs/DESIGN.md §15](docs/DESIGN.md).
-In short: no spilling (exceeding the memory budget is a hard error), and the
-gaps listed under "Known gaps" above. Rounding conventions (float-to-integer
-uses round-half-to-even; DECIMAL scale reduction rounds away from zero) are in
-the same section.
+| | |
+|---|---|
+| [docs/sql/](docs/sql/README.md) | SQL reference — what you can write in a query, page by page |
+| [js/README.md](js/README.md) | JS host API: registering sources, streaming, caching, error codes |
+| [docs/DESIGN.md](docs/DESIGN.md) | Architecture and the reasoning behind every constraint above |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, testing, Cargo features, size measurement |
 
 ## License
 
