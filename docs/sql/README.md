@@ -46,7 +46,7 @@ parameter binding, custom byte sources, memory limits).
 | Page | Covers |
 |---|---|
 | [queries.md](queries.md) | `SELECT` end to end: `WHERE`, joins, subqueries, CTEs (incl. `WITH RECURSIVE`), `UNION`/`INTERSECT`/`EXCEPT`, `GROUP BY`/`HAVING`/`GROUPING SETS`/`ROLLUP`/`CUBE`, window functions/`QUALIFY`, `SAMPLE`, `PIVOT`/`UNPIVOT`, `UNNEST`, `generate_series`/`range`, `DESCRIBE`/`SHOW TABLES`/`EXPLAIN` |
-| [types.md](types.md) | Data types, `CAST`/`TRY_CAST`, `NULL`/three-valued logic, rounding rules, `INTERVAL` literals |
+| [types.md](types.md) | Data types, `CAST`/`TRY_CAST`, `NULL`/three-valued logic, rounding rules, typed date/time literals, `INTERVAL` literals |
 | [data-sources.md](data-sources.md) | Reading Parquet/CSV/JSONL/JSON, glob and multi-file tables, Hive partitions, nested `STRUCT`/`LIST`/`MAP` |
 | [ddl-dml.md](ddl-dml.md) | `CREATE`/`ALTER`/`DROP TABLE`, views, `INSERT`/`UPDATE`/`DELETE`, `COPY ... TO` — all opt-in, in-memory-only features |
 | [limitations.md](limitations.md) | What's not supported, and DuckDB-visible behavior differences worth knowing about |
@@ -55,7 +55,7 @@ parameter binding, custom byte sources, memory limits).
 
 | Page | Covers |
 |---|---|
-| [functions-string.md](functions-string.md) | Case/trim/pad, substrings/search/split, `LIKE`/`ILIKE`/`GLOB`/`SIMILAR TO`, regular expressions, `printf`/`format` |
+| [functions-string.md](functions-string.md) | Case/trim/pad, substrings/search/split, SQL-standard `position`/`substring`/`trim` spellings, `^@`, `LIKE`/`ILIKE`/`GLOB`/`SIMILAR TO`, regular expressions, `printf`/`format` |
 | [functions-numeric.md](functions-numeric.md) | Arithmetic, rounding, `greatest`/`least`/`coalesce`/`nullif` |
 | [functions-datetime.md](functions-datetime.md) | `CURRENT_DATE`/`now()`, field extraction, truncation, parsing/formatting, date arithmetic |
 | [functions-json.md](functions-json.md) | `JSON` path operators and functions, list/map access, lambda expressions (`list_transform`/`list_filter`/`list_reduce`) |

@@ -44,6 +44,50 @@ SELECT contains('hello', 'ell');     -- true
 | `contains(s, sub)` | — | boolean |
 | `length(s)` | `len`, `char_length`, `character_length` | counts codepoints |
 
+## SQL-standard spellings
+
+The SQL standard writes three of the functions above with keywords instead
+of commas. Both spellings work and mean exactly the same thing — the
+keyword forms are rewritten to the positional calls while the query is
+parsed, so there is no difference in behavior or performance.
+
+```sql
+SELECT position('wor' IN 'hello world');        -- 7, same as strpos('hello world', 'wor')
+
+SELECT substring('hello' FROM 2);               -- 'ello'
+SELECT substring('hello' FROM 2 FOR 3);         -- 'ell'
+SELECT substring('hello' FOR 3);                -- 'hel'   (start defaults to 1)
+
+SELECT trim(BOTH 'x' FROM 'xxhixx');            -- 'hi',   same as trim('xxhixx', 'x')
+SELECT trim(LEADING 'x' FROM 'xxhixx');         -- 'hixx', same as ltrim('xxhixx', 'x')
+SELECT trim(TRAILING 'x' FROM 'xxhixx');        -- 'xxhi', same as rtrim('xxhixx', 'x')
+SELECT trim('x' FROM 'xxhixx');                 -- 'hi',   direction defaults to BOTH
+SELECT trim(FROM '  hi  ');                     -- 'hi',   char set defaults to a space
+```
+
+Note the **argument order flip** in `position`: the standard form names the
+string being searched *for* first, the positional form names the string
+being searched *in* first. `position('b' IN 'abc')` and `strpos('abc', 'b')`
+are the same call.
+
+`BOTH`, `LEADING`, `TRAILING`, and `FOR` are not reserved words — a column
+named `leading` or `for` still works unquoted, and `trim(leading, 'x')`
+stays an ordinary two-argument call on a column named `leading`.
+
+## Prefix operator (starts-with)
+
+```sql
+SELECT 'hello' ^@ 'he';                       -- true
+SELECT * FROM t WHERE name ^@ 'name_1';
+```
+
+`a ^@ b` is sugar for `starts_with(a, b)`; `NULL` on either side gives
+`NULL`. It binds at comparison strength, but reads its right operand more
+tightly than `||` does — so `'ab' ^@ 'a' || 'b'` is `('ab' ^@ 'a') || 'b'`,
+while `'a' || 'b' ^@ 'a'` is `('a' || 'b') ^@ 'a'`. (Both match DuckDB;
+this is the same asymmetry the `~~` operator family has, see
+[Pattern matching](#pattern-matching).)
+
 ## Other transforms
 
 ```sql

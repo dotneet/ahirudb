@@ -43,6 +43,20 @@ user-visible effect.
   no support for an explicit `ROWS`/`RANGE BETWEEN ...` frame. It's rejected
   at parse time rather than silently substituting the default, since that
   would change the result. See [queries.md](queries.md#window-functions).
+- **Typed string literals cover the four temporal types only** —
+  `DATE '...'`, `TIME '...'`, `TIMESTAMP '...'`, `TIMESTAMPTZ '...'` work
+  (see [types.md](types.md#typed-datetime-literals)), but DuckDB's general
+  `<any type> '<text>'` form (`INTEGER '5'`) does not; write
+  `CAST('5' AS INTEGER)` instead.
+- **`GROUP BY ALL` does not accept `*` in the select list.** DuckDB expands
+  the star and groups by every resulting column; here
+  `SELECT * ... GROUP BY ALL` fails with `unsupported SQL feature`. List the
+  columns explicitly, or use `SELECT DISTINCT *`. (`ORDER BY ALL` *does*
+  work with `*` — it is resolved after the star has been expanded.)
+- **`ORDER BY ALL` is not accepted on `PIVOT`/`UNPIVOT` statements** — those
+  rebuild their output column list while being desugared, so the shorthand
+  is rejected rather than silently resolved against the wrong columns. Use
+  an explicit `ORDER BY` list there.
 - **`PIVOT ... ON x`** requires an explicit `IN (...)` value list.
   DuckDB's auto-detect-distinct-values form (`PIVOT t ON x USING agg(y)`
   with no `IN`) is not supported — enumerate the pivot values yourself.
