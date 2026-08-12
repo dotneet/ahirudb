@@ -9,6 +9,7 @@ use super::agg::narrow_unnest_elem_ty;
 use super::cte::MAX_VIEW_DEPTH;
 use super::cte::{CteScope, ResolvedCte};
 use super::pruning::extract_pruners;
+use super::refs::each_child;
 use super::subquery::{and_all, equi_key, split_conjuncts, unify_key_types};
 use super::*;
 
@@ -529,49 +530,134 @@ pub fn resolve_from(catalog: &Catalog, from: &FromItem) -> Result<usize> {
 }
 
 /// クエリ木の中で参照されるテーブルを集める。
+///
+/// This must find *every* table the query will end up binding against,
+/// including ones that only appear inside a subquery in an expression
+/// (`SELECT (SELECT max(c) FROM u) FROM t`, `WHERE x IN (SELECT ...)`,
+/// `WHERE EXISTS (...)`, `ORDER BY (SELECT ...)`, ...). The caller
+/// (`Session::prepare` via `resolve_query`, or `ddl::ctas_rows`) resolves
+/// the schema of everything reported here *before* binding, and
+/// `push_table_rel` asserts that invariant with an `Internal` error — so a
+/// table missed here does not degrade gracefully, it surfaces as a bare
+/// "internal error" to the user.
 pub fn referenced_in_query(
     catalog: &Catalog,
+    arena: &ExprArena,
     q: &QueryStmt,
     out: &mut Vec<usize>,
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
     for c in &q.ctes {
-        referenced_in_query(catalog, &c.query, out, depth + 1)?;
+        referenced_in_query(catalog, arena, &c.query, out, depth + 1)?;
     }
-    referenced_in_set_expr(catalog, &q.body, out, depth + 1)
+    for o in &q.order_by {
+        referenced_in_expr(catalog, arena, o.expr, out, depth + 1)?;
+    }
+    referenced_in_set_expr(catalog, arena, &q.body, out, depth + 1)
 }
 
 fn referenced_in_set_expr(
     catalog: &Catalog,
+    arena: &ExprArena,
     e: &SetExpr,
     out: &mut Vec<usize>,
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    let d = depth + 1;
     match e {
-        SetExpr::Select(s) => match &s.from {
-            // CTE 名はカタログに無いので、見つからなくても後段のバインドに任せる。
-            Some(f) => {
-                let _ = referenced_tables_at(catalog, f, out, depth + 1);
-                Ok(())
+        SetExpr::Select(s) => {
+            if let Some(f) = &s.from {
+                // CTE 名はカタログに無いので、見つからなくても後段のバインドに任せる。
+                let _ = referenced_tables_at(catalog, arena, f, out, d);
             }
-            None => Ok(()),
-        },
+            // Every expression position of the SELECT can host a subquery.
+            for item in &s.items {
+                referenced_in_expr(catalog, arena, item.expr, out, d)?;
+            }
+            for e in [s.filter, s.having, s.qualify].into_iter().flatten() {
+                referenced_in_expr(catalog, arena, e, out, d)?;
+            }
+            for &e in s.group_by.iter().chain(&s.distinct_on) {
+                referenced_in_expr(catalog, arena, e, out, d)?;
+            }
+            if let Some(sets) = &s.grouping_sets {
+                for set in sets {
+                    for &e in set {
+                        referenced_in_expr(catalog, arena, e, out, d)?;
+                    }
+                }
+            }
+            for (_, def) in &s.windows {
+                for &e in &def.partition_by {
+                    referenced_in_expr(catalog, arena, e, out, d)?;
+                }
+                for o in &def.order_by {
+                    referenced_in_expr(catalog, arena, o.expr, out, d)?;
+                }
+            }
+            for o in &s.order_by {
+                referenced_in_expr(catalog, arena, o.expr, out, d)?;
+            }
+            Ok(())
+        }
         SetExpr::SetOp { left, right, .. } => {
-            referenced_in_set_expr(catalog, left, out, depth + 1)?;
-            referenced_in_set_expr(catalog, right, out, depth + 1)
+            referenced_in_set_expr(catalog, arena, left, out, d)?;
+            referenced_in_set_expr(catalog, arena, right, out, d)
         }
     }
 }
 
+/// 式の中のサブクエリが参照するテーブルを集める。
+///
+/// Deliberately *not* built on `refs::each_child`, which stops at a
+/// subquery boundary (correct for scope resolution — the inside of a
+/// subquery resolves against its own scope — but exactly backwards here,
+/// where the whole point is to reach the tables inside). The two star and
+/// lambda positions `each_child` also skips are walked here for the same
+/// reason: a subquery is syntactically valid in both
+/// (`SELECT * REPLACE ((SELECT max(c) FROM u) AS b) FROM t`).
+fn referenced_in_expr(
+    catalog: &Catalog,
+    arena: &ExprArena,
+    id: ExprId,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    let d = depth + 1;
+    match arena.get(id) {
+        Expr::ScalarSubquery(q) => referenced_in_query(catalog, arena, q, out, d),
+        Expr::Exists { query, .. } => referenced_in_query(catalog, arena, query, out, d),
+        Expr::InSubquery { arg, query, .. } | Expr::QuantifiedComparison { arg, query, .. } => {
+            referenced_in_expr(catalog, arena, *arg, out, d)?;
+            referenced_in_query(catalog, arena, query, out, d)
+        }
+        Expr::Star { replace, .. } => {
+            for &(e, _) in replace {
+                referenced_in_expr(catalog, arena, e, out, d)?;
+            }
+            Ok(())
+        }
+        Expr::Lambda { body, .. } => referenced_in_expr(catalog, arena, *body, out, d),
+        _ => each_child(arena, id, &mut |c| referenced_in_expr(catalog, arena, c, out, d)),
+    }
+}
+
 /// SQL が参照するテーブルをすべて集める。スキーマ解決の対象を知るために使う。
-pub fn referenced_tables(catalog: &Catalog, from: &FromItem, out: &mut Vec<usize>) -> Result<()> {
-    referenced_tables_at(catalog, from, out, 0)
+pub fn referenced_tables(
+    catalog: &Catalog,
+    arena: &ExprArena,
+    from: &FromItem,
+    out: &mut Vec<usize>,
+) -> Result<()> {
+    referenced_tables_at(catalog, arena, from, out, 0)
 }
 
 fn referenced_tables_at(
     catalog: &Catalog,
+    arena: &ExprArena,
     from: &FromItem,
     out: &mut Vec<usize>,
     depth: u32,
@@ -597,16 +683,24 @@ fn referenced_tables_at(
             }
             None => err!(TableNotFound),
         },
-        FromItem::Join { left, right, .. } => {
-            referenced_tables_at(catalog, left, out, depth + 1)?;
-            referenced_tables_at(catalog, right, out, depth + 1)
+        FromItem::Join { left, right, on, .. } => {
+            referenced_tables_at(catalog, arena, left, out, depth + 1)?;
+            referenced_tables_at(catalog, arena, right, out, depth + 1)?;
+            // `ON` can hold a subquery too (`JOIN u ON u.c = (SELECT ...)`).
+            match on {
+                Some(e) => referenced_in_expr(catalog, arena, *e, out, depth + 1),
+                None => Ok(()),
+            }
         }
-        FromItem::Subquery { query, .. } => referenced_in_query(catalog, query, out, depth + 1),
-        // `expr` は列参照のみを含みうるスカラ式で、そこが指すテーブルは
-        // 必ず左の兄弟が別の `FromItem` として持つ（暗黙 LATERAL の制約、
-        // `FromItem::Unnest` のドキュメント参照）ので、ここで新たに解決が
-        // 要るテーブルは無い。
-        FromItem::Unnest { .. } => Ok(()),
+        FromItem::Subquery { query, .. } => {
+            referenced_in_query(catalog, arena, query, out, depth + 1)
+        }
+        // `expr` の列参照が指すテーブルは必ず左の兄弟が別の `FromItem` として
+        // 持つ（暗黙 LATERAL の制約、`FromItem::Unnest` のドキュメント参照）
+        // ので、そこからは新たに解決が要るテーブルは出てこない。ただし
+        // `UNNEST((SELECT ...))` のようにサブクエリを含みうるので、式自体は
+        // 走査する。
+        FromItem::Unnest { expr, .. } => referenced_in_expr(catalog, arena, *expr, out, depth + 1),
         // カタログを経由しない計算だけのソースなので、解決が要るテーブルは無い。
         FromItem::GenerateSeries { .. } => Ok(()),
     }

@@ -66,6 +66,13 @@ SELECT 'name_0' LIKE 'name\_0' ESCAPE '\';   -- LIKE: %, _ wildcards
 SELECT 'NAME_0' ILIKE 'name_0';              -- ILIKE: case-insensitive LIKE
 SELECT 'name_0' GLOB 'name_?';               -- GLOB: shell-style *, ?, [...], [!...]
 SELECT 'abc' SIMILAR TO 'a.c';               -- SIMILAR TO: SQL regex, anchored to the whole string
+
+-- Punctuation aliases, from PostgreSQL/DuckDB:
+SELECT 'name_0' ~~ 'name_0';                 -- ~~   = LIKE
+SELECT 'name_0' !~~ 'x';                     -- !~~  = NOT LIKE
+SELECT 'NAME_0' ~~* 'name_0';                -- ~~*  = ILIKE
+SELECT 'NAME_0' !~~* 'x';                    -- !~~* = NOT ILIKE
+SELECT 'name_0' ~~~ 'name_?';                -- ~~~  = GLOB
 ```
 
 `GLOB`/`SIMILAR TO` desugar to the `glob(s, pattern)` / `regexp_full_match(s,
@@ -73,6 +80,31 @@ pattern)` scalar functions respectively (usable directly too). `GLOB`
 matching is byte-oriented, not codepoint-oriented; an unterminated `[` in
 the pattern matches nothing rather than erroring, matching DuckDB's
 observed behavior.
+
+The punctuation aliases (`~~`/`!~~`/`~~*`/`!~~*`/`~~~`) desugar the same
+way the keyword forms do, with one genuinely surprising difference in
+**operator precedence**: the keyword forms (`LIKE`/`ILIKE`/`GLOB`) read
+their pattern operand loosely enough to swallow a following `||`, but the
+punctuation forms read it more tightly, so a following `||` applies to the
+*result* instead:
+
+```sql
+SELECT 'ab' LIKE 'a' || 'b';   -- true      ('ab' LIKE ('a'||'b'))
+SELECT 'ab' ~~   'a' || 'b';   -- 'falseb'  (('ab' ~~ 'a') || 'b')
+SELECT 'ab' GLOB 'a' || '*';   -- true      ('ab' GLOB ('a'||'*'))
+SELECT 'ab' ~~~  'a' || '*';   -- 'false*'  (('ab' ~~~ 'a') || '*')
+```
+
+This matches DuckDB's own behavior exactly (verified against the `duckdb`
+CLI) — it isn't an ahirudb-specific quirk, but it's easy to get bitten by
+if you assume the punctuation spelling is a drop-in replacement for the
+keyword. `ESCAPE` is only accepted after the `LIKE`/`ILIKE` *keywords*, not
+after `~~`/`~~*` (DuckDB rejects it there too).
+
+Unlike `~~`/`~~*` above, plain single-`~`/`!~` (one tilde, not two) is
+*not* a `LIKE` alias — it's `SIMILAR TO`'s punctuation spelling, documented
+under [Regular expressions](#regular-expressions) below and in
+[queries.md](queries.md#where-operators-and-predicates).
 
 ## Regular expressions
 

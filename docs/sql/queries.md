@@ -59,6 +59,11 @@ SELECT * FROM t WHERE name ILIKE 'NAME_0';
 -- GLOB (shell-style wildcards: *, ?, [...], [!...])
 SELECT DISTINCT name FROM t WHERE name GLOB 'name_[01]' ORDER BY name;
 
+-- ~~ / !~~ / ~~* / !~~* / ~~~: punctuation aliases for LIKE / NOT LIKE /
+-- ILIKE / NOT ILIKE / GLOB (see functions-string.md#pattern-matching for
+-- the precedence quirk that sets these apart from the keyword forms).
+SELECT * FROM t WHERE name ~~ 'name_0';
+
 -- SIMILAR TO (SQL regex, anchored to the whole string)
 SELECT DISTINCT name FROM t WHERE name SIMILAR TO 'name_[0-1]' ORDER BY name;
 
@@ -69,6 +74,17 @@ SELECT DISTINCT name FROM t WHERE name !~ 'name_[0-1]' ORDER BY name;
 
 -- IS [NOT] NULL, CASE, COALESCE, IIF
 SELECT IIF(flag, 'yes', 'no') FROM t LIMIT 3;
+
+-- ISNULL / NOTNULL: DuckDB's non-standard postfix aliases for IS [NOT]
+-- NULL. Soft keywords, like GLOB/SIMILAR above -- a column actually named
+-- isnull/notnull still works unquoted (SELECT isnull FROM t).
+SELECT * FROM t WHERE name ISNULL;
+SELECT * FROM t WHERE name NOTNULL;
+
+-- IS [NOT] TRUE / IS [NOT] FALSE: unlike `= true`, these coerce a
+-- non-boolean operand (CAST to BOOLEAN) and never return NULL -- NULL IS
+-- TRUE is FALSE, not NULL, even though NULL = TRUE would be NULL.
+SELECT 3 IS TRUE, NULL IS TRUE, NULL IS NOT TRUE;   -- true, false, true
 
 -- IS [NOT] DISTINCT FROM: NULL-safe equality/inequality (never UNKNOWN,
 -- always TRUE/FALSE -- NULL is treated as equal to NULL and unequal to
@@ -85,6 +101,11 @@ SELECT '42'::INTEGER, (1 + 2)::VARCHAR;
 -- 512), and the bitwise operators & | << >> and prefix ~ (integer only)
 SELECT 2 ^ 10, 2 ** 10;
 SELECT 5 & 3, 5 | 2, 1 << 4, 16 >> 2, ~5;
+
+-- // (integer division, see functions-numeric.md#division-and-integer-division),
+-- @ (absolute value, prefix), ! (factorial, postfix, returns HUGEINT --
+-- see functions-numeric.md#factorial)
+SELECT 7 // 2, @(-5), 4!;
 ```
 
 `IN`/`BETWEEN` predicates against literal values are also what drives
@@ -413,14 +434,30 @@ SELECT t.x FROM range(3) AS t(x) WHERE t.x > 0;
 the same distinction DuckDB makes. Arguments must currently be literal
 integers (no expressions or column references).
 
-## SELECT * modifiers: EXCLUDE / REPLACE
+## SELECT * modifiers: EXCLUDE / REPLACE / RENAME
 
 ```sql
 SELECT * EXCLUDE (score, big, d) FROM t WHERE id < 4 ORDER BY id;
 SELECT * REPLACE (score * 2 AS score) FROM t WHERE id < 4 ORDER BY id;
+SELECT * RENAME (score AS points) FROM t WHERE id < 4 ORDER BY id;
 SELECT * EXCLUDE (name, big, d) REPLACE (score * 2 AS score) FROM t WHERE id < 4 ORDER BY id;
 SELECT t.* EXCLUDE (name, big, d) FROM t WHERE id < 4 ORDER BY id;   -- qualified star works too
 ```
+
+All three can combine on the same `*`, but the order is fixed:
+`EXCLUDE` -> `REPLACE` -> `RENAME`. Writing them in any other order (e.g.
+`RENAME (...) EXCLUDE (...)`) is a parser error.
+
+`RENAME (old AS new, ...)` only relabels the OUTPUT column name — `WHERE`,
+`GROUP BY`, and the rest of the query still see the original column name.
+`ORDER BY` accepts both the old and the new name. A renamed name is visible
+to an enclosing query the same way any other output column is.
+
+Unlike `EXCLUDE`/`REPLACE`, which error on a column that doesn't exist,
+`RENAME` of an unknown column is **silently ignored** (no error) — this
+asymmetry matches DuckDB's actual behavior. Renaming a column onto a name
+that already exists in the output is allowed and produces duplicate output
+column names, it is not rejected either.
 
 ## Introspection: DESCRIBE, SHOW TABLES, EXPLAIN
 

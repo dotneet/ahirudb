@@ -165,6 +165,7 @@ impl<'a> Parser<'a> {
             qualifier: None,
             exclude: Vec::new(),
             replace: Vec::new(),
+            rename: Vec::new(),
         });
         let mut s = SelectStmt::empty();
         s.items.push(SelectItem { expr: star, alias: None });
@@ -356,6 +357,20 @@ impl<'a> Parser<'a> {
         self.is_soft_kw(b"replace")
     }
 
+    /// `RENAME`. Same rationale as `is_star_replace_kw` just above: under the
+    /// `ddl` feature it is already a real reserved `Kw::Rename` (used by
+    /// `ALTER TABLE ... RENAME`), so that form is accepted too. Otherwise it
+    /// is a context-dependent keyword matched by spelling only, so a data set
+    /// with a `rename` column still works without quoting.
+    #[inline]
+    fn is_star_rename_kw(&self) -> bool {
+        #[cfg(feature = "ddl")]
+        if self.is(Tok::Kw(Kw::Rename)) {
+            return true;
+        }
+        self.is_soft_kw(b"rename")
+    }
+
     /// `*`/`t.*` の直後に続きうる `EXCLUDE (col, ...)` / `REPLACE (expr AS
     /// col, ...)`（DuckDB 拡張）。この 2 語は `ROWS`/`RANGE`/`QUALIFY` と同種の
     /// 「実データにありふれた列名」なので、`*` の直後というこの文脈でだけ
@@ -363,6 +378,15 @@ impl<'a> Parser<'a> {
     /// `REPLACE (...) EXCLUDE (...)` の逆順を試すと構文エラーになることを
     /// 確認済み）。カンマ区切りの複数指定は括弧必須だが、1 個だけなら括弧を
     /// 省略できる（`duckdb` の挙動に合わせた）。
+    ///
+    /// A third modifier, `RENAME (old AS new, ...)`, follows the same two
+    /// rules and must come last: the fixed order is
+    /// EXCLUDE -> REPLACE -> RENAME (verified against `duckdb` — either
+    /// modifier appearing after RENAME is a parser error). That order falls
+    /// out naturally from parsing the three blocks sequentially below: once
+    /// RENAME has been consumed, a trailing EXCLUDE/REPLACE keyword is just
+    /// leftover input and fails in the caller as an unexpected token, exactly
+    /// like the already-tested REPLACE-before-EXCLUDE case.
     pub(super) fn star_modifiers(&mut self) -> Result<StarModifiers> {
         let mut exclude: Vec<String> = Vec::new();
         if self.is_soft_kw(b"exclude") {
@@ -426,15 +450,66 @@ impl<'a> Parser<'a> {
                 pos
             );
         }
-        Ok((exclude, replace))
+        // `RENAME (old AS new, ...)`. Unlike EXCLUDE/REPLACE, `old` is
+        // resolved (or silently ignored if unknown) at bind time, not here —
+        // see the `Expr::Star::rename` doc comment. What *is* checked here,
+        // matching `duckdb`'s parser errors, is: the same source column
+        // named twice within RENAME, and a source column that also appears
+        // in EXCLUDE or REPLACE.
+        let mut rename: Vec<(String, String)> = Vec::new();
+        if self.is_star_rename_kw() {
+            self.bump()?;
+            if self.eat(Tok::LParen)? {
+                loop {
+                    let pos = self.pos;
+                    let old = self.ident()?;
+                    ensure!(
+                        !rename.iter().any(|(o, _): &(String, String)| eq_ascii_ci(
+                            o.as_bytes(),
+                            old.as_bytes()
+                        )),
+                        SyntaxError,
+                        pos
+                    );
+                    self.expect_kw(Kw::As)?;
+                    let new = self.ident()?;
+                    rename.push((old, new));
+                    if !self.eat(Tok::Comma)? {
+                        break;
+                    }
+                }
+                self.expect(Tok::RParen)?;
+            } else {
+                let old = self.ident()?;
+                self.expect_kw(Kw::As)?;
+                let new = self.ident()?;
+                rename.push((old, new));
+            }
+        }
+        let pos = self.pos;
+        for (old, _) in &rename {
+            ensure!(
+                !exclude.iter().any(|e| eq_ascii_ci(e.as_bytes(), old.as_bytes())),
+                SyntaxError,
+                pos
+            );
+            ensure!(
+                !replace
+                    .iter()
+                    .any(|(_, n): &(ExprId, String)| eq_ascii_ci(n.as_bytes(), old.as_bytes())),
+                SyntaxError,
+                pos
+            );
+        }
+        Ok((exclude, replace, rename))
     }
 
     fn select_item(&mut self) -> Result<SelectItem> {
         // 先頭の `*` だけは式ではなく列挙として扱う。`t.*` は primary 側。
         if self.is(Tok::Star) {
             self.bump()?;
-            let (exclude, replace) = self.star_modifiers()?;
-            let expr = self.arena.push(Expr::Star { qualifier: None, exclude, replace });
+            let (exclude, replace, rename) = self.star_modifiers()?;
+            let expr = self.arena.push(Expr::Star { qualifier: None, exclude, replace, rename });
             return Ok(SelectItem { expr, alias: None });
         }
         let expr = self.expr()?;

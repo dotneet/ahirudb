@@ -85,6 +85,23 @@ user-visible effect.
   parse failures, but different from DuckDB, which raises a hard error on
   plain `CAST` (only `TRY_CAST` returns `NULL` there). See
   [types.md](types.md#uuid).
+- **Integer `/` truncates instead of returning a float.** `SELECT 7 / 2`
+  is `3` here and `3.5` in DuckDB; `5.0 / 2` is `2.5` in both. This is a
+  long-standing divergence that predates the `//` operator (which DuckDB
+  defines as truncating integer division, and which is therefore exact
+  sugar for `/` here). Whether `/` should change to match DuckDB is an
+  open question. See
+  [functions-numeric.md](functions-numeric.md#division-and-integer-division).
+- **Postfix `!` (factorial) binds tighter than every binary operator
+  here**, so `2 + 3!` is `2 + (3!)` = `8`, and `3! + 1` (`(3!) + 1` = `7`)
+  parses at all. DuckDB's own precedence for `!` is internally
+  inconsistent Postgres legacy, not a coherent rule worth replicating —
+  it parses `3! ^ 2` fine (`36.0`) but rejects `2 ^ 3!` as a syntax error,
+  and silently reads `2 + 3!` as `(2+3)!` = `120` while rejecting
+  `3! + 1` outright. We chose the conventional, self-consistent reading
+  on purpose instead: `!` binds looser than the prefix operators (so
+  `-x!` is `(-x)!` for any `x`, matching DuckDB) but tighter than every
+  binary operator. See [functions-numeric.md](functions-numeric.md#factorial).
 
 ## No spilling
 
@@ -127,5 +144,6 @@ and query results can be surprising if you're expecting different rules.
 See [types.md](types.md#rounding-and-floating-point-conventions) for the
 full list — briefly: float→integer casts round to nearest-even, `DECIMAL`
 scale reduction rounds away from zero, integer arithmetic overflow wraps
-rather than erroring (except `SUM`), and division by zero returns `NULL`
-rather than raising an error.
+rather than erroring (except `SUM` and `factorial`/`!`, see
+[functions-numeric.md](functions-numeric.md#factorial)), and division by
+zero returns `NULL` rather than raising an error.

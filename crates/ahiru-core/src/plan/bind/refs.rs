@@ -51,6 +51,24 @@ pub(super) fn order_output_column(
                 }
             }
         }
+        // A `*` `RENAME (old AS new, ...)` acts like a per-column alias for
+        // `ORDER BY` purposes too (verified against `duckdb`: `ORDER BY new`
+        // resolves to the renamed output column, and so does `ORDER BY old`
+        // via the normal scope-resolution fallback below). Resolved by
+        // matching the final schema name rather than select-item position,
+        // since a `*` can expand into any number of columns and the two
+        // don't line up.
+        let is_rename_target = sel.items.iter().any(|it| {
+            matches!(arena.get(it.expr), Expr::Star { rename, .. }
+                if rename.iter().any(|(_, new)| eq_ascii_ci(new.as_bytes(), name.as_bytes())))
+        });
+        if is_rename_target {
+            if let Some(i) =
+                schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
+            {
+                return Ok(Some(i));
+            }
+        }
     }
     // 出力式と構造が一致するならその列を使う（再計算を避ける）。
     for (col, item) in sel.items.iter().enumerate() {

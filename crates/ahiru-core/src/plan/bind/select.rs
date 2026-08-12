@@ -869,7 +869,7 @@ pub(super) fn bind_select_in(
     let mut schema = Vec::new();
     for item in &sel.items {
         match arena.get(item.expr) {
-            Expr::Star { qualifier, exclude, replace } => {
+            Expr::Star { qualifier, exclude, replace, rename } => {
                 // 集約後に `*` は展開できない（元の行が残っていない）。
                 ensure!(!aggregating, NotGrouped);
                 let idx: Vec<usize> = match qualifier {
@@ -905,18 +905,33 @@ pub(super) fn bind_select_in(
                         .iter()
                         .find(|(_, n)| eq_ascii_ci(n.as_bytes(), fname.as_bytes()))
                         .map(|&(e, _)| e);
+                    // `RENAME (old AS new, ...)` only relabels the OUTPUT
+                    // column name — it is applied last (after EXCLUDE/
+                    // REPLACE above), and everything else in the query still
+                    // resolves the column by its original name (`fname`).
+                    // Unlike EXCLUDE/REPLACE, an `old` that matches no column
+                    // here is silently ignored rather than an error; this
+                    // deliberately mirrors `duckdb`'s real behavior, which is
+                    // asymmetric with EXCLUDE on this point.
+                    let out_name = rename
+                        .iter()
+                        .find(|(old, _)| eq_ascii_ci(old.as_bytes(), fname.as_bytes()))
+                        .map(|(_, new)| new.clone())
+                        .unwrap_or_else(|| fname.clone());
                     match rexpr {
                         Some(rexpr) => {
                             // REPLACE の式は通常の select item と同じスコープ
                             // （集約・ウィンドウ出力を含みうる `item_scope`）で
                             // コンパイルする。列名自体は元のまま変えない。
                             let p = compile_with_subs(arena, &item_scope, params, &subs, rexpr)?;
-                            schema.push(Field::new(fname, p.result_ty, true));
+                            schema.push(Field::new(out_name, p.result_ty, true));
                             exprs.push(p);
                         }
                         None => {
                             exprs.push(column_program(&scope, i)?);
-                            schema.push(scope.fields()[i].clone());
+                            let mut field = scope.fields()[i].clone();
+                            field.name = out_name;
+                            schema.push(field);
                         }
                     }
                 }

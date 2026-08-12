@@ -150,7 +150,10 @@ it needs to be explicit:
   systematically under-round.
 - Integer arithmetic overflow **wraps** (no error), except `SUM`, which
   accumulates in a 128-bit integer internally and only errors
-  (`ValueOutOfRange`) if that itself overflows.
+  (`ValueOutOfRange`) if that itself overflows, and `factorial`/`!`, which
+  errors on the same code the moment its `HUGEINT` result itself overflows
+  (`factorial(34)` and above — see
+  [functions-numeric.md](functions-numeric.md#factorial)).
 - `-0.0` and `0.0` are treated as identical for grouping/join keys; all
   `NaN` values collapse to one representative for grouping purposes.
   Comparison operators still treat `NaN` as not-equal-to-anything (`false`)

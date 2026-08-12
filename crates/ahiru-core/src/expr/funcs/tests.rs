@@ -80,6 +80,14 @@ fn flt_at(v: &Vector, i: usize) -> Option<f64> {
     }
 }
 
+fn i128_at(v: &Vector, i: usize) -> Option<i128> {
+    if v.is_valid(i) {
+        Some(v.i128s()[i])
+    } else {
+        None
+    }
+}
+
 /// 文字列 1 引数（+ 追加引数）の結果を 1 行ぶん取り出す近道。
 fn s1(name: &str, s: Option<&str>) -> Option<String> {
     str_at(&run(name, &[&vs(&[s])]).unwrap(), 0)
@@ -280,6 +288,60 @@ fn numeric_integer_domain() {
     assert_eq!(m(-7, 3), Some(-1));
     assert_eq!(m(7, -3), Some(1));
     assert_eq!(m(7, 0), None);
+}
+
+// `factorial`: HUGEINT (I128) output, the postfix `!` desugaring site
+// (`sql::parser::Parser::primary`/`cast_postfix`). Every value below is
+// cross-checked against a real `duckdb` CLI.
+#[test]
+fn factorial_matches_duckdb() {
+    let f = |x: i64| i128_at(&run("factorial", &[&vi(Ty::BigInt, &[Some(x)])]).unwrap(), 0);
+    assert_eq!(f(0), Some(1));
+    assert_eq!(f(1), Some(1));
+    assert_eq!(f(20), Some(2_432_902_008_176_640_000));
+    // duckdb: factorial(33) = 8683317618811886495518194401280000000, the
+    // largest factorial that fits in i128 (i128::MAX ~= 1.7e38, 33! ~=
+    // 8.68e36, 34! ~= 2.95e38 overflows -- see the next test).
+    assert_eq!(f(33), Some(8_683_317_618_811_886_495_518_194_401_280_000_000));
+    // duckdb: factorial(-1) = 1 -- negative n isn't an "undefined" case,
+    // it's just defined to be 1.
+    assert_eq!(f(-1), Some(1));
+    assert_eq!(f(-100), Some(1));
+    assert_eq!(i128_at(&run("factorial", &[&vi(Ty::BigInt, &[None])]).unwrap(), 0), None);
+}
+
+#[test]
+fn factorial_overflow_is_a_hard_error_not_a_silent_wrap() {
+    // duckdb: factorial(34) -> "Out of Range Error". This engine's usual
+    // convention is that integer arithmetic overflow wraps silently (see
+    // docs/sql/limitations.md's rounding-conventions note) -- but `SUM` is
+    // the existing exception (`exec::agg`'s `Code::ValueOutOfRange`), and
+    // `factorial` joins it here rather than silently wrapping to a
+    // nonsense negative HUGEINT.
+    assert_eq!(
+        code_of(run("factorial", &[&vi(Ty::BigInt, &[Some(34)])])),
+        Some(Code::ValueOutOfRange)
+    );
+    // A huge `n` must fail fast (33 multiplications at most before
+    // overflowing), not loop for a very long time.
+    assert_eq!(
+        code_of(run("factorial", &[&vi(Ty::BigInt, &[Some(i64::MAX)])])),
+        Some(Code::ValueOutOfRange)
+    );
+}
+
+#[test]
+fn factorial_resolve_accepts_only_integer_input() {
+    assert_eq!(resolve("factorial", &[Ty::Int]).unwrap().1, vec![Ty::BigInt]);
+    assert_eq!(resolve("factorial", &[Ty::Int]).unwrap().2, Ty::HugeInt);
+    assert_eq!(resolve("factorial", &[Ty::Null]).unwrap().2, Ty::HugeInt);
+    // duckdb rejects a DOUBLE argument to `factorial`/`!` as a type error
+    // (`duckdb -c "select factorial(4.0)"` / `select 4.5!`), and VARCHAR
+    // was never a numeric type to begin with.
+    assert_eq!(code_of(resolve("factorial", &[Ty::Double])), Some(Code::TypeMismatch));
+    assert_eq!(code_of(resolve("factorial", &[Ty::Varchar])), Some(Code::TypeMismatch));
+    assert_eq!(code_of(resolve("factorial", &[])), Some(Code::WrongArgCount));
+    assert_eq!(code_of(resolve("factorial", &[Ty::Int, Ty::Int])), Some(Code::WrongArgCount));
 }
 
 #[test]

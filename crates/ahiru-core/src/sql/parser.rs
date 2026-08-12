@@ -33,8 +33,9 @@ const MAX_DEPTH: u16 = 64;
 /// 数える（入れ子のクエリごとに上限を与えると積で効いてしまうため）。
 const MAX_LINKS: u16 = 64;
 
-/// `Parser::star_modifiers` の戻り値: `(EXCLUDE する列名, REPLACE する (式, 列名))`。
-type StarModifiers = (Vec<String>, Vec<(ExprId, String)>);
+/// `Parser::star_modifiers` の戻り値: `(EXCLUDE する列名, REPLACE する
+/// (式, 列名), RENAME する (旧列名, 新列名))`。
+type StarModifiers = (Vec<String>, Vec<(ExprId, String)>, Vec<(String, String)>);
 
 // 結合強度。大きいほど強く結合する。
 const BP_OR: u8 = 1;
@@ -53,7 +54,24 @@ const BP_MUL: u8 = 8;
 // 確認済み（`*`/`/` より強く、単項 `-` より弱い）。左結合
 // （`2^3^2` = `(2^3)^2` = 64、右結合の `512` にはならない）。
 const BP_POW: u8 = 9;
-const BP_UNARY: u8 = 10;
+// Postfix `!` (factorial). DuckDB's own precedence for `!` is internally
+// inconsistent Postgres legacy (`3! ^ 2` parses fine but `2 ^ 3!` is a
+// syntax error; `2 + 3!` silently reads as `(2+3)!` while `3! + 1` is a
+// syntax error) — not worth replicating. This engine instead picks a
+// self-consistent rule: `!` binds looser than every prefix operator
+// (`-`/`~`/`NOT`, all read at `BP_UNARY`) but tighter than every binary
+// operator. Concretely, `BP_BANG` sits strictly between `BP_POW` (the
+// strongest binary operator) and `BP_UNARY`, and `prefix()` always reads
+// its operand at `BP_UNARY` — so a `!` following `-x`/`~x` is left alone
+// by the inner (operand) parse and only picked up once the outer loop
+// already has the completed `-x`/`~x` node as `lhs`. That makes `-4!` and
+// `-x!` (literal and column operand alike) both parse as `(-x)!`, matching
+// DuckDB's actual behavior there, while deliberately diverging from
+// DuckDB on the binary-operator cases documented in
+// docs/sql/limitations.md (`2 + 3!` = `2 + (3!)` = `8` here, not
+// `(2+3)!` = `120`).
+const BP_BANG: u8 = 10;
+const BP_UNARY: u8 = 11;
 
 pub fn parse(sql: &str) -> Result<Parsed> {
     let mut p = Parser::new(sql)?;
@@ -422,6 +440,7 @@ impl<'a> Parser<'a> {
                 qualifier: None,
                 exclude: Vec::new(),
                 replace: Vec::new(),
+                rename: Vec::new(),
             });
             let mut s = SelectStmt::empty();
             s.items.push(SelectItem { expr: star, alias: None });

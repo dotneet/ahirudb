@@ -131,6 +131,13 @@ const F_BIT_SHL: FuncId = 64;
 const F_BIT_SHR: FuncId = 65;
 const F_BIT_NOT: FuncId = 66;
 
+// HUGEINT output (I128). `factorial`/postfix `!` (`sql::parser::Parser::
+// primary`/`cast_postfix` desugar `!` to this) is currently the only
+// function that returns HUGEINT — see `call`'s `PhysType::I128` arm, added
+// specifically to support it. Picked 93 to stay clear of both the JSON
+// block below (80-92) and `F_PART_BASE` (100, see the comment above).
+const F_FACTORIAL: FuncId = 93;
+
 // JSON（Bytes 出力）。`json_object`/`json_array` は引数の個数が可変で、
 // かつ NULL 引数を読み飛ばさず JSON `null` として埋め込む必要があるため、
 // `call` の行ループ（`eval_str`）の外、`F_CONCAT` などと同じ場所で処理する。
@@ -318,6 +325,20 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "bit_shift_left" => fixed(F_BIT_SHL, &[BigInt, BigInt], n, 2, BigInt),
         "bit_shift_right" => fixed(F_BIT_SHR, &[BigInt, BigInt], n, 2, BigInt),
         "bit_not" => fixed(F_BIT_NOT, &[BigInt], n, 1, BigInt),
+        // Postfix `!` (`sql::parser`) desugars here. Returns HUGEINT to
+        // match duckdb (`typeof(4!)` -> `HUGEINT`); only integer input is
+        // accepted (duckdb itself rejects a DOUBLE argument, e.g.
+        // `factorial(4.0)`, as a type error — verified against the
+        // `duckdb` CLI). `n < 0` is a valid input (see `numeric::factorial`
+        // — it returns 1, not an error), so no range check happens here.
+        "factorial" => {
+            ensure!(n == 1, WrongArgCount);
+            ensure!(
+                args[0] == Null || (args[0].is_numeric() && args[0].is_integer()),
+                TypeMismatch
+            );
+            Ok((F_FACTORIAL, vec![BigInt], HugeInt))
+        }
 
         // --- JSON -------------------------------------------------------
         // パス構文・既知の制限は `crate::json` のモジュール doc を参照。
@@ -606,7 +627,34 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
                 }
             }
         }
-        PhysType::I128 => err!(TypeMismatch),
+        // HUGEINT output (currently only `factorial`). Structurally the
+        // same row loop as `I32 | I64` above, but there's no "range check
+        // narrows to I32" concern (HUGEINT is the widest integer type), and
+        // a genuine overflow (e.g. `factorial(34)`) is a hard query error
+        // via `?` — propagated out of `eval_i128`, not turned into a
+        // per-row NULL — matching this engine's existing convention for
+        // `SUM` overflow (`exec::agg`'s `ValueOutOfRange`, see
+        // `docs/sql/limitations.md`'s rounding-conventions note: "integer
+        // arithmetic overflow wraps ... except SUM"; `factorial` joins
+        // `SUM` as the other place overflow is a hard error rather than a
+        // silent wrap).
+        PhysType::I128 => {
+            if let Data::I128(d) = &mut data {
+                for i in 0..n {
+                    if !live(i) {
+                        d.push(0);
+                        continue;
+                    }
+                    match eval_i128(id, &A { v: args, s: &s, i })? {
+                        Some(x) => d.push(x),
+                        None => {
+                            d.push(0);
+                            set_null(&mut bad, i, n);
+                        }
+                    }
+                }
+            }
+        }
     }
     let mut out = Vector::from_data(result_ty, data, merge(valid, bad));
     out.compact_validity();
@@ -780,7 +828,7 @@ use json::{
     concat_all, extremum, fold_null, json_array_build, json_object_build, nullif,
     regexp_full_match_build,
 };
-use numeric::{eval_f64, eval_int};
+use numeric::{eval_f64, eval_i128, eval_int};
 use string::eval_str;
 
 // Other modules (`expr::kernels`/`expr::regex`/`write::csv`/`write::jsonl`/

@@ -1,4 +1,5 @@
-//! `SELECT * EXCLUDE (...)` / `SELECT * REPLACE (...)` の統合テスト。
+//! `SELECT * EXCLUDE (...)` / `SELECT * REPLACE (...)` / `SELECT * RENAME (...)`
+//! の統合テスト。
 //!
 //! 期待値はすべて `duckdb -c "SELECT ..."` の実際の出力と突き合わせて決めている
 //! （`tests/data/basic.parquet` は DuckDB が書いた実ファイル。列は
@@ -273,4 +274,246 @@ fn exclude_and_replace_result_can_feed_an_aggregate() {
         "SELECT sum(score) FROM (SELECT * REPLACE (score * 2 AS score) FROM t WHERE id < 4)",
     );
     assert_eq!(rows2, vec![vec![f64(18.0)]]);
+}
+
+// --- RENAME ------------------------------------------------------------------
+//
+// `RENAME (old AS new, ...)` is the third `SELECT *` modifier (DuckDB's
+// fixed order is EXCLUDE -> REPLACE -> RENAME). It only relabels the OUTPUT
+// column name; every expected value below is cross-checked against a real
+// `duckdb -c` run against `tests/data/basic.parquet`.
+
+/// Basic form: renames one column, leaves the rest (including position)
+/// untouched.
+/// duckdb: SELECT * RENAME (score AS points) FROM 'basic.parquet' WHERE id < 4 ORDER BY id
+#[test]
+fn rename_relabels_a_single_column() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT * RENAME (score AS points) FROM t"),
+        vec!["id", "name", "points", "flag", "big", "d"]
+    );
+    let rows = run(
+        &mut s,
+        "SELECT id, points FROM (SELECT * RENAME (score AS points) FROM t) WHERE id < 4 ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![i32(0), f64(0.0)],
+            vec![i32(1), f64(1.5)],
+            vec![i32(2), f64(3.0)],
+            vec![i32(3), f64(4.5)],
+        ]
+    );
+}
+
+/// The bare, no-parens form works for a single entry (same convention as
+/// EXCLUDE/REPLACE).
+#[test]
+fn rename_allows_bare_single_item() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT * RENAME score AS points FROM t"),
+        vec!["id", "name", "points", "flag", "big", "d"]
+    );
+}
+
+/// Multiple entries in one RENAME list.
+/// duckdb: SELECT * RENAME (score AS points, name AS label) FROM 'basic.parquet'
+#[test]
+fn rename_supports_multiple_entries() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT * RENAME (score AS points, name AS label) FROM t"),
+        vec!["id", "label", "points", "flag", "big", "d"]
+    );
+}
+
+/// Qualified `t.* RENAME (...)` works too.
+#[test]
+fn qualified_star_supports_rename() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT t.* RENAME (score AS points) FROM t"),
+        vec!["id", "name", "points", "flag", "big", "d"]
+    );
+}
+
+/// RENAME combines with EXCLUDE.
+/// duckdb: SELECT * EXCLUDE (big, d) RENAME (score AS points) FROM 'basic.parquet'
+#[test]
+fn rename_combines_with_exclude() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT * EXCLUDE (big, d) RENAME (score AS points) FROM t"),
+        vec!["id", "name", "points", "flag"]
+    );
+}
+
+/// RENAME combines with REPLACE: REPLACE changes the VALUE of `score`,
+/// RENAME relabels the (unrelated) `id` column — DuckDB rejects the same
+/// column appearing in both REPLACE and RENAME, so these must be different
+/// columns (covered separately below).
+/// duckdb: SELECT * EXCLUDE (big, d) REPLACE (score * 2 AS score) RENAME (id AS pk)
+///         FROM 'basic.parquet' WHERE id < 4 ORDER BY id
+#[test]
+fn rename_combines_with_exclude_and_replace() {
+    let mut s = session_with_basic();
+    let rows = run(
+        &mut s,
+        "SELECT * EXCLUDE (big, d) REPLACE (score * 2 AS score) RENAME (id AS pk) FROM t \
+         WHERE id < 4 ORDER BY pk",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![i32(0), vc("name_0"), f64(0.0), b(true)],
+            vec![i32(1), vc("name_1"), f64(3.0), b(false)],
+            vec![i32(2), vc("name_2"), f64(6.0), b(false)],
+            vec![i32(3), vc("name_3"), f64(9.0), b(true)],
+        ]
+    );
+}
+
+/// Renaming a column that doesn't exist is silently ignored — no error.
+/// This is deliberately asymmetric with EXCLUDE/REPLACE, which DO error on
+/// an unknown column (both in `duckdb` and in this engine, see
+/// `exclude_of_unknown_column_is_rejected` above).
+/// duckdb: SELECT * RENAME (nope AS points) FROM 'basic.parquet'  -- returns unchanged
+#[test]
+fn rename_of_unknown_column_is_silently_ignored() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT * RENAME (nope AS points) FROM t"),
+        vec!["id", "name", "score", "flag", "big", "d"]
+    );
+}
+
+/// Renaming onto a name that already exists is allowed and produces
+/// duplicate output column names (not rejected).
+/// duckdb: DESCRIBE SELECT * RENAME (id AS name) FROM 'basic.parquet'  -- name, name, score, ...
+#[test]
+fn rename_onto_an_existing_name_produces_duplicate_output_names() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT * RENAME (id AS name) FROM t"),
+        vec!["name", "name", "score", "flag", "big", "d"]
+    );
+}
+
+/// The same source column named twice within one RENAME list is rejected at
+/// parse time (`duckdb`: Parser Error).
+#[test]
+fn rename_rejects_the_same_source_column_twice() {
+    let mut s = session_with_basic();
+    let err = s.prepare("SELECT * RENAME (id AS a, id AS b) FROM t", &[]);
+    assert_eq!(code_of(err), Some(Code::SyntaxError));
+}
+
+/// A column that appears in both EXCLUDE and RENAME is rejected
+/// (`duckdb`: "Column ... cannot occur in both EXCLUDE and RENAME list").
+#[test]
+fn rename_rejects_a_column_also_in_exclude() {
+    let mut s = session_with_basic();
+    let err = s.prepare("SELECT * EXCLUDE (id) RENAME (id AS pk) FROM t", &[]);
+    assert_eq!(code_of(err), Some(Code::SyntaxError));
+}
+
+/// A column that appears in both REPLACE and RENAME is rejected
+/// (`duckdb`: "Column ... cannot occur in both REPLACE and RENAME list").
+#[test]
+fn rename_rejects_a_column_also_in_replace() {
+    let mut s = session_with_basic();
+    let err = s.prepare("SELECT * REPLACE (1 AS id) RENAME (id AS pk) FROM t", &[]);
+    assert_eq!(code_of(err), Some(Code::SyntaxError));
+}
+
+/// The fixed modifier order is EXCLUDE -> REPLACE -> RENAME; RENAME must
+/// come last (`duckdb`: Parser Error for either reordering).
+#[test]
+fn rename_must_come_after_exclude_and_replace() {
+    let mut s = session_with_basic();
+    let err = s.prepare("SELECT * RENAME (id AS pk) EXCLUDE (big) FROM t", &[]);
+    assert_eq!(code_of(err), Some(Code::UnexpectedToken));
+    let err = s.prepare("SELECT * RENAME (id AS pk) REPLACE (1 AS big) FROM t", &[]);
+    assert_eq!(code_of(err), Some(Code::UnexpectedToken));
+}
+
+/// Column name matching is case-insensitive, same as EXCLUDE/REPLACE.
+#[test]
+fn rename_column_name_matching_is_case_insensitive() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        schema_names(&mut s, "SELECT * RENAME (ID AS pk) FROM t"),
+        vec!["pk", "name", "score", "flag", "big", "d"]
+    );
+}
+
+/// RENAME only relabels the OUTPUT: `WHERE` still sees (and must use) the
+/// original column name.
+/// duckdb: SELECT * RENAME (id AS pk) FROM 'basic.parquet' WHERE id = 1
+#[test]
+fn rename_where_clause_still_uses_the_original_name() {
+    let mut s = session_with_basic();
+    // `WHERE id = 1` and `RENAME (id AS pk)` are in the same `SELECT`, so
+    // `id` here is the pre-rename scope column, not the output — exactly
+    // like DuckDB. The output itself only has `pk`, not `id` (checked by
+    // `rename_new_name_is_visible_to_an_enclosing_query` below).
+    let rows = run(&mut s, "SELECT * RENAME (id AS pk) FROM t WHERE id = 1");
+    assert_eq!(
+        schema_names(&mut s, "SELECT * RENAME (id AS pk) FROM t"),
+        vec!["pk", "name", "score", "flag", "big", "d"]
+    );
+    assert_eq!(rows[0][0], i32(1));
+    assert_eq!(rows[0][1], vc("name_1"));
+}
+
+/// `ORDER BY` accepts both the original name and the new (renamed) name
+/// within the same `SELECT` that has the `RENAME`.
+/// duckdb: SELECT * RENAME (id AS pk) FROM 'basic.parquet' WHERE id < 4 ORDER BY id DESC
+///         / ... ORDER BY pk DESC  -- both give the same order
+#[test]
+fn rename_order_by_accepts_both_old_and_new_name() {
+    let mut s = session_with_basic();
+    let by_old = run(&mut s, "SELECT * RENAME (id AS pk) FROM t WHERE id < 4 ORDER BY id DESC");
+    let by_new = run(&mut s, "SELECT * RENAME (id AS pk) FROM t WHERE id < 4 ORDER BY pk DESC");
+    let pk_col_old: Vec<Value> = by_old.into_iter().map(|r| r[0].clone()).collect();
+    let pk_col_new: Vec<Value> = by_new.into_iter().map(|r| r[0].clone()).collect();
+    let expected = vec![i32(3), i32(2), i32(1), i32(0)];
+    assert_eq!(pk_col_old, expected);
+    assert_eq!(pk_col_new, expected);
+}
+
+/// An enclosing query only ever sees the new (renamed) name — the old name
+/// is not a valid reference from outside the `SELECT * RENAME (...)` itself.
+/// duckdb: SELECT count(*) FROM (SELECT * RENAME (id AS pk) FROM 'basic.parquet') WHERE pk < 4
+#[test]
+fn rename_new_name_is_visible_to_an_enclosing_query() {
+    let mut s = session_with_basic();
+    let rows = run(&mut s, "SELECT count(*) FROM (SELECT * RENAME (id AS pk) FROM t) WHERE pk < 4");
+    assert_eq!(rows, vec![vec![Value::I64(4)]]);
+}
+
+/// `rename` keeps working as an ordinary column name / alias outside the
+/// `*` context, same as the `exclude`/`replace` regression coverage this
+/// mirrors. Uses a derived table that aliases a column to `rename` so this
+/// stays a Parquet-only test like the rest of this file, without needing a
+/// dedicated data file with a literal `rename` column.
+///
+/// Gated the same way as the analogous `replace` case in
+/// `sql::parser::tests::star_exclude_replace`: under `ddl`, `rename` is a
+/// real reserved word (`Kw::Rename`, used by `ALTER TABLE ... RENAME`), so
+/// `AS rename` no longer parses as a plain alias there — see
+/// `sql::parser::tests::star_rename` for that `ddl`-feature interaction.
+#[cfg(not(feature = "ddl"))]
+#[test]
+fn rename_keyword_does_not_break_a_rename_named_column() {
+    let mut s = session_with_basic();
+    assert_eq!(schema_names(&mut s, "SELECT id AS rename FROM t"), vec!["rename"]);
+    let rows = run(
+        &mut s,
+        "SELECT rename FROM (SELECT id AS rename FROM t) WHERE rename < 2 ORDER BY rename",
+    );
+    assert_eq!(rows, vec![vec![i32(0)], vec![i32(1)]]);
 }

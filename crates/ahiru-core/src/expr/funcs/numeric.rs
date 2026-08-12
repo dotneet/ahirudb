@@ -79,6 +79,41 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
     })
 }
 
+/// HUGEINT (I128) output. Currently only `factorial`/postfix `!`
+/// (`F_FACTORIAL`, `sql::parser` desugars `!` to a call of this name).
+pub(super) fn eval_i128(id: FuncId, a: &A) -> Result<Option<i128>> {
+    Ok(match id {
+        F_FACTORIAL => Some(factorial(a.int(0))?),
+        _ => err!(Internal),
+    })
+}
+
+/// `n!`. Matches duckdb: negative `n` returns `1` rather than erroring
+/// (`duckdb -c "select factorial(-1)"` -> `1` — there's no "undefined"
+/// case to report here, only genuine overflow is an error). `33!` is the
+/// largest factorial that fits in `i128` (`8_683_317_618_811_886_495_518_
+/// 194_401_280_000_000_000`, versus `i128::MAX` ≈ `1.7e38`); `34!` ≈
+/// `2.95e38` overflows, and duckdb errors there too (`duckdb -c "select
+/// factorial(34)"` -> `Out of Range Error`), so this raises the engine's
+/// own overflow error rather than wrapping (see the doc comment on
+/// `funcs::call`'s `PhysType::I128` arm for why this diverges from the
+/// "integer arithmetic overflow wraps" default).
+fn factorial(n: i64) -> Result<i128> {
+    if n < 0 {
+        return Ok(1);
+    }
+    let mut acc: i128 = 1;
+    let mut k: i128 = 2;
+    while k <= n as i128 {
+        acc = match acc.checked_mul(k) {
+            Some(v) => v,
+            None => err!(ValueOutOfRange),
+        };
+        k += 1;
+    }
+    Ok(acc)
+}
+
 /// 10 の冪へ 0 から遠ざかる向きに丸める（`round(12345, -2)` → 12300）。
 fn round_int(x: i64, k: i64) -> Option<i64> {
     if k > 18 {

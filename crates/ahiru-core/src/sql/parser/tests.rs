@@ -65,7 +65,7 @@ fn r(a: &ExprArena, id: ExprId) -> String {
             Some(q) => format!("{}.{}", q, name),
             None => name.clone(),
         },
-        Expr::Star { qualifier, exclude, replace } => {
+        Expr::Star { qualifier, exclude, replace, rename } => {
             let mut s = match qualifier {
                 Some(q) => format!("{}.*", q),
                 None => "*".to_string(),
@@ -77,6 +77,11 @@ fn r(a: &ExprArena, id: ExprId) -> String {
                 let items: Vec<String> =
                     replace.iter().map(|(e, n)| format!("{} AS {}", r(a, *e), n)).collect();
                 s.push_str(&format!(" REPLACE ({})", items.join(", ")));
+            }
+            if !rename.is_empty() {
+                let items: Vec<String> =
+                    rename.iter().map(|(old, new)| format!("{} AS {}", old, new)).collect();
+                s.push_str(&format!(" RENAME ({})", items.join(", ")));
             }
             s
         }
@@ -551,7 +556,11 @@ fn predicates() {
     // 述語は比較と同じ強さ。AND より強く結合する。
     assert_eq!(ex("a IS NULL AND b IS NOT NULL"), "((a IS NULL) AND (b IS NOT NULL))");
     assert_eq!(ex("NOT a IS NULL"), "(NOT (a IS NULL))");
-    assert_eq!(code("SELECT x IS TRUE"), Code::UnsupportedFeature as u16);
+    // `IS TRUE`/`IS FALSE` are now supported (see the `is_true_desugars_to_
+    // cast_and_coalesce`/`is_false_desugars_to_negated_cast_and_coalesce`
+    // tests near the end of this file); an actually-unsupported `IS`
+    // right-hand side is still rejected.
+    assert_eq!(code("SELECT x IS 5"), Code::UnsupportedFeature as u16);
     assert_eq!(code("SELECT x NOT IS NULL"), Code::UnexpectedToken as u16);
 }
 
@@ -1020,6 +1029,74 @@ fn star_exclude_replace() {
     assert_eq!(sel("SELECT a AS exclude FROM t"), "SELECT a AS exclude FROM t");
     #[cfg(not(feature = "ddl"))]
     assert_eq!(sel("SELECT exclude, replace FROM t"), "SELECT exclude, replace FROM t");
+}
+
+/// `SELECT * RENAME (...)`, the third star modifier. All expected forms and
+/// error cases below are cross-checked against a real `duckdb` CLI.
+#[test]
+fn star_rename() {
+    // Basic parenthesized form.
+    assert_eq!(sel("SELECT * RENAME (a AS z) FROM t"), "SELECT * RENAME (a AS z) FROM t");
+    // Bare form (no parens) for a single entry, same convention as
+    // EXCLUDE/REPLACE.
+    assert_eq!(sel("SELECT * RENAME a AS z FROM t"), "SELECT * RENAME (a AS z) FROM t");
+    // Multiple entries require parens.
+    assert_eq!(
+        sel("SELECT * RENAME (a AS z, b AS y) FROM t"),
+        "SELECT * RENAME (a AS z, b AS y) FROM t"
+    );
+    // Qualified star.
+    assert_eq!(sel("SELECT t.* RENAME (a AS z) FROM t"), "SELECT t.* RENAME (a AS z) FROM t");
+    // Combines with EXCLUDE / REPLACE. Fixed order is
+    // EXCLUDE -> REPLACE -> RENAME (verified against `duckdb`).
+    assert_eq!(
+        sel("SELECT * EXCLUDE (b) RENAME (a AS z) FROM t"),
+        "SELECT * EXCLUDE (b) RENAME (a AS z) FROM t"
+    );
+    assert_eq!(
+        sel("SELECT * REPLACE (b + 10 AS b) RENAME (a AS z) FROM t"),
+        "SELECT * REPLACE ((b + 10i32) AS b) RENAME (a AS z) FROM t"
+    );
+    assert_eq!(
+        sel("SELECT * EXCLUDE (c) REPLACE (b + 10 AS b) RENAME (a AS z) FROM t"),
+        "SELECT * EXCLUDE (c) REPLACE ((b + 10i32) AS b) RENAME (a AS z) FROM t"
+    );
+
+    // RENAME must come last: EXCLUDE/REPLACE after RENAME is a parser error,
+    // same as the already-tested REPLACE-before-EXCLUDE case.
+    assert_eq!(code("SELECT * RENAME (a AS z) EXCLUDE (b) FROM t"), Code::UnexpectedToken as u16);
+    assert_eq!(
+        code("SELECT * RENAME (a AS z) REPLACE (1 AS b) FROM t"),
+        Code::UnexpectedToken as u16
+    );
+
+    // The same source column named twice in one RENAME list is rejected.
+    assert_eq!(code("SELECT * RENAME (a AS z, a AS y) FROM t"), Code::SyntaxError as u16);
+    // A column in both EXCLUDE and RENAME, or both REPLACE and RENAME, is
+    // rejected (`duckdb`: "Column ... cannot occur in both ... list").
+    assert_eq!(code("SELECT * EXCLUDE (a) RENAME (a AS z) FROM t"), Code::SyntaxError as u16);
+    assert_eq!(code("SELECT * REPLACE (1 AS a) RENAME (a AS z) FROM t"), Code::SyntaxError as u16);
+    // Renaming a source column onto a name that is itself immediately
+    // renamed elsewhere is a duplicate *source*, not a duplicate *target*,
+    // so it is allowed at parse time (target-name collisions are only
+    // checked/allowed at bind time; see the `star_rename_*` integration
+    // tests).
+    assert_eq!(
+        sel("SELECT * RENAME (a AS z, b AS z) FROM t"),
+        "SELECT * RENAME (a AS z, b AS z) FROM t"
+    );
+
+    // `RENAME` is only a keyword right after `*`/`t.*` (same convention as
+    // EXCLUDE/REPLACE), so it stays usable as an ordinary identifier
+    // elsewhere. Under `ddl`, `rename` is a real reserved word (used by
+    // `ALTER TABLE ... RENAME`, see `is_star_rename_kw`), so this part is
+    // only checked without that feature — mirroring how the REPLACE test
+    // above handles the same `ddl` interaction.
+    #[cfg(not(feature = "ddl"))]
+    {
+        assert_eq!(sel("SELECT rename FROM t"), "SELECT rename FROM t");
+        assert_eq!(sel("SELECT a AS rename FROM t"), "SELECT a AS rename FROM t");
+    }
 }
 
 #[test]
@@ -2226,4 +2303,223 @@ fn unknown_table_function_name_is_unsupported() {
         Code::UnsupportedFeature as u16
     );
     assert_eq!(code("SELECT * FROM nonsense_fn('a.parquet')"), Code::UnsupportedFeature as u16);
+}
+
+// =========================================================================
+// New operators: `~~`/`!~~`/`~~*`/`!~~*`/`~~~` (LIKE/ILIKE/GLOB aliases),
+// `IS [NOT] TRUE/FALSE`, `ISNULL`/`NOTNULL`, `//` (integer division), `@`
+// (absolute value), `!` (factorial). Parser-level desugaring only —
+// end-to-end evaluated results (NULL propagation, real table columns) are
+// covered by `crates/ahiru-core/tests/new_operators.rs`. Every expected
+// value below is cross-checked against a real `duckdb` CLI.
+// =========================================================================
+
+// --- `~~`/`!~~`/`~~*`/`!~~*` (LIKE/ILIKE aliases) -------------------------
+
+#[test]
+fn like_alias_operators_desugar_to_like() {
+    assert_eq!(ex("a ~~ 'x%'"), "(a LIKE 'x%')");
+    assert_eq!(ex("a !~~ 'x%'"), "(a NOT LIKE 'x%')");
+    assert_eq!(ex("a ~~* 'x%'"), "(a ILIKE 'x%')");
+    assert_eq!(ex("a !~~* 'x%'"), "(a NOT ILIKE 'x%')");
+}
+
+#[test]
+fn like_alias_operators_reject_escape() {
+    // Only the `LIKE`/`ILIKE` *keyword* forms accept `ESCAPE`; duckdb
+    // itself rejects `ESCAPE` after `~~` as a parse error (verified:
+    // `duckdb -c "select 'a%c' ~~ 'a$%c' escape '$'"` -> `Parser Error`).
+    assert_eq!(code("SELECT 'a%c' ~~ 'a$%c' ESCAPE '$' FROM t"), Code::UnexpectedToken as u16);
+}
+
+#[test]
+fn like_alias_operators_bind_tighter_than_concat_unlike_the_like_keyword() {
+    // This is a real, verified difference from the `LIKE` keyword, not a
+    // copy-paste slip:
+    //   duckdb: 'ab' LIKE 'a' || 'b' -> true,     i.e. 'ab' LIKE ('a'||'b')
+    //   duckdb: 'ab' ~~   'a' || 'b' -> 'falseb', i.e. ('ab' ~~ 'a') || 'b'
+    assert_eq!(ex("'ab' LIKE 'a' || 'b'"), "('ab' LIKE ('a' || 'b'))");
+    assert_eq!(ex("'ab' ~~ 'a' || 'b'"), "(('ab' LIKE 'a') || 'b')");
+    // Same quirk for the ILIKE spelling.
+    assert_eq!(ex("'AB' ~~* 'a' || 'b'"), "(('AB' ILIKE 'a') || 'b')");
+}
+
+// --- `~~~` (GLOB alias) ----------------------------------------------------
+
+#[test]
+fn glob_alias_operator_desugars_to_glob_call() {
+    assert_eq!(ex("a ~~~ 'x*'"), "glob(a, 'x*')");
+}
+
+#[test]
+fn glob_alias_operator_binds_tighter_than_concat_unlike_the_glob_keyword() {
+    // duckdb: 'ab' GLOB 'a' || '*'  -> true,   i.e. 'ab' GLOB ('a'||'*')
+    // duckdb: 'ab' ~~~  'a' || '*'  -> 'false*', i.e. ('ab' ~~~ 'a') || '*'
+    assert_eq!(ex("'ab' GLOB 'a' || '*'"), "glob('ab', ('a' || '*'))");
+    assert_eq!(ex("'ab' ~~~ 'a' || '*'"), "(glob('ab', 'a') || '*')");
+}
+
+#[test]
+fn tilde_regex_operators_are_unaffected_by_the_like_alias_family() {
+    // Same lexer bytes (`~`), different meaning depending on how many
+    // repeat: these must still desugar exactly the way they always have.
+    assert_eq!(ex("a ~ 'x.y'"), "regexp_full_match(a, 'x.y')");
+    assert_eq!(ex("a !~ 'x.y'"), "(NOT regexp_full_match(a, 'x.y'))");
+    assert_eq!(ex("~5"), "bit_not(5i32)");
+    // `~ ~5`: prefix bitwise NOT applied twice; the space is now required
+    // — `~~5` lexes as the `~~` (LIKE-alias) operator followed by `5`,
+    // which has no left-hand operand to attach to, so it's a parse error
+    // rather than two bitwise NOTs (duckdb agrees: `~ ~5` -> `5`).
+    assert_eq!(ex("~ ~5"), "bit_not(bit_not(5i32))");
+    assert_eq!(code("SELECT ~~5 FROM t"), Code::UnexpectedToken as u16);
+}
+
+#[test]
+fn ne_still_lexes_as_a_single_token_not_bang_eq() {
+    assert_eq!(ex("4 != 5"), "(4i32 != 5i32)");
+}
+
+// --- `IS [NOT] TRUE` / `IS [NOT] FALSE` -----------------------------------
+
+#[test]
+fn is_true_desugars_to_cast_and_coalesce() {
+    assert_eq!(ex("x IS TRUE"), "coalesce(CAST(x AS BOOLEAN), false)");
+    assert_eq!(ex("x IS NOT TRUE"), "(NOT coalesce(CAST(x AS BOOLEAN), false))");
+}
+
+#[test]
+fn is_false_desugars_to_negated_cast_and_coalesce() {
+    assert_eq!(ex("x IS FALSE"), "coalesce((NOT CAST(x AS BOOLEAN)), false)");
+    assert_eq!(ex("x IS NOT FALSE"), "(NOT coalesce((NOT CAST(x AS BOOLEAN)), false))");
+}
+
+// --- `ISNULL` / `NOTNULL` postfix -----------------------------------------
+
+#[test]
+fn isnull_notnull_desugar_to_is_null() {
+    assert_eq!(ex("x ISNULL"), "(x IS NULL)");
+    assert_eq!(ex("x NOTNULL"), "(x IS NOT NULL)");
+}
+
+#[test]
+fn isnull_notnull_are_soft_keywords_not_reserved() {
+    // A column named `isnull`/`notnull`: a bare reference is consumed
+    // whole by `primary_atom` as the *operand*, so it never reaches the
+    // postfix check in `expr_body`'s loop.
+    assert_eq!(code("SELECT isnull FROM t"), 0);
+    assert_eq!(code("SELECT notnull FROM t"), 0);
+    // `AS isnull` reads the alias through a separate `ident()` call in
+    // `opt_alias`, after `expr()` has already returned.
+    assert_eq!(code("SELECT 1 AS isnull FROM t"), 0);
+}
+
+#[test]
+fn isnull_binds_at_comparison_strength() {
+    // duckdb: SELECT 1 + 2 ISNULL -> false, i.e. (1+2) ISNULL, not
+    // 1 + (2 ISNULL).
+    assert_eq!(ex("1 + 2 ISNULL"), "((1i32 + 2i32) IS NULL)");
+}
+
+// --- `//` integer division -------------------------------------------------
+
+#[test]
+fn integer_division_operator_desugars_to_div() {
+    assert_eq!(ex("a // b"), "(a / b)");
+}
+
+#[test]
+fn integer_division_binds_like_star_and_slash() {
+    // duckdb: 2 + 5 // 2 -> 4, i.e. 2 + (5 // 2)
+    assert_eq!(ex("2 + 5 // 2"), "(2i32 + (5i32 / 2i32))");
+    // duckdb: 5 // 2 // 2 -> 1, left-associative: (5 // 2) // 2
+    assert_eq!(ex("5 // 2 // 2"), "((5i32 / 2i32) / 2i32)");
+}
+
+// --- `@` absolute value -----------------------------------------------------
+
+#[test]
+fn at_prefix_desugars_to_abs() {
+    assert_eq!(ex("@x"), "abs(x)");
+    assert_eq!(ex("@(-5)"), "abs(-5i32)");
+}
+
+// --- `!` postfix factorial --------------------------------------------------
+
+#[test]
+fn factorial_postfix_desugars_to_factorial_call() {
+    assert_eq!(ex("4!"), "factorial(4i32)");
+    assert_eq!(ex("x!"), "factorial(x)");
+    assert_eq!(ex("(2 + 2)!"), "factorial((2i32 + 2i32))");
+}
+
+#[test]
+fn factorial_applies_after_unary_minus_for_literals_and_columns_alike() {
+    // duckdb: SELECT -4! -> 1, and (confirmed independently against the
+    // `duckdb` CLI) SELECT -x! FROM t (x=4) -> 1 too -- `!` binds looser
+    // than prefix `-` (`BP_BANG`'s doc in `sql::parser` has the full
+    // rationale), so both parse as `(-x)!`, never `-(x!)`.
+    //
+    // This closes a real bug an earlier version of this parser had: the
+    // negative-*literal* fast path in `prefix()`'s `Tok::Minus` arm folded
+    // `-4` into one literal before `!` got a chance to apply, so `-4!`
+    // happened to come out right (`factorial(-4)`) -- but the *general*
+    // `-x` path (any non-literal operand, reached via `expr_bp(BP_UNARY)`)
+    // built `Unary::Neg(factorial(x))` instead, i.e. `-(x!)`. Same syntax,
+    // two different parses depending only on whether the operand was a
+    // literal. `BP_BANG` sitting below `BP_UNARY` (which is what `prefix`
+    // always reads its operand at) fixes both paths at once, uniformly.
+    assert_eq!(ex("-4!"), "factorial(-4i32)");
+    assert_eq!(ex("-x!"), "factorial((- x))");
+}
+
+#[test]
+fn factorial_and_cast_shorthand_interleave() {
+    // duckdb: SELECT 4!::VARCHAR -> '24', i.e. CAST(4! AS VARCHAR). `!` no
+    // longer joins `primary`'s postfix loop (see `BP_BANG`'s doc), so this
+    // `::` is picked up by an explicit `cast_postfix` call made right
+    // after `expr_body` folds the `!` -- without it, a `::` immediately
+    // after `!` would be silently dropped instead of erroring or applying.
+    assert_eq!(ex("4!::VARCHAR"), "CAST(factorial(4i32) AS VARCHAR)");
+    assert_eq!(ex("x!::VARCHAR"), "CAST(factorial(x) AS VARCHAR)");
+}
+
+#[test]
+fn factorial_precedence_is_self_consistent_but_diverges_from_duckdb_on_binary_operators() {
+    // `!` binds looser than every prefix operator (`-`/`~`/`NOT`) but
+    // tighter than every binary operator (`BP_BANG`'s doc has the full
+    // rationale). DuckDB's own grammar for postfix `!` is internally
+    // inconsistent Postgres legacy, verified against the `duckdb` CLI:
+    //   3! ^ 2   -> 36.0    (works)
+    //   2 ^ 3!   -> syntax error
+    //   3! = 6   -> true    (works)
+    //   2 + 3!   -> 120, i.e. (2+3)! silently
+    //   3! + 1   -> syntax error
+    // We deliberately do not replicate that inconsistency: `!` here always
+    // applies to just the immediately preceding operand and never absorbs
+    // a surrounding binary expression, so every one of these parses
+    // (`2 + 3!`/`3! + 1` diverge from DuckDB on purpose -- see
+    // docs/sql/limitations.md).
+    assert_eq!(ex("3! ^ 2"), "pow(factorial(3i32), 2i32)");
+    assert_eq!(ex("2 ^ 3!"), "pow(2i32, factorial(3i32))");
+    assert_eq!(ex("3! = 6"), "(factorial(3i32) = 6i32)");
+    assert_eq!(ex("2 + 3!"), "(2i32 + factorial(3i32))");
+    assert_eq!(ex("3! + 1"), "(factorial(3i32) + 1i32)");
+}
+
+#[test]
+fn factorial_applies_after_bitwise_not_too() {
+    // duckdb: SELECT ~5! -> 1 (confirmed: same as `(~5)!`, matching
+    // `(~5)! = factorial(-6) = 1`; `~(5!)` is a different value, `-121`).
+    // Prefix `~` reads its operand at `BP_UNARY` exactly like unary `-`
+    // does, so the same `BP_BANG < BP_UNARY` rule applies uniformly.
+    assert_eq!(ex("~5!"), "factorial(bit_not(5i32))");
+}
+
+#[test]
+fn bang_still_lexes_as_the_prefix_of_longer_operators() {
+    // `!=`/`!~`/`!~~`/`!~~*` must still win over a bare `Bang`.
+    assert_eq!(code("SELECT 4 != 5 FROM t"), 0);
+    assert_eq!(code("SELECT a !~ 'x' FROM t"), 0);
+    assert_eq!(code("SELECT a !~~ 'x' FROM t"), 0);
+    assert_eq!(code("SELECT a !~~* 'x' FROM t"), 0);
 }

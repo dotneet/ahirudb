@@ -190,7 +190,7 @@ pub(crate) fn run_query_to_rows(
     // IoFailed（`Session::prepare` の `resolve_query` に相当する処理を
     // ここで簡略化して行う）。
     let mut tables = Vec::new();
-    referenced_in_query(&session.catalog, q, &mut tables, 0)?;
+    referenced_in_query(&session.catalog, arena, q, &mut tables, 0)?;
     for t in tables {
         if let Some(table) = session.catalog.get_mut(t) {
             if table.resolve()?.is_err() {

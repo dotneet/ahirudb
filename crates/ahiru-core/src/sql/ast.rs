@@ -92,6 +92,16 @@ pub enum Expr {
         exclude: Vec<String>,
         /// 展開結果のうち指定列を式の評価結果に差し替える。列名自体は変わらない。
         replace: Vec<(ExprId, String)>,
+        /// `RENAME (old AS new, ...)`: relabels columns in the expansion,
+        /// as `(old_name, new_name)` pairs. Applied after `exclude`/`replace`
+        /// (DuckDB's fixed modifier order is EXCLUDE -> REPLACE -> RENAME).
+        /// Only the OUTPUT name changes — `WHERE`/`ORDER BY`/etc. in the same
+        /// query still see the original column name, and `ORDER BY` also
+        /// accepts the new name via the usual output-alias lookup.
+        /// Unlike `exclude`, an `old` name that doesn't match any column is
+        /// silently ignored rather than an error — this asymmetry matches
+        /// DuckDB's real behavior, it is not an oversight.
+        rename: Vec<(String, String)>,
     },
     Unary {
         op: UnaryOp,

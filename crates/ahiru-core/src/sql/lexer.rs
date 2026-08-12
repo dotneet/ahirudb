@@ -361,6 +361,33 @@ pub enum Tok<'a> {
     Tilde,
     /// `!~`（`~` の否定、`NOT (a ~ b)` の糖衣構文）
     NotTilde,
+    /// `~~`. PostgreSQL/DuckDB alias for `LIKE` (`sql::parser::expr_body`
+    /// desugars this to `Expr::Like`). Two tildes, not to be confused with
+    /// infix `~` (regex match) above.
+    TildeTilde,
+    /// `~~*`. Alias for `ILIKE` (case-insensitive `~~`).
+    TildeTildeStar,
+    /// `~~~`. Alias for `GLOB` (desugars to a `glob(...)` call, same as the
+    /// `GLOB` keyword — see `sql::parser::expr_body`).
+    TildeTildeTilde,
+    /// `!~~`. Negated `~~`; folded into `Expr::Like`'s `negated` field
+    /// rather than wrapped in `Unary::Not` (`sql::parser::expr_body`).
+    NotTildeTilde,
+    /// `!~~*`. Negated `~~*`.
+    NotTildeTildeStar,
+    /// `//`. Integer division: sugar for `BinaryOp::Div` (see the
+    /// desugaring site in `sql::parser::expr_body` for why this is a
+    /// correct alias for `/` specifically in this engine).
+    SlashSlash,
+    /// `@` (prefix only). Absolute value, sugar for `abs(x)`
+    /// (`sql::parser::Parser::prefix`).
+    At,
+    /// `!` (postfix only). Factorial, sugar for `factorial(x)`
+    /// (`sql::parser::Parser::primary`/`cast_postfix`). Also the leading
+    /// byte of `!=`/`!~`/`!~~`/`!~~*`, which the lexer matches first as
+    /// their own longer tokens — a lone `!` only remains when none of
+    /// those match.
+    Bang,
 }
 
 /// トークンと、その先頭の入力バイト位置。位置はそのままエラー報告に使う。
@@ -576,10 +603,19 @@ impl<'a> Lexer<'a> {
                     Tok::Minus
                 }
             }
-            b'/' => Tok::Slash,
+            // `//` (integer division). Not a comment: SQL line comments are
+            // `--`, already consumed by `skip_trivia` before `punct` runs.
+            b'/' => {
+                if eat(b'/') {
+                    Tok::SlashSlash
+                } else {
+                    Tok::Slash
+                }
+            }
             b'%' => Tok::Percent,
             b'?' => Tok::Param,
             b'^' => Tok::Pow,
+            b'@' => Tok::At,
             b':' => {
                 if eat(b':') {
                     Tok::ColonColon
@@ -592,16 +628,42 @@ impl<'a> Lexer<'a> {
                 eat(b'=');
                 Tok::Eq
             }
+            // Longest match first: `!~~*` / `!~~` / `!~` (existing
+            // `NotTilde`) / `!=` (existing `Ne`) / bare `!` (`Bang`,
+            // postfix factorial — see `Tok::Bang` doc).
             b'!' => {
-                if eat(b'=') {
+                if eat(b'~') {
+                    if eat(b'~') {
+                        if eat(b'*') {
+                            Tok::NotTildeTildeStar
+                        } else {
+                            Tok::NotTildeTilde
+                        }
+                    } else {
+                        Tok::NotTilde
+                    }
+                } else if eat(b'=') {
                     Tok::Ne
-                } else if eat(b'~') {
-                    Tok::NotTilde
                 } else {
-                    err!(UnexpectedToken, start)
+                    Tok::Bang
                 }
             }
-            b'~' => Tok::Tilde,
+            // Longest match first: `~~~` / `~~*` / `~~` / bare `~`
+            // (existing `Tilde`, prefix bitwise NOT or infix regex match —
+            // see `Tok::Tilde` doc).
+            b'~' => {
+                if eat(b'~') {
+                    if eat(b'~') {
+                        Tok::TildeTildeTilde
+                    } else if eat(b'*') {
+                        Tok::TildeTildeStar
+                    } else {
+                        Tok::TildeTilde
+                    }
+                } else {
+                    Tok::Tilde
+                }
+            }
             b'&' => Tok::Amp,
             b'<' => {
                 if eat(b'=') {

@@ -79,6 +79,33 @@ impl<'a> Parser<'a> {
                 lhs = self.similar_to(lhs, false)?;
                 continue;
             }
+            // `ISNULL`/`NOTNULL`: DuckDB's non-standard postfix aliases for
+            // `IS [NOT] NULL`. Soft keywords for the same reason as
+            // `glob`/`similar`/`filter`/`over` above (not in the reserved
+            // table) — `isnull`/`notnull` must stay usable as column names.
+            // That's safe here because both uses of the word are read
+            // through different code paths: `SELECT isnull FROM t` never
+            // reaches this loop (the bare identifier is consumed whole by
+            // `primary_atom`/`name_ref` as the *operand*, before this
+            // infix/postfix loop ever sees the token as `self.cur`), and
+            // `SELECT 1 AS isnull` reads the alias via a separate `ident()`
+            // call in `opt_alias` after `expr()` has already returned.
+            if self.is_soft_kw(b"isnull") {
+                if BP_CMP < min_bp {
+                    break;
+                }
+                self.bump()?;
+                lhs = self.arena.push(Expr::IsNull { arg: lhs, negated: false });
+                continue;
+            }
+            if self.is_soft_kw(b"notnull") {
+                if BP_CMP < min_bp {
+                    break;
+                }
+                self.bump()?;
+                lhs = self.arena.push(Expr::IsNull { arg: lhs, negated: true });
+                continue;
+            }
             let (op, bp) = match self.cur {
                 Tok::Kw(Kw::Or) => (BinaryOp::Or, BP_OR),
                 Tok::Kw(Kw::And) => (BinaryOp::And, BP_AND),
@@ -93,6 +120,18 @@ impl<'a> Parser<'a> {
                 Tok::Minus => (BinaryOp::Sub, BP_ADD),
                 Tok::Star => (BinaryOp::Mul, BP_MUL),
                 Tok::Slash => (BinaryOp::Div, BP_MUL),
+                // `//` (integer division). Sugar for plain `/`, not a new
+                // `BinaryOp` variant: this engine's `/` is *already*
+                // truncating integer division when both operands are
+                // integers (`7/2` = 3, `-7/2` = -3, matching DuckDB's `//`
+                // exactly), and stays real-valued division when either
+                // operand is a float (`5.0/2` = 2.5). That's the same
+                // behavior DuckDB gives `//` specifically (its plain `/`
+                // instead always returns a float, e.g. `7/2` = 3.5 — a
+                // pre-existing, out-of-scope divergence from DuckDB noted
+                // in docs/sql/functions-numeric.md). If `/`'s semantics
+                // ever change, this alias must be revisited.
+                Tok::SlashSlash => (BinaryOp::Div, BP_MUL),
                 Tok::Percent => (BinaryOp::Mod, BP_MUL),
                 // `&`/`|`/`<<`/`>>`/`^`/`**` も `->`/`->>` と同じく新しい
                 // `BinaryOp` を増やさず、既存のスカラ関数呼び出しへの糖衣構文
@@ -164,6 +203,83 @@ impl<'a> Parser<'a> {
                     } else {
                         call
                     };
+                    continue;
+                }
+                // `~~`/`!~~`/`~~*`/`!~~*`: PostgreSQL/DuckDB's punctuation
+                // aliases for `LIKE`/`NOT LIKE`/`ILIKE`/`NOT ILIKE`. Desugar
+                // straight into `Expr::Like` (same node the `LIKE`/`ILIKE`
+                // keywords produce in `predicate()` below) rather than a
+                // fresh AST variant.
+                //
+                // The right operand is read at `BP_CONCAT + 1`, one notch
+                // *tighter* than `LIKE`'s own `BP_CONCAT` (see
+                // `predicate()`'s `Kw::Like | Kw::Ilike` arm) — this is a
+                // real, verified difference from the `LIKE` keyword, not a
+                // copy-paste slip:
+                //   duckdb: 'ab' LIKE 'a' || 'b'  -> true      i.e. 'ab' LIKE ('a'||'b')
+                //   duckdb: 'ab' ~~   'a' || 'b'  -> 'falseb'  i.e. ('ab' ~~ 'a') || 'b'
+                // So a `||` right after one of these operators binds to the
+                // *result*, not into the pattern. `ESCAPE` is intentionally
+                // not accepted here (only the `LIKE`/`ILIKE` keyword forms
+                // take it) — duckdb rejects `'a%c' ~~ 'a$%c' ESCAPE '$'` as
+                // a parse error, confirmed against the `duckdb` CLI.
+                Tok::TildeTilde
+                | Tok::NotTildeTilde
+                | Tok::TildeTildeStar
+                | Tok::NotTildeTildeStar => {
+                    if BP_CMP < min_bp {
+                        break;
+                    }
+                    let negated = matches!(self.cur, Tok::NotTildeTilde | Tok::NotTildeTildeStar);
+                    let ci = matches!(self.cur, Tok::TildeTildeStar | Tok::NotTildeTildeStar);
+                    self.bump()?;
+                    let pattern = self.expr_bp(BP_CONCAT + 1)?;
+                    lhs = self.arena.push(Expr::Like {
+                        arg: lhs,
+                        pattern,
+                        negated,
+                        escape: None,
+                        ci,
+                    });
+                    continue;
+                }
+                // `~~~`: alias for `GLOB`. Same "bind tighter than `||`"
+                // quirk as the `~~` family above (verified: `duckdb -c
+                // "select 'ab' ~~~ 'a' || '*'"` -> `false*`, i.e. `('ab' ~~~
+                // 'a') || '*'`, while `'ab' GLOB 'a' || '*'` -> `true`, i.e.
+                // `'ab' GLOB ('a'||'*')` — the `GLOB` keyword itself reads
+                // its pattern at `BP_CONCAT`, see the `is_soft_kw(b"glob")`
+                // block above).
+                Tok::TildeTildeTilde => {
+                    if BP_CMP < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let pattern = self.expr_bp(BP_CONCAT + 1)?;
+                    lhs = self.simple_call("glob", vec![lhs, pattern]);
+                    continue;
+                }
+                // `!` (postfix factorial, sugar for `factorial(x)`) at
+                // `BP_BANG` — see that constant's doc in `sql::parser` for
+                // why it lives here (a dedicated strength between every
+                // binary operator and the prefix operators) rather than in
+                // `primary`'s postfix loop alongside `::`/`[...]`.
+                //
+                // One trap this creates: `primary`'s loop is what normally
+                // picks up a `::` immediately following a postfix
+                // expression, but `!` no longer goes through that loop, so
+                // a `::` right after `!` would otherwise be left dangling.
+                // Explicitly re-running `cast_postfix` on the folded
+                // `factorial(...)` node closes that gap (verified:
+                // `duckdb -c "select 4!::varchar"` -> `'24'`, i.e.
+                // `CAST(4! AS VARCHAR)`).
+                Tok::Bang => {
+                    if BP_BANG < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let call = self.simple_call("factorial", vec![lhs]);
+                    lhs = self.cast_postfix(call)?;
                     continue;
                 }
                 // `->`/`->>` は新しい BinaryOp を増やさず、`json_extract`/
@@ -245,6 +361,14 @@ impl<'a> Parser<'a> {
                 let arg = self.expr_bp(BP_UNARY)?;
                 Ok(self.simple_call("bit_not", vec![arg]))
             }
+            // `@` (prefix only, no infix meaning): absolute value, sugar
+            // for `abs(x)` (verified: `duckdb -c "select @(-5), @(-5.5)"`
+            // -> `5`, `5.5`).
+            Tok::At => {
+                self.bump()?;
+                let arg = self.expr_bp(BP_UNARY)?;
+                Ok(self.simple_call("abs", vec![arg]))
+            }
             _ => self.primary(),
         }
     }
@@ -274,7 +398,14 @@ impl<'a> Parser<'a> {
                     let rhs = self.expr_bp(BP_CMP + 1)?;
                     return Ok(self.distinct_from(arg, rhs, neg));
                 }
-                // v1 は IS [NOT] NULL のみ。IS TRUE などは範囲外。
+                // `IS [NOT] TRUE`/`IS [NOT] FALSE`. `Kw::True`/`Kw::False`
+                // are already reserved keywords (used for the `TRUE`/
+                // `FALSE` literals), so no soft-keyword lookahead is needed
+                // here.
+                if let Tok::Kw(want @ (Kw::True | Kw::False)) = self.cur {
+                    self.bump()?;
+                    return Ok(self.is_true_or_false(arg, want == Kw::True, neg));
+                }
                 if !self.is(Tok::Kw(Kw::Null)) {
                     err!(UnsupportedFeature, self.pos);
                 }
@@ -394,6 +525,37 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `IS [NOT] TRUE`/`IS [NOT] FALSE`. Modeled on `distinct_from` above:
+    /// no new `Expr`/`BinaryOp` variant, just existing nodes/functions
+    /// (`Cast`, `coalesce`, `Unary::Not`) composed to match duckdb's
+    /// verified semantics — a non-boolean operand is coerced rather than
+    /// rejected, and `NULL` never propagates (`IS TRUE`/`IS FALSE` always
+    /// return `TRUE`/`FALSE`, never `NULL`, on any input including `NULL`
+    /// itself):
+    ///   `x IS TRUE`  ≡ `coalesce(CAST(x AS BOOLEAN), false)`
+    ///   `x IS FALSE` ≡ `coalesce(NOT CAST(x AS BOOLEAN), false)`
+    /// The `CAST` is load-bearing, not decorative: this engine's `NOT`
+    /// requires an already-boolean operand (`SELECT NOT 1` is a type
+    /// error), while `CAST(3 AS BOOLEAN)` succeeds and `CAST(NULL AS
+    /// BOOLEAN)` yields `NULL` (which `coalesce` then turns into `false`).
+    /// The `IS NOT` forms wrap the whole thing in `Unary::Not` at the call
+    /// site (`predicate()` above), same as every other `IS NOT ...` form.
+    fn is_true_or_false(&mut self, arg: ExprId, want_true: bool, negated: bool) -> ExprId {
+        let cast = self.arena.push(Expr::Cast { arg, ty: Ty::Boolean, try_: false });
+        let cond = if want_true {
+            cast
+        } else {
+            self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: cast })
+        };
+        let false_lit = self.arena.push(Expr::Literal(Value::Bool(false)));
+        let result = self.simple_call("coalesce", vec![cond, false_lit]);
+        if negated {
+            self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: result })
+        } else {
+            result
+        }
+    }
+
     /// `primary_atom()` に続けて、任意個の postfix `::type` / `[i]` /
     /// `[i:j]` を、現れた順に畳み込む。いずれも前置演算子より強く結合する
     /// （`duckdb -c "select -1::varchar"` が `-(1::VARCHAR)` と解釈されて
@@ -408,6 +570,13 @@ impl<'a> Parser<'a> {
     /// （`CAST(list[1] AS VARCHAR)`）、`duckdb -c "select ([1,2,3]::json)[1]"`
     /// は「先にキャスト、後に添字」になる。そのため 1 つのループで両方を
     /// 交互に受け付ける。
+    ///
+    /// `!` (factorial) deliberately does *not* join this loop, even though
+    /// it's a postfix operator too — it lives in `expr_body`'s infix loop
+    /// instead, at its own strength `BP_BANG` (see that constant's doc in
+    /// `sql::parser`), which sits below the prefix operators but above
+    /// every binary operator. That's what makes `-4!`/`-x!` parse as
+    /// `(-x)!` without any special-casing here or in `prefix()`.
     fn primary(&mut self) -> Result<ExprId> {
         let mut node = self.primary_atom()?;
         loop {
@@ -429,6 +598,13 @@ impl<'a> Parser<'a> {
     /// （`duckdb -c "select -5[1]"` で確認済み）ので、この経路は `::` だけ
     /// 畳み込めばよく、`[i]`/`[i:j]` は付けない（`primary` 側のループとは
     /// 意図的に別実装）。
+    ///
+    /// `!` (factorial) doesn't belong here either, for the same reason it
+    /// doesn't belong in `primary`'s loop: `-4!` folds `-4` to a literal
+    /// via this function first, and it's `expr_body`'s outer loop —
+    /// operating on the completed `-4` node — that then picks up the `!`
+    /// at `BP_BANG` (see that constant's doc). That's also what makes
+    /// `-4!` and `-x!` (a non-literal operand) parse identically.
     fn cast_postfix(&mut self, mut node: ExprId) -> Result<ExprId> {
         while self.eat(Tok::ColonColon)? {
             let ty = self.type_name()?;
@@ -644,8 +820,13 @@ impl<'a> Parser<'a> {
         if self.eat(Tok::Dot)? {
             if self.is(Tok::Star) {
                 self.bump()?;
-                let (exclude, replace) = self.star_modifiers()?;
-                return Ok(self.arena.push(Expr::Star { qualifier: Some(name), exclude, replace }));
+                let (exclude, replace, rename) = self.star_modifiers()?;
+                return Ok(self.arena.push(Expr::Star {
+                    qualifier: Some(name),
+                    exclude,
+                    replace,
+                    rename,
+                }));
             }
             let col = self.ident()?;
             return Ok(self.arena.push(Expr::ColumnRef { qualifier: Some(name), name: col }));

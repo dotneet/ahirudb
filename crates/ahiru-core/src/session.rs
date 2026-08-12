@@ -249,7 +249,7 @@ impl Session {
             Stmt::Select(q) => self.prepare_query(&parsed.arena, q, params),
             // EXPLAIN はプランを組んでからテキストに落とす。実行はしない。
             Stmt::Explain(q) => {
-                if let Some(io) = self.resolve_query(q)? {
+                if let Some(io) = self.resolve_query(&parsed.arena, q)? {
                     return Ok(Prepared::NeedIo(io));
                 }
                 let plan = bind_query(&self.catalog, &parsed.arena, q, params)?;
@@ -328,7 +328,7 @@ impl Session {
         q: &crate::sql::ast::QueryStmt,
         params: &[Value],
     ) -> Result<Prepared> {
-        if let Some(io) = self.resolve_query(q)? {
+        if let Some(io) = self.resolve_query(arena, q)? {
             return Ok(Prepared::NeedIo(io));
         }
         let plan = bind_query(&self.catalog, arena, q, params)?;
@@ -346,9 +346,13 @@ impl Session {
     /// があると複数になる）。1 テーブルにつき 1 往復で済むよう、そのテーブルの
     /// 全パートが必要とする範囲を `Table::resolve` の時点で束ねてから積む
     /// （`catalog::Table::resolve` のドキュメント参照）。
-    fn resolve_query(&mut self, q: &crate::sql::ast::QueryStmt) -> Result<Option<Vec<IoRequest>>> {
+    fn resolve_query(
+        &mut self,
+        arena: &crate::sql::ast::ExprArena,
+        q: &crate::sql::ast::QueryStmt,
+    ) -> Result<Option<Vec<IoRequest>>> {
         let mut tables = Vec::new();
-        referenced_in_query(&self.catalog, q, &mut tables, 0)?;
+        referenced_in_query(&self.catalog, arena, q, &mut tables, 0)?;
         let mut io = Vec::new();
         for &table in &tables {
             let t = match self.catalog.get_mut(table) {
