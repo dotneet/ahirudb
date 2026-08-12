@@ -415,11 +415,33 @@ pub fn concat(a: &Vector, b: &Vector, out_ty: Ty) -> Result<Vector> {
     Ok(finish(out_ty, Data::Bytes(out), combine_validity(a, sa, b, sb, n), None))
 }
 
-/// SQL `LIKE`. `%` matches zero or more characters and `_` matches **exactly one byte**.
+/// Length in bytes of the UTF-8 sequence starting at `s[i]` (`i < s.len()` is required),
+/// clamped so it never runs past the end of `s`. A continuation byte or otherwise invalid
+/// lead byte falls back to 1 -- `s`/`p` are not assumed to be valid UTF-8 here (this is the
+/// same defensive posture as the rest of the untrusted-input-facing code), so this always
+/// makes forward progress instead of panicking or looping forever on malformed bytes.
+fn utf8_len_at(s: &[u8], i: usize) -> usize {
+    let n = match s[i] {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    };
+    n.min(s.len() - i)
+}
+
+/// SQL `LIKE`. `%` matches zero or more characters and `_` matches exactly one Unicode
+/// character (a UTF-8 sequence, not necessarily one byte) -- matching the Unicode-codepoint
+/// convention the rest of the string functions follow (`docs/sql/functions-string.md`).
 ///
-/// `_` is byte-wise rather than code-point-wise because bringing in UTF-8 boundary detection would
-/// grow the code. Strings containing non-ASCII will differ from expectations (a known limitation).
-/// The `ESCAPE` clause is unsupported too.
+/// `%`'s own literal/backtrack matching stays byte-oriented (cheap, and correct on its own:
+/// UTF-8 is self-synchronizing, so byte-for-byte literal comparison never needs character
+/// boundaries). The one place alignment actually matters is `_`, plus the backtrack step
+/// that retries a `%` with "one more `_`/literal token" -- that step also has to advance a
+/// full character, not one byte, or a retry could land mid-character and hand `_` a bogus
+/// starting point. `ESCAPE` is unsupported (rejected at parse time, see
+/// `docs/sql/limitations.md`), so there's no escape handling to keep in sync here.
 ///
 /// Backtracking is a two-pointer method remembering only "the position of the last `%` seen".
 /// It does not recurse, so it consumes no stack, and even a pattern like `%a%a%a...` costs at
@@ -429,7 +451,10 @@ fn like_match(s: &[u8], p: &[u8]) -> bool {
     // `star_p == usize::MAX` means "no `%` seen yet".
     let (mut star_p, mut star_s) = (usize::MAX, 0usize);
     while si < s.len() {
-        if pi < p.len() && (p[pi] == b'_' || p[pi] == s[si]) {
+        if pi < p.len() && p[pi] == b'_' {
+            si += utf8_len_at(s, si);
+            pi += 1;
+        } else if pi < p.len() && p[pi] == s[si] {
             si += 1;
             pi += 1;
         } else if pi < p.len() && p[pi] == b'%' {
@@ -437,9 +462,9 @@ fn like_match(s: &[u8], p: &[u8]) -> bool {
             star_s = si;
             pi += 1;
         } else if star_p != usize::MAX {
-            // Feed the previous `%` one more byte and retry.
+            // Feed the previous `%` one more character (not byte -- see doc comment) and retry.
             pi = star_p + 1;
-            star_s += 1;
+            star_s += utf8_len_at(s, star_s);
             si = star_s;
         } else {
             return false;
@@ -1346,6 +1371,34 @@ mod tests {
         assert!(like_match(b"", b""));
         assert!(!like_match(b"", b"_"));
         assert!(!like_match(b"abc", b""));
+    }
+
+    // Regression test: `_` used to advance by one UTF-8 *byte* instead of one Unicode
+    // character, so `'あ' LIKE '_'` (a 3-byte character) returned false. `_` should match
+    // exactly one character, matching DuckDB and this project's own documented convention
+    // that string matching is Unicode-codepoint-based (docs/sql/functions-string.md).
+    #[test]
+    fn like_underscore_matches_one_unicode_character() {
+        assert!(like_match("あ".as_bytes(), b"_"));
+        assert!(!like_match("あい".as_bytes(), b"_"));
+        assert!(like_match("あい".as_bytes(), b"__"));
+        assert!(like_match("あいう".as_bytes(), "あ_う".as_bytes()));
+        // Mixed ASCII / multibyte.
+        assert!(like_match("aあb".as_bytes(), b"a_b"));
+        assert!(like_match("aあb".as_bytes(), b"___"));
+        assert!(!like_match("aあb".as_bytes(), b"a_"));
+        // 4-byte character (emoji, outside the BMP).
+        assert!(like_match("😀".as_bytes(), b"_"));
+        assert!(like_match("a😀b".as_bytes(), b"a_b"));
+        assert!(!like_match("😀😀".as_bytes(), b"_"));
+        // `_` combined with `%` backtracking must stay character-aligned through the retry
+        // step too, not just on the first (non-backtracked) attempt.
+        assert!(like_match("aあx".as_bytes(), b"%_x"));
+        assert!(!like_match("あx".as_bytes(), b"%__x")); // only one char precedes 'x'
+                                                         // `%` itself is still fine matching byte-wise (any sequence of characters).
+        assert!(like_match("あいう".as_bytes(), b"%"));
+        assert!(like_match("あいう".as_bytes(), "%う".as_bytes()));
+        assert!(like_match("あいう".as_bytes(), "あ%".as_bytes()));
     }
 
     #[test]

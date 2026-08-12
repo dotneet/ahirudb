@@ -135,7 +135,16 @@ pub(crate) fn update(
     };
 
     let total = session.catalog.mem_get(idx).unwrap().rows.len();
-    let mut updated: u64 = 0;
+
+    // Pass 1 (validate): walk every batch, evaluate the SET expressions, and check NOT
+    // NULL for every matched row -- but don't touch `mt.rows` yet. A statement must be
+    // all-or-nothing (docs/sql/limitations.md, "UPDATE atomicity"): rows are batched in
+    // groups of BATCH_SIZE, and without this split, a constraint violation discovered in
+    // a later batch (e.g. row 2049 of a 2050-row UPDATE) would leave the earlier batch's
+    // rows already mutated in place. Buffering the validated new values costs memory
+    // proportional to the rows actually being updated (already bounded by the in-memory
+    // table itself, per DESIGN.md §16), not the whole table.
+    let mut planned: Vec<(usize, Vec<Value>)> = Vec::new();
     let mut pos = 0;
     while pos < total {
         let end = (pos + BATCH_SIZE).min(total);
@@ -161,19 +170,29 @@ pub(crate) fn update(
             new_cols.push(session.vm.eval(p, &batch)?);
         }
 
-        let mt = session.catalog.mem_get_mut(idx).unwrap();
-        for (local, global) in (0..end - pos).zip(pos..end) {
-            if !mask[local] {
+        for (local, &matched) in mask.iter().enumerate() {
+            if !matched {
                 continue;
             }
+            let mut row_values = Vec::with_capacity(set_cols.len());
             for (k, &ci) in set_cols.iter().enumerate() {
                 let v = new_cols[k].value_at(local);
-                ensure!(mt.schema[ci].nullable || !v.is_null(), TypeMismatch);
-                mt.rows[global][ci] = v;
+                ensure!(schema[ci].nullable || !v.is_null(), TypeMismatch);
+                row_values.push(v);
             }
-            updated += 1;
+            planned.push((pos + local, row_values));
         }
         pos = end;
+    }
+
+    // Pass 2 (apply): every row already validated above, so this loop does no
+    // fallible work -- just moves the precomputed values into the table.
+    let updated = planned.len() as u64;
+    let mt = session.catalog.mem_get_mut(idx).unwrap();
+    for (global, row_values) in planned {
+        for (&ci, v) in set_cols.iter().zip(row_values) {
+            mt.rows[global][ci] = v;
+        }
     }
     Ok(Prepared::Ready(count_result(updated as i64)))
 }
@@ -332,6 +351,74 @@ mod tests {
         s.prepare("INSERT INTO t VALUES (1)", &[]).unwrap();
         let r = s.prepare("UPDATE t SET a = NULL", &[]);
         assert_eq!(crate::error::code_of(r), Some(Code::TypeMismatch));
+    }
+
+    // Regression test for a bug where UPDATE applied its SET expressions batch-by-batch
+    // (BATCH_SIZE = 2048 rows), mutating each batch's rows in `mem_get_mut` as it went. A
+    // NOT NULL violation discovered in a later batch still errored the whole statement,
+    // but the earlier batch(es) had already been written -- so a 2050-row UPDATE where row
+    // 2048 (the first row of the second batch) violated NOT NULL left rows 0..2047
+    // mutated despite the statement as a whole reporting failure. UPDATE must be
+    // all-or-nothing: this crosses the BATCH_SIZE boundary on purpose and asserts both
+    // that the statement errors AND that no row was modified.
+    #[test]
+    fn update_crossing_batch_boundary_is_atomic_on_constraint_violation() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (id INTEGER, val INTEGER NOT NULL)", &[]).unwrap();
+        let n = BATCH_SIZE * 2 + 2; // 4098 rows: several full batches plus a partial one
+        let values: Vec<String> = (0..n).map(|i| format!("({i}, {i})")).collect();
+        s.prepare(&format!("INSERT INTO t VALUES {}", values.join(",")), &[]).unwrap();
+
+        // Row `BATCH_SIZE` (id 2048) is the first row of the *second* batch; setting its
+        // new value to NULL is what used to leave the first batch's rows mutated.
+        let sql =
+            format!("UPDATE t SET val = CASE WHEN id = {BATCH_SIZE} THEN NULL ELSE val + 1 END");
+        let r = s.prepare(&sql, &[]);
+        assert_eq!(crate::error::code_of(r), Some(Code::TypeMismatch));
+
+        // No row should have been touched -- every `val` must still equal its original `id`.
+        let rows = ready_rows(&mut s, "SELECT id, val FROM t ORDER BY id");
+        assert_eq!(rows.len(), n);
+        for row in rows {
+            assert_eq!(row[0], row[1], "row {:?} was mutated despite the statement failing", row);
+        }
+    }
+
+    // A successful UPDATE that spans multiple batches (more than BATCH_SIZE rows) should
+    // still update every matching row correctly -- the validate-then-apply split
+    // shouldn't change behavior for the non-error path.
+    #[test]
+    fn update_crossing_batch_boundary_succeeds_for_all_rows() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (id INTEGER, val INTEGER)", &[]).unwrap();
+        let n = BATCH_SIZE * 2 + 5;
+        let values: Vec<String> = (0..n).map(|i| format!("({i}, {i})")).collect();
+        s.prepare(&format!("INSERT INTO t VALUES {}", values.join(",")), &[]).unwrap();
+
+        let updated = s.prepare("UPDATE t SET val = val + 1", &[]).unwrap();
+        match updated {
+            Prepared::Ready(q) => {
+                let mut q = q;
+                match s.step(&mut q).unwrap() {
+                    QueryStep::Batch(mut b) => {
+                        b.materialize();
+                        assert_eq!(b.cols[0].value_at(0), Value::I64(n as i64));
+                    }
+                    _ => panic!("expected a count result batch"),
+                }
+            }
+            Prepared::NeedIo(_) => panic!("unexpected NeedIo"),
+        }
+
+        let rows = ready_rows(&mut s, "SELECT id, val FROM t ORDER BY id");
+        assert_eq!(rows.len(), n);
+        for row in rows {
+            let id = match &row[0] {
+                Value::I32(i) => *i as i64,
+                other => panic!("unexpected id value: {other:?}"),
+            };
+            assert_eq!(row[1], Value::I32((id + 1) as i32));
+        }
     }
 
     #[test]

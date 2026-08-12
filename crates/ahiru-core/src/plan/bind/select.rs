@@ -343,7 +343,17 @@ pub(super) fn bind_select_in(
     // --- Decomposing and pushing down WHERE ---------------------------------
     // With an outer join, applying a one-sided condition first would change the result of NULL
     // padding. Erring safe, nothing is pushed down.
-    let pushdown_ok = !tree.has_outer_join();
+    //
+    // When `USING SAMPLE`/`TABLESAMPLE` is present, pushdown is disabled too: SAMPLE applies to
+    // the joined FROM result before WHERE (confirmed against the `duckdb` CLI -- see
+    // docs/sql/queries.md's "SAMPLE / TABLESAMPLE" section and the comment on `Node::Sample`'s
+    // insertion point below). A single-relation conjunct pushed straight into the Scan (for
+    // statistics pruning, ordinarily a pure win) would then run *before* the `Node::Sample`
+    // interposed below, inverting that order -- the sample would end up drawn from the
+    // filtered rows instead of the full FROM result. The predicate is still applied, just as
+    // ordinary `leftover` filtering after Sample instead of pushed into the Scan; this only
+    // costs statistics-pruning opportunities, and only for queries that combine WHERE with SAMPLE.
+    let pushdown_ok = !tree.has_outer_join() && sel.sample.is_none();
     let mut conjuncts = Vec::new();
     if let Some(w) = sel.filter {
         split_conjuncts(arena, w, &mut conjuncts, 0)?;
@@ -410,12 +420,15 @@ pub(super) fn bind_select_in(
     // measured row count). That is why it is interposed before `WHERE` (`sel.filter`; see the
     // "applying WHERE" section below).
     //
-    // That said, part of a `WHERE` against a single table has already been pushed down as
-    // `per_rel`, all the way to just after `Node::Scan` inside `build_tree` (by design it
-    // happens together with projection pushdown; see the module docs at the top), so that part
-    // strictly runs in the opposite order from duckdb (filter, then sample). A simplification
-    // (following the task's priorities -- percentage > row count > distinguishing methods -- it
-    // does not chase exact agreement on the interaction with filtering).
+    // A single-relation `WHERE` conjunct would ordinarily already be pushed down into `per_rel`,
+    // all the way to just after `Node::Scan` inside `build_tree` above (by design it happens
+    // together with projection pushdown; see the module docs at the top), which would run
+    // strictly before this `Node::Sample` -- the opposite of `duckdb`'s order. `pushdown_ok`
+    // (see "Decomposing and pushing down WHERE" above) is set to disable that pushdown whenever
+    // `sel.sample` is present, specifically to avoid that inversion: every `WHERE` conjunct ends
+    // up in `leftover` instead and is applied via `Node::Filter` after this point (see the
+    // "applying WHERE" section below), matching `duckdb`'s order at the cost of the
+    // statistics-pruning benefit of pushing that predicate into the Scan.
     if let Some(spec) = &sel.sample {
         node = Node::Sample { input: Box::new(node), spec: resolve_sample_spec(spec) };
     }
@@ -455,23 +468,30 @@ pub(super) fn bind_select_in(
         let mut left_keys = Vec::new();
         let mut right_keys = Vec::new();
         if k == 0 {
-            // Uncorrelated: narrowed to one row, then LEFT joined. An empty set gives NULL.
-            // With two or more rows the SQL standard says error, but here the first is taken (a limitation).
-            right = Node::Limit { input: Box::new(right), limit: Some(1), offset: 0 };
+            // Uncorrelated: zero rows still gives NULL via the LEFT JOIN below. Two or more
+            // rows is a cardinality error (matching the SQL standard and DuckDB), not silently
+            // taking the first -- `Node::AssertMaxOneRow` raises `MultipleRowsSubquery` rather
+            // than truncating. `Limit(2)` first bounds the cost of proving that to "one row
+            // beyond the first", instead of `AssertMaxOneRow` alone potentially having to drain
+            // the whole subquery to prove there is no second row.
+            right = Node::Limit { input: Box::new(right), limit: Some(2), offset: 0 };
+            right = Node::AssertMaxOneRow { input: Box::new(right), keys: Vec::new() };
         } else {
-            // Correlated: each outer row has a different correlation key value, so narrowing the
-            // whole right side to one row (= a blanket LIMIT 1) would leave nearly every other
-            // outer row NULL. It is narrowed to "the first row" per correlation key value and
-            // then LEFT joined on that key (generalizing the uncorrelated version's "take the
-            // first when there are several" limitation to per-correlation-key). For correlation
-            // via an aggregate, the caller has already grouped so there is one row per key, and
-            // the DistinctOn here is effectively a no-op.
+            // Correlated: each outer row has a different correlation key value, so a single
+            // `AssertMaxOneRow` over the whole right side (as in the uncorrelated case above)
+            // would wrongly reject as soon as any two *different* outer rows' subqueries each
+            // produced one row. The check is instead per correlation key value, then LEFT joined
+            // on that key: two-or-more rows for the *same* key is the cardinality error: it
+            // means that one outer row's scalar subquery produced more than one row, which is
+            // still a `MultipleRowsSubquery` error, just scoped per key instead of globally. For
+            // correlation via an aggregate, the caller has already grouped so there is one row
+            // per key, and this is effectively a no-op (never triggers).
             let corr_scope = Scope::from_fields(right.schema().to_vec());
             let mut dkeys = Vec::with_capacity(k);
             for i in 0..k {
                 dkeys.push(column_program(&corr_scope, 1 + i)?);
             }
-            right = Node::DistinctOn { input: Box::new(right), keys: dkeys };
+            right = Node::AssertMaxOneRow { input: Box::new(right), keys: dkeys };
             for (i, &outer_e) in plan.correlated.iter().enumerate() {
                 let lp = compile(arena, &scope, params, outer_e)?;
                 let rp = column_program(&corr_scope, 1 + i)?;

@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,7 @@ import {
   coalesceRanges,
   decodeBatch,
   decodeCodecRequests,
+  decodeIoRequests,
   detectFormat,
   encodeParams,
   timestampToDate,
@@ -295,7 +296,12 @@ test('errors.js matches the Code / message in error.rs', () => {
   assert.ok(codes.size > 20, 'failed to read Code out of error.rs');
 
   const messages = new Map();
+  // rustfmt wraps an arm onto its own `{ "..." }` block once the single-line form
+  // would run past the line-length limit, so both forms have to be matched.
   for (const m of rs.matchAll(/^\s{12}(\w+) => "([^"]*)",$/gm)) messages.set(m[1], m[2]);
+  for (const m of rs.matchAll(/^\s{12}(\w+) => \{\s*\n\s*"([^"]*)"\s*\n\s*\}$/gm)) {
+    messages.set(m[1], m[2]);
+  }
 
   const known = new Set(Object.values(Code));
   for (const [name, value] of codes) {
@@ -571,6 +577,144 @@ test('cache: "none" fetches every time', async () => {
   }
 });
 
+// --- Custom ByteSource / URL safety -------------------------------------------
+
+test(
+  'a custom ByteSource read() result is copied before caching, not aliased',
+  { skip: needsVm },
+  async () => {
+    // Repro (see the bug report): a user's read() hands back a view onto memory
+    // it still owns (`buf.subarray(...)`). If the host caches that view directly
+    // instead of copying it, mutating the buffer afterwards corrupts the cache.
+    const fileBytes = new Uint8Array(await readFile(BASIC));
+    const cache = new MemoryCache();
+    const makeMutableSource = () => ({
+      key: 'mutable-source', // fixed key: both instances below must hit the same cache entry
+      size: fileBytes.length,
+      read: (o, l) => fileBytes.subarray(o, o + l),
+    });
+
+    const db1 = await openDb({ cache });
+    try {
+      db1.registerParquet('t', makeMutableSource());
+      assert.deepEqual(
+        await db1.query('SELECT id, name FROM t LIMIT 5'),
+        duck(`SELECT id, name FROM '${BASIC}' LIMIT 5`),
+      );
+    } finally {
+      db1.close();
+    }
+
+    // Corrupt every byte of the buffer read() aliased. A fresh session has no
+    // wasm-side copy of its own yet, so it must go through the (shared) cache.
+    fileBytes.fill(0xff);
+
+    const db2 = await openDb({ cache });
+    try {
+      db2.registerParquet('t', makeMutableSource());
+      assert.deepEqual(
+        await db2.query('SELECT id, name FROM t LIMIT 5'),
+        duck(`SELECT id, name FROM '${BASIC}' LIMIT 5`),
+        'the cache aliased the caller\'s buffer instead of copying it',
+      );
+    } finally {
+      db2.close();
+    }
+  },
+);
+
+test('a 206 response whose Content-Range does not cover the requested window is rejected', async () => {
+  const file = new Uint8Array(await readFile(WIDE));
+  const url = 'https://example.invalid/lying.parquet';
+  const fetchImpl = async (_target, init = {}) => {
+    const method = init.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, { headers: { 'content-length': String(file.length) } });
+    }
+    // Always answers with the first 1000 bytes, ignoring the Range that was asked
+    // for, while (truthfully) reporting a Content-Range for what it actually sent.
+    return new Response(file.subarray(0, 1000), {
+      status: 206,
+      headers: { 'content-range': `bytes 0-999/${file.length}` },
+    });
+  };
+  const db = await openDb({ fetch: fetchImpl });
+  try {
+    db.registerParquet('t', url);
+    // The footer probe asks for the last 64 KiB, which this server never sent.
+    await assert.rejects(
+      () => db.query('SELECT id FROM t LIMIT 1'),
+      (e) => e instanceof AhiruError && e.code === Code.IO_FAILED,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('decodeIoRequests rejects an offset beyond Number.MAX_SAFE_INTEGER instead of truncating it', () => {
+  const buf = new Uint8Array(4 + 24);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, 1, true); // count
+  dv.setUint32(4, 0, true); // table
+  dv.setUint32(8, 0, true); // part
+  dv.setBigUint64(12, BigInt(Number.MAX_SAFE_INTEGER) + 10n, true); // offset
+  dv.setBigUint64(20, 10n, true); // len
+  assert.throws(
+    () => decodeIoRequests(buf),
+    (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+  );
+});
+
+test('a fetch failure redacts the query string (tokens) from the error message', async () => {
+  const url = 'https://example.invalid/data.parquet?token=SECRET123&sig=abc';
+  const fetchImpl = async (_target, init = {}) => {
+    const method = init.method ?? 'GET';
+    if (method === 'HEAD') return new Response(null, { headers: { 'content-length': '1000' } });
+    return new Response('nope', { status: 403 });
+  };
+  const db = await openDb({ fetch: fetchImpl });
+  try {
+    db.registerParquet('t', url);
+    await assert.rejects(
+      () => db.query('SELECT id FROM t'),
+      (e) => {
+        assert.ok(e instanceof AhiruError);
+        assert.ok(!e.message.includes('SECRET123'), `token leaked into the error: ${e.message}`);
+        assert.ok(!e.message.includes('token='), `query string leaked into the error: ${e.message}`);
+        assert.ok(
+          e.message.includes('example.invalid/data.parquet'),
+          `origin+path should still be present: ${e.message}`,
+        );
+        return true;
+      },
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('a network failure redacts userinfo and the query string too', async () => {
+  const url = 'https://user:s3cr3t@example.invalid/data.parquet?token=SECRET456';
+  const fetchImpl = async () => {
+    throw new Error('network down');
+  };
+  const db = await openDb({ fetch: fetchImpl });
+  try {
+    db.registerParquet('t', url);
+    await assert.rejects(
+      () => db.query('SELECT id FROM t'),
+      (e) => {
+        assert.ok(e instanceof AhiruError);
+        assert.ok(!e.message.includes('SECRET456'), `token leaked into the error: ${e.message}`);
+        assert.ok(!e.message.includes('s3cr3t'), `userinfo leaked into the error: ${e.message}`);
+        return true;
+      },
+    );
+  } finally {
+    db.close();
+  }
+});
+
 // --- Errors ------------------------------------------------------------------
 
 test('a syntax error becomes an AhiruError (3xx)', async () => {
@@ -718,6 +862,95 @@ test('operations after close are errors', async () => {
   assert.throws(() => db.registerParquet('t', new Uint8Array(8)));
   await assert.rejects(() => db.query('SELECT 1 FROM t'));
 });
+
+// --- Concurrency: the session lock ---------------------------------------------
+
+/** Rejects with `msg` if `p` does not settle within `ms`. Turns a hang into a clear failure. */
+function withTimeout(p, ms, msg) {
+  return Promise.race([
+    p,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms)),
+  ]);
+}
+
+test(
+  'Promise.all concurrent queries on one AhiruDB return correct, independent results',
+  { skip: needsVm },
+  async () => {
+    const file = new Uint8Array(await readFile(WIDE));
+    const f = fakeFetcher(file);
+    const db = await openDb({ fetch: f.fetchImpl });
+    try {
+      db.registerParquet('t', f.url);
+      // Overlapping queries with awaits (fetch) inside their step loops. Without
+      // serializing access to the shared wasm out buffer / last-error state, these
+      // would interleave and silently return mixed-up rows for one another.
+      const [a, b, c] = await Promise.all([
+        db.query('SELECT id FROM t LIMIT 5'),
+        db.query('SELECT id FROM t LIMIT 5 OFFSET 100'),
+        db.query('SELECT id FROM t LIMIT 5 OFFSET 200'),
+      ]);
+      assert.deepEqual(a, duck(`SELECT id FROM '${WIDE}' LIMIT 5`));
+      assert.deepEqual(b, duck(`SELECT id FROM '${WIDE}' LIMIT 5 OFFSET 100`));
+      assert.deepEqual(c, duck(`SELECT id FROM '${WIDE}' LIMIT 5 OFFSET 200`));
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test(
+  'stream(): breaking out of the loop early still releases the session lock',
+  { skip: needsVm },
+  async () => {
+    const db = await openDb();
+    try {
+      db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
+      let seen = 0;
+      for await (const batch of db.stream('SELECT id FROM t')) {
+        seen += batch.numRows;
+        break; // abandon the iterator early -- the consumer's for-await calls .return()
+      }
+      assert.ok(seen > 0);
+
+      // If the lock were not released, this would hang until the test times out.
+      const rows = await withTimeout(
+        db.query('SELECT id FROM t LIMIT 3'),
+        5000,
+        'query after an early break did not resolve -- the session lock was not released',
+      );
+      assert.deepEqual(rows, duck(`SELECT id FROM '${BASIC}' LIMIT 3`));
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test(
+  'stream(): the consumer throwing out of the loop still releases the session lock',
+  { skip: needsVm },
+  async () => {
+    const db = await openDb();
+    try {
+      db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
+      await assert.rejects(async () => {
+        for await (const batch of db.stream('SELECT id FROM t')) {
+          void batch;
+          throw new Error('boom');
+        }
+      }, /boom/);
+
+      const rows = await withTimeout(
+        db.query('SELECT id FROM t LIMIT 1'),
+        5000,
+        'query after a thrown error did not resolve -- the session lock was not released',
+      );
+      assert.equal(rows.length, 1);
+    } finally {
+      db.close();
+    }
+  },
+);
 
 // --- WHERE (waiting on the expression VM) ------------------------------------
 
@@ -1109,7 +1342,32 @@ test('ZSTD fails naming ZSTD explicitly when no module is given', { skip: NOZSTD
  * `crates/ahiru-zstd/Cargo.toml`; the default is `rlib` only).
  * Only used to test the delegation path on a core built without `zstd`.
  */
-const ZSTD_WASM = join(ROOT, 'target/wasm32-unknown-unknown/wasm/ahiru_zstd.wasm');
+const ZSTD_DIR = join(ROOT, 'target/wasm32-unknown-unknown/wasm');
+
+/**
+ * Cargo only "uplifts" a copy of an artifact to the profile root for the
+ * crate-types declared in `[lib]`. `cdylib` is forced on the command line here
+ * rather than declared, so the module is written under `deps/` with a hash
+ * suffix and may never appear at the profile root. Look there too instead of
+ * silently skipping every ZSTD side-module test.
+ */
+function findZstdWasm() {
+  const uplifted = join(ZSTD_DIR, 'ahiru_zstd.wasm');
+  // A stale zero-export stub can be left at the root by a build that ran
+  // without `--crate-type cdylib`, so prefer the largest candidate.
+  const candidates = [uplifted];
+  const deps = join(ZSTD_DIR, 'deps');
+  if (existsSync(deps)) {
+    for (const name of readdirSync(deps)) {
+      if (/^ahiru_zstd-[0-9a-f]+\.wasm$/.test(name)) candidates.push(join(deps, name));
+    }
+  }
+  const found = candidates.filter((p) => existsSync(p));
+  if (found.length === 0) return null;
+  return found.sort((a, b) => statSync(b).size - statSync(a).size)[0];
+}
+
+let ZSTD_WASM = join(ZSTD_DIR, 'ahiru_zstd.wasm');
 const ZSTD_SKIP = await (async () => {
   try {
     execFileSync(
@@ -1123,7 +1381,9 @@ const ZSTD_SKIP = await (async () => {
   } catch {
     /* Even if the build fails, look at whatever is already there. */
   }
-  if (!existsSync(ZSTD_WASM)) return 'crates/ahiru-zstd does not build yet';
+  const found = findZstdWasm();
+  if (found === null) return 'crates/ahiru-zstd does not build yet';
+  ZSTD_WASM = found;
   const mod = await WebAssembly.compile(await readFile(ZSTD_WASM));
   const names = new Set(WebAssembly.Module.exports(mod).map((e) => e.name));
   const missing = ['zstd_alloc', 'zstd_free', 'zstd_decompress'].filter((n) => !names.has(n));

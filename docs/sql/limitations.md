@@ -179,6 +179,44 @@ degrading silently. In practice this means a `GROUP BY`/join/sort over data
 that doesn't fit the cap fails outright instead of running slowly — it
 never produces a partial or wrong result.
 
+## DML statement atomicity
+
+`INSERT`/`UPDATE`/`DELETE` against an in-memory table
+([ddl-dml.md](ddl-dml.md), DESIGN.md §16) are validate-then-apply: every
+row's new values are computed and checked (type coercion, `NOT NULL`)
+*before* any row in the table is mutated, and the table's rows are only ever
+written once every row has passed. Internally, rows are processed in
+batches of a fixed internal size for `UPDATE`/`DELETE`; that's purely an
+implementation detail and isn't visible in this guarantee — a constraint
+violation discovered in a later batch does not leave an earlier batch's
+rows already mutated. Concretely:
+
+- `INSERT` evaluates and NOT-NULL-checks every row of the new data first,
+  then appends the whole batch to the table in one step.
+- `UPDATE` evaluates every `SET` expression and NOT-NULL-checks every
+  matched row across the whole statement first, then writes all the
+  validated values in one step.
+- `DELETE` computes the full "rows to keep" list first, then replaces the
+  table's row list in one step.
+
+So a statement that fails partway through — a `NOT NULL` violation, a type
+error, or any other row-level check — leaves the target table completely
+unchanged, for the whole statement, not just a "this batch" scope.
+
+This is **not** general transactional rollback (ahirudb has no
+`BEGIN`/`COMMIT`/`ROLLBACK`, see "Not supported at all" above) — it only
+covers row-level constraint violations discovered while evaluating the
+statement, which is what a `Result::Err` from validation can actually catch.
+It does not, and structurally cannot, cover an abrupt allocator or process
+failure partway through evaluating or applying a statement (for example, the
+wasm heap running out while buffering the validated rows) — `alloc::Vec`
+aborts on allocation failure rather than returning a recoverable error in
+this engine's `no_std` build, so there's no `Result` to intercept and no way
+to guarantee a defined table state afterward. In practice such a failure
+takes down the whole session, not just the DML statement's target table, so
+"the table might be left half-updated" isn't really the operative risk in
+that scenario — the session itself doesn't survive it either.
+
 ## Performance-adjacent notes, not correctness bugs
 
 - **Hash join build-side choice** relies on Parquet row-count metadata,
@@ -191,10 +229,36 @@ never produces a partial or wrong result.
   runs against materialized values, not dictionary codes. This is a
   plausible future optimization that was never built, not a gap in
   correctness.
-- **A `CSV` split boundary that lands inside a quoted newline** can be
-  mis-resynchronized. This is a known trade-off shared by parallel CSV
-  readers generally, and CSV in ahirudb currently reads as a single split,
-  which avoids it in practice.
+- **A `CSV`/`TSV` file is always read as a single split once it looks like it
+  uses RFC 4180 quoting.** A quoted field's embedded newline is not a record
+  boundary, but a fixed-size split cut has no way to tell, from its own
+  bytes alone, whether the byte at its boundary sits inside an open quote —
+  the field carrying it can start arbitrarily far back in the file, well
+  outside what one split step can see. Guessing wrong there used to surface
+  as an extra `(NULL, NULL)`-style row (a real, fixed bug). Instead of
+  guessing, `ahirudb` inspects the same leading sample already fetched for
+  header/type inference (up to 256 KiB) for a `"` byte; if one is found, the
+  whole file is read as one split, which sidesteps the ambiguity entirely.
+
+  Be aware what that costs: a split's whole fetch range has to be resident
+  before it can be read, so a single-split file is read with its entire data
+  region in memory at once, not just the 8 MiB a chunk would need. Alongside
+  the loss of split-level I/O parallelism, this means a large quoted CSV can
+  exhaust memory where an unquoted file of the same size would stream fine —
+  a deliberate trade of a rare wrong answer for a visible failure. Convert
+  large quoted CSV inputs to Parquet, or strip the quoting, if you need to
+  read them at a size that does not fit in memory. Unquoted CSV/TSV files
+  (the common case for large files) are unaffected and still split normally
+  (8 MiB chunks by default).
+
+  This has one narrow, known residual gap: if a file's first 256 KiB
+  contains **no** `"` at all, but a quoted field appears only later, a
+  newline embedded in that later quoted field can still be
+  mis-resynchronized if it happens to land exactly on a later split
+  boundary. In practice this needs a file that is both large enough to
+  split (past 8 MiB) and quote-free for its entire first 256 KiB before
+  quoting begins — files that quote consistently from early on, or don't
+  quote at all, are not affected.
 - **Low-selectivity `IN`-list pruning**: predicate pushdown for `WHERE x IN
   (...)` skips whole RowGroups/pages when the candidate values cluster
   together. If a list's values are scattered widely enough that nearly

@@ -602,7 +602,11 @@ fn as_f64_vec(out: &mut Vector, cap: usize) -> Result<&mut Vec<f64>> {
     }
 }
 
-fn is_unsigned(ty: Ty) -> bool {
+/// Whether `ty` is one of the unsigned integer logical types. Also used by
+/// `format::parquet::stat_value`/`plain_encode_for_bloom`, which need to apply the
+/// exact same zero-extension this module applies when decoding actual column values,
+/// so that pruning compares values on the same scale the reader would produce.
+pub(crate) fn is_unsigned(ty: Ty) -> bool {
     matches!(ty, Ty::UTinyInt | Ty::USmallInt | Ty::UInt | Ty::UBigInt)
 }
 

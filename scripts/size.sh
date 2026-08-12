@@ -92,10 +92,31 @@ measure "max build [opt-in]" "zstd,csv,jsonl,export-parquet,dml"; MAX_SIZE=$SIZE
 # `crate-type` defaults to rlib only (to avoid building the cdylib, and hitting
 # link errors, when `ahiru-core` depends on it), so the standalone build
 # overrides it explicitly with `cargo rustc --crate-type cdylib`.
+#
+# Cargo only uplifts a copy to the profile root for the crate-types declared in
+# `[lib]`, so a `cdylib` forced on the command line is written under `deps/`
+# with a hash suffix and may never appear at the profile root. Look in both
+# places, newest first, rather than reporting the module as missing.
+# Prints the newest candidate, or nothing. Careful with `set -euo pipefail`:
+# a glob that matches nothing must not abort the whole script, which is what
+# the previous unconditional `cp` of the profile-root path did -- it took the
+# per-feature summary below down with it whenever the module was not uplifted.
+find_zstd_wasm() {
+  local dir=target/wasm32-unknown-unknown/wasm
+  local candidates=() f
+  for f in "$dir/ahiru_zstd.wasm" "$dir"/deps/ahiru_zstd-*.wasm; do
+    [ -f "$f" ] && candidates+=("$f")
+  done
+  [ ${#candidates[@]} -eq 0 ] && return 0
+  ls -t "${candidates[@]}" 2>/dev/null | head -1 || true
+}
+
 ZSTD_OUT=target/ahiru-zstd.wasm
-if cargo rustc --profile wasm --target wasm32-unknown-unknown -p ahiru-zstd \
-     --no-default-features --features standalone -- --crate-type cdylib >/dev/null 2>&1; then
-  cp target/wasm32-unknown-unknown/wasm/ahiru_zstd.wasm "$ZSTD_OUT"
+cargo rustc --profile wasm --target wasm32-unknown-unknown -p ahiru-zstd \
+  --no-default-features --features standalone -- --crate-type cdylib >/dev/null 2>&1 || true
+ZSTD_SRC=$(find_zstd_wasm)
+if [ -n "$ZSTD_SRC" ]; then
+  cp "$ZSTD_SRC" "$ZSTD_OUT"
   if command -v wasm-opt >/dev/null 2>&1; then
     wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory \
       --enable-nontrapping-float-to-int \

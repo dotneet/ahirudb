@@ -12,6 +12,17 @@ export type AhiruTypeName =
 export type PhysType = 0 | 1 | 2 | 3 | 4 | 5;
 
 /**
+ * The opened physical representation of an INTERVAL (`unpackInterval`).
+ * Months and days cannot be collapsed into microseconds (the length of "one
+ * month" depends on the reference date), so all three are kept separate.
+ */
+export interface AhiruInterval {
+  months: number;
+  days: number;
+  micros: bigint;
+}
+
+/**
  * A row value.
  * - BOOLEAN -> boolean
  * - INTEGER family (physical I32) -> number
@@ -20,15 +31,25 @@ export type PhysType = 0 | 1 | 2 | 3 | 4 | 5;
  * - FLOAT / DOUBLE -> number
  * - DECIMAL -> string (precision/scale already applied; a number would lose digits)
  * - VARCHAR -> string, BLOB -> Uint8Array
+ * - JSON -> string (raw JSON text, not parsed)
+ * - INTERVAL -> `{ months, days, micros }` (see `AhiruInterval`)
  * - UUID -> string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form)
  * - NULL -> null (the validity bitmap is honored)
  */
-export type AhiruValue = boolean | number | bigint | string | Uint8Array | null;
+export type AhiruValue = boolean | number | bigint | string | Uint8Array | AhiruInterval | null;
 
 export type Row = Record<string, AhiruValue>;
 
 /** A parameter that can be passed to a query. Pass TIMESTAMP as BigInt microseconds. */
-export type AhiruParam = null | boolean | number | bigint | string | Uint8Array | ArrayBuffer;
+export type AhiruParam =
+  | null
+  | undefined
+  | boolean
+  | number
+  | bigint
+  | string
+  | Uint8Array
+  | ArrayBuffer;
 
 export interface Field {
   name: string;
@@ -51,7 +72,8 @@ export type ColumnValues =
   | Float64Array
   | bigint[] // HUGEINT
   | string[] // DECIMAL
-  | (string | Uint8Array)[]; // VARCHAR / BLOB
+  | AhiruInterval[] // INTERVAL
+  | (string | Uint8Array)[]; // VARCHAR / JSON / UUID / BLOB
 
 export interface Column {
   name: string;
@@ -104,8 +126,19 @@ export type TableSource = string | URL | Uint8Array | ArrayBuffer | Blob | ByteS
 /** @deprecated Use `TableSource`. Formats other than Parquet can be registered too. */
 export type ParquetSource = TableSource;
 
-/** Supported formats. Determined by the extension of the registered name. */
+/**
+ * Formats that can be passed explicitly via `register(name, source, { format })`
+ * (`ahiru_register_as`'s wire values). There is no explicit value for single-document
+ * JSON yet — reach it via extension-based detection instead (see `DetectedFormatName`).
+ */
 export type FormatName = 'parquet' | 'csv' | 'tsv' | 'jsonl';
+
+/**
+ * Formats `detectFormat()` can infer from a registered name's extension.
+ * Adds `'json'` (a top-level JSON document, `.json`) on top of `FormatName`,
+ * which `register()`'s explicit `format` option cannot express.
+ */
+export type DetectedFormatName = FormatName | 'json';
 
 export interface InitOptions {
   /** URL of the wasm. On Node it is read as a file path. */
@@ -182,15 +215,26 @@ export declare function coalesceRanges(
 ): { offset: number; len: number }[];
 
 /** Infers the format from the extension of a registered name (a mirror of `FormatKind::detect`). */
-export declare function detectFormat(name: string): FormatName;
+export declare function detectFormat(name: string): DetectedFormatName;
 
-/** Decoder / encoder for the wire format in abi.rs. */
+/**
+ * Opens the physical representation of an INTERVAL (months / days / microseconds
+ * packed into a single i128) into `{ months, days, micros }`. Mirrors `unpack_interval`
+ * in `vector::types`.
+ */
+export declare function unpackInterval(packed: bigint | number): AhiruInterval;
+
+/**
+ * Decoder / encoder for the wire format in abi.rs.
+ * `part` identifies which file of a multi-file table (`ahiru_register_multi`) a
+ * request belongs to; single-file registration always reports 0.
+ */
 export declare function decodeIoRequests(
   bytes: Uint8Array,
-): { table: number; offset: number; len: number }[];
+): { table: number; part: number; offset: number; len: number }[];
 export declare function decodeCodecRequests(
   bytes: Uint8Array,
-): { table: number; codec: number; offset: number; len: number; outLen: number }[];
+): { table: number; part: number; codec: number; offset: number; len: number; outLen: number }[];
 export declare function decodeSchema(bytes: Uint8Array): SchemaField[];
 export declare function decodeBatch(
   bytes: Uint8Array,

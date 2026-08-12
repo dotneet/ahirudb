@@ -37,6 +37,18 @@ const RESULT_MAGIC: u32 = 0x4148_5231; // "AHR1"
 struct State {
     sessions: Vec<Option<Session>>,
     queries: Vec<Option<QuerySlot>>,
+    /// Generation counter per query-handle slot index, bumped every time that
+    /// slot is closed. Packed into the high bits of the handle returned by
+    /// `ahiru_query_start` (see `make_query_handle`), so a handle minted
+    /// before a close can never address whatever query later reuses its slot
+    /// index -- validation rejects it instead of silently aliasing.
+    ///
+    /// Unlike `queries`, this Vec is never truncated: it has to outlive the
+    /// slot's `Some`/`None` payload, or a slot index freed by
+    /// `ahiru_query_close`'s trailing-`None` truncation could hand out
+    /// generation 0 again and make an old, already-invalid handle look valid
+    /// once more (the classic ABA problem).
+    query_generations: Vec<u32>,
     last_error: u32,
     /// The buffer returned by `ahiru_result` / `ahiru_io_requests`.
     /// It must stay alive until the next call, hence living here.
@@ -47,6 +59,33 @@ struct QuerySlot {
     session: usize,
     query: Query,
     io: Vec<IoRequest>,
+}
+
+/// Bits of a query handle spent on the slot index; the remaining bits below
+/// the sign bit (which must stay clear -- negative handles are the
+/// `ahiru_query_start` error/NEED_IO sentinels) hold the generation from
+/// `State::query_generations`. 65536 concurrently open, unclosed queries or
+/// 32768 open/close cycles on one slot are both far beyond anything a real
+/// caller does; going past either is treated as an error rather than risking
+/// two live handles aliasing the same bits.
+const QUERY_IDX_BITS: u32 = 16;
+const QUERY_IDX_MASK: i32 = (1 << QUERY_IDX_BITS) - 1;
+const QUERY_GEN_MASK: u32 = (1 << (31 - QUERY_IDX_BITS)) - 1;
+
+fn make_query_handle(index: usize, generation: u32) -> i32 {
+    (((generation & QUERY_GEN_MASK) as i32) << QUERY_IDX_BITS) | (index as i32 & QUERY_IDX_MASK)
+}
+
+/// Splits a handle into its slot index and generation. `None` for any
+/// negative value -- the error/NEED_IO sentinels `ahiru_query_start` returns
+/// are always negative, so this alone rejects them without a separate check.
+fn split_query_handle(h: i32) -> Option<(usize, u32)> {
+    if h < 0 {
+        return None;
+    }
+    let index = (h & QUERY_IDX_MASK) as usize;
+    let generation = (h as u32 >> QUERY_IDX_BITS) & QUERY_GEN_MASK;
+    Some((index, generation))
 }
 
 struct Cell(UnsafeCell<Option<State>>);
@@ -61,6 +100,7 @@ fn state() -> &'static mut State {
         *slot = Some(State {
             sessions: Vec::new(),
             queries: Vec::new(),
+            query_generations: Vec::new(),
             last_error: 0,
             out: Vec::new(),
         });
@@ -351,8 +391,26 @@ pub unsafe extern "C" fn ahiru_query_start(
     match s.prepare(sql, &params) {
         Ok(Prepared::Ready(q)) => {
             let st = state();
-            st.queries.push(Some(QuerySlot { session: h as usize, query: q, io: Vec::new() }));
-            (st.queries.len() - 1) as i32
+            // Reuse the first closed slot instead of growing forever: a
+            // long-lived module that runs many queries over its lifetime
+            // would otherwise leak one `Vec` entry per query ever opened.
+            let index = st.queries.iter().position(|s| s.is_none()).unwrap_or(st.queries.len());
+            if index > QUERY_IDX_MASK as usize {
+                return fail_code(crate::error::Code::LimitExceeded, -1);
+            }
+            let slot = QuerySlot { session: h as usize, query: q, io: Vec::new() };
+            if index == st.queries.len() {
+                st.queries.push(Some(slot));
+            } else {
+                st.queries[index] = Some(slot);
+            }
+            // `query_generations` may already know this index (it survives
+            // `ahiru_query_close`'s truncation of `queries`); only a genuinely
+            // new index needs a fresh generation.
+            if index >= st.query_generations.len() {
+                st.query_generations.resize(index + 1, 0);
+            }
+            make_query_handle(index, st.query_generations[index])
         }
         // The stage where the footer must be fetched. The host satisfies the request and calls again.
         Ok(Prepared::NeedIo(io)) => {
@@ -368,13 +426,20 @@ pub unsafe extern "C" fn ahiru_query_start(
 pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
     clear_error();
     let st = state();
-    let slot = match st.queries.get_mut(q as usize).and_then(|s| s.as_mut()) {
+    let Some((index, gen)) = split_query_handle(q) else { return STATUS_ERROR };
+    if st.query_generations.get(index).copied() != Some(gen) {
+        // Out of range, or a stale handle whose slot has since been closed
+        // (and possibly reused for an unrelated query): reject rather than
+        // silently stepping whatever now lives at `index`.
+        return STATUS_ERROR;
+    }
+    let slot = match st.queries.get_mut(index).and_then(|s| s.as_mut()) {
         Some(s) => s,
         None => return STATUS_ERROR,
     };
     let sidx = slot.session;
     // The session and the query cannot be mutably borrowed at once, so take it out first.
-    let mut query = match core::mem::replace(&mut st.queries[q as usize], None) {
+    let mut query = match core::mem::replace(&mut st.queries[index], None) {
         Some(s) => s,
         None => return STATUS_ERROR,
     };
@@ -406,7 +471,7 @@ pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
             STATUS_ERROR
         }
     };
-    st.queries[q as usize] = Some(query);
+    st.queries[index] = Some(query);
     status
 }
 
@@ -414,8 +479,25 @@ pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
 pub extern "C" fn ahiru_query_close(q: i32) {
     clear_error();
     let st = state();
-    if let Some(slot) = st.queries.get_mut(q as usize) {
+    let Some((index, gen)) = split_query_handle(q) else { return };
+    if st.query_generations.get(index).copied() != Some(gen) {
+        // Same guard as `ahiru_query_step`: a stale handle must not be able
+        // to close a live query that has since reused its slot index.
+        return;
+    }
+    if let Some(slot) = st.queries.get_mut(index) {
         *slot = None;
+    }
+    if let Some(g) = st.query_generations.get_mut(index) {
+        *g = g.wrapping_add(1) & QUERY_GEN_MASK;
+    }
+    // Shrink the trailing run of now-empty slots so a long-lived module that
+    // closes its most recently opened queries also gets the `Vec`'s memory
+    // back, not just a reusable index. `query_generations` is never
+    // truncated (see its doc comment), so this can't reopen the ABA hazard
+    // slot reuse alone would otherwise avoid.
+    while matches!(st.queries.last(), Some(None)) {
+        st.queries.pop();
     }
 }
 
@@ -632,7 +714,13 @@ fn put_slice<T: Copy>(out: &mut Vec<u8>, v: &[T], width: usize) {
 pub extern "C" fn ahiru_schema(q: i32) -> isize {
     clear_error();
     let st = state();
-    let slot = match st.queries.get(q as usize).and_then(|s| s.as_ref()) {
+    let Some((index, gen)) = split_query_handle(q) else {
+        return fail_code(crate::error::Code::Internal, -1);
+    };
+    if st.query_generations.get(index).copied() != Some(gen) {
+        return fail_code(crate::error::Code::Internal, -1);
+    }
+    let slot = match st.queries.get(index).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => return fail_code(crate::error::Code::Internal, -1),
     };
@@ -777,6 +865,73 @@ mod tests {
         };
         assert_eq!(idx, -1);
         assert_ne!(ahiru_last_error(), 0);
+        ahiru_session_free(h);
+    }
+
+    #[test]
+    fn query_handle_round_trips_through_pack_and_split() {
+        assert_eq!(split_query_handle(make_query_handle(0, 0)), Some((0, 0)));
+        assert_eq!(split_query_handle(make_query_handle(7, 3)), Some((7, 3)));
+        assert_eq!(
+            split_query_handle(make_query_handle(QUERY_IDX_MASK as usize, QUERY_GEN_MASK)),
+            Some((QUERY_IDX_MASK as usize, QUERY_GEN_MASK))
+        );
+        // The sign bit must never be set for a valid handle: it is reserved
+        // for the -1/-2 error and NEED_IO sentinels.
+        assert!(make_query_handle(QUERY_IDX_MASK as usize, QUERY_GEN_MASK) >= 0);
+        // Negative values (the sentinels) never decode to a slot.
+        assert_eq!(split_query_handle(-1), None);
+        assert_eq!(split_query_handle(-2), None);
+    }
+
+    /// `range()` needs no registered table and no I/O, so a query against it
+    /// always reaches `Prepared::Ready` synchronously -- exactly what these
+    /// tests need to drive the query handle lifecycle without mocking I/O.
+    fn start_range_query(h: i32) -> i32 {
+        let sql = b"SELECT 1 FROM range(3)";
+        let q = unsafe { ahiru_query_start(h, sql.as_ptr(), sql.len(), core::ptr::null(), 0) };
+        assert!(q >= 0, "query_start failed: last_error={}", ahiru_last_error());
+        q
+    }
+
+    #[test]
+    fn query_slot_is_reused_and_vec_does_not_grow_across_cycles() {
+        let h = ahiru_session_new();
+        for _ in 0..50 {
+            let q = start_range_query(h);
+            // One live query: never more than one slot in use.
+            assert_eq!(state().queries.len(), 1);
+            ahiru_query_close(q);
+            // Closing the only open query also truncates the now-empty tail,
+            // so the backing `Vec` gives its memory back rather than keeping
+            // a permanently growing history of every query ever opened.
+            assert_eq!(state().queries.len(), 0);
+        }
+        ahiru_session_free(h);
+    }
+
+    #[test]
+    fn stale_handle_is_rejected_after_its_slot_is_reused() {
+        let h = ahiru_session_new();
+        let q1 = start_range_query(h);
+        ahiru_query_close(q1);
+
+        let q2 = start_range_query(h);
+        // The closed slot's index was reused for the new query...
+        assert_eq!(q1 & QUERY_IDX_MASK, q2 & QUERY_IDX_MASK, "test assumes the slot was reused");
+        // ...but the generation bump means the two handles differ.
+        assert_ne!(q1, q2);
+
+        // The stale handle must not be able to step or close the new query.
+        assert_eq!(ahiru_query_step(q1), STATUS_ERROR);
+        ahiru_query_close(q1);
+        assert_ne!(
+            ahiru_query_step(q2),
+            STATUS_ERROR,
+            "the live query must be unaffected by operations on the stale handle"
+        );
+
+        ahiru_query_close(q2);
         ahiru_session_free(h);
     }
 }

@@ -258,7 +258,16 @@ function makeSource(spec, fetchImpl) {
   if (spec && typeof spec.read === 'function') {
     const key = spec.key ?? `custom:${++sourceSeq}`;
     const size = typeof spec.size === 'function' ? () => spec.size() : () => spec.size;
-    return { key, size: async () => Number(await size()), read: (o, l) => spec.read(o, l) };
+    return {
+      key,
+      size: async () => Number(await size()),
+      read: (o, l) => spec.read(o, l),
+      // The caller's `read()` may return a view onto memory it still owns (e.g.
+      // `buf.subarray(...)`), unlike the bytes this host produces itself from
+      // `fetch`/`Blob`. #read() copies before retaining anything from a source
+      // marked this way (cache entries, the resident copy used by codec delegation).
+      untrusted: true,
+    };
   }
   throw new TypeError('registerParquet: pass one of url / Uint8Array / ArrayBuffer / Blob');
 }
@@ -285,12 +294,32 @@ function blobSource(blob) {
   };
 }
 
+/**
+ * Strips whatever should never end up in a log or thrown error: userinfo and the
+ * query string (and any fragment). Presigned S3 URLs and API tokens commonly ride
+ * in the query string, so an error message must never carry one verbatim.
+ */
+function redactUrl(url) {
+  try {
+    const u = new URL(String(url));
+    u.username = '';
+    u.password = '';
+    u.search = '';
+    u.hash = '';
+    return u.toString();
+  } catch {
+    // Not a parseable absolute URL (a relative path, or something else). Still
+    // drop anything that looks like a query string / fragment as a fallback.
+    return String(url).split(/[?#]/)[0];
+  }
+}
+
 /** Network-layer failures are normalized to E504 too (so callers only need to look at code). */
 async function request(doFetch, url, init) {
   try {
     return await doFetch(url, init);
   } catch (cause) {
-    throw new AhiruError(Code.IO_FAILED, { detail: `fetch ${url} failed`, cause });
+    throw new AhiruError(Code.IO_FAILED, { detail: `fetch ${redactUrl(url)} failed`, cause });
   }
 }
 
@@ -316,18 +345,52 @@ function urlSource(url, fetchImpl) {
       if (m) return Number(m[1]);
       const len = r.headers?.get('content-length');
       if (r.ok && len) return Number(len);
-      throw new AhiruError(Code.IO_FAILED, { detail: `cannot determine size of ${url}` });
+      throw new AhiruError(Code.IO_FAILED, { detail: `cannot determine size of ${redactUrl(url)}` });
     },
     async read(offset, len) {
       const r = await request(doFetch, url, {
         headers: { Range: `bytes=${offset}-${offset + len - 1}` },
       });
       if (!r.ok) {
-        throw new AhiruError(Code.IO_FAILED, { detail: `${url} -> HTTP ${r.status}` });
+        throw new AhiruError(Code.IO_FAILED, { detail: `${redactUrl(url)} -> HTTP ${r.status}` });
       }
       const buf = new Uint8Array(await r.arrayBuffer());
-      // Some servers ignore Range and return the whole thing. Slice out the requested window.
-      if (r.status !== 206 && buf.byteLength > len) return buf.subarray(offset, offset + len);
+      if (r.status === 206) {
+        // A conforming server's Content-Range says exactly which bytes these are.
+        // Trust that over just the body length -- otherwise a server that ignores
+        // Range but still (wrongly) answers 206 with the whole file would have its
+        // bytes inserted at the requested offset, and the caller would read garbage
+        // without any error ever being raised.
+        const cr = r.headers?.get('content-range');
+        const m = cr && /^bytes\s+(\d+)-(\d+)\/(?:\d+|\*)\s*$/i.exec(cr);
+        if (!m) {
+          // No Content-Range to check the body against. A body of exactly the
+          // requested length is presumably correct; anything else cannot be
+          // trusted, so fail loudly rather than risk misaligned bytes.
+          if (buf.byteLength === len) return buf;
+          throw new AhiruError(Code.IO_FAILED, {
+            detail:
+              `${redactUrl(url)}: 206 response has no Content-Range and an unexpected ` +
+              `body length (${buf.byteLength} vs the ${len} requested)`,
+          });
+        }
+        const start = Number(m[1]);
+        const end = Number(m[2]);
+        if (start === offset && end - start + 1 === buf.byteLength) return buf; // exactly what was asked for
+        // The server answered a different range than requested (most commonly:
+        // the whole file, ignoring Range, while still claiming 206). Slice out the
+        // requested window only when Content-Range proves it is actually in there.
+        if (start <= offset && offset + len <= start + buf.byteLength) {
+          return buf.subarray(offset - start, offset - start + len);
+        }
+        throw new AhiruError(Code.IO_FAILED, {
+          detail:
+            `${redactUrl(url)}: 206 response covers [${start}, ${end}], which does not ` +
+            `contain the requested [${offset}, ${offset + len})`,
+        });
+      }
+      // Some servers ignore Range and return 200 with the whole thing. Slice out the requested window.
+      if (buf.byteLength > len) return buf.subarray(offset, offset + len);
       return buf;
     },
   };
@@ -365,6 +428,25 @@ export function coalesceRanges(ranges, gap = COALESCE_GAP, totalLen = Infinity) 
 // --- Wire format decoding ----------------------------------------------------
 
 /**
+ * Converts a `u64` (as BigInt) crossing the wasm ABI into a `number`, throwing
+ * instead of silently losing precision above `Number.MAX_SAFE_INTEGER`.
+ *
+ * `ByteSource.read(offset, length)` is a public contract expressed in `number`s
+ * (see the type docs / README), and widening it to `bigint` end-to-end would
+ * ripple into every host and every user-supplied source. A file whose offsets
+ * exceed 2^53 is outside what a browser `fetch`/Range request can address
+ * sanely anyway, so failing loudly here is the smaller, safer change.
+ */
+function toSafeNumber(big, what) {
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `${what} ${big} exceeds Number.MAX_SAFE_INTEGER`,
+    });
+  }
+  return Number(big);
+}
+
+/**
  * `encode_io`: [count:u32][{table:u32, part:u32, offset:u64, len:u64}...]
  *
  * `part` says which file of a multi-file table (`ahiru_register_multi`) is meant.
@@ -381,8 +463,8 @@ export function decodeIoRequests(u8) {
     out.push({
       table: dv.getUint32(p, true),
       part: dv.getUint32(p + 4, true),
-      offset: Number(dv.getBigUint64(p + 8, true)),
-      len: Number(dv.getBigUint64(p + 16, true)),
+      offset: toSafeNumber(dv.getBigUint64(p + 8, true), 'I/O request offset'),
+      len: toSafeNumber(dv.getBigUint64(p + 16, true), 'I/O request length'),
     });
   }
   return out;
@@ -402,7 +484,7 @@ export function decodeCodecRequests(u8) {
       table: dv.getUint32(p, true),
       part: dv.getUint32(p + 4, true),
       codec: dv.getUint32(p + 8, true),
-      offset: Number(dv.getBigUint64(p + 12, true)),
+      offset: toSafeNumber(dv.getBigUint64(p + 12, true), 'codec request offset'),
       len: dv.getUint32(p + 20, true),
       outLen: dv.getUint32(p + 24, true),
     });
@@ -778,9 +860,19 @@ class ZstdModule {
   decompress(src, outLen) {
     const e = this.#exports;
     const srcPtr = e.zstd_alloc(src.length);
+    // zstd_alloc returns null on allocation failure (it uses try_reserve_exact,
+    // same as the core's #provide checks ahiru_alloc). Writing to a null pointer
+    // would corrupt the start of wasm memory instead of failing loudly.
+    if (srcPtr === 0) {
+      throw new AhiruError(Code.OOM, { detail: 'zstd module: allocation failed for the input buffer' });
+    }
     // Memory may grow on every alloc. Re-take the view each time (same policy as the core).
     new Uint8Array(e.memory.buffer).set(src, srcPtr);
     const dstPtr = e.zstd_alloc(outLen);
+    if (dstPtr === 0) {
+      e.zstd_free(srcPtr, src.length);
+      throw new AhiruError(Code.OOM, { detail: 'zstd module: allocation failed for the output buffer' });
+    }
     const n = e.zstd_decompress(srcPtr, src.length, dstPtr, outLen);
     if (n < 0) {
       e.zstd_free(srcPtr, src.length);
@@ -792,6 +884,34 @@ class ZstdModule {
     e.zstd_free(srcPtr, src.length);
     e.zstd_free(dstPtr, outLen);
     return out;
+  }
+}
+
+// --- Session lock --------------------------------------------------------------
+
+/**
+ * A minimal async mutex, used to serialize every entry point that touches the
+ * wasm session.
+ *
+ * The engine keeps its result buffer and last-error state as module-level
+ * singletons (`State` in `abi.rs`), not per-session, so two `ahiru_query_step`
+ * calls interleaving on the same instance (e.g. `Promise.all([db.query(a),
+ * db.query(b)])`) would silently overwrite each other's output. Queuing callers
+ * here instead makes that impossible.
+ */
+class Mutex {
+  #tail = Promise.resolve();
+
+  /** Waits for the lock. Returns a function the caller must call exactly once to release it. */
+  async acquire() {
+    let release;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    const prev = this.#tail;
+    this.#tail = prev.then(() => held);
+    await prev;
+    return release;
   }
 }
 
@@ -832,6 +952,8 @@ export class AhiruDB {
   /** The ZSTD side module. Not loaded until the first NEED_CODEC. */
   #zstd = null;
   #zstdOptions;
+  /** Serializes query()/stream() against each other (see the Mutex doc comment). */
+  #sessionLock = new Mutex();
 
   constructor(instance, options) {
     this.#zstdOptions = {
@@ -965,33 +1087,45 @@ export class AhiruDB {
 
   async *#run(sql, params, copy) {
     this.#assertOpen();
-    await this.#bindTables(sql);
-
-    const q = await this.#start(sql, params);
+    // Every wasm entry point below shares module-level state (the out buffer,
+    // last-error) across the whole instance, so only one #run may be in flight
+    // at a time. The lock is held for the entire lifetime of this generator,
+    // including while the caller sits between `yield`s in stream() -- an early
+    // `break`/`return()`/`throw()` on the consumer's side is delivered here as a
+    // return/throw injected at the suspended yield, which still runs this `finally`
+    // (standard (async) generator semantics), so the lock is always released.
+    const release = await this.#sessionLock.acquire();
     try {
-      const schema = this.#readSchema(q, sql);
-      let lastSignature = null;
-      for (;;) {
-        const status = this.#exports.ahiru_query_step(q);
-        this.#checkMemory(sql);
-        if (status === STATUS_BATCH_READY) {
-          const out = this.#out();
-          yield decodeBatch(out, schema, copy);
-          continue;
+      await this.#bindTables(sql);
+
+      const q = await this.#start(sql, params);
+      try {
+        const schema = this.#readSchema(q, sql);
+        let lastSignature = null;
+        for (;;) {
+          const status = this.#exports.ahiru_query_step(q);
+          this.#checkMemory(sql);
+          if (status === STATUS_BATCH_READY) {
+            const out = this.#out();
+            yield decodeBatch(out, schema, copy);
+            continue;
+          }
+          if (status === STATUS_NEED_IO) {
+            lastSignature = await this.#pump(decodeIoRequests(this.#out()), lastSignature, sql);
+            continue;
+          }
+          if (status === STATUS_NEED_CODEC) {
+            await this.#decompress(decodeCodecRequests(this.#out()), sql);
+            continue;
+          }
+          if (status === STATUS_DONE) return;
+          throw this.#lastError(sql);
         }
-        if (status === STATUS_NEED_IO) {
-          lastSignature = await this.#pump(decodeIoRequests(this.#out()), lastSignature, sql);
-          continue;
-        }
-        if (status === STATUS_NEED_CODEC) {
-          await this.#decompress(decodeCodecRequests(this.#out()), sql);
-          continue;
-        }
-        if (status === STATUS_DONE) return;
-        throw this.#lastError(sql);
+      } finally {
+        this.#exports.ahiru_query_close(q);
       }
     } finally {
-      this.#exports.ahiru_query_close(q);
+      release();
     }
   }
 
@@ -1191,8 +1325,15 @@ export class AhiruDB {
       if (hit !== undefined) return hit;
     }
     const bytes = await rec.source.read(offset, len);
-    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    if (cacheable) this.#cache.set(key, u8);
+    let u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    // A user-supplied ByteSource may hand back a view aliasing memory it still
+    // owns; copy it before this host retains it anywhere. Bytes this host produced
+    // itself (fetch / Blob) are already privately owned, so they are not copied again.
+    if (rec.source.untrusted) u8 = u8.slice();
+    // A short/partial read must never be cached under the full requested-length
+    // key: a later request for the same [offset, len) would then keep replaying
+    // the truncated body forever instead of refetching.
+    if (cacheable && u8.byteLength === len) this.#cache.set(key, u8);
     return u8;
   }
 

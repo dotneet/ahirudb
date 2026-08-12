@@ -178,47 +178,27 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 
 /// JSON does not allow NaN/Infinity (RFC 8259), so they fall back to `null`.
 /// DuckDB's `TO JSON` takes the same stance.
+///
+/// For finite values: `core` has no float formatting (`core::fmt`'s
+/// Display/Debug machinery alone costs 30-60 KB, DESIGN.md §4, so this crate
+/// avoids it everywhere, not just here), so this is hand-rolled. The
+/// shortest-round-trip digit generation itself (`normalize_and_correct` /
+/// `shortest_digits` / `nearest_at_length` / `cmp_midpoint` / `Big`, and the
+/// fixed-vs-exponential rendering) is shared with the CSV writer -- see
+/// `write/float.rs`'s module doc for why that lives in one place instead of
+/// being duplicated per format.
+///
+/// The only thing that differs between the two writers is how non-finite
+/// values are spelled: JSON has no NaN/Infinity literal (so this writes
+/// `null`), while CSV writes `NaN` / `Infinity` / `-Infinity` -- that split
+/// is why this function itself is not shared, only what it delegates to
+/// below.
 fn push_f64(out: &mut Vec<u8>, v: f64) {
     if !v.is_finite() {
         out.extend_from_slice(b"null");
         return;
     }
-    if v == 0.0 {
-        out.extend_from_slice(if v.is_sign_negative() { b"-0.0" } else { b"0.0" });
-        return;
-    }
-    let neg = v < 0.0;
-    let mut x = if neg { -v } else { v };
-    if neg {
-        out.push(b'-');
-    }
-    // `trunc()` is not in `core` (it's a libm dependency), so an `as i128`
-    // saturating, round-toward-zero cast is used instead.
-    let ip = x as i128;
-    push_int(out, ip);
-    out.push(b'.');
-    // If `ip` saturates outside the i128 range (v's absolute value exceeds
-    // i128::MAX), `x - ip as f64` becomes a huge residual that does not fit in
-    // [0,1). Extracting digits from it as-is would saturate `x as u8` at 255,
-    // and `b'0' + d` would overflow the u8 addition (a debug panic, or a
-    // corrupted byte write in release builds). So once saturated, give up on
-    // extracting the fraction part entirely.
-    if ip == i128::MAX || ip == i128::MIN {
-        out.push(b'0');
-    } else {
-        x -= ip as f64;
-        let mut digits = Vec::with_capacity(15);
-        for _ in 0..15 {
-            x *= 10.0;
-            let d = x as u8;
-            digits.push(b'0' + d);
-            x -= d as f64;
-        }
-        while digits.len() > 1 && *digits.last().unwrap() == b'0' {
-            digits.pop();
-        }
-        out.extend_from_slice(&digits);
-    }
+    super::float::write_f64_finite(out, v);
 }
 
 fn push_date_string(out: &mut Vec<u8>, days: i64) {
@@ -403,13 +383,25 @@ mod tests {
         assert_eq!(lines, vec![r#"{"a":-5,"b":-1.5}"#]);
     }
 
-    // Regression test for `push_f64`'s integer-part saturation guard (the same kind of bug as in csv.rs).
-    // Before the fix, extracting the residual after `x as i128` saturated to
-    // i128::MAX caused a u8-addition overflow panic.
     #[test]
-    fn float_formatting_saturates_on_extremely_large_finite_values_without_panicking() {
-        let lines = run("SELECT a FROM t", b"a\n1e40\n".to_vec(), crate::format::FormatKind::Csv);
-        assert_eq!(lines, vec![format!(r#"{{"a":{}.0}}"#, i128::MAX)]);
+    fn non_finite_values_render_as_json_null() {
+        // JSONL's own share of `push_f64`: non-finite handling is the one
+        // thing that is not shared with the CSV writer (JSON has no
+        // NaN/Infinity literal, so this writes `null` instead of CSV's `NaN`
+        // / `Infinity` / `-Infinity` -- see that file's equivalent test).
+        // Everything else -- shortest round-trip digit generation,
+        // exact-tie regression cases, and the std-Display property test --
+        // is covered once, for both writers, in `write/float.rs`'s own test
+        // module.
+        let mut out = Vec::new();
+        push_f64(&mut out, f64::NAN);
+        assert_eq!(out, b"null");
+        out.clear();
+        push_f64(&mut out, f64::INFINITY);
+        assert_eq!(out, b"null");
+        out.clear();
+        push_f64(&mut out, f64::NEG_INFINITY);
+        assert_eq!(out, b"null");
     }
 
     // Regression test for a real bug found during QA: a `Ty::Json` column
