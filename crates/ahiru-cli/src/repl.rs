@@ -212,6 +212,21 @@ impl Shell {
         Ok(())
     }
 
+    /// Runs a final statement left in the buffer with no trailing `;` when
+    /// input ends (Ctrl-D on the interactive prompt, or EOF partway through a
+    /// piped script). Mirrors the per-statement error handling in
+    /// `interactive`'s main loop, so a failing final statement is diagnosed
+    /// and still marks the session as failed -- previously the result of
+    /// this last `run_script` call was discarded, so the process could exit
+    /// 0 even though the last statement errored.
+    fn run_trailing(&mut self, script: &str) {
+        if let Err(e) = self.run_script(script) {
+            let msg = format!("error: {e}");
+            self.diag(&msg);
+            self.failed = true;
+        }
+    }
+
     /// The interactive loop.
     pub fn interactive(&mut self) -> R<()> {
         if !self.mode_set {
@@ -271,7 +286,7 @@ impl Shell {
         // A trailing statement without a terminating `;`, then Ctrl-D.
         if !buf.trim().is_empty() {
             let script = std::mem::take(&mut buf);
-            let _ = self.run_script(&script);
+            self.run_trailing(&script);
         }
         ed.save_history();
         Ok(())
@@ -1000,5 +1015,24 @@ mod tests {
         assert!(complete_word(".ta", &tables).contains(&".tables".to_string()));
         assert!(complete_word("tr", &tables).contains(&"trips".to_string()));
         assert!(complete_word("sel", &tables).contains(&"SELECT".to_string()));
+    }
+
+    #[test]
+    fn trailing_statement_without_semicolon_at_eof_marks_failure() {
+        let opts = Options::default();
+        let mut sh = Shell::new(&opts);
+        // Mirrors what `interactive()` does when input ends mid-statement
+        // (Ctrl-D at the prompt, or EOF partway through a piped script): an
+        // unterminated final statement is still run, via `run_trailing`.
+        sh.run_trailing("SELECT nosuchfunc()");
+        assert!(sh.into_result().is_err(), "a failing trailing statement must be reported");
+    }
+
+    #[test]
+    fn trailing_statement_without_semicolon_at_eof_succeeds_when_ok() {
+        let opts = Options::default();
+        let mut sh = Shell::new(&opts);
+        sh.run_trailing("SELECT 1");
+        assert!(sh.into_result().is_ok());
     }
 }

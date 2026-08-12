@@ -313,6 +313,13 @@ pub fn make(kind: FormatKind, name: &str) -> Result<Box<dyn TableFormat>> {
 ///
 /// Too large and one split's memory balloons; too small and range-fetch round trips multiply.
 /// It leans smaller than Parquet's typical RowGroup (tens of MB).
+///
+/// `format::csv` overrides this back down to "one split for the whole file" whenever the file
+/// looks like it uses RFC 4180 quoting (see `CsvFormat::quoted_sample`) -- a quoted field's
+/// embedded newline cannot be told apart from a real record boundary at an arbitrary split cut,
+/// so this constant only actually governs splitting for CSV/TSV files confirmed unquoted (by
+/// their leading sample), and for JSONL (whose records are single JSON lines and so can never
+/// contain a raw, unescaped `\n`, making this scan always exact there).
 #[cfg(any(feature = "csv", feature = "jsonl"))]
 pub const TEXT_SPLIT_BYTES: u64 = 8 * 1024 * 1024;
 

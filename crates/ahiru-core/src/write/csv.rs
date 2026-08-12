@@ -190,9 +190,19 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
     }
 }
 
-/// `core` has no float formatting, so this is hand-rolled. For values without
-/// an exponent, a simple integer-part + fraction-part suffices (this is
-/// basically what DuckDB's CSV output does too).
+/// `core` has no float formatting (`core::fmt`'s Display/Debug machinery
+/// alone costs 30-60 KB, DESIGN.md §4, so this crate avoids it everywhere,
+/// not just here), so this is hand-rolled. The shortest-round-trip digit
+/// generation itself (`normalize_and_correct` / `shortest_digits` /
+/// `nearest_at_length` / `cmp_midpoint` / `Big`, and the fixed-vs-exponential
+/// rendering) is shared with the JSONL writer -- see `write/float.rs`'s
+/// module doc for why that lives in one place instead of being duplicated
+/// per format.
+///
+/// The only thing that differs between the two writers is how non-finite
+/// values are spelled: CSV writes `NaN` / `Infinity` / `-Infinity`, while
+/// JSON has no such literal (JSONL writes `null` instead) -- that split is
+/// why this function itself is not shared, only what it delegates to below.
 fn push_f64(out: &mut Vec<u8>, v: f64) {
     if v.is_nan() {
         out.extend_from_slice(b"NaN");
@@ -202,43 +212,7 @@ fn push_f64(out: &mut Vec<u8>, v: f64) {
         out.extend_from_slice(if v > 0.0 { b"Infinity" } else { b"-Infinity" });
         return;
     }
-    if v == 0.0 {
-        out.extend_from_slice(if v.is_sign_negative() { b"-0.0" } else { b"0.0" });
-        return;
-    }
-    let neg = v < 0.0;
-    let mut x = if neg { -v } else { v };
-    if neg {
-        out.push(b'-');
-    }
-    // Integer part. `trunc()` is not in `core` (it's a libm dependency), so
-    // an `as i128` saturating, round-toward-zero cast is used instead.
-    let ip = x as i128;
-    push_int(out, ip);
-    out.push(b'.');
-    // If `ip` saturates outside the i128 range (v's absolute value exceeds
-    // i128::MAX), `x - ip as f64` becomes a huge residual that does not fit in
-    // [0,1). Extracting digits from it as-is would saturate `x as u8` at 255,
-    // and `b'0' + d` would overflow the u8 addition (a debug panic, or a
-    // corrupted byte write in release builds). So once saturated, give up on
-    // extracting the fraction part entirely.
-    if ip == i128::MAX || ip == i128::MIN {
-        out.push(b'0');
-    } else {
-        x -= ip as f64;
-        // The fraction part goes up to 15 digits max. Trailing zeros are trimmed, keeping at least one digit.
-        let mut digits = Vec::with_capacity(15);
-        for _ in 0..15 {
-            x *= 10.0;
-            let d = x as u8;
-            digits.push(b'0' + d);
-            x -= d as f64;
-        }
-        while digits.len() > 1 && *digits.last().unwrap() == b'0' {
-            digits.pop();
-        }
-        out.extend_from_slice(&digits);
-    }
+    super::float::write_f64_finite(out, v);
 }
 
 fn push_date(out: &mut Vec<u8>, days: i64) {
@@ -384,17 +358,24 @@ mod tests {
         assert_eq!(out, "a\n0.1\n100.0\n-0.5\n");
     }
 
-    // `push_f64` has no exponent-notation formatting in `core`, so it can only
-    // write fixed-point integer-part + fraction-part (see the comment at the
-    // top of the file). For huge finite values whose integer part exceeds the
-    // i128 range, `as i128` saturates and produces an integer part equal to
-    // `i128::MAX`. Normal DECIMAL/DOUBLE data should essentially never reach
-    // this, but the behavior is pinned down here so future changes don't break it unknowingly.
     #[test]
-    fn float_formatting_saturates_on_extremely_large_finite_values() {
-        let out =
-            run_csv("SELECT a FROM t", "t", b"a\n1e40\n".to_vec(), crate::format::FormatKind::Csv);
-        assert_eq!(out, format!("a\n{}.0\n", i128::MAX));
+    fn non_finite_values_render_as_nan_and_infinity() {
+        // CSV's own share of `push_f64`: non-finite handling is the one
+        // thing that is not shared with the JSONL writer (JSON has no
+        // NaN/Infinity literal, so `write/jsonl.rs` writes `null` instead --
+        // see that file's equivalent test). Everything else -- shortest
+        // round-trip digit generation, exact-tie regression cases, and the
+        // std-Display property test -- is covered once, for both writers,
+        // in `write/float.rs`'s own test module.
+        let mut out = Vec::new();
+        push_f64(&mut out, f64::NAN);
+        assert_eq!(out, b"NaN");
+        out.clear();
+        push_f64(&mut out, f64::INFINITY);
+        assert_eq!(out, b"Infinity");
+        out.clear();
+        push_f64(&mut out, f64::NEG_INFINITY);
+        assert_eq!(out, b"-Infinity");
     }
 
     #[test]

@@ -66,6 +66,11 @@ pub enum Code {
     /// (`MAX_RECURSIVE_ITERATIONS` in `exec::recursive`). A safety valve that
     /// reliably stops a non-terminating recursive CTE in finite time.
     RecursionLimitExceeded = 505,
+    /// A scalar subquery (used as a plain expression, not with `IN`/`EXISTS`/`ANY`/`ALL`)
+    /// produced more than one row at runtime -- matching what DuckDB itself raises
+    /// ("More than one row returned by a subquery used as an expression"). Zero rows is
+    /// still a valid `NULL`; this is only for two or more.
+    MultipleRowsSubquery = 506,
 
     // 9xx: internal inconsistency (bug)
     Internal = 900,
@@ -176,6 +181,9 @@ impl Error {
             ValueOutOfRange => "value out of range",
             IoFailed => "io failed",
             RecursionLimitExceeded => "recursive CTE exceeded the maximum number of iterations",
+            MultipleRowsSubquery => {
+                "more than one row returned by a subquery used as an expression"
+            }
             Internal => "internal error",
         }
     }

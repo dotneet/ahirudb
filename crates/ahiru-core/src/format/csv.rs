@@ -9,6 +9,14 @@
 //! The schema is inferred from the leading `SAMPLE_BYTES`, so later rows can fall outside it.
 //! A value that falls outside is not an error but NULL. Making that one cell NULL is more
 //! practical than failing the whole query over one anomalous row.
+//!
+//! Splitting a file that uses RFC 4180 quoting is unsafe in general: an embedded `\n` inside a
+//! quoted field is not a record boundary, but a fixed-size split cut has no way to know, from its
+//! own bytes alone, whether the byte right at its boundary sits inside an open quote (the field
+//! carrying it can start arbitrarily far back). So `resolve` checks the leading sample for a `"`
+//! byte and, if found, forces the whole file to be read as a single split (`quoted_sample` on
+//! `CsvFormat`) rather than risk mis-resynchronizing and emitting a phantom row. See
+//! `docs/sql/limitations.md` for the resulting (narrow) residual gap.
 
 use crate::catalog::Source;
 use crate::format::{get_or_internal, ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
@@ -45,6 +53,18 @@ pub struct CsvFormat {
     /// It also doubles as the "overread amount" for finishing a record that straddles a split
     /// boundary, so a file with a record exceeding it cannot be read split (`LimitExceeded`).
     pub max_record: u64,
+    /// Set once, in `resolve`, when the leading sample contains a `"` byte.
+    ///
+    /// A split boundary can only ever be mis-resynchronized (§ the module doc's quoting caveat)
+    /// when the file uses RFC 4180 quoting: an unquoted CSV/TSV field can never contain the
+    /// delimiter, `\n`, or `\r`, so the naive "resync at the first `\n`" scan in `read_split` is
+    /// exact for such files. Determining whether a `\n` found *at* a split boundary sits inside an
+    /// open quote would need unbounded backward context (the field carrying it can start anywhere
+    /// earlier in the file) -- context a single split step does not have, by the split-boundary
+    /// I/O barrier design (`docs/DESIGN.md` §6). Rather than guess, quoting forces the whole file
+    /// to be read as a single split, which sidesteps the ambiguity entirely (at the cost of the
+    /// per-split I/O parallelism, per `docs/sql/limitations.md`).
+    quoted_sample: bool,
 }
 
 impl CsvFormat {
@@ -57,6 +77,7 @@ impl CsvFormat {
             resolved: false,
             split_bytes: TEXT_SPLIT_BYTES,
             max_record: TEXT_MAX_RECORD,
+            quoted_sample: false,
         }
     }
 
@@ -70,8 +91,16 @@ impl CsvFormat {
     }
 
     /// 0 would break the split-count computation, so it is always rounded up to at least 1.
+    ///
+    /// When the leading sample looked quoted (`quoted_sample`), this returns the whole data
+    /// region so `num_splits` collapses to (at most) 1 -- see `quoted_sample`'s doc comment for
+    /// why a quoted file cannot be safely resynchronized at an arbitrary split boundary.
     fn chunk_size(&self) -> u64 {
-        self.split_bytes.max(1)
+        if self.quoted_sample {
+            self.data_len().max(1)
+        } else {
+            self.split_bytes.max(1)
+        }
     }
 
     /// The boundaries of split `split`.
@@ -126,6 +155,12 @@ impl TableFormat for CsvFormat {
         // A UTF-8 BOM is dropped. Leaving it would mix into the first column's name and break column references.
         let bom = if sample.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
         let body = &sample[bom..];
+
+        // See `quoted_sample`'s doc comment: any `"` in the leading sample is treated as evidence
+        // the file may use RFC 4180 quoting, which forces reading it as a single split. A quote
+        // that first appears only after this sample is a known, documented residual gap
+        // (`docs/sql/limitations.md`), not something this check can see.
+        self.quoted_sample = body.contains(&b'"');
 
         // --- The header row -------------------------------------------------
         let mut sc = Scanner::new(body, self.delimiter);
@@ -268,12 +303,15 @@ impl TableFormat for CsvFormat {
             // the beginning. Otherwise it skips to just after the first line terminator (that
             // record was finished by the previous split).
             //
-            // This is quoting's one weak point: this scan cannot know the quoting state. It may
+            // This scan cannot know the quoting state at this position in general -- it may
             // mistake a newline inside quotes for a line terminator, and "record length <=
-            // max_record" alone cannot prevent that. The remaining constraint is that splitting is
-            // only safe when "no newline inside quotes lands right after a split boundary"
-            // (a limitation every implementation that reads RFC 4180 CSV in parallel shares, and
-            // not solved here either).
+            // max_record" alone cannot prevent that (a limitation every implementation that reads
+            // RFC 4180 CSV in parallel shares). That is exactly why `resolve` forces `num_splits`
+            // down to 1 whenever the leading sample looked quoted (`quoted_sample`): `lead > 0`
+            // (i.e. `split > 0`) is unreachable for such a file, since there is only ever one
+            // split. This byte scan is only ever live for files confirmed (by that sample) not to
+            // use quoting, where an unquoted field can never contain the delimiter/`\n`/`\r`, so
+            // scanning for a raw `\n` here is exact, not a heuristic.
             match buf.first() {
                 Some(&b'\n') => sc.seek(1),
                 _ => match buf.iter().skip(1).position(|&c| c == b'\n') {
@@ -1372,6 +1410,41 @@ mod tests {
                 assert_eq!(*v, Value::I64(i as i64), "split_bytes={size}");
             }
         }
+    }
+
+    #[test]
+    fn quoted_sample_is_detected_from_the_leading_bytes() {
+        let (plain, _) = open(b"a,b\n1,x\n2,y\n", b',');
+        assert!(!plain.quoted_sample);
+        let (quoted, _) = open(b"a,b\n1,\"x\"\n2,y\n", b',');
+        assert!(quoted.quoted_sample);
+        // A quote in the header alone is enough (quoting could start on any row).
+        let (quoted_header, _) = open(b"\"a\",b\n1,x\n", b',');
+        assert!(quoted_header.quoted_sample);
+    }
+
+    #[test]
+    fn quoted_newline_straddling_a_split_boundary_forces_a_single_split() {
+        // Regression test: a quoted field whose embedded `\n` used to land exactly on a split
+        // boundary. Before the fix, `read_split`'s "resync at the first raw `\n`" scan could not
+        // tell that newline was inside an open quote, so the trailing half of the quoted value
+        // was misread as a new (bogus) record -- typically surfacing as an extra `(NULL, NULL)`
+        // row and one row too many overall.
+        let bytes = b"a,b\n1,\"multi\nline\"\n2,plain\n3,\"another\nembedded\nnewline\"\n4,end\n";
+        // split_bytes is set absurdly small so that, without the fix, several split boundaries
+        // would fall inside the quoted values above.
+        let (f, src) = open_split(bytes, b',', 8);
+        assert!(f.quoted_sample);
+        assert_eq!(f.num_splits(), 1, "a quoted file must always resolve to exactly one split");
+
+        let got = read_all(&f, &src, &[0, 1]);
+        // Exactly 4 rows -- no phantom row from a misinterpreted embedded newline.
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2), Value::I64(3), Value::I64(4)]);
+        assert!(!got[0].contains(&Value::Null), "no phantom NULL row");
+        assert_eq!(text(&got[1][0]), "multi\nline");
+        assert_eq!(text(&got[1][1]), "plain");
+        assert_eq!(text(&got[1][2]), "another\nembedded\nnewline");
+        assert_eq!(text(&got[1][3]), "end");
     }
 
     #[test]

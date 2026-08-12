@@ -21,6 +21,12 @@
 
 #[cfg(feature = "csv")]
 pub mod csv;
+// Shared `f64` shortest-round-trip formatting for `csv`/`jsonl`. Only built
+// when at least one of them is, since it has no other caller; private since
+// its API (`write_f64_finite`) is an internal implementation detail of those
+// two writers, not part of this crate's public surface.
+#[cfg(any(feature = "csv", feature = "jsonl"))]
+mod float;
 #[cfg(feature = "jsonl")]
 pub mod jsonl;
 #[cfg(feature = "export-parquet")]

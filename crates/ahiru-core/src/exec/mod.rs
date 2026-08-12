@@ -162,6 +162,9 @@ fn build_ctx(node: Node, working: Option<&[Batch]>) -> Result<Box<dyn Operator>>
                 Box::new(sample::Bernoulli::new(input, &spec))
             }
         }
+        Node::AssertMaxOneRow { input, keys } => {
+            Box::new(AssertMaxOneRow::new(build_ctx(*input, working)?, keys))
+        }
     })
 }
 
@@ -473,6 +476,60 @@ impl Operator for DistinctOn {
             let mut out = batch;
             out.sel = Some(sel);
             return Ok(Step::Ready(out));
+        }
+    }
+}
+
+// --- AssertMaxOneRow ---------------------------------------------------------
+
+/// Enforces `Node::AssertMaxOneRow`: at most one row overall (`keys` empty) or at most one row
+/// per key (`keys` non-empty) may pass through, else `Code::MultipleRowsSubquery`.
+///
+/// Structurally this is `DistinctOn` with the outcome for a repeat key flipped from "silently
+/// dropped" to "an error" -- deliberately a separate operator rather than a flag on
+/// `DistinctOn`, since real `DISTINCT ON` queries (`plan::bind::select`'s other use of
+/// `Node::DistinctOn`) must keep the "first row wins" behavior, not turn a duplicate into an
+/// error.
+pub struct AssertMaxOneRow {
+    input: Box<dyn Operator>,
+    keys: Vec<Program>,
+    seen: HashIndex,
+}
+
+impl AssertMaxOneRow {
+    pub fn new(input: Box<dyn Operator>, keys: Vec<Program>) -> Self {
+        AssertMaxOneRow { input, keys, seen: HashIndex::new() }
+    }
+}
+
+impl Operator for AssertMaxOneRow {
+    fn next(&mut self, ctx: &mut ExecContext) -> Result<Step> {
+        loop {
+            let batch = match self.input.next(ctx)? {
+                Step::Ready(b) => b,
+                other => return Ok(other),
+            };
+            let rows = batch.card();
+            let mut kcols = Vec::with_capacity(self.keys.len());
+            for p in &self.keys {
+                kcols.push(ctx.vm.eval(p, &batch)?);
+            }
+            let refs: Vec<&Vector> = kcols.iter().collect();
+            let mut key = Vec::new();
+            for row in 0..rows {
+                encode_key(&refs, row, &mut key);
+                let (_, is_new) = self.seen.get_or_insert(&key);
+                // With `keys` empty, `encode_key` produces the same (empty) key for every row,
+                // so the second row seen anywhere -- not just the second with a matching key --
+                // trips this.
+                ensure!(is_new, MultipleRowsSubquery);
+            }
+            // Same cap as `DistinctOn`, whose `seen` index this mirrors byte-for-byte.
+            ensure!(self.seen.approx_bytes() <= MAX_DISTINCT_ON_BYTES, Oom);
+            if rows == 0 {
+                continue;
+            }
+            return Ok(Step::Ready(batch));
         }
     }
 }

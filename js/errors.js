@@ -55,6 +55,7 @@ export const Code = Object.freeze({
   VALUE_OUT_OF_RANGE: 503,
   IO_FAILED: 504,
   RECURSION_LIMIT_EXCEEDED: 505,
+  MULTIPLE_ROWS_SUBQUERY: 506,
 
   // 9xx: internal inconsistency (bug)
   INTERNAL: 900,
@@ -102,6 +103,7 @@ const MESSAGES = Object.freeze({
   503: 'value out of range',
   504: 'io failed',
   505: 'recursive CTE exceeded the maximum number of iterations',
+  506: 'more than one row returned by a subquery used as an expression',
   900: 'internal error',
 });
 

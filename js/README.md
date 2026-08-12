@@ -168,6 +168,18 @@ a `MemoryCache` instance directly lets multiple `AhiruDB` instances share one
 (in that case `close()` does not clear it). `"cache-api"` currently falls back
 to the in-memory implementation.
 
+**The cache assumes registered sources are immutable.** The key has no ETag,
+Last-Modified, or version component, so if a URL's content changes between
+queries, a shared `MemoryCache`/`"memory"` cache keeps serving the bytes it
+fetched the first time for any range it already holds — not the new content.
+This is fine for the common case (versioned object storage, content-addressed
+paths, files that are written once and read many times), but it means a URL
+whose content is mutated in place will read stale after the first query. If
+your data can change under a fixed URL, either give each `AhiruDB` its own
+cache (the default — don't pass a shared `MemoryCache` instance), use
+`cache: 'none'`, or put a version/content-hash in the URL/path itself so a
+changed file gets a new cache key.
+
 ## Handling wasm memory (implementation notes)
 
 `ahiru_alloc` / `ahiru_provide` can grow the wasm heap, and growth detaches any
@@ -205,6 +217,36 @@ try {
 `errors.js` mirrors `Code` and `message()` from
 `crates/ahiru-core/src/error.rs`, so **always update both together**. If they
 drift apart, the test (`errors.js matches the Code / message in error.rs`) fails.
+
+## Security
+
+**Running untrusted SQL against a Node process with network access is not
+safe.** `parquet('URL')` / `read_csv('URL')` (and `register(name, url)`) make
+plain HEAD and `Range` HTTP requests from wherever the JS host runs. There is
+no URL allowlist and no way to disable URL sources. In a browser this is
+constrained by CORS and same-origin policy the same as any other `fetch`; in
+Node there is no such boundary — the process can reach anything on its
+network, including `http://127.0.0.1/...`, other hosts on a private network,
+and cloud instance-metadata endpoints (`http://169.254.169.254/...`). SQL that
+embeds a URL is therefore effectively an SSRF primitive if it comes from an
+untrusted source (a user-supplied query string, an LLM-generated query, etc.).
+
+If you need to run SQL you don't fully trust in a Node process that also has
+access to internal services:
+
+- Don't. Run it in an environment with no route to anything sensitive, or
+- Supply your own `ByteSource` implementations (via `register(name, source)`)
+  instead of registering URLs at all, so the host never makes an HTTP request
+  on the engine's behalf, or
+- Parse/filter the SQL yourself before running it (reject or rewrite
+  `parquet(...)` / `read_csv(...)` / `read_json(...)` calls with URL
+  arguments) — the engine and this host layer do not do this for you.
+
+There is currently no built-in allowlist option. `AhiruDB.init({ fetch })`
+already lets a caller substitute their own `fetch` implementation for every
+outgoing URL request the host makes, though, so an allowlist can be built at
+that layer today (reject or redirect requests to disallowed hosts inside your
+`fetch` wrapper) without any change to this library.
 
 ## Tests
 

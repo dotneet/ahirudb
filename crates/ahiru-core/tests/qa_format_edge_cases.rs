@@ -41,31 +41,38 @@ fn s(v: &str) -> Value {
     Value::Bytes(v.as_bytes().to_vec())
 }
 
-// --- CSV: known split-boundary limitation, verified at the byte level -----
+// --- CSV: split-boundary quote handling, verified at the byte level -------
 
-/// `format::csv.rs` documents (around `read_split`'s `lead` handling) that
-/// the split-boundary scanner cannot track quote state, so a quoted newline
-/// that lands right at/after a split boundary can be misread as a record
-/// terminator. This test pins down *what actually happens* in that case:
-/// with the fixture below, a boundary that falls inside the quoted embedded
-/// newline causes the scanner to resynchronize mid-quote and inject one
-/// spurious all-NULL row — real rows before and after survive intact, and
-/// nothing panics or drops data. This is the documented, accepted
-/// limitation (not something this QA pass fixes), but it's worth pinning so
-/// a future change to the split algorithm doesn't silently change this
-/// failure mode without anyone noticing.
+/// Regression test for a real, fixed bug (previously pinned by this same
+/// test under a different name as an "accepted limitation"): a quoted
+/// newline landing right at/after a fixed-size split boundary used to be
+/// misread as a record terminator, injecting one spurious all-NULL row. Full
+/// quote-state recovery at an arbitrary split boundary needs unbounded
+/// backward context (`format::csv`'s module doc, and `docs/sql/
+/// limitations.md`), so the fix instead has `CsvFormat::resolve` check its
+/// leading sample for a `"` byte and, if found, force the whole file to read
+/// as a single split — sidestepping the ambiguity entirely rather than
+/// guessing wrong. This test pins that down: with the fixture below, a
+/// `split_bytes` small enough to have put a boundary exactly inside the
+/// quoted embedded newline is now simply ignored, `num_splits()` stays 1,
+/// and both records come back correctly with no spurious row.
 #[test]
-fn quoted_embedded_newline_on_a_split_boundary_can_inject_a_spurious_row() {
+fn quoted_embedded_newline_no_longer_injects_a_spurious_row_at_a_split_boundary() {
     // Row 1's second field is quoted and contains a literal '\n'. Absolute
     // byte offset 12 (right after "line1") is exactly that embedded
     // newline; data_start (after the "a,b\n" header) is 4, so split_bytes=8
-    // puts a split boundary exactly there.
+    // would have put a split boundary exactly there under the old,
+    // quote-unaware resync.
     let data = "a,b\n1,\"line1\nline2\"\n2,x\n";
     let src = Source::from_bytes(data.as_bytes().to_vec());
     let mut f = CsvFormat::new(b',');
     f.resolve(&src).unwrap().unwrap();
     f.split_bytes = 8;
-    assert!(f.num_splits() > 1, "test fixture must actually straddle a split boundary");
+    assert_eq!(
+        f.num_splits(),
+        1,
+        "a file whose leading sample contains a quote is always read as a single split"
+    );
 
     let mut rows: Vec<(Value, Value)> = Vec::new();
     for split in 0..f.num_splits() {
@@ -74,26 +81,12 @@ fn quoted_embedded_newline_on_a_split_boundary_can_inject_a_spurious_row() {
             rows.push((cols[0].value_at(i), cols[1].value_at(i)));
         }
     }
-    // The two real records survive. A single spurious (NULL, NULL) row is
-    // injected between them — the documented failure mode, not silent
-    // corruption of real data.
-    assert_eq!(rows[0], (Value::I64(1), s("line1\nline2")));
-    assert_eq!(rows.last().unwrap(), &(Value::I64(2), s("x")));
-    assert!(
-        rows.iter().any(|r| r.0 == Value::Null && r.1 == Value::Null),
-        "expected the documented spurious all-NULL row, got {rows:?}"
+    // Exactly the two real records -- no spurious (NULL, NULL) row.
+    assert_eq!(
+        rows,
+        vec![(Value::I64(1), s("line1\nline2")), (Value::I64(2), s("x"))],
+        "no phantom row from the (now-unreachable) mid-quote resync"
     );
-
-    // With a split size that keeps the whole quoted field inside a single
-    // split (no boundary lands inside the quote), the same data reads back
-    // with no spurious row at all — confirming the artifact above really is
-    // caused by the boundary landing inside the quote, not a general bug.
-    let mut g = CsvFormat::new(b',');
-    g.resolve(&src).unwrap().unwrap();
-    g.split_bytes = 1024;
-    assert_eq!(g.num_splits(), 1);
-    let cols = g.read_split(&src, 0, &[0, 1]).unwrap();
-    assert_eq!(cols[0].len(), 2, "no split boundary inside the quote => no spurious row");
 }
 
 // --- CSV: through Session/SQL ----------------------------------------------

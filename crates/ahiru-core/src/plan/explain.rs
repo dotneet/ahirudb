@@ -159,6 +159,12 @@ fn walk(n: &Node, depth: usize, out: &mut Vec<String>) {
             out.push(line);
             walk(input, depth + 1, out);
         }
+        Node::AssertMaxOneRow { input, keys } => {
+            line.push_str("AssertMaxOneRow  keys=");
+            push_u64(&mut line, keys.len() as u64);
+            out.push(line);
+            walk(input, depth + 1, out);
+        }
     }
 }
 

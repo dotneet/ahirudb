@@ -15,11 +15,11 @@ use crate::parquet::meta::{
 };
 use crate::parquet::nested::read_nested_column;
 use crate::parquet::reader::{
-    collect_codec_pages, collect_codec_pages_all, collect_codec_pages_selected, read_column_chunk,
-    read_selected_pages, CodecPage,
+    collect_codec_pages, collect_codec_pages_all, collect_codec_pages_selected, is_unsigned,
+    read_column_chunk, read_selected_pages, CodecPage,
 };
 use crate::parquet::schema::ColumnDesc;
-use crate::parquet::PType;
+use crate::parquet::{PType, TimeUnit};
 use crate::prelude::*;
 use crate::vector::{Field, PhysType, Ty, Value, Vector};
 
@@ -357,8 +357,8 @@ impl TableFormat for ParquetFormat {
             let (Some(min), Some(max)) = (&stats.min_value, &stats.max_value) else {
                 continue;
             };
-            let Some(ty) = self.schema.get(col).map(|f| f.ty) else { continue };
-            let (Some(min), Some(max)) = (stat_value(ty, min), stat_value(ty, max)) else {
+            let Ok(desc) = self.desc(col) else { continue };
+            let (Some(min), Some(max)) = (stat_value(desc, min), stat_value(desc, max)) else {
                 continue;
             };
             if !range_may_match(p, &min, &max) {
@@ -448,14 +448,7 @@ impl TableFormat for ParquetFormat {
                 continue;
             }
             let Some(bf) = BloomFilter::new(&buf[used..need]) else { continue };
-            let Ok(cc) = self.column_chunk(split, col) else { continue };
-            let ptype = cc.meta.as_ref().map(|m| m.ptype);
-            let Some(ptype) = ptype else { continue };
-            let desc_ty = self.schema.get(col).map(|f| f.ty);
-            let Some(desc_ty) = desc_ty else { continue };
-            let type_length =
-                self.file().ok().and_then(|f| f.schema.columns.get(col)).map(|d| d.type_length);
-            let Some(type_length) = type_length else { continue };
+            let Ok(desc) = self.desc(col) else { continue };
 
             // The split can be dropped only once every candidate is encodable and every one is
             // known to be absent from the filter. If even one candidate cannot be encoded, it
@@ -463,7 +456,7 @@ impl TableFormat for ParquetFormat {
             let mut any_maybe_present = false;
             let mut all_encoded = true;
             for v in core::iter::once(&p.value).chain(p.in_values.iter()) {
-                let Some(key) = plain_encode_for_bloom(ptype, type_length, desc_ty, v) else {
+                let Some(key) = plain_encode_for_bloom(desc, v) else {
                     all_encoded = false;
                     break;
                 };
@@ -498,8 +491,8 @@ impl TableFormat for ParquetFormat {
             if ci.null_pages.len() != oi.page_locations.len() || oi.page_locations.is_empty() {
                 continue;
             }
-            let Some(ty) = self.schema.get(col).map(|f| f.ty) else { continue };
-            let ranges = page_ranges_for_pruner(p, ty, &ci, &oi, num_rows);
+            let Ok(desc) = self.desc(col) else { continue };
+            let ranges = page_ranges_for_pruner(p, desc, &ci, &oi, num_rows);
             kept = Some(match kept {
                 Some(prev) => intersect_ranges(&prev, &ranges),
                 None => ranges,
@@ -657,7 +650,7 @@ fn ranges_overlap(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
 /// A page whose statistics are unusable (`null_pages` or a type mismatch) errs safe and is kept.
 fn page_ranges_for_pruner(
     p: &Pruner,
-    ty: Ty,
+    desc: &ColumnDesc,
     ci: &ColumnIndex,
     oi: &OffsetIndex,
     num_rows: u64,
@@ -671,8 +664,8 @@ fn page_ranges_for_pruner(
             // A page with no statistics (all NULL, say) cannot be decided and is kept.
             true
         } else {
-            let min = ci.min_values.get(i).and_then(|b| stat_value(ty, b));
-            let max = ci.max_values.get(i).and_then(|b| stat_value(ty, b));
+            let min = ci.min_values.get(i).and_then(|b| stat_value(desc, b));
+            let max = ci.max_values.get(i).and_then(|b| stat_value(desc, b));
             match (min, max) {
                 (Some(min), Some(max)) => range_may_match(p, &min, &max),
                 _ => true,
@@ -746,25 +739,63 @@ fn select_indices_full(nrows: usize, kept: &[(u64, u64)]) -> Vec<u32> {
     out
 }
 
+/// Unwinds the microseconds-normalization `reader::push_i32_values`/`push_i64_values` apply
+/// (`TimeUnit::to_micros`) back to the column's on-disk physical unit.
+///
+/// `None` (no `time_unit`, e.g. plain integers/DECIMAL) and `Micros` need no change. `Millis`
+/// divides back only when the microsecond value has no sub-millisecond remainder -- any remainder
+/// means the value could not have come from a MILLIS column in the first place under exact
+/// normalization, so there is nothing correct to encode. `Nanos` always returns `None`: the
+/// reader's `v / 1000` truncation is lossy (many nanosecond values collapse onto the same
+/// microsecond value), so a microsecond `Value` cannot be unwound back to *the* nanosecond bytes a
+/// writer would have hashed -- guessing `micros * 1000` would probe the wrong key whenever the
+/// original had a nonzero sub-microsecond remainder, which could wrongly report "definitely
+/// absent" for a value that is actually present (exactly the false-negative pruning bug this file
+/// exists to avoid).
+fn unwind_time_unit(micros: i64, unit: Option<TimeUnit>) -> Option<i64> {
+    match unit {
+        None | Some(TimeUnit::Micros) => Some(micros),
+        Some(TimeUnit::Millis) => (micros % 1000 == 0).then_some(micros / 1000),
+        Some(TimeUnit::Nanos) => None,
+    }
+}
+
 /// Turns a `Value` into PLAIN bytes matching that column's Parquet physical type.
 /// A Bloom filter hashes the physical type's byte sequence, so a `Value` widened for the logical
-/// type has to be unwound.
+/// type (time-unit scaling, UINT32 zero-extension -- DESIGN.md §8) has to be unwound first. This
+/// is the exact inverse of `stat_value`'s normalization and of
+/// `reader::push_i32_values`/`push_i64_values`.
 ///
-/// Combinations whose conversion has not been verified (BOOLEAN, INT96, a FIXED_LEN_BYTE_ARRAY
-/// DECIMAL, and so on) return `None` and give up on the Bloom check (erring safe = treated as
-/// "probably matches"). The widening correspondence is the inverse map of
-/// `format::parquet::stat_value`, and only the INT32/INT64/FLOAT/DOUBLE/BYTE_ARRAY covered there
-/// are handled.
-fn plain_encode_for_bloom(ptype: PType, type_length: usize, ty: Ty, v: &Value) -> Option<Vec<u8>> {
-    let _ = ty;
-    match ptype {
+/// Combinations whose conversion is not well-defined (BOOLEAN, INT96, a NANOS-scaled time value,
+/// a FIXED_LEN_BYTE_ARRAY/BYTE_ARRAY DECIMAL, and so on) return `None` and give up on the Bloom
+/// check (erring safe = treated as "probably matches").
+fn plain_encode_for_bloom(desc: &ColumnDesc, v: &Value) -> Option<Vec<u8>> {
+    // A nested (LIST/MAP/STRUCT-with-repeated) column has no single physical value to hash --
+    // callers already exclude these, but this keeps the function safe standalone too.
+    if desc.nested.is_some() {
+        return None;
+    }
+    match desc.ptype {
         PType::Int32 => match v {
             Value::I32(x) => Some(x.to_le_bytes().to_vec()),
-            Value::I64(x) => i32::try_from(*x).ok().map(|x| x.to_le_bytes().to_vec()),
+            Value::I64(x) => {
+                if is_unsigned(desc.ty) {
+                    // UINT32 is zero-extended (not sign-extended) to I64 by the reader; narrow
+                    // it back, rejecting anything the physical INT32 width cannot hold.
+                    u32::try_from(*x).ok().map(|u| (u as i32).to_le_bytes().to_vec())
+                } else {
+                    // TIME_MILLIS is stored as INT32 and scaled to microseconds by the reader.
+                    let x = unwind_time_unit(*x, desc.time_unit)?;
+                    i32::try_from(x).ok().map(|x| x.to_le_bytes().to_vec())
+                }
+            }
             _ => None,
         },
         PType::Int64 => match v {
-            Value::I64(x) => Some(x.to_le_bytes().to_vec()),
+            Value::I64(x) => {
+                let x = unwind_time_unit(*x, desc.time_unit)?;
+                Some(x.to_le_bytes().to_vec())
+            }
             Value::I32(x) => Some((*x as i64).to_le_bytes().to_vec()),
             _ => None,
         },
@@ -781,7 +812,12 @@ fn plain_encode_for_bloom(ptype: PType, type_length: usize, ty: Ty, v: &Value) -
             _ => None,
         },
         PType::FixedLenByteArray => match v {
-            Value::Bytes(b) if b.len() == type_length => Some(b.clone()),
+            // A DECIMAL(p<=18) stored as FIXED_LEN_BYTE_ARRAY has physical type Bytes but is
+            // widened to `Value::I64` (big-endian two's complement, see `push_byte_values`), so
+            // it never matches this `Value::Bytes` arm and safely falls through to `None` --
+            // unwinding that big-endian encoding back is not attempted here. Only UUID/BLOB
+            // (whose `Value` stays `Bytes` unwidened) actually take this path.
+            Value::Bytes(b) if b.len() == desc.type_length => Some(b.clone()),
             _ => None,
         },
         // For BOOLEAN and INT96 the inverse of widening is not obvious
@@ -791,27 +827,69 @@ fn plain_encode_for_bloom(ptype: PType, type_length: usize, ty: Ty, v: &Value) -
     }
 }
 
-/// Turns statistics bytes into a comparable `Value` according to that column's type.
+/// Turns statistics bytes into a comparable `Value`, applying exactly the same normalization the
+/// reader applies when decoding actual column values (DESIGN.md §8: TIME/TIMESTAMP are always
+/// microseconds internally, UINT32 is zero-extended rather than sign-extended). Without this, a
+/// millis/nanos-scaled or unsigned column's statistics would be compared against a normalized
+/// query value on the wrong scale, and RowGroup/page pruning could silently drop data that
+/// actually matches.
 ///
-/// Parquet statistics are written in the physical type's little-endian representation. Even when
-/// the logical type is INT64-equivalent, a physical INT32 gives only 4 bytes (DATE, TIME_MILLIS).
-pub fn stat_value(ty: Ty, bytes: &[u8]) -> Option<Value> {
-    match ty.phys() {
+/// Parquet statistics are written in the physical type's little-endian representation (with one
+/// exception -- see below). Even when the logical type is INT64-equivalent, a physical INT32
+/// gives only 4 bytes (DATE, TIME_MILLIS).
+///
+/// Returns `None` (skip pruning for this value, erring safe) for:
+/// - INT96: the 12-byte statistics encoding is Julian day + nanoseconds-since-midnight, not the
+///   epoch-microseconds `Value` the reader produces, and correctly decoding that here is out of
+///   scope (mirrors `plain_encode_for_bloom`, which already skips INT96 for the same reason).
+/// - DECIMAL stored as FIXED_LEN_BYTE_ARRAY/BYTE_ARRAY: unlike everything else here, those
+///   statistics are big-endian two's complement (see `push_byte_values`), a different encoding
+///   this little-endian path does not attempt to handle.
+/// - Anything else not covered by the I32/I64/F64 physical-type cases below (strings, BOOLEAN,
+///   nested/JSON columns -- `Ty::Json.phys()` is `Bytes`, which is not one of the three).
+pub fn stat_value(desc: &ColumnDesc, bytes: &[u8]) -> Option<Value> {
+    if desc.ptype == PType::Int96 {
+        return None;
+    }
+    if matches!(desc.ptype, PType::FixedLenByteArray | PType::ByteArray)
+        && matches!(desc.ty, Ty::Decimal { .. })
+    {
+        return None;
+    }
+    match desc.ty.phys() {
         PhysType::I32 => {
             if bytes.len() < 4 {
                 return None;
             }
             Some(Value::I32(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
         }
-        PhysType::I64 => match bytes.len() {
-            4 => Some(Value::I64(
-                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64
-            )),
-            n if n >= 8 => Some(Value::I64(i64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]))),
-            _ => None,
-        },
+        PhysType::I64 => {
+            let unsigned = is_unsigned(desc.ty);
+            match bytes.len() {
+                4 => {
+                    let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    // UINT32 is zero-extended (not sign-extended) to 64 bits, matching
+                    // `reader::push_i32_values`. TIME_MILLIS is stored as INT32 and normalized
+                    // to microseconds, matching the reader's scaling. A column is never both.
+                    let x = if unsigned { raw as u32 as i64 } else { raw as i64 };
+                    Some(Value::I64(match desc.time_unit {
+                        Some(u) => u.to_micros(x),
+                        None => x,
+                    }))
+                }
+                n if n >= 8 => {
+                    let raw = i64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    Some(Value::I64(match desc.time_unit {
+                        Some(u) => u.to_micros(raw),
+                        None => raw,
+                    }))
+                }
+                _ => None,
+            }
+        }
         PhysType::F64 => match bytes.len() {
             4 => Some(Value::F64(
                 f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
@@ -830,19 +908,148 @@ pub fn stat_value(ty: Ty, bytes: &[u8]) -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// Builds a minimal `ColumnDesc` for a flat (non-nested) leaf column, with only the fields
+    /// `stat_value`/`plain_encode_for_bloom` actually look at set meaningfully.
+    fn desc_for(ty: Ty, ptype: PType, time_unit: Option<TimeUnit>) -> ColumnDesc {
+        ColumnDesc {
+            name: String::new(),
+            ty,
+            nullable: true,
+            max_def_level: 1,
+            ptype,
+            type_length: 0,
+            time_unit,
+            phys_cols: vec![0],
+            leaves: Vec::new(),
+            nested: None,
+        }
+    }
+
     #[test]
     fn stat_value_reads_physical_width() {
-        assert_eq!(stat_value(Ty::Int, &7i32.to_le_bytes()), Some(Value::I32(7)));
-        assert_eq!(stat_value(Ty::BigInt, &7i64.to_le_bytes()), Some(Value::I64(7)));
-        // DATE is logically I32, but there are also columns like TIME_MILLIS that are physically
-        // INT32 and logically I64. The 4 bytes are widened to 64 bits when read.
-        assert_eq!(stat_value(Ty::Time, &7i32.to_le_bytes()), Some(Value::I64(7)));
-        assert_eq!(stat_value(Ty::Double, &1.5f64.to_le_bytes()), Some(Value::F64(1.5)));
-        assert_eq!(stat_value(Ty::Float, &1.5f32.to_le_bytes()), Some(Value::F64(1.5)));
+        let int_desc = desc_for(Ty::Int, PType::Int32, None);
+        assert_eq!(stat_value(&int_desc, &7i32.to_le_bytes()), Some(Value::I32(7)));
+
+        let bigint_desc = desc_for(Ty::BigInt, PType::Int64, None);
+        assert_eq!(stat_value(&bigint_desc, &7i64.to_le_bytes()), Some(Value::I64(7)));
+
+        // TIME_MILLIS is physically INT32 (4 bytes) but logically I64, and DESIGN.md §8 says the
+        // internal representation is always microseconds -- so the 4 raw bytes must be widened to
+        // I64 *and* scaled by 1000, not just widened. This corrects a previous version of this
+        // test that pinned the then-current *buggy* behavior (millis value "7" staying "7"
+        // instead of becoming 7_000 microseconds): that mismatch between statistics (millis) and
+        // the internal `Value` (micros) is exactly what let equality/range pruning silently drop
+        // RowGroups/pages that actually matched the predicate.
+        let time_millis_desc = desc_for(Ty::Time, PType::Int32, Some(TimeUnit::Millis));
+        assert_eq!(stat_value(&time_millis_desc, &7i32.to_le_bytes()), Some(Value::I64(7_000)));
+
+        let double_desc = desc_for(Ty::Double, PType::Double, None);
+        assert_eq!(stat_value(&double_desc, &1.5f64.to_le_bytes()), Some(Value::F64(1.5)));
+
+        let float_desc = desc_for(Ty::Float, PType::Float, None);
+        assert_eq!(stat_value(&float_desc, &1.5f32.to_le_bytes()), Some(Value::F64(1.5)));
+
         // Strings are not used.
-        assert_eq!(stat_value(Ty::Varchar, b"abc"), None);
+        let varchar_desc = desc_for(Ty::Varchar, PType::ByteArray, None);
+        assert_eq!(stat_value(&varchar_desc, b"abc"), None);
+
         // Statistics that are too short are not read.
-        assert_eq!(stat_value(Ty::BigInt, &[1, 2]), None);
+        assert_eq!(stat_value(&bigint_desc, &[1, 2]), None);
+    }
+
+    #[test]
+    fn stat_value_scales_timestamp_millis_to_micros() {
+        // TIMESTAMP_MILLIS is physically INT64 (8 bytes). A stats value of 1_700_000_000_000
+        // milliseconds since the epoch must come out as 1_700_000_000_000_000 microseconds to
+        // compare correctly against the micros-normalized query literal.
+        let desc = desc_for(Ty::Timestamp, PType::Int64, Some(TimeUnit::Millis));
+        let millis = 1_700_000_000_000i64;
+        assert_eq!(stat_value(&desc, &millis.to_le_bytes()), Some(Value::I64(millis * 1000)),);
+    }
+
+    #[test]
+    fn stat_value_scales_timestamp_nanos_to_micros() {
+        // TIMESTAMP_NANOS is also physically INT64. Nanoseconds truncate down to microseconds
+        // (matching `TimeUnit::to_micros`'s `v / 1000`, the same truncation the reader applies).
+        let desc = desc_for(Ty::Timestamp, PType::Int64, Some(TimeUnit::Nanos));
+        let nanos = 1_700_000_000_123_456_789i64;
+        assert_eq!(stat_value(&desc, &nanos.to_le_bytes()), Some(Value::I64(nanos / 1000)),);
+    }
+
+    #[test]
+    fn stat_value_zero_extends_uint32_at_and_above_2_pow_31() {
+        // A UINT32 value >= 2^31 is stored as 4 raw bytes that are negative when read as a
+        // signed INT32. The reader zero-extends (as u32) rather than sign-extends when widening
+        // to I64 (`reader::push_i32_values`); statistics comparison must match, or a value like
+        // 3_000_000_000 would compare as a large negative number and be pruned away incorrectly.
+        let desc = desc_for(Ty::UInt, PType::Int32, None);
+        let v: u32 = 3_000_000_000;
+        assert_eq!(stat_value(&desc, &v.to_le_bytes()), Some(Value::I64(v as i64)));
+    }
+
+    #[test]
+    fn stat_value_skips_int96() {
+        // INT96 statistics are Julian day + nanoseconds-since-midnight, not the epoch-microseconds
+        // `Value` the reader produces for INT96 columns (see `reader::decode_plain`'s INT96 arm).
+        // Decoding that correctly is out of scope here, so pruning must be skipped rather than
+        // comparing against a misinterpreted value.
+        let desc = desc_for(Ty::Timestamp, PType::Int96, None);
+        // Bytes shaped like a real INT96 stats value (12 bytes): nanos-since-midnight (i64 LE) +
+        // Julian day number (i32 LE). Even though this superficially satisfies the ">= 8 bytes"
+        // branch that PhysType::I64 would otherwise take, it must still be rejected.
+        let mut bytes = 0i64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&2_440_588i32.to_le_bytes());
+        assert_eq!(stat_value(&desc, &bytes), None);
+    }
+
+    #[test]
+    fn stat_value_skips_decimal_fixed_len_byte_array() {
+        // DECIMAL(p<=18) stored as FIXED_LEN_BYTE_ARRAY writes big-endian two's complement bytes
+        // (see `reader::push_byte_values`/`be_signed`), not the little-endian encoding every other
+        // case here uses. Misreading those bytes as little-endian would silently produce a wrong
+        // value, so this combination is skipped rather than guessed at.
+        let desc =
+            desc_for(Ty::Decimal { precision: 10, scale: 2 }, PType::FixedLenByteArray, None);
+        assert_eq!(stat_value(&desc, &100i64.to_be_bytes()), None);
+    }
+
+    #[test]
+    fn bloom_encode_round_trips_timestamp_millis() {
+        // The value the reader would produce for a TIMESTAMP_MILLIS column (microseconds) must
+        // encode back to exactly the 8 PLAIN bytes (raw milliseconds, little-endian) a writer
+        // would have hashed into the Bloom filter.
+        let desc = desc_for(Ty::Timestamp, PType::Int64, Some(TimeUnit::Millis));
+        let millis = 1_700_000_000_000i64;
+        let reader_value = Value::I64(millis * 1000); // what the reader hands to the rest of the engine
+        assert_eq!(
+            plain_encode_for_bloom(&desc, &reader_value),
+            Some(millis.to_le_bytes().to_vec()),
+        );
+    }
+
+    #[test]
+    fn bloom_encode_round_trips_uint32_at_and_above_2_pow_31() {
+        let desc = desc_for(Ty::UInt, PType::Int32, None);
+        let v: u32 = 3_000_000_000;
+        let reader_value = Value::I64(v as i64);
+        assert_eq!(plain_encode_for_bloom(&desc, &reader_value), Some(v.to_le_bytes().to_vec()),);
+    }
+
+    #[test]
+    fn bloom_encode_skips_timestamp_nanos() {
+        // Unwinding micros back to nanos is lossy (the reader truncates), so encoding must be
+        // skipped rather than guessing `micros * 1000`, which could silently probe the wrong key
+        // and report "definitely absent" for a value that is actually present.
+        let desc = desc_for(Ty::Timestamp, PType::Int64, Some(TimeUnit::Nanos));
+        let reader_value = Value::I64(1_700_000_000_123_456);
+        assert_eq!(plain_encode_for_bloom(&desc, &reader_value), None);
+    }
+
+    #[test]
+    fn bloom_encode_skips_int96() {
+        let desc = desc_for(Ty::Timestamp, PType::Int96, None);
+        let reader_value = Value::I64(1_700_000_000_000_000);
+        assert_eq!(plain_encode_for_bloom(&desc, &reader_value), None);
     }
 
     #[test]

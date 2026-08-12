@@ -1,0 +1,30 @@
+{
+  "name": "ahirudb",
+  "version": "0.1.0",
+  "description": "JS host layer for ahirudb: drives ahiru-core.wasm, a SQL engine that queries Parquet/CSV/JSONL directly in under 1 MiB of WebAssembly.",
+  "type": "module",
+  "main": "./ahirudb.js",
+  "types": "./ahirudb.d.ts",
+  "exports": {
+    ".": {
+      "types": "./ahirudb.d.ts",
+      "default": "./ahirudb.js"
+    },
+    "./errors.js": "./errors.js"
+  },
+  "files": [
+    "ahirudb.js",
+    "errors.js",
+    "ahirudb.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dotneet/ahirudb"
+  },
+  "sideEffects": false
+}

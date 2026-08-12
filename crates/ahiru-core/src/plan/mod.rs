@@ -391,6 +391,23 @@ pub enum Node {
         input: Box<Node>,
         spec: SampleSpec,
     },
+    /// Enforces that `input` produces at most one row (per `keys`, if non-empty), raising
+    /// `error::Code::MultipleRowsSubquery` instead of silently keeping only the first. This is
+    /// how `plan::bind::select` gives a scalar subquery (`SELECT (SELECT x FROM t)`, or the
+    /// correlated form `SELECT (SELECT x FROM t WHERE t.k = outer.k)`) correct SQL semantics:
+    /// zero rows still becomes `NULL` through the `LEFT JOIN` placed above this node, exactly
+    /// one row becomes that value, and two or more rows is a runtime error rather than a
+    /// silently different answer.
+    ///
+    /// With `keys` empty (the uncorrelated case), every row belongs to the same group, so any
+    /// second row is an error; the caller bounds the cost of proving that by first wrapping
+    /// `input` in `Node::Limit(2)`, so at most one row beyond the first is ever pulled. With
+    /// `keys` non-empty (the correlated case), the check is per correlation key -- the input is
+    /// already read in full to build the decorrelating join, so this adds no extra scanning.
+    AssertMaxOneRow {
+        input: Box<Node>,
+        keys: Vec<Program>,
+    },
 }
 
 /// The runtime parameters of `Node::Sample`. The method
@@ -429,7 +446,8 @@ impl Node {
             | Node::Sort { input, .. }
             | Node::Limit { input, .. }
             | Node::DistinctOn { input, .. }
-            | Node::Sample { input, .. } => input.schema(),
+            | Node::Sample { input, .. }
+            | Node::AssertMaxOneRow { input, .. } => input.schema(),
         }
     }
 }

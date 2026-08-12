@@ -393,3 +393,36 @@ fn using_sample_can_follow_group_by_having_before_order_by() {
     );
     assert_eq!(got, vec![0, 1, 2]);
 }
+
+/// The bug report's repro: for a single-table query, `WHERE` is ordinarily pushed down into a
+/// `Filter` sitting directly above the `Scan` (`plan::bind::select`'s `per_rel` pushdown), which
+/// -- before the `pushdown_ok` guard added for this -- ran *before* the `Sample` node interposed
+/// higher up, contradicting docs/sql/queries.md's documented (and `duckdb`-confirmed) "SAMPLE
+/// before WHERE" order. Concretely: `range(1000)` has 500 even values, so `USING SAMPLE 10 ROWS`
+/// applied to the *filtered* (`range % 2 = 0`) input picks 10 of those 500 evens -- always
+/// exactly 10 rows. Applied to the *unfiltered* 1000-row input first, as documented, it picks 10
+/// rows overall and only then keeps whichever of those happen to be even -- fewer than 10 (and,
+/// with this engine's fixed default seed, a specific reproducible number).
+#[test]
+fn using_sample_rows_applies_before_the_pushed_down_where_not_after() {
+    let mut db = session_with_dual();
+    let sql = "SELECT range AS x FROM range(1000) WHERE range % 2 = 0 USING SAMPLE 10 ROWS";
+    let got = run_x(&mut db, sql);
+
+    // Reference: sample the *unfiltered* input first (same query, same default seed, minus the
+    // WHERE), then apply the WHERE predicate afterward in Rust. If SAMPLE really runs before
+    // WHERE, `got` must equal this set exactly -- same seed means the same row stream reaches
+    // the row-reservoir sampler either way, since disabling pushdown removes the only thing that
+    // could make the two runs see a different stream.
+    let mut db2 = session_with_dual();
+    let sampled = run_x(&mut db2, "SELECT range AS x FROM range(1000) USING SAMPLE 10 ROWS");
+    assert_eq!(sampled.len(), 10);
+    let want: Vec<i64> = sampled.into_iter().filter(|x| x % 2 == 0).collect();
+    assert_eq!(got, want);
+
+    // The bug's own symptom, checked directly: under the inversion, WHERE narrows to the 500
+    // evens first, so sampling 10 ROWS from *that* always returns exactly 10. Fewer than 10 here
+    // is direct evidence SAMPLE saw the full 1000-row input, not the pre-filtered one.
+    assert!(got.len() < 10, "got {} rows, want fewer than 10 (see comment above)", got.len());
+    assert!(got.iter().all(|x| x % 2 == 0), "every returned row must still satisfy WHERE");
+}

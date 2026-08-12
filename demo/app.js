@@ -1,7 +1,7 @@
 // Browser demo for ahirudb. Zero build step, same as js/ahirudb.js itself —
 // this is just a thin UI wrapper over the public AhiruDB API.
 
-import { AhiruDB, AhiruError } from '../js/ahirudb.js';
+import { AhiruDB, AhiruError, detectFormat } from '../js/ahirudb.js';
 
 const WASM_URL = '../target/ahiru-core-full.wasm';
 
@@ -213,10 +213,21 @@ async function loadSample() {
 async function loadFile() {
   const file = fileInput.files[0];
   if (!file) return;
-  const name = file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_') || 'uploaded';
+  const stripped = file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_') || 'uploaded';
+  // Detect the format from the *original* filename before the extension is
+  // stripped for the table name — otherwise register() has nothing left to
+  // infer from and every non-Parquet upload gets misread as Parquet.
+  const format = detectFormat(file.name);
+  // Single-document JSON has no explicit `format` wire value yet
+  // (js/ahirudb.js's FORMAT_CODES has no entry for it), so it can only be
+  // reached through extension-based auto-detection. Keep the extension on
+  // the registered name in that case, same as the bundled json_demo.json
+  // sample; reference it quoted (quoteIfNeeded handles that below).
+  const name = format === 'json' ? `${stripped}.json` : stripped;
+  const options = format !== 'json' && format !== 'parquet' ? { format } : undefined;
   try {
     const db = await ensureDb();
-    db.register(name, file);
+    db.register(name, file, options);
     registered.set(name, file.name);
     renderTablesList();
     sqlBox.value = `SELECT * FROM ${quoteIfNeeded(name)} LIMIT 20`;
