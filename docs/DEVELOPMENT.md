@@ -8,7 +8,7 @@ can write in a query, see [sql/README.md](sql/README.md).
 
 | Tool | Needed for |
 |---|---|
-| Rust (stable) | building and testing |
+| Rust | building and testing — the version is pinned by `rust-toolchain.toml` and rustup installs it (with `clippy`, `rustfmt` and the wasm target) on the first `cargo` invocation |
 | `wasm32-unknown-unknown` target | wasm builds and size measurement |
 | [DuckDB CLI](https://duckdb.org/docs/installation/) | SQL end-to-end tests and test-data generation (tests that need it are skipped when absent) |
 | Node 18+ | JS host test suite |
@@ -23,10 +23,15 @@ so the split is "develop and test natively, measure size on wasm"
 
 ```bash
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --all-features
 cargo fmt --all --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
+
+`--all-features` is not optional. Several integration test files are gated
+behind `#![cfg(feature = "dml")]` or `"export"`, so without it they are
+compiled out and `cargo test` reports success without having run them.
 
 The native CLI is the fastest way to poke at a change:
 
@@ -66,8 +71,13 @@ binary entirely (DESIGN.md §16).
 ## Tests
 
 ```bash
-cargo test --workspace
+cargo test --workspace --all-features
 ```
+
+A plain `cargo test --workspace` skips every `dml`-gated file silently (four
+files, 45 tests), and only picks up the `export`-gated ones by accident,
+through workspace feature unification from `ahiru-cli`. CI runs the
+`--all-features` form for that reason.
 
 The SQL end-to-end tests (`crates/ahiru-cli/tests/sql_e2e.rs`) **don't
 hardcode expected values — the same query is run against DuckDB and the
@@ -100,8 +110,13 @@ It reports raw and gzip sizes per configuration plus the incremental cost of
 adding CSV / JSONL / ZSTD, and with `wasm-opt` and `twiggy` installed, the
 optimized size and a function-by-function breakdown.
 
-The 1 MiB gate is judged on the **fully-loaded configuration** — passing only
-with a trimmed distribution wouldn't actually enforce the budget. CI runs the
+The opt-in write-path features are measured too, marked `[opt-in]`, as deltas
+on top of the default `zstd` config. They are informational: those features
+are not part of the distributed default, so they stay outside the gate.
+
+The 1 MiB gate is judged on the **fully-loaded read configuration**
+(`zstd,csv,jsonl`) — passing only with a trimmed distribution wouldn't
+actually enforce the budget. CI runs the
 gate as its own job on every PR, because size is a constraint to hold, not a
 target to measure at the end (DESIGN.md §11). Adding a dependency requires
 attaching the measured size delta to the PR.

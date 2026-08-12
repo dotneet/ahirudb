@@ -205,7 +205,7 @@ struct Partial {
 /// time: literal components are appended without touching the filesystem,
 /// `**` recurses through zero or more directory levels, and any other
 /// component lists its parent directory and keeps entries whose name
-/// [`matches`]. Only the final component is allowed to match plain files —
+/// [`matches()`]. Only the final component is allowed to match plain files —
 /// every earlier component must resolve to a directory to descend into.
 pub fn expand(pattern: &str) -> Vec<PathBuf> {
     if pattern.is_empty() {

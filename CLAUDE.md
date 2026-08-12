@@ -28,14 +28,26 @@ Before considering a change done, run:
 
 ```bash
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --all-features
 cargo fmt --all --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
+Keep `--all-features`: the `dml`- and `export`-gated integration tests are
+compiled out without it, and `cargo test` then passes without running them.
+
 If touching `crates/ahiru-core`, also check the opt-in feature combinations
-that apply (`csv`, `jsonl`, `export`, `export-parquet`, `ddl`, `dml`) and the
-wasm size budget:
+that apply (`csv`, `jsonl`, `export`, `export-parquet`, `ddl`, `dml`) on the
+wasm target, and the wasm size budget. `--target wasm32-unknown-unknown` is
+required: a `no_std` build for the host target fails, because the host is
+`panic=unwind` while the crate brings its own panic handler. Use
+`--profile wasm` so the check matches what actually ships.
+
+```bash
+cargo check -p ahiru-core --target wasm32-unknown-unknown --profile wasm \
+  --no-default-features --features zstd,csv,jsonl,export,export-parquet,dml
+```
 
 ```bash
 ./scripts/size.sh

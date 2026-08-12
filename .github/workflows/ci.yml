@@ -13,16 +13,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version and its components/targets; rustup (preinstalled on GitHub's
+      # ubuntu runners) reads it and installs everything the file declares.
+      # With no toolchain argument this installs the active one, i.e. exactly
+      # what that file pins. `rustup show` is not a substitute: since rustup
+      # 1.28 it no longer installs the active toolchain as a side effect.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
 
       - name: fmt
         run: cargo fmt --all --check
 
+      # --all-features so this lints the same code the test step below
+      # actually compiles and runs (see the comment on that step).
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features
 
       - name: install duckdb (reference implementation for cross-checking SQL results)
         run: |
@@ -31,8 +42,56 @@ jobs:
           chmod +x /usr/local/bin/duckdb
           duckdb -version
 
+      # --all-features is load-bearing, not cosmetic: ddl_dml.rs,
+      # any_all_subquery.rs, correlated_subqueries.rs, and
+      # qa_ddl_dml_edge_cases.rs are `#![cfg(feature = "dml")]` and are
+      # compiled out entirely under plain `--all`, silently skipping 45
+      # tests. The `export`/`export-parquet` tests were also only running
+      # by accident, via feature unification from ahiru-cli depending on
+      # ahiru-core with those features enabled -- `--all-features` makes
+      # that intent explicit instead of leaving it to a workspace-graph
+      # accident.
       - name: test
-        run: cargo test --all
+        run: cargo test --workspace --all-features
+
+  # The wasm build is only ever exercised by scripts/size.sh, which covers
+  # just the read-path feature combinations (csv/jsonl/zstd). The mutating
+  # features (export, export-parquet, ddl, dml) are `no_std` and have their
+  # own panic handler, so nothing here proved they even compile for wasm
+  # before this job existed. One job, one cache, a shell loop over feature
+  # sets -- cheaper than a GitHub matrix for this many short cargo-check runs.
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check wasm feature combinations
+        run: |
+          set -euo pipefail
+          # --target wasm32-unknown-unknown is required: these are no_std
+          # builds that bring their own panic handler, so the same command
+          # without it fails against the host's panic=unwind profile. The
+          # wasm target defaults to panic=abort, which is what the crate
+          # assumes.
+          # --profile wasm is the configuration that actually ships, so it is
+          # the one worth compile-checking (it also reuses the same build
+          # units as the size job's cache).
+          for features in \
+            "" \
+            "zstd" \
+            "csv,jsonl" \
+            "zstd,csv,jsonl" \
+            "zstd,export,export-parquet" \
+            "zstd,dml" \
+            "zstd,csv,jsonl,export,export-parquet,dml"; do
+            echo "::group::features=[$features]"
+            args=(--profile wasm --target wasm32-unknown-unknown -p ahiru-core --no-default-features)
+            [ -n "$features" ] && args+=(--features "$features")
+            cargo check "${args[@]}"
+            echo "::endgroup::"
+          done
 
   # Size is not a goal we measure at the end but a constraint every PR upholds,
   # so it gets its own job and acts as a hard gate (DESIGN.md §11).
@@ -40,9 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
 
       - name: install binaryen and twiggy
@@ -82,9 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - run: rustup toolchain install
       - uses: actions/setup-node@v4
         with:
           node-version: '20'

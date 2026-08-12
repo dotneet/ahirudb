@@ -7,6 +7,17 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/dotneet/ahirudb"
+# Pinned conservatively to the toolchain in rust-toolchain.toml, not a
+# discovered lower bound; see that file's comment for why the toolchain
+# itself is pinned.
+rust-version = "1.97"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# Low-risk hygiene lints, verified to produce zero warnings across the
+# workspace (all crates, --all-targets --all-features) before being added.
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
 
 # For native development. Tests and debugging run here.
 [profile.release]
