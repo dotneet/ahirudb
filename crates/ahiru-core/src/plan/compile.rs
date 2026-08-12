@@ -788,6 +788,33 @@ impl<'a> Compiler<'a> {
         }
 
         if op == BinaryOp::Concat {
+            // `||` between two JSON operands is *list* concatenation, not text
+            // concatenation (`duckdb -c "select [1,2] || [3]"` -> `[1, 2, 3]`).
+            // A list has no physical type of its own here — it is a `Ty::Json`
+            // value (`docs/DESIGN.md` §5/§8) — so this is the only place the
+            // distinction can be made, and it has to be made on the static
+            // type. Everything else (including JSON on just one side, e.g.
+            // `json_col || 'x'`) keeps the VARCHAR behavior, which is what
+            // `'a' || 1` -> `a1` relies on.
+            //
+            // `Ty::Null` counts as a JSON operand as long as the other side is
+            // JSON, so `[1] || NULL` stays a JSON NULL rather than becoming a
+            // VARCHAR one; `coerce` turns the untyped NULL into a JSON NULL
+            // constant. The result is NULL either way (`duckdb -c "select [1]
+            // || NULL::INTEGER[]"` -> NULL), only its type differs.
+            //
+            // Whether the JSON values are actually *arrays* can only be known
+            // at run time; a non-array operand raises `TypeMismatch` there
+            // (`funcs::json::list_concat_build`).
+            let json_side = |t: Ty| matches!(t, Ty::Json | Ty::Null);
+            if json_side(lt) && json_side(rt) && (lt == Ty::Json || rt == Ty::Json) {
+                let l = self.coerce(lr, lt, Ty::Json)?;
+                let r = self.coerce(rr, rt, Ty::Json)?;
+                let aux = self.prog.add_call(funcs::F_LIST_CONCAT_OP, vec![l, r], Ty::Json);
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::with_aux(OpCode::Call, Ty::Json.phys(), dst, 0, 0, aux));
+                return Ok((dst, Ty::Json));
+            }
             let l = self.coerce(lr, lt, Ty::Varchar)?;
             let r = self.coerce(rr, rt, Ty::Varchar)?;
             return Ok((self.emit(OpCode::Concat, Ty::Varchar, l, r), Ty::Varchar));

@@ -70,7 +70,8 @@ user-visible effect.
   invisible, but it means, for example, that list elements need an explicit
   `CAST(... AS VARCHAR)` / `CAST(... AS INTEGER)` round-trip before doing
   arithmetic on them inside a lambda (`list_transform(xs, x -> CAST(CAST(x
-  AS VARCHAR) AS INTEGER) + 1)`).
+  AS VARCHAR) AS INTEGER) + 1)`). It also changes what `||` means — see
+  [JSON is also the list type](#json-is-also-the-list-type) below.
 - **JSON equality is byte-comparison**, not semantic comparison — two JSON
   documents that differ only in whitespace (`'{"a": 1}'` vs `'{"a":1}'`)
   compare unequal. Only `=`/`<>` are defined on `JSON`; ordering comparisons
@@ -102,6 +103,46 @@ user-visible effect.
   on purpose instead: `!` binds looser than the prefix operators (so
   `-x!` is `(-x)!` for any `x`, matching DuckDB) but tighter than every
   binary operator. See [functions-numeric.md](functions-numeric.md#factorial).
+
+## JSON is also the list type
+
+DuckDB has a statically-typed `LIST` and a separate `JSON` type. ahirudb has
+only `JSON` (see [DESIGN.md §5/§8](../DESIGN.md) — six physical types is a
+load-bearing size constraint), so `[1, 2]` and `CAST('[1,2]' AS JSON)` are
+literally the same value of the same type. Three consequences, all of them
+around `||`:
+
+- **`||` between two `JSON` operands concatenates them as lists**, matching
+  `SELECT [1,2] || [3]` → `[1, 2, 3]` in DuckDB. **An operand that isn't a
+  JSON array raises a `TypeMismatch` error at run time.** This is where it
+  diverges: DuckDB's `JSON` isn't a list, so `'{"a":1}'::JSON ||
+  '{"b":2}'::JSON` there is VARCHAR text concatenation (`{"a":1}{"b":2}`).
+  Nothing in the type can distinguish the two cases here, so one behavior
+  has to win — and an error is the only one that doesn't silently return a
+  wrong answer. (Returning `NULL` was considered and rejected: it would be
+  harder to notice than the invalid-JSON string this whole rule replaced.)
+  **To concatenate two JSON documents as text, cast out of `JSON` first:**
+  `CAST(a AS VARCHAR) || CAST(b AS VARCHAR)`. Mixed operands
+  (`[1] || '{"a":1}'::JSON`) raise too, in either order, and so does a
+  non-array paired with `NULL` — the error takes priority over `NULL`
+  propagation so the result never depends on operand order. `[1] || NULL`
+  is still `NULL`. Note that the `list_concat` **function** is *not* strict
+  this way: it keeps returning `NULL` for a non-array operand, like every
+  other `list_*` function (`list_extract`, `list_slice`,
+  `list_transform`).
+- **`||` with `JSON` on one side only stays VARCHAR concatenation.** `SELECT
+  [1] || 2` is `'[1]2'` here; DuckDB rejects it ("Cannot concatenate types
+  INTEGER[] and INTEGER"). It can afford to, because it can tell a list from
+  a JSON document, and `json_col || 'suffix'` is legal DuckDB — rejecting it
+  here would reject that too.
+- **Mixed element types are allowed.** `SELECT ['a'] || [1]` is
+  `'["a",1]'`; DuckDB rejects it ("Cannot concatenate lists of types
+  VARCHAR[] and INTEGER[]") because its lists are homogeneously typed. JSON
+  arrays aren't.
+
+See [functions-json.md](functions-json.md#concatenating-lists) for the
+`list_concat` function, which is defined on the same values but handles
+`NULL` differently (as DuckDB also does).
 
 ## No spilling
 

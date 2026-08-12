@@ -169,6 +169,18 @@ const F_JSON_ARRAY_LENGTH: FuncId = 90;
 /// 100 以上の番号を汎用関数に使うと衝突する。
 const F_LIST_SLICE: FuncId = 92;
 
+// `list_concat` (and its `list_cat`/`array_concat`/`array_cat` aliases), plus
+// the `||` operator when both operands are `JSON`. Two IDs share one body
+// (`json::list_concat_build`) because the only difference between them is
+// NULL handling, which DuckDB defines differently for the function and the
+// operator — see that function's doc comment for the verification commands.
+// 94/95 are the next free numbers below `F_PART_BASE` (93 = `F_FACTORIAL`).
+//
+// `F_LIST_CONCAT_OP` is `pub(crate)` because `plan::compile::binary` emits it
+// directly: `resolve` is keyed on a function name, and `||` has none.
+const F_LIST_CONCAT: FuncId = 94;
+pub(crate) const F_LIST_CONCAT_OP: FuncId = 95;
+
 /// `year()` などの略記。ID に part 番号を埋め込み、`date_part` と同じ
 /// 抽出関数へ合流させる（関数ごとに ID を分けても中身は 1 本）。
 const F_PART_BASE: FuncId = 100;
@@ -356,6 +368,16 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         // なく切り詰める（`crate::json::list_slice` のモジュール doc 参照）。
         "list_slice" | "array_slice" => fixed(F_LIST_SLICE, &[Json, BigInt, BigInt], n, 3, Json),
         "map_extract" => fixed(F_MAP_EXTRACT, &[Json, Varchar], n, 2, Json),
+        // Variadic, like DuckDB (`duckdb -c "select list_concat([1]),
+        // list_concat([1,2],[3],NULL::INT[],[4])"` -> `[1]`, `[1, 2, 3, 4]`).
+        // `list_cat`/`array_concat`/`array_cat` are DuckDB's own aliases for
+        // the same function (verified with `duckdb -c "select list_cat([1],
+        // [2]), array_concat([1],[2]), array_cat([1],[2])"`), and cost one
+        // more match pattern each.
+        "list_concat" | "list_cat" | "array_concat" | "array_cat" => {
+            ensure!(n >= 1, WrongArgCount);
+            Ok((F_LIST_CONCAT, vec![Json; n], Json))
+        }
         "to_json" => {
             ensure!(n == 1, WrongArgCount);
             ensure!(json_encodable(args[0]), TypeMismatch);
@@ -549,6 +571,13 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
         // 専用関数へ渡す。
         F_JSON_ARRAY => return json_array_build(args),
         F_JSON_OBJECT => return json_object_build(args),
+        // `list_concat` and `||`-on-JSON also decide NULL row by row rather
+        // than letting `call()`'s default propagation do it (the function form
+        // treats a NULL list as an empty one; the operator form has to keep
+        // inspecting the other operands after seeing a NULL, because a
+        // non-array one raises), so they get the same bypass as
+        // `concat`/`json_array`.
+        F_LIST_CONCAT | F_LIST_CONCAT_OP => return list_concat_build(args, id == F_LIST_CONCAT_OP),
         _ => {}
     }
     let (n, s) = strides(args)?;
@@ -825,8 +854,8 @@ mod tests;
 // `call()` above dispatches into these submodule bodies.
 use bool_ops::eval_bool;
 use json::{
-    concat_all, extremum, fold_null, json_array_build, json_object_build, nullif,
-    regexp_full_match_build,
+    concat_all, extremum, fold_null, json_array_build, json_object_build, list_concat_build,
+    nullif, regexp_full_match_build,
 };
 use numeric::{eval_f64, eval_i128, eval_int};
 use string::eval_str;

@@ -59,6 +59,10 @@ nothing to the result. This differs from `||` (the `Concat` binary
 operator), which follows standard NULL propagation (`'a' || NULL` is
 `NULL`).
 
+`||` is string concatenation *unless both operands are `JSON`*, in which
+case it concatenates them as lists (`[1,2] || [3]` → `[1,2,3]`) — see
+[functions-json.md](functions-json.md#concatenating-lists).
+
 ## Pattern matching
 
 ```sql

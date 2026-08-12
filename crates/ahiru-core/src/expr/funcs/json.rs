@@ -168,6 +168,106 @@ pub(super) fn json_array_build(args: &[&Vector]) -> Result<Vector> {
     Ok(Vector::from_data(Ty::Json, Data::Bytes(out), None))
 }
 
+/// `list_concat`/`list_cat`/`array_concat`/`array_cat`, and the `||` operator
+/// when both of its operands are `JSON` (`plan::compile::binary` emits
+/// `F_LIST_CONCAT_OP` for that case). `is_operator` selects between the two,
+/// which differ in NULL handling and in what a non-array operand does.
+///
+/// **NULL.** DuckDB defines the function and the operator differently, and
+/// this reproduces both:
+///
+/// - `duckdb -c "select list_concat([1], NULL::INTEGER[]),
+///   list_concat(NULL::INTEGER[], NULL::INTEGER[])"` -> `[1]`, `[]`. The
+///   function reads a NULL list as an empty one and never returns NULL.
+/// - `duckdb -c "select [1] || NULL::INTEGER[], NULL || [1]"` -> NULL, NULL.
+///   The operator propagates NULL like every other binary operator.
+///
+/// Other DuckDB-verified cases this reproduces: `[1,2] || [3]` -> `[1, 2, 3]`,
+/// `[] || [1]` -> `[1]`, `list_concat([1,2],[3],NULL::INT[],[4])` ->
+/// `[1, 2, 3, 4]`.
+///
+/// **A JSON value that is not an array.** DuckDB cannot reach this case:
+/// there `LIST` and `JSON` are separate types, so `'{"a":1}'::JSON ||
+/// '{"b":2}'::JSON` is *string* concatenation (`{"a":1}{"b":2}`, VARCHAR),
+/// and every mixed combination is a binder error (`duckdb -c "select [1] ||
+/// '{\"a\":1}'::JSON"` -> "Cannot concatenate types INTEGER[] and JSON - an
+/// explicit cast is required"; the same for `'[2]'::JSON` on the right, and
+/// with the operands swapped). This engine has no `LIST` physical type — a
+/// list *is* a `Ty::Json` value (`docs/DESIGN.md` §5/§8) — so the two cases
+/// are indistinguishable at plan time and the behavior has to be chosen:
+///
+/// - **The operator raises `TypeMismatch`.** That is the code the VARCHAR
+///   `||` kernel itself already raises for a run-time type problem
+///   (`kernels::concat`), and the code `plan::compile::binary` already raises
+///   for the other undefined `JSON` operator (ordering comparison). Returning
+///   NULL instead would trade one silent wrong answer for another — and a
+///   harder one to notice than the invalid-JSON string (`{"a":1}{"b":2}`)
+///   this function was written to replace. `CAST(a AS VARCHAR) || CAST(b AS
+///   VARCHAR)` is the documented way to get DuckDB's text concatenation.
+/// - **The function still yields SQL NULL**, matching the leniency every
+///   other `list_*` function here has for non-array JSON
+///   (`list_extract`/`list_slice`/`list_transform`).
+///
+/// The operator's error takes priority over NULL propagation, so the result
+/// does not depend on operand order: `'{"a":1}'::JSON || NULL` and `NULL ||
+/// '{"a":1}'::JSON` both raise, rather than one raising and the other
+/// returning NULL depending on which side is scanned first. A row is NULL
+/// only when every non-NULL operand is a well-formed array. Documented in
+/// `docs/sql/limitations.md`.
+///
+/// Element spans are copied verbatim out of each input, so no element is
+/// re-serialized; `crate::json::list_slice(doc, 1, i64::MAX)` gives both the
+/// span covering every element and the "is this an array at all" check, and
+/// validates the array's structure on the way (a malformed input is an
+/// `Err`, not a silently truncated list).
+pub(super) fn list_concat_build(args: &[&Vector], is_operator: bool) -> Result<Vector> {
+    let (n, s) = strides(args)?;
+    let mut out = BytesData::with_capacity(n, n * 8);
+    let mut bad: Option<Bitmap> = None;
+    let mut buf = Vec::new();
+    for i in 0..n {
+        buf.clear();
+        buf.push(b'[');
+        let mut null_row = false;
+        for (k, a) in args.iter().enumerate() {
+            let j = i * s[k];
+            if !a.is_valid(j) {
+                // The function reads a NULL list as an empty one; the operator
+                // propagates. Keep scanning either way — a later non-array
+                // operand still has to raise (see the doc comment).
+                null_row |= is_operator;
+                continue;
+            }
+            let doc = a.bytes().get(j);
+            let Some((lo, hi)) = crate::json::list_slice(doc, 1, i64::MAX)? else {
+                if is_operator {
+                    err!(TypeMismatch);
+                }
+                null_row = true;
+                break;
+            };
+            if lo == hi {
+                continue; // Empty list: contributes nothing, not even a comma.
+            }
+            if buf.len() > 1 {
+                buf.push(b',');
+            }
+            buf.extend_from_slice(&doc[lo..hi]);
+        }
+        buf.push(b']');
+        if null_row {
+            out.push_empty();
+            set_null(&mut bad, i, n);
+        } else {
+            ensure!(out.data.len() + buf.len() <= u32::MAX as usize, LimitExceeded);
+            out.push(&buf);
+        }
+    }
+    let mut v = Vector::from_data(Ty::Json, Data::Bytes(out), bad);
+    v.compact_validity();
+    Ok(v)
+}
+
 /// `json_object(key1, val1, key2, val2, ...)`。キーは `resolve` が
 /// VARCHAR へ変換済み。NULL キーは意味のある既定が無いので空文字列キーに
 /// 落とす（他の値と同じく `null` にはしない: JSON のキーは文字列でなければ

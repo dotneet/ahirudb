@@ -863,6 +863,139 @@ fn list_extract_is_one_based_with_negative_from_end() {
 }
 
 #[test]
+fn list_concat_joins_arrays_and_reads_null_as_an_empty_list() {
+    // duckdb: list_concat([1,2],[3]) -> [1, 2, 3];
+    //         list_concat([], [1]) -> [1]; list_concat([1]) -> [1];
+    //         list_concat([1,2],[3],NULL::INT[],[4]) -> [1, 2, 3, 4];
+    //         list_concat([1], NULL::INTEGER[]) -> [1];
+    //         list_concat(NULL::INTEGER[], NULL::INTEGER[]) -> [].
+    // A NULL list reads as an empty one, so the function never returns NULL.
+    let one = |args: &[&Vector]| str_at(&run("list_concat", args).unwrap(), 0);
+    let a = vj(&[Some("[1,2]")]);
+    let b = vj(&[Some("[3]")]);
+    let empty = vj(&[Some("[]")]);
+    let null = vj(&[None]);
+    assert_eq!(one(&[&a, &b]).as_deref(), Some("[1,2,3]"));
+    assert_eq!(one(&[&empty, &b]).as_deref(), Some("[3]"));
+    assert_eq!(one(&[&b, &empty]).as_deref(), Some("[3]"));
+    assert_eq!(one(&[&a]).as_deref(), Some("[1,2]"));
+    assert_eq!(one(&[&a, &b, &null, &vj(&[Some("[4]")])]).as_deref(), Some("[1,2,3,4]"));
+    assert_eq!(one(&[&a, &null]).as_deref(), Some("[1,2]"));
+    assert_eq!(one(&[&null, &null]).as_deref(), Some("[]"));
+    assert_eq!(code_of(resolve("list_concat", &[])), Some(Code::WrongArgCount));
+}
+
+#[test]
+fn list_concat_aliases_resolve_to_the_same_function() {
+    // duckdb: list_cat([1],[2]) = array_concat([1],[2]) = array_cat([1],[2])
+    //         = list_concat([1],[2]) -> [1, 2]
+    let (a, b) = (vj(&[Some("[1]")]), vj(&[Some("[2]")]));
+    for name in ["list_concat", "list_cat", "array_concat", "array_cat"] {
+        let out = run(name, &[&a, &b]).unwrap();
+        assert_eq!(out.ty(), Ty::Json);
+        assert_eq!(str_at(&out, 0).as_deref(), Some("[1,2]"), "{name}");
+    }
+}
+
+#[test]
+fn list_concat_function_is_null_when_an_operand_is_not_a_json_array() {
+    // This case cannot exist in DuckDB (LIST and JSON are separate types
+    // there, so a non-list argument is a binder error). Here a list *is* a
+    // JSON value, so it has to be decided at run time. The *function* keeps
+    // the leniency `list_extract`/`list_slice`/`list_transform` already have
+    // — SQL NULL, never a text concatenation that would produce invalid JSON.
+    // The *operator* raises instead, see
+    // `list_concat_operator_raises_type_mismatch_on_a_non_array`.
+    let obj = vj(&[Some(r#"{"a":1}"#)]);
+    let arr = vj(&[Some("[1]")]);
+    assert_eq!(str_at(&run("list_concat", &[&obj, &arr]).unwrap(), 0), None);
+    assert_eq!(str_at(&run("list_concat", &[&arr, &obj]).unwrap(), 0), None);
+    assert_eq!(str_at(&run("list_concat", &[&vj(&[Some("5")]), &arr]).unwrap(), 0), None);
+}
+
+/// `||` on JSON, which `resolve` cannot reach (an operator has no name) —
+/// `plan::compile::binary` emits `F_LIST_CONCAT_OP` directly, so call it the
+/// same way here.
+fn concat_op(args: &[&Vector]) -> Result<Vector> {
+    call(F_LIST_CONCAT_OP, Ty::Json, args)
+}
+
+#[test]
+fn list_concat_operator_propagates_null_where_the_function_absorbs_it() {
+    // duckdb: [1,2] || [3] -> [1, 2, 3]; [1] || NULL::INTEGER[] -> NULL;
+    //         NULL || [1] -> NULL.
+    // Contrast `list_concat_joins_arrays_and_reads_null_as_an_empty_list`:
+    // the function returns `[1]`/`[]` for the same NULL operands.
+    let (a, b) = (vj(&[Some("[1,2]")]), vj(&[Some("[3]")]));
+    let null = vj(&[None]);
+    assert_eq!(str_at(&concat_op(&[&a, &b]).unwrap(), 0).as_deref(), Some("[1,2,3]"));
+    assert_eq!(str_at(&concat_op(&[&a, &null]).unwrap(), 0), None);
+    assert_eq!(str_at(&concat_op(&[&null, &a]).unwrap(), 0), None);
+    assert_eq!(str_at(&concat_op(&[&null, &null]).unwrap(), 0), None);
+}
+
+#[test]
+fn list_concat_operator_raises_type_mismatch_on_a_non_array() {
+    // A non-array JSON operand is a hard error for the operator, not NULL:
+    // NULL would trade one silent wrong answer for another, and this whole
+    // code path exists to stop `||` from quietly returning `{"a":1}{"b":2}`.
+    // `TypeMismatch` is what the VARCHAR `||` kernel (`kernels::concat`) and
+    // the other undefined JSON operator (ordering comparison) already raise.
+    let obj = vj(&[Some(r#"{"a":1}"#)]);
+    let arr = vj(&[Some("[1]")]);
+    let scalar = vj(&[Some("5")]);
+    let null = vj(&[None]);
+    for args in [
+        [&obj, &obj],
+        [&obj, &arr], // mixed: duckdb rejects `[1] || '{"a":1}'::JSON` too
+        [&arr, &obj],
+        [&scalar, &arr],
+        // The error wins over NULL propagation, in either operand order, so
+        // the result never depends on which side is scanned first.
+        [&obj, &null],
+        [&null, &obj],
+    ] {
+        assert_eq!(code_of(concat_op(&args)), Some(Code::TypeMismatch));
+    }
+}
+
+#[test]
+fn list_concat_operator_keeps_rows_independent() {
+    // A whole-batch raise, not a per-row one: any row with a non-array
+    // operand fails the query. Rows that are all arrays still concatenate
+    // when no row is bad.
+    let a = vj(&[Some("[1]"), Some("[]"), None]);
+    let b = vj(&[Some("[2]")]);
+    let out = concat_op(&[&a, &b]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some("[1,2]"));
+    assert_eq!(str_at(&out, 1).as_deref(), Some("[2]"));
+    assert_eq!(str_at(&out, 2), None);
+
+    let bad = vj(&[Some("[1]"), Some(r#"{"a":1}"#)]);
+    assert_eq!(code_of(concat_op(&[&bad, &b])), Some(Code::TypeMismatch));
+}
+
+#[test]
+fn list_concat_keeps_rows_independent() {
+    // Per-row NULL, not a whole-vector one: row 1's non-array operand must
+    // not disturb rows 0/2. Also exercises the constant (stride 0) path.
+    let a = vj(&[Some("[1]"), Some(r#"{"a":1}"#), Some("[]")]);
+    let b = vj(&[Some("[2]")]);
+    let out = run("list_concat", &[&a, &b]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some("[1,2]"));
+    assert_eq!(str_at(&out, 1), None);
+    assert_eq!(str_at(&out, 2).as_deref(), Some("[2]"));
+}
+
+#[test]
+fn list_concat_rejects_malformed_json_instead_of_truncating() {
+    // A broken array is an error, not a silently shortened list.
+    let bad = vj(&[Some("[1,")]);
+    let ok = vj(&[Some("[2]")]);
+    assert!(run("list_concat", &[&bad, &ok]).is_err());
+}
+
+#[test]
 fn map_extract_looks_up_a_key_or_returns_null() {
     let m = vj(&[Some(r#"{"a":1,"b":2}"#)]);
     assert_eq!(
