@@ -76,10 +76,15 @@ Only a misspelled value fails, with E409 — falling back to Auto would read it
 as Parquet and fail with an opaque `BadMagic` instead.
 
 Extension-based detection recognizes `.csv` / `.tsv` / `.tab` / `.jsonl` /
-`.ndjson`; anything else is treated as Parquet. CSV and JSONL are gated behind
-wasm-side features (`--features csv,jsonl`), so they aren't present in the
-default distribution build. Registering them against a build that lacks the
-feature raises E409.
+`.ndjson` / `.json`; anything else is treated as Parquet. `.json` means a
+single top-level JSON document (array of objects, or one object) — the
+`read_json`/`read_json_auto` shape, distinct from `.jsonl`'s one-object-per-line
+— and can currently only be reached through extension detection: there is no
+`format: 'json'` option, since `ahiru_register_as`'s explicit-format
+parameter doesn't have a wire value for it yet. CSV and JSONL are gated
+behind wasm-side features (`--features csv,jsonl`), so they aren't present in
+the default distribution build. Registering them against a build that lacks
+the feature raises E409.
 
 ### Parameters
 
@@ -100,6 +105,7 @@ off-by-a-magnitude bugs). To compare against a TIMESTAMP, pass
 | FLOAT / DOUBLE | `number` |
 | DECIMAL | `string` (precision/scale already applied, e.g. `"1.0050"`) |
 | VARCHAR | `string` (already UTF-8 decoded) |
+| JSON | `string` (raw JSON text, not parsed — call `JSON.parse()` yourself if you want an object/array back) |
 | BLOB | `Uint8Array` |
 | NULL | `null` |
 

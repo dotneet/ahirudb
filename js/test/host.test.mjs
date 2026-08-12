@@ -933,6 +933,26 @@ test('DECIMAL は precision/scale を適用した文字列で返る', { skip: ne
   }
 });
 
+test('JSON 型は生テキストの string で返る（デコード済み文字列にはしない）', { skip: needsVm }, async () => {
+  const db = await openDb();
+  try {
+    const rows = await db.query(
+      "SELECT json_object('a', 1, 'b', [1, 2, 3]) AS o, json_array(1, 2, 3) AS l FROM range(1)",
+    );
+    assert.deepEqual(rows, [{ o: '{"a":1,"b":[1,2,3]}', l: '[1,2,3]' }]);
+    assert.equal(typeof rows[0].o, 'string');
+    assert.equal(typeof rows[0].l, 'string');
+    // 呼び出し側が必要なら自分で JSON.parse する契約であることの確認。
+    assert.deepEqual(JSON.parse(rows[0].o), { a: 1, b: [1, 2, 3] });
+    assert.deepEqual(JSON.parse(rows[0].l), [1, 2, 3]);
+    for await (const b of db.stream("SELECT json_array(1, 2) AS l FROM range(1)")) {
+      assert.equal(b.schema[0].type, 'JSON');
+    }
+  } finally {
+    db.close();
+  }
+});
+
 // --- コーデック委譲 ----------------------------------------------------------
 
 test('decodeCodecRequests は要求列を読む', () => {
@@ -1079,6 +1099,7 @@ test('detectFormat は登録名の拡張子でフォーマットを決める', (
   assert.equal(detectFormat('a.CSV'), 'csv');
   assert.equal(detectFormat('a.tsv'), 'tsv');
   assert.equal(detectFormat('a.ndjson'), 'jsonl');
+  assert.equal(detectFormat('a.json'), 'json');
   assert.equal(detectFormat('data'), 'parquet');
   assert.equal(detectFormat('https://x/y/trips.csv?token=abc'), 'csv');
   assert.equal(detectFormat('https://x/y/data.parquet?name=a.csv'), 'parquet');

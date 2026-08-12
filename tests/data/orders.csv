@@ -1,0 +1,11 @@
+order_id,customer_id,amount,status
+101,1,250.00,paid
+102,1,80.50,paid
+103,2,120.00,pending
+104,2,300.00,paid
+105,3,45.00,paid
+106,3,60.00,paid
+107,3,15.00,cancelled
+108,4,500.00,paid
+109,5,20.00,paid
+110,1,99.99,paid

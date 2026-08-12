@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ahirudb — WASM SQL demo</title>
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+<header>
+  <h1>ahirudb</h1>
+  <p class="tagline">
+    A SQL engine that queries Parquet / CSV / JSONL directly, running entirely
+    in this tab as &lt;1&nbsp;MiB of WebAssembly — no server, no upload.
+  </p>
+  <p id="db-status" class="db-status">Loading ahiru-core.wasm…</p>
+</header>
+
+<main>
+  <section class="panel data-panel">
+    <h2>Data</h2>
+
+    <div class="field">
+      <label for="sample-select">Sample files (bundled under <code>tests/data/</code>)</label>
+      <div class="row">
+        <select id="sample-select"></select>
+        <button id="load-sample" type="button">Register</button>
+      </div>
+      <p class="hint">
+        Parquet samples are registered by URL and fetched lazily over HTTP
+        Range requests as the query needs them — nothing is downloaded up
+        front.
+      </p>
+    </div>
+
+    <div class="field">
+      <label for="file-input">Or query your own file</label>
+      <input id="file-input" type="file" accept=".parquet,.csv,.tsv,.jsonl,.ndjson,.json" />
+      <p class="hint">
+        Stays in this tab. The file is registered directly from the
+        <code>File</code> object and never leaves the browser.
+      </p>
+    </div>
+
+    <div class="field">
+      <label>Registered tables</label>
+      <ul id="tables" class="tables"></ul>
+    </div>
+  </section>
+
+  <section class="panel query-panel">
+    <h2>Query</h2>
+    <textarea id="sql" spellcheck="false" rows="6">SELECT * FROM basic LIMIT 20</textarea>
+    <div class="row query-actions">
+      <button id="run" type="button">Run ▶ <span class="kbd">⌘/Ctrl + Enter</span></button>
+      <span id="status" class="status"></span>
+    </div>
+    <div id="results" class="results"></div>
+  </section>
+</main>
+
+<footer>
+  <p>
+    <a href="https://github.com/dotneet/ahirudb" target="_blank" rel="noopener">ahirudb on GitHub</a>
+    · <a href="../docs/sql/README.md" target="_blank" rel="noopener">SQL reference</a>
+    · Engine build: parquet + csv + jsonl + zstd (read-only demo; no <code>ddl</code>/<code>dml</code>/<code>export</code>)
+  </p>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

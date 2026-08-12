@@ -75,6 +75,7 @@ const TYPE_NAMES = [
 ];
 const TY_DECIMAL = 13;
 const TY_VARCHAR = 14;
+const TY_JSON = 20;
 const TY_UUID = 21;
 
 /** 隣接判定のしきい値。この幅未満の穴は「読んだ方が安い」として結合する。 */
@@ -204,6 +205,7 @@ export function detectFormat(name) {
   if (ext === 'csv') return 'csv';
   if (ext === 'tsv' || ext === 'tab') return 'tsv';
   if (ext === 'jsonl' || ext === 'ndjson') return 'jsonl';
+  if (ext === 'json') return 'json';
   return 'parquet';
 }
 
@@ -573,9 +575,11 @@ export function decodeBatch(u8, schema, copy = true) {
       for (let i = 0; i < numRows; i++) {
         const s = offsets[i];
         const e = offsets[i + 1];
-        // VARCHAR は UTF-8 文字列、UUID はハイフン付き 16 進文字列、
-        // それ以外（BLOB）はバイト列のまま返す。
-        if (ty === TY_VARCHAR) {
+        // VARCHAR / JSON は UTF-8 文字列（JSON の物理表現はデコード前の
+        // 生テキストそのものなので、そのまま文字列として渡してよい —
+        // `JSON.parse` するかどうかは呼び出し側に委ねる）、UUID はハイフン
+        // 付き 16 進文字列、それ以外（BLOB）はバイト列のまま返す。
+        if (ty === TY_VARCHAR || ty === TY_JSON) {
           values[i] = textDecoder.decode(data.subarray(s, e));
         } else if (ty === TY_UUID) {
           values[i] = formatUuid(data.subarray(s, e));

@@ -789,9 +789,12 @@ use string::eval_str;
 // so that path keeps resolving — only the implementation moved, not the
 // public name/path.
 pub(crate) use datetime::{
-    add_interval_to_ts, civil_from_days, days_from_civil, fmt_date, fmt_time, fmt_timestamp,
-    fmt_timestamptz, fmt_uuid, parse_date, parse_time, parse_timestamp, parse_timestamptz,
-    parse_uuid,
+    add_interval_to_ts, days_from_civil, fmt_date, fmt_time, fmt_timestamp, fmt_timestamptz,
+    fmt_uuid, parse_date, parse_time, parse_timestamp, parse_timestamptz, parse_uuid,
 };
+// Only `write::csv`/`write::jsonl` (both gated on `export`) reach this one;
+// every other caller of `datetime::*` above is unconditional.
+#[cfg(feature = "export")]
+pub(crate) use datetime::civil_from_days;
 pub use lambda::call_lambda;
 pub(crate) use numeric::{f_abs, f_trunc};

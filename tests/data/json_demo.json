@@ -1,0 +1,6 @@
+[
+  {"id": 1, "name": "widget", "tags": ["red", "small", "on-sale"], "attrs": {"color": "red", "weight_kg": 0.4, "in_stock": true}},
+  {"id": 2, "name": "gadget", "tags": ["blue", "large"], "attrs": {"color": "blue", "weight_kg": 2.1, "in_stock": false}},
+  {"id": 3, "name": "gizmo", "tags": [], "attrs": {"color": "green", "weight_kg": 1.05, "in_stock": true, "notes": "fragile"}},
+  {"id": 4, "name": "thingamajig", "tags": ["yellow", "clearance", "limited"], "attrs": {"color": "yellow", "weight_kg": 0.75, "in_stock": true}}
+]

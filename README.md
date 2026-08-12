@@ -58,6 +58,17 @@ wouldn't actually enforce the budget). CI fails if it exceeds 1 MiB.
 
 **Known gaps**: `PIVOT`/`UNPIVOT`, `ASOF JOIN`, general `LATERAL` (beyond `UNNEST`), `CREATE MACRO`, sequences/constraints, transactions, `ATTACH`, named parameters. See [docs/DESIGN.md §15](docs/DESIGN.md) for the full list of intentional limitations.
 
+## Browser demo
+
+```bash
+./scripts/demo.sh
+```
+
+Builds a Parquet + CSV + JSONL + ZSTD `.wasm` and opens a local page
+(`demo/`) where you can run SQL against the bundled sample files or your own
+`.parquet`/`.csv`/`.jsonl` — entirely in the tab, no server-side query
+execution. See [js/README.md](js/README.md) for the JS host API it's built on.
+
 ## Usage (native CLI)
 
 Development and testing run natively; debugging through wasm is inefficient.

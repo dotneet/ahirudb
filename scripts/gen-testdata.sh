@@ -279,6 +279,16 @@ else
   echo "!! pyarrow が無いので pagetest.parquet / list_pagetest.parquet の再生成をスキップします" >&2
 fi
 
+# --- ブラウザデモ用（demo/app.js の cross-format JOIN サンプル） -----------
+# customers は Parquet、orders.csv/regions.jsonl は手書きのプレーンテキスト
+# （duckdb で作る理由が無いのでここには含めない）。
+duckdb -c "
+COPY (SELECT * FROM (VALUES
+    (1, 'Alice', 'east'), (2, 'Bob', 'west'), (3, 'Carol', 'east'),
+    (4, 'Dave', 'west'), (5, 'Erin', 'north'), (6, 'Frank', 'south')
+  ) AS t(customer_id, name, region))
+TO 'customers.parquet' (FORMAT PARQUET);"
+
 echo
 ls -la
 echo
