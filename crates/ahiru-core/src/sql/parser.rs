@@ -247,6 +247,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `self.cur` が関数呼び出しの開き括弧であるという前提で、対応する閉じ
+    /// 括弧までの**同じ入れ子深さ**に `want` が現れるかを、何も消費せずに
+    /// 判定する（`peek_quantifier` と同じく `lex` の複製で先読みするだけ）。
+    ///
+    /// SQL 標準の `position(a IN b)` / `trim(BOTH x FROM s)` のように、
+    /// 引数リストの途中にキーワードを挟む構文かどうかを、引数の式そのものを
+    /// パースする前に確定させるために使う。`EXTRACT` の 2 トークン先読みでは
+    /// 足りない（キーワードの前に任意の長さの式が来る）ケース専用。
+    ///
+    /// 内側の呼び出し・部分クエリに現れた同じ語は深さで弾く
+    /// （`trim(f(x FROM y))` のような形を取り違えない）。入力は常に有限で、
+    /// 走査は閉じ括弧か `Eof` で必ず止まる。
+    fn call_has_top_level(&self, want: Tok<'a>) -> Result<bool> {
+        let mut lx = self.lex.clone();
+        // `self.lex` は既に `self.cur`（開き括弧）の**次**を指しているので、
+        // 深さは 1 から数え始める。
+        let mut depth = 1u32;
+        loop {
+            match lx.next_token()?.tok {
+                Tok::Eof => return Ok(false),
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen | Tok::RBracket => {
+                    // 開き括弧（`self.cur`）に対応する閉じ括弧まで来たら終わり。
+                    if depth == 1 {
+                        return Ok(false);
+                    }
+                    depth -= 1;
+                }
+                t if depth == 1 && t == want => return Ok(true),
+                _ => {}
+            }
+        }
+    }
+
     fn eat(&mut self, t: Tok<'a>) -> Result<bool> {
         if self.cur == t {
             self.bump()?;

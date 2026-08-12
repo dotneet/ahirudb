@@ -2523,3 +2523,180 @@ fn bang_still_lexes_as_the_prefix_of_longer_operators() {
     assert_eq!(code("SELECT a !~~ 'x' FROM t"), 0);
     assert_eq!(code("SELECT a !~~* 'x' FROM t"), 0);
 }
+
+// --- Typed temporal literals (`DATE '...'` and friends) ---------------------
+
+#[test]
+fn typed_temporal_literals_fold_to_typed_literal_constants() {
+    // duckdb: SELECT DATE '2020-01-01' -> 2020-01-01 (type DATE).
+    // 18262 = days from 1970-01-01 to 2020-01-01.
+    assert_eq!(ex("DATE '2020-01-01'"), "I32(18262)::DATE");
+    // duckdb: SELECT TIMESTAMP '2020-01-01 00:00:00' -> type TIMESTAMP.
+    assert_eq!(ex("TIMESTAMP '2020-01-01 00:00:00'"), "I64(1577836800000000)::TIMESTAMP");
+    // duckdb: SELECT TIME '01:00:00' -> type TIME.
+    assert_eq!(ex("TIME '01:00:00'"), "I64(3600000000)::TIME");
+    // duckdb: TIMESTAMPTZ '2020-01-01 09:00:00+09' is the same instant as
+    // 2020-01-01 00:00:00 UTC.
+    assert_eq!(ex("TIMESTAMPTZ '2020-01-01 09:00:00+09'"), "I64(1577836800000000)::TIMESTAMPTZ");
+}
+
+#[test]
+fn typed_temporal_literal_spelling_is_case_insensitive() {
+    assert_eq!(ex("date '2020-01-01'"), "I32(18262)::DATE");
+    assert_eq!(ex("Timestamp '2020-01-01 00:00:00'"), "I64(1577836800000000)::TIMESTAMP");
+}
+
+#[test]
+fn temporal_type_names_are_still_usable_as_column_names() {
+    // The whole point of not reserving them: column names come from data
+    // files. duckdb does not reserve these either (`select date, time from
+    // (select 1 as date, 2 as time)` works there).
+    assert_eq!(sel("SELECT date FROM t"), "SELECT date FROM t");
+    assert_eq!(sel("SELECT time, timestamp FROM t"), "SELECT time, timestamp FROM t");
+    assert_eq!(ex("date + 1"), "(date + 1i32)");
+    assert_eq!(ex("t.date"), "t.date");
+    assert_eq!(sel("SELECT 1 AS date FROM t"), "SELECT 1i32 AS date FROM t");
+    assert_eq!(
+        sel("SELECT a FROM t ORDER BY date"),
+        "SELECT a FROM t ORDER BY date ASC NULLS LAST"
+    );
+    // A quoted identifier is never read as a type name.
+    assert_eq!(ex("\"date\""), "date");
+    // `date(x)` stays an ordinary function call, not a literal.
+    assert_eq!(ex("date(x)"), "date(x)");
+}
+
+#[test]
+fn unparseable_typed_temporal_literal_is_a_parse_error() {
+    // duckdb raises `Conversion Error: invalid date field format` here.
+    // A literal is fixed query text, so it fails loudly instead of
+    // following this engine's "bad CAST input becomes NULL" rule.
+    assert_eq!(code("SELECT DATE 'nonsense' FROM t"), Code::InvalidCast as u16);
+    assert_eq!(code("SELECT TIMESTAMP '2020-13-01 00:00:00' FROM t"), Code::InvalidCast as u16);
+    assert_eq!(code("SELECT TIME '99:99:99' FROM t"), Code::InvalidCast as u16);
+}
+
+// --- `^@` prefix operator ---------------------------------------------------
+
+#[test]
+fn caret_at_desugars_to_starts_with() {
+    assert_eq!(ex("a ^@ 'x'"), "starts_with(a, 'x')");
+}
+
+#[test]
+fn caret_at_binds_tighter_than_concat_on_the_right_only() {
+    // duckdb: select 'a' || 'b' ^@ 'a'  -> true      i.e. ('a'||'b') ^@ 'a'
+    assert_eq!(ex("'a' || 'b' ^@ 'a'"), "starts_with(('a' || 'b'), 'a')");
+    // duckdb: select 'ab' ^@ 'a' || 'b' -> 'trueb'   i.e. ('ab' ^@ 'a') || 'b'
+    assert_eq!(ex("'ab' ^@ 'a' || 'b'"), "(starts_with('ab', 'a') || 'b')");
+    // duckdb: select 'ab' ^@ 'a' = true -> true      i.e. (...) = true
+    assert_eq!(ex("'ab' ^@ 'a' = true"), "(starts_with('ab', 'a') = true)");
+}
+
+#[test]
+fn caret_and_at_still_lex_separately_when_not_adjacent() {
+    // `^` (pow) and prefix `@` (abs) must be unaffected by the new token.
+    assert_eq!(ex("2 ^ 3"), "pow(2i32, 3i32)");
+    assert_eq!(ex("2 ^ @x"), "pow(2i32, abs(x))");
+}
+
+// --- `IS [NOT] UNKNOWN` -----------------------------------------------------
+
+#[test]
+fn is_unknown_desugars_to_is_null() {
+    // duckdb: NULL is unknown -> true, NULL is not unknown -> false,
+    // 1 is unknown -> false. Exactly `IS [NOT] NULL`.
+    assert_eq!(ex("x IS UNKNOWN"), "(x IS NULL)");
+    assert_eq!(ex("x IS NOT UNKNOWN"), "(x IS NOT NULL)");
+    assert_eq!(ex("x is unknown"), "(x IS NULL)");
+}
+
+#[test]
+fn unknown_is_a_soft_keyword_not_reserved() {
+    // A column literally named `unknown` still resolves everywhere.
+    assert_eq!(sel("SELECT unknown FROM t"), "SELECT unknown FROM t");
+    assert_eq!(sel("SELECT 1 AS unknown FROM t"), "SELECT 1i32 AS unknown FROM t");
+    assert_eq!(ex("unknown + 1"), "(unknown + 1i32)");
+    assert_eq!(ex("unknown IS NULL"), "(unknown IS NULL)");
+    assert_eq!(ex("unknown IS UNKNOWN"), "(unknown IS NULL)");
+    assert!(keyword(b"unknown").is_none(), "UNKNOWN must not be a reserved word");
+}
+
+// --- SQL-standard functional syntaxes ---------------------------------------
+
+#[test]
+fn position_in_form_desugars_to_strpos_with_swapped_arguments() {
+    // duckdb: position('b' in 'abc') = strpos('abc','b') = 2. Note that the
+    // argument order flips.
+    assert_eq!(ex("position('b' IN 'abc')"), "strpos('abc', 'b')");
+    assert_eq!(ex("position(needle IN haystack)"), "strpos(haystack, needle)");
+    // `||` is stronger than the `IN` separator, so it stays inside the
+    // searched-for operand.
+    assert_eq!(ex("position('a' || 'b' IN s)"), "strpos(s, ('a' || 'b'))");
+}
+
+#[test]
+fn position_without_in_stays_an_ordinary_call() {
+    // This engine's own `position(a, b)` alias of `strpos` is untouched
+    // (duckdb rejects that spelling, but the alias predates this change).
+    assert_eq!(ex("position(a, b)"), "position(a, b)");
+    // A column named `position` also still works.
+    assert_eq!(sel("SELECT position FROM t"), "SELECT position FROM t");
+    assert_eq!(ex("position + 1"), "(position + 1i32)");
+}
+
+#[test]
+fn substring_from_for_desugars_to_positional_arguments() {
+    // The written spelling (`substring`/`substr`) is preserved -- they are
+    // the same function in `expr::funcs`; only the argument *shape* changes.
+    // duckdb: substring('abcdef' from 2) -> 'bcdef'
+    assert_eq!(ex("substring('abcdef' FROM 2)"), "substring('abcdef', 2i32)");
+    // duckdb: substring('abcdef' from 2 for 3) -> 'bcd'
+    assert_eq!(ex("substring('abcdef' FROM 2 FOR 3)"), "substring('abcdef', 2i32, 3i32)");
+    // duckdb: substring('abcdef' for 3) -> 'abc' (start defaults to 1)
+    assert_eq!(ex("substring('abcdef' FOR 3)"), "substring('abcdef', 1i32, 3i32)");
+    // Bounds may be arbitrary expressions (duckdb: `... from 1+1 for 1+2`).
+    assert_eq!(ex("substring(s FROM a + 1 FOR b + 2)"), "substring(s, (a + 1i32), (b + 2i32))");
+    // `substr` accepts the same syntax.
+    assert_eq!(ex("substr('abcdef' FROM 2)"), "substr('abcdef', 2i32)");
+}
+
+#[test]
+fn substring_comma_form_and_for_as_a_column_name_still_work() {
+    assert_eq!(ex("substring(s, 2, 3)"), "substring(s, 2i32, 3i32)");
+    assert_eq!(sel("SELECT for FROM t"), "SELECT for FROM t");
+    assert_eq!(ex("substring(for, 2)"), "substring(for, 2i32)");
+}
+
+#[test]
+fn trim_from_form_desugars_to_trim_ltrim_rtrim() {
+    // Every line here was verified against the `duckdb` CLI; see
+    // `Parser::trim_from_call`'s doc comment for the measured results.
+    assert_eq!(ex("trim(BOTH 'x' FROM s)"), "trim(s, 'x')");
+    assert_eq!(ex("trim(LEADING 'x' FROM s)"), "ltrim(s, 'x')");
+    assert_eq!(ex("trim(TRAILING 'x' FROM s)"), "rtrim(s, 'x')");
+    assert_eq!(ex("trim('x' FROM s)"), "trim(s, 'x')");
+    assert_eq!(ex("trim(FROM s)"), "trim(s)");
+    assert_eq!(ex("trim(BOTH FROM s)"), "trim(s)");
+    assert_eq!(ex("trim(leading from s)"), "ltrim(s)");
+}
+
+#[test]
+fn trim_comma_form_and_direction_words_as_column_names_still_work() {
+    assert_eq!(ex("trim(s)"), "trim(s)");
+    assert_eq!(ex("trim(s, 'x')"), "trim(s, 'x')");
+    // Without a top-level FROM inside the call, `both`/`leading`/`trailing`
+    // are never read as direction words -- they stay ordinary columns.
+    assert_eq!(ex("trim(leading)"), "trim(leading)");
+    assert_eq!(ex("trim(leading, 'x')"), "trim(leading, 'x')");
+    assert_eq!(sel("SELECT trailing FROM t"), "SELECT trailing FROM t");
+}
+
+#[test]
+fn top_level_keyword_lookahead_ignores_nested_occurrences() {
+    // A `FROM` belonging to a nested subquery must not turn this into the
+    // SQL-standard `trim(... FROM ...)` form.
+    assert_eq!(ex("trim((SELECT x FROM t))"), "trim((SELECT x FROM t))");
+    // Likewise a nested `IN` inside parentheses.
+    assert_eq!(ex("position((a IN (1, 2)), b)"), "position((a IN [1i32, 2i32]), b)");
+}

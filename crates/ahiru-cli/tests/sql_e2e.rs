@@ -466,6 +466,53 @@ fn iif_desugars_like_case_when() {
     }
 }
 
+// --- DuckDB expression sugar (typed literals / `^@` / IS UNKNOWN / SQL
+// --- standard function syntax / GROUP BY ALL / ORDER BY ALL) ---------------
+
+// 型付き時刻リテラル。`d` は TIMESTAMP 列なので、`DATE`/`TIMESTAMP`
+// リテラルとの比較・算術がそのまま突き合わせられる。
+e2e!(
+    typed_temporal_literals,
+    "tests/data/basic.parquet",
+    [
+        "SELECT id FROM t WHERE d >= TIMESTAMP '2024-01-05 00:00:00' AND d < TIMESTAMP '2024-01-09 00:00:00' ORDER BY id",
+        "SELECT id FROM t WHERE CAST(d AS DATE) = DATE '2024-01-03' ORDER BY id",
+        "SELECT count(*) FROM t WHERE d > TIMESTAMP '2024-06-01 00:00:00'",
+        "SELECT DATE '2020-02-29' AS a, TIME '01:02:03' AS b FROM t LIMIT 1",
+        // 定数のプルーニングに乗る形（結果は当然変わらない）。
+        "SELECT id, d FROM t WHERE d = TIMESTAMP '2024-01-10 00:00:00'",
+    ]
+);
+
+e2e!(
+    prefix_operator_and_is_unknown,
+    "tests/data/basic.parquet",
+    [
+        "SELECT id FROM t WHERE name ^@ 'name_1' ORDER BY id LIMIT 10",
+        "SELECT count(*) FROM t WHERE NOT name ^@ 'name_'",
+        "SELECT id, name ^@ 'name_0' FROM t ORDER BY id LIMIT 5",
+        // NULL はそのまま NULL に伝播する。
+        "SELECT id, big IS UNKNOWN, big IS NOT UNKNOWN FROM t ORDER BY id LIMIT 6",
+        "SELECT count(*) FROM t WHERE big IS UNKNOWN",
+    ]
+);
+
+e2e!(
+    sql_standard_function_syntax,
+    "tests/data/basic.parquet",
+    [
+        "SELECT id, position('_' IN name) FROM t ORDER BY id LIMIT 5",
+        "SELECT count(*) FROM t WHERE position('9' IN name) > 0",
+        "SELECT substring(name FROM 6) FROM t ORDER BY id LIMIT 5",
+        "SELECT substring(name FROM 1 FOR 4) FROM t ORDER BY id LIMIT 5",
+        "SELECT substring(name FOR 4) FROM t ORDER BY id LIMIT 5",
+        "SELECT trim(BOTH 'e' FROM name) FROM t ORDER BY id LIMIT 5",
+        "SELECT trim(LEADING 'n' FROM name) FROM t ORDER BY id LIMIT 5",
+        "SELECT trim(TRAILING '0' FROM name) FROM t ORDER BY id LIMIT 5",
+        "SELECT trim(FROM name) FROM t ORDER BY id LIMIT 5",
+    ]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // `t2` や `text` の中の t を書き換えてしまうと、比較対象の SQL が壊れる。
