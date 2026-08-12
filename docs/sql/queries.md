@@ -459,6 +459,83 @@ asymmetry matches DuckDB's actual behavior. Renaming a column onto a name
 that already exists in the output is allowed and produces duplicate output
 column names, it is not rejected either.
 
+## COLUMNS(...)
+
+`COLUMNS(...)` is a star that expands to a *subset* of the input columns.
+Three argument forms are supported:
+
+```sql
+SELECT COLUMNS(*) FROM t;                        -- every column, like a bare *
+SELECT COLUMNS('^s') FROM t;                     -- columns whose name matches a regex
+SELECT COLUMNS(['score', 'id']) FROM t;          -- an explicit list of column names
+```
+
+The `EXCLUDE`/`REPLACE`/`RENAME` modifiers go **inside** the parentheses,
+and work exactly as they do on a bare `*` (including the fixed
+`EXCLUDE` -> `REPLACE` -> `RENAME` order):
+
+```sql
+SELECT COLUMNS(* EXCLUDE (score, big, d)) FROM t;
+SELECT COLUMNS(* REPLACE (score * 2 AS score) RENAME (id AS pk)) FROM t;
+```
+
+Details worth knowing:
+
+- **The regex is an unanchored search**, so `COLUMNS('a')` matches every
+  column with an `a` anywhere in its name. Use `^`/`$` to anchor it. The
+  regex dialect is the one in
+  [functions-string.md](functions-string.md#regular-expressions), which has
+  real gaps — see [limitations.md](limitations.md).
+- **The regex match is case-sensitive**, unlike every other column-name
+  comparison in ahirudb. `COLUMNS('NAME')` does not match a `name` column.
+- **A regex that matches nothing is an error**, not an empty result.
+- **An explicit list expands in schema order, not list order.**
+  `COLUMNS(['score', 'id'])` yields `id, score`. Names in the list are
+  matched case-insensitively, and listing the same column twice still emits
+  it once.
+- **A listed name that no column has is an error.** On the
+  error-vs-silently-ignore question, `COLUMNS` behaves like `EXCLUDE`, not
+  like `RENAME`.
+- A `COLUMNS(...)` item cannot be table-qualified: `t.COLUMNS(*)` is
+  rejected (DuckDB rejects it too).
+
+### Renaming the expansion: `AS '<template>'`
+
+An alias on a `COLUMNS(...)` item is a *name template* applied to every
+expanded column, not one output name. `\0` stands for the whole column name
+and `\1`..`\9` for the regex's capture groups:
+
+```sql
+SELECT COLUMNS('(\w{2}).*') AS '\1' FROM t;   -- id, na, sc, fl, bi
+SELECT COLUMNS(*) AS 'x_\0' FROM t;           -- x_id, x_name, x_score, ...
+```
+
+A capture group the pattern doesn't have expands to the empty string, and a
+template that expands to nothing at all leaves the original name in place.
+The template also wins over `RENAME` and is built from the original column
+name. A plain unquoted alias (`COLUMNS(['id','big']) AS x`) is just a
+template with no escapes, so every expanded column gets that same name.
+
+### Not supported
+
+These are real DuckDB star-expression features that ahirudb rejects with a
+clear `unsupported SQL feature` error rather than half-implementing:
+
+| Form | Example |
+|---|---|
+| Distributing an enclosing expression over the expansion | `min(COLUMNS(*))`, `COLUMNS(*) + 1` |
+| `UNPACK(...)` / `*COLUMNS(...)` unpacking | `SELECT *COLUMNS(*)` |
+| The lambda predicate form | `COLUMNS(c -> c LIKE 'n%')` |
+| Star filtering operators | `SELECT * LIKE 'col%'`, `* GLOB ...`, `* SIMILAR TO ...` |
+
+For the first row, list the columns explicitly
+(`SELECT min(a), min(b) FROM t`); for the lambda and star-filtering forms,
+`COLUMNS('regex')` or `COLUMNS([...])` usually expresses the same intent.
+
+`COLUMNS` is **not** a reserved word — it is only read as a star expression
+at the start of a select-list item immediately followed by `(`. A column,
+alias, or table named `columns` keeps working unquoted.
+
 ## Introspection: DESCRIBE, SHOW TABLES, EXPLAIN
 
 ```sql

@@ -470,6 +470,31 @@ e2e!(
     ]
 );
 
+// DuckDB's `COLUMNS(...)` star expression. Headers are not compared by this
+// harness, so the value here is in the row *content* and column order —
+// which is exactly where the two easy ways to get `COLUMNS` wrong show up
+// (expanding the explicit list in list order instead of schema order, and
+// treating the regex as an anchored full match instead of a search).
+e2e!(
+    columns_star_expression,
+    "tests/data/basic.parquet",
+    [
+        "SELECT COLUMNS(*) FROM t ORDER BY id LIMIT 3",
+        "SELECT COLUMNS(* EXCLUDE (score, big, d)) FROM t ORDER BY id LIMIT 3",
+        "SELECT COLUMNS(* REPLACE (score * 2 AS score)) FROM t ORDER BY id LIMIT 3",
+        // Unanchored search: `a` matches `name` and `flag`.
+        "SELECT COLUMNS('a') FROM t ORDER BY id LIMIT 3",
+        "SELECT COLUMNS('^s') FROM t ORDER BY id LIMIT 3",
+        // Schema order, not list order.
+        "SELECT COLUMNS(['score', 'id']) FROM t ORDER BY id LIMIT 3",
+        "SELECT COLUMNS(['ID']) FROM t ORDER BY id LIMIT 3",
+        // Capture-group renaming; the 1-character `d` column doesn't match.
+        r"SELECT COLUMNS('(\w{2}).*') AS '\1' FROM t ORDER BY id LIMIT 3",
+        "SELECT COLUMNS(*) AS 'x_\\0' FROM t ORDER BY id LIMIT 3",
+        "SELECT 1 AS z, COLUMNS(['id', 'name']) FROM t ORDER BY id LIMIT 3",
+    ]
+);
+
 /// `ORDER BY` を省略した `DISTINCT ON` は「到着順で最初の行」を残す。
 /// DuckDB も同じ規則だが、どちらを「到着順の先頭」とみなすかはスキャンの
 /// 実装依存（ページ読み出し順など）で、別エンジン同士を突き合わせる意味が

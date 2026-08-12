@@ -21,6 +21,8 @@ use super::subquery::{
     split_conjuncts, ConjClass,
 };
 use super::*;
+use crate::expr::regex;
+use crate::sql::ast::ColumnsSpec;
 
 // --- SAMPLE ------------------------------------------------------------------
 
@@ -37,6 +39,83 @@ fn resolve_sample_spec(spec: &crate::sql::ast::SampleSpec) -> crate::plan::Sampl
         None => crate::plan::DEFAULT_SAMPLE_SEED,
     };
     crate::plan::SampleSpec { is_rows: spec.is_rows, amount: spec.amount, seed }
+}
+
+// --- COLUMNS(...) ------------------------------------------------------------
+
+/// Resolve DuckDB's `COLUMNS(...)` star expression against an input scope.
+///
+/// Returns `(column index, output name override)` pairs **in schema order**,
+/// which is what `duckdb` does even for the explicit-list form
+/// (`COLUMNS(['name','id'])` yields `id, name`, not `name, id`). The name
+/// override is `Some` only when the item carried an `AS '<template>'` alias;
+/// see `expr::regex::expand_name_template` for the template rules.
+///
+/// This runs twice per `COLUMNS(...)` item — once over the full scope while
+/// collecting columns for projection pushdown (so a `COLUMNS('regex')` over a
+/// wide table only ever reads the columns it actually expands to), and once
+/// over the narrowed scope when building the projection. Both passes apply
+/// the same predicate to the same names, so they always agree on the set;
+/// only the indices differ.
+///
+/// Failure modes are DuckDB's, verified against `duckdb` v1.4.4:
+/// a regex matching nothing is an error ("No matching columns found that
+/// match regex"), and so is a listed name that no column has ("Column ...
+/// was selected but was not found in the FROM clause"). That puts `COLUMNS`
+/// on the `EXCLUDE` side of the asymmetry documented on `Expr::Star::rename`,
+/// not the `RENAME` side.
+pub(super) fn expand_columns(
+    spec: &ColumnsSpec,
+    scope: &Scope,
+    template: Option<&str>,
+) -> Result<Vec<(usize, Option<String>)>> {
+    let named = |name: &str, saves: Option<&[u32]>| -> Option<String> {
+        let t = template?;
+        let bytes = regex::expand_name_template(name.as_bytes(), saves, t.as_bytes());
+        Some(String::from_utf8(bytes).unwrap_or_else(|_| name.into()))
+    };
+    let mut out: Vec<(usize, Option<String>)> = Vec::new();
+    match spec {
+        ColumnsSpec::All => {
+            for i in 0..scope.len() {
+                out.push((i, named(&scope.fields()[i].name, None)));
+            }
+        }
+        ColumnsSpec::Regex(pattern) => {
+            // The match is an unanchored search over the column name, and it
+            // is case-sensitive — unlike every other column-name comparison
+            // in this engine, which is case-insensitive. Both verified
+            // against `duckdb`: `COLUMNS('um')` matches a `num` column, while
+            // `COLUMNS('N.*')` matches nothing at all.
+            let prog = regex::compile(pattern.as_bytes())?;
+            for i in 0..scope.len() {
+                let name = &scope.fields()[i].name;
+                if let Some(saves) = regex::find(&prog, name.as_bytes())? {
+                    out.push((i, named(name, Some(&saves[..]))));
+                }
+            }
+            ensure!(!out.is_empty(), ColumnNotFound);
+        }
+        ColumnsSpec::Names(names) => {
+            for i in 0..scope.len() {
+                let name = &scope.fields()[i].name;
+                if names.iter().any(|n| eq_ascii_ci(n.as_bytes(), name.as_bytes())) {
+                    out.push((i, named(name, None)));
+                }
+            }
+            // A name listed twice, or one that matches columns from two
+            // different relations of a join, is not an error — the loop above
+            // already emits each *column* exactly once, which matches
+            // `duckdb` (`COLUMNS(['id','id'])` yields one `id`).
+            for n in names {
+                ensure!(
+                    scope.fields().iter().any(|f| eq_ascii_ci(f.name.as_bytes(), n.as_bytes())),
+                    ColumnNotFound
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 // --- 本体 --------------------------------------------------------------------
@@ -70,8 +149,22 @@ pub(super) fn bind_select_in(
     let mut star_quals: Vec<String> = Vec::new();
     for item in &sel.items {
         match arena.get(item.expr) {
-            Expr::Star { qualifier: None, replace, .. } => {
-                star_all = true;
+            Expr::Star { qualifier: None, columns, replace, .. } => {
+                match columns {
+                    // `COLUMNS('regex')` / `COLUMNS([...])` expand to a
+                    // *subset* of the input, so only that subset has to be
+                    // read. Resolving the spec here rather than falling back
+                    // to "read everything" is what keeps the engine's
+                    // never-read-a-byte-you-don't-need property (DESIGN.md
+                    // §2) intact for a `COLUMNS('regex')` over a wide table.
+                    Some(spec @ (ColumnsSpec::Regex(_) | ColumnsSpec::Names(_))) => {
+                        for (i, _) in expand_columns(spec, &scope_all, None)? {
+                            refs.push(i);
+                        }
+                    }
+                    // `COLUMNS(*)` is exactly a plain `*`.
+                    None | Some(ColumnsSpec::All) => star_all = true,
+                }
                 // `REPLACE (expr AS col, ...)` の `expr` は式木の外（`*` の
                 // 展開の中）にあるので、他の select item と同じく参照列を
                 // 拾っておかないと射影プッシュダウンから漏れる。
@@ -869,18 +962,27 @@ pub(super) fn bind_select_in(
     let mut schema = Vec::new();
     for item in &sel.items {
         match arena.get(item.expr) {
-            Expr::Star { qualifier, exclude, replace, rename } => {
+            Expr::Star { qualifier, columns, exclude, replace, rename } => {
                 // 集約後に `*` は展開できない（元の行が残っていない）。
                 ensure!(!aggregating, NotGrouped);
-                let idx: Vec<usize> = match qualifier {
-                    Some(q) => scope.indices_for_qualifier(q),
-                    None => (0..scope.len()).collect(),
+                // For a `COLUMNS(...)` item the select-item alias is a name
+                // *template* applied per expanded column, not a single output
+                // name — see `expr::regex::expand_name_template`.
+                let expanded: Vec<(usize, Option<String>)> = match columns {
+                    Some(spec) => expand_columns(spec, &scope, item.alias.as_deref())?,
+                    None => {
+                        let idx: Vec<usize> = match qualifier {
+                            Some(q) => scope.indices_for_qualifier(q),
+                            None => (0..scope.len()).collect(),
+                        };
+                        idx.into_iter().map(|i| (i, None)).collect()
+                    }
                 };
                 // `EXCLUDE`/`REPLACE` に書かれた列名が実在するかを検証する
                 // （`duckdb` は "Column ... not found" として束縛時に拒否する）。
                 for name in exclude {
                     ensure!(
-                        idx.iter().any(|&i| eq_ascii_ci(
+                        expanded.iter().any(|&(i, _)| eq_ascii_ci(
                             scope.fields()[i].name.as_bytes(),
                             name.as_bytes()
                         )),
@@ -889,14 +991,14 @@ pub(super) fn bind_select_in(
                 }
                 for (_, name) in replace {
                     ensure!(
-                        idx.iter().any(|&i| eq_ascii_ci(
+                        expanded.iter().any(|&(i, _)| eq_ascii_ci(
                             scope.fields()[i].name.as_bytes(),
                             name.as_bytes()
                         )),
                         ColumnNotFound
                     );
                 }
-                for i in idx {
+                for (i, templated) in expanded {
                     let fname = scope.fields()[i].name.clone();
                     if exclude.iter().any(|e| eq_ascii_ci(e.as_bytes(), fname.as_bytes())) {
                         continue;
@@ -913,11 +1015,18 @@ pub(super) fn bind_select_in(
                     // here is silently ignored rather than an error; this
                     // deliberately mirrors `duckdb`'s real behavior, which is
                     // asymmetric with EXCLUDE on this point.
-                    let out_name = rename
-                        .iter()
-                        .find(|(old, _)| eq_ascii_ci(old.as_bytes(), fname.as_bytes()))
-                        .map(|(_, new)| new.clone())
-                        .unwrap_or_else(|| fname.clone());
+                    //
+                    // A `COLUMNS(...) AS '<template>'` name wins over RENAME
+                    // and is built from the ORIGINAL column name (verified
+                    // against `duckdb`: `COLUMNS(* RENAME (id AS ident)) AS
+                    // 'x_\0'` yields `x_id`, not `x_ident`).
+                    let out_name = templated.unwrap_or_else(|| {
+                        rename
+                            .iter()
+                            .find(|(old, _)| eq_ascii_ci(old.as_bytes(), fname.as_bytes()))
+                            .map(|(_, new)| new.clone())
+                            .unwrap_or_else(|| fname.clone())
+                    });
                     match rexpr {
                         Some(rexpr) => {
                             // REPLACE の式は通常の select item と同じスコープ

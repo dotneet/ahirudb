@@ -1014,6 +1014,49 @@ fn parse_repl(repl: &[u8]) -> Option<(Vec<ReplTok>, u8)> {
     Some((toks, max_g))
 }
 
+/// `COLUMNS(...) AS '<template>'` の出力列名を 1 列ぶん組み立てる
+/// （DuckDB のスター式における捕獲グループ改名。`plan::bind` から呼ぶ）。
+///
+/// Semantics below are all verified against `duckdb` v1.4.4:
+///
+/// - `\0` is the **whole column name**, not the matched substring
+///   (`SELECT COLUMNS('u') AS 'x_\0'` over a `num` column yields `x_num`,
+///   not `x_u`).
+/// - `\1`..`\9` are the pattern's capture groups. `saves` is the slot array
+///   `find` returned for this column name, or `None` for the
+///   `COLUMNS(*)`/`COLUMNS([...])` forms, which have no pattern at all. A
+///   group that did not participate in the match — including a reference
+///   past the pattern's group count — expands to the empty string
+///   (`COLUMNS('(n)(a)?.*') AS 'x\2'` yields `x` and `xa`).
+/// - If the template is malformed, or if the whole expansion comes out
+///   empty, the column keeps its original name (`COLUMNS('n.*') AS '\1'`
+///   with a group-less pattern leaves `num`/`name` untouched, while
+///   `AS 'q\1'` renames both to `q`). The malformed case follows the same
+///   "invalid replacement means no substitution" rule `regexp_replace`
+///   already uses — see `parse_repl`.
+pub fn expand_name_template(name: &[u8], saves: Option<&[u32]>, template: &[u8]) -> Vec<u8> {
+    let Some((toks, _)) = parse_repl(template) else { return name.to_vec() };
+    let mut out = Vec::with_capacity(template.len() + name.len());
+    for t in &toks {
+        match t {
+            ReplTok::Lit(b) => out.push(*b),
+            ReplTok::Group(0) => out.extend_from_slice(name),
+            ReplTok::Group(g) => {
+                let slot = |k: usize| saves.and_then(|s| s.get(k).copied());
+                if let (Some(st), Some(en)) = (slot(2 * *g as usize), slot(2 * *g as usize + 1)) {
+                    if st != u32::MAX && en as usize <= name.len() && st <= en {
+                        out.extend_from_slice(&name[st as usize..en as usize]);
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return name.to_vec();
+    }
+    out
+}
+
 fn emit_repl(toks: &[ReplTok], text: &[u8], saves: &[u32; SLOTS], out: &mut Vec<u8>) {
     for t in toks {
         match t {

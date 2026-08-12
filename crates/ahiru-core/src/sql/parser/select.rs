@@ -163,6 +163,7 @@ impl<'a> Parser<'a> {
         }
         let star = self.arena.push(Expr::Star {
             qualifier: None,
+            columns: None,
             exclude: Vec::new(),
             replace: Vec::new(),
             rename: Vec::new(),
@@ -504,17 +505,150 @@ impl<'a> Parser<'a> {
         Ok((exclude, replace, rename))
     }
 
+    /// `self.cur` starts a `COLUMNS(...)` star expression.
+    ///
+    /// `COLUMNS` is a context-dependent keyword, recognized only at the start
+    /// of a select-list item and only when immediately followed by `(` — the
+    /// same rule `EXCLUDE`/`REPLACE`/`RENAME`/`FILTER`/`OVER` follow, and for
+    /// the same reason (`sql/lexer.rs`'s `KEYWORDS` comment): column names
+    /// come from data files, so a column literally named `columns` has to
+    /// keep working unquoted. `duckdb` agrees — `SELECT columns FROM u` on a
+    /// table with a `columns` column works there too.
+    #[inline]
+    fn is_columns_kw(&self) -> Result<bool> {
+        Ok(self.is_soft_kw(b"columns") && self.peek()? == Tok::LParen)
+    }
+
+    /// The body of a `COLUMNS(...)` select-list item, positioned at `COLUMNS`.
+    ///
+    /// Three argument forms are supported, all verified against `duckdb`
+    /// v1.4.4 (see `sql::ast::ColumnsSpec` for the resolved semantics of
+    /// each): `COLUMNS(*)` — optionally with the ordinary star modifiers
+    /// *inside* the parentheses — `COLUMNS('regex')`, and
+    /// `COLUMNS(['a', 'b'])`.
+    ///
+    /// DuckDB's `COLUMNS(c -> <predicate>)` lambda form is deliberately
+    /// rejected here as `UnsupportedFeature` rather than being left to fail
+    /// as a confusing token error: the argument would have to be evaluated
+    /// per column name at bind time, which is a different mechanism from the
+    /// name matching the other three forms share.
+    fn columns_item(&mut self) -> Result<SelectItem> {
+        self.bump()?; // COLUMNS
+        self.expect(Tok::LParen)?;
+        let pos = self.pos;
+        let (columns, exclude, replace, rename) = if self.eat(Tok::Star)? {
+            let (exclude, replace, rename) = self.star_modifiers()?;
+            (ColumnsSpec::All, exclude, replace, rename)
+        } else if self.is(Tok::LBracket) {
+            self.bump()?; // '['
+            let mut names: Vec<String> = Vec::new();
+            loop {
+                names.push(self.string_lit()?);
+                if !self.eat(Tok::Comma)? {
+                    break;
+                }
+            }
+            self.expect(Tok::RBracket)?;
+            (ColumnsSpec::Names(names), Vec::new(), Vec::new(), Vec::new())
+        } else if matches!(self.cur, Tok::Str(_)) {
+            (ColumnsSpec::Regex(self.string_lit()?), Vec::new(), Vec::new(), Vec::new())
+        } else {
+            // Covers `COLUMNS(c -> ...)` (the lambda form) and anything else
+            // that isn't one of the three supported arguments. `duckdb`
+            // rejects an empty `COLUMNS()` too.
+            err!(UnsupportedFeature, pos)
+        };
+        self.expect(Tok::RParen)?;
+        // A `COLUMNS(...)` item is a whole select-list entry, never an operand:
+        // DuckDB *does* distribute an enclosing expression over the expansion
+        // (`COLUMNS(*) + 1` yields one `+ 1` column per input column), which
+        // this engine cannot do — the binder would have to synthesize one
+        // expression node per expanded column, and the arena is immutable by
+        // the time the input schema is known. Everything that can legitimately
+        // follow here is a keyword (`FROM`, `AS`, ...), an alias identifier, a
+        // comma, or the end of the item list; an operator token means the
+        // distributing form, so it gets the same `UnsupportedFeature` as
+        // `min(COLUMNS(*))` instead of an "unexpected token" on the operator.
+        let pos = self.pos;
+        ensure!(
+            matches!(
+                self.cur,
+                Tok::Eof
+                    | Tok::Kw(_)
+                    | Tok::Ident(_)
+                    | Tok::QIdent(_)
+                    | Tok::Comma
+                    | Tok::RParen
+                    | Tok::Semi
+            ),
+            UnsupportedFeature,
+            pos
+        );
+        // `AS '<template>'` is the capture-group renaming form
+        // (`COLUMNS('(\w{3}).*') AS '\1'`), so the alias here may be a string
+        // literal, which the shared `opt_alias` deliberately does not accept.
+        let alias = if self.eat_kw(Kw::As)? {
+            Some(match self.cur {
+                Tok::Str(_) => self.string_lit()?,
+                _ => self.ident()?,
+            })
+        } else {
+            self.opt_alias()?
+        };
+        let expr = self.arena.push(Expr::Star {
+            qualifier: None,
+            columns: Some(columns),
+            exclude,
+            replace,
+            rename,
+        });
+        Ok(SelectItem { expr, alias })
+    }
+
     fn select_item(&mut self) -> Result<SelectItem> {
+        if self.is_columns_kw()? {
+            return self.columns_item();
+        }
         // 先頭の `*` だけは式ではなく列挙として扱う。`t.*` は primary 側。
         if self.is(Tok::Star) {
             self.bump()?;
+            // `*COLUMNS(...)` (DuckDB's unpacking form) and `* LIKE 'pat'` /
+            // `* GLOB ...` / `* SIMILAR TO ...` (star filtering) are both
+            // unsupported. Caught explicitly so they fail as
+            // `UnsupportedFeature` instead of as an "unexpected token" from
+            // the enclosing item list, which would read as if the syntax were
+            // simply malformed.
+            let pos = self.pos;
+            ensure!(!self.is_columns_kw()?, UnsupportedFeature, pos);
             let (exclude, replace, rename) = self.star_modifiers()?;
-            let expr = self.arena.push(Expr::Star { qualifier: None, exclude, replace, rename });
+            let pos = self.pos;
+            ensure!(!self.is_star_filter_kw(), UnsupportedFeature, pos);
+            let expr = self.arena.push(Expr::Star {
+                qualifier: None,
+                columns: None,
+                exclude,
+                replace,
+                rename,
+            });
             return Ok(SelectItem { expr, alias: None });
         }
         let expr = self.expr()?;
         let alias = self.opt_alias()?;
         Ok(SelectItem { expr, alias })
+    }
+
+    /// `self.cur` starts one of DuckDB's star-filtering operators
+    /// (`* LIKE 'pat'`, `* ILIKE`, `* GLOB`, `* SIMILAR TO`), which this
+    /// engine does not implement. Only used to turn those into a clear
+    /// `UnsupportedFeature`; `NOT` is included so `* NOT LIKE ...` reports the
+    /// same thing.
+    #[inline]
+    fn is_star_filter_kw(&self) -> bool {
+        self.is(Tok::Kw(Kw::Like))
+            || self.is(Tok::Kw(Kw::Ilike))
+            || self.is(Tok::Kw(Kw::Not))
+            || self.is_soft_kw(b"glob")
+            || self.is_soft_kw(b"similar")
     }
 
     pub(super) fn order_item(&mut self) -> Result<OrderByItem> {

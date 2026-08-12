@@ -511,7 +511,15 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
   argument position of `list_transform`/`list_filter`/`list_reduce`
   specifically; each lambda body compiles in its own isolated scope and
   cannot see outer-query columns), scalar and correlated subqueries
-- `SELECT *` modifiers: `EXCLUDE (...)`, `REPLACE (expr AS col, ...)`
+- Star expressions: `SELECT *` modifiers `EXCLUDE (...)`,
+  `REPLACE (expr AS col, ...)`, `RENAME (old AS new, ...)`, and
+  `COLUMNS(*)` / `COLUMNS('regex')` / `COLUMNS(['a','b'])` with the
+  `AS '\1'` capture-group renaming form. All expand at bind time against
+  the resolved input schema, and `COLUMNS('regex')`/`COLUMNS([...])` narrow
+  projection pushdown to just the columns they expand to. DuckDB's
+  function-distribution (`min(COLUMNS(*))`), `UNPACK`/`*COLUMNS`
+  unpacking, `COLUMNS(lambda)`, and `* LIKE`-style star filtering are
+  rejected with `UnsupportedFeature` (docs/sql/limitations.md)
 - Aggregates: `COUNT`/`COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
   `stddev`/`variance`/`median`/`mode`/`approx_count_distinct`, `string_agg`,
   `array_agg`, `FILTER (WHERE ...)` on any aggregate
@@ -863,7 +871,7 @@ what used to be labeled "M8, not started":
 - `UNNEST` (select-list and implicit-lateral `FROM`)
 - Array/list literals, `GLOB`/`SIMILAR TO`
 - Lambda expressions (`list_transform`/`list_filter`/`list_reduce`)
-- `SELECT * EXCLUDE/REPLACE`
+- `SELECT * EXCLUDE/REPLACE/RENAME`, `COLUMNS(...)`
 - `SAMPLE`/`TABLESAMPLE`, `generate_series`/`range`
 - `PIVOT`/`UNPIVOT`
 - `IN`-list and `BETWEEN` predicate pushdown into RowGroup/page/Bloom-filter

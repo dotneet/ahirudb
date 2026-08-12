@@ -59,6 +59,39 @@ impl BinaryOp {
     }
 }
 
+/// The argument of DuckDB's `COLUMNS(...)` star expression
+/// (<https://duckdb.org/docs/lts/sql/expressions/star>).
+///
+/// A `COLUMNS(...)` item is a star that expands to a *subset* of the input
+/// columns, so it is carried on `Expr::Star` rather than being its own node
+/// — expansion happens at bind time against the resolved input schema,
+/// exactly where `*` already expands.
+///
+/// Only the three argument forms below are supported. DuckDB's
+/// `COLUMNS(lambda)` predicate form, `UNPACK(...)`/`*COLUMNS(...)`
+/// unpacking, distributing an enclosing function over the expansion
+/// (`min(COLUMNS(*))`), and `* LIKE 'pat'`-style star filtering are all
+/// rejected with `UnsupportedFeature` — see `sql::parser::Parser::columns_item`.
+pub enum ColumnsSpec {
+    /// `COLUMNS(*)`. Same column set as a bare `*`; the `EXCLUDE`/`REPLACE`/
+    /// `RENAME` modifiers are written *inside* the parentheses
+    /// (`COLUMNS(* EXCLUDE (a))`), which is what DuckDB accepts.
+    All,
+    /// `COLUMNS('regex')`. Matched with `expr::regex` as an unanchored,
+    /// case-sensitive search over each column name (both verified against
+    /// `duckdb` v1.4.4: `COLUMNS('um')` matches `num`, `COLUMNS('N.*')`
+    /// matches nothing). Matching no column at all is an error, not an
+    /// empty expansion.
+    Regex(String),
+    /// `COLUMNS(['a', 'b'])`. Names are matched case-insensitively, and the
+    /// expansion follows *schema* order, not list order (verified against
+    /// `duckdb`: `COLUMNS(['name','id'])` yields `id, name`). A listed name
+    /// that matches no column is an error — i.e. `COLUMNS` sides with
+    /// `EXCLUDE`, not with `RENAME`, on the asymmetry documented on
+    /// `Expr::Star::rename`.
+    Names(Vec<String>),
+}
+
 // Clone は導出しない。サブクエリを含むようになったため、式 1 つの複製が
 // クエリ木まるごとの複製になりかねない。必要な場所では子の Vec だけを複製する。
 pub enum Expr {
@@ -88,6 +121,14 @@ pub enum Expr {
     /// という文脈でだけキーワードとして読む（`sql::parser` 参照）。
     Star {
         qualifier: Option<String>,
+        /// `Some(..)` when this star was written as DuckDB's `COLUMNS(...)`
+        /// star expression rather than a bare `*`/`t.*`. It only narrows
+        /// *which* columns the expansion produces; everything else
+        /// (`exclude`/`replace`/`rename`, the bind-time expansion itself) is
+        /// shared with the plain-`*` path. `COLUMNS` never carries a
+        /// qualifier — `t.COLUMNS(*)` is not accepted by DuckDB either
+        /// (verified: "Scalar Function with name columns does not exist").
+        columns: Option<ColumnsSpec>,
         /// 展開結果から除く列名（大小無視で比較）。
         exclude: Vec<String>,
         /// 展開結果のうち指定列を式の評価結果に差し替える。列名自体は変わらない。

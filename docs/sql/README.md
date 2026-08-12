@@ -45,7 +45,7 @@ parameter binding, custom byte sources, memory limits).
 
 | Page | Covers |
 |---|---|
-| [queries.md](queries.md) | `SELECT` end to end: `WHERE`, joins, subqueries, CTEs (incl. `WITH RECURSIVE`), `UNION`/`INTERSECT`/`EXCEPT`, `GROUP BY`/`HAVING`/`GROUPING SETS`/`ROLLUP`/`CUBE`, window functions/`QUALIFY`, `SAMPLE`, `PIVOT`/`UNPIVOT`, `UNNEST`, `generate_series`/`range`, `DESCRIBE`/`SHOW TABLES`/`EXPLAIN` |
+| [queries.md](queries.md) | `SELECT` end to end: `WHERE`, joins, subqueries, CTEs (incl. `WITH RECURSIVE`), `UNION`/`INTERSECT`/`EXCEPT`, `GROUP BY`/`HAVING`/`GROUPING SETS`/`ROLLUP`/`CUBE`, window functions/`QUALIFY`, `SAMPLE`, `PIVOT`/`UNPIVOT`, `UNNEST`, `generate_series`/`range`, star expressions (`* EXCLUDE`/`REPLACE`/`RENAME`, `COLUMNS(...)`), `DESCRIBE`/`SHOW TABLES`/`EXPLAIN` |
 | [types.md](types.md) | Data types, `CAST`/`TRY_CAST`, `NULL`/three-valued logic, rounding rules, `INTERVAL` literals |
 | [data-sources.md](data-sources.md) | Reading Parquet/CSV/JSONL/JSON, glob and multi-file tables, Hive partitions, nested `STRUCT`/`LIST`/`MAP` |
 | [ddl-dml.md](ddl-dml.md) | `CREATE`/`ALTER`/`DROP TABLE`, views, `INSERT`/`UPDATE`/`DELETE`, `COPY ... TO` — all opt-in, in-memory-only features |
