@@ -3,6 +3,7 @@ name = "ahiru-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -49,5 +50,5 @@ dml = ["ddl"]
 # (see the comments in both crates' `rt.rs`/`lib.rs`).
 ahiru-zstd = { path = "../ahiru-zstd", default-features = false, optional = true }
 
-[lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
+[lints]
+workspace = true

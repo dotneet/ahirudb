@@ -3,6 +3,7 @@ name = "ahiru-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "ahiru"
@@ -20,3 +21,6 @@ ahiru-core = { path = "../ahiru-core", features = ["std", "export", "export-parq
 # link it directly (the size constraint applies only to the core .wasm).
 # Doing so also lets the CLI exercise the codec delegation protocol end to end.
 ahiru-zstd = { path = "../ahiru-zstd", features = ["std"] }
+
+[lints]
+workspace = true

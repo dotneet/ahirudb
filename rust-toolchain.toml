@@ -1,0 +1,10 @@
+# Pinned (not `stable`): this project has a hard 1 MiB wasm size budget
+# enforced as a CI gate (docs/DESIGN.md §3), and generated code size varies
+# between rustc versions, so a floating `stable` toolchain would make the
+# gate move on its own between otherwise-unrelated PRs. Pinning also keeps
+# new clippy lints introduced by a toolchain bump from turning unrelated PRs
+# red.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

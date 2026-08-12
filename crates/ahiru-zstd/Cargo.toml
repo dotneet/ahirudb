@@ -3,6 +3,7 @@ name = "ahiru-zstd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lib]
 # Do not give this crate `cdylib` by default. Cargo builds every crate-type
@@ -33,5 +34,5 @@ standalone = []
 [dependencies]
 # Zero dependencies. Keep the side module even smaller than the core (DESIGN.md §6).
 
-[lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
+[lints]
+workspace = true

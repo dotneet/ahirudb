@@ -61,7 +61,7 @@ impl Instr {
 pub enum OpCode {
     /// dst = column aux of the input batch
     LoadCol,
-    /// dst = constant pool[aux] as a length-1 vector
+    /// dst = `constant pool[aux]` as a length-1 vector
     LoadConst,
 
     // Arithmetic. ty is one of {I32, I64, I128, F64}
@@ -90,7 +90,7 @@ pub enum OpCode {
     IsNull,
     IsNotNull,
 
-    /// dst = a converted according to cast table[aux].
+    /// dst = a converted according to `cast table[aux]`.
     Cast,
     /// `TRY_CAST`. Uses the same cast table as `Cast`, but an unconvertible combination
     /// (where `kernels::cast` returns an error) becomes all-NULL rather than an error.
