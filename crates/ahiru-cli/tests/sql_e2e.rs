@@ -399,6 +399,54 @@ e2e!(
     ]
 );
 
+// A conjunct that predicate pushdown consumes into the scan's pruner
+// (`id = <literal>`) next to one it cannot (a scalar function call, `ILIKE`'s
+// implicit `lower()` calls) gets compiled as two separate programs and merged
+// by `plan::compile::and_programs`. That merge used to drop the right-hand
+// side's `calls`/`lambdas` tables, so the residual predicate either failed
+// with `Internal` or silently ran the wrong function. Conjunct order matters
+// here: with the pushdown-able side first the call table being merged into is
+// empty, which is exactly the case that broke — so each query is listed in
+// both orders.
+e2e!(
+    pushdown_residual_predicate_with_function_calls,
+    "tests/data/basic.parquet",
+    [
+        "SELECT id, name FROM t WHERE id = 1 AND upper(name) = 'NAME_1' ORDER BY id",
+        "SELECT id, name FROM t WHERE upper(name) = 'NAME_1' AND id = 1 ORDER BY id",
+        "SELECT id, name FROM t WHERE id = 1 AND name ILIKE 'name_1' ORDER BY id",
+        "SELECT id, name FROM t WHERE name ILIKE 'name_1' AND id = 1 ORDER BY id",
+        "SELECT id, name FROM t WHERE big = 100 AND name ILIKE 'N%' ORDER BY id",
+        "SELECT id, name FROM t WHERE name ILIKE 'N%' AND big = 100 ORDER BY id",
+        // Function calls on both sides: the two call tables must stay distinct
+        // rather than the second one aliasing the first.
+        "SELECT id, name FROM t WHERE lower(name) = 'name_1' AND upper(name) = 'NAME_1' ORDER BY id",
+        "SELECT id, name FROM t WHERE upper(name) = 'NAME_1' AND lower(name) = 'name_1' ORDER BY id",
+        // Three conjuncts, so the merge happens twice and the second merge sees
+        // a non-empty left-hand call table.
+        "SELECT id, name FROM t WHERE id = 1 AND upper(name) = 'NAME_1' AND lower(name) = 'name_1' ORDER BY id",
+        // Predicates the pruner never consumed still work (guarding against a
+        // fix that just turns pushdown off).
+        "SELECT id FROM t WHERE id = 1 ORDER BY id",
+        "SELECT id FROM t WHERE upper(name) = 'NAME_1' ORDER BY id",
+        "SELECT id FROM t WHERE id = 1 AND name <> 'x' ORDER BY id",
+        "SELECT id FROM t WHERE id = 1 AND name LIKE 'name%' ORDER BY id",
+    ]
+);
+
+// The bug lives in the expression compiler, not in any one format's scan, so
+// it reproduces on CSV too (`tests/data/basic.csv` is the same data).
+e2e!(
+    pushdown_residual_predicate_with_function_calls_csv,
+    "tests/data/basic.csv",
+    [
+        "SELECT id, name FROM t WHERE id = 1 AND upper(name) = 'NAME_1' ORDER BY id",
+        "SELECT id, name FROM t WHERE upper(name) = 'NAME_1' AND id = 1 ORDER BY id",
+        "SELECT id, name FROM t WHERE id = 1 AND name ILIKE 'name_1' ORDER BY id",
+        "SELECT id, name FROM t WHERE lower(name) = 'name_1' AND upper(name) = 'NAME_1' ORDER BY id",
+    ]
+);
+
 e2e!(
     try_cast_expr,
     "tests/data/basic.parquet",
