@@ -77,6 +77,75 @@ SELECT map_extract('{"a":1}', 'z');       -- NULL  (missing key -> NULL, not an 
 
 `array_extract` is an alias for `list_extract`.
 
+## Concatenating lists
+
+```sql
+SELECT list_concat([1, 2], [3]);          -- '[1,2,3]'
+SELECT [1, 2] || [3];                     -- '[1,2,3]'  (the || operator, when both sides are JSON)
+SELECT [[1]] || [[3]];                    -- '[[1],[3]]'  (never flattened)
+SELECT [1, 2] || [3] || [4];              -- '[1,2,3,4]'  (left-associative, stays a list throughout)
+```
+
+`list_cat`, `array_concat`, and `array_cat` are aliases for `list_concat`.
+`list_concat` is variadic (`list_concat([1,2], [3], [4])`).
+
+The function and the operator differ in exactly one way, and both follow
+DuckDB:
+
+```sql
+SELECT list_concat([1], NULL);   -- '[1]'  (the function reads NULL as an empty list, never returns NULL)
+SELECT list_concat(NULL, NULL);  -- '[]'
+SELECT [1] || NULL;              -- NULL   (the operator propagates NULL, like every other binary operator)
+```
+
+`||` concatenates as lists only when **both** operands are `JSON`. With
+`JSON` on one side only it stays VARCHAR concatenation, which is what
+`SELECT 'a' || 1` (`'a1'`) relies on:
+
+```sql
+SELECT 'a' || 'b';    -- 'ab'
+SELECT 'a' || 1;      -- 'a1'
+SELECT [1] || 2;      -- '[1]2'   (VARCHAR; DuckDB rejects this instead -- see limitations.md)
+```
+
+### `||` requires arrays; cast to concatenate JSON documents as text
+
+Because a list *is* a `JSON` value here, `||` between two `JSON` operands
+means list concatenation, and an operand that is **not** a JSON array is a
+type error (`TypeMismatch`) at run time — not `NULL`, and not a text
+concatenation that would produce invalid JSON:
+
+```sql
+SELECT CAST('{"a":1}' AS JSON) || CAST('{"b":2}' AS JSON);  -- error: TypeMismatch
+SELECT [1] || CAST('{"a":1}' AS JSON);                      -- error: TypeMismatch (either order)
+SELECT CAST('5' AS JSON) || [1];                            -- error: TypeMismatch (a scalar is not an array)
+```
+
+**Cast out of `JSON` to concatenate two documents as text** — this is the
+only way to get the behavior DuckDB's `JSON || JSON` has, and it works
+because the operands are then plain `VARCHAR`:
+
+```sql
+SELECT CAST(CAST('{"a":1}' AS JSON) AS VARCHAR)
+    || CAST(CAST('{"b":2}' AS JSON) AS VARCHAR);   -- '{"a":1}{"b":2}'
+```
+
+The error wins over `NULL` propagation, so operand order doesn't change the
+outcome: `CAST('{"a":1}' AS JSON) || NULL` and `NULL || CAST('{"a":1}' AS
+JSON)` both raise. A row is `NULL` only when every non-`NULL` operand is a
+well-formed array.
+
+The `list_concat` **function** is deliberately different: it keeps returning
+`NULL` for a non-array operand, matching the leniency `list_extract`,
+`list_slice`, and `list_transform` already have.
+
+```sql
+SELECT list_concat(CAST('{"a":1}' AS JSON), [1]);  -- NULL (the function, not the operator)
+```
+
+See [limitations.md](limitations.md#json-is-also-the-list-type) for why this
+divergence from DuckDB exists at all.
+
 ## CAST to/from JSON
 
 ```sql

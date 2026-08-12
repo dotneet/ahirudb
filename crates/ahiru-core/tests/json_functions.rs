@@ -168,6 +168,155 @@ fn map_extract_looks_up_object_keys() {
     assert_eq!(one(&mut sess, r#"map_extract('{"a":1}', 'z')"#), Value::Null);
 }
 
+// --- list_concat / `||` on lists ---------------------------------------------
+
+#[test]
+fn list_concat_matches_duckdb() {
+    let mut sess = session_with_basic();
+    // duckdb: list_concat([1,2],[3]) -> [1, 2, 3]; list_concat([1]) -> [1];
+    //         list_concat([],[1]) -> [1]
+    assert_eq!(one(&mut sess, "list_concat([1,2], [3])"), s("[1,2,3]"));
+    assert_eq!(one(&mut sess, "list_concat([1])"), s("[1]"));
+    assert_eq!(one(&mut sess, "list_concat([], [1])"), s("[1]"));
+    // duckdb: list_cat/array_concat/array_cat are aliases of list_concat.
+    assert_eq!(one(&mut sess, "list_cat([1], [2])"), s("[1,2]"));
+    assert_eq!(one(&mut sess, "array_concat([1], [2])"), s("[1,2]"));
+    assert_eq!(one(&mut sess, "array_cat([1], [2])"), s("[1,2]"));
+    // duckdb: list_concat([1], NULL::INTEGER[]) -> [1];
+    //         list_concat(NULL::INTEGER[], NULL::INTEGER[]) -> [].
+    // The *function* reads NULL as an empty list and never returns NULL —
+    // unlike the `||` *operator*, see `list_concat_operator_matches_duckdb`.
+    assert_eq!(one(&mut sess, "list_concat([1], NULL)"), s("[1]"));
+    assert_eq!(one(&mut sess, "list_concat(NULL, NULL)"), s("[]"));
+    assert_eq!(one(&mut sess, "list_concat([1,2], [3], NULL, [4])"), s("[1,2,3,4]"));
+}
+
+#[test]
+fn list_concat_operator_matches_duckdb() {
+    let mut sess = session_with_basic();
+    // The bug this replaced: `||` used to cast both sides to VARCHAR, so
+    // `[1,2] || [3]` silently returned the string `[1,2][3]`.
+    // duckdb: [1,2] || [3] -> [1, 2, 3] (INTEGER[])
+    assert_eq!(one(&mut sess, "[1,2] || [3]"), s("[1,2,3]"));
+    // duckdb: [] || [1] -> [1]; [[1]] || [[3]] -> [[1], [3]] (no flattening)
+    assert_eq!(one(&mut sess, "[] || [1]"), s("[1]"));
+    assert_eq!(one(&mut sess, "[1] || []"), s("[1]"));
+    assert_eq!(one(&mut sess, "[[1]] || [[3]]"), s("[[1],[3]]"));
+    // Left-associative chaining stays a list all the way through.
+    assert_eq!(one(&mut sess, "[1,2] || [3] || [4]"), s("[1,2,3,4]"));
+    // duckdb: [1] || NULL::INTEGER[] -> NULL, NULL || [1] -> NULL.
+    // The operator propagates NULL (the function does not).
+    assert_eq!(one(&mut sess, "[1] || NULL"), Value::Null);
+    assert_eq!(one(&mut sess, "NULL || [1]"), Value::Null);
+    // An explicitly JSON-typed operand behaves the same as a list literal —
+    // in this engine they are the same type (`docs/DESIGN.md` §5/§8).
+    assert_eq!(one(&mut sess, "CAST('[1,2]' AS JSON) || CAST('[3]' AS JSON)"), s("[1,2,3]"));
+}
+
+#[test]
+fn concat_operator_keeps_varchar_behavior_when_not_both_json() {
+    let mut sess = session_with_basic();
+    // duckdb: 'a' || 'b' -> 'ab', 'a' || 1 -> 'a1', 'a' || NULL -> NULL
+    assert_eq!(one(&mut sess, "'a' || 'b'"), s("ab"));
+    assert_eq!(one(&mut sess, "'a' || 1"), s("a1"));
+    assert_eq!(one(&mut sess, "'a' || NULL"), Value::Null);
+    assert_eq!(one(&mut sess, "NULL || NULL"), Value::Null);
+    // JSON on one side only stays text concatenation. DuckDB rejects
+    // `[1] || 2` outright ("Cannot concatenate types INTEGER[] and
+    // INTEGER"), but it can tell a LIST from a JSON document and this engine
+    // cannot, and `json_col || 'suffix'` is legal DuckDB. Documented in
+    // `docs/sql/limitations.md`.
+    assert_eq!(one(&mut sess, "[1] || 2"), s("[1]2"));
+    assert_eq!(one(&mut sess, "1 || [2]"), s("1[2]"));
+    // Casting out of JSON is the documented escape hatch for concatenating
+    // JSON documents as text (which is what DuckDB's `JSON || JSON` does).
+    assert_eq!(one(&mut sess, "CAST([1,2] AS VARCHAR) || CAST([3] AS VARCHAR)"), s("[1,2][3]"));
+}
+
+/// Run `SELECT <expr> FROM t LIMIT 1` and return the error code it fails
+/// with, or `None` if it succeeds. The failures this is used for are
+/// *runtime* ones — whether a JSON value is an array can't be known until the
+/// value is read — so they surface from `Session::step`, not `prepare`, the
+/// same way `cast_invalid_json_text_errors_the_whole_query` does.
+fn err_code(session: &mut Session, expr: &str) -> Option<Code> {
+    let sql = format!("SELECT {expr} AS x FROM t LIMIT 1");
+    let mut q = match session.prepare(&sql, &[]) {
+        Ok(Prepared::Ready(q)) => q,
+        Ok(Prepared::NeedIo(_)) => panic!("{sql}: unexpected NeedIo"),
+        Err(e) => return Some(e.code),
+    };
+    loop {
+        match session.step(&mut q) {
+            Ok(QueryStep::Batch(_)) => continue,
+            Ok(QueryStep::Done) => return None,
+            Ok(QueryStep::NeedIo(_)) | Ok(QueryStep::NeedCodec(_)) => panic!("{sql}: unexpected"),
+            Err(e) => return Some(e.code),
+        }
+    }
+}
+
+#[test]
+fn concat_operator_on_non_array_json_is_a_type_error() {
+    let mut sess = session_with_basic();
+    // Deliberate divergence from DuckDB, where JSON is a distinct type from
+    // LIST and `'{"a":1}'::JSON || '{"b":2}'::JSON` is VARCHAR text
+    // concatenation (`{"a":1}{"b":2}`). Here a list *is* a JSON value, so the
+    // two cases cannot be told apart, and `||` raises rather than guessing —
+    // returning NULL would just be a second silent wrong answer. See
+    // `docs/sql/limitations.md`.
+    let obj = r#"CAST('{"a":1}' AS JSON)"#;
+    assert_eq!(
+        err_code(&mut sess, &format!(r#"{obj} || CAST('{{"b":2}}' AS JSON)"#)),
+        Some(Code::TypeMismatch)
+    );
+    // Mixed array/non-array, in both orders. DuckDB rejects these too, at
+    // bind time: `duckdb -c "select [1] || '{\"a\":1}'::JSON"` -> "Cannot
+    // concatenate types INTEGER[] and JSON - an explicit cast is required".
+    assert_eq!(err_code(&mut sess, &format!("[1] || {obj}")), Some(Code::TypeMismatch));
+    assert_eq!(err_code(&mut sess, &format!("{obj} || [1]")), Some(Code::TypeMismatch));
+    // A JSON scalar is not an array either.
+    assert_eq!(err_code(&mut sess, "CAST('5' AS JSON) || [1]"), Some(Code::TypeMismatch));
+    // The error takes priority over NULL propagation, in either order, so the
+    // result never depends on which operand is inspected first.
+    assert_eq!(err_code(&mut sess, &format!("{obj} || NULL")), Some(Code::TypeMismatch));
+    assert_eq!(err_code(&mut sess, &format!("NULL || {obj}")), Some(Code::TypeMismatch));
+    // The escape hatch stays available and is the only way to get DuckDB's
+    // text concatenation of two JSON documents.
+    assert_eq!(
+        one(
+            &mut sess,
+            &format!(r#"CAST({obj} AS VARCHAR) || CAST(CAST('{{"b":2}}' AS JSON) AS VARCHAR)"#)
+        ),
+        s(r#"{"a":1}{"b":2}"#)
+    );
+}
+
+#[test]
+fn list_concat_function_on_non_array_json_stays_null() {
+    let mut sess = session_with_basic();
+    // Unlike the operator above, the *function* keeps the leniency the rest
+    // of the `list_*` family has for non-array JSON. DuckDB's own
+    // function-vs-operator split (NULL as an empty list vs NULL propagation)
+    // already treats them as different things.
+    assert_eq!(one(&mut sess, r#"list_concat(CAST('{"a":1}' AS JSON), [1])"#), Value::Null);
+    assert_eq!(one(&mut sess, r#"array_concat([1], CAST('5' AS JSON))"#), Value::Null);
+}
+
+#[test]
+fn list_concat_works_over_table_columns() {
+    let mut sess = session_with_basic();
+    // Per-row evaluation, not just constant folding: one operand varies per
+    // row and one row's list is NULL (so the operator's row is NULL too).
+    let rows = run(
+        &mut sess,
+        "SELECT [id] || CASE WHEN id = 0 THEN NULL ELSE [99] END \
+         FROM t WHERE id IN (0, 1) ORDER BY id",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Null);
+    assert_eq!(rows[1][0], s("[1,99]"));
+}
+
 // --- CAST --------------------------------------------------------------------
 
 #[test]
