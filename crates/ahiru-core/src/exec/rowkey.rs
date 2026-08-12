@@ -1,22 +1,22 @@
-//! 行キーの正規化とハッシュ索引。
+//! Row key normalization and the hash index.
 //!
-//! 集約（GROUP BY）と結合（等値結合）はどちらも「複数列の値をキーにして
-//! 引く」動作をする。**別々に実装すると等価判定の細部（NULL の扱い、-0.0、
-//! NaN）がずれて静かに壊れる**ので、1 か所に寄せて共有する。
-//! コードサイズの点でも 2 つ持つ理由がない。
+//! Aggregation (GROUP BY) and joins (equi-joins) both "look things up by a key made of several
+//! columns' values". **Implementing them separately would let the details of equality (NULL
+//! handling, -0.0, NaN) drift apart and break silently**, so they are unified in one place.
+//! There is no reason to carry two, code size included.
 //!
-//! キーは**等価判定専用**で、順序は持たない。ソートは値を直接比較する。
+//! Keys are **for equality only** and carry no ordering. Sorting compares values directly.
 
 use crate::prelude::*;
 use crate::rt::hash::hash_u64;
 use crate::vector::{Data, Vector};
 
-/// 1 行分のキーを `out` に書く。
+/// Writes one row's key into `out`.
 ///
-/// 各列は「1 バイトの有無フラグ + 値」。NULL はフラグ 0 のみで値を持たない。
-/// SQL の `=` では NULL は NULL と等しくないが、**GROUP BY と DISTINCT では
-/// 同じグループに入る**。この関数は後者の意味論で符号化するので、結合側は
-/// NULL キーの行を投入する前に自分で弾くこと。
+/// Each column is "a 1-byte presence flag + the value". NULL is just flag 0 with no value.
+/// Under SQL's `=`, NULL does not equal NULL, but **under GROUP BY and DISTINCT they land in
+/// the same group**. This function encodes with the latter semantics, so the join side must
+/// reject NULL-key rows itself before feeding them in.
 pub fn encode_key(cols: &[&Vector], row: usize, out: &mut Vec<u8>) {
     out.clear();
     for c in cols {
@@ -40,11 +40,11 @@ pub fn encode_key(cols: &[&Vector], row: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// 浮動小数のビット表現を正規化する。
+/// Normalizes a floating-point bit representation.
 ///
-/// `-0.0` と `0.0` は同じ値なので同じグループに入れる。NaN は比較演算では
-/// 常に偽だが、グループ化では 1 つにまとめる（DuckDB と同じ挙動）。
-/// ビット列をそのままキーにすると、この 2 つが別グループに割れてしまう。
+/// `-0.0` and `0.0` are the same value and belong in the same group. NaN is always false under
+/// comparison operators, but grouping collapses them into one (the same behavior as DuckDB).
+/// Using the raw bits as the key would split those two into separate groups.
 #[inline]
 pub fn canonical_f64(v: f64) -> u64 {
     if v.is_nan() {
@@ -56,14 +56,14 @@ pub fn canonical_f64(v: f64) -> u64 {
     }
 }
 
-/// キーが 1 つでも NULL を含むか。等値結合では NULL キーは決して一致しない
-/// ので、投入・探索の前に弾くのに使う。
+/// Whether the key contains even one NULL. In an equi-join a NULL key never matches, so this is
+/// used to reject rows before insertion and probing.
 pub fn key_has_null(cols: &[&Vector], row: usize) -> bool {
     cols.iter().any(|c| !c.is_valid(row))
 }
 
-/// 10^scale。`f64::powi` は core に無いので掛け算で作る。
-/// `exec::agg`/`exec::window` の DECIMAL ⇔ f64 変換で共有する。
+/// 10^scale. `f64::powi` is not in core, so it is built by multiplication.
+/// Shared by the DECIMAL <-> f64 conversions in `exec::agg`/`exec::window`.
 pub fn pow10(scale: u8) -> f64 {
     let mut d = 1.0f64;
     for _ in 0..scale {
@@ -72,12 +72,12 @@ pub fn pow10(scale: u8) -> f64 {
     d
 }
 
-/// NaN を「すべてより大きい」とみなす全順序。
+/// A total order treating NaN as "greater than everything".
 ///
-/// こうすると MAX は他に値が無いときだけ NaN を返し、MIN は NaN 以外を
-/// 優先する（全部 NaN のグループだけ NaN になる）。`encode_key`/
-/// `canonical_f64` が NaN を 1 グループにまとめるのと矛盾しない。
-/// `exec::agg`/`exec::window` の MIN/MAX 系集約で共有する。
+/// That way MAX returns NaN only when there is no other value, and MIN prefers anything but NaN
+/// (only an all-NaN group gives NaN). It does not contradict `encode_key`/`canonical_f64`
+/// collapsing NaN into one group.
+/// Shared by the MIN/MAX-family aggregates in `exec::agg`/`exec::window`.
 pub fn ord_f64(a: f64, b: f64) -> core::cmp::Ordering {
     use core::cmp::Ordering::*;
     if a < b {
@@ -95,25 +95,25 @@ pub fn ord_f64(a: f64, b: f64) -> core::cmp::Ordering {
     }
 }
 
-/// バイト列キー → `u32` 値のオープンアドレッシング表。
+/// An open-addressing table mapping byte-sequence keys to `u32` values.
 ///
-/// キー本体は 1 本のアリーナに連結して置く。エントリごとに `Vec` を持つと
-/// 確保回数が行数に比例して増えるため。
+/// The keys themselves are concatenated into a single arena. A `Vec` per entry would make
+/// allocations grow in proportion to the row count.
 pub struct HashIndex {
-    /// キーを連結したアリーナ。
+    /// The arena of concatenated keys.
     keys: Vec<u8>,
-    /// `(キー開始, キー長, 値)`
+    /// `(key start, key length, value)`
     entries: Vec<(u32, u32, u32)>,
-    /// 各エントリのハッシュ値。再ハッシュ時にキーを読み直さずに済む。
+    /// Each entry's hash value. Saves rereading keys when rehashing.
     hashes: Vec<u64>,
-    /// バケット。0 は空、それ以外は `entries` の添字 + 1。
+    /// The buckets. 0 is empty; anything else is an index into `entries` plus 1.
     buckets: Vec<u32>,
     mask: usize,
 }
 
-/// バケットの初期容量（2 のべき乗）。
+/// The buckets' initial capacity (a power of two).
 const INITIAL_BUCKETS: usize = 1024;
-/// この使用率を超えたら倍にする。
+/// Doubles once this load factor is exceeded.
 const LOAD_NUM: usize = 7;
 const LOAD_DEN: usize = 10;
 
@@ -136,15 +136,14 @@ impl HashIndex {
         self.entries.is_empty()
     }
 
-    /// 保持しているキーの総バイト数。メモリ上限の判定に使う。
+    /// The total bytes of keys held. Used for the memory cap check.
     pub fn key_bytes(&self) -> usize {
         self.keys.len()
     }
 
-    /// メモリ上限判定用のおおまかな使用バイト数。キー本体（`key_bytes`）に
-    /// エントリ 1 個あたりの固定オーバーヘッド（バケット・ハッシュ・エントリ
-    /// タプル分、32 バイトで概算）を足す。各オペレータの `Oom` 判定が
-    /// 共通で使う見積り式。
+    /// The rough byte usage for the memory cap check. Adds a fixed per-entry overhead (the
+    /// bucket, the hash, and the entry tuple, estimated at 32 bytes) to the keys themselves
+    /// (`key_bytes`). The shared estimation formula used by every operator's `Oom` check.
     pub fn approx_bytes(&self) -> usize {
         const ENTRY_OVERHEAD: usize = 32;
         self.key_bytes() + self.len() * ENTRY_OVERHEAD
@@ -161,7 +160,7 @@ impl HashIndex {
         &self.keys[off as usize..(off + len) as usize]
     }
 
-    /// 空きスロット、または一致するエントリのスロットを線形探査で探す。
+    /// Finds, by linear probing, an empty slot or the slot of a matching entry.
     #[inline]
     fn probe(&self, key: &[u8], h: u64) -> (usize, Option<usize>) {
         let mut slot = (hash_u64(h) as usize) & self.mask;
@@ -178,8 +177,8 @@ impl HashIndex {
         }
     }
 
-    /// 集約用。キーが無ければ「次のスロット番号」を値として挿入する。
-    /// 返り値は `(値, 新規に挿入したか)`。
+    /// For aggregation. If the key is absent, inserts "the next slot number" as the value.
+    /// Returns `(value, whether it was newly inserted)`.
     pub fn get_or_insert(&mut self, key: &[u8]) -> (u32, bool) {
         let h = Self::hash(key);
         let (slot, hit) = self.probe(key, h);
@@ -191,17 +190,17 @@ impl HashIndex {
         (value, true)
     }
 
-    /// 探索のみ。無ければ `None`。
+    /// Lookup only. `None` if absent.
     pub fn lookup(&self, key: &[u8]) -> Option<u32> {
         let h = Self::hash(key);
         let (_, hit) = self.probe(key, h);
         hit.map(|i| self.entries[i].2)
     }
 
-    /// 結合のビルド側用。同じキーが複数あってよい。
+    /// For a join's build side. The same key may appear several times.
     ///
-    /// 既存の値を返しつつ新しい値で置き換えるので、呼び出し側は
-    /// `next[value] = 返り値` としてチェーンを張れる。
+    /// It returns the existing value while replacing it with the new one, so the caller can build
+    /// the chain as `next[value] = the returned value`.
     pub fn insert_chained(&mut self, key: &[u8], value: u32) -> Option<u32> {
         let h = Self::hash(key);
         let (slot, hit) = self.probe(key, h);
@@ -299,8 +298,8 @@ mod tests {
 
     #[test]
     fn multi_column_keys_are_not_confusable() {
-        // ("a", "bc") と ("ab", "c") が同じキーにならないこと。
-        // 長さを前置していなければ衝突する。
+        // ("a", "bc") and ("ab", "c") must not give the same key.
+        // Without a length prefix they would collide.
         let a1 = vec_str(&[Some("a")]);
         let b1 = vec_str(&[Some("bc")]);
         let a2 = vec_str(&[Some("ab")]);
@@ -315,14 +314,14 @@ mod tests {
         v.push_value(&Value::F64(-0.0));
         v.push_value(&Value::F64(f64::NAN));
         v.push_value(&Value::F64(-f64::NAN));
-        assert_eq!(key(&[&v], 0), key(&[&v], 1), "-0.0 は 0.0 と同じグループ");
-        assert_eq!(key(&[&v], 2), key(&[&v], 3), "NaN は 1 つのグループ");
+        assert_eq!(key(&[&v], 0), key(&[&v], 1), "-0.0 groups with 0.0");
+        assert_eq!(key(&[&v], 2), key(&[&v], 3), "NaN forms a single group");
         assert_ne!(key(&[&v], 0), key(&[&v], 2));
     }
 
-    // DECIMAL(precision>18)/HUGEINT/UBIGINT/INTERVAL は物理表現がすべて
-    // `Data::I128` に統一されている（`Ty::phys`）。エンコード自体はどの
-    // 論理型でも同じコードパスを通るので、物理型レベルで確認すれば十分。
+    // DECIMAL(precision>18)/HUGEINT/UBIGINT/INTERVAL all share the physical representation
+    // `Data::I128` (`Ty::phys`). Encoding itself takes the same code path for every logical
+    // type, so checking at the physical-type level is enough.
     fn vec_i128(ty: Ty, vals: &[Option<i128>]) -> Vector {
         let mut v = Vector::new(ty);
         for x in vals {
@@ -340,20 +339,20 @@ mod tests {
             Ty::HugeInt,
             &[Some(1), Some(1), Some(-1), Some(i128::MAX), Some(i128::MIN), Some(0)],
         );
-        // 同値は同キー。
+        // Equal values give equal keys.
         assert_eq!(key(&[&a], 0), key(&[&a], 1));
-        // 符号違い・境界値はすべて異なるキーになる（総当たりで確認）。
+        // Differing signs and boundary values all give different keys (checked exhaustively).
         let n = 6;
         for i in 0..n {
             for j in 0..n {
                 if (i == 0 && j == 1) || (i == 1 && j == 0) {
-                    continue; // vals[0] == vals[1] == 1 なので除外（両方向とも）。
+                    continue; // excluded, since vals[0] == vals[1] == 1 (both directions).
                 }
                 if i != j {
                     assert_ne!(
                         key(&[&a], i),
                         key(&[&a], j),
-                        "行 {i} と {j} は異なる値なのにキーが衝突した"
+                        "rows {i} and {j} have different values yet their keys collided"
                     );
                 }
             }
@@ -363,14 +362,14 @@ mod tests {
     #[test]
     fn i128_null_is_distinguished_from_zero() {
         let a = vec_i128(Ty::HugeInt, &[None, None, Some(0)]);
-        assert_eq!(key(&[&a], 0), key(&[&a], 1), "NULL 同士は同じグループ");
-        assert_ne!(key(&[&a], 0), key(&[&a], 2), "NULL と 0 は別グループ");
+        assert_eq!(key(&[&a], 0), key(&[&a], 1), "NULLs group together");
+        assert_ne!(key(&[&a], 0), key(&[&a], 2), "NULL and 0 are separate groups");
     }
 
     #[test]
     fn i128_composite_key_with_null_in_another_column() {
-        // DECIMAL(38,0) 列 + INTEGER 列の複合キーで、DECIMAL 側が同値でも
-        // 他方の NULL/非 NULL で別グループになることを確認する。
+        // With a composite key of a DECIMAL(38,0) column and an INTEGER column, confirms that
+        // equal DECIMAL values still form separate groups by the other column's NULL/non-NULL.
         let dec = vec_i128(Ty::decimal(38, 0), &[Some(100), Some(100)]);
         let other = vec_i32(&[None, Some(0)]);
         assert_ne!(key(&[&dec, &other], 0), key(&[&dec, &other], 1));
@@ -398,7 +397,7 @@ mod tests {
     #[test]
     fn growth_preserves_all_entries() {
         let mut h = HashIndex::new();
-        // 初期容量を大きく超える件数を入れて再ハッシュを起こす。
+        // Feed in far more than the initial capacity to trigger a rehash.
         let n = 5000u32;
         for i in 0..n {
             let k = i.to_le_bytes();
@@ -407,7 +406,7 @@ mod tests {
         assert_eq!(h.len(), n as usize);
         for i in 0..n {
             let k = i.to_le_bytes();
-            assert_eq!(h.lookup(&k), Some(i), "再ハッシュ後に {i} が引けない");
+            assert_eq!(h.lookup(&k), Some(i), "{i} cannot be looked up after rehashing");
         }
     }
 
@@ -417,14 +416,14 @@ mod tests {
         assert_eq!(h.insert_chained(b"k", 0), None);
         assert_eq!(h.insert_chained(b"k", 1), Some(0));
         assert_eq!(h.insert_chained(b"k", 2), Some(1));
-        // 最後に入れたものが先頭。
+        // The last one inserted comes first.
         assert_eq!(h.lookup(b"k"), Some(2));
         assert_eq!(h.len(), 1);
     }
 
     #[test]
     fn empty_key_is_a_valid_key() {
-        // GROUP BY を持たない集約は空キーの 1 グループになる。
+        // An aggregate without GROUP BY forms one group under the empty key.
         let mut h = HashIndex::new();
         assert_eq!(h.get_or_insert(b""), (0, true));
         assert_eq!(h.get_or_insert(b""), (0, false));

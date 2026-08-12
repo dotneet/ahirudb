@@ -1,12 +1,12 @@
-//! プラン木のテキスト化。`EXPLAIN` 用。
+//! Rendering the plan tree as text. For `EXPLAIN`.
 //!
-//! `format!` はサイズ予算の都合で使えないので、文字列は手で組み立てる。
-//! 数値の桁組みも自前（`push_u64`）。
+//! `format!` is unavailable given the size budget, so strings are assembled by hand,
+//! including number formatting (`push_u64`).
 
 use crate::plan::Node;
 use crate::prelude::*;
 
-/// プランを 1 行 1 ノードのテキストにする。深さはインデントで表す。
+/// Renders a plan as text, one node per line. Depth is shown by indentation.
 pub fn explain(root: &Node) -> Vec<String> {
     let mut out = Vec::new();
     walk(root, 0, &mut out);
@@ -60,7 +60,7 @@ fn walk(n: &Node, depth: usize, out: &mut Vec<String>) {
             line.push_str("Sort  keys=");
             push_u64(&mut line, keys.len() as u64);
             if let Some(l) = limit {
-                // Top-N に落ちているかどうかは性能を読むうえで重要。
+                // Whether it lowered to a Top-N matters for reading performance.
                 line.push_str(" topn=");
                 push_u64(&mut line, *l as u64);
             }

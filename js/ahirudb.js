@@ -1,50 +1,50 @@
-// ahirudb の JS ホスト層。依存ゼロの ES モジュール（ブラウザ / Node 18+）。
+// The JS host layer for ahirudb. A dependency-free ES module (browser / Node 18+).
 //
-// wasm 側との契約はすべて crates/ahiru-core/src/abi.rs にある。ステータス値・
-// ワイヤ形式・エラーコードを変えるときは、あちらとこのファイルを同時に直すこと。
+// The entire contract with the wasm side lives in crates/ahiru-core/src/abi.rs.
+// When changing status values, the wire format, or error codes, change that file and this one together.
 //
-// このホストが担うのは 3 つだけ:
-//   1. NEED_IO ループ … エンジンが要求したバイト範囲を結合して並列取得し、返す
-//   2. 結果バッファのデコード … 列指向のリトルエンディアン表現 → JS の値
-//   3. エラーメッセージの組み立て（errors.js の表）
+// This host is responsible for exactly three things:
+//   1. the NEED_IO loop ... coalesce the byte ranges the engine asks for, fetch them in parallel, and hand them back
+//   2. decoding the result buffer ... columnar little-endian representation -> JS values
+//   3. assembling error messages (the table in errors.js)
 //
-// --- wasm メモリの扱い（重要）-------------------------------------------------
-// `ahiru_alloc` / `ahiru_provide` は wasm のヒープを伸ばす可能性があり、伸びた
-// 瞬間に既存の TypedArray ビューは detach して長さ 0 になる。silent に壊れる
-// タイプのバグなので、方針を固定する:
+// --- Handling wasm memory (important) ----------------------------------------
+// `ahiru_alloc` / `ahiru_provide` may grow the wasm heap, and the moment it grows
+// every existing TypedArray view detaches and becomes zero-length. That is a
+// silently-corrupting class of bug, so the policy is fixed:
 //
-//   (a) `memory.buffer` へのビューは wasm 呼び出しをまたいで保持しない。
-//       必ず呼び出しの直後に `new Uint8Array(memory.buffer)` で取り直す。
-//   (b) `ahiru_out_ptr()` が指すバッファは次の `ahiru_query_step` /
-//       `ahiru_schema` で作り直される。値を後で使うなら、次の wasm 呼び出しの
-//       前に JS 側へコピーし終えていること。
-//   (c) 上記 (b) を守れる場合に限り、デコードはビューのまま行いコピーを省く
-//       （`query()` はその場で行オブジェクトに詰めるのでコピー不要、
-//        `stream()` は呼び出し側にバッチを渡すので必ず `.slice()` する）。
+//   (a) Never hold a view onto `memory.buffer` across a wasm call.
+//       Always re-take it with `new Uint8Array(memory.buffer)` right after the call.
+//   (b) The buffer `ahiru_out_ptr()` points at is rebuilt by the next
+//       `ahiru_query_step` / `ahiru_schema`. If a value is needed later, it must be
+//       copied to the JS side before the next wasm call.
+//   (c) Only when (b) above can be upheld, decode straight from the view and skip
+//       the copy (`query()` packs into row objects on the spot so no copy is
+//       needed; `stream()` hands batches to the caller so it always `.slice()`s).
 
 import { AhiruError, Code, errorMessage } from './errors.js';
 
 export { AhiruError, Code, errorMessage };
 
-// --- abi.rs と対応する定数 ---------------------------------------------------
+// --- Constants mirroring abi.rs ----------------------------------------------
 
 const STATUS_BATCH_READY = 0;
 const STATUS_NEED_IO = 1;
 const STATUS_DONE = 2;
 const STATUS_ERROR = 3;
-/** 内蔵しないコーデック（GZIP / ZSTD）の展開をホストに依頼する。 */
+/** Asks the host to decompress a codec that is not built in (GZIP / ZSTD). */
 const STATUS_NEED_CODEC = 4;
 
-/** 結果バッファ先頭のマジック "AHR1"。 */
+/** The magic "AHR1" at the head of the result buffer. */
 const RESULT_MAGIC = 0x41485231;
 
-/** `encode_io` の 1 要素: table:u32 + part:u32 + offset:u64 + len:u64。 */
+/** One element of `encode_io`: table:u32 + part:u32 + offset:u64 + len:u64. */
 const IO_REQUEST_SIZE = 24;
 
-/** `encode_codec` の 1 要素: table:u32 + part:u32 + codec:u32 + offset:u64 + len:u32 + out_len:u32。 */
+/** One element of `encode_codec`: table:u32 + part:u32 + codec:u32 + offset:u64 + len:u32 + out_len:u32. */
 const CODEC_REQUEST_SIZE = 28;
 
-/** Parquet の Compression enum（parquet/mod.rs）。内蔵しないものだけ名前を持つ。 */
+/** Parquet's Compression enum (parquet/mod.rs). Only the ones not built in are named. */
 const CODEC_NAMES = {
   0: 'UNCOMPRESSED',
   1: 'SNAPPY',
@@ -58,7 +58,7 @@ const CODEC_NAMES = {
 const CODEC_GZIP = 2;
 const CODEC_ZSTD = 6;
 
-/** PhysType の数値。abi.rs の `const _: ()` アサーションで固定されている。 */
+/** PhysType numbers. Pinned by the `const _: ()` assertions in abi.rs. */
 const PHYS_BOOL = 0;
 const PHYS_I32 = 1;
 const PHYS_I64 = 2;
@@ -66,7 +66,7 @@ const PHYS_F64 = 3;
 const PHYS_I128 = 4;
 const PHYS_BYTES = 5;
 
-/** 論理型コード（`ty_code`）→ 型名。添字がそのままコード。 */
+/** Logical type code (`ty_code`) -> type name. The index is the code itself. */
 const TYPE_NAMES = [
   'NULL', 'BOOLEAN', 'TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT',
   'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL',
@@ -79,41 +79,41 @@ const TY_INTERVAL = 19;
 const TY_JSON = 20;
 const TY_UUID = 21;
 
-/** 隣接判定のしきい値。この幅未満の穴は「読んだ方が安い」として結合する。 */
+/** Adjacency threshold. Gaps narrower than this are coalesced, on the grounds that reading them is cheaper. */
 const COALESCE_GAP = 1024 * 1024;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder('utf-8');
 
-// --- 時刻ヘルパ ---------------------------------------------------------------
+// --- Time helpers ------------------------------------------------------------
 
-/** TIMESTAMP（エポックからのマイクロ秒, BigInt）を `Date` にする。 */
+/** Turns a TIMESTAMP (microseconds since the epoch, BigInt) into a `Date`. */
 export function timestampToDate(micros) {
-  // Date はミリ秒精度なので、マイクロ秒の端数はここで落ちる。
+  // Date has millisecond precision, so the sub-millisecond remainder is dropped here.
   return new Date(Number(BigInt(micros) / 1000n));
 }
 
-/** DATE（エポックからの日数, number）を UTC の `Date` にする。 */
+/** Turns a DATE (days since the epoch, number) into a UTC `Date`. */
 export function dateToDate(days) {
   return new Date(Number(days) * 86400000);
 }
 
 /**
- * TIMESTAMPTZ（エポックからの UTC マイクロ秒, BigInt）を `Date` にする。
- * 物理表現は TIMESTAMP と同一（このエンジンにセッションタイムゾーンの
- * 概念は無く、値は常に UTC の瞬間を表す）なので `timestampToDate` の別名。
+ * Turns a TIMESTAMPTZ (UTC microseconds since the epoch, BigInt) into a `Date`.
+ * The physical representation is identical to TIMESTAMP (this engine has no notion
+ * of a session time zone, and values always denote a UTC instant), so this is an alias of `timestampToDate`.
  */
 export const timestamptzToDate = timestampToDate;
 
 /**
- * INTERVAL の物理表現（月 / 日 / マイクロ秒を 1 個の i128 に詰めたもの）を
- * `{ months, days, micros }` に開く。`vector::types` の `unpack_interval`
- * と同じ計算なので、あちらを変えたらここも変えること。
+ * Opens the physical representation of an INTERVAL (months / days / microseconds
+ * packed into a single i128) into `{ months, days, micros }`. This is the same
+ * computation as `unpack_interval` in `vector::types`, so change both together.
  *
- * 3 成分を別々に持つのは DuckDB / PostgreSQL と同じモデルで、月と日を
- * マイクロ秒に潰さないのは「1 か月」の長さが基準日に依存するため
- * （`pack_interval` の doc 参照）。したがってこの 3 つを 1 個の数値に
- * まとめて返すことはできない。
+ * Keeping three separate components is the same model DuckDB / PostgreSQL use.
+ * Months and days are not collapsed into microseconds because the length of
+ * "one month" depends on the reference date (see the docs on `pack_interval`).
+ * The three therefore cannot be returned as a single number.
  */
 export function unpackInterval(packed) {
   const v = BigInt(packed);
@@ -124,7 +124,7 @@ export function unpackInterval(packed) {
   };
 }
 
-/** 16 バイトを `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` にする。 */
+/** Turns 16 bytes into `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. */
 function formatUuid(bytes) {
   let s = '';
   for (let i = 0; i < 16; i++) {
@@ -134,13 +134,14 @@ function formatUuid(bytes) {
   return s;
 }
 
-// --- レンジキャッシュ ---------------------------------------------------------
+// --- Range cache -------------------------------------------------------------
 
 /**
- * `(source, offset, len)` をキーにしたバイト範囲の LRU キャッシュ。
+ * An LRU cache of byte ranges keyed by `(source, offset, len)`.
  *
- * 完全一致のみを見る。部分被覆の探索は線形になるうえ、エンジンは同じ
- * RowGroup に対して毎回同じ範囲を要求するので、実用上これで当たる。
+ * Only exact matches are considered. Searching for partial coverage would be
+ * linear, and the engine asks for the same range of the same RowGroup every time,
+ * so in practice this hits.
  */
 export class MemoryCache {
   #map = new Map();
@@ -157,14 +158,14 @@ export class MemoryCache {
   get(key) {
     const v = this.#map.get(key);
     if (v === undefined) return undefined;
-    // Map は挿入順を保つので、消して入れ直すだけで LRU になる。
+    // Map preserves insertion order, so deleting and reinserting is all LRU takes.
     this.#map.delete(key);
     this.#map.set(key, v);
     return v;
   }
 
   set(key, bytes) {
-    if (bytes.byteLength > this.maxBytes) return; // 単体で入らないものは諦める
+    if (bytes.byteLength > this.maxBytes) return; // give up on anything that does not fit on its own
     const old = this.#map.get(key);
     if (old !== undefined) {
       this.#map.delete(key);
@@ -185,7 +186,7 @@ export class MemoryCache {
   }
 }
 
-/** 何も覚えないキャッシュ。`cache: "none"`。 */
+/** A cache that remembers nothing. `cache: "none"`. */
 class NullCache {
   get() {
     return undefined;
@@ -197,25 +198,26 @@ class NullCache {
 function makeCache(spec, maxBytes) {
   if (spec === 'none' || spec === false || spec === null) return new NullCache();
   if (spec === undefined || spec === 'memory') return new MemoryCache(maxBytes);
-  // "cache-api" はブラウザ限定。Node には `caches` が無いのでメモリへ落とす。
-  // （Cache API 版は Response をまたぐ非同期 I/O が増えるので、まずは同じ挙動に
-  //   縮退させておく。メモリキャッシュの正しさの方が優先。）
+  // "cache-api" is browser-only. Node has no `caches`, so fall back to memory.
+  // (A Cache API version adds asynchronous I/O across Responses, so for now it is
+  //  degraded to the same behavior. The correctness of the memory cache comes first.)
   if (spec === 'cache-api') return new MemoryCache(maxBytes);
   if (spec && typeof spec.get === 'function' && typeof spec.set === 'function') return spec;
   throw new TypeError(`unknown cache option: ${String(spec)}`);
 }
 
-// --- フォーマット判定 ---------------------------------------------------------
+// --- Format detection --------------------------------------------------------
 
-/** `ahiru_register_as` の format 引数。abi.rs の `format_kind` と 1:1。 */
+/** The format argument of `ahiru_register_as`. 1:1 with `format_kind` in abi.rs. */
 const FORMAT_CODES = { auto: 0, parquet: 1, csv: 2, tsv: 3, jsonl: 4 };
 
 /**
- * 登録名の拡張子からフォーマットを推定する。
- * `format::FormatKind::detect` の写しなので、あちらを変えたらここも変える。
+ * Infers the format from the extension of the registered name.
+ * A mirror of `format::FormatKind::detect`, so change both together.
  *
- * エンジンも同じ推定をするので、これは「明示指定が無いときに何として読まれるか」
- * を JS 側で見せるための写し。判定そのものは Auto で wasm に任せる。
+ * The engine performs the same inference, so this exists only to show, on the JS
+ * side, what a name would be read as absent an explicit choice. The decision
+ * itself is left to the wasm via Auto.
  */
 export function detectFormat(name) {
   const path = String(name).split(/[?#]/)[0];
@@ -229,16 +231,16 @@ export function detectFormat(name) {
   return 'parquet';
 }
 
-// --- バイト供給元 -------------------------------------------------------------
+// --- Byte sources ------------------------------------------------------------
 
 let sourceSeq = 0;
 
 /**
- * 登録されたものを共通のインタフェースに包む。
- * `{ key, size(), read(offset, len) }` の 3 つだけが要件。
+ * Wraps whatever was registered in a common interface.
+ * The only requirements are `{ key, size(), read(offset, len) }`.
  *
- * `size()` と `read()` を分けているのは、登録時に I/O させないため。
- * 総バイト長は `ahiru_register` に必要なので、初回クエリまで遅延する。
+ * `size()` and `read()` are separate so that registration performs no I/O.
+ * The total byte length is needed by `ahiru_register`, so it is deferred to the first query.
  */
 function makeSource(spec, fetchImpl) {
   if (typeof spec === 'string' || spec instanceof URL) {
@@ -248,17 +250,17 @@ function makeSource(spec, fetchImpl) {
   if (ArrayBuffer.isView(spec)) {
     return bytesSource(new Uint8Array(spec.buffer, spec.byteOffset, spec.byteLength));
   }
-  // Blob / File。Node 18+ にも Blob はある。
+  // Blob / File. Node 18+ has Blob too.
   if (spec && typeof spec.arrayBuffer === 'function' && typeof spec.size === 'number') {
     return blobSource(spec);
   }
-  // 独自の供給元（テストや OPFS など）。
+  // A custom source (tests, OPFS, and so on).
   if (spec && typeof spec.read === 'function') {
     const key = spec.key ?? `custom:${++sourceSeq}`;
     const size = typeof spec.size === 'function' ? () => spec.size() : () => spec.size;
     return { key, size: async () => Number(await size()), read: (o, l) => spec.read(o, l) };
   }
-  throw new TypeError('registerParquet: url / Uint8Array / ArrayBuffer / Blob のいずれかを渡すこと');
+  throw new TypeError('registerParquet: pass one of url / Uint8Array / ArrayBuffer / Blob');
 }
 
 function bytesSource(bytes) {
@@ -267,7 +269,7 @@ function bytesSource(bytes) {
     key,
     size: async () => bytes.byteLength,
     read: async (offset, len) => bytes.subarray(offset, offset + len),
-    // メモリ上にあるものをキャッシュに積むのは二重持ちなので抑止する。
+    // Caching what is already in memory would hold it twice, so suppress that.
     cacheable: false,
   };
 }
@@ -283,7 +285,7 @@ function blobSource(blob) {
   };
 }
 
-/** ネットワーク層の失敗も E504 に揃える（呼び出し側が code だけ見れば済むように）。 */
+/** Network-layer failures are normalized to E504 too (so callers only need to look at code). */
 async function request(doFetch, url, init) {
   try {
     return await doFetch(url, init);
@@ -295,18 +297,18 @@ async function request(doFetch, url, init) {
 function urlSource(url, fetchImpl) {
   const doFetch = fetchImpl ?? globalThis.fetch;
   if (typeof doFetch !== 'function') {
-    throw new TypeError('fetch がありません。init({ fetch }) で実装を渡してください');
+    throw new TypeError('no fetch available. Pass an implementation via init({ fetch })');
   }
   return {
     key: `url:${url}`,
     async size() {
-      // まず HEAD。使えないサーバもあるので Content-Range へフォールバックする。
+      // HEAD first. Some servers do not support it, so fall back to Content-Range.
       try {
         const r = await doFetch(url, { method: 'HEAD' });
         const len = r.headers?.get('content-length');
         if (r.ok && len) return Number(len);
       } catch {
-        /* HEAD 不可。下のレンジ要求で総長を得る。 */
+        /* HEAD unavailable. The range request below yields the total length. */
       }
       const r = await request(doFetch, url, { headers: { Range: 'bytes=0-0' } });
       const cr = r.headers?.get('content-range');
@@ -324,21 +326,21 @@ function urlSource(url, fetchImpl) {
         throw new AhiruError(Code.IO_FAILED, { detail: `${url} -> HTTP ${r.status}` });
       }
       const buf = new Uint8Array(await r.arrayBuffer());
-      // Range を無視して全体を返すサーバがある。要求した窓だけを切り出す。
+      // Some servers ignore Range and return the whole thing. Slice out the requested window.
       if (r.status !== 206 && buf.byteLength > len) return buf.subarray(offset, offset + len);
       return buf;
     },
   };
 }
 
-// --- レンジ結合 ---------------------------------------------------------------
+// --- Range coalescing --------------------------------------------------------
 
 /**
- * 近接するレンジを 1 本にまとめる。
+ * Coalesces nearby ranges into one.
  *
- * 900 KB を 1 回取る方が、100 KB の穴を挟んだ 400 KB × 2 回より速い。
- * エンジンが RowGroup 単位で要求をまとめて返してくるのはこのためなので、
- * 1 本ずつ投げてその意図を潰さない（DESIGN.md §6）。
+ * Fetching 900 KB once beats fetching 400 KB twice around a 100 KB gap.
+ * That is exactly why the engine batches its requests per RowGroup, so do not
+ * defeat that intent by issuing them one at a time (DESIGN.md §6).
  */
 export function coalesceRanges(ranges, gap = COALESCE_GAP, totalLen = Infinity) {
   const sorted = ranges
@@ -355,20 +357,20 @@ export function coalesceRanges(ranges, gap = COALESCE_GAP, totalLen = Infinity) 
     }
     out.push({ offset: r.offset, len: r.len });
   }
-  // ファイル末尾を越える要求はサーバが 416 を返すので詰めておく。
+  // Servers answer 416 for requests past the end of the file, so clamp them.
   for (const r of out) r.len = Math.min(r.len, Math.max(0, totalLen - r.offset));
   return out.filter((r) => r.len > 0);
 }
 
-// --- ワイヤ形式のデコード -----------------------------------------------------
+// --- Wire format decoding ----------------------------------------------------
 
 /**
  * `encode_io`: [count:u32][{table:u32, part:u32, offset:u64, len:u64}...]
  *
- * `part` は複数ファイルテーブル（`ahiru_register_multi`）の何ファイル目かを
- * 指す。単一ファイル登録（`ahiru_register`/`ahiru_register_as`）は常に 0。
- * `ahiru_provide` を呼ぶときにそのまま渡し戻す必要がある — `table` だけでは
- * バイトオフセットの基準となるファイルを一意に決められない。
+ * `part` says which file of a multi-file table (`ahiru_register_multi`) is meant.
+ * Single-file registration (`ahiru_register`/`ahiru_register_as`) is always 0.
+ * It must be passed straight back when calling `ahiru_provide` -- `table` alone
+ * cannot uniquely identify the file the byte offsets are relative to.
  */
 export function decodeIoRequests(u8) {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
@@ -388,7 +390,7 @@ export function decodeIoRequests(u8) {
 
 /**
  * `encode_codec`: [count:u32][{table:u32, part:u32, codec:u32, offset:u64, len:u32, out_len:u32}...]
- * `part` の意味は `decodeIoRequests` と同じ。
+ * `part` means the same thing as in `decodeIoRequests`.
  */
 export function decodeCodecRequests(u8) {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
@@ -436,7 +438,7 @@ export function decodeSchema(u8) {
 }
 
 /**
- * パラメータを直列化する。`[count:u32]` + 値ごとに `[tag:u8][payload]`。
+ * Serializes parameters. `[count:u32]` followed by `[tag:u8][payload]` per value.
  * tag: 0=NULL, 1=BOOL(1B), 2=I64(8B LE), 3=F64(8B LE), 4=BYTES(u32 len + bytes)
  */
 export function encodeParams(params) {
@@ -455,7 +457,7 @@ export function encodeParams(params) {
     } else if (typeof v === 'bigint' || typeof v === 'number') {
       const b = new Uint8Array(9);
       const dv = new DataView(b.buffer);
-      // 安全な整数と BigInt は I64、それ以外の number は F64 に載せる。
+      // Safe integers and BigInt ride on I64; every other number rides on F64.
       if (typeof v === 'bigint' || Number.isSafeInteger(v)) {
         if (typeof v === 'bigint' && BigInt.asIntN(64, v) !== v) {
           throw new AhiruError(Code.VALUE_OUT_OF_RANGE, { detail: `${v} does not fit in i64` });
@@ -480,12 +482,12 @@ export function encodeParams(params) {
       push(head);
       push(bytes);
     } else {
-      // Date を暗黙にマイクロ秒へ直すと桁を間違えても気づけない。明示させる。
+      // Implicitly converting a Date to microseconds would hide an off-by-a-factor mistake. Require it explicitly.
       throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
         detail:
           `cannot bind ${Object.prototype.toString.call(v)}; ` +
           'use null / boolean / number / bigint / string / Uint8Array ' +
-          '(TIMESTAMP は BigInt のマイクロ秒で渡す)',
+          '(pass TIMESTAMP as BigInt microseconds)',
       });
     }
   }
@@ -500,10 +502,10 @@ export function encodeParams(params) {
 }
 
 /**
- * DECIMAL のスケール適用。
+ * Applying DECIMAL scale.
  *
- * 値は「スケール前の整数」で届く。`number` に落とすと 18 桁以上で丸まるので、
- * **文字列**で返す。桁が問題にならない用途では `Number(v)` すればよい。
+ * Values arrive as "the integer before scaling". Dropping them into a `number`
+ * rounds past 18 digits, so a **string** is returned. Where digits do not matter, call `Number(v)`.
  */
 function scaleDecimal(unscaled, scale) {
   const v = BigInt(unscaled);
@@ -514,15 +516,15 @@ function scaleDecimal(unscaled, scale) {
   return `${neg ? '-' : ''}${digits.slice(0, cut)}.${digits.slice(cut)}`;
 }
 
-/** ビットマップ（LSB-first）の i 番目。u64 リトルエンディアン = バイト単位の LSB-first。 */
+/** The i-th bit of a bitmap (LSB-first). u64 little-endian = LSB-first per byte. */
 function bitAt(bits, i) {
   return (bits[i >> 3] >> (i & 7)) & 1;
 }
 
 /**
- * 整列していれば wasm メモリ上のビュー、していなければコピーの上にビューを作る。
- * wasm の out バッファは列ごとに 4 バイト境界しか保証されないので、
- * F64 / I64 の列は 8 バイト境界に乗らないことがある。
+ * If aligned, this is a view onto wasm memory; otherwise a view over a copy.
+ * The wasm out buffer only guarantees 4-byte alignment per column, so F64 / I64
+ * columns may not land on an 8-byte boundary.
  */
 function viewOrCopy(Ctor, u8, byteOffset, count, copy) {
   const abs = u8.byteOffset + byteOffset;
@@ -540,16 +542,16 @@ function readI128(dv, off) {
 }
 
 /**
- * `encode_batch` をデコードする。
+ * Decodes `encode_batch`.
  *
  * ```text
  * magic:u32 num_cols:u32 num_rows:u32
- * 列ごとに: phys:u32 validity_len:u32 [validity] data_len:u32 [data]
- *           Bytes 型のみ data の前に offsets_len:u32 [offsets]
+ * Per column: phys:u32 validity_len:u32 [validity] data_len:u32 [data]
+ *             for Bytes only, offsets_len:u32 [offsets] precedes data
  * ```
  *
- * `copy=false` のときは戻り値の TypedArray が wasm メモリを直接指すことがある。
- * 次の wasm 呼び出しの前に読み切れる場合だけ使うこと（冒頭の方針 (b)(c)）。
+ * With `copy=false` the returned TypedArrays may point directly at wasm memory.
+ * Use it only when they can be fully read before the next wasm call (policy (b)(c) at the top).
  */
 export function decodeBatch(u8, schema, copy = true) {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
@@ -571,8 +573,8 @@ export function decodeBatch(u8, schema, copy = true) {
     let valid = null;
     if (validityLen > 0) {
       const bits = u8.subarray(p, p + validityLen);
-      // ビットマップは常にコピーする。行あたり 1 バイトに展開した方が
-      // 呼び出し側の扱いが楽で、サイズも（行数/8 → 行数）と小さい。
+      // Bitmaps are always copied. Expanding to one byte per row is easier for
+      // callers to handle, and it stays small (rows/8 -> rows).
       valid = new Uint8Array(numRows);
       for (let i = 0; i < numRows; i++) valid[i] = bitAt(bits, i);
       p += validityLen;
@@ -595,10 +597,10 @@ export function decodeBatch(u8, schema, copy = true) {
       for (let i = 0; i < numRows; i++) {
         const s = offsets[i];
         const e = offsets[i + 1];
-        // VARCHAR / JSON は UTF-8 文字列（JSON の物理表現はデコード前の
-        // 生テキストそのものなので、そのまま文字列として渡してよい —
-        // `JSON.parse` するかどうかは呼び出し側に委ねる）、UUID はハイフン
-        // 付き 16 進文字列、それ以外（BLOB）はバイト列のまま返す。
+        // VARCHAR / JSON are UTF-8 strings (JSON's physical representation is the
+        // raw text before decoding, so it can be handed over as a string as is --
+        // whether to `JSON.parse` is left to the caller); UUID is a hyphenated hex
+        // string; everything else (BLOB) is returned as raw bytes.
         if (ty === TY_VARCHAR || ty === TY_JSON) {
           values[i] = textDecoder.decode(data.subarray(s, e));
         } else if (ty === TY_UUID) {
@@ -618,7 +620,7 @@ export function decodeBatch(u8, schema, copy = true) {
 
     switch (phys) {
       case PHYS_BOOL: {
-        // Bool もビットマップ。0/1 の Uint8Array に展開する。
+        // Bool is a bitmap too. Expand it into a 0/1 Uint8Array.
         const bits = u8.subarray(dataAt, dataAt + dataLen);
         values = new Uint8Array(numRows);
         for (let i = 0; i < numRows; i++) values[i] = bitAt(bits, i);
@@ -634,7 +636,7 @@ export function decodeBatch(u8, schema, copy = true) {
         values = viewOrCopy(Float64Array, u8, dataAt, numRows, copy);
         break;
       case PHYS_I128: {
-        // 128 ビットの TypedArray は無いので BigInt の配列にする。
+        // There is no 128-bit TypedArray, so use an array of BigInt.
         values = new Array(numRows);
         for (let i = 0; i < numRows; i++) values[i] = readI128(dv, dataAt + i * 16);
         break;
@@ -643,15 +645,15 @@ export function decodeBatch(u8, schema, copy = true) {
         throw new AhiruError(Code.INTERNAL, { detail: `unknown phys type ${phys}` });
     }
     if (ty === TY_DECIMAL) {
-      // スケール前の整数のままでは使えないので、ここで文字列に直す。
+      // The pre-scale integer is not usable as is, so convert it to a string here.
       const scale = field?.scale ?? 0;
       const scaled = new Array(numRows);
       for (let i = 0; i < numRows; i++) scaled[i] = scaleDecimal(values[i], scale);
       values = scaled;
     } else if (ty === TY_INTERVAL) {
-      // 詰めたままの i128 は数値として意味を持たない（月が 2^96 の位に居る）
-      // ので、3 成分に開いて返す。DECIMAL と同じ「物理表現のままでは使えない
-      // 型はここで直す」扱い。
+      // A packed i128 has no meaning as a number (months sit at the 2^96 place),
+      // so it is opened into three components. Same treatment as DECIMAL: types
+      // unusable in their physical representation are fixed up here.
       const parts = new Array(numRows);
       for (let i = 0; i < numRows; i++) parts[i] = unpackInterval(values[i]);
       values = parts;
@@ -669,7 +671,7 @@ export function decodeBatch(u8, schema, copy = true) {
   return new Batch(numRows, columns);
 }
 
-/** 1 バッチ（列指向）。`stream()` が渡すもの。 */
+/** One batch (columnar). What `stream()` hands over. */
 export class Batch {
   constructor(numRows, columns) {
     this.numRows = numRows;
@@ -684,25 +686,25 @@ export class Batch {
     return i;
   }
 
-  /** 列の生の値（TypedArray or Array）。NULL の位置にはダミー値が入っている。 */
+  /** Raw column values (TypedArray or Array). NULL positions hold a dummy value. */
   column(k) {
     return this.columns[this.#index(k)].values;
   }
 
-  /** 行が NULL かどうか。validity ビットマップを尊重する。 */
+  /** Whether a row is NULL. Honors the validity bitmap. */
   isNull(k, row) {
     const v = this.columns[this.#index(k)].valid;
     return v !== null && v[row] === 0;
   }
 
-  /** i 行 k 列の値。NULL は `null`。 */
+  /** The value at row i, column k. NULL is `null`. */
   get(k, row) {
     const c = this.columns[this.#index(k)];
     if (c.valid !== null && c.valid[row] === 0) return null;
     return c.physType === PHYS_BOOL ? c.values[row] === 1 : c.values[row];
   }
 
-  /** バッチをプレーンなオブジェクトの配列にする。 */
+  /** Turns the batch into an array of plain objects. */
   toRows() {
     const rows = new Array(this.numRows);
     for (let r = 0; r < this.numRows; r++) {
@@ -721,13 +723,13 @@ export class Batch {
   }
 }
 
-// --- コーデック委譲 -----------------------------------------------------------
+// --- Codec delegation --------------------------------------------------------
 //
-// コアは GZIP / ZSTD を持たない。持たせないことがコアが小さい理由そのもの
-// （DESIGN.md §6）。GZIP はブラウザ / Node が標準で持っている
-// `DecompressionStream` に、ZSTD は別 wasm モジュールに投げる。
+// The core does not carry GZIP / ZSTD. Not carrying them is precisely why the core
+// is small (DESIGN.md §6). GZIP goes to `DecompressionStream`, which browsers /
+// Node have built in; ZSTD goes to a separate wasm module.
 
-/** GZIP。追加バイトゼロで済むのがこの委譲の狙い。 */
+/** GZIP. Costing zero extra bytes is the whole point of this delegation. */
 async function gunzip(bytes) {
   if (typeof DecompressionStream !== 'function') {
     throw new AhiruError(Code.UNSUPPORTED_CODEC, {
@@ -738,7 +740,7 @@ async function gunzip(bytes) {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-/** 別 wasm モジュールに載せた ZSTD デコーダ。初回要求まで読み込まない。 */
+/** The ZSTD decoder carried by a separate wasm module. Not loaded until first requested. */
 class ZstdModule {
   #exports;
 
@@ -776,7 +778,7 @@ class ZstdModule {
   decompress(src, outLen) {
     const e = this.#exports;
     const srcPtr = e.zstd_alloc(src.length);
-    // alloc のたびにメモリが伸びうる。ビューは毎回取り直す（コアと同じ方針）。
+    // Memory may grow on every alloc. Re-take the view each time (same policy as the core).
     new Uint8Array(e.memory.buffer).set(src, srcPtr);
     const dstPtr = e.zstd_alloc(outLen);
     const n = e.zstd_decompress(srcPtr, src.length, dstPtr, outLen);
@@ -785,7 +787,7 @@ class ZstdModule {
       e.zstd_free(dstPtr, outLen);
       throw new AhiruError(Code.BAD_COMPRESSED_DATA, { detail: `zstd_decompress -> ${n}` });
     }
-    // wasm 内に置いたままだと次の alloc で detach するのでコピーして返す。
+    // Left inside wasm it would detach on the next alloc, so return a copy.
     const out = new Uint8Array(e.memory.buffer, dstPtr, n).slice();
     e.zstd_free(srcPtr, src.length);
     e.zstd_free(dstPtr, outLen);
@@ -793,7 +795,7 @@ class ZstdModule {
   }
 }
 
-// --- wasm ロード --------------------------------------------------------------
+// --- wasm loading ------------------------------------------------------------
 
 const isNode = typeof process !== 'undefined' && process.versions?.node !== undefined;
 
@@ -811,23 +813,23 @@ async function loadWasmBytes(wasmUrl, fetchImpl) {
   return new Uint8Array(await r.arrayBuffer());
 }
 
-// --- 本体 --------------------------------------------------------------------
+// --- Main --------------------------------------------------------------------
 
 export class AhiruDB {
   #exports;
   #memory;
   #session;
   #tables = new Map(); // name(lower) -> record
-  #byIndex = new Map(); // wasm のテーブル添字 -> record
+  #byIndex = new Map(); // wasm table index -> record
   #cache;
-  /** キャッシュを外から渡された場合、close() で消してはいけない。 */
+  /** When the cache was supplied from outside, close() must not clear it. */
   #ownsCache;
   #fetch;
   #memoryLimit;
-  /** コーデック委譲用に抱えておく取得済みバイトの上限。 */
+  /** Cap on the fetched bytes retained for codec delegation. */
   #residentLimit;
   #closed = false;
-  /** ZSTD サイドモジュール。初回の NEED_CODEC まで読み込まない。 */
+  /** The ZSTD side module. Not loaded until the first NEED_CODEC. */
   #zstd = null;
   #zstdOptions;
 
@@ -850,10 +852,10 @@ export class AhiruDB {
   }
 
   /**
-   * wasm を読み込んでセッションを 1 つ開く。
+   * Loads the wasm and opens a single session.
    *
-   * `wasmUrl` は URL でもファイルパスでもよい（Node ではファイルとして読む）。
-   * 既にバイト列やコンパイル済みモジュールがあるなら `wasmBinary` / `wasmModule`。
+   * `wasmUrl` may be a URL or a file path (on Node it is read as a file).
+   * If you already have bytes or a compiled module, use `wasmBinary` / `wasmModule`.
    */
   static async init(options = {}) {
     const { wasmUrl, wasmBinary, wasmModule } = options;
@@ -866,38 +868,38 @@ export class AhiruDB {
           ? new Uint8Array(wasmBinary.buffer, wasmBinary.byteOffset, wasmBinary.byteLength)
           : new Uint8Array(wasmBinary)
         : await loadWasmBytes(wasmUrl ?? 'ahiru-core.wasm', options.fetch);
-      // core は import を 1 つも持たない（no_std, panic=abort）。
+      // The core has no imports at all (no_std, panic=abort).
       ({ instance } = await WebAssembly.instantiate(bytes, {}));
     }
     return new AhiruDB(instance, options);
   }
 
   /**
-   * テーブルを登録する。ここでは I/O を一切行わない。
-   * 総バイト長の取得もフッタ / ヘッダの読み込みも、初回クエリまで遅延する。
+   * Registers a table. No I/O whatsoever happens here.
+   * Fetching the total byte length and reading the footer / header are both deferred to the first query.
    *
-   * `format` を渡さなければ、エンジンが**登録名の拡張子**から推定する
-   * （`format::FormatKind::detect`）。渡した場合はそれが優先されるので、
-   * 名前に拡張子を持たせる必要はない。
+   * Without `format`, the engine infers it from the **extension of the registered
+   * name** (`format::FormatKind::detect`). When given, it takes precedence, so the
+   * name does not need an extension.
    *
    * ```js
-   * db.register('logs', url, { format: 'csv' });  // FROM logs と書ける
+   * db.register('logs', url, { format: 'csv' });  // lets you write FROM logs
    * db.register('logs.csv', url);                 // FROM "logs.csv"
    * ```
    *
-   * 明示指定が拡張子と食い違っていても通す。名前と読み方を切り離せることが
-   * このオプションの目的なので、そこを検査で塞いだら意味がない。
+   * An explicit choice that disagrees with the extension is allowed. Decoupling the
+   * name from how it is read is the purpose of this option; blocking that with a check would defeat it.
    */
   register(name, source, { format } = {}) {
     this.#assertOpen();
     if (typeof name !== 'string' || name.length === 0) {
-      throw new TypeError('register: テーブル名が必要です');
+      throw new TypeError('register: a table name is required');
     }
     let code = FORMAT_CODES.auto;
     if (format !== undefined && format !== null) {
       code = FORMAT_CODES[String(format).toLowerCase()];
-      // 綴り間違いを Auto に落とすと、Parquet として読まれて BadMagic になり
-      // 原因が分からなくなる。知らない名前はここで弾く。
+      // Falling back to Auto on a typo would read it as Parquet, fail with BadMagic,
+      // and obscure the cause. Reject unknown names here.
       if (code === undefined || code === FORMAT_CODES.auto) {
         throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
           detail: `unknown format "${format}" (parquet / csv / tsv / jsonl)`,
@@ -905,46 +907,46 @@ export class AhiruDB {
       }
     }
     const src = makeSource(source, this.#fetch);
-    // 同名は置き換える（wasm 側の catalog も同じ規則）。
+    // A duplicate name replaces the previous one (the wasm-side catalog follows the same rule).
     this.#tables.set(name.toLowerCase(), {
       name,
       source: src,
       index: -1,
       size: -1,
-      // 実際に何として読まれるか。Auto ならエンジンと同じ規則で推定して見せる。
+      // What it will actually be read as. For Auto, infer it with the engine's rule and show that.
       format: code === FORMAT_CODES.auto ? detectFormat(name) : String(format).toLowerCase(),
       formatCode: code,
-      // 供給済みバイトの控えと、これまでに取った範囲（控えを捨てた後の判断用）。
+      // The retained copy of supplied bytes, and the ranges fetched so far (used once the copy is dropped).
       resident: [],
       fetched: [],
     });
     return this;
   }
 
-  /** `register` の別名。Parquet 以外も受け付ける。 */
+  /** Alias for `register`. Accepts formats other than Parquet too. */
   registerParquet(name, source, options) {
     return this.register(name, source, options);
   }
 
-  /** 結果を全部メモリに載せて返す。 */
+  /** Materializes the entire result in memory and returns it. */
   async query(sql, params) {
     const rows = [];
-    // copy=false: 行オブジェクトに詰め替えるまでの間しかビューを使わないので、
-    // 列バッファのコピーを 1 回省ける。
+    // copy=false: the views are only used until the values are moved into row
+    // objects, which saves one copy of the column buffers.
     for await (const batch of this.#run(sql, params, false)) {
-      // ここでは wasm メモリを直接指すビューを読んでいるので、
-      // 次の step の前に行オブジェクトへ移し切る（冒頭の方針 (c)）。
+      // Views pointing directly at wasm memory are being read here, so move
+      // everything into row objects before the next step (policy (c) at the top).
       for (const r of batch.toRows()) rows.push(r);
     }
     return rows;
   }
 
-  /** 列指向のバッチを順に返す。大きな結果を 1 つの配列に載せないための入口。 */
+  /** Yields columnar batches in order. The entry point for not putting a large result in one array. */
   stream(sql, params) {
     return this.#run(sql, params, true);
   }
 
-  /** セッションを閉じる。以後の呼び出しはエラー。 */
+  /** Closes the session. Later calls are errors. */
   close() {
     if (this.#closed) return;
     this.#closed = true;
@@ -954,12 +956,12 @@ export class AhiruDB {
     if (this.#ownsCache) this.#cache.clear();
   }
 
-  /** 現在 wasm ヒープが保持しているバイト数。 */
+  /** How many bytes the wasm heap currently holds. */
   get heapUsed() {
     return this.#exports.ahiru_heap_used();
   }
 
-  // --- 実行ループ -----------------------------------------------------------
+  // --- Execution loop -------------------------------------------------------
 
   async *#run(sql, params, copy) {
     this.#assertOpen();
@@ -994,7 +996,7 @@ export class AhiruDB {
   }
 
   /**
-   * クエリを開始する。フッタ未取得なら `-2` が返るので、要求を満たして再試行する。
+   * Starts a query. If the footer is not fetched yet it returns `-2`, so satisfy the request and retry.
    */
   async #start(sql, params) {
     const bytes = textEncoder.encode(sql);
@@ -1002,12 +1004,12 @@ export class AhiruDB {
     let lastSignature = null;
     for (;;) {
       const e = this.#exports;
-      // コアは時計を持たないので、CURRENT_DATE/CURRENT_TIMESTAMP/now() 用に
-      // クエリ開始時刻をここで渡す（DESIGN.md §2）。
+      // The core has no clock, so the query start time is passed in here for
+      // CURRENT_DATE/CURRENT_TIMESTAMP/now() (DESIGN.md §2).
       e.ahiru_set_now(this.#session, BigInt(Date.now()) * 1000n);
       const ptr = e.ahiru_alloc(bytes.length);
       const pptr = pbytes.length > 0 ? e.ahiru_alloc(pbytes.length) : 0;
-      // alloc でメモリが伸びうるので、書き込む直前にビューを取り直す。
+      // alloc may grow memory, so re-take the view right before writing.
       const mem = new Uint8Array(this.#memory.buffer);
       mem.set(bytes, ptr);
       if (pptr !== 0) mem.set(pbytes, pptr);
@@ -1016,16 +1018,16 @@ export class AhiruDB {
       if (pptr !== 0) e.ahiru_free(pptr, pbytes.length);
       if (h >= 0) return h;
       if (h !== -2) throw this.#lastError(sql);
-      // -2: フッタを読むためのバイトが足りない。
+      // -2: not enough bytes to read the footer.
       lastSignature = await this.#pump(decodeIoRequests(this.#out()), lastSignature, sql);
     }
   }
 
   /**
-   * コーデック展開要求を満たす。
+   * Satisfies codec decompression requests.
    *
-   * 圧縮ブロックは直前の NEED_IO で取得済みのはずなので、新たな取得はしない。
-   * 手元に無い場合は黙って取りに行かず、エンジン側の要求がおかしいと報告する。
+   * The compressed blocks should already have been fetched by the preceding NEED_IO,
+   * so nothing new is fetched. If they are not on hand, report that the engine's request is wrong rather than silently fetching.
    */
   async #decompress(requests, sql) {
     for (const req of requests) {
@@ -1035,11 +1037,11 @@ export class AhiruDB {
           detail: `${CODEC_NAMES[req.codec] ?? `codec ${req.codec}`} is not handled by the host`,
         });
       }
-      // ZSTD が 1 つでもあるなら、並列に入る前に 1 回だけ読み込む。
+      // If there is even one ZSTD, load it once before going parallel.
       if (req.codec === CODEC_ZSTD) this.#zstd ??= await ZstdModule.load(this.#zstdOptions);
     }
 
-    // 展開は独立なので並列に回す（GZIP は非同期ストリーム）。
+    // Decompression is independent, so run it in parallel (GZIP is an async stream).
     const outputs = await Promise.all(
       requests.map(async (req) => {
         const rec = this.#byIndex.get(req.table);
@@ -1059,12 +1061,12 @@ export class AhiruDB {
       }),
     );
 
-    // wasm への受け渡しは逐次。alloc のたびにメモリが動くため。
+    // Handing back to wasm is sequential, because memory moves on every alloc.
     for (let i = 0; i < requests.length; i++) this.#provideCodec(requests[i], outputs[i], sql);
     this.#checkMemory(sql);
   }
 
-  /** 展開済みブロックを wasm に返す。 */
+  /** Returns decompressed blocks to wasm. */
   #provideCodec(req, bytes, sql) {
     const e = this.#exports;
     const ptr = e.ahiru_alloc(bytes.length);
@@ -1084,11 +1086,12 @@ export class AhiruDB {
   }
 
   /**
-   * 圧縮ブロックのバイトを手元から切り出す。
+   * Slices the bytes of a compressed block out of what is on hand.
    *
-   * 直前の NEED_IO で取った控えにあるのが正常系。控えを溢れさせて捨てた分だけは
-   * 取り直す（キャッシュに残っていれば I/O にはならない）。一度も取っていない
-   * 範囲を要求されたらエンジン側の不整合なので、黙って取りに行かず報告する。
+   * The normal case is that they are in the copy retained by the preceding NEED_IO.
+   * Only what was discarded when that copy overflowed gets refetched (which is not
+   * I/O if it is still cached). A request for a range never fetched at all is an
+   * engine-side inconsistency, so it is reported rather than silently fetched.
    */
   async #bytesAt(rec, offset, len, sql) {
     for (const c of rec.resident) {
@@ -1096,7 +1099,7 @@ export class AhiruDB {
         return c.bytes.subarray(offset - c.offset, offset - c.offset + len);
       }
     }
-    // メモリ / Blob 供給元は切り出しに I/O が要らないので、控えを持たない。
+    // Memory / Blob sources need no I/O to slice, so they keep no retained copy.
     if (rec.source.cacheable === false) return rec.source.read(offset, len);
     const everFetched = rec.fetched.some(
       (r) => r.offset <= offset && offset + len <= r.offset + r.len,
@@ -1110,9 +1113,9 @@ export class AhiruDB {
     });
   }
 
-  /** 出力スキーマを読む。`ahiru_schema` は out バッファを作り直すので step の前に。 */
+  /** Reads the output schema. `ahiru_schema` rebuilds the out buffer, so call it before step. */
   #readSchema(q, sql) {
-    // 負値はハンドル不正。0 は「列が 0 個」なので区別する。
+    // A negative value means a bad handle. 0 means "zero columns", so keep them distinct.
     const len = this.#exports.ahiru_schema(q);
     if (len < 0) throw this.#lastError(sql);
     if (len === 0) return [];
@@ -1120,16 +1123,16 @@ export class AhiruDB {
   }
 
   /**
-   * I/O 要求を満たす。結合 → 並列取得 → `ahiru_provide`。
-   * 戻り値は次回の比較用シグネチャ。
+   * Satisfies I/O requests. Coalesce -> fetch in parallel -> `ahiru_provide`.
+   * Returns a signature for comparison on the next round.
    */
   async #pump(requests, lastSignature, sql) {
     const signature = requests.map((r) => `${r.table}.${r.part}/${r.offset}+${r.len}`).join(',');
 
-    // `table` だけでは複数ファイルテーブルの何ファイル目かを区別できない
-    // （オフセットはファイルごとに独立した空間）ので、`table:part` の複合
-    // キーで束ねる。単一ファイル登録では常に part=0 なので、今まで通りの
-    // 挙動のまま複数ファイルにも安全に拡張できる。
+    // `table` alone cannot tell which file of a multi-file table is meant (offsets
+    // live in a separate space per file), so requests are grouped by the composite
+    // key `table:part`. Single-file registration always has part=0, so this extends
+    // safely to multiple files while behaving exactly as before.
     const jobs = [];
     for (const [key, list] of groupBy(requests, (r) => `${r.table}:${r.part}`)) {
       const [table, part] = key.split(':').map(Number);
@@ -1142,25 +1145,25 @@ export class AhiruDB {
       }
     }
 
-    // 往復を重ねないよう、結合後のレンジは並列に取る。
+    // Coalesced ranges are fetched in parallel, to avoid stacking round trips.
     const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.offset, j.len)));
 
     let provided = 0;
     for (let i = 0; i < jobs.length; i++) {
       const { rec, table, part, offset } = jobs[i];
       provided += this.#provide(table, part, offset, buffers[i], sql);
-      // 遠隔供給元だけ控えを持つ。コーデック委譲で圧縮ブロックを求められたとき、
-      // ここから切り出せれば取り直さずに済む（メモリ供給元は slice で足りる）。
+      // Only remote sources keep a retained copy. When codec delegation asks for a
+      // compressed block, slicing it out of here avoids a refetch (memory sources just slice).
       //
-      // JS 側の登録 API（`register`/`registerParquet`）は今のところ 1 テーブル
-      // = 1 ファイルなので `part` は常に 0 であり、`rec` が単一の控えを持つ
-      // ことと矛盾しない。複数ファイル登録（`ahiru_register_multi`）を JS から
-      // 使えるようにするときは、この控えをファイルごとに分ける必要がある。
+      // The JS-side registration API (`register`/`registerParquet`) is one table =
+      // one file for now, so `part` is always 0, which is consistent with `rec`
+      // holding a single retained copy. When multi-file registration
+      // (`ahiru_register_multi`) becomes usable from JS, this copy must be split per file.
       if (rec.source.cacheable !== false && !rec.resident.some((c) => c.offset === offset)) {
         rec.resident.push({ offset, bytes: buffers[i] });
         rec.fetched.push({ offset, len: buffers[i].byteLength });
-        // 際限なく抱えないよう、古い順に落とす。落とした範囲が後で要るなら
-        // キャッシュから取り直す（`#bytesAt`）。
+        // Drop oldest first, so this does not grow without bound. If a dropped range
+        // is needed later it is refetched from the cache (`#bytesAt`).
         let held = rec.resident.reduce((a, c) => a + c.bytes.byteLength, 0);
         while (held > this.#residentLimit && rec.resident.length > 1) {
           held -= rec.resident.shift().bytes.byteLength;
@@ -1169,7 +1172,7 @@ export class AhiruDB {
     }
     this.#checkMemory(sql);
 
-    // ライブロック検出: 同じ要求が繰り返され、1 バイトも増えていない。
+    // Livelock detection: the same request repeats and not one byte has been added.
     if (provided === 0 && signature === lastSignature) {
       throw new AhiruError(Code.IO_FAILED, {
         sql,
@@ -1179,7 +1182,7 @@ export class AhiruDB {
     return signature;
   }
 
-  /** キャッシュ越しにバイト範囲を読む。 */
+  /** Reads a byte range through the cache. */
   async #read(rec, offset, len) {
     const key = `${rec.source.key}:${offset}:${len}`;
     const cacheable = rec.source.cacheable !== false;
@@ -1193,13 +1196,13 @@ export class AhiruDB {
     return u8;
   }
 
-  /** 取得したバイト列を wasm に渡す。渡した長さを返す。 */
+  /** Hands fetched bytes to wasm. Returns the length handed over. */
   #provide(table, part, offset, bytes, sql) {
     if (bytes.byteLength === 0) return 0;
     const e = this.#exports;
     const ptr = e.ahiru_alloc(bytes.byteLength);
     if (ptr === 0) throw new AhiruError(Code.OOM, { sql });
-    // alloc でメモリが伸びた可能性があるので、ここで必ず取り直す。
+    // alloc may have grown memory, so always re-take the view here.
     new Uint8Array(this.#memory.buffer).set(bytes, ptr);
     const rc = e.ahiru_provide(this.#session, table, part, BigInt(offset), ptr, bytes.byteLength);
     e.ahiru_free(ptr, bytes.byteLength);
@@ -1208,25 +1211,25 @@ export class AhiruDB {
   }
 
   /**
-   * SQL が参照しているテーブルだけを wasm に登録する。
+   * Registers only the tables the SQL actually references.
    *
-   * 登録には総バイト長が要る（= URL なら HEAD 1 往復）ので、
-   * 使いもしないテーブルの分まで往復しないよう、識別子を拾って絞る。
+   * Registration needs the total byte length (= one HEAD round trip for a URL), so
+   * identifiers are collected to narrow it down and avoid round trips for unused tables.
    */
   async #bindTables(sql) {
     const mentioned = new Set();
     const add = (s) => {
       mentioned.add(s.toLowerCase());
-      // `t.id` のようなドット付きは、全体と各要素の両方を候補にする
-      // （テーブル名自体が `basic.csv` のように点を含みうるため）。
+      // For dotted names like `t.id`, take both the whole thing and each part as
+      // candidates (a table name itself may contain a dot, as in `basic.csv`).
       if (s.includes('.')) for (const part of s.split('.')) mentioned.add(part.toLowerCase());
     };
     for (const m of sql.matchAll(/[A-Za-z_][A-Za-z0-9_$.]*|'([^']*)'|"([^"]*)"/g)) {
       add(m[1] ?? m[2] ?? m[0]);
     }
-    // `FROM parquet('https://…')` はパスをそのままテーブル名として登録する
-    // 約束になっている（plan/bind.rs の resolve_from を参照）。
-    // 名前は parquet だが、拡張子が .csv などなら CSV として読まれる。
+    // `FROM parquet('https://...')` is contracted to register the path itself as the
+    // table name (see resolve_from in plan/bind.rs).
+    // The function is named parquet, but an extension such as .csv is read as CSV.
     for (const m of sql.matchAll(/parquet\(\s*'([^']*)'/gi)) {
       const path = m[1];
       if (!this.#tables.has(path.toLowerCase())) this.register(path, path);
@@ -1240,8 +1243,8 @@ export class AhiruDB {
       const name = textEncoder.encode(rec.name);
       const ptr = e.ahiru_alloc(name.length);
       new Uint8Array(this.#memory.buffer).set(name, ptr);
-      // 古いコアには ahiru_register_as が無い。Auto なら 4 引数版で等価だが、
-      // 明示指定を黙って無視すると別のフォーマットとして読まれるので落とす。
+      // Older cores have no ahiru_register_as. For Auto the 4-argument version is
+      // equivalent, but silently ignoring an explicit choice would read it as another format, so fail.
       const hasRegisterAs = typeof e.ahiru_register_as === 'function';
       if (!hasRegisterAs && rec.formatCode !== FORMAT_CODES.auto) {
         e.ahiru_free(ptr, name.length);
@@ -1259,9 +1262,9 @@ export class AhiruDB {
     }
   }
 
-  // --- 小物 -----------------------------------------------------------------
+  // --- Odds and ends --------------------------------------------------------
 
-  /** 現在の out バッファのビュー。次の wasm 呼び出しまでしか有効でない。 */
+  /** A view of the current out buffer. Valid only until the next wasm call. */
   #out() {
     const ptr = this.#exports.ahiru_out_ptr();
     const len = this.#exports.ahiru_out_len();

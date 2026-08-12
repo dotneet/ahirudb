@@ -1,6 +1,6 @@
-//! ビットマップ。validity マスクと BOOLEAN 値の格納に使う。
+//! Bitmaps. Used for validity masks and to store BOOLEAN values.
 //!
-//! ビット順は LSB-first（Arrow / Parquet と同じ）。
+//! Bit order is LSB-first (the same as Arrow / Parquet).
 
 use crate::prelude::*;
 
@@ -24,25 +24,25 @@ impl Bitmap {
         Bitmap { words: Vec::with_capacity(nwords(cap)), len: 0 }
     }
 
-    /// 全ビット 1 のビットマップ。
+    /// A bitmap with every bit set.
     pub fn ones(len: usize) -> Self {
         let mut b = Bitmap { words: vec![u64::MAX; nwords(len)], len };
         b.clear_tail();
         b
     }
 
-    /// 全ビット 0 のビットマップ。
+    /// A bitmap with every bit clear.
     pub fn zeros(len: usize) -> Self {
         Bitmap { words: vec![0u64; nwords(len)], len }
     }
 
-    /// LSB-first でパックされたバイト列から読み込む。
-    /// Parquet の PLAIN BOOLEAN / bit-packed run と同じレイアウト。
+    /// Reads from LSB-first packed bytes.
+    /// The same layout as Parquet's PLAIN BOOLEAN / bit-packed runs.
     pub fn from_lsb_bytes(bytes: &[u8], len: usize) -> Self {
         let mut b = Bitmap::zeros(len);
         let n = core::cmp::min(bytes.len(), len.div_ceil(8));
-        // 添字はワード位置とシフト量の両方に使う。イテレータにすると
-        // かえって読みにくくなるので添字ループのままにする。
+        // The index serves as both the word position and the shift amount. An iterator
+        // would read worse here, so this stays an index loop.
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             let w = i / 8;
@@ -93,9 +93,9 @@ impl Bitmap {
         }
     }
 
-    /// `n` 個の同じ値をまとめて追加する。RLE run の展開で使う。
+    /// Appends `n` copies of the same value at once. Used when expanding an RLE run.
     pub fn push_n(&mut self, v: bool, n: usize) {
-        // 素朴なループでも 64 ビット境界まで進めば word 単位に落ちる。
+        // Even a naive loop drops to word granularity once it reaches a 64-bit boundary.
         let mut rest = n;
         while rest > 0 && !self.len.is_multiple_of(64) {
             self.push(v);
@@ -112,15 +112,15 @@ impl Bitmap {
         }
     }
 
-    /// 別のビットマップを末尾に連結する。ページ単位の validity を
-    /// 列チャンク全体のビットマップに積むのに使う。
+    /// Concatenates another bitmap onto the end. Used to stack per-page validity
+    /// into the bitmap for the whole column chunk.
     pub fn extend(&mut self, other: &Bitmap) {
         if self.len.is_multiple_of(64) {
-            // ワード境界に揃っているので word 単位でコピーできる。
+            // Word-aligned, so this can copy a word at a time.
             let base = self.words.len();
             self.words.extend_from_slice(&other.words);
             self.len += other.len;
-            // other 側の末尾パディングは 0 なので、そのままで整合する。
+            // The trailing padding on the other side is 0, so it stays consistent as is.
             let _ = base;
         } else {
             for i in 0..other.len {
@@ -129,7 +129,7 @@ impl Bitmap {
         }
     }
 
-    /// 長さを `len` に伸ばし、追加分を `v` で埋める。
+    /// Grows the length to `len`, filling the addition with `v`.
     pub fn resize(&mut self, len: usize, v: bool) {
         if len <= self.len {
             self.len = len;
@@ -144,7 +144,7 @@ impl Bitmap {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
-    /// 全ビットが 1 か。validity が実質不要かの判定に使う。
+    /// Whether every bit is set. Used to decide whether validity is effectively unnecessary.
     pub fn all_set(&self) -> bool {
         self.count_ones() == self.len
     }
@@ -163,7 +163,7 @@ impl Bitmap {
         }
     }
 
-    /// ビット反転。末尾のパディングビットは 0 のまま保つ。
+    /// Inverts every bit, keeping the trailing padding bits at 0.
     pub fn negate(&mut self) {
         for w in self.words.iter_mut() {
             *w = !*w;
@@ -171,8 +171,8 @@ impl Bitmap {
         self.clear_tail();
     }
 
-    /// 立っているビットの位置を昇順に `out` へ追記する。
-    /// フィルタ結果から selection vector を作るのに使う。
+    /// Appends the positions of the set bits to `out`, in ascending order.
+    /// Used to build a selection vector from a filter result.
     pub fn append_set_indices(&self, out: &mut Vec<u32>) {
         for (wi, &w) in self.words.iter().enumerate() {
             let mut bits = w;
@@ -184,7 +184,7 @@ impl Bitmap {
         }
     }
 
-    /// 末尾の余りビットを 0 にする。`count_ones` などが狂わないように。
+    /// Clears the leftover trailing bits, so `count_ones` and friends stay correct.
     fn clear_tail(&mut self) {
         let rem = self.len % 64;
         if rem != 0 {
@@ -205,8 +205,8 @@ impl Default for Bitmap {
     }
 }
 
-/// 型不一致のアクセサが返すための空ビットマップ。
-/// `Vec::new()` は const fn なので確保も静的初期化子も不要。
+/// The empty bitmap returned by accessors on a type mismatch.
+/// `Vec::new()` is a const fn, so neither allocation nor a static initializer is needed.
 static EMPTY: Bitmap = Bitmap { words: Vec::new(), len: 0 };
 
 impl Bitmap {
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn from_lsb_bytes_matches_parquet_layout() {
-        // 0b1010_1100 = ビット 2,3,5,7 が 1
+        // 0b1010_1100 = bits 2, 3, 5, and 7 are set
         let b = Bitmap::from_lsb_bytes(&[0b1010_1100], 8);
         let got: Vec<bool> = (0..8).map(|i| b.get(i)).collect();
         assert_eq!(got, vec![false, false, true, true, false, true, false, true]);

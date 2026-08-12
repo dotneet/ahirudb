@@ -1,33 +1,33 @@
-//! JSONL (NDJSON) — 1 行 1 JSON オブジェクト。
+//! JSONL (NDJSON) -- one JSON object per line.
 //!
-//! ## 分割
+//! ## Splits
 //!
-//! 行指向なので統計は無く、分割は固定長バイトチャンク（`TEXT_SPLIT_BYTES`）。
-//! 射影を渡されても取得バイトは減らせないが、`read_split` で不要な列の復号を
-//! 省ける（`format` モジュールの doc にある 2 段階の後半だけが効く）。
+//! Being row-oriented it has no statistics, and splits are fixed-length byte chunks
+//! (`TEXT_SPLIT_BYTES`). A projection cannot reduce the fetched bytes, but `read_split` can skip
+//! decoding unneeded columns (only the second of the two stages in the `format` module's docs applies).
 //!
-//! ## 入れ子の値の扱い（設計判断）
+//! ## Handling nested values (a design decision)
 //!
-//! `crate::vector::Ty` に LIST / STRUCT は無い。Parquet 側は入れ子スキーマを
-//! `UnsupportedNested` で拒否するが、JSONL で同じことをすると「1 列だけ配列が
-//! 混じったファイル」が丸ごと読めなくなる。JSON では入れ子が普通に出てくるので、
-//! ここでは**入れ子の値を VARCHAR 列として扱い、その生の JSON テキストを格納する**。
+//! `crate::vector::Ty` has no LIST / STRUCT. The Parquet side rejects nested schemas with
+//! `UnsupportedNested`, but doing the same for JSONL would make "a file with just one array
+//! column mixed in" entirely unreadable. Nesting shows up routinely in JSON, so here **nested
+//! values are treated as VARCHAR columns holding their raw JSON text**.
 //!
-//! つまり `SELECT tags FROM t` は `["a","b"]` という文字列を返す。
-//! **入れ子の中への構造的なアクセス（要素取り出し・展開）は未対応。**
-//! 必要になったら型システム側に LIST/STRUCT を入れる話になる。
+//! That is, `SELECT tags FROM t` returns the string `["a","b"]`.
+//! **Structural access into the nesting (extracting or expanding elements) is unsupported.**
+//! Needing it would mean adding LIST/STRUCT to the type system.
 //!
-//! ## 型推論
+//! ## Type inference
 //!
-//! 先頭 `SAMPLE_BYTES` の中の最大 `SAMPLE_LINES` 行を見て、列ごとに
-//! NULL → BOOLEAN → BIGINT → DOUBLE → VARCHAR の束で広げる。列集合は
-//! 行ごとのキーの**和集合**（初出順）で、ある行に無いキーはその行だけ NULL。
-//! CSV と違って行ごとに列が欠けうる点がこのフォーマットの本質。
+//! Looking at up to `SAMPLE_LINES` rows within the leading `SAMPLE_BYTES`, each column widens
+//! along the lattice NULL -> BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR. The column set is the
+//! **union** of the per-row keys (in order of first appearance), and a key absent from a row is
+//! NULL for that row alone. Unlike CSV, columns can be missing per row -- that is this format's essence.
 //!
-//! ## 入力は信用しない
+//! ## The input is untrusted
 //!
-//! 壊れた JSON は `Err` か NULL セルになる。パニック・範囲外参照・無限再帰は
-//! 起こさない。走査は再帰せず、入れ子は `MAX_DEPTH` で打ち切る。
+//! Broken JSON gives `Err` or a NULL cell. It never panics, reads out of range, or recurses
+//! infinitely. Scanning does not recurse, and nesting is cut off at `MAX_DEPTH`.
 
 use crate::catalog::Source;
 use crate::format::{get_or_internal, ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
@@ -35,14 +35,14 @@ use crate::json::{byte_at, decode_string, kind_of, scan_string, skip_value, skip
 use crate::prelude::*;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
-/// スキーマ推論のために先頭から読むバイト数。
+/// How many leading bytes are read for schema inference.
 pub const SAMPLE_BYTES: u64 = 256 * 1024;
 
-/// スキーマ推論に使う最大行数。これ以上見ても型はまず変わらない。
+/// The maximum rows used for schema inference. Looking at more is unlikely to change the types.
 pub const SAMPLE_LINES: usize = 1000;
 
-/// 推論で作る列数の上限。キーが行ごとに違う病的な入力で
-/// 無制限に確保しないための歯止め。
+/// The cap on the number of columns inference creates. A stop against unbounded allocation on
+/// pathological input whose keys differ per row.
 const MAX_COLUMNS: usize = 1024;
 
 pub struct JsonlFormat {
@@ -62,19 +62,19 @@ impl JsonlFormat {
         }
     }
 
-    /// 分割サイズ。既定は `TEXT_SPLIT_BYTES` (8 MiB)。
+    /// The split size. Defaults to `TEXT_SPLIT_BYTES` (8 MiB).
     pub fn split_bytes(&self) -> u64 {
         self.split_bytes
     }
 
-    /// 分割サイズを上書きする。小さなファイルでも複数分割の経路を通せるように
-    /// しておく（分割境界の扱いはテストしないと壊れていても気づけない）。
-    /// 0 は 1 に丸める。
+    /// Overrides the split size, so even a small file can exercise the multi-split path
+    /// (split-boundary handling could be broken without being noticed unless it is tested).
+    /// 0 is rounded to 1.
     pub fn set_split_bytes(&mut self, n: u64) {
         self.split_bytes = n.max(1);
     }
 
-    /// 分割 `split` が担当するバイト範囲 `[start, end)`。
+    /// The byte range `[start, end)` split `split` is responsible for.
     fn chunk(&self, split: usize) -> (u64, u64) {
         let start = (split as u64).saturating_mul(self.split_bytes).min(self.total_len);
         let end = start.saturating_add(self.split_bytes).min(self.total_len);
@@ -96,7 +96,7 @@ impl TableFormat for JsonlFormat {
         self.total_len = src.total_len;
         let n = SAMPLE_BYTES.min(src.total_len);
         if n == 0 {
-            // 空ファイル。列も分割も無いが、解決自体は成功させる。
+            // An empty file. There are neither columns nor splits, but resolution itself succeeds.
             self.resolved = true;
             return Ok(Ok(()));
         }
@@ -104,7 +104,7 @@ impl TableFormat for JsonlFormat {
             Some(b) => b,
             None => return Ok(Err((0, n))),
         };
-        // サンプルがファイル全体でないなら、最後の行は途中で切れている恐れがある。
+        // If the sample is not the whole file, the last line may be cut off partway.
         let partial = n < src.total_len;
 
         let mut names: Vec<String> = Vec::new();
@@ -140,10 +140,10 @@ impl TableFormat for JsonlFormat {
                 infs[idx] = widen(infs[idx], infer(&m));
             }
         }
-        // サンプル内に 1 行も収まらなかった＝1 レコードが 256 KiB を超えている。
+        // Not one line fit within the sample = one record exceeds 256 KiB.
         ensure!(!(truncated && lines == 0), LimitExceeded);
 
-        // JSON の値はいつでも欠けうるので、列はすべて nullable。
+        // A JSON value can be missing at any time, so every column is nullable.
         self.schema =
             names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect();
         self.resolved = true;
@@ -166,7 +166,7 @@ impl TableFormat for JsonlFormat {
     }
 
     fn split_rows(&self, _split: usize) -> Option<u64> {
-        // 読むまで行数は分からない。
+        // The row count is unknown until it is read.
         None
     }
 
@@ -178,8 +178,8 @@ impl TableFormat for JsonlFormat {
     ) -> Result<()> {
         ensure!(split < self.num_splits(), Internal);
         let (start, end) = self.chunk(split);
-        // 行指向なので射影ではバイトは減らない。分割のバイトは常に全部要る。
-        // 境界をまたいだレコードを読み切れるよう TEXT_MAX_RECORD だけ余分に取る。
+        // Being row-oriented, a projection does not reduce bytes. A split's bytes are always all needed.
+        // An extra TEXT_MAX_RECORD is taken so a record straddling the boundary can be finished.
         let read_end = end.saturating_add(TEXT_MAX_RECORD).min(self.total_len);
         out.push((start, read_end));
         Ok(())
@@ -200,28 +200,28 @@ impl TableFormat for JsonlFormat {
                 None => err!(Internal),
             };
             names.push(f.name.as_bytes());
-            // 1 行 64 バイト前後を見込んだ雑な予約。外れても正しさには効かない。
+            // A rough reservation assuming around 64 bytes per line. Being off does not affect correctness.
             builders.push(Builder::new(f.ty, (buf.len() / 64).min(1 << 16)));
         }
 
-        // JSON の文字列には生の改行を書けない（`\n` にエスケープされる）ので、
-        // `\n` を探すだけでレコード境界が一意に決まる。CSV の引用符と違って
-        // 状態を持たずに分割できるのはこのため。
+        // A raw newline cannot appear inside a JSON string (it is escaped as `\n`), so record
+        // boundaries are uniquely determined by looking for `\n` alone. That is why, unlike CSV's
+        // quoting, splitting needs no state.
         let mut pos = if split == 0 {
             skip_bom(buf)
         } else {
-            // 先頭の改行までは前の分割が読み切る行。
+            // Everything up to the first newline is a line the previous split finishes.
             match find_nl(buf, 0) {
                 Some(i) => i + 1,
-                // 窓の中に改行が無い＝この分割から始まる行は 1 つも無い。
+                // No newline within the window = not one line starts in this split.
                 None => return Ok(builders.into_iter().map(|b| b.finish()).collect()),
             }
         };
 
-        // 行の所有権: 分割 k(>0) の最初の行は「chunk_start 以降の最初の改行の直後」
-        // から始まるので、開始位置は必ず chunk_start より大きい。よって前の分割は
-        // 開始位置が chunk_end **以下**の行までを担当しないと、境界ちょうどから
-        // 始まる行が誰にも読まれずに消える。
+        // Line ownership: split k(>0)'s first line starts "just after the first newline at or past
+        // chunk_start", so its start position is always greater than chunk_start. The previous
+        // split must therefore cover lines whose start is at or **below** chunk_end, or a line
+        // starting exactly at the boundary would be read by no one and vanish.
         let mut slots: Vec<Option<Member>> = vec![None; projection.len()];
         let mut key = Vec::new();
         let mut val = Vec::new();
@@ -233,8 +233,8 @@ impl TableFormat for JsonlFormat {
             let (line, next) = match find_nl(buf, pos) {
                 Some(i) => (strip_cr(&buf[pos..i]), i + 1),
                 None => {
-                    // 改行が無い。ファイル末尾なら最終行、そうでなければ
-                    // TEXT_MAX_RECORD を超える長すぎるレコード。
+                    // No newline. At end of file it is the final line; otherwise it is a record too
+                    // long, exceeding TEXT_MAX_RECORD.
                     ensure!(read_end == self.total_len, LimitExceeded);
                     (strip_cr(&buf[pos..]), buf.len())
                 }
@@ -250,8 +250,8 @@ impl TableFormat for JsonlFormat {
             let mut it = Members::new(line)?;
             while let Some(m) = it.next()? {
                 let name = member_key(&m, &mut key)?;
-                // 射影された列だけ位置を覚える。それ以外の値は復号しない
-                // （Members が値スパンを読み飛ばすだけで済ませている）。
+                // Only the projected columns have their positions remembered. Other values are not
+                // decoded (Members merely skips their value spans).
                 if let Some(j) = names.iter().position(|n| *n == name) {
                     slots[j] = Some(m);
                 }
@@ -265,10 +265,10 @@ impl TableFormat for JsonlFormat {
     }
 }
 
-// --- 型推論 -----------------------------------------------------------------
+// --- Type inference -----------------------------------------------------------
 
-/// 推論中の列の型。`Ty` を直接使わないのは、DATE/TIMESTAMP を
-/// 「文字列から昇格した特別扱い」として束の中で区別したいから。
+/// The column type during inference. `Ty` is not used directly because DATE/TIMESTAMP need to be
+/// distinguished within the lattice as "specially promoted from a string".
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Inf {
     Null,
@@ -283,8 +283,8 @@ enum Inf {
 impl Inf {
     fn ty(self) -> Ty {
         match self {
-            // サンプル中すべて NULL。以降どんな値が来ても落とさずに済む
-            // VARCHAR にしておく。
+            // Everything in the sample was NULL. VARCHAR is chosen so no later value, whatever it
+            // is, gets dropped.
             Inf::Null | Inf::Varchar => Ty::Varchar,
             Inf::Bool => Ty::Boolean,
             Inf::Int => Ty::BigInt,
@@ -295,8 +295,8 @@ impl Inf {
     }
 }
 
-/// NULL → BOOLEAN → BIGINT → DOUBLE → VARCHAR の束。
-/// 系統をまたぐ混在（数値と日付など）はテキストに落とすしかない。
+/// The lattice NULL -> BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR.
+/// A mixture across families (numbers and dates, say) can only fall to text.
 fn widen(a: Inf, b: Inf) -> Inf {
     use Inf::*;
     if a == b {
@@ -317,7 +317,7 @@ fn infer(m: &Member<'_>) -> Inf {
         Kind::Null => Inf::Null,
         Kind::Bool => Inf::Bool,
         Kind::Num => {
-            // 小数点・指数があれば無条件に DOUBLE。i64 に入らない整数も DOUBLE。
+            // A decimal point or exponent means DOUBLE unconditionally. An integer not fitting i64 is DOUBLE too.
             if m.val.iter().any(|&c| c == b'.' || c == b'e' || c == b'E') {
                 Inf::Double
             } else if parse_i64(m.val).is_some() {
@@ -327,7 +327,7 @@ fn infer(m: &Member<'_>) -> Inf {
             }
         }
         Kind::Str => {
-            // エスケープを含む文字列が日付になることはまず無いので復号しない。
+            // A string containing escapes is essentially never a date, so it is not decoded.
             if m.value_escaped() {
                 return Inf::Varchar;
             }
@@ -340,12 +340,12 @@ fn infer(m: &Member<'_>) -> Inf {
                 Inf::Varchar
             }
         }
-        // 入れ子は生 JSON テキストとして VARCHAR に載せる（モジュール doc 参照）。
+        // Nesting rides in a VARCHAR as raw JSON text (see the module docs).
         Kind::Object | Kind::Array => Inf::Varchar,
     }
 }
 
-// --- 列ビルダ ---------------------------------------------------------------
+// --- Column builders ------------------------------------------------------------
 
 enum Cell<'a> {
     Bool(bool),
@@ -355,7 +355,7 @@ enum Cell<'a> {
     Bytes(&'a [u8]),
 }
 
-/// 1 列分の組み立て。データ長と validity 長を必ず 1:1 で進めることだけを守る。
+/// Building one column. The only rule it upholds is advancing the data length and the validity length 1:1.
 struct Builder {
     ty: Ty,
     data: Data,
@@ -373,8 +373,8 @@ impl Builder {
         }
     }
 
-    /// `None` と物理型の不一致はどちらも NULL。型が合わない値を捨てるのは、
-    /// 推論がサンプル由来で後続行が外れうるため（エラーにはしない）。
+    /// Both `None` and a physical type mismatch give NULL. Discarding a value of the wrong type is
+    /// because inference comes from a sample and later rows can fall outside (it is not an error).
     fn push(&mut self, cell: Option<Cell<'_>>) {
         let ok = match (&mut self.data, &cell) {
             (Data::Bool(d), Some(Cell::Bool(v))) => {
@@ -419,7 +419,7 @@ impl Builder {
     }
 }
 
-/// メンバ 1 つを列の型に合わせて積む。キー欠落 (`None`) と `null` は NULL。
+/// Pushes one member according to the column's type. A missing key (`None`) and `null` are both NULL.
 fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -> Result<()> {
     let m = match m {
         Some(m) if m.kind != Kind::Null => m,
@@ -449,7 +449,7 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
             Kind::Str => parse_timestamp(m.str_body()).map(Cell::I64),
             _ => None,
         }),
-        // VARCHAR は何でも受ける。文字列は復号し、それ以外は生の JSON テキスト。
+        // VARCHAR accepts anything. Strings are decoded, and everything else is raw JSON text.
         _ => match m.kind {
             Kind::Str => {
                 scratch.clear();
@@ -462,23 +462,23 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
     Ok(())
 }
 
-// --- JSON 走査 --------------------------------------------------------------
-// トークナイザそのもの（`byte_at`/`skip_ws`/`skip_value` 等）は
-// `crate::json` にある。ここに残るのは NDJSON の 1 行 1 オブジェクトを
-// 前提にした「トップレベルオブジェクトのメンバを順に返す」反復子だけ。
+// --- JSON scanning --------------------------------------------------------------
+// The tokenizer itself (`byte_at`/`skip_ws`/`skip_value` and so on) lives in `crate::json`.
+// What remains here is only the iterator returning a top-level object's members in order,
+// premised on NDJSON's one object per line.
 
 #[derive(Clone, Copy)]
 struct Member<'a> {
-    /// キーの本体（引用符の内側、エスケープ未展開）。
+    /// The key's body (inside the quotes, escapes unexpanded).
     key: &'a [u8],
     key_escaped: bool,
-    /// 値のスパン。文字列なら引用符を含む。
+    /// The value's span. For a string it includes the quotes.
     val: &'a [u8],
     kind: Kind,
 }
 
 impl<'a> Member<'a> {
-    /// 文字列値の本体（引用符を除く）。`kind == Str` のときだけ意味を持つ。
+    /// A string value's body (without the quotes). Meaningful only when `kind == Str`.
     fn str_body(&self) -> &'a [u8] {
         let n = self.val.len();
         if n >= 2 {
@@ -488,17 +488,17 @@ impl<'a> Member<'a> {
         }
     }
 
-    /// 文字列値がエスケープを含むか。
+    /// Whether the string value contains escapes.
     fn value_escaped(&self) -> bool {
         self.str_body().contains(&b'\\')
     }
 }
 
-/// トップレベルオブジェクトのメンバを順に返す。再帰しない。
+/// Returns a top-level object's members in order. It does not recurse.
 struct Members<'a> {
     b: &'a [u8],
     i: usize,
-    /// 既に 1 つ以上返したか。カンマの要否判定に使う。
+    /// Whether at least one has already been returned. Used to decide whether a comma is required.
     started: bool,
     done: bool,
 }
@@ -506,7 +506,7 @@ struct Members<'a> {
 impl<'a> Members<'a> {
     fn new(line: &'a [u8]) -> Result<Self> {
         let i = skip_ws(line, 0);
-        // オブジェクト以外の行は受け付けない。
+        // A line that is not an object is not accepted.
         ensure!(byte_at(line, i)? == b'{', SyntaxError, i);
         Ok(Members { b: line, i: i + 1, started: false, done: false })
     }
@@ -520,7 +520,7 @@ impl<'a> Members<'a> {
         let mut c = byte_at(b, i)?;
         if c == b'}' {
             self.done = true;
-            // 閉じた後に残るのは空白だけ。`{}{}` のような行は弾く。
+            // Only whitespace may remain after the close. A line like `{}{}` is rejected.
             ensure!(skip_ws(b, i + 1) == b.len(), SyntaxError, i + 1);
             return Ok(None);
         }
@@ -543,7 +543,7 @@ impl<'a> Members<'a> {
     }
 }
 
-/// メンバのキーをバイト列として得る。エスケープ付きだけ `scratch` に復号する。
+/// Gets a member's key as bytes. Only an escaped one is decoded into `scratch`.
 fn member_key<'k>(m: &Member<'k>, scratch: &'k mut Vec<u8>) -> Result<&'k [u8]> {
     if !m.key_escaped {
         return Ok(m.key);
@@ -553,9 +553,9 @@ fn member_key<'k>(m: &Member<'k>, scratch: &'k mut Vec<u8>) -> Result<&'k [u8]> 
     Ok(scratch)
 }
 
-// --- 数値・日時 --------------------------------------------------------------
+// --- Numbers and date-times -----------------------------------------------------
 
-/// 整数リテラルを i64 に。小数点・指数付き、または範囲外なら `None`。
+/// An integer literal as i64. `None` when it has a decimal point or exponent, or is out of range.
 fn parse_i64(s: &[u8]) -> Option<i64> {
     let (neg, ds) = match s.first() {
         Some(b'-') => (true, &s[1..]),
@@ -564,7 +564,7 @@ fn parse_i64(s: &[u8]) -> Option<i64> {
     if ds.is_empty() {
         return None;
     }
-    // 負側で累算する。i64::MIN を特別扱いせずに済む。
+    // Accumulated on the negative side. That avoids special-casing i64::MIN.
     let mut acc: i64 = 0;
     for &c in ds {
         if !c.is_ascii_digit() {
@@ -579,13 +579,13 @@ fn parse_i64(s: &[u8]) -> Option<i64> {
     }
 }
 
-/// 浮動小数は core の `str::parse::<f64>`（dec2flt）に任せる。
-/// 自前で書くより小さく、丸めも正しい。
+/// Floating point is left to core's `str::parse::<f64>` (dec2flt).
+/// It is smaller than writing one in-house and rounds correctly.
 fn parse_f64(s: &[u8]) -> Option<f64> {
     core::str::from_utf8(s).ok()?.parse::<f64>().ok()
 }
 
-/// 先頭 `n` バイトを 10 進数として読む。数字以外が混じれば `None`。
+/// Reads the leading `n` bytes as a decimal number. `None` if anything but digits is mixed in.
 fn digits(s: &[u8], n: usize) -> Option<u32> {
     if s.len() < n {
         return None;
@@ -614,18 +614,18 @@ fn days_in_month(y: i32, m: u32) -> u32 {
     }
 }
 
-/// days-from-civil (Howard Hinnant)。エポック 1970-01-01 からの日数。
+/// days-from-civil (Howard Hinnant). Days since the epoch 1970-01-01.
 fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 }; // 3 月始まりに寄せる
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // shift to a March-based year
     let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146097 + doe as i32 - 719468
 }
 
-/// `YYYY-MM-DD` をエポックからの日数に。
+/// `YYYY-MM-DD` as days since the epoch.
 fn parse_date(s: &[u8]) -> Option<i32> {
     if s.len() != 10 || s[4] != b'-' || s[7] != b'-' {
         return None;
@@ -639,8 +639,8 @@ fn parse_date(s: &[u8]) -> Option<i32> {
     Some(days_from_civil(y, m, d))
 }
 
-/// `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]` をエポックからのマイクロ秒に。
-/// 日付だけの文字列は深夜 0 時として受ける（DATE → TIMESTAMP の昇格用）。
+/// `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]` as microseconds since the epoch.
+/// A date-only string is accepted as midnight (for the DATE -> TIMESTAMP promotion).
 fn parse_timestamp(s: &[u8]) -> Option<i64> {
     let days = parse_date(s.get(..10)?)? as i64;
     if s.len() == 10 {
@@ -664,7 +664,7 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
         if frac.is_empty() || frac.len() > 9 {
             return None;
         }
-        // 6 桁に切り詰め／ゼロ埋めしてマイクロ秒にする。
+        // Truncated or zero-padded to 6 digits to give microseconds.
         for k in 0..6 {
             let d = match frac.get(k) {
                 Some(&c) if c.is_ascii_digit() => (c - b'0') as u32,
@@ -683,10 +683,10 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     Some(secs * 1_000_000 + micros as i64)
 }
 
-// --- バイト列ユーティリティ ---------------------------------------------------
-// `byte_at`/`skip_ws` は `crate::json` のものをそのまま使う（上の import）。
+// --- Byte-sequence utilities ------------------------------------------------------
+// `byte_at`/`skip_ws` come straight from `crate::json` (imported above).
 
-/// UTF-8 BOM があれば読み飛ばす。
+/// Skips a UTF-8 BOM if present.
 fn skip_bom(b: &[u8]) -> usize {
     if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
         3
@@ -699,7 +699,7 @@ fn find_nl(b: &[u8], from: usize) -> Option<usize> {
     b.get(from..)?.iter().position(|&c| c == b'\n').map(|i| i + from)
 }
 
-/// CRLF の `\r` を落とす。
+/// Drops CRLF's `\r`.
 fn strip_cr(line: &[u8]) -> &[u8] {
     match line.split_last() {
         Some((b'\r', rest)) => rest,
@@ -711,7 +711,7 @@ fn is_blank(line: &[u8]) -> bool {
     line.iter().all(|&c| matches!(c, b' ' | b'\t' | b'\r'))
 }
 
-/// `pos` から 1 行取り出す。`(行, 次の位置, 改行で終わっていたか)`。
+/// Takes one line from `pos`. `(the line, the next position, whether it ended with a newline)`.
 fn next_line(b: &[u8], pos: usize) -> (&[u8], usize, bool) {
     match find_nl(b, pos) {
         Some(i) => (strip_cr(&b[pos..i]), i + 1, true),
@@ -730,13 +730,13 @@ mod tests {
         std::fs::read(format!("{p}{name}")).unwrap_or_else(|e| panic!("{name}: {e}"))
     }
 
-    /// 解決してスキーマを返す。
+    /// Resolves and returns the schema.
     fn resolve(bytes: &[u8]) -> (JsonlFormat, Source) {
         let src = Source::from_bytes(bytes.to_vec());
         let mut f = JsonlFormat::new();
         match f.resolve(&src).expect("resolve") {
             Ok(()) => {}
-            Err(r) => panic!("メモリ上の Source なのに範囲要求 {r:?} が返った"),
+            Err(r) => panic!("a range request {r:?} came back from an in-memory Source"),
         }
         (f, src)
     }
@@ -746,7 +746,7 @@ mod tests {
         f.schema().iter().map(|c| (c.name.clone(), c.ty)).collect()
     }
 
-    /// 全分割を読み、列ごとの `Value` 列にして返す。
+    /// Reads every split and returns per-column `Value` sequences.
     fn read_cols(bytes: &[u8], split_bytes: u64, proj: Option<&[usize]>) -> Vec<Vec<Value>> {
         let src = Source::from_bytes(bytes.to_vec());
         let mut f = JsonlFormat::new();
@@ -763,11 +763,11 @@ mod tests {
         for s in 0..f.num_splits() {
             ranges.clear();
             f.split_ranges(s, &projection, &mut ranges).expect("split_ranges");
-            assert_eq!(ranges.len(), 1, "行指向なので範囲は 1 本のはず");
+            assert_eq!(ranges.len(), 1, "being row-oriented, there should be exactly one range");
             let cols = f.read_split(&src, s, &projection).expect("read_split");
             assert_eq!(cols.len(), projection.len());
             let rows = cols.first().map_or(0, |c| c.len());
-            assert!(cols.iter().all(|c| c.len() == rows), "列の長さが揃っていない");
+            assert!(cols.iter().all(|c| c.len() == rows), "the column lengths do not agree");
             for (j, c) in cols.iter().enumerate() {
                 for i in 0..c.len() {
                     out[j].push(c.value_at(i));
@@ -785,7 +785,7 @@ mod tests {
         Value::Bytes(v.as_bytes().to_vec())
     }
 
-    /// 1 列だけのファイルを推論して型を得る。
+    /// Infers a single-column file and gets its type.
     fn infer_ty(values: &[&str]) -> Ty {
         let mut text = String::new();
         for v in values {
@@ -796,7 +796,7 @@ mod tests {
         schema_of(&text)[0].1
     }
 
-    // --- 実ファイル ---------------------------------------------------------
+    // --- Real files ---------------------------------------------------------
 
     #[test]
     fn basic_jsonl_schema_matches_duckdb() {
@@ -828,9 +828,9 @@ mod tests {
         assert_eq!(cols[4][0], Value::Null);
         assert_eq!(cols[2][1], Value::F64(1.5));
         assert_eq!(cols[4][1], Value::I64(100));
-        // duckdb: SELECT epoch_us(d) FROM ... LIMIT 1  → 1704067200000000
+        // duckdb: SELECT epoch_us(d) FROM ... LIMIT 1 -> 1704067200000000
         assert_eq!(cols[5][0], Value::I64(1_704_067_200_000_000));
-        // 末尾。
+        // The end.
         assert_eq!(cols[0][999], Value::I64(999));
         assert_eq!(cols[1][999], s("name_5"));
         assert_eq!(cols[4][999], Value::I64(99_900));
@@ -844,12 +844,12 @@ mod tests {
             assert_eq!(
                 cols[4][i] == Value::Null,
                 i % 5 == 0,
-                "行 {i} の big の NULL 判定がずれている"
+                "the NULL determination for big in row {i} is off"
             );
         }
     }
 
-    // --- 列集合の和 ---------------------------------------------------------
+    // --- The union of column sets -------------------------------------------
 
     #[test]
     fn schema_is_the_union_of_keys_in_first_seen_order() {
@@ -870,15 +870,15 @@ mod tests {
              {\"a\":null,\"b\":4}\n",
         );
         assert_eq!(cols[0], [Value::I64(1), Value::I64(3), Value::Null]);
-        // 2 行目は b というキー自体が無い。
+        // The second row does not have the key b at all.
         assert_eq!(cols[1], [Value::I64(2), Value::Null, Value::I64(4)]);
     }
 
-    // --- 型推論 -------------------------------------------------------------
+    // --- Type inference -----------------------------------------------------
 
     #[test]
     fn inference_lattice_covers_every_transition() {
-        assert_eq!(infer_ty(&["null"]), Ty::Varchar); // 全 NULL は VARCHAR に倒す
+        assert_eq!(infer_ty(&["null"]), Ty::Varchar); // all-NULL falls to VARCHAR
         assert_eq!(infer_ty(&["true"]), Ty::Boolean);
         assert_eq!(infer_ty(&["null", "true"]), Ty::Boolean);
         assert_eq!(infer_ty(&["1"]), Ty::BigInt);
@@ -896,15 +896,15 @@ mod tests {
         assert_eq!(infer_ty(&["\"2024-01-01 12:34:56\""]), Ty::Timestamp);
         assert_eq!(infer_ty(&["\"2024-01-01T12:34:56\""]), Ty::Timestamp);
         assert_eq!(infer_ty(&["\"2024-01-01T12:34:56.123456\""]), Ty::Timestamp);
-        // DATE と TIMESTAMP の混在は TIMESTAMP に寄せる。
+        // A mixture of DATE and TIMESTAMP settles on TIMESTAMP.
         assert_eq!(infer_ty(&["\"2024-01-01\"", "\"2024-01-01 00:00:00\""]), Ty::Timestamp);
-        // 他の文字列が混ざれば VARCHAR に落ちる。
+        // With another string mixed in it falls to VARCHAR.
         assert_eq!(infer_ty(&["\"2024-01-01\"", "\"hello\""]), Ty::Varchar);
         assert_eq!(infer_ty(&["\"2024-01-01 00:00:00\"", "\"hello\""]), Ty::Varchar);
-        // 日付として無効なものは日付にしない。
+        // Something invalid as a date does not become a date.
         assert_eq!(infer_ty(&["\"2024-02-30\""]), Ty::Varchar);
         assert_eq!(infer_ty(&["\"2024-13-01\""]), Ty::Varchar);
-        // 数値と混ざれば VARCHAR。
+        // Mixed with numbers it is VARCHAR.
         assert_eq!(infer_ty(&["\"2024-01-01\"", "1"]), Ty::Varchar);
     }
 
@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(infer_ty(&["-3"]), Ty::BigInt);
         assert_eq!(infer_ty(&["1e3"]), Ty::Double);
         assert_eq!(infer_ty(&["-1.5E-2"]), Ty::Double);
-        // i64 に入らない整数は DOUBLE へ広げる。
+        // An integer not fitting i64 widens to DOUBLE.
         assert_eq!(infer_ty(&["9223372036854775808"]), Ty::Double);
         assert_eq!(infer_ty(&["-9223372036854775809"]), Ty::Double);
         assert_eq!(infer_ty(&["-9223372036854775808"]), Ty::BigInt);
@@ -940,8 +940,8 @@ mod tests {
         let cols = read_all("{\"a\":1e3}\n{\"a\":-1.5E-2}\n{\"a\":7}\n");
         assert_eq!(cols[0], [Value::F64(1000.0), Value::F64(-0.015), Value::F64(7.0)]);
 
-        // 推論はサンプル (SAMPLE_LINES 行) しか見ない。そこから外れた行に
-        // 型の合わない値が出てきたら、エラーにせずその行だけ NULL にする。
+        // Inference sees only the sample (SAMPLE_LINES rows). When a row outside it carries a value
+        // of the wrong type, that row alone becomes NULL rather than an error.
         let mut text = String::new();
         for _ in 0..SAMPLE_LINES {
             text.push_str("{\"a\":1}\n");
@@ -955,7 +955,7 @@ mod tests {
         assert_eq!(cols[0][SAMPLE_LINES + 3], Value::I64(2));
     }
 
-    // --- 文字列 -------------------------------------------------------------
+    // --- Strings ------------------------------------------------------------
 
     #[test]
     fn string_escapes_are_decoded() {
@@ -965,14 +965,14 @@ mod tests {
 
     #[test]
     fn unicode_escapes_and_surrogate_pairs() {
-        // \u00e9 = é, \u65e5 = 日, \uD83D\uDE00 = 😀
+        // \u00e9 = e-acute, \u65e5 = a CJK character, \uD83D\uDE00 = an emoji
         let cols = read_all("{\"a\":\"\\u00e9\\u65e5\\uD83D\\uDE00\"}\n");
-        assert_eq!(cols[0][0], s("é日😀"));
+        assert_eq!(cols[0][0], s("\u{e9}\u{65e5}\u{1f600}"));
     }
 
     #[test]
     fn lone_surrogates_become_the_replacement_character() {
-        // 対にならない上位／下位サロゲートはエラーにせず U+FFFD にする。
+        // Unpaired high/low surrogates become U+FFFD rather than an error.
         let cols = read_all(
             "{\"a\":\"\\uD800\"}\n\
              {\"a\":\"\\uDC00x\"}\n\
@@ -986,14 +986,14 @@ mod tests {
     #[test]
     fn escaped_keys_match_their_decoded_name() {
         let (f, _) = resolve(b"{\"a\\u0062\":1}\n{\"ab\":2}\n");
-        // 同じ名前に解決されるので列は 1 本。
+        // They resolve to the same name, so there is one column.
         assert_eq!(f.schema().len(), 1);
         assert_eq!(f.schema()[0].name, "ab");
         let cols = read_all("{\"a\\u0062\":1}\n{\"ab\":2}\n");
         assert_eq!(cols[0], [Value::I64(1), Value::I64(2)]);
     }
 
-    // --- 入れ子 -------------------------------------------------------------
+    // --- Nesting ------------------------------------------------------------
 
     #[test]
     fn nested_values_are_kept_as_raw_json_text() {
@@ -1011,12 +1011,12 @@ mod tests {
 
     #[test]
     fn varchar_column_keeps_raw_text_for_non_strings() {
-        // 型が混ざって VARCHAR になった列は、数値も真偽値も生テキストで載る。
+        // A column that became VARCHAR through mixed types carries numbers and booleans as raw text too.
         let cols = read_all("{\"a\":1}\n{\"a\":\"x\"}\n{\"a\":true}\n{\"a\":2.5}\n{\"a\":null}\n");
         assert_eq!(cols[0], [s("1"), s("x"), s("true"), s("2.5"), Value::Null]);
     }
 
-    // --- 行の取り扱い -------------------------------------------------------
+    // --- Row handling -------------------------------------------------------
 
     #[test]
     fn blank_lines_are_skipped() {
@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(cols[0], [Value::I64(1), Value::I64(2)]);
     }
 
-    // --- 射影 ---------------------------------------------------------------
+    // --- Projection ---------------------------------------------------------
 
     #[test]
     fn projection_returns_requested_columns_in_order() {
@@ -1050,12 +1050,12 @@ mod tests {
         assert_eq!(cols[0][1], Value::I64(100)); // big
         assert_eq!(cols[1][1], s("name_1")); // name
         assert_eq!(cols[0][0], Value::Null);
-        // 空射影でも壊れない。
+        // It does not break with an empty projection either.
         let cols = read_cols(&bytes, 0, Some(&[]));
         assert!(cols.is_empty());
     }
 
-    // --- 分割 ---------------------------------------------------------------
+    // --- Splits -------------------------------------------------------------
 
     #[test]
     fn split_count_and_ranges_cover_the_file() {
@@ -1072,10 +1072,10 @@ mod tests {
             f.split_ranges(i, &[], &mut out).unwrap();
             let (a, b) = out[0];
             assert_eq!(a, i as u64 * 1024);
-            // 末尾の読み越し分はファイル長で頭打ち。
+            // The trailing overread is capped by the file length.
             assert_eq!(b, (a + 1024 + TEXT_MAX_RECORD).min(total));
         }
-        // 範囲外の分割は要求できない。
+        // An out-of-range split cannot be requested.
         assert_eq!(code_of(f.split_ranges(f.num_splits(), &[], &mut out)), Some(Code::Internal));
     }
 
@@ -1083,22 +1083,22 @@ mod tests {
     fn multi_split_reads_every_row_exactly_once() {
         let bytes = data_file("basic.jsonl");
         let reference = read_cols(&bytes, 0, None);
-        // 分割サイズを変えても行数・値・順序が変わらないこと。
-        // 84 バイト/行なので、下の値はどれも行の途中で切れる。
+        // Changing the split size must not change the row count, the values, or the order.
+        // At 84 bytes per line, every value below cuts partway through a line.
         for &sb in &[1u64, 7, 63, 84, 85, 128, 1000, 4096] {
             let cols = read_cols(&bytes, sb, None);
-            assert_eq!(cols[0].len(), 1000, "split_bytes={sb} で行数がずれた");
+            assert_eq!(cols[0].len(), 1000, "the row count is off at split_bytes={sb}");
             for (j, col) in cols.iter().enumerate() {
-                assert_eq!(col, &reference[j], "split_bytes={sb} の列 {j} がずれた");
+                assert_eq!(col, &reference[j], "column {j} is off at split_bytes={sb}");
             }
         }
     }
 
     #[test]
     fn split_boundary_values_are_not_duplicated_or_dropped() {
-        // 1 行 11 バイト固定 (`{"a":0000}\n`) にそろえ、分割サイズを行長の
-        // 倍数（境界がちょうど行頭に来る＝取りこぼしが起きやすい）と
-        // 非倍数の両方で試す。
+        // Lines are fixed at 11 bytes (`{"a":0000}\n`), and split sizes are tried both as multiples
+        // of the line length (boundaries landing exactly at a line start = the case most prone to
+        // dropping rows) and as non-multiples.
         let mut text = String::new();
         for i in 0..500 {
             text.push_str(&format!("{{\"a\":{i:04}}}\n"));
@@ -1108,14 +1108,14 @@ mod tests {
         let expect: Vec<Value> = (0..500).map(Value::I64).collect();
         for &sb in &[5u64, 10, 11, 12, 22, 23, 110, 121] {
             let cols = read_cols(&bytes, sb, None);
-            assert_eq!(cols[0], expect, "split_bytes={sb} で境界の行がずれた");
+            assert_eq!(cols[0], expect, "a boundary row is off at split_bytes={sb}");
         }
     }
 
     #[test]
     fn oversized_record_is_rejected_instead_of_being_silently_split() {
-        // TEXT_MAX_RECORD を超える行は読み越せない。境界より前で始まり、
-        // 読み窓の外まで続く行は LimitExceeded になる。
+        // A line exceeding TEXT_MAX_RECORD cannot be overread. A line starting before the boundary
+        // and continuing past the read window gives LimitExceeded.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"{\"a\":1}\n{\"a\":");
         bytes.resize(bytes.len() + (TEXT_MAX_RECORD as usize + 16), b'0');
@@ -1127,7 +1127,7 @@ mod tests {
         assert_eq!(code_of(f.read_split(&src, 0, &[0])), Some(Code::LimitExceeded));
     }
 
-    // --- 壊れた入力 ---------------------------------------------------------
+    // --- Corrupt input ------------------------------------------------------
 
     fn read_err(text: &str) -> Option<Code> {
         let src = Source::from_bytes(text.as_bytes().to_vec());
@@ -1143,31 +1143,31 @@ mod tests {
 
     #[test]
     fn malformed_input_is_an_error_not_a_panic() {
-        // 閉じていない文字列。
+        // An unclosed string.
         assert_eq!(read_err("{\"a\":\"abc}\n"), Some(Code::UnexpectedEof));
-        // 閉じていないオブジェクト。
+        // An unclosed object.
         assert_eq!(read_err("{\"a\":1\n"), Some(Code::UnexpectedEof));
         assert_eq!(read_err("{\"a\":{\"b\":1}\n"), Some(Code::UnexpectedEof));
-        // オブジェクトでない行。
+        // A line that is not an object.
         assert_eq!(read_err("[1,2,3]\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("42\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("\"x\"\n"), Some(Code::SyntaxError));
-        // 閉じた後にゴミが続く。
+        // Garbage following the close.
         assert_eq!(read_err("{\"a\":1}{\"a\":2}\n"), Some(Code::SyntaxError));
-        // 区切り・コロンの欠落と末尾カンマ。
+        // A missing separator or colon, and a trailing comma.
         assert_eq!(read_err("{\"a\":1 \"b\":2}\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("{\"a\" 1}\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("{\"a\":1,}\n"), Some(Code::SyntaxError));
-        // 数値・リテラルの形が壊れている。
+        // A malformed number or literal.
         assert_eq!(read_err("{\"a\":1.}\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("{\"a\":-}\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("{\"a\":tru}\n"), Some(Code::SyntaxError));
-        // 括弧の対応が取れていない。
+        // Unbalanced brackets.
         assert_eq!(read_err("{\"a\":[1,2}}\n"), Some(Code::SyntaxError));
-        // \u の桁が 16 進でない／足りない。
+        // \u's digits are not hex, or are too few.
         assert_eq!(read_err("{\"a\":\"\\u12zz\"}\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("{\"a\":\"\\u12\"}\n"), Some(Code::UnexpectedEof));
-        // 未知のエスケープ。
+        // An unknown escape.
         assert_eq!(read_err("{\"a\":\"\\x\"}\n"), Some(Code::SyntaxError));
     }
 
@@ -1186,7 +1186,7 @@ mod tests {
         text.push_str("}\n");
         assert_eq!(read_err(&text), Some(Code::NestingTooDeep));
 
-        // 上限ちょうどは通る（VARCHAR 列として生テキストが載る）。
+        // Exactly at the limit passes (the raw text rides in a VARCHAR column).
         let mut ok = String::from("{\"a\":");
         for _ in 0..MAX_DEPTH {
             ok.push('[');
@@ -1201,8 +1201,8 @@ mod tests {
 
     #[test]
     fn too_many_columns_is_rejected() {
-        // 1 行あたり大量のキーを持つ行を数行。SAMPLE_LINES で頭打ちになる
-        // 前に列数の上限へ到達する形にする。
+        // A few rows each carrying a great many keys, shaped so the column cap is reached before
+        // SAMPLE_LINES caps things.
         let mut text = String::new();
         for chunk in 0..2 {
             text.push('{');
@@ -1219,7 +1219,7 @@ mod tests {
         assert_eq!(code_of(f.resolve(&src)), Some(Code::LimitExceeded));
     }
 
-    // --- resolve の I/O 要求 -------------------------------------------------
+    // --- resolve's I/O requests ---------------------------------------------
 
     #[test]
     fn resolve_requests_the_sample_range_when_bytes_are_missing() {
@@ -1230,17 +1230,17 @@ mod tests {
                 assert_eq!(off, 0);
                 assert_eq!(len, SAMPLE_BYTES);
             }
-            Ok(()) => panic!("バイトが無いのに解決できるはずがない"),
+            Ok(()) => panic!("it cannot possibly resolve with no bytes"),
         }
         assert!(!f.is_resolved());
         assert_eq!(f.num_splits(), 0);
 
-        // ファイルより長い範囲は要求しない。
+        // It does not request a range longer than the file.
         let mut f = JsonlFormat::new();
         let src = Source::remote(100);
         match f.resolve(&src).unwrap() {
             Err((off, len)) => assert_eq!((off, len), (0, 100)),
-            Ok(()) => panic!("バイトが無いのに解決できるはずがない"),
+            Ok(()) => panic!("it cannot possibly resolve with no bytes"),
         }
     }
 
@@ -1262,7 +1262,7 @@ mod tests {
         assert_eq!(f.split_bytes(), TEXT_SPLIT_BYTES);
     }
 
-    // --- 補助関数 -----------------------------------------------------------
+    // --- Helper functions ---------------------------------------------------
 
     #[test]
     fn days_from_civil_matches_known_dates() {

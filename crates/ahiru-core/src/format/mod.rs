@@ -1,38 +1,38 @@
-//! テーブルフォーマットの抽象化。
+//! The table format abstraction.
 //!
-//! 実行エンジンはこのトレイト越しにしかデータ源を見ない。Parquet 固有の概念
-//! （RowGroup、列チャンク、Thrift 統計）は `format::parquet` の内側に閉じる。
+//! The execution engine sees data sources only through this trait. Parquet-specific concepts
+//! (RowGroups, column chunks, Thrift statistics) stay inside `format::parquet`.
 //!
-//! ## 分割 (split) という単位
+//! ## The unit called a split
 //!
-//! フォーマットの違いを吸収する鍵は「分割」という 1 つの概念に集約すること。
+//! The key to absorbing format differences is concentrating them into the single notion of a split.
 //!
-//! | フォーマット | 分割の実体 | 統計 | 射影で減るバイト |
+//! | format | what a split is | statistics | bytes saved by projection |
 //! |---|---|---|---|
-//! | Parquet | RowGroup | あり | 減る（列チャンク単位で取る） |
-//! | CSV / JSONL | 固定長バイトチャンク | なし | 減らない（行指向なので全部読む） |
+//! | Parquet | a RowGroup | yes | yes (fetched per column chunk) |
+//! | CSV / JSONL | a fixed-length byte chunk | no | no (row-oriented, so everything is read) |
 //!
-//! DESIGN.md §6 の「RowGroup 境界 I/O バリア」は、正確には**分割境界**バリア
-//! である。分割の開始時点で必要なバイト範囲が確定することだけが要件で、
-//! Parquet であることは要件ではない。だから CSV でも同じ実行ループが使える。
+//! DESIGN.md §6's "RowGroup boundary I/O barrier" is more precisely a **split boundary** barrier.
+//! The only requirement is that the needed byte ranges are settled at the start of a split;
+//! being Parquet is not a requirement. That is why the same execution loop works for CSV.
 //!
-//! ## 射影の扱いが 2 段階に分かれる理由
+//! ## Why projection handling is split into two stages
 //!
-//! `split_ranges` に射影を渡すのは、列指向フォーマットが**取得するバイト自体を
-//! 減らせる**ため。行指向フォーマットは射影を渡されても全バイトを読むしかない
-//! が、`read_split` 側で不要な列の変換を省ける。この 2 段階を 1 つの引数で
-//! 表現しておくと、呼び出し側はフォーマットの性質を知らずに済む。
+//! The projection is passed to `split_ranges` because a columnar format can **reduce the bytes
+//! fetched** with it. A row-oriented format has to read every byte regardless, but `read_split`
+//! can skip converting unneeded columns. Expressing these two stages with one argument keeps the
+//! caller from having to know the format's nature.
 //!
-//! ## ページ単位の絞り込みが独立したフックである理由
+//! ## Why page-level filtering is a separate hook
 //!
-//! `may_match`（RowGroup 統計）は追加の I/O 無しで判定できるが、ページ単位の
-//! 絞り込み（Parquet の ColumnIndex/OffsetIndex/Bloom フィルタ）はそれ自体が
-//! 別バイト範囲の取得を要る。`split_ranges` の入力（射影・pruners）だけでは
-//! 「どのバイトが要るか」を確定できず、`index_ranges` → I/O →
-//! `refine_with_index`（デコードしてページを選ぶ）→ `split_ranges`
-//! （選ばれたページだけのバイト範囲を返す）という追加の 1 往復が要る。
-//! 既定実装は「該当バイト無し」なので、対応しないフォーマット（CSV/JSONL）は
-//! 1 行も変更せずに以前の「分割 = 1 回の I/O 判定」のままで動く。
+//! `may_match` (RowGroup statistics) can decide with no extra I/O, but page-level filtering
+//! (Parquet's ColumnIndex/OffsetIndex/Bloom filter) itself requires fetching another byte range.
+//! `split_ranges`'s inputs (the projection and pruners) alone cannot settle "which bytes are
+//! needed", so an extra round trip is required: `index_ranges` -> I/O ->
+//! `refine_with_index` (decode and pick pages) -> `split_ranges`
+//! (returning the byte ranges of only the chosen pages).
+//! The default implementation is "no such bytes", so formats without support (CSV/JSONL) keep
+//! working exactly as before -- "a split = one I/O decision" -- without a single line changed.
 
 pub mod parquet;
 pub mod partitioned;
@@ -43,8 +43,8 @@ pub mod csv;
 #[cfg(feature = "jsonl")]
 pub mod jsonl;
 
-// トップレベルが 1 個の JSON 配列/オブジェクトのファイル。JSONL と近縁の
-// フォーマットなので、専用の Cargo フィーチャは増やさず `jsonl` に相乗りする。
+// A file whose top level is a single JSON array/object. It is a close relative of JSONL, so rather
+// than adding a dedicated Cargo feature it rides `jsonl`.
 #[cfg(feature = "jsonl")]
 pub mod json;
 
@@ -53,19 +53,19 @@ use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::vector::{Field, Value, Vector};
 
-/// 統計による枝刈りに使える単純な範囲述語。
+/// A simple range predicate usable for statistics-based pruning.
 ///
-/// `WHERE` から抽出できた `列 <op> 定数` の形だけを持つ。
-/// `column` は**射影後の列番号**（= スキャン出力での位置）を指す。
-/// `Clone` は `Node::Aggregate`（延いては `Node`）の複製に要る
-/// （GROUPING SETS でグルーピングセットの数だけ入力プランを複製するため）。
+/// It holds only the `column <op> constant` shapes extractable from `WHERE`.
+/// `column` refers to the **post-projection column number** (= the position in the scan's output).
+/// `Clone` is needed for cloning `Node::Aggregate` (and hence `Node`)
+/// (GROUPING SETS duplicates the input plan once per grouping set).
 #[derive(Clone)]
 pub struct Pruner {
     pub column: usize,
     pub op: PruneOp,
     pub value: Value,
-    /// `PruneOp::In` のときだけ使う残りの候補値（`value` が先頭の 1 つを持つ）。
-    /// 他の演算子では常に空。
+    /// The remaining candidate values, used only for `PruneOp::In` (`value` holds the first one).
+    /// Always empty for other operators.
     pub in_values: Vec<Value>,
 }
 
@@ -77,23 +77,23 @@ pub enum PruneOp {
     Le,
     Gt,
     Ge,
-    /// `列 IN (定数, ...)`。`value` + `in_values` のどれかに等しければよい
-    /// （= 複数の `Eq` を OR で束ねたもの）。
+    /// `column IN (constant, ...)`. It suffices to equal any of `value` + `in_values`
+    /// (= several `Eq`s bundled with OR).
     In,
 }
 
-/// 統計の `[min, max]` がこの述語を満たしうるか。偽なら分割を丸ごと飛ばせる。
+/// Whether the statistics' `[min, max]` could satisfy this predicate. If false, the whole split can be skipped.
 ///
-/// 判断できないときは必ず `true` を返す（読む側に倒す）。枝刈りの誤りは
-/// 行が消えるという最悪の壊れ方をするので、安全側の定義を 1 か所に固定する。
+/// When it cannot decide it always returns `true` (erring toward reading). A pruning mistake
+/// breaks things in the worst way -- rows vanish -- so the safe definition is pinned in one place.
 pub fn range_may_match(p: &Pruner, min: &Value, max: &Value) -> bool {
     use core::cmp::Ordering::*;
     if p.op == PruneOp::In {
-        // OR 意味論: どれか 1 つの候補が範囲に入りうればこの分割は残す。
+        // OR semantics: if any one candidate could fall in the range, this split is kept.
         return core::iter::once(&p.value).chain(p.in_values.iter()).any(|v| {
             match (min.partial_cmp_same(v), max.partial_cmp_same(v)) {
                 (Some(cmp_min), Some(cmp_max)) => cmp_min != Greater && cmp_max != Less,
-                // 比較できない候補は安全側（あり得る扱い）に倒す。
+                // A candidate that cannot be compared errs safe (treated as possible).
                 _ => true,
             }
         });
@@ -101,7 +101,7 @@ pub fn range_may_match(p: &Pruner, min: &Value, max: &Value) -> bool {
     let (cmp_min, cmp_max) = match (min.partial_cmp_same(&p.value), max.partial_cmp_same(&p.value))
     {
         (Some(a), Some(b)) => (a, b),
-        // 比較できない（型が違う・NULL）なら枝刈りしない。
+        // If it cannot be compared (different types, NULL) there is no pruning.
         _ => return true,
     };
     match p.op {
@@ -114,47 +114,47 @@ pub fn range_may_match(p: &Pruner, min: &Value, max: &Value) -> bool {
     }
 }
 
-/// スキーマ解決の結果。バイトが足りなければ必要な範囲を返す。
+/// The result of schema resolution. When bytes are missing it returns the ranges needed.
 pub type ResolveStep = core::result::Result<(), (u64, u64)>;
 
-/// ホストに展開を委譲する圧縮ブロック。
+/// A compressed block whose decompression is delegated to the host.
 ///
-/// wasm コアが内蔵しないコーデック（GZIP / ZSTD）はホスト側で展開する
-/// （DESIGN.md §6）。GZIP はブラウザの `DecompressionStream`、ZSTD は別の
-/// wasm モジュールが処理する。エンジンから見ればどちらも同じ「ホストに
-/// 頼む作業」なので、1 つの経路にまとめてある。
+/// Codecs the wasm core does not carry (GZIP / ZSTD) are decompressed on the host side
+/// (DESIGN.md §6). GZIP is handled by the browser's `DecompressionStream` and ZSTD by a separate
+/// wasm module. From the engine's point of view both are the same "work asked of the host", so
+/// they are unified into one path.
 #[derive(Clone, Copy)]
 pub struct CodecTask {
     pub codec: crate::parquet::Compression,
-    /// 圧縮データ本体のファイル上の位置と長さ。キャッシュのキーでもある。
+    /// The compressed data's position and length in the file. Also the cache key.
     pub offset: u64,
     pub len: u32,
-    /// 展開後サイズ。ホストはこれを超える出力を返してはならない。
+    /// The decompressed size. The host must not return output exceeding it.
     pub out_len: u32,
 }
 
-/// フォーマット非依存のテーブル読み取り。
+/// Format-independent table reading.
 pub trait TableFormat {
-    /// スキーマを解決する。I/O は行わず、足りない範囲を要求して戻る。
-    /// 同じ範囲が満たされた状態で呼び直されたら前進しなければならない。
+    /// Resolves the schema. It performs no I/O and returns after requesting the ranges it lacks.
+    /// When called again with the same ranges satisfied, it must make progress.
     fn resolve(&mut self, src: &Source) -> Result<ResolveStep>;
 
     fn is_resolved(&self) -> bool;
 
-    /// 解決済みの列。`resolve` が `Ok(Ok(()))` を返す前は空。
+    /// The resolved columns. Empty until `resolve` returns `Ok(Ok(()))`.
     fn schema(&self) -> &[Field];
 
-    /// スキャン分割の総数。
+    /// The total number of scan splits.
     fn num_splits(&self) -> usize;
 
-    /// 分割の行数。事前に分からないフォーマットは `None`。
-    /// 結合順序の見積りと進捗表示にしか使わないので、精度は問わない。
+    /// A split's row count. `None` for formats where it is not known in advance.
+    /// It is used only for join-order estimation and progress display, so accuracy does not matter.
     fn split_rows(&self, split: usize) -> Option<u64>;
 
-    /// 分割を読むのに必要なバイト範囲を `out` に積む。
+    /// Pushes into `out` the byte ranges needed to read a split.
     ///
-    /// `projection` はスキーマ上の列番号。列指向フォーマットはこれを使って
-    /// 取得範囲を絞る。行指向フォーマットは無視してよい。
+    /// `projection` holds schema column numbers. A columnar format uses it to narrow the fetched
+    /// ranges. A row-oriented format may ignore it.
     fn split_ranges(
         &self,
         split: usize,
@@ -162,13 +162,13 @@ pub trait TableFormat {
         out: &mut Vec<(u64, u64)>,
     ) -> Result<()>;
 
-    /// この分割の復号に必要な、ホスト側での展開作業を列挙する。
+    /// Enumerates the host-side decompression work needed to decode this split.
     ///
-    /// `split_ranges` が示したバイトが揃った**後**に呼ばれる。ページヘッダは
-    /// 非圧縮なので、この時点で必要な作業をすべて確定できる。実行の途中で
-    /// 止まらずに済むのはこの性質のおかげ（DESIGN.md §6）。
+    /// Called **after** the bytes `split_ranges` named are present. Page headers are uncompressed,
+    /// so all the necessary work can be settled at this point. That property is why execution never
+    /// has to stop midway (DESIGN.md §6).
     ///
-    /// 内蔵コーデックしか使わないフォーマットは既定実装のままでよい。
+    /// Formats using only built-in codecs can leave the default implementation.
     fn codec_tasks(
         &self,
         _src: &Source,
@@ -179,23 +179,23 @@ pub trait TableFormat {
         Ok(())
     }
 
-    /// 統計でこの分割を落とせるか。統計を持たないフォーマットは既定実装のまま
-    /// `true` を返せばよい。
+    /// Whether statistics can rule this split out. Formats without statistics can leave the default
+    /// implementation returning `true`.
     ///
-    /// `pruners` の `column` は `projection` 上の位置を指す。
+    /// `pruners`' `column` refers to a position within `projection`.
     fn may_match(&self, _split: usize, _pruners: &[Pruner], _projection: &[usize]) -> bool {
         true
     }
 
-    /// ページ単位の絞り込み（ColumnIndex/OffsetIndex/Bloom フィルタ）に使う
-    /// バイト範囲を `out` に積む。`may_match`（RowGroup 統計、追加 I/O 無し）
-    /// で判定しきれない場合に、`split_ranges` より前に追加で 1 往復するための
-    /// フック。
+    /// Pushes into `out` the byte ranges used for page-level filtering
+    /// (ColumnIndex/OffsetIndex/Bloom filter). A hook for one extra round trip before
+    /// `split_ranges`, for when `may_match` (RowGroup statistics, no extra I/O) cannot decide on
+    /// its own.
     ///
-    /// 該当データが無い（対応しない、または pruners が使えない）フォーマット
-    /// は既定実装のまま何も積まなくてよい。積まれなければ後続の
-    /// `refine_with_index` は既定実装のまま `true` を返すだけになり、
-    /// 実質的に「ページ単位の絞り込みは無効」という以前の挙動と完全に一致する。
+    /// Formats with no such data (unsupported, or where the pruners are unusable) can leave the
+    /// default implementation and push nothing. With nothing pushed, the subsequent
+    /// `refine_with_index` stays at its default and merely returns `true`, matching the earlier
+    /// behavior of "page-level filtering disabled" exactly.
     fn index_ranges(
         &self,
         _split: usize,
@@ -206,12 +206,12 @@ pub trait TableFormat {
         Ok(())
     }
 
-    /// `index_ranges` が要求したバイトが揃った後に呼ぶ。ページ選択の結果
-    /// （どのページを読むか）を内部にキャッシュしてよい（`&mut self`）。
+    /// Called after the bytes `index_ranges` requested are present. The page selection result
+    /// (which pages to read) may be cached internally (`&mut self`).
     ///
-    /// 戻り値 `false` はこの分割を丸ごと読み飛ばせることを意味する
-    /// （Bloom フィルタでの否定、またはどのページも統計上一致し得ない場合）。
-    /// 既定実装は常に `true`（絞り込みなし = 元の全列チャンク取得のまま）。
+    /// A return value of `false` means the whole split can be skipped
+    /// (a Bloom filter negative, or no page can match by statistics).
+    /// The default implementation always returns `true` (no filtering = fetching whole column chunks as before).
     fn refine_with_index(
         &mut self,
         _src: &Source,
@@ -222,19 +222,18 @@ pub trait TableFormat {
         Ok(true)
     }
 
-    /// 分割を復号して列ベクタを返す。
+    /// Decodes a split and returns the column vectors.
     ///
-    /// 返す列は `projection` と同じ順・同じ個数で、すべて同じ長さでなければ
-    /// ならない。呼び出し側は `split_ranges` が示した範囲が `src` に揃っている
-    /// ことを保証する。
+    /// The returned columns must be in the same order and of the same count as `projection`, and
+    /// all of the same length. The caller guarantees the ranges `split_ranges` named are present in `src`.
     fn read_split(&self, src: &Source, split: usize, projection: &[usize]) -> Result<Vec<Vector>>;
 }
 
-/// `[start, end)` を `src` から取り出す。呼び出し側（`split_ranges`/
-/// `index_ranges` が示した範囲）は既に `src` に揃っている契約なので、無い
-/// 場合は呼び出し側の契約違反として `Internal` にする（I/O 待ちにはしない）。
+/// Extracts `[start, end)` from `src`. The caller is contracted to have the ranges (named by
+/// `split_ranges`/`index_ranges`) already present in `src`, so their absence is a caller contract
+/// violation and gives `Internal` (rather than waiting on I/O).
 ///
-/// 全フォーマットの `read_split`/`codec_tasks` が共通で使う小さなヘルパー。
+/// A small helper shared by every format's `read_split`/`codec_tasks`.
 pub(crate) fn get_or_internal(src: &Source, start: u64, end: u64) -> Result<&[u8]> {
     match src.get(start, (end - start) as usize) {
         Some(b) => Ok(b),
@@ -242,30 +241,29 @@ pub(crate) fn get_or_internal(src: &Source, start: u64, end: u64) -> Result<&[u8
     }
 }
 
-/// 対応フォーマット。
+/// The supported formats.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum FormatKind {
-    /// 名前（ファイル名・URL）の拡張子から推定する。
+    /// Inferred from the extension of the name (file name or URL).
     Auto,
     Parquet,
     Csv,
-    /// タブ区切り。CSV と同じ実装を区切り文字違いで使う。
+    /// Tab-separated. The same implementation as CSV with a different delimiter.
     Tsv,
-    /// 1 行 1 JSON オブジェクト（NDJSON）。
+    /// One JSON object per line (NDJSON).
     Jsonl,
-    /// ファイル全体が 1 個の JSON 値（トップレベル配列、またはオブジェクト
-    /// 単体）。`read_json`/`read_json_auto` 相当（`format::json` 参照）。
+    /// The whole file is a single JSON value (a top-level array, or a single object).
+    /// The equivalent of `read_json`/`read_json_auto` (see `format::json`).
     Json,
 }
 
 impl FormatKind {
-    /// 名前の拡張子からフォーマットを推定する。
+    /// Infers the format from the name's extension.
     ///
-    /// URL のクエリ文字列とフラグメントは落としてから見る。判定できない場合は
-    /// Parquet とみなす（主対象フォーマットであるため）。誤判定した場合は
-    /// マジックバイトの検査ではなくフッタ解決の失敗として現れ、
-    /// `BadMagic` が返る。
+    /// A URL's query string and fragment are dropped before inspection. When it cannot decide it
+    /// counts as Parquet (the primary target format). A misdetection surfaces not as a magic-byte
+    /// check but as a footer-resolution failure, and `BadMagic` is returned.
     pub fn detect(name: &str) -> FormatKind {
         let path = name.split(['?', '#']).next().unwrap_or(name);
         let ext = match path.rfind('.') {
@@ -287,11 +285,10 @@ impl FormatKind {
     }
 }
 
-/// フォーマット実装を作る。
+/// Builds a format implementation.
 ///
-/// `Auto` は `name` から推定する。未対応（フィーチャ無効）のフォーマットは
-/// `UnsupportedFeature` を返す。黙って Parquet として読もうとするより、
-/// 対応していないと言う方がよい。
+/// `Auto` infers from `name`. An unsupported format (its feature disabled) gives
+/// `UnsupportedFeature`. Saying it is unsupported beats silently trying to read it as Parquet.
 pub fn make(kind: FormatKind, name: &str) -> Result<Box<dyn TableFormat>> {
     let kind = match kind {
         FormatKind::Auto => FormatKind::detect(name),
@@ -312,15 +309,15 @@ pub fn make(kind: FormatKind, name: &str) -> Result<Box<dyn TableFormat>> {
     }
 }
 
-/// 行指向フォーマットが分割を切るときのチャンクサイズ。
+/// The chunk size a row-oriented format uses when cutting splits.
 ///
-/// 大きすぎると 1 分割のメモリが膨らみ、小さすぎるとレンジ取得の往復が増える。
-/// Parquet の典型的な RowGroup（数十 MB）より小さめに寄せてある。
+/// Too large and one split's memory balloons; too small and range-fetch round trips multiply.
+/// It leans smaller than Parquet's typical RowGroup (tens of MB).
 #[cfg(any(feature = "csv", feature = "jsonl"))]
 pub const TEXT_SPLIT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// 行指向フォーマットで 1 レコードが分割境界をまたぐときに、次の改行を探して
-/// 読み越してよい最大バイト数。
+/// The maximum bytes a row-oriented format may read past a split boundary looking for the next
+/// newline when a record straddles one.
 #[cfg(any(feature = "csv", feature = "jsonl"))]
 pub const TEXT_MAX_RECORD: u64 = 1024 * 1024;
 
@@ -337,7 +334,7 @@ mod tests {
         assert_eq!(FormatKind::detect("a.ndjson"), FormatKind::Jsonl);
         assert_eq!(FormatKind::detect("a.json"), FormatKind::Json);
         assert_eq!(FormatKind::detect("a.JSON"), FormatKind::Json);
-        // 拡張子が無い・未知のものは Parquet 扱い。
+        // No extension, or an unknown one, counts as Parquet.
         assert_eq!(FormatKind::detect("data"), FormatKind::Parquet);
         assert_eq!(FormatKind::detect("a.bin"), FormatKind::Parquet);
     }
@@ -346,14 +343,14 @@ mod tests {
     fn url_query_and_fragment_are_ignored() {
         assert_eq!(FormatKind::detect("https://x/y/trips.csv?token=abc"), FormatKind::Csv);
         assert_eq!(FormatKind::detect("https://x/y/trips.jsonl#frag"), FormatKind::Jsonl);
-        // クエリ側の拡張子に釣られないこと。
+        // It must not be fooled by an extension in the query string.
         assert_eq!(FormatKind::detect("https://x/y/data.parquet?name=a.csv"), FormatKind::Parquet);
     }
 
     #[test]
     fn pruning_is_safe_when_statistics_are_unusable() {
         let p = Pruner { column: 0, op: PruneOp::Eq, value: Value::I64(1), in_values: Vec::new() };
-        // 型が噛み合わない統計では枝刈りしない。
+        // Statistics whose types do not line up do not prune.
         assert!(range_may_match(&p, &Value::Bytes(vec![]), &Value::Bytes(vec![])));
         assert!(range_may_match(&p, &Value::Null, &Value::Null));
     }
@@ -384,9 +381,9 @@ mod tests {
             value: Value::I64(5),
             in_values: vec![Value::I64(50), Value::I64(500)],
         };
-        // 50 が [0,100] に入るので残る。
+        // 50 falls within [0,100], so it is kept.
         assert!(range_may_match(&p, &Value::I64(0), &Value::I64(100)));
-        // どの候補も [1000,2000] に入らないので飛ばせる。
+        // No candidate falls within [1000,2000], so it can be skipped.
         assert!(!range_may_match(&p, &Value::I64(1000), &Value::I64(2000)));
     }
 
@@ -398,7 +395,7 @@ mod tests {
             value: Value::I64(5),
             in_values: vec![Value::Bytes(vec![1])],
         };
-        // 比較不能な候補が 1 つでもあれば安全側で残す。
+        // If even one candidate is incomparable it errs safe and is kept.
         assert!(range_may_match(&p, &Value::I64(1000), &Value::I64(2000)));
     }
 }

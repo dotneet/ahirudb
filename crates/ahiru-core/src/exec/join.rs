@@ -1,42 +1,41 @@
-//! ハッシュ結合とネストループ結合。
+//! Hash join and nested-loop join.
 //!
-//! ビルド側は**常に右入力**に固定する。どちらを右に置くか（＝小さいほうを
-//! ビルドにする）はバインダの仕事で、ここでは判断しない。実行時に入れ替えると
-//! 出力列順（左の列 → 右の列）が変わり、`residual` と上位のスキーマが崩れる。
+//! The build side is fixed to **always be the right input**. Which side goes right (= making
+//! the smaller one the build side) is the binder's job and is not decided here. Swapping at
+//! runtime would change the output column order (left columns then right) and break `residual` and the schema above.
 //!
-//! ## 中断と再開
+//! ## Interruption and resumption
 //!
-//! 入力は `NeedIo` / `NeedCodec` を返しうる。ビルドは右入力を**全部**読み切って
-//! からでないと探索を始められないので、フェーズ（`Building` → `Probing` →
-//! `DrainingUnmatched` → `Done`）を明示的に持ち、中断時はそのまま抜けて次の
-//! `next()` で同じ位置から再開する。ハッシュ表・探索中のバッチ・一致ビットマップ
-//! はすべて `self` に置く。
+//! The inputs can return `NeedIo` / `NeedCodec`. Probing cannot start until the right input
+//! is read through, so the phase (`Building` -> `Probing` -> `DrainingUnmatched` -> `Done`) is
+//! held explicitly; on interruption it simply exits and the next `next()` resumes from the same
+//! position. The hash table, the batch being probed, and the match bitmap all live in `self`.
 //!
-//! ## メモリ
+//! ## Memory
 //!
-//! ビルド側はメモリに全部載せる。溢れをディスクに逃がす仕組みは持たない
-//! （既知の制限）。代わりに `MAX_BUILD_BYTES` で頭打ちにして `Oom` を返す。
+//! The build side is held entirely in memory. There is no mechanism to spill overflow to disk
+//! (a known limitation). Instead `MAX_BUILD_BYTES` caps it and returns `Oom`.
 //!
 //! ## Semi / Anti
 //!
-//! `IN (SELECT)` / `EXISTS` の書き換え先。出力は**左の列だけ**で、左の 1 行は
-//! 高々 1 回しか出ない。探索の仕組みは共有し、候補ペアを返さずに一致ビット
-//! （`Probe::matched`）だけ立てて、バッチ末尾のドレインで Semi は一致行を、
-//! Anti は未一致行をまとめて出す。
+//! The rewrite target of `IN (SELECT)` / `EXISTS`. The output is **the left columns only**, and
+//! one left row appears at most once. The probing machinery is shared: rather than returning
+//! candidate pairs it only sets the match bit (`Probe::matched`), and the drain at the end of a
+//! batch emits the matched rows for Semi and the unmatched rows for Anti.
 //!
-//! NULL キーの左行はどのビルド行とも一致しないので、Semi では消え Anti では
-//! 残る。`Anti` は素直に「一致が無ければ出す」だけを行い、SQL の 3 値論理は
-//! 見ない（`NOT EXISTS` の意味論）。
+//! A left row with a NULL key matches no build row, so it disappears under Semi and survives
+//! under Anti. `Anti` plainly does "emit if there is no match" and does not consider SQL's
+//! three-valued logic (the semantics of `NOT EXISTS`).
 //!
-//! `NOT IN (SELECT ...)` はこれとは別物で、`AntiNullAware` を使う。DuckDB で
-//! 確かめた 3 値論理は次のとおり:
+//! `NOT IN (SELECT ...)` is a different thing and uses `AntiNullAware`. The three-valued logic
+//! confirmed with DuckDB is:
 //!
-//! - 右のキーに NULL が 1 つでもあれば、どの左行との比較も UNKNOWN。**結果は
-//!   空**（`2 NOT IN (1, NULL)` は真ではなく UNKNOWN）。
-//! - 左のキーが NULL の行は、右が空でない限り UNKNOWN なので出さない。
-//! - 右が空なら `x NOT IN ()` は左が NULL でも真。**全行**を出す。
+//! - If the right keys contain even one NULL, every comparison with any left row is UNKNOWN.
+//!   **The result is empty** (`2 NOT IN (1, NULL)` is UNKNOWN, not true).
+//! - A left row with a NULL key is UNKNOWN unless the right side is empty, so it is not emitted.
+//! - If the right side is empty, `x NOT IN ()` is true even for a NULL left. **Every row** is emitted.
 //!
-//! どちらを使うかはバインダが決める。オペレータは渡された `kind` に従うだけ。
+//! Which one to use is the binder's decision. The operator just follows the `kind` it is given.
 
 use crate::exec::rowkey::{encode_key, key_has_null, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
@@ -45,38 +44,38 @@ use crate::prelude::*;
 use crate::sql::ast::JoinKind;
 use crate::vector::{Batch, Bitmap, Data, Ty, Vector, BATCH_SIZE};
 
-/// 「相手が居ない」を表す行番号。チェーンの終端にも使う。
+/// The row number meaning "no counterpart". Also used as a chain terminator.
 const NONE: u32 = u32::MAX;
 
-/// バッファできるビルド側のバイト数。スピルを持たないので、これを超えたら
-/// 静かに巨大なメモリを掴む代わりにエラーで落とす。
+/// How many bytes of the build side may be buffered. With no spilling, exceeding this fails
+/// with an error instead of silently grabbing enormous memory.
 const MAX_BUILD_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// 右入力を読み切ってハッシュ表を作っている。
+    /// Reading the right input through and building the hash table.
     Building,
-    /// 左入力を 1 バッチずつ探索している。
+    /// Probing the left input one batch at a time.
     Probing,
-    /// RIGHT/FULL で、どの左行とも一致しなかったビルド行を吐いている。
+    /// For RIGHT/FULL, emitting the build rows that matched no left row.
     DrainingUnmatched,
     Done,
 }
 
-/// 探索中の左バッチと、その途中経過。
+/// The left batch being probed, and its progress.
 struct Probe {
-    /// selection を畳んだ左バッチ。行番号がそのまま添字になる。
+    /// The left batch with selection materialized. Row numbers serve directly as indices.
     batch: Batch,
-    /// 左キーの評価結果。`batch` と同じ行数。
+    /// The evaluated left keys. The same row count as `batch`.
     keys: Vec<Vector>,
-    /// 走査中の左行。
+    /// The left row being scanned.
     row: usize,
-    /// 次に試すビルド行。`None` はこの左行をまだ開始していないこと、
-    /// `Some(NONE)` は候補を出し切ったことを表す。
+    /// The next build row to try. `None` means this left row has not been started yet,
+    /// and `Some(NONE)` means the candidates are exhausted.
     cursor: Option<u32>,
-    /// 左行ごとの「residual まで通った一致があったか」。
+    /// Per left row: "was there a match that made it through residual".
     matched: Bitmap,
-    /// 未一致左行の NULL 拡張で次に見る行。
+    /// The next row to look at when NULL-extending unmatched left rows.
     drain: usize,
 }
 
@@ -89,36 +88,36 @@ pub struct HashJoin {
     left_types: Vec<Ty>,
     right_types: Vec<Ty>,
 
-    /// `kind` はこれらのフラグにしか効かないので、そのまま持たずに畳む。
-    /// 未一致の左行を出すか（LEFT / FULL は NULL 拡張、ANTI は左列だけ）。
+    /// `kind` affects only these flags, so it is folded rather than kept.
+    /// Whether to emit unmatched left rows (LEFT / FULL NULL-extend; ANTI emits the left columns only).
     emit_unmatched_left: bool,
-    /// 一致した左行を（結合ペアではなく）1 回だけ出すか（SEMI）。
+    /// Whether to emit a matched left row exactly once (rather than as join pairs) -- SEMI.
     emit_matched_left: bool,
-    /// 出力が左の列だけか（SEMI / ANTI / ANTI NULL AWARE）。
+    /// Whether the output is the left columns only (SEMI / ANTI / ANTI NULL AWARE).
     left_only: bool,
-    /// `NOT IN` の 3 値論理を再現するか（ANTI NULL AWARE）。
+    /// Whether to reproduce `NOT IN`'s three-valued logic (ANTI NULL AWARE).
     null_aware: bool,
-    /// 未一致のビルド行を NULL 拡張して出すか（RIGHT / FULL）。
+    /// Whether to NULL-extend and emit unmatched build rows (RIGHT / FULL).
     emit_unmatched_right: bool,
 
     phase: Phase,
-    /// バッファしたビルド側。右入力の全バッチを 1 本に連結したもの。
+    /// The buffered build side. Every batch of the right input concatenated into one.
     build_cols: Vec<Vector>,
     build_rows: usize,
-    /// 概算のバッファ量。上限判定にしか使わない。
+    /// The approximate amount buffered. Used only for the cap check.
     build_bytes: usize,
-    /// キー → チェーン先頭のビルド行番号。
+    /// Key -> the build row number at the head of the chain.
     index: HashIndex,
-    /// 同じキーを持つビルド行の連鎖。終端は `NONE`。
+    /// The chain of build rows sharing a key. Terminated by `NONE`.
     next: Vec<u32>,
-    /// ビルド行ごとの一致フラグ。RIGHT/FULL のときだけ確保する。
+    /// The match flag per build row. Allocated only for RIGHT/FULL.
     build_matched: Bitmap,
-    /// ビルド側のキーに NULL を含む行があったか。ANTI NULL AWARE でだけ使う。
+    /// Whether any build-side key row contained a NULL. Used only by ANTI NULL AWARE.
     build_has_null: bool,
-    /// `encode_key` の書き込み先。行ごとに確保しないよう使い回す。
+    /// The destination `encode_key` writes to. Reused rather than allocated per row.
     keybuf: Vec<u8>,
     probe: Option<Probe>,
-    /// `DrainingUnmatched` で次に見るビルド行。
+    /// The next build row to look at in `DrainingUnmatched`.
     drain: usize,
 }
 
@@ -134,7 +133,7 @@ impl HashJoin {
         left_types: Vec<Ty>,
         right_types: Vec<Ty>,
     ) -> Result<Self> {
-        // 等値条件は左右で対になっている。ずれていればバインダのバグ。
+        // Equality conditions pair up left and right. A mismatch is a binder bug.
         ensure!(left_keys.len() == right_keys.len(), Internal);
         let build_cols = right_types.iter().map(|t| Vector::new(*t)).collect();
         Ok(HashJoin {
@@ -145,8 +144,8 @@ impl HashJoin {
             residual,
             left_types,
             right_types,
-            // ANTI は「一致しなかった左行」を出すので LEFT と同じ側に置く。
-            // 違いは右の列を並べないことだけ（`left_only`）。
+            // ANTI emits "left rows that did not match", so it sits on the same side as LEFT.
+            // The only difference is not laying out the right columns (`left_only`).
             emit_unmatched_left: matches!(
                 kind,
                 JoinKind::Left | JoinKind::Full | JoinKind::Anti | JoinKind::AntiNullAware
@@ -169,16 +168,16 @@ impl HashJoin {
         })
     }
 
-    /// 等値キーが無い＝ネストループで総当たりする。CROSS と `ON a.x < b.y`
-    /// のような非等値結合がここに来る。
+    /// No equality keys = brute force with a nested loop. CROSS and non-equi joins such as
+    /// `ON a.x < b.y` come here.
     #[inline]
     fn nested(&self) -> bool {
         self.right_keys.is_empty()
     }
 
-    /// 右バッチ 1 つをビルド側に取り込む。
+    /// Takes one right batch into the build side.
     fn absorb(&mut self, ctx: &mut ExecContext, mut batch: Batch) -> Result<()> {
-        // 以降は行番号で引くので selection をここで畳む。
+        // From here on lookups are by row number, so selection is materialized now.
         batch.materialize();
         let rows = batch.num_rows();
         if rows == 0 {
@@ -186,7 +185,7 @@ impl HashJoin {
         }
         ensure!(batch.cols.len() == self.right_types.len(), Internal);
 
-        // キーは連結前に評価する（materialize 済みなので行番号がそのまま対応）。
+        // Keys are evaluated before concatenation (already materialized, so row numbers correspond directly).
         let mut keys = Vec::with_capacity(self.right_keys.len());
         for p in &self.right_keys {
             keys.push(ctx.vm.eval(p, &batch)?);
@@ -198,8 +197,8 @@ impl HashJoin {
             self.build_bytes += vector_bytes(src);
         }
         self.build_rows += rows;
-        // 行番号は u32 で持つ。上限バイト数のほうが先に効くはずだが、
-        // 0 列のバッチ（COUNT(*) 経路）ではバイト数が増えないので明示的に見る。
+        // Row numbers are held as u32. The byte cap should bite first, but a zero-column batch
+        // (the COUNT(*) path) does not grow the byte count, so this is checked explicitly.
         ensure!(self.build_rows < NONE as usize, Oom);
         ensure!(self.build_bytes + self.index.key_bytes() <= MAX_BUILD_BYTES, Oom);
 
@@ -207,11 +206,11 @@ impl HashJoin {
             self.next.resize(self.build_rows, NONE);
             let refs: Vec<&Vector> = keys.iter().collect();
             for r in 0..rows {
-                // NULL を含むキーは何とも一致しない（SQL の `=` は NULL 安全でない）
-                // ので表に入れない。行自体は残るので OUTER の未一致ドレインには出る。
+                // A key containing NULL matches nothing (SQL's `=` is not NULL-safe), so it is
+                // not put in the table. The row itself remains and appears in the OUTER unmatched drain.
                 if key_has_null(&refs, r) {
-                    // `NOT IN` だけは「右に NULL があるかどうか」自体が答えを
-                    // 変えるので、見たことを覚えておく。
+                    // Only for `NOT IN` does "whether the right side has a NULL" itself change
+                    // the answer, so having seen one is remembered.
                     self.build_has_null = true;
                     continue;
                 }
@@ -223,7 +222,7 @@ impl HashJoin {
         Ok(())
     }
 
-    /// 探索フェーズを 1 歩進める。`None` は「出力は無いが状態は進んだ」。
+    /// Advances the probe phase by one step. `None` means "no output, but state advanced".
     fn probe_step(&mut self, ctx: &mut ExecContext) -> Result<Option<Step>> {
         if self.probe.is_none() {
             let mut batch = match self.left.next(ctx)? {
@@ -236,7 +235,7 @@ impl HashJoin {
                     };
                     return Ok(None);
                 }
-                // 中断。ハッシュ表はそのまま、探索も未開始のまま抜ける。
+                // Interrupted. The hash table stays, and probing exits still unstarted.
                 other => return Ok(Some(other)),
             };
             batch.materialize();
@@ -259,9 +258,9 @@ impl HashJoin {
             });
         }
 
-        // --- 候補ペアを最大 BATCH_SIZE 件ぶん作る -----------------------------
-        // 1 つの左行が多数のビルド行に当たることがあるので、左行の途中で
-        // 打ち切れるように `cursor` を残す。
+        // --- Build up to BATCH_SIZE candidate pairs ---------------------------
+        // One left row can hit many build rows, so `cursor` is kept so it can break off in the
+        // middle of a left row.
         let mut lidx: Vec<u32> = Vec::new();
         let mut ridx: Vec<u32> = Vec::new();
         {
@@ -272,9 +271,9 @@ impl HashJoin {
             let rows = p.batch.num_rows();
             let refs: Vec<&Vector> = p.keys.iter().collect();
             while lidx.len() < BATCH_SIZE && p.row < rows {
-                // SEMI / ANTI は「一致が 1 つでもあるか」しか要らない。一致が
-                // 確定した左行は残りのチェーンを辿らずに打ち切る。`matched` は
-                // residual を通ったペアでしか立たないので早すぎることはない。
+                // SEMI / ANTI only need "is there at least one match". A left row whose match is
+                // settled breaks off without walking the rest of the chain. `matched` is only set
+                // by pairs that passed residual, so it is never too early.
                 if self.left_only && p.matched.get(p.row) {
                     p.row += 1;
                     p.cursor = None;
@@ -283,8 +282,8 @@ impl HashJoin {
                 let cur = match p.cursor {
                     Some(c) => c,
                     None => {
-                        // `nested()` と同じ判定。`probe` を借りている間はメソッドを
-                        // 呼べないのでフィールドを直接見る。
+                        // The same check as `nested()`. Methods cannot be called while `probe` is
+                        // borrowed, so the fields are read directly.
                         let head = if self.right_keys.is_empty() {
                             if self.build_rows == 0 {
                                 NONE
@@ -292,12 +291,12 @@ impl HashJoin {
                                 0
                             }
                         } else if key_has_null(&refs, p.row) {
-                            // 探索側も同じ。NULL キーはどのビルド行とも一致しない。
+                            // The same on the probe side. A NULL key matches no build row.
                             //
-                            // ただし `NOT IN` では「NULL NOT IN (空でない集合)」が
-                            // UNKNOWN なので、この左行も返してはいけない。一致した
-                            // ことにしてドレインの対象から外す（右が空なら
-                            // `NULL NOT IN ()` は真なので、そのときだけ出す）。
+                            // But under `NOT IN`, `NULL NOT IN (a non-empty set)` is UNKNOWN, so
+                            // this left row must not be returned either. It is marked as matched to
+                            // exclude it from the drain (when the right side is empty,
+                            // `NULL NOT IN ()` is true, so only then is it emitted).
                             if self.null_aware && self.build_rows > 0 {
                                 p.matched.set(p.row, true);
                             }
@@ -318,7 +317,7 @@ impl HashJoin {
                 lidx.push(p.row as u32);
                 ridx.push(cur);
                 p.cursor = Some(if self.right_keys.is_empty() {
-                    // ネストループは次のビルド行へ進むだけ。
+                    // A nested loop simply advances to the next build row.
                     if (cur as usize) + 1 < self.build_rows {
                         cur + 1
                     } else {
@@ -336,8 +335,8 @@ impl HashJoin {
                     Some(p) => p,
                     None => err!(Internal),
                 };
-                // SEMI / ANTI はこのバッチを返さない。residual を見ないなら
-                // 組み立てる必要すら無いので行数だけの器で済ませる。
+                // SEMI / ANTI do not return this batch. Without residual to consider there is no
+                // need to assemble it at all, so a container carrying only the row count suffices.
                 if self.left_only && self.residual.is_none() {
                     Batch::rows_only(lidx.len())
                 } else {
@@ -352,9 +351,9 @@ impl HashJoin {
                     )
                 }
             };
-            // residual は「一致した」と数える**前**に適用する。キーは合ったが
-            // residual で落ちたペアは一致ではないので、OUTER ではその左行を
-            // NULL 拡張して出さなければならない。
+            // residual is applied **before** counting a match. A pair whose keys agreed but that
+            // residual rejected is not a match, so under OUTER that left row must still be
+            // NULL-extended and emitted.
             let keep: Option<Vec<u32>> = match &self.residual {
                 Some(r) => {
                     let mut sel = Vec::new();
@@ -387,13 +386,13 @@ impl HashJoin {
                     }
                 }
             }
-            // SEMI / ANTI は結合ペアを返さない。一致ビットだけ立てて、出力は
-            // 下のドレインでまとめて行う（左行は高々 1 回）。
+            // SEMI / ANTI do not return join pairs. Only the match bit is set, and output happens
+            // together in the drain below (a left row appears at most once).
             if self.left_only {
                 return Ok(None);
             }
             match keep {
-                // 候補が全滅した。空バッチは返さず次の塊へ進む。
+                // The candidates are exhausted. An empty batch is not returned; move to the next chunk.
                 Some(sel) if sel.is_empty() => return Ok(None),
                 Some(sel) => out.sel = Some(sel),
                 None => {}
@@ -401,10 +400,10 @@ impl HashJoin {
             return Ok(Some(Step::Ready(out)));
         }
 
-        // --- 候補を出し切った。左行そのものを出す段 --------------------------
-        // LEFT/FULL は未一致行を NULL 拡張、ANTI は未一致行を左列だけ、
-        // SEMI は一致行を左列だけ。拾う条件は「一致ビット == emit_matched_left」
-        // の 1 本にまとまる。
+        // --- Candidates exhausted. The stage that emits the left rows themselves --
+        // LEFT/FULL NULL-extend unmatched rows, ANTI emits unmatched rows' left columns only, and
+        // SEMI emits matched rows' left columns only. The pickup condition collapses to the single
+        // test "match bit == emit_matched_left".
         let mut idx: Vec<u32> = Vec::new();
         if self.emit_unmatched_left || self.emit_matched_left {
             let p = match self.probe.as_mut() {
@@ -429,14 +428,14 @@ impl HashJoin {
                 &self.left_types,
                 Some(&idx),
                 &self.build_cols,
-                // SEMI / ANTI の出力は左のスキーマだけ。
+                // SEMI / ANTI output only the left schema.
                 if self.left_only { &[] } else { &self.right_types },
                 None,
                 idx.len(),
             ))));
         }
 
-        // このバッチは片付いた。次の左バッチを引く。
+        // This batch is finished. Pull the next left batch.
         self.probe = None;
         Ok(None)
     }
@@ -449,20 +448,20 @@ impl Operator for HashJoin {
                 Phase::Building => match self.right.next(ctx)? {
                     Step::Ready(b) => self.absorb(ctx, b)?,
                     Step::Done => {
-                        // 未一致ビルド行を出すのは RIGHT/FULL だけ。行数ぶんの
-                        // ビットマップなので、要らないときは確保しない。
+                        // Only RIGHT/FULL emit unmatched build rows. It is a bitmap sized to the
+                        // row count, so it is not allocated when unnecessary.
                         if self.emit_unmatched_right {
                             self.build_matched = Bitmap::zeros(self.build_rows);
                         }
-                        // `NOT IN` で右のキーに NULL があれば、どの左行との比較も
-                        // UNKNOWN になり結果は空。左を 1 行も引かずに終わる。
+                        // Under `NOT IN`, a NULL among the right keys makes every comparison with
+                        // any left row UNKNOWN and the result empty. It finishes without pulling a single left row.
                         self.phase = if self.null_aware && self.build_has_null {
                             Phase::Done
                         } else {
                             Phase::Probing
                         };
                     }
-                    // NeedIo / NeedCodec。作りかけのハッシュ表を保ったまま抜ける。
+                    // NeedIo / NeedCodec. Exits with the partially built hash table intact.
                     other => return Ok(other),
                 },
                 Phase::Probing => {
@@ -498,10 +497,10 @@ impl Operator for HashJoin {
     }
 }
 
-// --- 出力の組み立て ---------------------------------------------------------
+// --- Assembling the output ---------------------------------------------------
 
-/// 左の列に続けて右の列を並べたバッチを作る。添字が `None` の側は全行 NULL
-/// （OUTER の NULL 拡張）。列順はバインダが作るスキーマとの契約なので変えない。
+/// Builds a batch laying the right columns after the left ones. A side whose index is `None`
+/// is all NULL (OUTER NULL extension). The column order is a contract with the schema the binder builds, so it does not change.
 fn assemble(
     lcols: &[Vector],
     ltys: &[Ty],
@@ -515,7 +514,7 @@ fn assemble(
     push_side(&mut cols, lcols, ltys, lidx, n);
     push_side(&mut cols, rcols, rtys, ridx, n);
     if cols.is_empty() {
-        // 列を持たない入力同士（COUNT(*) 経路）。行数だけを伝える。
+        // Two inputs with no columns (the COUNT(*) path). Only the row count is conveyed.
         return Batch::rows_only(n);
     }
     Batch::new(cols)
@@ -530,16 +529,16 @@ fn push_side(out: &mut Vec<Vector>, cols: &[Vector], tys: &[Ty], idx: Option<&[u
     }
 }
 
-/// `Vector::gather` に「相手が居ない」印（`NONE`）を許したもの。
+/// `Vector::gather` extended to allow the "no counterpart" marker (`NONE`).
 fn gather_opt(src: &Vector, idx: &[u32], ty: Ty) -> Vector {
     if !idx.contains(&NONE) {
         return src.gather(idx);
     }
     if src.is_empty() {
-        // ビルド側が空なら拾える行が無い。全行 NULL で返す。
+        // With an empty build side there is no row to pick up. Return all NULL.
         return null_vector(ty, idx.len());
     }
-    // 適当な行を拾ってから validity を落とす。`Value` 経由の行コピーを避ける。
+    // Pick up an arbitrary row and then clear validity. Avoids copying rows through `Value`.
     let safe: Vec<u32> = idx.iter().map(|&i| if i == NONE { 0 } else { i }).collect();
     let mut v = src.gather(&safe);
     let bm = v.validity_mut();
@@ -559,8 +558,8 @@ fn null_vector(ty: Ty, n: usize) -> Vector {
     v
 }
 
-/// `dst` の末尾に `src` の全行を連結する。1 行ずつ `Value` を経由すると
-/// 可変長列で確保回数が行数に比例するので、バッチ単位でまとめて積む。
+/// Concatenates every row of `src` onto the end of `dst`. Going through `Value` row by row
+/// would make allocations proportional to the row count for variable-length columns, so it is done in batch units.
 fn append_all(dst: &mut Vector, src: &Vector) -> Result<()> {
     let base = dst.len();
     let n = src.len();
@@ -579,11 +578,11 @@ fn append_all(dst: &mut Vector, src: &Vector) -> Result<()> {
                 d.push(s.get(i));
             }
         }
-        // 物理型が食い違うのは上流のバグ。
+        // A physical type mismatch is an upstream bug.
         _ => err!(Internal),
     }
     if src.has_nulls() || dst.has_nulls() {
-        // `validity_mut` は不足分を「有効」で埋めるので、NULL の位置だけ落とす。
+        // `validity_mut` fills any shortfall as "valid", so only the NULL positions are cleared.
         let bm = dst.validity_mut();
         for i in 0..n {
             if !src.is_valid(i) {
@@ -594,7 +593,7 @@ fn append_all(dst: &mut Vector, src: &Vector) -> Result<()> {
     Ok(())
 }
 
-/// バッファ量の概算。上限判定にしか使わないので厳密でなくてよい。
+/// An estimate of the buffered amount. Used only for the cap check, so it need not be exact.
 fn vector_bytes(v: &Vector) -> usize {
     let d = match v.data() {
         Data::Bool(b) => b.len() / 8 + 1,
@@ -604,7 +603,7 @@ fn vector_bytes(v: &Vector) -> usize {
         Data::I128(x) => x.len() * 16,
         Data::Bytes(b) => b.data.len() + (b.len() + 1) * 4,
     };
-    // validity と結合用のチェーンぶん。
+    // Plus validity and the join chain.
     d + v.len() / 8 + 4
 }
 
@@ -616,10 +615,10 @@ mod tests {
     use crate::expr::{Instr, OpCode};
     use crate::vector::Value;
 
-    // --- モック入力 ---------------------------------------------------------
+    // --- Mock inputs --------------------------------------------------------
 
-    /// 台本どおりに `Step` を返す入力。`NeedIo` を挟むと、リモート入力で
-    /// 途中中断された状況をそのまま再現できる。
+    /// An input returning `Step`s from a script. Interposing `NeedIo` reproduces exactly the
+    /// situation of a remote input being interrupted midway.
     struct Mock {
         steps: Vec<Option<Step>>,
         pos: usize,
@@ -645,7 +644,7 @@ mod tests {
         }
     }
 
-    // --- 組み立てヘルパ -----------------------------------------------------
+    // --- Construction helpers -----------------------------------------------
 
     fn ints(vals: &[Option<i32>]) -> Vector {
         let mut v = Vector::new(Ty::Int);
@@ -681,7 +680,7 @@ mod tests {
         Step::Ready(Batch::new(cols))
     }
 
-    /// 第 `i` 列をそのままキーにするプログラム。
+    /// A program using column `i` directly as the key.
     fn col_prog(i: u16, ty: Ty) -> Program {
         let mut p = Program::new();
         let r = p.alloc_reg();
@@ -691,7 +690,7 @@ mod tests {
         p
     }
 
-    /// `col a <op> col b` を返すプログラム（residual 用）。
+    /// A program returning `col a <op> col b` (for residual).
     fn cmp_prog(a: u16, b: u16, ty: Ty, op: OpCode) -> Program {
         let mut p = Program::new();
         let ra = p.alloc_reg();
@@ -707,7 +706,7 @@ mod tests {
 
     struct Runner {
         rows: Vec<Vec<Value>>,
-        /// 返ってきた `NeedIo` の回数。
+        /// How many `NeedIo`s came back.
         interrupts: usize,
         batches: usize,
     }
@@ -717,14 +716,14 @@ mod tests {
         let mut vm = Vm::new();
         let mut out = Runner { rows: Vec::new(), interrupts: 0, batches: 0 };
         for guard in 0..100_000 {
-            assert!(guard < 99_999, "終わらない");
+            assert!(guard < 99_999, "does not terminate");
             let mut ctx =
                 ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
             match op.next(&mut ctx).unwrap() {
                 Step::Ready(b) => {
                     let n = b.card();
-                    assert!(n > 0, "空バッチを返してはいけない");
-                    assert!(n <= BATCH_SIZE, "1 回の next で {n} 行はバッチ上限超え");
+                    assert!(n > 0, "an empty batch must not be returned");
+                    assert!(n <= BATCH_SIZE, "{n} rows in one next exceeds the batch cap");
                     out.batches += 1;
                     for i in 0..n {
                         let r = match &b.sel {
@@ -741,7 +740,7 @@ mod tests {
         out
     }
 
-    /// 行を整数（NULL は `None`）に潰して並べ替える。順序は保証しないため。
+    /// Flattens rows to integers (NULL as `None`) and sorts them, since the order is not guaranteed.
     fn norm(rows: &[Vec<Value>]) -> Vec<Vec<Option<i64>>> {
         let mut v: Vec<Vec<Option<i64>>> =
             rows.iter().map(|r| r.iter().map(|x| x.as_i64()).collect()).collect();
@@ -776,7 +775,7 @@ mod tests {
             .unwrap()
     }
 
-    /// 1 列（INT のキーのみ）同士の結合。
+    /// A join of one column each (an INT key only).
     fn join1(left: Vec<Step>, right: Vec<Step>, kind: JoinKind) -> HashJoin {
         join(left, right, kind, 1, vec![Ty::Int], vec![Ty::Int])
     }
@@ -785,9 +784,9 @@ mod tests {
         ready(vec![ints(vals)])
     }
 
-    // --- 中断と再開 ---------------------------------------------------------
+    // --- Interruption and resumption ----------------------------------------
 
-    /// 最重要。ビルド中・探索中に `NeedIo` が挟まっても結果が変わらないこと。
+    /// The most important one. The result must not change when `NeedIo` interposes during build or probe.
     #[test]
     fn need_io_mid_build_and_mid_probe_is_transparent() {
         let l = || vec![ints1(&[Some(1), Some(2)]), ints1(&[Some(3), Some(1)])];
@@ -809,10 +808,10 @@ mod tests {
             Step::NeedIo,
         ];
         let got = run(&mut join1(interrupted_left, interrupted_right, JoinKind::Full));
-        assert!(got.interrupts >= 5, "中断がそのまま伝わっていない");
+        assert!(got.interrupts >= 5, "the interruptions were not passed through");
         assert_eq!(norm(&got.rows), norm(&clean.rows));
 
-        // INNER / LEFT / RIGHT でも同じ。
+        // The same for INNER / LEFT / RIGHT.
         for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Right] {
             let clean = run(&mut join1(l(), r(), kind));
             let noisy = run(&mut join1(
@@ -835,8 +834,8 @@ mod tests {
         }
     }
 
-    /// 1 つの左行が BATCH_SIZE を超える出力を生む場合、探索の途中で中断されても
-    /// チェーンの位置を見失わないこと。
+    /// When one left row produces more output than BATCH_SIZE, the chain position must not be
+    /// lost even if the probe is interrupted midway.
     #[test]
     fn need_io_does_not_disturb_a_long_chain() {
         let big: Vec<Option<i32>> = (0..3000).map(|_| Some(7)).collect();
@@ -844,7 +843,7 @@ mod tests {
         let right = vec![Step::NeedIo, ready(vec![ints(&big)]), Step::NeedIo];
         let got = run(&mut join1(left, right, JoinKind::Inner));
         assert_eq!(got.rows.len(), 3000);
-        assert_eq!(got.batches, 2, "BATCH_SIZE で区切られる");
+        assert_eq!(got.batches, 2, "split at BATCH_SIZE");
     }
 
     // --- INNER --------------------------------------------------------------
@@ -883,10 +882,10 @@ mod tests {
         );
     }
 
-    /// 多対多。チェーンの張り方を間違えると件数が合わない。
+    /// Many-to-many. Getting the chaining wrong would give the wrong count.
     #[test]
     fn inner_many_to_many_row_count() {
-        // 左: 1,1,2,2,3 / 右: 1,1,1,2 → 2*3 + 2*1 = 8
+        // Left: 1,1,2,2,3 / right: 1,1,1,2 -> 2*3 + 2*1 = 8
         let got = run(&mut join1(
             vec![ints1(&[Some(1), Some(1), Some(2), Some(2), Some(3)])],
             vec![ints1(&[Some(1), Some(1), Some(1), Some(2)])],
@@ -897,7 +896,7 @@ mod tests {
         assert_eq!(ones, 6);
     }
 
-    /// 右入力が複数バッチに割れていてもチェーンが繋がること。
+    /// The chain must connect even when the right input is split across several batches.
     #[test]
     fn build_side_spanning_batches() {
         let got = run(&mut join1(
@@ -949,20 +948,20 @@ mod tests {
         );
     }
 
-    // --- NULL キー ----------------------------------------------------------
+    // --- NULL keys ----------------------------------------------------------
 
-    /// NULL は NULL とも一致しない。ただし OUTER では未一致行として出る。
+    /// NULL does not match NULL either. Under OUTER it does appear as an unmatched row.
     #[test]
     fn null_keys_never_match_each_other() {
         let left = || vec![ints1(&[None, Some(1)])];
         let right = || vec![ints1(&[None, Some(1)])];
 
         let got = run(&mut join1(left(), right(), JoinKind::Inner));
-        assert_eq!(norm(&got.rows), vec![vec![Some(1), Some(1)]], "NULL 同士が繋がっている");
+        assert_eq!(norm(&got.rows), vec![vec![Some(1), Some(1)]], "NULLs got connected");
 
         let got = run(&mut join1(left(), right(), JoinKind::Left));
         assert_eq!(norm(&got.rows), vec![vec![None, None], vec![Some(1), Some(1)]]);
-        // 左が NULL の行は「左だけ有効」として出ているはず。
+        // The row whose left is NULL should appear as "left only valid".
         let extended = got.rows.iter().filter(|r| r[0].is_null() && r[1].is_null()).count();
         assert_eq!(extended, 1);
 
@@ -970,7 +969,7 @@ mod tests {
         assert_eq!(norm(&got.rows), vec![vec![None, None], vec![Some(1), Some(1)]]);
 
         let got = run(&mut join1(left(), right(), JoinKind::Full));
-        // 左の NULL 行と右の NULL 行が別々に 1 行ずつ。
+        // The left NULL row and the right NULL row, one each, separately.
         assert_eq!(got.rows.len(), 3);
         assert_eq!(
             norm(&got.rows),
@@ -978,7 +977,7 @@ mod tests {
         );
     }
 
-    /// 複合キー。片方が NULL なら他方が一致していても繋がらない。
+    /// A composite key. If one part is NULL it does not connect even when the other matches.
     #[test]
     fn multi_column_keys_with_one_null() {
         let left = vec![ready(vec![
@@ -994,14 +993,14 @@ mod tests {
         assert_eq!(
             norm(&got.rows),
             vec![
-                vec![Some(1), None, None, None], // (1, NULL) は何とも一致しない
+                vec![Some(1), None, None, None], // (1, NULL) matches nothing
                 vec![Some(1), Some(10), Some(1), Some(10)],
-                vec![Some(2), Some(20), None, None], // 第 2 列が違う
+                vec![Some(2), Some(20), None, None], // the second column differs
             ]
         );
     }
 
-    // --- 型ごとのキー -------------------------------------------------------
+    // --- Keys per type ------------------------------------------------------
 
     #[test]
     fn string_keys() {
@@ -1020,23 +1019,23 @@ mod tests {
         );
     }
 
-    /// `encode_key` が -0.0 と NaN を正規化するので、どちらも結合する。
+    /// `encode_key` normalizes -0.0 and NaN, so both join.
     #[test]
     fn float_keys_canonicalise_zero_and_nan() {
         let left = vec![ready(vec![dbls(&[-0.0, f64::NAN, 1.5])])];
         let right = vec![ready(vec![dbls(&[0.0, f64::NAN])])];
         let mut j = join(left, right, JoinKind::Inner, 1, vec![Ty::Double], vec![Ty::Double]);
         let got = run(&mut j);
-        assert_eq!(got.rows.len(), 2, "-0.0=0.0 と NaN=NaN で 2 行");
+        assert_eq!(got.rows.len(), 2, "2 rows, from -0.0=0.0 and NaN=NaN");
         let z = got.rows.iter().find(|r| r[0].as_f64() == Some(0.0)).unwrap();
-        // 左は -0.0、右は 0.0。ビット列は違うのに結合されている。
+        // The left is -0.0 and the right is 0.0. The bit patterns differ yet they join.
         assert_eq!(z[0].as_f64().unwrap().to_bits(), (-0.0f64).to_bits());
         assert_eq!(z[1].as_f64().unwrap().to_bits(), 0.0f64.to_bits());
         let n = got.rows.iter().find(|r| r[0].as_f64().unwrap().is_nan()).unwrap();
         assert!(n[1].as_f64().unwrap().is_nan());
     }
 
-    // --- CROSS / 非等値 -----------------------------------------------------
+    // --- CROSS / non-equi ---------------------------------------------------
 
     #[test]
     fn cross_join_is_cartesian() {
@@ -1085,7 +1084,7 @@ mod tests {
         assert!(run(&mut cross(Vec::new(), vec![ints1(&[Some(1)])])).rows.is_empty());
     }
 
-    /// 等値に落ちない述語（`a < b`）。ネストループに落ちること。
+    /// A predicate that does not reduce to equality (`a < b`). It must fall to a nested loop.
     #[test]
     fn non_equi_join_falls_back_to_nested_loop() {
         let mut j = HashJoin::new(
@@ -1094,7 +1093,7 @@ mod tests {
             JoinKind::Inner,
             Vec::new(),
             Vec::new(),
-            // 結合後スキーマ: 0 = 左, 1 = 右
+            // Post-join schema: 0 = left, 1 = right
             Some(cmp_prog(0, 1, Ty::Int, OpCode::Lt)),
             vec![Ty::Int],
             vec![Ty::Int],
@@ -1107,7 +1106,7 @@ mod tests {
         );
     }
 
-    /// 非等値 + LEFT。どのビルド行とも通らなかった左行は NULL 拡張される。
+    /// Non-equi + LEFT. A left row that passed with no build row is NULL-extended.
     #[test]
     fn non_equi_left_join_keeps_unmatched() {
         let mut j = HashJoin::new(
@@ -1130,11 +1129,11 @@ mod tests {
 
     // --- residual -----------------------------------------------------------
 
-    /// キーは一致したが residual で落ちたペアは「一致していない」。LEFT では
-    /// その左行を NULL 拡張して出す（落として消してはいけない）。
+    /// A pair whose keys matched but that residual rejected is "not matched". Under LEFT that
+    /// left row is NULL-extended and emitted (it must not be dropped).
     #[test]
     fn residual_failure_still_yields_null_extended_left_row() {
-        // 左 (key, v) / 右 (key, w)、residual: 左の v < 右の w
+        // Left (key, v) / right (key, w), residual: left's v < right's w
         let left = vec![ready(vec![ints(&[Some(1), Some(2)]), ints(&[Some(100), Some(0)])])];
         let right = vec![ready(vec![ints(&[Some(1), Some(2)]), ints(&[Some(5), Some(5)])])];
         let ty = vec![Ty::Int, Ty::Int];
@@ -1144,7 +1143,7 @@ mod tests {
             JoinKind::Left,
             vec![col_prog(0, Ty::Int)],
             vec![col_prog(0, Ty::Int)],
-            // 結合後スキーマ: 0=左key 1=左v 2=右key 3=右w
+            // Post-join schema: 0=left key 1=left v 2=right key 3=right w
             Some(cmp_prog(1, 3, Ty::Int, OpCode::Lt)),
             ty.clone(),
             ty,
@@ -1154,13 +1153,13 @@ mod tests {
         assert_eq!(
             norm(&got.rows),
             vec![
-                vec![Some(1), Some(100), None, None], // 100 < 5 は偽 → NULL 拡張
+                vec![Some(1), Some(100), None, None], // 100 < 5 is false -> NULL extension
                 vec![Some(2), Some(0), Some(2), Some(5)],
             ]
         );
     }
 
-    /// FULL + residual。落ちたペアは左右どちらの側でも未一致として扱う。
+    /// FULL + residual. A rejected pair counts as unmatched on both sides.
     #[test]
     fn residual_failure_marks_both_sides_unmatched() {
         let left = vec![ready(vec![ints(&[Some(1)]), ints(&[Some(100)])])];
@@ -1184,10 +1183,10 @@ mod tests {
         );
     }
 
-    // --- バッチ境界 ---------------------------------------------------------
+    // --- Batch boundaries ---------------------------------------------------
 
-    /// 1 つの左行が BATCH_SIZE を超える出力を生む。探索の途中で切って続きから
-    /// 再開できないと行が落ちる。
+    /// One left row produces more output than BATCH_SIZE. Without cutting mid-probe and resuming
+    /// from there, rows would be lost.
     #[test]
     fn one_probe_row_spans_multiple_batches() {
         let big: Vec<Option<i32>> = (0..BATCH_SIZE + 500).map(|_| Some(4)).collect();
@@ -1200,7 +1199,7 @@ mod tests {
         assert_eq!(got.batches, 2);
     }
 
-    /// 未一致行のドレインもバッチに収まる。
+    /// The unmatched-row drain fits into batches too.
     #[test]
     fn unmatched_drain_spans_multiple_batches() {
         let many: Vec<Option<i32>> = (0..BATCH_SIZE as i32 + 10).map(Some).collect();
@@ -1220,7 +1219,7 @@ mod tests {
         assert!(got.batches >= 2);
     }
 
-    // --- 空入力 -------------------------------------------------------------
+    // --- Empty inputs -------------------------------------------------------
 
     #[test]
     fn empty_build_side_for_each_kind() {
@@ -1230,7 +1229,7 @@ mod tests {
             let got = run(&mut join1(vec![ints1(&[Some(1), Some(2)])], Vec::new(), kind));
             assert_eq!(got.rows.len(), expect, "{kind:?}");
             for r in &got.rows {
-                assert!(r[1].is_null(), "右は NULL 拡張のはず");
+                assert!(r[1].is_null(), "the right should be NULL-extended");
             }
         }
     }
@@ -1243,7 +1242,7 @@ mod tests {
             let got = run(&mut join1(Vec::new(), vec![ints1(&[Some(1), Some(2)])], kind));
             assert_eq!(got.rows.len(), expect, "{kind:?}");
             for r in &got.rows {
-                assert!(r[0].is_null(), "左は NULL 拡張のはず");
+                assert!(r[0].is_null(), "the left should be NULL-extended");
             }
         }
     }
@@ -1258,7 +1257,7 @@ mod tests {
 
     // --- SEMI / ANTI --------------------------------------------------------
 
-    /// 出力は左のスキーマだけ。右の列は 1 本も付かない。
+    /// The output is the left schema only. Not a single right column is attached.
     #[test]
     fn semi_and_anti_emit_left_columns_only() {
         let left = || vec![ready(vec![ints(&[Some(1), Some(2)]), strs(&[Some("a"), Some("b")])])];
@@ -1278,7 +1277,7 @@ mod tests {
         };
         let got = run(&mut mk(JoinKind::Semi));
         assert_eq!(got.rows.len(), 1);
-        assert_eq!(got.rows[0].len(), 2, "左の 2 列だけ");
+        assert_eq!(got.rows[0].len(), 2, "just the left's 2 columns");
         assert_eq!(got.rows[0][0].as_i64(), Some(1));
         assert_eq!(got.rows[0][1].as_bytes(), Some(&b"a"[..]));
 
@@ -1290,7 +1289,7 @@ mod tests {
 
     #[test]
     fn semi_and_anti_with_no_match_and_one_match() {
-        // 右に無い / 1 つだけある。
+        // Absent from the right / present exactly once.
         let l = || vec![ints1(&[Some(1), Some(2), Some(3)])];
         let r = || vec![ints1(&[Some(2)])];
         assert_eq!(norm(&run(&mut join1(l(), r(), JoinKind::Semi)).rows), vec![vec![Some(2)]]);
@@ -1299,15 +1298,15 @@ mod tests {
             vec![vec![Some(1)], vec![Some(3)]]
         );
 
-        // 右が空なら SEMI は 0 行、ANTI は全行。
+        // With an empty right side, SEMI gives 0 rows and ANTI gives every row.
         assert!(run(&mut join1(l(), Vec::new(), JoinKind::Semi)).rows.is_empty());
         assert_eq!(run(&mut join1(l(), Vec::new(), JoinKind::Anti)).rows.len(), 3);
-        // 左が空ならどちらも 0 行。
+        // With an empty left side, both give 0 rows.
         assert!(run(&mut join1(Vec::new(), r(), JoinKind::Semi)).rows.is_empty());
         assert!(run(&mut join1(Vec::new(), r(), JoinKind::Anti)).rows.is_empty());
     }
 
-    /// 一致が何個あっても左行は**ちょうど 1 回**しか出ない。
+    /// However many matches there are, a left row appears **exactly once**.
     #[test]
     fn semi_emits_a_left_row_at_most_once_with_many_matches() {
         let many: Vec<Option<i32>> = (0..BATCH_SIZE + 500).map(|_| Some(7)).collect();
@@ -1316,10 +1315,14 @@ mod tests {
             vec![ready(vec![ints(&many)])],
             JoinKind::Semi,
         ));
-        assert_eq!(norm(&got.rows), vec![vec![Some(7)], vec![Some(7)]], "左の 2 行が 1 回ずつ");
+        assert_eq!(
+            norm(&got.rows),
+            vec![vec![Some(7)], vec![Some(7)]],
+            "the 2 left rows once each"
+        );
         assert_eq!(got.batches, 1);
 
-        // ANTI 側も同じ入力で「一致しない 8 だけ」。
+        // The ANTI side, with the same input, gives "only the unmatched 8".
         let many: Vec<Option<i32>> = (0..BATCH_SIZE + 500).map(|_| Some(7)).collect();
         let got = run(&mut join1(
             vec![ints1(&[Some(7), Some(7), Some(8)])],
@@ -1329,7 +1332,7 @@ mod tests {
         assert_eq!(norm(&got.rows), vec![vec![Some(8)]]);
     }
 
-    /// 一致した左行が BATCH_SIZE を超えてもドレインが分割されるだけ。
+    /// Even when matched left rows exceed BATCH_SIZE, the drain is merely split.
     #[test]
     fn semi_drain_spans_multiple_batches() {
         let many: Vec<Option<i32>> = (0..BATCH_SIZE as i32 + 10).map(Some).collect();
@@ -1342,9 +1345,9 @@ mod tests {
         assert!(got.batches >= 2);
     }
 
-    /// NULL キーの左行はどのビルド行とも一致しない。SEMI では消え ANTI では残る。
-    /// `NOT IN` の「右に NULL があれば 1 行も返さない」規則はバインダの責務で、
-    /// ここには無い。
+    /// A left row with a NULL key matches no build row. It disappears under SEMI and survives under ANTI.
+    /// `NOT IN`'s "return no rows if the right has a NULL" rule is the binder's responsibility
+    /// and is not here.
     #[test]
     fn null_keys_are_dropped_by_semi_and_kept_by_anti() {
         let l = || vec![ints1(&[None, Some(1), Some(2)])];
@@ -1353,15 +1356,15 @@ mod tests {
         assert_eq!(
             norm(&run(&mut join1(l(), r(), JoinKind::Anti)).rows),
             vec![vec![None], vec![Some(2)]],
-            "右に NULL があっても ANTI は素直に未一致行を返す"
+            "ANTI plainly returns the unmatched rows even with a NULL on the right"
         );
     }
 
-    /// residual で唯一の一致が落ちたら、SEMI はその左行を出さず ANTI は出す。
+    /// If residual rejects the only match, SEMI does not emit that left row and ANTI does.
     #[test]
     fn residual_that_kills_the_only_match_flips_semi_and_anti() {
         let mk = |kind| {
-            // 左 (key, v) / 右 (key, w)、residual: 左の v < 右の w
+            // Left (key, v) / right (key, w), residual: left's v < right's w
             HashJoin::new(
                 Mock::script(vec![ready(vec![
                     ints(&[Some(1), Some(2)]),
@@ -1374,28 +1377,28 @@ mod tests {
                 kind,
                 vec![col_prog(0, Ty::Int)],
                 vec![col_prog(0, Ty::Int)],
-                // 結合後スキーマ: 0=左key 1=左v 2=右key 3=右w
+                // Post-join schema: 0=left key 1=left v 2=right key 3=right w
                 Some(cmp_prog(1, 3, Ty::Int, OpCode::Lt)),
                 vec![Ty::Int, Ty::Int],
                 vec![Ty::Int, Ty::Int],
             )
             .unwrap()
         };
-        // key=1 は 100 < 5 が偽なので一致なし、key=2 は 0 < 5 で一致。
+        // key=1 has no match since 100 < 5 is false; key=2 matches with 0 < 5.
         assert_eq!(
             norm(&run(&mut mk(JoinKind::Semi)).rows),
             vec![vec![Some(2), Some(0)]],
-            "residual で落ちた左行は SEMI から消える"
+            "a left row rejected by residual disappears from SEMI"
         );
         assert_eq!(
             norm(&run(&mut mk(JoinKind::Anti)).rows),
             vec![vec![Some(1), Some(100)]],
-            "同じ行が ANTI では残る"
+            "the same row survives under ANTI"
         );
     }
 
-    /// 等値キーを持たない SEMI（相関 EXISTS の書き換え先）。ネストループ +
-    /// residual でも一致ビットの立ち方は同じ。
+    /// SEMI without equality keys (the rewrite target of a correlated EXISTS). The match bit is
+    /// set the same way with a nested loop plus residual.
     #[test]
     fn non_equi_semi_and_anti() {
         let mk = |kind| {
@@ -1415,7 +1418,7 @@ mod tests {
         assert_eq!(norm(&run(&mut mk(JoinKind::Anti)).rows), vec![vec![Some(50)]]);
     }
 
-    /// SEMI / ANTI でも中断は素通しで、結果は中断なしと一致する。
+    /// Interruption passes straight through for SEMI / ANTI too, and the result matches the uninterrupted run.
     #[test]
     fn semi_and_anti_survive_need_io_and_need_codec() {
         let l = || vec![ints1(&[Some(1), Some(2)]), ints1(&[Some(3), Some(1)])];
@@ -1438,10 +1441,10 @@ mod tests {
                 ],
                 kind,
             ));
-            assert!(noisy.interrupts >= 5, "中断がそのまま伝わっていない");
+            assert!(noisy.interrupts >= 5, "the interruptions were not passed through");
             assert_eq!(norm(&noisy.rows), norm(&clean.rows), "{kind:?}");
         }
-        // 中身も確認。左 1,2,3,1 に対し右は 1,3,1,9。
+        // The contents too. Left 1,2,3,1 against right 1,3,1,9.
         assert_eq!(
             norm(&run(&mut join1(l(), r(), JoinKind::Semi)).rows),
             vec![vec![Some(1)], vec![Some(1)], vec![Some(3)]]
@@ -1449,15 +1452,15 @@ mod tests {
         assert_eq!(norm(&run(&mut join1(l(), r(), JoinKind::Anti)).rows), vec![vec![Some(2)]]);
     }
 
-    // --- ANTI NULL AWARE（`NOT IN (SELECT ...)`）----------------------------
+    // --- ANTI NULL AWARE (`NOT IN (SELECT ...)`) ----------------------------
     //
-    // 期待値はすべて DuckDB で確認したもの:
-    //   NULL NOT IN (空)      → 真   （行が残る）
-    //   x    NOT IN (空)      → 真
-    //   NULL NOT IN (非空)    → UNKNOWN（行は消える）
-    //   x    NOT IN (…NULL…)  → UNKNOWN（どの行も消える）
+    // Every expectation was confirmed with DuckDB:
+    //   NULL NOT IN (empty)      -> true    (the row survives)
+    //   x    NOT IN (empty)      -> true
+    //   NULL NOT IN (non-empty)  -> UNKNOWN (the row disappears)
+    //   x    NOT IN (...NULL...) -> UNKNOWN (every row disappears)
 
-    /// 右のキーに NULL があれば、一致しない左行があっても結果は空。
+    /// With a NULL among the right keys, the result is empty even with unmatched left rows.
     #[test]
     fn null_aware_anti_is_empty_when_build_side_has_a_null_key() {
         let got = run(&mut join1(
@@ -1465,8 +1468,11 @@ mod tests {
             vec![ints1(&[Some(1), None])],
             JoinKind::AntiNullAware,
         ));
-        assert!(got.rows.is_empty(), "2 と 3 は一致しないが UNKNOWN なので出ない");
-        // 素の ANTI は同じ入力で 2 行返す（違いがここに出る）。
+        assert!(
+            got.rows.is_empty(),
+            "2 and 3 do not match but are UNKNOWN, so they are not emitted"
+        );
+        // Plain ANTI returns 2 rows for the same input (the difference shows here).
         let plain = run(&mut join1(
             vec![ints1(&[Some(1), Some(2), Some(3)])],
             vec![ints1(&[Some(1), None])],
@@ -1475,7 +1481,7 @@ mod tests {
         assert_eq!(norm(&plain.rows), vec![vec![Some(2)], vec![Some(3)]]);
     }
 
-    /// 右に NULL が無ければ素の ANTI と同じ。
+    /// With no NULL on the right it behaves like plain ANTI.
     #[test]
     fn null_aware_anti_matches_plain_anti_without_nulls() {
         let l = || vec![ints1(&[Some(1), Some(2)]), ints1(&[Some(3), Some(1)])];
@@ -1486,7 +1492,7 @@ mod tests {
         assert_eq!(norm(&aware.rows), vec![vec![Some(2)], vec![Some(3)]]);
     }
 
-    /// 左のキーが NULL の行は、右が空でなければ落ちる。
+    /// A left row with a NULL key drops unless the right side is empty.
     #[test]
     fn null_aware_anti_drops_left_rows_with_null_keys() {
         let got = run(&mut join1(
@@ -1494,8 +1500,8 @@ mod tests {
             vec![ints1(&[Some(1)])],
             JoinKind::AntiNullAware,
         ));
-        assert_eq!(norm(&got.rows), vec![vec![Some(2)]], "NULL の左行は UNKNOWN");
-        // 素の ANTI は NULL の左行を残す。
+        assert_eq!(norm(&got.rows), vec![vec![Some(2)]], "the NULL left row is UNKNOWN");
+        // Plain ANTI keeps the NULL left row.
         let plain = run(&mut join1(
             vec![ints1(&[None, Some(2), Some(1)])],
             vec![ints1(&[Some(1)])],
@@ -1504,13 +1510,13 @@ mod tests {
         assert_eq!(norm(&plain.rows), vec![vec![None], vec![Some(2)]]);
     }
 
-    /// 右が空なら `NOT IN ()` は常に真。左の NULL 行も含めて全行返す。
+    /// With an empty right side, `NOT IN ()` is always true. Every row is returned, including the left NULL row.
     #[test]
     fn null_aware_anti_with_empty_build_side_emits_every_left_row() {
         let got =
             run(&mut join1(vec![ints1(&[None, Some(2)])], Vec::new(), JoinKind::AntiNullAware));
         assert_eq!(norm(&got.rows), vec![vec![None], vec![Some(2)]]);
-        // 0 行のバッチしか来ない場合も「右は空」。
+        // "The right is empty" also covers the case where only 0-row batches arrive.
         let got = run(&mut join1(
             vec![ints1(&[None, Some(2)])],
             vec![ints1(&[])],
@@ -1519,21 +1525,21 @@ mod tests {
         assert_eq!(got.rows.len(), 2);
     }
 
-    /// 複合キーでは片方の列が NULL でも「キーに NULL がある」。
+    /// With a composite key, a NULL in either column still counts as "the key contains a NULL".
     #[test]
     fn null_aware_anti_looks_at_every_key_column() {
         let left = vec![ready(vec![ints(&[Some(1), Some(2)]), ints(&[Some(10), Some(20)])])];
         let right = vec![ready(vec![ints(&[Some(9)]), ints(&[None])])];
         let ty = vec![Ty::Int, Ty::Int];
         let got = run(&mut join(left, right, JoinKind::AntiNullAware, 2, ty.clone(), ty));
-        assert!(got.rows.is_empty(), "右のキーに NULL があるので空");
+        assert!(got.rows.is_empty(), "empty, since the right keys contain a NULL");
     }
 
-    /// 短絡しても `Done` に到達する（ぶら下がらない）。左は 1 行も引かない。
+    /// Short-circuiting still reaches `Done` (it does not hang). Not a single left row is pulled.
     #[test]
     fn null_aware_anti_short_circuit_terminates_without_reading_the_left() {
         let mut j = HashJoin::new(
-            // 左を引いてしまったら分かるように、台本を Ready で埋めておく。
+            // The script is padded with Ready so that pulling the left would be noticeable.
             Mock::script(vec![ints1(&[Some(1)]), ints1(&[Some(2)])]),
             Mock::script(vec![ints1(&[None])]),
             JoinKind::AntiNullAware,
@@ -1553,7 +1559,7 @@ mod tests {
         }
     }
 
-    /// 中断を挟んでも判定が変わらない。
+    /// The decision does not change with an interruption interposed.
     #[test]
     fn null_aware_anti_survives_interrupts() {
         let l = || vec![ints1(&[Some(1), Some(2)]), ints1(&[None, Some(3)])];
@@ -1573,7 +1579,7 @@ mod tests {
         assert_eq!(norm(&noisy.rows), norm(&clean.rows));
         assert_eq!(norm(&clean.rows), vec![vec![Some(2)], vec![Some(3)]]);
 
-        // 右の NULL が 2 バッチ目に来る場合も短絡すること。
+        // It must short-circuit when the right's NULL arrives in the second batch too.
         let got = run(&mut join1(
             vec![Step::NeedIo, ints1(&[Some(2)])],
             vec![ints1(&[Some(1)]), Step::NeedIo, ints1(&[None])],
@@ -1582,7 +1588,7 @@ mod tests {
         assert!(got.rows.is_empty());
     }
 
-    /// residual で唯一の一致が落ちれば、NULL 対応 ANTI でも左行は残る。
+    /// If residual rejects the only match, the left row survives under NULL-aware ANTI as well.
     #[test]
     fn null_aware_anti_respects_the_residual() {
         let mut j = HashJoin::new(

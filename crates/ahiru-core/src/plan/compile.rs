@@ -1,8 +1,8 @@
-//! AST 式 → バイトコード。
+//! AST expressions -> bytecode.
 //!
-//! ここが型検査も兼ねる。暗黙変換は `Ty::unify` に一本化し、必要な場所に
-//! 明示的な `Cast` 命令を挿入する。実行カーネルが型変換を意識しなくて済むので
-//! カーネル数を増やさずに済む（DESIGN.md §11）。
+//! This also serves as type checking. Implicit conversion goes through `Ty::unify` alone,
+//! with explicit `Cast` instructions inserted where needed. Execution kernels never have
+//! to think about type conversion, so the number of kernels does not grow (DESIGN.md §11).
 
 use crate::expr::{funcs, CallSpec, Instr, OpCode, Program, Reg};
 use crate::plan::{AggKind, Scope};
@@ -11,42 +11,42 @@ use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{BinaryOp, Expr, ExprArena, ExprId, UnaryOp};
 use crate::vector::{Field, Ty, Value};
 
-/// 式のネスト上限。パーサ側でも制限しているが、二重に守る。
+/// The expression nesting limit. The parser limits it too; this is a second layer of defense.
 const MAX_DEPTH: u32 = 64;
 
-/// 部分式を入力列で置き換える指示。
+/// An instruction to replace a subexpression with an input column.
 ///
-/// 集約の上で式をコンパイルするときに使う。`SELECT a + 1, count(*) ... GROUP BY a + 1`
-/// なら、`a + 1` と `count(*)` はどちらも集約オペレータの出力列になっているので、
-/// そこを `LoadCol` に差し替えて再評価を避ける。
+/// Used when compiling expressions on top of an aggregate. In
+/// `SELECT a + 1, count(*) ... GROUP BY a + 1`, both `a + 1` and `count(*)` are already
+/// output columns of the aggregate operator, so they are swapped for `LoadCol` to avoid re-evaluation.
 #[derive(Clone, Copy)]
 pub struct Substitution {
-    /// 置き換える対象の式。
+    /// The expression to replace.
     pub expr: ExprId,
-    /// 差し替え先の入力列番号。
+    /// The input column number to replace it with.
     pub column: usize,
-    /// `true` なら構造の一致で判定する（GROUP BY 式の照合）。
-    /// `false` なら同一ノードのときだけ（集約呼び出しの照合）。
+    /// `true` matches structurally (for matching GROUP BY expressions).
+    /// `false` matches only the identical node (for matching aggregate calls).
     pub structural: bool,
 }
 
 pub struct Compiler<'a> {
     arena: &'a ExprArena,
-    /// 入力バッチの列。添字がそのまま `LoadCol` の列番号になる。
+    /// The input batch's columns. The index doubles as `LoadCol`'s column number.
     scope: &'a Scope,
-    /// `?` プレースホルダに束縛された値。
+    /// The values bound to `?` placeholders.
     params: &'a [Value],
     subs: &'a [Substitution],
     prog: Program,
     depth: u32,
 }
 
-/// 単一の式をコンパイルする。
+/// Compiles a single expression.
 pub fn compile(arena: &ExprArena, scope: &Scope, params: &[Value], id: ExprId) -> Result<Program> {
     compile_with_subs(arena, scope, params, &[], id)
 }
 
-/// 置き換え指示付きでコンパイルする。集約の上で使う。
+/// Compiles with replacement instructions. Used on top of an aggregate.
 pub fn compile_with_subs(
     arena: &ExprArena,
     scope: &Scope,
@@ -61,7 +61,7 @@ pub fn compile_with_subs(
     Ok(c.prog)
 }
 
-/// 述語をコンパイルする。結果が BOOLEAN でなければエラー。
+/// Compiles a predicate. An error if the result is not BOOLEAN.
 pub fn compile_predicate(
     arena: &ExprArena,
     scope: &Scope,
@@ -83,7 +83,7 @@ pub fn compile_predicate_with_subs(
     Ok(p)
 }
 
-/// 入力列をそのまま返すだけのプログラム。`SELECT *` や結合キーで使う。
+/// A program that just returns the input columns unchanged. Used by `SELECT *` and join keys.
 pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
     let ty = match scope.fields().get(i) {
         Some(f) => f.ty,
@@ -97,19 +97,19 @@ pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
     Ok(p)
 }
 
-/// DATE の加減算の結果型を決める。返り値の `bool` は左右を入れ替えるべきか。
+/// Determines the result type of DATE arithmetic. The returned `bool` says whether the operands should be swapped.
 ///
-/// - `DATE + 整数` / `整数 + DATE` → DATE（日数を足す）
-/// - `DATE - 整数` → DATE
-/// - `DATE - DATE` → 日数（DuckDB は INTEGER を返す）
+/// - `DATE + integer` / `integer + DATE` -> DATE (adds days)
+/// - `DATE - integer` -> DATE
+/// - `DATE - DATE` -> a day count (DuckDB returns INTEGER)
 ///
-/// TIMESTAMP と整数の加減算は DuckDB でもエラーなので受け付けない
-/// （単位が秒なのかマイクロ秒なのか決められないため）。
+/// Arithmetic between TIMESTAMP and an integer is an error in DuckDB too and is not
+/// accepted (the unit -- seconds or microseconds -- cannot be decided).
 fn date_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, bool)> {
     use BinaryOp::*;
     match (op, lt, rt) {
         (Add, Ty::Date, r) if r.is_integer() => Some((Ty::Date, false)),
-        // `1 + DATE` は交換して DATE を左に持ってくる。
+        // `1 + DATE` swaps so DATE comes first.
         (Add, l, Ty::Date) if l.is_integer() => Some((Ty::Date, true)),
         (Sub, Ty::Date, r) if r.is_integer() => Some((Ty::Date, false)),
         (Sub, Ty::Date, Ty::Date) => Some((Ty::BigInt, false)),
@@ -117,25 +117,25 @@ fn date_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, bool)> {
     }
 }
 
-/// DECIMAL が絡む乗除の型を決める。該当しなければ `None`。
+/// Determines the type of multiplication and division involving DECIMAL. `None` if it does not apply.
 ///
-/// 加減算は「スケールを揃えてから足す」で正しいので通常の共通型経路でよいが、
-/// **乗算はスケールが足し算になる**（`1.25 * 2.5 = 3.125`: s=2 と s=3 で s=5）。
-/// 共通型に揃えてから掛けると、スケールが 2 倍ずれた値が返ってしまう。
-/// カーネルは生の整数として掛けるだけなので、正しいスケールを持つ結果型を
-/// ここで決め、両辺は**スケールを変えずに**物理幅だけ広げる。
+/// Addition and subtraction are correct as "align the scales, then add", so the ordinary
+/// common-type path suffices, but **multiplication adds the scales** (`1.25 * 2.5 = 3.125`:
+/// s=2 and s=3 give s=5). Aligning to a common type before multiplying would return a value
+/// off by a doubled scale. The kernel merely multiplies raw integers, so the correctly
+/// scaled result type is decided here, and both operands are widened in physical width only, **keeping their scale**.
 ///
-/// 除算は DuckDB と同じく DOUBLE に落とす。整数除算のままだとスケールが
-/// 引き算になり、桁が足りずにほとんどの場合 0 になってしまう。
+/// Division falls to DOUBLE, as in DuckDB. Left as integer division the scale would
+/// subtract, leaving too few digits and giving 0 in most cases.
 fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, Ty, Ty)> {
     if !matches!(op, BinaryOp::Mul | BinaryOp::Div) {
         return None;
     }
-    // どちらかが DECIMAL でなければ通常経路。
+    // If neither side is DECIMAL, take the ordinary path.
     if !matches!(lt, Ty::Decimal { .. }) && !matches!(rt, Ty::Decimal { .. }) {
         return None;
     }
-    // 浮動小数が混ざったら DOUBLE に倒す（DuckDB と同じ）。
+    // With floating point mixed in, fall to DOUBLE (as in DuckDB).
     if matches!(lt, Ty::Float | Ty::Double) || matches!(rt, Ty::Float | Ty::Double) {
         return Some((Ty::Double, Ty::Double, Ty::Double));
     }
@@ -144,21 +144,21 @@ fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, Ty, Ty)> {
     if op == BinaryOp::Div {
         return Some((Ty::Double, Ty::Double, Ty::Double));
     }
-    // 乗算: precision は足し算、scale も足し算。
+    // Multiplication: precision adds, and so does scale.
     let res = Ty::decimal(p1.saturating_add(p2), s1.saturating_add(s2));
     let (rp, _) = res.as_decimal()?;
-    // 両辺は scale を保ったまま、結果と同じ物理幅へ広げる。
+    // Both operands keep their scale and widen to the result's physical width.
     Some((Ty::decimal(rp, s1), Ty::decimal(rp, s2), res))
 }
 
-/// DATE/TIMESTAMP ± INTERVAL, INTERVAL ± INTERVAL, INTERVAL * 整数 の形を
-/// 認識する。該当しなければ `None`（＝ 通常の `Ty::unify` 経路へ）。
+/// Recognizes the shapes DATE/TIMESTAMP +- INTERVAL, INTERVAL +- INTERVAL, and
+/// INTERVAL * integer. `None` if none applies (= take the ordinary `Ty::unify` path).
 ///
-/// `Ty::unify` に載せない理由は `date_arith` と同じ: INTERVAL は他のどの型
-/// とも広さの順序を持たないので、共通型への昇格という発想自体が合わない。
+/// The reason it is not on `Ty::unify` is the same as for `date_arith`: INTERVAL has no
+/// width ordering against any other type, so the very idea of promoting to a common type does not fit.
 enum IntervalOp {
-    /// `swap`: 左右を入れ替えるか（`INTERVAL + DATE` の形）。
-    /// `negate_b`: 先に INTERVAL 側を符号反転するか（`- INTERVAL` の形）。
+    /// `swap`: whether to swap the operands (the `INTERVAL + DATE` shape).
+    /// `negate_b`: whether to negate the INTERVAL side first (the `- INTERVAL` shape).
     TsInterval {
         swap: bool,
         negate_b: bool,
@@ -166,7 +166,7 @@ enum IntervalOp {
     IntervalInterval {
         negate_b: bool,
     },
-    /// `swap`: 整数が左に来ているか（`3 * INTERVAL`）。
+    /// `swap`: whether the integer is on the left (`3 * INTERVAL`).
     IntervalMul {
         swap: bool,
     },
@@ -193,20 +193,20 @@ fn interval_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<IntervalOp> {
     }
 }
 
-/// 2 つのプログラムを `AND` で束ねる。
+/// Bundles two programs with `AND`.
 ///
-/// `WHERE a AND b` は AST の段階で 1 本にまとめてコンパイルできるが、
-/// 述語を分解して一部だけ押し下げたあとに残りを束ね直す場面では、
-/// 既にコンパイル済みのプログラム同士をつなぐ必要がある。
-/// `lhs`/`rhs` の 2 本の `Program` を 1 本に併合する共通処理。
+/// `WHERE a AND b` can be compiled as one program at the AST stage, but when a predicate is
+/// decomposed, part of it pushed down, and the rest bundled back together, already-compiled
+/// programs have to be joined.
+/// This is the shared routine for merging the two `Program`s `lhs`/`rhs` into one.
 ///
-/// レジスタ・定数・キャストテーブルの番号を `rhs` 側だけ `lhs` の末尾に
-/// ずらして (`base`/`kbase`/`cbase`)、`rhs.instrs` を `lhs.instrs` に追記する。
-/// 呼び出し側は返った `(結果レジスタ番号, リベース後の rhs 結果レジスタ番号)`
-/// を使って、末尾に自分の演算（`And`/`Coalesce`/...）を 1 命令足すだけでよい。
+/// Register, constant, and cast-table numbers are shifted on the `rhs` side only, to sit
+/// after `lhs`'s end (`base`/`kbase`/`cbase`), and `rhs.instrs` is appended to `lhs.instrs`.
+/// The caller then only needs to append its own operation (`And`/`Coalesce`/...) as one
+/// instruction, using the returned `(result register number, rebased rhs result register number)`.
 ///
-/// `lhs.num_regs` はここで `rhs` ぶん増やしてあるので、呼び出し側は
-/// そのまま `lhs.alloc_reg()` を呼んでよい。
+/// `lhs.num_regs` is already increased here by `rhs`'s share, so the caller may call
+/// `lhs.alloc_reg()` directly.
 ///
 /// Every side table a `Program` carries has to be rebased here, not just
 /// `consts`/`casts`: `OpCode::Call`'s `aux` indexes `Program::calls`, a
@@ -241,7 +241,7 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
     for i in &rhs.instrs {
         let mut i2 = *i;
         i2.dst += base;
-        // LoadCol / LoadConst は a・b を使わないので、ずらすと壊れる。
+        // LoadCol / LoadConst do not use a and b, so shifting them would break things.
         match i2.op {
             OpCode::LoadCol => {}
             OpCode::LoadConst => i2.aux += kbase,
@@ -249,7 +249,7 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
                 i2.a += base;
                 i2.aux += cbase;
             }
-            // Select だけ aux が第 3 オペランドのレジスタ番号。
+            // Only for Select is aux the register number of the third operand.
             OpCode::Select => {
                 i2.a += base;
                 i2.b += base;
@@ -279,8 +279,8 @@ pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
     Ok(lhs)
 }
 
-/// 既にコンパイル済みのプログラムの結果を別の型へ変換する。
-/// 集合演算で左右の列型を揃えるときに使う。
+/// Converts the result of an already-compiled program to another type.
+/// Used to align the left and right column types of a set operation.
 pub fn cast_program(mut p: Program, to: Ty) -> Result<Program> {
     if p.result_ty == to {
         return Ok(p);
@@ -295,10 +295,10 @@ pub fn cast_program(mut p: Program, to: Ty) -> Result<Program> {
     Ok(p)
 }
 
-/// 2 つの式が構造的に等しいか。`GROUP BY` 式と SELECT 中の部分式の照合に使う。
+/// Whether two expressions are structurally equal. Used to match `GROUP BY` expressions against subexpressions in SELECT.
 ///
-/// 名前の比較は大文字小文字を区別しない（`GROUP BY a` と `SELECT A` を同じと
-/// 見なす）。定数は値の一致で判定する。
+/// Name comparison is case-insensitive (`GROUP BY a` and `SELECT A` count as the same).
+/// Constants are judged by value equality.
 pub fn expr_eq(arena: &ExprArena, a: ExprId, b: ExprId) -> bool {
     expr_eq_at(arena, a, b, 0)
 }
@@ -384,9 +384,9 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
     }
 }
 
-/// ラムダを引数に取りうる関数名か（`sql::parser::is_lambda_func` と同じ
-/// 固定集合。パーサ側はこの名前の集合の引数位置でだけ `->` をラムダとして
-/// 読み、束縛後にここでも同じ判定で `Compiler::lambda_call` へ振り分ける）。
+/// Whether this function name may take a lambda (the same fixed set as
+/// `sql::parser::is_lambda_func`. The parser reads `->` as a lambda only in the argument
+/// positions of these names, and after binding the same check dispatches to `Compiler::lambda_call` here).
 fn is_lambda_func(name: &str) -> bool {
     eq_ascii_ci(name.as_bytes(), b"list_transform")
         || eq_ascii_ci(name.as_bytes(), b"list_filter")
@@ -407,27 +407,27 @@ impl<'a> Compiler<'a> {
         dst
     }
 
-    /// `from` 型のレジスタを `to` 型へ揃える。
+    /// Aligns a register of type `from` to type `to`.
     fn coerce(&mut self, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
         self.coerce_with(OpCode::Cast, reg, from, to)
     }
 
-    /// `TRY_CAST` 用。`coerce` と同じ命令列を組むが `Cast` の代わりに
-    /// `TryCast` を発行する。変換できない組み合わせは実行時にエラーではなく
-    /// 全行 NULL になる（`expr::vm::exec` 参照）。行単位の変換失敗
-    /// （範囲外・パース不能）はどちらの命令でも元々その行だけ NULL になる
-    /// （`kernels::cast` の契約）ので、ここで違いを付ける必要はない。
+    /// For `TRY_CAST`. Builds the same instruction sequence as `coerce` but emits `TryCast`
+    /// instead of `Cast`. A combination that cannot be converted becomes all-NULL at runtime
+    /// rather than an error (see `expr::vm::exec`). Per-row conversion failures (out of
+    /// range, unparsable) already turn just that row into NULL under either instruction
+    /// (the contract of `kernels::cast`), so no distinction is needed here.
     fn try_coerce(&mut self, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
         self.coerce_with(OpCode::TryCast, reg, from, to)
     }
 
-    /// `coerce`/`try_coerce` の共通実装。`op` は `Cast`/`TryCast` のどちらか。
+    /// The shared implementation of `coerce`/`try_coerce`. `op` is either `Cast` or `TryCast`.
     fn coerce_with(&mut self, op: OpCode, reg: Reg, from: Ty, to: Ty) -> Result<Reg> {
         if from == to {
             return Ok(reg);
         }
-        // NULL リテラルは型を持たない。変換するのではなく、目的の型の NULL 定数を
-        // 作り直す。こうすると Cast カーネルが Ty::Null を扱わなくて済む。
+        // A NULL literal has no type. Rather than converting it, a NULL constant of the
+        // target type is built afresh. That way the Cast kernel never has to handle Ty::Null.
         if from == Ty::Null {
             return Ok(self.konst(to, Value::Null));
         }
@@ -437,7 +437,7 @@ impl<'a> Compiler<'a> {
         Ok(dst)
     }
 
-    /// `ILIKE` 用に `lower(x)` を 1 引数呼び出しとして発行する。
+    /// Emits `lower(x)` as a one-argument call, for `ILIKE`.
     fn lower_reg(&mut self, r: Reg) -> Result<Reg> {
         let (id, _want, res) = crate::expr::funcs::resolve("lower", &[Ty::Varchar])?;
         let aux = self.prog.add_call(id, vec![r], res);
@@ -446,7 +446,7 @@ impl<'a> Compiler<'a> {
         Ok(dst)
     }
 
-    /// 二項演算の両辺を共通型に揃える。
+    /// Aligns both operands of a binary operation to a common type.
     fn unify_operands(&mut self, lr: Reg, lt: Ty, rr: Reg, rt: Ty) -> Result<(Reg, Reg, Ty)> {
         let t = Ty::unify_or_mismatch(lt, rt)?;
         let l = self.coerce(lr, lt, t)?;
@@ -454,7 +454,7 @@ impl<'a> Compiler<'a> {
         Ok((l, r, t))
     }
 
-    /// `interval_arith` が認識した形をバイトコードへ落とす。
+    /// Lowers the shape `interval_arith` recognized into bytecode.
     fn compile_interval_op(
         &mut self,
         kind: IntervalOp,
@@ -466,8 +466,8 @@ impl<'a> Compiler<'a> {
         match kind {
             IntervalOp::TsInterval { swap, negate_b } => {
                 let (ts_r, ts_t, iv_r) = if swap { (rr, rt, lr) } else { (lr, lt, rr) };
-                // DATE は先に TIMESTAMP へ寄せる。DuckDB も DATE ± INTERVAL は
-                // TIMESTAMP を返す（INTERVAL が時刻成分を持ちうるため）。
+                // DATE is moved to TIMESTAMP first. DuckDB also returns TIMESTAMP for
+                // DATE +- INTERVAL (since an INTERVAL may carry time components).
                 let ts_r = self.coerce(ts_r, ts_t, Ty::Timestamp)?;
                 let iv_r = if negate_b {
                     self.emit(OpCode::IntervalNeg, Ty::Interval, iv_r, 0)
@@ -522,7 +522,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn expr_inner(&mut self, id: ExprId) -> Result<(Reg, Ty)> {
-        // 置き換えが先。集約結果と GROUP BY キーは既に列として存在している。
+        // Replacement comes first. Aggregate results and GROUP BY keys already exist as columns.
         if let Some(r) = self.substitute(id) {
             return r;
         }
@@ -558,7 +558,7 @@ impl<'a> Compiler<'a> {
             Expr::IsNull { arg, negated } => {
                 let (r, _) = self.expr(*arg)?;
                 let op = if *negated { OpCode::IsNotNull } else { OpCode::IsNull };
-                // 入力の物理型は問わない。カーネルは validity しか見ない。
+                // The input's physical type does not matter. The kernel looks only at validity.
                 let dst = self.emit(op, Ty::Boolean, r, 0);
                 Ok((dst, Ty::Boolean))
             }
@@ -570,9 +570,9 @@ impl<'a> Compiler<'a> {
                 let (p, pt) = self.expr(*pattern)?;
                 let mut a = self.coerce(a, at, Ty::Varchar)?;
                 let mut p = self.coerce(p, pt, Ty::Varchar)?;
-                // ILIKE は大小文字を無視する。専用カーネルは持たず、`lower()` を
-                // 両辺にかけてから通常の LIKE に落とす（upper/lower と同じ
-                // ASCII 限定の制限をそのまま継承する）。
+                // ILIKE ignores case. There is no dedicated kernel; `lower()` is applied to
+                // both sides and it falls to an ordinary LIKE (inheriting the same
+                // ASCII-only limitation as upper/lower).
                 if *ci {
                     a = self.lower_reg(a)?;
                     p = self.lower_reg(p)?;
@@ -581,8 +581,8 @@ impl<'a> Compiler<'a> {
                 Ok((self.maybe_not(dst, *negated), Ty::Boolean))
             }
             Expr::Case { operand, whens, else_ } => self.case(*operand, whens.clone(), *else_),
-            // ウィンドウ関数とサブクエリはバインダが専用ノードに書き換えてから
-            // 来る。ここに残っているのは、書ける位置ではないところに書かれた場合。
+            // Window functions and subqueries arrive only after the binder has rewritten them
+            // into dedicated nodes. Anything left here was written somewhere it cannot be.
             Expr::Window { .. } => err!(UnsupportedFeature),
             // `QuantifiedComparison` is either desugared away by the binder
             // (`= ANY`/`<> ALL` into `InSubquery`, `<`/`<=`/`>`/`>=` ANY/ALL
@@ -597,22 +597,22 @@ impl<'a> Compiler<'a> {
             | Expr::QuantifiedComparison { .. } => {
                 err!(UnsupportedFeature)
             }
-            // `UNNEST` もバインダが `Node::Unnest` + `Substitution` に書き換えて
-            // から来る。ここに残っているのは書ける位置ではないところに書かれた
-            // 場合（`plan::bind::collect_unnests` が検出して先に拒否するので、
-            // 実質的にはバインダのバグ検出用の網）。
+            // `UNNEST` likewise arrives only after the binder rewrites it into
+            // `Node::Unnest` + `Substitution`. Anything left here was written somewhere it
+            // cannot be (`plan::bind::collect_unnests` detects and rejects that earlier, so
+            // in practice this is a net for catching binder bugs).
             Expr::Unnest(_) => err!(UnsupportedFeature),
-            // `list_transform`/`list_filter`/`list_reduce` の第 2 引数としてしか
-            // パーサは生成しない（`sql::parser::Parser::call` 参照）。それ以外の
-            // 位置に来た（＝バグかパーサの取りこぼし）場合はここで弾く。
+            // The parser produces this only as the second argument of
+            // `list_transform`/`list_filter`/`list_reduce` (see `sql::parser::Parser::call`).
+            // Anywhere else (= a bug or a parser oversight) is rejected here.
             Expr::Lambda { .. } => err!(UnsupportedFeature),
             Expr::Function { name, args, distinct, star, filter } => {
-                // 集約関数はバインダが置き換えてから来る。ここに残っているのは
-                // 集約できない位置（WHERE など）に書かれた場合か、集約の入れ子。
+                // Aggregate functions arrive only after the binder replaces them. Anything
+                // left here was written where aggregation is impossible (WHERE and the like), or is a nested aggregate.
                 if AggKind::from_name(name).is_some() {
                     err!(NotAggregate);
                 }
-                // FILTER はスカラ関数には意味を持たない。
+                // FILTER is meaningless for a scalar function.
                 ensure!(!*distinct && !*star && filter.is_none(), UnsupportedFeature);
                 if is_lambda_func(name) {
                     return self.lambda_call(name, args);
@@ -622,8 +622,8 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// スカラ関数呼び出し。型検査と引数の変換はここで済ませ、実行時には
-    /// 変換済みのベクタだけを渡す。
+    /// A scalar function call. Type checking and argument conversion are finished here, so
+    /// only already-converted vectors are passed at runtime.
     fn scalar_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
         let mut regs = Vec::with_capacity(args.len());
         let mut tys = Vec::with_capacity(args.len());
@@ -644,31 +644,31 @@ impl<'a> Compiler<'a> {
     }
 
     /// `list_transform(list, x -> expr)` / `list_filter(list, x -> expr)` /
-    /// `list_reduce(list, (acc, x) -> expr [, initial])`。
+    /// `list_reduce(list, (acc, x) -> expr [, initial])`.
     ///
-    /// `scalar_call` の一般経路（各引数を `self.expr()` で外側スコープの
-    /// レジスタへコンパイルしてから 1 個の `Call` 命令にまとめる）には乗らない:
-    /// このバイトコード VM はベクタ化実行が前提で「配列の要素ごとに式を評価
-    /// する」処理は行あたり可変長になり形が合わない。そこでラムダ本体だけを
-    /// **別の小さな `Program`** としてコンパイルし `Program::lambdas` に埋め込む。
-    /// 実行時は `expr::funcs::call_lambda` が配列の要素数ぶんだけ
-    /// `Batch::new` + `Vm::eval` を繰り返す（`ddl`/`dml` が 1 行だけのバッチを
-    /// 組んで `Vm::eval` に通すのと同じ発想。`expr::funcs` モジュール冒頭の
-    /// list_transform/list_filter/list_reduce セクション doc も参照）。
+    /// This does not ride `scalar_call`'s general path (compiling each argument with
+    /// `self.expr()` into an outer-scope register and bundling them into one `Call`
+    /// instruction): this bytecode VM assumes vectorized execution, and "evaluate an
+    /// expression per array element" is variable-length per row and does not fit. So only the
+    /// lambda body is compiled as **a separate small `Program`** embedded in `Program::lambdas`.
+    /// At runtime `expr::funcs::call_lambda` repeats `Batch::new` + `Vm::eval` once per array
+    /// element (the same idea as `ddl`/`dml` building a one-row batch and running it through
+    /// `Vm::eval`; see also the list_transform/list_filter/list_reduce section docs at the
+    /// top of the `expr::funcs` module).
     ///
-    /// **既知の制限**: ラムダ本体は自分のパラメータだけを参照できる。外側の
-    /// SQL スコープの列は参照できない（`list_transform(tags, x -> x ||
-    /// suffix_col)` のように外側列を混ぜる書き方は非対応で `ColumnNotFound`
-    /// になる）。本体は毎回パラメータだけの孤立した `Scope` でコンパイルする
-    /// ため。
+    /// **Known limitation**: a lambda body can reference only its own parameters. It cannot
+    /// reference columns of the enclosing SQL scope (a form mixing in an outer column, such
+    /// as `list_transform(tags, x -> x || suffix_col)`, is unsupported and gives
+    /// `ColumnNotFound`), because the body is always compiled in an isolated `Scope`
+    /// containing only the parameters.
     ///
-    /// パラメータの型は常に `Ty::Json`（`list_extract` の結果と同じ、配列
-    /// 要素はすべて動的型付けの JSON 値として表現される）。このエンジンでは
-    /// `Ty::Json` は他のどの型とも `Ty::unify` しない（`vector::types` の doc
-    /// 参照）ため、本体でパラメータに算術・比較を行うには
-    /// `CAST(CAST(x AS VARCHAR) AS INTEGER)` のように一度 VARCHAR を経由して
-    /// 明示的に変換する必要がある（`list_extract` の結果に対する既存の制限と
-    /// 同じで、ラムダ固有の制約ではない）。
+    /// The parameters' type is always `Ty::Json` (the same as `list_extract`'s result; array
+    /// elements are all represented as dynamically typed JSON values). In this engine
+    /// `Ty::Json` does not `Ty::unify` with any other type (see the `vector::types` docs), so
+    /// doing arithmetic or comparison on a parameter in the body requires an explicit
+    /// conversion through VARCHAR, as in `CAST(CAST(x AS VARCHAR) AS INTEGER)` (the same as
+    /// the existing limitation on `list_extract`'s result, not a lambda-specific
+    /// constraint).
     fn lambda_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
         let is_reduce = eq_ascii_ci(name.as_bytes(), b"list_reduce");
         let func = if eq_ascii_ci(name.as_bytes(), b"list_transform") {
@@ -682,7 +682,7 @@ impl<'a> Compiler<'a> {
         };
         ensure!(args.len() == 2 || (is_reduce && args.len() == 3), WrongArgCount);
 
-        // 第 1 引数（リスト）は通常どおり外側スコープでコンパイルする。
+        // The first argument (the list) is compiled in the outer scope as usual.
         let (list_reg, list_ty) = self.expr(args[0])?;
         ensure!(matches!(list_ty, Ty::Json | Ty::Null), TypeMismatch);
         let list_reg =
@@ -690,17 +690,17 @@ impl<'a> Compiler<'a> {
 
         let (params, body) = match self.arena.get(args[1]) {
             Expr::Lambda { params, body } => (params.clone(), *body),
-            // パーサは `list_transform` 等の第 2 引数をラムダ構文
-            // （`x -> expr` / `(a, b) -> expr`）としてしか読まないので、他の
-            // 式（列参照など）が来るのは構文エラー。
+            // The parser reads the second argument of `list_transform` and friends only as
+            // lambda syntax (`x -> expr` / `(a, b) -> expr`), so any other expression (a
+            // column reference, say) is a syntax error.
             _ => err!(SyntaxError),
         };
         let want_params = if is_reduce { 2 } else { 1 };
         ensure!(params.len() == want_params, WrongArgCount);
 
-        // `list_reduce` の第 3 引数（初期値）。省略時はリストの先頭要素を使う
-        // （`expr::funcs::call_list_reduce` 参照）。第 1 引数と同様、Ty::Json
-        // でなければならない（`to_json(...)` 等で明示的に変換して渡す）。
+        // `list_reduce`'s third argument (the initial value). When omitted, the list's first
+        // element is used (see `expr::funcs::call_list_reduce`). Like the first argument it
+        // must be Ty::Json (convert explicitly with `to_json(...)` or similar).
         let mut call_args = vec![list_reg];
         if args.len() == 3 {
             let (init_reg, init_ty) = self.expr(args[2])?;
@@ -710,8 +710,8 @@ impl<'a> Compiler<'a> {
             call_args.push(init_reg);
         }
 
-        // 本体は「パラメータだけ」の孤立したスコープでコンパイルする
-        // （このメソッドの doc の「既知の制限」参照）。
+        // The body is compiled in an isolated scope containing only the parameters
+        // (see "Known limitation" in this method's docs).
         let fields: Vec<Field> =
             params.iter().map(|p| Field::new(p.clone(), Ty::Json, true)).collect();
         let param_scope = Scope::from_fields(fields);
@@ -744,11 +744,11 @@ impl<'a> Compiler<'a> {
         Ok((dst, ty))
     }
 
-    /// 置き換え指示に一致する式なら、その入力列を読むだけにする。
+    /// If an expression matches a replacement instruction, it becomes just a read of that input column.
     ///
-    /// **後から追加した指示を優先する**（逆順に走査する）。同じ式に対して
-    /// 「スカラサブクエリの列」と「集約後のグループ列」の両方が登録されうるが、
-    /// 集約より上では後者が正しいため。
+    /// **Later-added instructions win** (the scan runs in reverse). Both "a scalar subquery's
+    /// column" and "a post-aggregation group column" can be registered for the same
+    /// expression, and above the aggregate the latter is correct.
     fn substitute(&mut self, id: ExprId) -> Option<Result<(Reg, Ty)>> {
         for s in self.subs.iter().rev() {
             let hit = if s.structural { expr_eq(self.arena, s.expr, id) } else { s.expr == id };
@@ -820,23 +820,23 @@ impl<'a> Compiler<'a> {
             return Ok((self.emit(OpCode::Concat, Ty::Varchar, l, r), Ty::Varchar));
         }
 
-        // DATE と整数の加減算は日数として扱う（DuckDB と同じ）。
-        // `unify(Date, Int)` は None なので、共通型経路には乗らない。
+        // Arithmetic between DATE and an integer is treated as days (the same as DuckDB).
+        // `unify(Date, Int)` is None, so it does not ride the common-type path.
         if let Some((res, swap)) = date_arith(op, lt, rt) {
             let (l, r) = if swap { (rr, lr) } else { (lr, rr) };
             let code = if op == BinaryOp::Add { OpCode::Add } else { OpCode::Sub };
-            // DATE も INTEGER も物理型は I32 なので、演算自体に変換は要らない。
+            // Both DATE and INTEGER are physically I32, so the operation itself needs no conversion.
             let dst = self.prog.alloc_reg();
             self.prog.push(Instr::new(code, crate::vector::PhysType::I32, dst, l, r));
-            // 日数差は DuckDB が BIGINT を返すので合わせる。値は同じだが、
-            // 型が違うと上位の型解決がずれる。
+            // DuckDB returns BIGINT for a day difference, so this matches. The value is the
+            // same, but a different type would throw off type resolution above.
             if res == Ty::BigInt {
                 return Ok((self.coerce(dst, Ty::Int, Ty::BigInt)?, Ty::BigInt));
             }
             return Ok((dst, res));
         }
 
-        // DECIMAL の乗除はスケールが変わるので、共通型に揃える経路には乗せない。
+        // DECIMAL multiplication and division change the scale, so they do not ride the common-type path.
         if let Some((lcast, rcast, res)) = decimal_arith(op, lt, rt) {
             let l = self.coerce(lr, lt, lcast)?;
             let r = self.coerce(rr, rt, rcast)?;
@@ -844,7 +844,7 @@ impl<'a> Compiler<'a> {
             return Ok((self.emit(code, res, l, r), res));
         }
 
-        // DATE/TIMESTAMP ± INTERVAL, INTERVAL ± INTERVAL, INTERVAL * 整数。
+        // DATE/TIMESTAMP +- INTERVAL, INTERVAL +- INTERVAL, INTERVAL * integer.
         if let Some(kind) = interval_arith(op, lt, rt) {
             return self.compile_interval_op(kind, lr, lt, rr, rt);
         }
@@ -852,14 +852,14 @@ impl<'a> Compiler<'a> {
         let (l, r, t) = self.unify_operands(lr, lt, rr, rt)?;
 
         if op.is_comparison() {
-            // 大小比較は月・日・マイクロ秒の相対的な重みが定義できない
-            // （1 か月は 28〜31 日のどれとも比較しうる）ので、順序比較は
-            // 未対応のまま明示的にエラーにする。等価比較はビットパターンの
-            // 一致で正しく判定できるので許す。
-            // JSON も INTERVAL と同じ理由（大小の順序が定義できない）で
-            // 等価比較のみ許す。等価はバイト列一致で判定するので、キー順序や
-            // 空白の違いだけで不一致になりうる（DuckDB のような正規化比較は
-            // 行わない、v1 の既知の制限）。
+            // Ordering comparison cannot define the relative weight of months, days, and
+            // microseconds (one month could compare as anywhere from 28 to 31 days), so it
+            // stays unsupported and is explicitly an error. Equality is decided correctly by
+            // bit-pattern equality, so it is allowed.
+            // JSON allows equality only for the same reason as INTERVAL (no definable
+            // ordering). Equality is decided by byte equality, so a difference in key order or
+            // whitespace alone can make it unequal (no normalizing comparison as in DuckDB --
+            // a known v1 limitation).
             if t == Ty::Interval || t == Ty::Json {
                 ensure!(matches!(op, BinaryOp::Eq | BinaryOp::Ne), TypeMismatch);
             }
@@ -871,7 +871,7 @@ impl<'a> Compiler<'a> {
                 BinaryOp::Gt => OpCode::Gt,
                 _ => OpCode::Ge,
             };
-            // 比較の入力型で命令を発行し、出力は必ず BOOLEAN。
+            // The instruction is emitted for the comparison's input type; the output is always BOOLEAN.
             let dst = self.prog.alloc_reg();
             self.prog.push(Instr::new(code, t.phys(), dst, l, r));
             return Ok((dst, Ty::Boolean));
@@ -896,7 +896,7 @@ impl<'a> Compiler<'a> {
         high: ExprId,
         negated: bool,
     ) -> Result<(Reg, Ty)> {
-        // BETWEEN は (a >= lo) AND (a <= hi) に展開する。専用カーネルを持たない。
+        // BETWEEN expands to (a >= lo) AND (a <= hi). There is no dedicated kernel.
         let (ar, at) = self.expr(arg)?;
         let (lr, lt) = self.expr(low)?;
         let (hr, ht) = self.expr(high)?;
@@ -915,8 +915,8 @@ impl<'a> Compiler<'a> {
 
     fn in_list(&mut self, arg: ExprId, list: Vec<ExprId>, negated: bool) -> Result<(Reg, Ty)> {
         ensure!(!list.is_empty(), SyntaxError);
-        // IN は Eq の OR 連鎖に展開する。専用の集合命令を持たないぶん、
-        // 要素数が多いと線形になる。v1 では許容する。
+        // IN expands to a chain of Eq joined by OR. Without a dedicated set instruction it is
+        // linear in the number of elements. Acceptable for v1.
         let (ar, at) = self.expr(arg)?;
         let mut acc: Option<Reg> = None;
         for item in list {
@@ -944,7 +944,7 @@ impl<'a> Compiler<'a> {
     ) -> Result<(Reg, Ty)> {
         ensure!(!whens.is_empty(), SyntaxError);
 
-        // まず条件と値を評価し、結果型を決めてから Select を後ろから積む。
+        // Conditions and values are evaluated first, then the result type is decided and Select instructions are stacked from the back.
         let operand = match operand {
             Some(o) => Some(self.expr(o)?),
             None => None,
@@ -955,7 +955,7 @@ impl<'a> Compiler<'a> {
         let mut result_ty = Ty::Null;
         for (c, v) in whens {
             let cond = match operand {
-                // CASE x WHEN a … は x = a に読み替える。
+                // `CASE x WHEN a ...` is read as `x = a`.
                 Some((or, ot)) => {
                     let (cr, ct) = self.expr(c)?;
                     let (l, r, t) = self.unify_operands(or, ot, cr, ct)?;
@@ -987,7 +987,7 @@ impl<'a> Compiler<'a> {
             Some((r, t)) => self.coerce(r, t, result_ty)?,
             None => self.konst(result_ty, Value::Null),
         };
-        // 後ろの WHEN から前へ積むと、条件の優先順位がそのまま入れ子になる。
+        // Stacking from the last WHEN forward nests the conditions in priority order.
         for (cond, (vr, vt)) in conds.into_iter().zip(vals).rev() {
             let v = self.coerce(vr, vt, result_ty)?;
             let dst = self.prog.alloc_reg();
@@ -1021,7 +1021,7 @@ mod tests {
         ])
     }
 
-    /// `id <op> <literal>` の式を組み立てる。
+    /// Builds an `id <op> <literal>` expression.
     fn bin(a: &mut ExprArena, op: BinaryOp, col: &str, v: Value) -> ExprId {
         let l = a.push(Expr::ColumnRef { qualifier: None, name: col.into() });
         let r = a.push(Expr::Literal(v));
@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn widening_cast_is_inserted() {
-        // BIGINT 列と INTEGER リテラルの比較は BIGINT に揃える。
+        // Comparing a BIGINT column with an INTEGER literal aligns to BIGINT.
         let mut a = ExprArena::new();
         let id = bin(&mut a, BinaryOp::Lt, "big", Value::I32(5));
         let p = compile(&a, &cols(), &[], id).unwrap();
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[test]
     fn null_literal_is_retyped_not_cast() {
-        // NULL は Cast ではなく目的の型の定数として作り直される。
+        // NULL is rebuilt as a constant of the target type rather than via Cast.
         let mut a = ExprArena::new();
         let id = bin(&mut a, BinaryOp::Eq, "big", Value::Null);
         let p = compile(&a, &cols(), &[], id).unwrap();
@@ -1153,10 +1153,10 @@ mod tests {
         let id = a.push(Expr::Like { arg, pattern, negated: false, escape: None, ci: true });
         let p = compile(&a, &cols(), &[], id).unwrap();
         assert_eq!(p.result_ty, Ty::Boolean);
-        // `lower()` の呼び出しが 2 回（両辺）、その後に Like が 1 回。
+        // Two `lower()` calls (both sides), then one Like.
         assert_eq!(p.calls.len(), 2);
         assert!(p.instrs.iter().any(|i| i.op == OpCode::Like));
-        // ILIKE でない通常の LIKE は lower() を呼ばない。
+        // An ordinary LIKE, unlike ILIKE, does not call lower().
         let id2 = a.push(Expr::Like { arg, pattern, negated: false, escape: None, ci: false });
         let p2 = compile(&a, &cols(), &[], id2).unwrap();
         assert!(p2.calls.is_empty());
@@ -1179,8 +1179,8 @@ mod tests {
 
     #[test]
     fn filter_on_a_non_aggregate_function_is_rejected() {
-        // FILTER はスカラ関数呼び出しには意味を持たない。集約置換前にここへ
-        // 来た（＝集約できない位置に書かれた）場合と同じ経路でも弾かれる。
+        // FILTER is meaningless on a scalar function call. It is rejected on the same path as
+        // arriving here before aggregate replacement (= written where aggregation is impossible).
         let mut a = ExprArena::new();
         let arg = a.push(Expr::ColumnRef { qualifier: None, name: "id".into() });
         let cond = a.push(Expr::Literal(Value::Bool(true)));
@@ -1216,7 +1216,7 @@ mod tests {
         let p = compile(&a, &date_col(), &[], id).unwrap();
         assert_eq!(p.result_ty, Ty::Timestamp);
         assert!(p.instrs.iter().any(|i| i.op == OpCode::TsAddInterval));
-        // DATE → TIMESTAMP への暗黙キャストが挟まる。
+        // An implicit DATE -> TIMESTAMP cast is interposed.
         assert!(p.casts.iter().any(|c| c.from == Ty::Date && c.to == Ty::Timestamp));
     }
 
@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(p.result_ty, Ty::Interval);
         assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalMul));
 
-        // `n * INTERVAL` も同じ経路（左右入れ替え）。
+        // `n * INTERVAL` takes the same path (with the operands swapped).
         let mul2 = a.push(Expr::Binary { op: BinaryOp::Mul, lhs: n, rhs: i1 });
         let p = compile(&a, &cols(), &[], mul2).unwrap();
         assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalMul));
@@ -1280,9 +1280,9 @@ mod tests {
 
     #[test]
     fn json_ordering_comparison_is_rejected_but_equality_is_not() {
-        // JSON も INTERVAL と同じ理由で大小比較を拒否する。
-        // JSON は他のどの型とも `Ty::unify` しない（モジュール doc 参照）ので、
-        // 比較相手も明示的に JSON へ CAST してから渡す。
+        // JSON rejects ordering comparison for the same reason as INTERVAL.
+        // JSON does not `Ty::unify` with any other type (see the module docs), so the
+        // comparison operand must be explicitly CAST to JSON as well.
         let scope = Scope::from_fields(vec![Field::new("doc", Ty::Json, true)]);
         let mut a = ExprArena::new();
         let doc = a.push(Expr::ColumnRef { qualifier: None, name: "doc".into() });
@@ -1298,9 +1298,9 @@ mod tests {
 
     #[test]
     fn cast_to_json_is_generic_cast_opcode_no_special_compile_path() {
-        // JSON への CAST は他の型と同じ経路（`Expr::Cast` → `Cast`/`TryCast`
-        // opcode）を通るだけで、compile.rs 側に特別な分岐は要らない
-        // （検証は `expr::kernels::cast` にある）。
+        // A CAST to JSON merely takes the same path as any other type (`Expr::Cast` ->
+        // the `Cast`/`TryCast` opcode); no special branch is needed in compile.rs
+        // (the validation lives in `expr::kernels::cast`).
         let scope = Scope::from_fields(vec![Field::new("s", Ty::Varchar, true)]);
         let mut a = ExprArena::new();
         let s = a.push(Expr::ColumnRef { qualifier: None, name: "s".into() });
@@ -1320,7 +1320,7 @@ mod tests {
         assert!(p.instrs.iter().any(|i| i.op == OpCode::IntervalNeg));
     }
 
-    // --- ラムダ: list_transform / list_filter / list_reduce -------------------
+    // --- Lambdas: list_transform / list_filter / list_reduce ------------------
 
     fn json_lit(a: &mut ExprArena, text: &str) -> ExprId {
         let s = a.push(Expr::Literal(Value::Bytes(text.as_bytes().to_vec())));
@@ -1357,7 +1357,7 @@ mod tests {
     fn list_filter_requires_a_boolean_lambda_body() {
         let mut a = ExprArena::new();
         let list = json_lit(&mut a, "[1,2,3]");
-        // 本体が `x`（Ty::Json）そのものなので BOOLEAN にならない。
+        // The body is `x` (Ty::Json) itself, so it is not BOOLEAN.
         let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
         let lambda = a.push(Expr::Lambda { params: vec!["x".into()], body: x });
         let id = func_call(&mut a, "list_filter", vec![list, lambda]);
@@ -1379,9 +1379,9 @@ mod tests {
 
     #[test]
     fn lambda_body_cannot_see_outer_scope_columns() {
-        // 既知の制限: ラムダ本体は自分のパラメータだけを参照できる
-        // （`Compiler::lambda_call` の doc 参照）。`id` は外側スコープの列で
-        // パラメータではないので `ColumnNotFound` になる。
+        // Known limitation: a lambda body can reference only its own parameters (see the
+        // `Compiler::lambda_call` docs). `id` is a column of the outer scope and not a
+        // parameter, so it gives `ColumnNotFound`.
         let mut a = ExprArena::new();
         let list = json_lit(&mut a, "[1,2,3]");
         let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
@@ -1397,7 +1397,7 @@ mod tests {
         let mut a = ExprArena::new();
         let list = json_lit(&mut a, "[1,2,3]");
         let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
-        // list_transform はパラメータ 1 個のラムダしか受け付けない。
+        // list_transform accepts only a one-parameter lambda.
         let lambda = a.push(Expr::Lambda { params: vec!["x".into(), "y".into()], body: x });
         let id = func_call(&mut a, "list_transform", vec![list, lambda]);
         assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::WrongArgCount));
@@ -1423,7 +1423,7 @@ mod tests {
         let p = compile(&a, &cols(), &[], id).unwrap();
         assert_eq!(p.result_ty, Ty::Json);
 
-        // 第 3 引数（初期値）付きも受け付ける。
+        // A third argument (the initial value) is accepted too.
         let mut a2 = ExprArena::new();
         let list2 = json_lit(&mut a2, "[1,2,3]");
         let acc2 = a2.push(Expr::ColumnRef { qualifier: None, name: "acc".into() });
@@ -1436,8 +1436,8 @@ mod tests {
 
     #[test]
     fn lambda_as_a_bare_expression_is_unsupported() {
-        // パーサは list_transform 等の第 2 引数としてしかラムダを作らないが、
-        // `plan::compile` 側も念のため通常の式位置に来た場合を拒否する。
+        // The parser only ever builds a lambda as the second argument of list_transform and
+        // friends, but `plan::compile` also rejects one in an ordinary expression position, just in case.
         let mut a = ExprArena::new();
         let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
         let id = a.push(Expr::Lambda { params: vec!["x".into()], body: x });

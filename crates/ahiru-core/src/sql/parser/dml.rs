@@ -4,7 +4,7 @@ use super::*;
 use crate::sql::ast::InsertSource;
 
 impl<'a> Parser<'a> {
-    // --- DML（`dml` フィーチャ） ----------------------------------------------
+    // --- DML (the `dml` feature) ----------------------------------------------
 
     #[cfg(feature = "dml")]
     pub(super) fn insert_stmt(&mut self) -> Result<Stmt> {

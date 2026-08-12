@@ -1,14 +1,14 @@
-// エラーコード表。
+// Error code table.
 //
-// wasm 側は数値コードしか返さない（`core::fmt` を一切リンクしないため）。
-// 文字列を持つのはここだけで、その分 wasm の予算をエンジン本体に回せる。
+// The wasm side returns numeric codes only (it never links `core::fmt`).
+// This is the only place holding strings, which frees that much wasm budget for the engine itself.
 //
-// ★ crates/ahiru-core/src/error.rs の `Code` / `message()` と 1:1 で対応する。
-//   どちらか片方だけを書き換えないこと。値は既存クエリの互換性のため変更しない。
+// NOTE: this maps 1:1 to `Code` / `message()` in crates/ahiru-core/src/error.rs.
+//   Never change only one side. Values stay fixed for compatibility with existing queries.
 
-/** エラーコード。error.rs の `#[repr(u16)] enum Code` と同じ数値。 */
+/** Error codes. Same numbers as `#[repr(u16)] enum Code` in error.rs. */
 export const Code = Object.freeze({
-  // 1xx: 入力バイト列の破損
+  // 1xx: corrupt input bytes
   UNEXPECTED_EOF: 100,
   BAD_MAGIC: 101,
   BAD_THRIFT: 102,
@@ -18,21 +18,21 @@ export const Code = Object.freeze({
   BAD_COMPRESSED_DATA: 106,
   CHECKSUM_MISMATCH: 107,
 
-  // 2xx: 未対応の Parquet 機能
+  // 2xx: unsupported Parquet features
   UNSUPPORTED_ENCODING: 200,
   UNSUPPORTED_CODEC: 201,
   UNSUPPORTED_TYPE: 202,
   UNSUPPORTED_NESTED: 203,
   ENCRYPTION_UNSUPPORTED: 204,
 
-  // 3xx: SQL 構文
+  // 3xx: SQL syntax
   SYNTAX_ERROR: 300,
   UNEXPECTED_TOKEN: 301,
   UNTERMINATED_STRING: 302,
   NUMBER_OVERFLOW: 303,
   EXPRESSION_TOO_DEEP: 304,
 
-  // 4xx: 束縛・意味解析
+  // 4xx: binding and semantic analysis
   TABLE_NOT_FOUND: 400,
   COLUMN_NOT_FOUND: 401,
   AMBIGUOUS_COLUMN: 402,
@@ -48,7 +48,7 @@ export const Code = Object.freeze({
   READ_ONLY_TABLE: 412,
   DUPLICATE_COLUMN: 413,
 
-  // 5xx: 実行時
+  // 5xx: runtime
   OOM: 500,
   LIMIT_EXCEEDED: 501,
   DIVIDE_BY_ZERO: 502,
@@ -56,11 +56,11 @@ export const Code = Object.freeze({
   IO_FAILED: 504,
   RECURSION_LIMIT_EXCEEDED: 505,
 
-  // 9xx: 内部矛盾（バグ）
+  // 9xx: internal inconsistency (bug)
   INTERNAL: 900,
 });
 
-/** コード → メッセージ。error.rs の `Error::message()` と同じ文字列。 */
+/** Code -> message. Same strings as `Error::message()` in error.rs. */
 const MESSAGES = Object.freeze({
   100: 'unexpected end of input',
   101: 'not a parquet file (bad magic)',
@@ -73,8 +73,8 @@ const MESSAGES = Object.freeze({
   200: 'unsupported parquet encoding',
   201: 'unsupported compression codec',
   202: 'unsupported parquet type',
-  // LIST/MAP/STRUCT 自体は対応済み（Dremel 組み立て、または STRUCT のドット
-  // 区切りフラット化）。壊れた/敵対的なスキーマの検出時だけこのコードになる。
+  // LIST/MAP/STRUCT themselves are supported (Dremel assembly, or dot-separated
+  // flattening for STRUCT). This code is only used when a broken/hostile schema is detected.
   203: 'malformed or oversized nested parquet schema',
   204: 'encrypted parquet files are not supported',
   300: 'syntax error',
@@ -105,16 +105,16 @@ const MESSAGES = Object.freeze({
   900: 'internal error',
 });
 
-/** コードに対応する英文メッセージ。未知のコードでも必ず文字列を返す。 */
+/** The English message for a code. Always returns a string, even for unknown codes. */
 export function errorMessage(code) {
   return MESSAGES[code] ?? `unknown error (code ${code})`;
 }
 
 /**
- * エンジンから返るエラー。
+ * An error returned by the engine.
  *
- * `code` は error.rs の数値、`message` は上の表から組み立てたもの。
- * 追加の文脈（実行中の SQL、ホスト側の補足説明）は任意。
+ * `code` is the number from error.rs; `message` is built from the table above.
+ * Extra context (the SQL being run, host-side notes) is optional.
  */
 export class AhiruError extends Error {
   constructor(code, { sql, detail, cause } = {}) {
@@ -122,7 +122,7 @@ export class AhiruError extends Error {
     super(detail ? `[E${code}] ${base}: ${detail}` : `[E${code}] ${base}`, { cause });
     this.name = 'AhiruError';
     this.code = code;
-    /** コード本来のメッセージ（detail を含まない）。 */
+    /** The code's own message (without detail). */
     this.reason = base;
     if (sql !== undefined) this.sql = sql;
     if (detail !== undefined) this.detail = detail;

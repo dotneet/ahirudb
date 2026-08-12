@@ -1,8 +1,8 @@
-//! 複数ファイル / Hive パーティションの手動疎通確認。
+//! A manual smoke check for multiple files / Hive partitions.
 //!
-//! ユニットテストはエージェントが `catalog.rs`/`session.rs` 側に書いている
-//! はずなので、ここでは「コーディネータの視点で実データに対して動くか」を
-//! 素朴に確認するだけに留める。
+//! The agent should already have written unit tests on the `catalog.rs`/`session.rs` side,
+//! so here we keep it to a simple check of "does this work against real data from the
+//! coordinator's perspective".
 
 use ahiru_core::format::FormatKind;
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -16,7 +16,7 @@ fn read(rel: &str) -> Vec<u8> {
 fn run_all(sql: &str, s: &mut Session) -> Vec<Vec<Value>> {
     let mut q = match s.prepare(sql, &[]).unwrap() {
         Prepared::Ready(q) => q,
-        Prepared::NeedIo(_) => panic!("メモリ上のデータで NeedIo は出ないはず"),
+        Prepared::NeedIo(_) => panic!("NeedIo should not happen for in-memory data"),
     };
     let mut rows = Vec::new();
     loop {
@@ -47,18 +47,18 @@ fn three_plain_files_union_into_one_table() {
         FormatKind::Parquet,
     )
     .unwrap();
-    // 3 ファイルとも (id INTEGER, name VARCHAR) で列名・並びが揃っている。
-    // 100 + 150 + 230 行。
+    // All 3 files share the same column names and order: (id INTEGER, name VARCHAR).
+    // 100 + 150 + 230 rows.
     let rows = run_all("SELECT count(*) AS n FROM t", &mut s);
     assert_eq!(rows, [[Value::I64(480)]]);
 }
 
 #[test]
 fn parts_with_mismatched_column_names_are_rejected_not_silently_merged() {
-    // small_a.parquet: (k, v) / small_b.parquet: (k, w)。2 列目の名前が違う
-    // （型はどちらも INTEGER で偶然両立してしまう）ので、位置だけで揃えると
-    // 意味の違う列を静かに 1 列として merge してしまう。`catalog::unify_schema`
-    // は列名の位置一致も要求するので、ここは明確なエラーになるべき。
+    // small_a.parquet: (k, v) / small_b.parquet: (k, w). The 2nd column's name differs
+    // (both happen to be type-compatible as INTEGER), so aligning by position alone would
+    // silently merge columns with different meanings into one. `catalog::unify_schema`
+    // also requires column names to match by position, so this should be a clear error.
     let mut s = Session::new();
     s.register_multi_bytes(
         "t",
@@ -73,7 +73,7 @@ fn parts_with_mismatched_column_names_are_rejected_not_silently_merged() {
     assert_eq!(
         ahiru_core::error::code_of(r),
         Some(ahiru_core::error::Code::TypeMismatch),
-        "列名が食い違うパートは明確に拒否されるべき"
+        "a part with a mismatched column name should be clearly rejected"
     );
 }
 
@@ -81,7 +81,7 @@ fn parts_with_mismatched_column_names_are_rejected_not_silently_merged() {
 fn hive_partitioned_files_expose_partition_columns() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/hive");
     if !std::path::Path::new(dir).exists() {
-        eprintln!("hive フィクスチャが無いので飛ばす");
+        eprintln!("skipping: no hive fixture present");
         return;
     }
     let mut s = Session::new();

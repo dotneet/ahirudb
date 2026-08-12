@@ -1,8 +1,8 @@
-//! JSONL (NDJSON) 書き出し（`export` フィーチャ）。
+//! JSONL (NDJSON) writing (`export` feature).
 //!
-//! 1 行 1 JSON オブジェクト。`format/jsonl.rs`（読み取り側）と対称の設計だが、
-//! 依存関係は無い方向にしてある（書き出しが読み取りを呼ぶことはあっても
-//! 逆はない）。数値・文字列のエスケープはこのファイル内で完結させる。
+//! One JSON object per line. Symmetric with `format/jsonl.rs` (the read side)
+//! in design, but with the dependency going only one way (write may call
+//! read, never the reverse). Number and string escaping are self-contained in this file.
 
 use crate::expr::funcs::civil_from_days;
 use crate::prelude::*;
@@ -82,14 +82,14 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         }
         Value::I64(x) => push_int(out, *x as i128),
         Value::I128(x) => match ty {
-            // DECIMAL は JSON の数値だと丸め誤差が乗るので文字列で正確に出す。
-            // JSON は任意精度の数値を安全に表現する標準の型を持たない。
+            // A DECIMAL as a JSON number picks up rounding error, so write it as a string to keep it exact.
+            // JSON has no standard type that safely represents arbitrary-precision numbers.
             Ty::Decimal { scale, .. } => {
                 out.push(b'"');
                 push_decimal(out, *x, scale);
                 out.push(b'"');
             }
-            // INTERVAL は JSON にネイティブな型が無いので文字列で出す。
+            // INTERVAL has no native JSON type, so write it as a string.
             Ty::Interval => {
                 let (months, days, micros) = crate::vector::unpack_interval(*x);
                 out.push(b'"');
@@ -176,8 +176,8 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
     }
 }
 
-/// JSON は NaN/Infinity を許さない（RFC 8259）ので `null` に落とす。
-/// DuckDB の `TO JSON` も同じ立場を取る。
+/// JSON does not allow NaN/Infinity (RFC 8259), so they fall back to `null`.
+/// DuckDB's `TO JSON` takes the same stance.
 fn push_f64(out: &mut Vec<u8>, v: f64) {
     if !v.is_finite() {
         out.extend_from_slice(b"null");
@@ -192,16 +192,17 @@ fn push_f64(out: &mut Vec<u8>, v: f64) {
     if neg {
         out.push(b'-');
     }
-    // `trunc()` は core に無い（libm 依存）ので `as i128` の
-    // 飽和・ゼロ方向丸めキャストで代用する。
+    // `trunc()` is not in `core` (it's a libm dependency), so an `as i128`
+    // saturating, round-toward-zero cast is used instead.
     let ip = x as i128;
     push_int(out, ip);
     out.push(b'.');
-    // `ip` が i128 の範囲外で飽和した場合（v の絶対値が i128::MAX 超）、
-    // `x - ip as f64` は [0,1) に収まらない巨大な残差になる。そのまま桁
-    // 抽出すると `x as u8` が 255 に飽和し、`b'0' + d` で u8 加算オーバー
-    // フロー（デバッグ panic、release ビルドでは不正なバイトの書き込み）
-    // になる。飽和したら小数部の抽出自体を諦める。
+    // If `ip` saturates outside the i128 range (v's absolute value exceeds
+    // i128::MAX), `x - ip as f64` becomes a huge residual that does not fit in
+    // [0,1). Extracting digits from it as-is would saturate `x as u8` at 255,
+    // and `b'0' + d` would overflow the u8 addition (a debug panic, or a
+    // corrupted byte write in release builds). So once saturated, give up on
+    // extracting the fraction part entirely.
     if ip == i128::MAX || ip == i128::MIN {
         out.push(b'0');
     } else {
@@ -282,7 +283,7 @@ fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {
     }
 }
 
-/// JSON 文字列としてエスケープして書く（引用符込み）。
+/// Writes as an escaped JSON string (including the surrounding quotes).
 fn push_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
     for &b in s {
@@ -344,17 +345,16 @@ mod tests {
 
     #[test]
     fn string_escaping() {
-        // CSV は引用符で囲んだフィールドの中に生の改行・タブ・二重引用符
-        // （`""` で表す）を持てる。それぞれ JSON の `\n` `\t` `\"` に
-        // 変換されることを確認する。バイト列を直接組み立てて、Rust の
-        // 文字列エスケープと CSV のクォート規則が混ざって読みにくくなる
-        // のを避ける。
+        // A CSV field wrapped in quotes can contain raw newlines, tabs, and
+        // double quotes (represented as `""`). Confirm each converts to JSON's
+        // `\n` `\t` `\"`. Build the byte sequence directly to avoid mixing
+        // Rust string escaping with CSV quoting rules, which would be hard to read.
         let mut csv = Vec::new();
         csv.extend_from_slice(b"s\n\"line1");
-        csv.push(b'\n'); // フィールド内の生の改行
+        csv.push(b'\n'); // raw newline inside the field
         csv.extend_from_slice(b"line2");
-        csv.push(b'\t'); // フィールド内の生のタブ
-        csv.extend_from_slice(b"tab\"\"q\"\n"); // `""` は埋め込みの `"` 1 個
+        csv.push(b'\t'); // raw tab inside the field
+        csv.extend_from_slice(b"tab\"\"q\"\n"); // `""` is one embedded `"`
         let lines = run("SELECT s FROM t", csv, crate::format::FormatKind::Csv);
         assert_eq!(lines[0], "{\"s\":\"line1\\nline2\\ttab\\\"q\"}");
     }
@@ -403,9 +403,9 @@ mod tests {
         assert_eq!(lines, vec![r#"{"a":-5,"b":-1.5}"#]);
     }
 
-    // `push_f64` の整数部飽和ガードの回帰テスト（csv.rs と同種のバグ）。
-    // 修正前は `x as i128` が i128::MAX に飽和した後の残差抽出で
-    // u8 加算オーバーフローが起き panic していた。
+    // Regression test for `push_f64`'s integer-part saturation guard (the same kind of bug as in csv.rs).
+    // Before the fix, extracting the residual after `x as i128` saturated to
+    // i128::MAX caused a u8-addition overflow panic.
     #[test]
     fn float_formatting_saturates_on_extremely_large_finite_values_without_panicking() {
         let lines = run("SELECT a FROM t", b"a\n1e40\n".to_vec(), crate::format::FormatKind::Csv);

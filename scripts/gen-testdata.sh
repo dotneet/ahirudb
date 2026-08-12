@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# tests/data/ を再生成する。
+# Regenerates tests/data/.
 #
-# 生成物はリポジトリに追跡している（.gitignore の末尾に理由あり）。
-# ahiru-core の単体テストがこれらを直接読むので、clean clone で `cargo test` が
-# 通ることを優先した。このスクリプトは「どう作ったか」を残すためのもので、
-# 普段は実行しなくてよい。
+# The generated files are tracked in the repository (the reason is at the end of
+# .gitignore). ahiru-core's unit tests read them directly, and having `cargo test`
+# pass on a clean clone won out. This script exists to record how they were made;
+# you do not normally need to run it.
 #
-# 期待値の参照実装も DuckDB なので、DuckDB のバージョンを上げたときは
-# 再生成してテストが通ることを確認すること。
+# DuckDB is also the reference implementation for expected values, so after
+# bumping the DuckDB version, regenerate and check that the tests still pass.
 set -euo pipefail
 
 cd "$(dirname "$0")/../tests/data"
 
-command -v duckdb >/dev/null || { echo "duckdb が必要です" >&2; exit 1; }
+command -v duckdb >/dev/null || { echo "duckdb is required" >&2; exit 1; }
 echo "duckdb: $(duckdb -version)"
 
-# --- 基本のケース ---------------------------------------------------------
-# 1000 行。NULL（5 行に 1 つ）、辞書エンコードされる文字列、BOOLEAN、
-# TIMESTAMP をひと通り含む。RowGroup を小さくして複数ページを作る。
+# --- Basic cases ----------------------------------------------------------
+# 1000 rows. Covers NULLs (one in every five), dictionary-encoded strings,
+# BOOLEAN, and TIMESTAMP. RowGroups are kept small so multiple pages are created.
 duckdb -c "
 COPY (SELECT i::INTEGER                                            AS id,
              ('name_' || (i % 7))::VARCHAR                         AS name,
@@ -28,15 +28,15 @@ COPY (SELECT i::INTEGER                                            AS id,
       FROM range(0, 1000) t(i))
 TO 'basic.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 400);"
 
-# 同じ内容を CSV と JSONL でも。3 フォーマットが同じ結果を返すことの検証に使う。
+# The same content as CSV and JSONL, used to verify all three formats agree.
 duckdb -c "COPY (SELECT * FROM 'basic.parquet') TO 'basic.csv'   (FORMAT CSV, HEADER);"
 duckdb -c "COPY (SELECT * FROM 'basic.parquet') TO 'basic.jsonl' (FORMAT JSON);"
-# 同じ内容を、改行区切りではなく単一の JSON 配列ファイルとしても
-# （`format::json` = `read_json`/`read_json_auto` 相当のテスト用）。
+# The same content as a single JSON array file rather than newline-delimited
+# (to test `format::json`, i.e. the `read_json`/`read_json_auto` equivalent).
 duckdb -c "COPY (SELECT * FROM 'basic.parquet') TO 'basic_array.json' (FORMAT JSON, ARRAY true);"
 
-# --- 複数 RowGroup / 複数分割 ---------------------------------------------
-# 50000 行 × 8192 行 RowGroup = 7 RowGroup。分割境界の取りこぼしを検出する。
+# --- Multiple RowGroups / multiple splits ---------------------------------
+# 50000 rows x 8192-row RowGroups = 7 RowGroups. Detects rows dropped at split boundaries.
 duckdb -c "
 COPY (SELECT i::INTEGER AS id, (i % 97)::BIGINT AS k,
              ('v' || (i % 1000))::VARCHAR AS s, (i * 0.25)::DOUBLE AS f
@@ -44,14 +44,14 @@ COPY (SELECT i::INTEGER AS id, (i % 97)::BIGINT AS k,
 TO 'multi_rg.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 8192);"
 duckdb -c "COPY (SELECT * FROM 'multi_rg.parquet') TO 'multi_rg.csv' (FORMAT CSV, HEADER);"
 
-# --- コーデック別 ---------------------------------------------------------
-# 非圧縮と、ホストに展開を委譲する 2 種（DESIGN.md §6）。
+# --- Per codec ------------------------------------------------------------
+# Uncompressed, plus the two codecs whose decompression is delegated to the host (DESIGN.md §6).
 duckdb -c "COPY (SELECT i::INTEGER AS id FROM range(0,5000) t(i))
            TO 'plain.parquet' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED);"
 duckdb -c "COPY (SELECT i::INTEGER AS id FROM range(0,5000) t(i))
            TO 'zstd.parquet'  (FORMAT PARQUET, COMPRESSION ZSTD);"
 
-# 文字列と浮動小数を含む版。委譲経路を集約クエリで確かめるのに使う。
+# A variant with strings and floats. Used to exercise the delegation path with aggregate queries.
 for spec in "gzip:GZIP" "zstd2:ZSTD"; do
   name="${spec%%:*}"; codec="${spec##*:}"
   duckdb -c "
@@ -60,41 +60,41 @@ for spec in "gzip:GZIP" "zstd2:ZSTD"; do
   TO '${name}.parquet' (FORMAT PARQUET, COMPRESSION ${codec});"
 done
 
-# --- 結合用 ---------------------------------------------------------------
-# basic.name に対応するディメンション表。
+# --- For joins ------------------------------------------------------------
+# A dimension table keyed by basic.name.
 duckdb -c "
 COPY (SELECT (i % 7)::INTEGER AS nid, ('name_' || (i % 7))::VARCHAR AS label,
              (i * 3)::BIGINT AS w
       FROM range(0, 7) t(i))
 TO 'dim.parquet' (FORMAT PARQUET);"
 
-# キーが 2 つだけ重なる小さい表。外部結合の NULL 補完を目視できる大きさにしてある。
+# A small table overlapping on only two keys. Sized so outer-join NULL padding is visible by eye.
 duckdb -c "COPY (SELECT i::INTEGER AS k, (i * 2)::INTEGER AS v FROM range(0,5) t(i))
            TO 'small_a.parquet' (FORMAT PARQUET);"
 duckdb -c "COPY (SELECT (i + 2)::INTEGER AS k, (i * 10)::INTEGER AS w FROM range(0,5) t(i))
            TO 'small_b.parquet' (FORMAT PARQUET);"
 
-# --- CSV の引用符まわり ---------------------------------------------------
-# 二重引用符のエスケープ、フィールド内改行、空フィールド。手書きでないと作れない。
+# --- CSV quoting ----------------------------------------------------------
+# Escaped double quotes, newlines inside fields, empty fields. Only writable by hand.
 printf 'a,b,c\n1,"he said ""hi""",2.5\n2,"multi\nline",3.5\n3,,4.5\n' > quoted.csv
 
-# --- STRUCT（ネストしたスキーマ） ------------------------------------------
-# 単一段の STRUCT。address 列の下に city / zip の 2 リーフ。
-# ドット区切り名 (address.city, address.zip) に解決されることを確かめる。
+# --- STRUCT (nested schemas) ----------------------------------------------
+# A single level of STRUCT: two leaves, city / zip, under the address column.
+# Checks that they resolve to dotted names (address.city, address.zip).
 duckdb -c "
 COPY (SELECT i::INTEGER AS id, {'city': 'Tokyo', 'zip': (10000+i)::INTEGER} AS address
       FROM range(0,100) t(i))
 TO 'struct1.parquet' (FORMAT PARQUET);"
 
-# 3 段のネスト (nested.a.b.c)。深さ優先で辿る再帰が正しく動くかを見る。
+# Three levels of nesting (nested.a.b.c). Exercises the depth-first recursion.
 duckdb -c "
 COPY (SELECT i::INTEGER AS id, {'a': {'b': {'c': i::INTEGER}}} AS nested
       FROM range(0,20) t(i))
 TO 'struct_deep.parquet' (FORMAT PARQUET);"
 
-# STRUCT グループそのものが NULL になる行を混ぜたもの。definition level の
-# 「途中のどのグループが NULL でも、子リーフは同じ 1 ビットの validity に
-# 潰れる」という前提が本当に正しいかを実バイト列で確かめるための版。
+# A version mixing in rows where the STRUCT group itself is NULL. Confirms against
+# real bytes that the definition-level assumption holds: "whichever intermediate
+# group is NULL, the child leaves collapse into the same single validity bit".
 duckdb -c "
 COPY (SELECT i::INTEGER AS id,
              CASE WHEN i % 3 = 0 THEN NULL
@@ -102,16 +102,17 @@ COPY (SELECT i::INTEGER AS id,
       FROM range(0,30) t(i))
 TO 'struct_null.parquet' (FORMAT PARQUET);"
 
-# LIST は STRUCT ではなく REPEATED グループの実体。最小のケースとして残す
-# （1 本の JSON 列 `[1,2,3]` に組み立てられることを確認する）。
+# A LIST is a REPEATED group rather than a STRUCT. Kept as the minimal case
+# (checks that it assembles into a single JSON column `[1,2,3]`).
 duckdb -c "
 COPY (SELECT i::INTEGER AS id, [1,2,3] AS xs FROM range(0,10) t(i))
 TO 'list1.parquet' (FORMAT PARQUET);"
 
-# --- LIST/MAP（Dremel 組み立て） -------------------------------------------
-# NULL 配列・空配列・要素内 NULL・可変長を 1 本に混ぜる。definition level
-# だけで「配列自体が NULL」と「配列は存在するが 0 要素」を区別できるかが
-# ここでの本題（どちらも JSON にすると別の見た目になる: null vs []）。
+# --- LIST/MAP (Dremel assembly) -------------------------------------------
+# Mixes NULL arrays, empty arrays, NULL elements, and varying lengths into one
+# column. The point here is whether definition levels alone distinguish "the
+# array itself is NULL" from "the array exists but has 0 elements" (they look
+# different in JSON: null vs []).
 duckdb -c "
 COPY (SELECT i::INTEGER AS id,
              CASE WHEN i % 5 = 0 THEN NULL
@@ -122,44 +123,44 @@ COPY (SELECT i::INTEGER AS id,
       FROM range(0, 50) t(i))
 TO 'list_varied.parquet' (FORMAT PARQUET);"
 
-# LIST<STRUCT<...>>。配列の要素が構造体。既存の STRUCT フラット化とは別に、
-# 部分木ごと JSON にする経路が使われることを確認する。
+# LIST<STRUCT<...>>: array elements are structs. Confirms that the path emitting
+# a whole subtree as JSON is used, separately from the existing STRUCT flattening.
 duckdb -c "
 COPY (SELECT i::INTEGER AS id,
              [{'a': i, 'b': ('s' || i)::VARCHAR}, {'a': i + 1, 'b': NULL}] AS items
       FROM range(0, 20) t(i))
 TO 'list_of_struct.parquet' (FORMAT PARQUET);"
 
-# STRUCT の中に LIST がある場合。STRUCT フラット化（address.city 方式）とは
-# 切り分けて、STRUCT ごと 1 本の JSON 列になることを確認する。
+# A LIST inside a STRUCT. Kept distinct from STRUCT flattening (the address.city
+# scheme) to confirm the whole STRUCT becomes a single JSON column.
 duckdb -c "
 COPY (SELECT i::INTEGER AS id,
              {'name': ('n' || i)::VARCHAR, 'tags': ['t' || i, 't' || (i + 1)]} AS s
       FROM range(0, 20) t(i))
 TO 'struct_with_list.parquet' (FORMAT PARQUET);"
 
-# LIST<LIST<INT>>。3 段エンコーディングが 2 重になったケース（配列の配列）。
+# LIST<LIST<INT>>: the three-level encoding doubled up (an array of arrays).
 duckdb -c "
 COPY (SELECT i::INTEGER AS id, [[i, i + 1], [], [i * 10]] AS xss
       FROM range(0, 10) t(i))
 TO 'list_of_list.parquet' (FORMAT PARQUET);"
 
-# MAP<VARCHAR, INT>。文字列キー。
+# MAP<VARCHAR, INT>: string keys.
 duckdb -c "
 COPY (SELECT i::INTEGER AS id, map(['a', 'b', 'c'], [i, i * 2, NULL]) AS m
       FROM range(0, 20) t(i))
 TO 'map_basic.parquet' (FORMAT PARQUET);"
 
-# MAP<INT, VARCHAR>。文字列以外のキー（内部表現の判断が問われるケース）。
+# MAP<INT, VARCHAR>: non-string keys (a case that probes the internal representation).
 duckdb -c "
 COPY (SELECT i::INTEGER AS id, map([i, i + 1], ['v' || i, 'v' || (i + 1)]) AS m
       FROM range(0, 20) t(i))
 TO 'map_int_key.parquet' (FORMAT PARQUET);"
 
-# LIST<STRUCT<..., LIST<...>>>。3 段のネスト（配列 → 構造体 → 配列）。
-# list_of_struct/struct_with_list はどちらも 2 段までしか組み合わせていない
-# ので、Dremel 組み立てが3段以上でも repetition/definition level を
-# 正しく積み重ねられるかをこれで確認する。
+# LIST<STRUCT<..., LIST<...>>>: three levels of nesting (array -> struct -> array).
+# list_of_struct/struct_with_list only combine two levels, so this checks that
+# Dremel assembly stacks repetition/definition levels correctly at three levels
+# and beyond.
 duckdb -c "
 COPY (SELECT i::INTEGER AS id,
              [{'name': ('n' || i)::VARCHAR, 'tags': ['t' || i, 't' || (i + 1)]},
@@ -167,9 +168,9 @@ COPY (SELECT i::INTEGER AS id,
       FROM range(0, 10) t(i))
 TO 'list_of_struct_with_list.parquet' (FORMAT PARQUET);"
 
-# --- 複数ファイル 1 テーブル ------------------------------------------------
-# 素の複数ファイル UNION（パーティションなし）。行数をわざと不揃いにして、
-# 「各パートの行数を単純に足し合わせただけ」の取りこぼしを検出しやすくする。
+# --- Multiple files, one table ----------------------------------------------
+# A plain multi-file UNION (no partitioning). Row counts are deliberately uneven
+# to make it easier to catch "just summed each part's row count" mistakes.
 mkdir -p multi
 duckdb -c "COPY (SELECT i::INTEGER AS id, ('n' || i)::VARCHAR AS name FROM range(0, 100) t(i))
            TO 'multi/a.parquet' (FORMAT PARQUET);"
@@ -178,18 +179,18 @@ duckdb -c "COPY (SELECT i::INTEGER AS id, ('n' || i)::VARCHAR AS name FROM range
 duckdb -c "COPY (SELECT i::INTEGER AS id, ('n' || i)::VARCHAR AS name FROM range(250, 480) t(i))
            TO 'multi/c.parquet' (FORMAT PARQUET);"
 
-# Hive スタイルのパーティションディレクトリ。`year=`/`month=` をディレクトリ名
-# から読み取れることと、パーティション列での絞り込みでファイル単位に絞れる
-# ことの両方をこの 1 セットで確認する。
+# Hive-style partition directories. This one set confirms both that `year=`/`month=`
+# can be read out of directory names, and that filtering on a partition column
+# narrows things down to individual files.
 mkdir -p hive/year=2024/month=01 hive/year=2024/month=02 hive/year=2025/month=01
 duckdb -c "COPY (SELECT * FROM range(0,300) t(id)) TO 'hive/year=2024/month=01/part.parquet' (FORMAT PARQUET);"
 duckdb -c "COPY (SELECT * FROM range(300,700) t(id)) TO 'hive/year=2024/month=02/part.parquet' (FORMAT PARQUET);"
 duckdb -c "COPY (SELECT * FROM range(700,1000) t(id)) TO 'hive/year=2025/month=01/part.parquet' (FORMAT PARQUET);"
 
 # --- PIVOT/UNPIVOT ---------------------------------------------------------
-# region × category の小さい表。amount を PIVOT で集約し、q1..q4 を UNPIVOT で
-# 畳み込む。id/region/q1..q4 は「GROUP BY 省略時に自動で残る列」の確認に使う
-# ので、category/amount 以外の列を複数用意してある。
+# A small region x category table. amount is aggregated with PIVOT and q1..q4 are
+# folded with UNPIVOT. id/region/q1..q4 are used to check "columns retained
+# automatically when GROUP BY is omitted", hence several columns beyond category/amount.
 duckdb -c "
 COPY (SELECT i::INTEGER AS id,
              (['north','south','east','west'])[1 + i % 4]::VARCHAR AS region,
@@ -202,8 +203,9 @@ COPY (SELECT i::INTEGER AS id,
       FROM range(0, 60) t(i))
 TO 'pivot.parquet' (FORMAT PARQUET);"
 
-# 上と同じ列構成だが手書きできる大きさの版。GROUP BY 自動検出や IN リストの
-# 別名付けなど、出力を目で数えたいテストはこちらを使う。
+# The same column layout at a size you can write out by hand. Use this one for
+# tests where you want to count the output by eye, such as automatic GROUP BY
+# detection or aliasing in IN lists.
 duckdb -c "
 COPY (SELECT * FROM (VALUES
   ('east', 'a', 10),
@@ -214,20 +216,20 @@ COPY (SELECT * FROM (VALUES
 ) AS t(region, category, amount))
 TO 'pivot_small.parquet' (FORMAT PARQUET);"
 
-# --- ページ単位の枝刈り（ColumnIndex/OffsetIndex/Bloom フィルタ）-----------
-# `pagetest.parquet` は DuckDB ではなく pyarrow (parquet-cpp) で生成する。
-# この環境の DuckDB（v1.4.4）は ColumnIndex/OffsetIndex は書くが Bloom
-# フィルタの書き出しオプションを持たない（`COPY ... (FORMAT PARQUET,
-# BLOOM_FILTER_COLUMNS [...])` は "Unrecognized option" で拒否される）。
-# ColumnIndex/OffsetIndex/Bloom フィルタが揃った実ファイルが要るので、
-# 対応している pyarrow を使う。id は 0..50000 の一意な昇順（等号述語で
-# ちょうど 1 ページに絞り込めることを確認するため）、data_page_size を
-# 小さくしてページ数を稼いでいる。生成後は
-# `crates/ahiru-core/src/parquet/meta.rs` のテストで、pyarrow の書いた
-# ColumnIndex/OffsetIndex とバイト単位で突き合わせている。
+# --- Page-level pruning (ColumnIndex/OffsetIndex/Bloom filter) -------------
+# `pagetest.parquet` is generated with pyarrow (parquet-cpp), not DuckDB.
+# The DuckDB in this environment (v1.4.4) writes ColumnIndex/OffsetIndex but has
+# no option for writing Bloom filters (`COPY ... (FORMAT PARQUET,
+# BLOOM_FILTER_COLUMNS [...])` is rejected with "Unrecognized option").
+# A real file carrying ColumnIndex, OffsetIndex, and a Bloom filter is needed,
+# so pyarrow, which supports it, is used instead. id is unique and ascending over
+# 0..50000 (so an equality predicate can be confirmed to narrow to exactly one
+# page), and data_page_size is kept small to get a decent page count. Once
+# generated, the tests in `crates/ahiru-core/src/parquet/meta.rs` cross-check it
+# byte for byte against the ColumnIndex/OffsetIndex pyarrow wrote.
 #
-# duckdb が要らないので、他のブロックと違って `command -v duckdb` の外に
-# 書いてある。再生成するには `pip install pyarrow` が要る。
+# Since duckdb is not needed, unlike the other blocks this sits outside the
+# `command -v duckdb` check. Regenerating it requires `pip install pyarrow`.
 if command -v python3 >/dev/null && python3 -c "import pyarrow" >/dev/null 2>&1; then
   python3 - <<'PY'
 import pyarrow as pa
@@ -240,23 +242,23 @@ table = pa.table({"id": ids, "s": vals})
 
 pq.write_table(
     table, "pagetest.parquet",
-    row_group_size=n,           # 1 RowGroup に固定し、ページ選択だけを見る
-    data_page_size=4 * 1024,    # 小さいページを大量に作る
-    write_page_index=True,      # ColumnIndex/OffsetIndex を書く
+    row_group_size=n,           # pin to 1 RowGroup, so only page selection is exercised
+    data_page_size=4 * 1024,    # create lots of small pages
+    write_page_index=True,      # write ColumnIndex/OffsetIndex
     bloom_filter_options={"id": {"ndv": n, "fpp": 0.01}},
-    use_dictionary=False,       # 辞書化すると min/max の傾向が変わるので避ける
+    use_dictionary=False,       # dictionary encoding changes the min/max distribution, so avoid it
     compression="SNAPPY",
 )
 PY
 
-  # LIST 列とページ単位の絞り込みの組み合わせ。id に等号/範囲 pruner が
-  # 効いてページ選択が有効化されたとき、xs（複数物理列にまたがらない単純な
-  # LIST だが、入れ子列であることには変わりない）が「ページ選択の対象外
-  # として常に列チャンク全体を読み、選択された行範囲へ後から gather する」
-  # フォールバック分岐 (`format::parquet::read_split` の
-  # `None if desc.nested.is_some()`) を通ることを確認するための版。
-  # DuckDB の COPY にはページサイズを制御するオプションが無いので、ここも
-  # pyarrow を使う。
+  # A LIST column combined with page-level filtering. Confirms that when an
+  # equality/range pruner fires on id and page selection kicks in, xs (a simple
+  # LIST that does not span multiple physical columns, but a nested column all
+  # the same) takes the fallback branch that reads the whole column chunk,
+  # exempt from page selection, and gathers the selected row ranges afterwards
+  # (`None if desc.nested.is_some()` in `format::parquet::read_split`).
+  # DuckDB's COPY has no option to control page size, so pyarrow is used here
+  # as well.
   python3 - <<'PY'
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -276,12 +278,12 @@ pq.write_table(
 )
 PY
 else
-  echo "!! pyarrow が無いので pagetest.parquet / list_pagetest.parquet の再生成をスキップします" >&2
+  echo "!! pyarrow not found; skipping regeneration of pagetest.parquet / list_pagetest.parquet" >&2
 fi
 
-# --- ブラウザデモ用（demo/app.js の cross-format JOIN サンプル） -----------
-# customers は Parquet、orders.csv/regions.jsonl は手書きのプレーンテキスト
-# （duckdb で作る理由が無いのでここには含めない）。
+# --- For the browser demo (the cross-format JOIN sample in demo/app.js) ----
+# customers is Parquet; orders.csv/regions.jsonl are hand-written plain text
+# (no reason to build them with duckdb, so they are not included here).
 duckdb -c "
 COPY (SELECT * FROM (VALUES
     (1, 'Alice', 'east'), (2, 'Bob', 'west'), (3, 'Carol', 'east'),
@@ -292,4 +294,4 @@ TO 'customers.parquet' (FORMAT PARQUET);"
 echo
 ls -la
 echo
-echo "OK: tests/data を再生成しました"
+echo "OK: regenerated tests/data"

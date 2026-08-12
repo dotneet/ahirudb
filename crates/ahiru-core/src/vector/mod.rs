@@ -1,9 +1,9 @@
-//! ミニ Arrow 相当の列指向ベクタ層。
+//! The columnar vector layer, a miniature equivalent of Arrow.
 //!
-//! - 1 バッチ = 2048 行。オペレータ間はこの単位で受け渡す。
-//! - `Vector` の長さはデータ本体から導出する（別途 `len` を持たない）。
-//!   フィールドの二重管理による不整合バグを構造的に潰すため。
-//! - フィルタは行をコピーせず `Batch::sel`（selection vector）を絞る。
+//! - One batch = 2048 rows. Operators hand data to each other in these units.
+//! - A `Vector`'s length is derived from the data itself (there is no separate `len`),
+//!   structurally eliminating inconsistency bugs from managing the same fact twice.
+//! - Filtering narrows `Batch::sel` (the selection vector) instead of copying rows.
 
 pub mod bitmap;
 pub mod types;
@@ -15,10 +15,10 @@ pub use value::Value;
 
 use crate::prelude::*;
 
-/// 1 バッチあたりの行数。
+/// Rows per batch.
 pub const BATCH_SIZE: usize = 2048;
 
-/// 可変長バイト列の格納。`offsets.len() == 行数 + 1`。
+/// Storage for variable-length byte sequences. `offsets.len() == rows + 1`.
 #[derive(Clone)]
 pub struct BytesData {
     pub offsets: Vec<u32>,
@@ -38,7 +38,7 @@ impl BytesData {
 
     #[inline]
     pub fn len(&self) -> usize {
-        // `saturating_sub` は空 offsets（`BytesData::EMPTY`）を安全に 0 行として扱うため。
+        // `saturating_sub` is what safely treats empty offsets (`BytesData::EMPTY`) as 0 rows.
         self.offsets.len().saturating_sub(1)
     }
 
@@ -60,7 +60,7 @@ impl BytesData {
         self.offsets.push(self.data.len() as u32);
     }
 
-    /// 空バイト列を追加する。NULL 行のプレースホルダに使う。
+    /// Appends an empty byte sequence. Used as the placeholder for NULL rows.
     #[inline]
     pub fn push_empty(&mut self) {
         self.offsets.push(self.data.len() as u32);
@@ -78,7 +78,7 @@ impl Default for BytesData {
     }
 }
 
-/// 物理型ごとのデータ本体。
+/// The data itself, per physical type.
 #[derive(Clone)]
 pub enum Data {
     Bool(Bitmap),
@@ -152,11 +152,11 @@ impl Data {
     }
 }
 
-/// 1 列分のベクタ。
+/// The vector for one column.
 #[derive(Clone)]
 pub struct Vector {
     ty: Ty,
-    /// `None` は「全行 valid」を意味する。NULL の無い列でビットマップを持たない。
+    /// `None` means "every row is valid". Columns without NULLs carry no bitmap.
     validity: Option<Bitmap>,
     data: Data,
 }
@@ -181,7 +181,7 @@ impl Vector {
         self.ty
     }
 
-    /// 論理型だけを差し替える。物理型が同じ場合のみ許される（例: INT → DATE）。
+    /// Replaces just the logical type. Allowed only when the physical type is unchanged (e.g. INT -> DATE).
     pub fn retype(&mut self, ty: Ty) {
         debug_assert_eq!(ty.phys(), self.data.phys());
         self.ty = ty;
@@ -230,7 +230,7 @@ impl Vector {
         self.validity = v;
     }
 
-    /// validity ビットマップを実体化して返す。無ければ全 1 で作る。
+    /// Materializes and returns the validity bitmap, creating an all-ones one if absent.
     pub fn validity_mut(&mut self) -> &mut Bitmap {
         if self.validity.is_none() {
             self.validity = Some(Bitmap::ones(self.data.len()));
@@ -242,7 +242,7 @@ impl Vector {
         b
     }
 
-    /// NULL が 1 つも無ければ validity を捨てる。以降の演算が速くなる。
+    /// Drops the validity when there is not a single NULL. Later operations get faster.
     pub fn compact_validity(&mut self) {
         if let Some(b) = &self.validity {
             if b.all_set() {
@@ -251,9 +251,9 @@ impl Vector {
         }
     }
 
-    // --- 型別アクセサ -------------------------------------------------------
-    // 物理型の不一致は呼び出し側のバグ。no_std でパニックさせないため、
-    // デバッグビルドで検出しリリースでは空を返す。
+    // --- Per-type accessors -------------------------------------------------
+    // A physical type mismatch is a caller bug. To avoid panicking under no_std,
+    // it is detected in debug builds and returns empty in release.
 
     #[inline]
     pub fn i32s(&self) -> &[i32] {
@@ -321,8 +321,8 @@ impl Vector {
         }
     }
 
-    /// i 番目の値をスカラとして取り出す。結果出力と定数畳み込み用。
-    /// ホットループでは使わない。
+    /// Extracts the i-th value as a scalar. For result output and constant folding.
+    /// Not for use in hot loops.
     pub fn value_at(&self, i: usize) -> Value {
         if !self.is_valid(i) {
             return Value::Null;
@@ -337,7 +337,7 @@ impl Vector {
         }
     }
 
-    /// 末尾に NULL を 1 行追加する。物理データにはダミー値を入れる。
+    /// Appends one NULL row at the end. A dummy value goes into the physical data.
     pub fn push_null(&mut self) {
         match &mut self.data {
             Data::Bool(b) => b.push(false),
@@ -401,8 +401,8 @@ impl Vector {
         }
     }
 
-    /// selection vector に従って行を抽出した新しいベクタを作る。
-    /// 結果を materialize する必要が生じたときにだけ呼ぶ。
+    /// Builds a new vector with the rows selected by the selection vector.
+    /// Called only when the result genuinely has to be materialized.
     pub fn gather(&self, sel: &[u32]) -> Vector {
         let mut out = Vector::with_capacity(self.ty, sel.len());
         match &self.data {
@@ -437,7 +437,7 @@ impl Vector {
     }
 }
 
-// `bytes()` の型不一致時に返す空データ。`Vec::new()` は const fn。
+// The empty data returned by `bytes()` on a type mismatch. `Vec::new()` is a const fn.
 static EMPTY_BYTES: BytesData = BytesData { offsets: Vec::new(), data: Vec::new() };
 
 impl BytesData {
@@ -446,12 +446,12 @@ impl BytesData {
     }
 }
 
-/// オペレータ間で受け渡す 1 バッチ。
+/// One batch, as handed between operators.
 pub struct Batch {
     pub cols: Vec<Vector>,
-    /// 有効行のインデックス。`None` は「全行有効」。
+    /// Indices of the valid rows. `None` means "all rows are valid".
     pub sel: Option<Vec<u32>>,
-    /// 列が 0 個のとき（`COUNT(*)` など）に行数を保持する。
+    /// Holds the row count when there are zero columns (as with `COUNT(*)`).
     empty_rows: usize,
 }
 
@@ -460,12 +460,12 @@ impl Batch {
         Batch { cols, sel: None, empty_rows: 0 }
     }
 
-    /// 列を持たず行数だけを表すバッチ。
+    /// A batch with no columns, representing only a row count.
     pub fn rows_only(n: usize) -> Self {
         Batch { cols: Vec::new(), sel: None, empty_rows: n }
     }
 
-    /// 物理行数（selection 適用前）。
+    /// The physical row count (before selection is applied).
     pub fn num_rows(&self) -> usize {
         match self.cols.first() {
             Some(c) => c.len(),
@@ -473,7 +473,7 @@ impl Batch {
         }
     }
 
-    /// 有効行数（selection 適用後）。
+    /// The valid row count (after selection is applied).
     pub fn card(&self) -> usize {
         match &self.sel {
             Some(s) => s.len(),
@@ -485,12 +485,12 @@ impl Batch {
         self.card() == 0
     }
 
-    /// selection を実体化して全列を絞り込む。
-    /// ハッシュ表への投入など、ランダムアクセスが増える手前で呼ぶ。
+    /// Materializes the selection, narrowing every column.
+    /// Called just before random access increases, such as feeding a hash table.
     pub fn materialize(&mut self) {
         if let Some(sel) = self.sel.take() {
             if sel.len() == self.num_rows() {
-                // すべて選択されているならコピー不要。
+                // No copy needed if everything is selected.
                 let full = sel.iter().enumerate().all(|(i, &v)| i as u32 == v);
                 if full {
                     return;

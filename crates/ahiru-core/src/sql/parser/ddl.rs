@@ -4,7 +4,7 @@ use super::*;
 use crate::sql::ast::{AlterTableAction, ColumnDef};
 
 impl<'a> Parser<'a> {
-    // --- DDL（`ddl` フィーチャ） ----------------------------------------------
+    // --- DDL (the `ddl` feature) ----------------------------------------------
 
     #[cfg(feature = "ddl")]
     fn if_not_exists(&mut self) -> Result<bool> {
@@ -52,7 +52,7 @@ impl<'a> Parser<'a> {
             self.expect_kw(Kw::Null)?;
             false
         } else {
-            // 明示 `NULL` は既定と同じ意味なので読み捨てる。
+            // An explicit `NULL` means the same as the default, so it is read and discarded.
             self.eat_kw(Kw::Null)?;
             true
         };
@@ -86,9 +86,9 @@ impl<'a> Parser<'a> {
         Ok(Stmt::CreateTable { name, or_replace, if_not_exists, columns, as_select: None })
     }
 
-    /// ビュー本体は AST ではなく原文の切り出しで保持する
-    /// （`sql::ast::Stmt::CreateView` のドキュメント参照）。ここでは構文検証を
-    /// 兼ねて一度パースし、消費したトークン範囲をそのまま文字列として拾う。
+    /// The view body is kept as a slice of the original text rather than an AST
+    /// (see the docs on `sql::ast::Stmt::CreateView`). Here it is parsed once, which
+    /// doubles as syntax validation, and the consumed token range is taken as the string.
     #[cfg(feature = "ddl")]
     fn create_view_stmt(&mut self, sql: &'a str, or_replace: bool) -> Result<Stmt> {
         let name = self.ident()?;
@@ -117,9 +117,9 @@ impl<'a> Parser<'a> {
     /// `ALTER TABLE t ADD [COLUMN] col ty [NOT NULL] [DEFAULT expr]` /
     /// `ALTER TABLE t DROP [COLUMN] col` /
     /// `ALTER TABLE t RENAME [COLUMN] old TO new` /
-    /// `ALTER TABLE t RENAME TO new_name`。
+    /// `ALTER TABLE t RENAME TO new_name`.
     ///
-    /// `COLUMN` キーワードは DuckDB と同じく省略可（CLI で確認済み）。
+    /// The `COLUMN` keyword is optional, as in DuckDB (confirmed with the CLI).
     #[cfg(feature = "ddl")]
     pub(super) fn alter_table_stmt(&mut self) -> Result<Stmt> {
         self.bump()?; // ALTER

@@ -1,16 +1,17 @@
-//! ビットリーダ 2 種。
+//! Two kinds of bit reader.
 //!
-//! zstd は流儀を 2 つ混在させる。FSE テーブル記述だけが前から読む LSB 先行の
-//! ストリームで、ハフマンとシーケンスの本体は末尾バイトから前方向へ戻りながら
-//! 読む。どちらもここに閉じ込めて、上位からはビット数だけを扱わせる。
+//! zstd mixes two conventions. Only the FSE table description is an LSB-first
+//! stream read front to back; the Huffman and sequences payloads are read
+//! backwards from the last byte. Both are confined here so callers above only
+//! ever deal in bit counts.
 
 use crate::Error;
 
-/// `src` を「バイト 0 の最下位ビットを 0 番」とするビット列と見なし、
-/// ビット位置 `off` から `n` ビット (n <= 32) を読む。
+/// Treats `src` as a bit sequence whose bit 0 is the least significant bit of
+/// byte 0, and reads `n` bits (n <= 32) starting at bit position `off`.
 ///
-/// 範囲外は 0 として扱う。逆向きリーダが末尾のパディングを踏むとき、
-/// 仕様上そこは 0 埋めとして解釈するため（境界検査は呼び出し側で済ませる）。
+/// Out-of-range bits read as 0. When the backwards reader steps into the trailing
+/// padding, the spec says to interpret it as zero fill (bounds checking is the caller's job).
 fn read_le(src: &[u8], off: usize, n: u32) -> u64 {
     let mut res: u64 = 0;
     let mut got: u32 = 0;
@@ -33,7 +34,7 @@ fn read_le(src: &[u8], off: usize, n: u32) -> u64 {
     }
 }
 
-/// 前向き LSB 先行リーダ。FSE テーブル記述専用。
+/// Forward LSB-first reader. For FSE table descriptions only.
 pub struct Forward<'a> {
     src: &'a [u8],
     bit: usize,
@@ -44,7 +45,7 @@ impl<'a> Forward<'a> {
         Forward { src, bit: 0 }
     }
 
-    /// `n` ビット (n <= 32) 読む。入力が尽きたら `Err`。
+    /// Reads `n` bits (n <= 32). `Err` once the input runs out.
     pub fn read(&mut self, n: u32) -> Result<u32, Error> {
         if n == 0 {
             return Ok(0);
@@ -58,22 +59,22 @@ impl<'a> Forward<'a> {
         Ok(v as u32)
     }
 
-    /// 1 ビット戻す。テーブル記述の「小さい値は 1 ビット短い」符号で使う。
+    /// Puts one bit back. Used by the table description's "small values are one bit shorter" coding.
     pub fn rewind1(&mut self) {
         self.bit = self.bit.saturating_sub(1);
     }
 
-    /// バイト境界に切り上げた消費バイト数。
+    /// Bytes consumed, rounded up to a byte boundary.
     pub fn bytes_used(&self) -> usize {
         self.bit.div_ceil(8)
     }
 }
 
-/// 逆向きリーダ。
+/// The backwards reader.
 ///
-/// 末尾バイトの最上位の 1 ビットがストリーム終端マーカで、それより上位は
-/// パディング。`off` は「まだ読んでいないビット数」で、負になったら
-/// ストリームを踏み越えた合図（FSE のシンボル数はこれでしか分からない）。
+/// The highest set bit of the last byte is the stream end marker, and everything
+/// above it is padding. `off` is "bits not yet read"; going negative signals that
+/// the stream was overrun (which is the only way to learn FSE's symbol count).
 pub struct Reverse<'a> {
     src: &'a [u8],
     off: i64,
@@ -85,7 +86,7 @@ impl<'a> Reverse<'a> {
             Some(v) => *v,
             None => return Err(Error::UnexpectedEof),
         };
-        // マーカが立っていないストリームは壊れている。
+        // A stream without the marker set is corrupt.
         if last == 0 {
             return Err(Error::BadBitstream);
         }
@@ -94,7 +95,7 @@ impl<'a> Reverse<'a> {
         Ok(Reverse { src, off })
     }
 
-    /// 消費せずに上位 `n` ビットを覗く。足りない分は下位を 0 で埋める。
+    /// Peeks the top `n` bits without consuming. Anything missing is zero-filled at the bottom.
     pub fn peek(&self, n: u32) -> u64 {
         if n == 0 {
             return 0;
@@ -123,7 +124,7 @@ impl<'a> Reverse<'a> {
         v
     }
 
-    /// 残りビット数。負ならストリームを踏み越えている。
+    /// Bits remaining. Negative means the stream was overrun.
     pub fn off(&self) -> i64 {
         self.off
     }

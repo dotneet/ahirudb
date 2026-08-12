@@ -1,8 +1,8 @@
-//! 物理オペレータ（プル型 Volcano、ベクトル化）。
+//! Physical operators (pull-based Volcano, vectorized).
 //!
-//! プッシュ型のほうが速いが、プル型のほうがコード量が小さく、RowGroup 境界の
-//! ステップ実行（DESIGN.md §6）に自然に載るのでプル型を採る。1 回の `next()`
-//! で 2048 行を返すため、Volcano の呼び出しオーバーヘッドは相対的に無視できる。
+//! Push-based would be faster, but pull-based takes less code and rides naturally on the
+//! step-wise execution at RowGroup boundaries (DESIGN.md §6), so pull-based it is. One
+//! `next()` returns 2048 rows, so Volcano's call overhead is relatively negligible.
 
 pub mod agg;
 pub mod join;
@@ -23,27 +23,27 @@ use crate::plan::{Node, ScanSpec};
 use crate::prelude::*;
 use crate::vector::{Batch, Field, Vector, BATCH_SIZE};
 
-/// ホストに要求するバイト範囲。
+/// A byte range requested from the host.
 #[derive(Clone, Copy)]
 pub struct IoRequest {
-    /// カタログ上のテーブル添字。
+    /// The table index in the catalog.
     pub table: usize,
-    /// テーブル内のパート添字（複数ファイルテーブルの何ファイル目か）。
-    /// 単一ファイルのテーブルは常に 0。
+    /// The part index within the table (which file of a multi-file table).
+    /// Always 0 for a single-file table.
     pub part: usize,
     pub offset: u64,
     pub len: u64,
 }
 
-/// ホストに展開を依頼する圧縮ブロック。
+/// A compressed block the host is asked to decompress.
 ///
-/// wasm コアが内蔵しないコーデック（GZIP / ZSTD）はここを通る。GZIP は
-/// ブラウザの `DecompressionStream`、ZSTD は別 wasm モジュールが処理する
-/// （DESIGN.md §6）。エンジンから見ればどちらも同じ「ホストに頼む作業」。
+/// Codecs the wasm core does not carry (GZIP / ZSTD) go through here. GZIP is handled by the
+/// browser's `DecompressionStream` and ZSTD by a separate wasm module (DESIGN.md §6). From
+/// the engine's point of view both are the same "work asked of the host".
 #[derive(Clone, Copy)]
 pub struct CodecRequest {
     pub table: usize,
-    /// `IoRequest::part` と同じ意味。
+    /// The same meaning as `IoRequest::part`.
     pub part: usize,
     pub codec: crate::parquet::Compression,
     pub offset: u64,
@@ -53,9 +53,9 @@ pub struct CodecRequest {
 
 pub enum Step {
     Ready(Batch),
-    /// 必要なバイトが未取得。`ExecContext::io` に要求が積まれている。
+    /// The needed bytes are not fetched yet. The requests are queued on `ExecContext::io`.
     NeedIo,
-    /// 内蔵していないコーデックの展開が必要。`ExecContext::codec` に要求がある。
+    /// A codec that is not built in must be decompressed. The requests are on `ExecContext::codec`.
     NeedCodec,
     Done,
 }
@@ -71,20 +71,20 @@ pub trait Operator {
     fn next(&mut self, ctx: &mut ExecContext) -> Result<Step>;
 }
 
-/// 論理プランから物理オペレータ木を組み立てる。
+/// Builds the physical operator tree from the logical plan.
 pub fn build(node: Node) -> Result<Box<dyn Operator>> {
     build_ctx(node, None)
 }
 
-/// `build` の本体。`working` は「再帰 CTE の再帰項を組み立てている最中か」
-/// を表し、`Some` のときだけ `Node::WorkingTable` を解決できる
-/// （`exec::recursive` 参照）。トップレベルの `build` は常に `None` で呼ぶ。
+/// The body of `build`. `working` says whether a recursive CTE's recursive term is being
+/// assembled, and only when it is `Some` can `Node::WorkingTable` be resolved
+/// (see `exec::recursive`). The top-level `build` always calls with `None`.
 ///
-/// 再帰 CTE の入れ子（ある再帰 CTE の再帰項が、既に完成した別の再帰 CTE を
-/// 参照する）でも `working` はそのまま素通しするだけで安全: `bind` は
-/// `Node::WorkingTable` を「それを生んだ `RecursiveCte` 自身の再帰項」の
-/// 中にしか置かないので、内側の木に迷い込んだ外側の作業テーブルが誤って
-/// 使われることはない。
+/// Even with nested recursive CTEs (one recursive CTE's recursive term referencing another,
+/// already-completed one), passing `working` straight through is safe: `bind` only ever
+/// places a `Node::WorkingTable` inside "the recursive term of the `RecursiveCte` that
+/// produced it", so an outer working table straying into an inner tree can never be used by
+/// mistake.
 fn build_ctx(node: Node, working: Option<&[Batch]>) -> Result<Box<dyn Operator>> {
     Ok(match node {
         Node::Scan(spec) => Box::new(Scan::new(*spec)),
@@ -139,9 +139,9 @@ fn build_ctx(node: Node, working: Option<&[Batch]>) -> Result<Box<dyn Operator>>
             recursive::RecursiveCte::new(build_ctx(*anchor, working)?, *recursive_term, union_all),
         ),
         Node::WorkingTable { .. } => {
-            // `bind` は `Node::WorkingTable` を自分を生んだ `RecursiveCte` の
-            // 再帰項の中にしか置かないので、`working` が無いのはバインダの
-            // バグ（あるいは `exec::build` をこのノードへ直接呼んだバグ）。
+            // `bind` only places a `Node::WorkingTable` inside the recursive term of the
+            // `RecursiveCte` that produced it, so a missing `working` is a binder bug (or a bug
+            // calling `exec::build` directly on this node).
             let batches = match working {
                 Some(w) => recursive::clone_batches(w),
                 None => err!(Internal),
@@ -169,20 +169,20 @@ fn build_ctx(node: Node, working: Option<&[Batch]>) -> Result<Box<dyn Operator>>
 
 pub struct Scan {
     spec: ScanSpec,
-    /// 現在読んでいるテーブルパートの添字（複数ファイルテーブルの何ファイル
-    /// 目か）。単一ファイルのテーブルは常に 0 のまま終わる。
+    /// The index of the table part currently being read (which file of a multi-file table).
+    /// For a single-file table it stays 0 throughout.
     part: usize,
-    /// 現在のパート内で次に読む分割（Parquet なら RowGroup、CSV なら
-    /// バイトチャンク）。パートを跨ぐと 0 に戻る。
+    /// The next split to read within the current part (a RowGroup for Parquet, a byte chunk for
+    /// CSV). It resets to 0 when crossing into a new part.
     split: usize,
-    /// 復号済みの分割。
+    /// The decoded split.
     cur: Option<Decoded>,
 }
 
 struct Decoded {
     cols: Vec<Vector>,
     rows: usize,
-    /// 次に返す行の先頭。
+    /// The start of the next row to return.
     pos: usize,
 }
 
@@ -195,12 +195,12 @@ impl Scan {
 impl Operator for Scan {
     fn next(&mut self, ctx: &mut ExecContext) -> Result<Step> {
         loop {
-            // 復号済みの分割が残っていればそこから返す。
+            // If a decoded split remains, return from it.
             if let Some(d) = &mut self.cur {
                 if d.pos < d.rows {
                     let n = (d.rows - d.pos).min(BATCH_SIZE);
-                    // TODO: 連続範囲のコピーで済むので、専用のスライスを用意すれば
-                    // この添字配列は不要になる。
+                    // TODO: a contiguous-range copy would do, so a dedicated slice would make
+                    // this index array unnecessary.
                     let idx: Vec<u32> = (d.pos as u32..(d.pos + n) as u32).collect();
                     let cols = d.cols.iter().map(|c| c.gather(&idx)).collect();
                     d.pos += n;
@@ -214,11 +214,11 @@ impl Operator for Scan {
                 None => err!(TableNotFound),
             };
 
-            // 現在のパートを読み切っていたら次のパートへ進む。分割が 0 個の
-            // パート（空ファイルなど）も飛ばせるよう while で進める。これで
-            // 上位のオペレータ（Filter/Project/...）は複数ファイルテーブルを
-            // 意識せずに済む — 分割番号を「テーブル全体で平坦な列」に見せる
-            // のがこのループの役目。
+            // Once the current part is read through, advance to the next. A `while` is used so
+            // parts with zero splits (an empty file, say) can be skipped as well. That way the
+            // operators above (Filter/Project/...) need not be aware of multi-file tables --
+            // presenting split numbers as "one flat sequence across the whole table" is this
+            // loop's job.
             while self.part < table.parts.len()
                 && self.split >= table.parts[self.part].format.num_splits()
             {
@@ -231,16 +231,16 @@ impl Operator for Scan {
             let part = &table.parts[self.part];
             let fmt = &part.format;
 
-            // 統計で落とせるならバイトを 1 つも取らずに次へ進む。
-            // 統計を持たないフォーマットは既定実装で常に通す。
+            // If statistics can rule it out, move on without fetching a single byte.
+            // Formats with no statistics always pass under the default implementation.
             if !fmt.may_match(self.split, &self.spec.pruners, &self.spec.columns) {
                 self.split += 1;
                 continue;
             }
 
-            // ページ単位の絞り込み（ColumnIndex/OffsetIndex/Bloom フィルタ）に
-            // 使うバイトを集める。対象が無ければ何も積まれない（既定実装）ので、
-            // 対応しないフォーマットはここで 1 往復も増えない。
+            // Collects the bytes needed for page-level filtering (ColumnIndex/OffsetIndex/Bloom
+            // filter). With nothing to target, nothing is queued (the default implementation), so
+            // formats without support add not one round trip here.
             let mut idx_ranges = Vec::with_capacity(self.spec.columns.len());
             fmt.index_ranges(self.split, &self.spec.pruners, &self.spec.columns, &mut idx_ranges)?;
             let mut idx_missing = Vec::new();
@@ -259,11 +259,10 @@ impl Operator for Scan {
                 return Ok(Step::NeedIo);
             }
 
-            // 取得できたインデックスバイトでページ選択を確定する。`false` なら
-            // この分割は丸ごと読み飛ばせる（Bloom フィルタでの否定、または
-            // 統計上どのページも一致し得ない場合）。`&mut self` が要るので、
-            // ここだけ `catalog` を可変で借り直す（`table`/`part`/`fmt` は
-            // 以降で改めて取り直す）。
+            // Page selection is settled with the index bytes obtained. `false` means this whole
+            // split can be skipped (a Bloom filter negative, or no page can match by statistics).
+            // It needs `&mut self`, so only here is `catalog` reborrowed mutably
+            // (`table`/`part`/`fmt` are re-taken afterwards).
             let keep = match ctx.catalog.get_mut(self.spec.table) {
                 Some(t) => match t.parts.get_mut(self.part) {
                     Some(p) => p.format.refine_with_index(
@@ -288,10 +287,10 @@ impl Operator for Scan {
             let part = &table.parts[self.part];
             let fmt = &part.format;
 
-            // この分割に必要なバイト範囲を集め、未取得なら一括で要求する。
-            // 分割境界でしか I/O を待たないので、オペレータは非同期を意識しない
-            // （DESIGN.md §6）。ページ選択が効いていれば、ここで返る範囲は
-            // 列チャンク全体ではなく生存ページだけに絞られる。
+            // Collects the byte ranges this split needs and requests them all at once if not yet
+            // fetched. I/O is awaited only at split boundaries, so operators never think about
+            // asynchrony (DESIGN.md §6). With page selection in effect, the ranges returned here
+            // are narrowed to the surviving pages rather than whole column chunks.
             let mut ranges = Vec::with_capacity(self.spec.columns.len());
             fmt.split_ranges(self.split, &self.spec.columns, &mut ranges)?;
             let mut missing = Vec::new();
@@ -310,8 +309,8 @@ impl Operator for Scan {
                 return Ok(Step::NeedIo);
             }
 
-            // 内蔵していないコーデックはホストに展開してもらう。ページヘッダは
-            // 非圧縮なので、この時点で必要な作業をすべて洗い出せる。
+            // Codecs that are not built in are decompressed by the host. Page headers are
+            // uncompressed, so all the necessary work can be enumerated at this point.
             let mut tasks = Vec::new();
             fmt.codec_tasks(&part.source, self.split, &self.spec.columns, &mut tasks)?;
             let mut pending = Vec::new();
@@ -333,13 +332,13 @@ impl Operator for Scan {
             }
 
             let cols = fmt.read_split(&part.source, self.split, &self.spec.columns)?;
-            // フォーマット実装の契約: 射影と同じ個数・同じ長さの列を返す。
+            // The format implementation's contract: return as many columns, of the same length, as the projection.
             ensure!(cols.len() == self.spec.columns.len(), Internal);
             let rows = cols.first().map_or(0, |c| c.len());
             ensure!(cols.iter().all(|c| c.len() == rows), Internal);
 
-            // 展開済みページはこの分割でしか使わない。抱えたままだと
-            // 圧縮前のファイルより大きなメモリを持つことになる。
+            // Decompressed pages are used only within this split. Holding on to them would keep
+            // more memory than the pre-compression file.
             if let Some(t) = ctx.catalog.get_mut(self.spec.table) {
                 if let Some(p) = t.parts.get_mut(self.part) {
                     p.source.clear_decoded();
@@ -348,7 +347,7 @@ impl Operator for Scan {
 
             self.split += 1;
             if rows == 0 {
-                // 空の分割（空の CSV チャンクなど）は読み飛ばす。
+                // An empty split (an empty CSV chunk, say) is skipped.
                 continue;
             }
             self.cur = Some(Decoded { cols, rows, pos: 0 });
@@ -358,9 +357,9 @@ impl Operator for Scan {
 
 // --- MemScan (`ddl`) ---------------------------------------------------------
 
-/// `catalog::MemTable` の走査。データは既にメモリ上にあるので、`Scan` と
-/// 違って `NeedIo`/`NeedCodec` は原理的に返らない
-/// （DESIGN.md §16「なぜ 4 つに割るのか」）。
+/// Scanning a `catalog::MemTable`. The data is already in memory, so unlike `Scan` it can
+/// never in principle return `NeedIo`/`NeedCodec`
+/// (DESIGN.md §16, "why it is split into four").
 #[cfg(feature = "ddl")]
 pub struct MemScan {
     spec: crate::plan::MemScanSpec,
@@ -408,7 +407,7 @@ impl Operator for Filter {
             let mut sel = Vec::new();
             ctx.vm.eval_filter(&self.pred, &batch, &mut sel)?;
             if sel.is_empty() {
-                // 全行落ちたバッチは上流に返さず次を引く。
+                // A batch whose rows are all filtered out is not returned upstream; the next is pulled.
                 continue;
             }
             batch.sel = Some(sel);
@@ -419,14 +418,14 @@ impl Operator for Filter {
 
 // --- DistinctOn ---------------------------------------------------------------
 
-/// `DISTINCT ON (keys)`。
+/// `DISTINCT ON (keys)`.
 ///
-/// 入力の並び順で、キーごとに**最初に見た行だけ**を通すストリーミングフィルタ。
-/// 「どの行が先か」を決めるのはこのオペレータの仕事ではなく、呼び出し側
-/// （バインダ）が必要なら先に `Sort` を挟んで並びを確定させておく。
-/// ブロッキングではないので `NeedIo`/`NeedCodec` はそのまま素通しするだけで
-/// 再開できる（`Filter` と同じ単純さ）。状態（`seen`）はバッチをまたいで
-/// 保持するが、1 バッチぶんの処理は途中で抜けずに丸ごと終える。
+/// A streaming filter passing, in the input's order, **only the first row seen** per key.
+/// Deciding "which row comes first" is not this operator's job; the caller (the binder)
+/// interposes a `Sort` first when the order matters.
+/// It is not blocking, so `NeedIo`/`NeedCodec` are simply passed through and it resumes (the
+/// same simplicity as `Filter`). State (`seen`) is kept across batches, but one batch's worth
+/// of processing always finishes in full rather than bailing out midway.
 const MAX_DISTINCT_ON_BYTES: usize = 64 << 20;
 
 pub struct DistinctOn {
@@ -509,7 +508,7 @@ pub struct Limit {
     input: Box<dyn Operator>,
     limit: Option<u64>,
     offset: u64,
-    /// OFFSET 消化のために読み飛ばした行数。
+    /// How many rows were skipped to consume the OFFSET.
     seen: u64,
     emitted: u64,
 }
@@ -528,7 +527,7 @@ impl Operator for Limit {
             };
             let card = batch.card() as u64;
 
-            // OFFSET をまだ消化しきっていない。
+            // The OFFSET has not been fully consumed yet.
             if self.seen + card <= self.offset {
                 self.seen += card;
                 continue;
@@ -557,17 +556,17 @@ impl Operator for Limit {
     }
 }
 
-/// 実行結果のスキーマ。
+/// The schema of an execution result.
 pub fn result_schema(node: &Node) -> Vec<Field> {
     node.schema().to_vec()
 }
 
 // --- Values -----------------------------------------------------------------
 
-/// あらかじめ作ったバッチを 1 回だけ返すオペレータ。
+/// An operator returning a pre-built batch exactly once.
 ///
-/// `DESCRIBE` / `SHOW TABLES` / `EXPLAIN` のように、スキャンを伴わずに
-/// 結果が確定しているものに使う。専用の実行経路を作らずに済む。
+/// Used where the result is already settled without a scan, as with
+/// `DESCRIBE` / `SHOW TABLES` / `EXPLAIN`. It saves building a dedicated execution path.
 pub struct Values {
     batch: Option<Batch>,
 }
@@ -606,7 +605,7 @@ mod distinct_on_tests {
         v
     }
 
-    /// `idx` 列をそのまま返すプログラム。
+    /// A program that just returns column `idx`.
     fn load(idx: u16) -> Program {
         let mut p = Program::new();
         let r = p.alloc_reg();
@@ -646,7 +645,7 @@ mod distinct_on_tests {
         let mut vm = Vm::new();
         let mut rows = Vec::new();
         for guard in 0..10_000 {
-            assert!(guard < 9_999, "終わらない");
+            assert!(guard < 9_999, "does not terminate");
             let mut ctx =
                 ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
             match op.next(&mut ctx).unwrap() {
@@ -668,7 +667,7 @@ mod distinct_on_tests {
 
     #[test]
     fn keeps_only_the_first_row_per_key_in_arrival_order() {
-        // key=1 の行が 3 つ、key=2 の行が 2 つ来る。各キーの最初の行だけ残る。
+        // Three rows with key=1 and two with key=2 arrive. Only the first row of each key survives.
         let steps = vec![Script::Rows(vec![
             ints(&[Some(1), Some(2), Some(1), Some(2), Some(1)]),
             ints(&[Some(10), Some(20), Some(11), Some(21), Some(12)]),
@@ -699,7 +698,7 @@ mod distinct_on_tests {
             ints(&[Some(100), Some(200), Some(300)]),
         ])];
         let rows = drive(steps, vec![load(0), load(1)]);
-        // (1,1) と (1,2) は別キー、2 つ目の (1,1) は重複なので落ちる。
+        // (1,1) and (1,2) are different keys; the second (1,1) is a duplicate and is dropped.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][2], Value::I32(100));
         assert_eq!(rows[1][2], Value::I32(200));
@@ -718,14 +717,14 @@ mod distinct_on_tests {
         };
         let plain = drive(make(false), vec![load(0)]);
         let interrupted = drive(make(true), vec![load(0)]);
-        assert_eq!(plain, interrupted, "NeedIo をまたいでも結果が変わってはいけない");
+        assert_eq!(plain, interrupted, "the result must not change across a NeedIo");
         assert_eq!(plain.len(), 3);
     }
 
     #[test]
     fn all_duplicates_in_a_batch_yield_no_output_batch() {
-        // 1 バッチが丸ごと重複だけなら、そのバッチは呼び出し元に返らず
-        // 次の入力を引きにいく（`Filter` と同じ「空なら次へ」規律）。
+        // If a whole batch is nothing but duplicates, that batch is not returned to the caller
+        // and the next input is pulled (the same "empty means next" discipline as `Filter`).
         let steps = vec![
             Script::Rows(vec![ints(&[Some(1)]), ints(&[Some(10)])]),
             Script::Rows(vec![ints(&[Some(1), Some(1)]), ints(&[Some(99), Some(98)])]),

@@ -1,11 +1,13 @@
-//! 列チャンク（辞書ページ + データページ群）→ `Vector`。
+//! Column chunk (dictionary page + data pages) -> `Vector`.
 //!
-//! v1 はフラットスキーマのみを扱うので repetition level は常に 0 であり、
-//! definition level は 0/1 の 1 ビットで表せる。これは validity ビットマップ
-//! そのものなので、レベル配列を実体化せず直接ビットマップに落とす。
+//! v1 only handles flat schemas, so the repetition level is always 0, and
+//! the definition level can be represented as a single 0/1 bit. This is
+//! exactly the validity bitmap, so we decode straight into a bitmap without
+//! ever materializing a level array.
 //!
-//! 論理型ごとの分岐はここに閉じ込める。ここから下流（式 VM、オペレータ）は
-//! 物理型 6 種しか見ない（DESIGN.md §8）。
+//! Branching per logical type is confined to this module. Everything
+//! downstream from here (the expression VM, operators) sees only the 6
+//! physical types (DESIGN.md §8).
 
 use alloc::borrow::Cow;
 
@@ -17,23 +19,24 @@ use crate::parquet::*;
 use crate::prelude::*;
 use crate::vector::{Bitmap, Data, PhysType, Ty, Vector};
 
-/// Unix エポック (1970-01-01) のユリウス通日。INT96 の変換に使う。
+/// Julian day number of the Unix epoch (1970-01-01). Used to convert INT96.
 const JULIAN_EPOCH: i64 = 2_440_588;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
-/// 1 ページあたりの値数の上限。破損したヘッダによる巨大確保を防ぐ。
+/// Upper bound on the number of values per page. Prevents a huge allocation from a corrupted header.
 const MAX_PAGE_VALUES: usize = 1 << 26;
 
-/// ホストが展開したページの置き場。
+/// Storage for pages the host has decompressed.
 ///
-/// 内蔵していないコーデック（GZIP / ZSTD）はホストに展開を委譲する
-/// （DESIGN.md §6）。委譲した結果はここから引く。キーは圧縮ページ本体の
-/// **ファイル上の絶対オフセットと長さ**で、ページ 1 つに 1 エントリ対応する。
+/// Codecs that aren't built in (GZIP / ZSTD) delegate decompression to the
+/// host (DESIGN.md §6). Delegated results are looked up here. The key is the
+/// **absolute file offset and length of the compressed page body**, with one
+/// entry per page.
 pub trait PageCache {
     fn get(&self, offset: u64, len: u32) -> Option<&[u8]>;
 }
 
-/// 委譲を使わない場合のダミー。内蔵コーデックだけのファイルではこれで足りる。
+/// A dummy for when delegation isn't used. Sufficient for files that only use built-in codecs.
 pub struct NoPageCache;
 
 impl PageCache for NoPageCache {
@@ -42,21 +45,21 @@ impl PageCache for NoPageCache {
     }
 }
 
-/// ホストに展開してもらう必要のあるページ。
+/// A page that needs the host to decompress it.
 #[derive(Clone, Copy)]
 pub struct CodecPage {
     pub codec: Compression,
-    /// 圧縮データ本体のファイル上の位置と長さ。
+    /// File position and length of the compressed data body.
     pub offset: u64,
     pub len: u32,
-    /// ページヘッダが宣言する展開後サイズ。
+    /// Decompressed size as declared by the page header.
     pub out_len: u32,
 }
 
-/// 列チャンク全体をデコードして 1 本のベクタにする。
+/// Decode an entire column chunk into a single vector.
 ///
-/// `buf` は `ColumnMetaData::byte_range()` が示す範囲のバイト列。
-/// `num_rows` はその RowGroup の行数。
+/// `buf` is the byte range indicated by `ColumnMetaData::byte_range()`.
+/// `num_rows` is that RowGroup's row count.
 pub fn read_column_chunk(
     desc: &ColumnDesc,
     meta: &ColumnMetaData,
@@ -66,7 +69,7 @@ pub fn read_column_chunk(
     cache: &dyn PageCache,
 ) -> Result<Vector> {
     let mut out = Vector::with_capacity(desc.ty, num_rows);
-    // definition level を持つ列だけ validity を積む。
+    // Only accumulate validity for columns that have a definition level.
     let mut validity =
         if desc.max_def_level > 0 { Some(Bitmap::with_capacity(num_rows)) } else { None };
     let mut dict: Option<Vector> = None;
@@ -112,9 +115,11 @@ pub fn read_column_chunk(
     Ok(out)
 }
 
-/// ページヘッダに応じてデータページ (v1/v2) を 1 枚デコードし、追加した行数を
-/// 返す。`IndexPage` は実際には書かれない種別なので何もしない。辞書ページは
-/// 呼び出し側が別扱いする（デコード結果を後続ページが参照するため）。
+/// Decode a single data page (v1/v2) according to its page header, and
+/// return the number of rows added. `IndexPage` is a variant that's never
+/// actually written, so this does nothing for it. The caller handles
+/// dictionary pages separately (because subsequent pages reference the
+/// decoded result).
 #[allow(clippy::too_many_arguments)]
 fn decode_one_page(
     desc: &ColumnDesc,
@@ -134,7 +139,7 @@ fn decode_one_page(
         PageType::DataPageV2 => {
             read_data_page_v2(desc, meta, hdr, raw, raw_off, dict, out, validity, cache)
         }
-        // 実際には書かれないページ種別。読み飛ばす。
+        // A page type that is never actually written. Skip it.
         PageType::IndexPage => Ok(0),
         PageType::DictionaryPage => err!(BadPageHeader),
     }
@@ -157,20 +162,23 @@ pub(crate) fn decode_dictionary_page(
     Ok(v)
 }
 
-/// ページ選択によって絞り込まれた、非連続なページ集合だけを読み、
-/// `(値ベクタ, 各行の RowGroup 内絶対行番号)` を返す。
+/// Read only the non-contiguous set of pages narrowed down by page
+/// selection, and return `(value vector, each row's absolute row number
+/// within the RowGroup)`.
 ///
-/// `read_column_chunk` が「列チャンク全体が 1 本の連続バイト列」を前提に
-/// ヘッダを逐次走査するのに対し、こちらは `OffsetIndex` が示す個々のページの
-/// バイト範囲を呼び出し側（`format::parquet`）が個別に取得済みである前提で、
-/// 各ページを独立にデコードする。ページ境界は行境界と一致する
-/// （v1 はフラットスキーマのみなので 1 ページ = 連続した行の集まり）ため、
-/// `first_row_index` から各行の絶対位置をそのまま導出できる。
+/// While `read_column_chunk` scans headers sequentially, assuming the
+/// entire column chunk is one contiguous byte range, this function assumes
+/// the caller (`format::parquet`) has already fetched the byte range of each
+/// individual page indicated by the `OffsetIndex`, and decodes each page
+/// independently. Page boundaries coincide with row boundaries (since v1 only
+/// handles flat schemas, one page = a contiguous run of rows), so each row's
+/// absolute position can be derived directly from `first_row_index`.
 ///
-/// `dict_buf` は辞書ページの `(ページヘッダ込みの生バイト列, ファイル上の
-/// 開始オフセット)`。`pages` は `(ページヘッダ込みの生バイト列, 開始
-/// オフセット, そのページの先頭行の RowGroup 内絶対行番号)` を行番号昇順で
-/// 並べたもの。
+/// `dict_buf` is the dictionary page's `(raw bytes including the page
+/// header, file offset where it starts)`. `pages` is a list of the same for
+/// each data page -- `(raw bytes including the page header, start offset,
+/// absolute row number within the RowGroup of that page's first row)` --
+/// sorted by ascending row number.
 pub fn read_selected_pages(
     desc: &ColumnDesc,
     meta: &ColumnMetaData,
@@ -240,10 +248,11 @@ pub(crate) fn check_count(n: i32) -> Result<usize> {
     Ok(n as usize)
 }
 
-/// 展開後のページバイト列。非圧縮ならコピーせず借用する。
+/// The decompressed page byte slice. Borrowed without copying when uncompressed.
 ///
-/// 内蔵していないコーデックはホストに委譲済みのはずなので、キャッシュから引く。
-/// 引けなければ呼び出し順序の誤り（`codec_pages` で要求を出していない）。
+/// A codec that isn't built in should already have been delegated to the
+/// host, so we look it up in the cache. Failing to find it means the calls
+/// were made in the wrong order (no request was issued via `codec_pages`).
 pub(crate) fn decompress<'a>(
     codec: Compression,
     raw: &'a [u8],
@@ -263,7 +272,7 @@ pub(crate) fn decompress<'a>(
     }
 }
 
-/// データページ v1。レベルと値が同じ圧縮ブロックに入っている。
+/// Data page v1. Levels and values are packed into the same compressed block.
 #[allow(clippy::too_many_arguments)]
 fn read_data_page_v1(
     desc: &ColumnDesc,
@@ -281,7 +290,7 @@ fn read_data_page_v1(
     let page = decompress(meta.codec, raw, hdr.uncompressed_page_size, raw_off, cache)?;
     let mut off = 0usize;
 
-    // v1 のレベルは 4 バイトのリトルエンディアン長が前置される。
+    // v1 levels are prefixed with a 4-byte little-endian length.
     let page_validity = if desc.max_def_level > 0 {
         ensure!(dp.definition_level_encoding == Encoding::Rle, UnsupportedEncoding);
         let (bm, used) = read_levels_prefixed(&page, n, desc.max_def_level as u32)?;
@@ -307,7 +316,7 @@ fn read_data_page_v1(
     Ok(n)
 }
 
-/// データページ v2。レベルは非圧縮でページ先頭に置かれ、値部分だけが圧縮される。
+/// Data page v2. Levels sit uncompressed at the start of the page; only the value portion is compressed.
 #[allow(clippy::too_many_arguments)]
 fn read_data_page_v2(
     desc: &ColumnDesc,
@@ -339,8 +348,8 @@ fn read_data_page_v2(
 
     let values_raw = &raw[def_len..];
     let values = if dp.is_compressed {
-        // v2 はレベルが非圧縮でページ先頭に置かれる。圧縮されているのは値の部分
-        // だけなので、展開後サイズからレベル分を差し引く。
+        // v2 levels sit uncompressed at the start of the page. Only the value
+        // portion is compressed, so subtract the levels' share from the decompressed size.
         let want = (hdr.uncompressed_page_size as i64) - (rep_len + def_len) as i64;
         ensure!(want >= 0, BadPageHeader);
         decompress(meta.codec, values_raw, want as i32, raw_off + def_len as u64, cache)?
@@ -358,7 +367,7 @@ pub(crate) fn check_len(v: i32) -> Result<usize> {
     Ok(v as usize)
 }
 
-/// 4 バイト長前置の RLE レベルストリームを読む。返り値は `(validity, 消費バイト数)`。
+/// Read a 4-byte-length-prefixed RLE level stream. Returns `(validity, bytes consumed)`.
 fn read_levels_prefixed(page: &[u8], n: usize, max_level: u32) -> Result<(Bitmap, usize)> {
     ensure!(page.len() >= 4, UnexpectedEof, 0);
     let len = u32::from_le_bytes([page[0], page[1], page[2], page[3]]) as usize;
@@ -370,7 +379,7 @@ fn read_levels_prefixed(page: &[u8], n: usize, max_level: u32) -> Result<(Bitmap
     Ok((bm, 4 + len))
 }
 
-/// 値部分をデコードし、NULL 位置を埋めながら `out` に追記する。
+/// Decode the value portion and append it to `out`, filling in NULL positions.
 #[allow(clippy::too_many_arguments)]
 fn decode_and_append(
     desc: &ColumnDesc,
@@ -383,20 +392,20 @@ fn decode_and_append(
     out: &mut Vector,
     validity: &mut Option<Bitmap>,
 ) -> Result<()> {
-    // 密な値列（NULL を含まない）をまず作る。
+    // First build the dense value column (containing no NULLs).
     let dense = decode_dense(desc, enc, data, present, dict)?;
     ensure!(dense.len() == present, BadCompressedData);
 
     match (&page_validity, validity.as_mut()) {
         (Some(pv), Some(acc)) => acc.extend(pv),
         (None, Some(acc)) => acc.push_n(true, n),
-        // definition level が無い列。validity は最後まで None のまま。
+        // A column with no definition level. validity stays None the whole way through.
         (_, None) => {}
     }
     append_scattered(out, &dense, page_validity.as_ref(), n)
 }
 
-/// エンコーディングに応じて密な値列を作る。
+/// Build a dense value column according to the encoding.
 pub(crate) fn decode_dense(
     desc: &ColumnDesc,
     enc: Encoding,
@@ -409,13 +418,13 @@ pub(crate) fn decode_dense(
             Some(d) => d,
             None => err!(BadCompressedData),
         };
-        // 値部分の先頭 1 バイトがビット幅。
+        // The first byte of the value portion is the bit width.
         ensure!(!data.is_empty(), UnexpectedEof, 0);
         let bw = data[0];
         ensure!(bw <= 32, BadCompressedData, 0);
         let mut idx = Vec::with_capacity(present);
         RleDecoder::new(&data[1..], bw).read_u32(present, &mut idx)?;
-        // 辞書の範囲外インデックスは破損。gather 前に検査する。
+        // An index out of the dictionary's range is corruption. Check before gathering.
         let dlen = dict.len() as u32;
         for &i in &idx {
             ensure!(i < dlen, BadCompressedData);
@@ -439,7 +448,7 @@ pub(crate) fn decode_dense(
                 encoding::decode_delta_byte_array(data, present, b)?;
             }
         }
-        // RLE は BOOLEAN 列の値エンコーディングとしても使われる。
+        // RLE is also used as the value encoding for BOOLEAN columns.
         Encoding::Rle => {
             ensure!(desc.ptype == PType::Boolean, UnsupportedEncoding);
             ensure!(data.len() >= 4, UnexpectedEof, 0);
@@ -470,9 +479,9 @@ fn decode_delta(desc: &ColumnDesc, data: &[u8], n: usize, out: &mut Vector) -> R
     }
 }
 
-// --- PLAIN デコード ---------------------------------------------------------
+// --- PLAIN decoding ---------------------------------------------------------
 
-/// PLAIN エンコードされた `n` 個の値を読み、論理型に合わせて `out` に積む。
+/// Read `n` PLAIN-encoded values and push them into `out` according to the logical type.
 fn decode_plain(desc: &ColumnDesc, data: &[u8], n: usize, out: &mut Vector) -> Result<()> {
     match desc.ptype {
         PType::Boolean => {
@@ -551,7 +560,7 @@ fn decode_plain(desc: &ColumnDesc, data: &[u8], n: usize, out: &mut Vector) -> R
     }
 }
 
-// --- 物理値 → 論理型への詰め替え -------------------------------------------
+// --- Repacking physical values into logical types ---------------------------
 
 fn as_i32_vec(out: &mut Vector, cap: usize) -> Result<&mut Vec<i32>> {
     match out.data_mut() {
@@ -597,7 +606,7 @@ fn is_unsigned(ty: Ty) -> bool {
     matches!(ty, Ty::UTinyInt | Ty::USmallInt | Ty::UInt | Ty::UBigInt)
 }
 
-/// INT32 物理型からの詰め替え。
+/// Repacking from the INT32 physical type.
 fn push_i32_values(desc: &ColumnDesc, vals: &[i32], out: &mut Vector) -> Result<()> {
     match desc.ty.phys() {
         PhysType::I32 => {
@@ -609,9 +618,9 @@ fn push_i32_values(desc: &ColumnDesc, vals: &[i32], out: &mut Vector) -> Result<
             let unit = desc.time_unit;
             let d = as_i64_vec(out, vals.len())?;
             for &v in vals {
-                // UINT32 は符号なしとして 64 ビットへ広げる。
+                // UINT32 is widened to 64 bits as unsigned.
                 let x = if unsigned { v as u32 as i64 } else { v as i64 };
-                // TIME_MILLIS は INT32 に格納される。マイクロ秒へ正規化する。
+                // TIME_MILLIS is stored as INT32. Normalize it to microseconds.
                 d.push(match unit {
                     Some(u) => u.to_micros(x),
                     None => x,
@@ -636,7 +645,7 @@ fn push_i32_values(desc: &ColumnDesc, vals: &[i32], out: &mut Vector) -> Result<
     Ok(())
 }
 
-/// INT64 物理型からの詰め替え。
+/// Repacking from the INT64 physical type.
 fn push_i64_values(desc: &ColumnDesc, vals: &[i64], out: &mut Vector) -> Result<()> {
     match desc.ty.phys() {
         PhysType::I64 => {
@@ -669,8 +678,8 @@ fn push_i64_values(desc: &ColumnDesc, vals: &[i64], out: &mut Vector) -> Result<
     Ok(())
 }
 
-/// BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY からの詰め替え。
-/// DECIMAL はビッグエンディアンの 2 の補数として整数に変換する。
+/// Repacking from BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY.
+/// DECIMAL is converted to an integer as a big-endian two's complement value.
 fn push_byte_values(desc: &ColumnDesc, items: &[&[u8]], out: &mut Vector) -> Result<()> {
     match desc.ty.phys() {
         PhysType::Bytes => {
@@ -709,13 +718,13 @@ fn push_byte_values(desc: &ColumnDesc, items: &[&[u8]], out: &mut Vector) -> Res
     }
 }
 
-/// ビッグエンディアンの 2 の補数表現を i128 にする。
+/// Convert a big-endian two's complement representation into an i128.
 fn be_signed(b: &[u8]) -> Result<i128> {
     ensure!(b.len() <= 16, ValueOutOfRange);
     if b.is_empty() {
         return Ok(0);
     }
-    // 最上位ビットが立っていれば全ビット 1 から始めて符号拡張する。
+    // If the most significant bit is set, start from all-1 bits and sign-extend.
     let mut v: i128 = if b[0] & 0x80 != 0 { -1 } else { 0 };
     for &x in b {
         v = (v << 8) | (x as i128 & 0xff);
@@ -723,10 +732,11 @@ fn be_signed(b: &[u8]) -> Result<i128> {
     Ok(v)
 }
 
-// --- NULL 位置を埋めながら追記 ----------------------------------------------
+// --- Appending while filling in NULL positions -------------------------------
 
-/// 密な値列 `src` を、`validity` が示す NULL 位置を飛ばしながら `out` に積む。
-/// NULL 位置にはダミー値を入れる（validity 側で無効と分かるため値は問わない）。
+/// Push the dense value column `src` into `out`, skipping over the NULL
+/// positions indicated by `validity`. Dummy values are inserted at NULL
+/// positions (since validity marks them invalid, the actual value doesn't matter).
 fn append_scattered(
     out: &mut Vector,
     src: &Vector,
@@ -734,7 +744,7 @@ fn append_scattered(
     n: usize,
 ) -> Result<()> {
     let validity = match validity {
-        // NULL が 1 つも無いページは丸ごと連結できる。
+        // A page with no NULLs at all can be appended wholesale.
         None => return append_all(out, src, n),
         Some(v) if v.count_ones() == n => return append_all(out, src, n),
         Some(v) => v,
@@ -810,11 +820,12 @@ pub(crate) fn append_all(out: &mut Vector, src: &Vector, n: usize) -> Result<()>
     Ok(())
 }
 
-/// 列チャンク内を走査し、ホストに展開を委譲すべきページを列挙する。
+/// Scan a column chunk and enumerate the pages that need decompression delegated to the host.
 ///
-/// ページヘッダは非圧縮なので、バイトさえ揃っていれば復号前に走査できる。
-/// これが「分割の開始時点で必要な作業が確定する」性質を保つ鍵で、実行の
-/// 途中で止まらずに済む（DESIGN.md §6）。
+/// Page headers are uncompressed, so scanning is possible before decoding as
+/// long as the bytes are available. This is the key to preserving the
+/// property that "the work needed is determined up front, at the start of the
+/// split" -- so execution never has to stop partway through (DESIGN.md §6).
 pub fn collect_codec_pages(
     meta: &ColumnMetaData,
     buf: &[u8],
@@ -851,9 +862,10 @@ pub fn collect_codec_pages(
     Ok(())
 }
 
-/// `collect_codec_pages` の入れ子列向け版。REPEATED 列は 1 ページの値数が
-/// 行数と一致しない（配列の要素数ぶん増減する）ので、`num_rows` 到達では
-/// なく「列チャンクのバイト列を使い切ったか」でループを終える。
+/// The nested-column variant of `collect_codec_pages`. A REPEATED column's
+/// per-page value count doesn't match the row count (it varies with the
+/// number of array elements), so the loop ends not by reaching `num_rows` but
+/// by exhausting the column chunk's byte range.
 pub fn collect_codec_pages_all(
     meta: &ColumnMetaData,
     buf: &[u8],
@@ -876,10 +888,11 @@ pub fn collect_codec_pages_all(
     Ok(())
 }
 
-/// 1 ページぶんのヘッダから、必要ならホスト委譲エントリを `out` に積む。
-/// `collect_codec_pages`（連続バッファの逐次走査）と
-/// `collect_codec_pages_selected`（ページ選択後の非連続バッファ群）の
-/// 両方が共有する本体部分。
+/// Given one page's header, push a host-delegation entry into `out` if
+/// needed. This is the shared core used by both `collect_codec_pages`
+/// (sequential scanning of a contiguous buffer) and
+/// `collect_codec_pages_selected` (the non-contiguous set of buffers after
+/// page selection).
 fn push_codec_page(
     meta: &ColumnMetaData,
     hdr: &PageHeader,
@@ -887,7 +900,7 @@ fn push_codec_page(
     clen: usize,
     out: &mut Vec<CodecPage>,
 ) -> Result<()> {
-    // v2 はレベルが非圧縮で先頭に載るので、その分を除いた範囲だけを委譲する。
+    // v2 has uncompressed levels at the start, so only the range excluding that is delegated.
     let (off, len, out_len) = match (&hdr.data_page_v2, hdr.ptype) {
         (Some(dp), PageType::DataPageV2) => {
             let skip = check_len(dp.repetition_levels_byte_length)?
@@ -911,9 +924,10 @@ fn push_codec_page(
     Ok(())
 }
 
-/// ページ選択後の非連続なページ集合から、ホストに展開を委譲すべきページを
-/// 列挙する。`collect_codec_pages` のページ選択版。`dict` は辞書ページの
-/// `(生バイト列, 開始オフセット)`、`pages` は各データページの同じ組。
+/// Enumerate the pages that need decompression delegated to the host, from
+/// the non-contiguous set of pages after page selection. The page-selection
+/// variant of `collect_codec_pages`. `dict` is the dictionary page's `(raw
+/// bytes, start offset)`, and `pages` is the same pair for each data page.
 pub fn collect_codec_pages_selected(
     meta: &ColumnMetaData,
     dict: Option<(&[u8], u64)>,
@@ -964,11 +978,11 @@ mod tests {
 
     #[test]
     fn int96_epoch_conversion() {
-        // ユリウス通日 2440588 = 1970-01-01。ナノ秒 0 ならエポック。
+        // Julian day number 2440588 = 1970-01-01. Nanoseconds of 0 means the epoch.
         let mut data = Vec::new();
         data.extend_from_slice(&0i64.to_le_bytes());
         data.extend_from_slice(&(JULIAN_EPOCH as i32).to_le_bytes());
-        // 翌日の 1 秒後
+        // One second into the next day
         data.extend_from_slice(&1_000_000_000i64.to_le_bytes());
         data.extend_from_slice(&(JULIAN_EPOCH as i32 + 1).to_le_bytes());
 
@@ -1004,7 +1018,7 @@ mod tests {
             nested: None,
         };
         let mut v = Vector::with_capacity(Ty::UInt, 2);
-        // -1i32 は u32 では 4294967295。
+        // -1i32 is 4294967295 as a u32.
         push_i32_values(&desc, &[-1, 7], &mut v).unwrap();
         assert_eq!(v.i64s(), &[4_294_967_295, 7]);
     }
@@ -1034,7 +1048,7 @@ mod tests {
         if let Data::I32(d) = src.data_mut() {
             d.extend_from_slice(&[10, 20, 30]);
         }
-        // 5 行中 1,3 行目が NULL
+        // Rows 1 and 3 (of 5) are NULL
         let mut bm = Bitmap::with_capacity(5);
         for b in [true, false, true, false, true] {
             bm.push(b);
@@ -1055,7 +1069,7 @@ mod tests {
             bm.push(b);
         }
         let mut out = Vector::with_capacity(Ty::Int, 3);
-        // validity は 3 個の値を要求するが密な列には 1 個しかない。
+        // validity requires 3 values, but the dense column has only 1.
         assert!(append_scattered(&mut out, &src, Some(&bm), 3).is_err());
     }
 
@@ -1073,7 +1087,7 @@ mod tests {
             leaves: Vec::new(),
             nested: None,
         };
-        // 長さ 100 を宣言しているが実データは 2 バイトしかない。
+        // Declares length 100, but the actual data is only 2 bytes.
         let data = [100u8, 0, 0, 0, b'a', b'b'];
         let mut v = Vector::with_capacity(Ty::Varchar, 1);
         assert_eq!(

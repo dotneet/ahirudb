@@ -1,6 +1,6 @@
-//! `UUID` / `TIMESTAMPTZ` の統合テスト。
+//! Integration tests for `UUID` / `TIMESTAMPTZ`.
 //!
-//! 期待値は `duckdb -c "..."` の実際の出力と突き合わせて決めている。
+//! Expected values are decided by cross-checking against the actual output of `duckdb -c "..."`.
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::format::FormatKind;

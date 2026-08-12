@@ -1,4 +1,4 @@
-//! SQL フロントエンド: 字句解析 → 構文解析 → AST。
+//! The SQL front end: lexing -> parsing -> AST.
 
 pub mod ast;
 pub mod lexer;

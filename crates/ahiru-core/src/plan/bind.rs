@@ -1,13 +1,13 @@
-//! AST → 論理プラン。
+//! AST -> logical plan.
 //!
-//! ここでやることは 3 つ。
+//! Three things happen here.
 //!
-//! 1. **名前解決**（`Scope`）。結合が入ると同名列が複数出るので修飾子込みで扱う。
-//! 2. **射影プッシュダウン**。実際に参照される列だけをスキャンに読ませる。
-//!    読むバイト数が減るのがこのエンジンで最も効く最適化なので、後段の
-//!    最適化パスではなく束縛と同時に行う（DESIGN.md §9）。
-//! 3. **集約の書き換え**。SELECT / HAVING / ORDER BY の中の集約呼び出しと
-//!    GROUP BY 式を、集約オペレータの出力列への参照に差し替える。
+//! 1. **Name resolution** (`Scope`). Joins produce several same-named columns, so names are handled with qualifiers.
+//! 2. **Projection pushdown**. Only the columns actually referenced are read by the scan.
+//!    Reading fewer bytes is the most effective optimization in this engine, so it happens
+//!    during binding rather than in a later optimization pass (DESIGN.md §9).
+//! 3. **Aggregate rewriting**. Aggregate calls and GROUP BY expressions inside
+//!    SELECT / HAVING / ORDER BY are replaced with references to the aggregate operator's output columns.
 
 use crate::catalog::Catalog;
 use crate::expr::{Instr, OpCode, Program};
@@ -32,15 +32,15 @@ use cte::{bind_one_cte, CteScope};
 use refs::ordinal_of;
 use select::bind_select_in;
 
-/// FROM 句のネスト上限。パーサ側でも制限しているが二重に守る。
+/// The FROM-clause nesting limit. The parser limits it too; this is a second layer of defense.
 const MAX_FROM_DEPTH: u32 = 64;
-/// 式のネスト上限。
+/// The expression nesting limit.
 const MAX_EXPR_DEPTH: u32 = 64;
 
 pub fn bind(catalog: &Catalog, parsed: &Parsed, params: &[Value]) -> Result<Plan> {
     match &parsed.stmt {
         Stmt::Select(q) | Stmt::Explain(q) => bind_query(catalog, &parsed.arena, q, params),
-        // DESCRIBE / SHOW はセッション層が処理する。
+        // DESCRIBE / SHOW are handled by the session layer.
         _ => err!(UnsupportedFeature),
     }
 }
@@ -53,15 +53,15 @@ pub fn bind_query(
 ) -> Result<Plan> {
     let mut ctes = CteScope::default();
     for c in &q.ctes {
-        // CTE 自身も CTE を参照できる（前方定義のみ）。CTE の定義は常に
-        // 非相関（外側スコープを持たない）。
+        // A CTE may reference CTEs too (only ones defined earlier). CTE definitions are
+        // always uncorrelated (they have no outer scope).
         bind_one_cte(catalog, arena, c, params, &mut ctes)?;
     }
     bind_query_in(catalog, arena, q, params, &mut ctes, None)
 }
 
-/// `outer_scope` は相関サブクエリのバインドにのみ使う。トップレベルの
-/// クエリ・CTE・FROM 句の派生表は常に `None`（後方互換のデフォルト）。
+/// `outer_scope` is used only when binding a correlated subquery. Top-level queries, CTEs,
+/// and FROM-clause derived tables always pass `None` (the backward-compatible default).
 fn bind_query_in(
     catalog: &Catalog,
     arena: &ExprArena,
@@ -71,13 +71,13 @@ fn bind_query_in(
     outer_scope: Option<&Scope>,
 ) -> Result<Plan> {
     let (mut node, correlated) = bind_set_expr(catalog, arena, &q.body, params, ctes, outer_scope)?;
-    // 相関キー列は末尾に付加された実装用の列で、ORDER BY の序数・列名
-    // からは見えない（SQL 上は存在しない列なので）。
+    // Correlation key columns are implementation columns appended at the end and are
+    // invisible to ORDER BY ordinals and column names (they do not exist in SQL terms).
     let visible_len = node.schema().len() - correlated.len();
-    // 相関サブクエリが `QueryStmt` 側の ORDER BY/LIMIT を持つケース（二重括弧・
-    // CTE 付きなど）は、`bind_select_in` 側の同様のチェックの網から漏れる。
-    // ここでも同じ理由で明確に拒否する（相関キーごとではなく全体に効いて
-    // しまうため）。
+    // The case where a correlated subquery carries an ORDER BY/LIMIT on the `QueryStmt` side
+    // (double parentheses, with a CTE, and so on) slips through the similar check in
+    // `bind_select_in`. It is explicitly rejected here for the same reason (it would apply to
+    // the whole thing rather than per correlation key).
     ensure!(
         correlated.is_empty()
             || (q.order_by.is_empty()
@@ -87,15 +87,15 @@ fn bind_query_in(
         UnsupportedFeature
     );
 
-    // 外側の ORDER BY / LIMIT は集合演算の結果全体に掛かる。
+    // An outer ORDER BY / LIMIT applies to the whole set-operation result.
     if !q.order_by.is_empty() || q.order_by_all.is_some() {
         let scope = Scope::from_fields(node.schema()[..visible_len].to_vec());
         let mut keys = Vec::with_capacity(q.order_by.len().max(visible_len));
-        // `ORDER BY ALL`: 出力列を左から順に、すべて同じ向き・同じ NULL 位置
-        // で並べ替える（`duckdb -c "select g,h from t union all select g,h
-        // from t order by all"` が集合演算の結果全体に効くことを確認済み）。
-        // ここでの「出力列」は集合演算の結果スキーマそのものなので、
-        // `bind_select_in` 側と違って射影を組み直す必要は無い。
+        // `ORDER BY ALL`: sorts by the output columns left to right, all in the same
+        // direction and with the same NULL placement (confirmed that
+        // `duckdb -c "select g,h from t union all select g,h from t order by all"` applies to
+        // the whole set-operation result). "Output columns" here are the set operation's own
+        // result schema, so unlike on the `bind_select_in` side, no projection needs rebuilding.
         if let Some(oa) = &q.order_by_all {
             for col in 0..visible_len {
                 keys.push(SortKey {
@@ -106,7 +106,7 @@ fn bind_query_in(
             }
         }
         for o in &q.order_by {
-            // 集合演算の結果には元の式が残っていないので、序数か出力列名だけ。
+            // The original expressions are gone from a set-operation result, so only ordinals or output column names.
             let col = match ordinal_of(arena, o.expr) {
                 Some(n) => {
                     ensure!(n >= 1 && (n as usize) <= scope.len(), ColumnNotFound);
@@ -136,10 +136,10 @@ fn bind_query_in(
     Ok(Plan { root: node, correlated })
 }
 
-/// 戻り値の `Vec<ExprId>` は `bind_select_in` が検出した相関キー（`Plan::correlated`
-/// と同じ意味）。`UNION`/`INTERSECT`/`EXCEPT` の両辺には相関を伝播しない
-/// （各辺が別々の相関キー集合を持ちうると 1 本のプランに統合できないため。
-/// 相関参照があれば通常どおり `ColumnNotFound` で失敗する）。
+/// The returned `Vec<ExprId>` is the correlation keys `bind_select_in` detected (the same
+/// meaning as `Plan::correlated`). Correlation is not propagated to either side of
+/// `UNION`/`INTERSECT`/`EXCEPT` (if each side could carry a different set of correlation
+/// keys they could not be merged into one plan; a correlated reference fails with the usual `ColumnNotFound`).
 fn bind_set_expr(
     catalog: &Catalog,
     arena: &ExprArena,
@@ -162,8 +162,8 @@ fn bind_set_expr(
                 SetOp::Intersect => SetOpKind::Intersect,
                 SetOp::Except => SetOpKind::Except,
             };
-            // 型がずれている列は射影で揃えてから渡す。集合演算のオペレータに
-            // 型変換まで持たせると、キー符号化の前提が崩れる。
+            // Columns whose types differ are aligned by a projection before being passed on.
+            // Giving the set-operation operator type conversion too would break the key-encoding assumptions.
             let l = coerce_to(l, &schema)?;
             let r = coerce_to(r, &schema)?;
             Ok((
@@ -174,19 +174,19 @@ fn bind_set_expr(
     }
 }
 
-/// 集合演算の出力スキーマ。列数が違えばエラー、型は共通型に寄せる。
+/// The output schema of a set operation. A differing column count is an error; types settle on a common type.
 fn unify_setop_schema(l: &[Field], r: &[Field]) -> Result<Vec<Field>> {
     ensure!(l.len() == r.len(), TypeMismatch);
     let mut out = Vec::with_capacity(l.len());
     for (a, b) in l.iter().zip(r) {
         let ty = crate::vector::Ty::unify_or_mismatch(a.ty, b.ty)?;
-        // 名前は左を採る（SQL 標準）。
+        // Names come from the left (per the SQL standard).
         out.push(Field::new(a.name.clone(), ty, a.nullable || b.nullable));
     }
     Ok(out)
 }
 
-/// 出力スキーマに合わせて射影を挟む。型が既に一致していれば何もしない。
+/// Interposes a projection to match the output schema. Does nothing if the types already agree.
 ///
 /// Rejects a column-count mismatch with `ColumnCountMismatch` rather than
 /// silently truncating (`have.len() > want.len()`) or hitting an unrelated

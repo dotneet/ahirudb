@@ -1,33 +1,37 @@
-# Rust のビルド成果物。ワークスペース直下の target だけを対象にするため
-# 先頭にスラッシュを付ける（crates/*/target を誤って無視しないように）。
+# Rust build artifacts. The leading slash restricts this to the target
+# directory at the workspace root (so crates/*/target is not ignored by mistake).
 /target
 
-# ビルドした wasm。`scripts/size.sh` は target/ に出すので実質ここには来ないが、
-# 250 KB のバイナリを取り違えて追加する事故は起きやすいので網を張っておく。
-# 配布物としてリポジトリに置きたくなったら、その 1 ファイルだけを
-# `git add -f` するか、ここに `!path/to/file.wasm` を足すこと。
+# Built wasm. `scripts/size.sh` writes under target/, so nothing normally lands
+# here, but adding a 250 KB binary by accident is easy enough to be worth a net.
+# If you ever want to commit a distributable, either `git add -f` that single
+# file or add a `!path/to/file.wasm` line here.
 *.wasm
 
-# scripts/size.sh の出力を CI が `tee` で書き出す先。
+# Where CI `tee`s the output of scripts/size.sh.
 size-report.txt
 
-# JS ホスト層。npm 依存もバンドルも今は無いが、追加されたときの備え。
+# JS host layer. There are no npm dependencies or bundles today; this is for when there are.
 node_modules
 dist
 
-# エディタと OS
+# Scratch git worktrees created by Claude Code. They hold checkouts of this same
+# repository, so committing them would nest a working tree inside the history.
+.claude/worktrees/
+
+# Editors and OS
 .DS_Store
 .idea/
 .vscode/
 *.swp
 *~
 
-# Cargo.lock は **追跡する**。
-# バイナリ（ahiru CLI）を含むワークスペースであることに加え、このプロジェクトは
-# wasm のサイズがハード制約なので、依存グラフの揺れが再現できないと
-# サイズ回帰の原因を追えなくなる。
+# Cargo.lock **is tracked**.
+# Besides this being a workspace containing a binary (the ahiru CLI), wasm size
+# is a hard constraint here, and without a reproducible dependency graph there
+# is no way to track down the cause of a size regression.
 #
-# tests/data/ の生成物も **追跡する**。
-# ahiru-core の単体テストがこれらを直接読むので、無視すると clean clone で
-# `cargo test` が落ちる。テストが外部ツール（duckdb）の有無に左右されない方を
-# 優先した。再生成するときは scripts/gen-testdata.sh を使う。
+# The generated files under tests/data/ **are tracked** too.
+# ahiru-core's unit tests read them directly, so ignoring them would make
+# `cargo test` fail on a clean clone. Keeping the tests independent of external
+# tools (duckdb) won out. Use scripts/gen-testdata.sh to regenerate them.

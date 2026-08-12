@@ -1,23 +1,24 @@
-//! ahiru-zstd — Zstandard (RFC 8878) 展開専用デコーダ。
+//! ahiru-zstd -- a decompression-only Zstandard (RFC 8878) decoder.
 //!
-//! ahirudb のコアは 1 MiB のサイズ予算を持つため、ZSTD は意図的にコアから外し、
-//! 別ロードする wasm サイドモジュールとして配る（`docs/DESIGN.md` §3 / §6）。
-//! したがってこのクレートはコアに依存せず、アロケータもパニックハンドラも
-//! 自前で持つ。依存クレートはゼロ。
+//! The ahirudb core has a 1 MiB size budget, so ZSTD is deliberately kept out of
+//! it and shipped as a separately loaded wasm side module (`docs/DESIGN.md` §3 / §6).
+//! This crate therefore does not depend on the core and carries its own allocator
+//! and panic handler. Zero dependencies.
 //!
-//! 対応範囲は Parquet が書く範囲、つまり「辞書無しの単体フレーム」。
-//! 辞書 (Dictionary_ID) が付いた入力は `Err` を返す。
+//! The supported subset is what Parquet writes: single frames without a dictionary.
+//! Input carrying a dictionary (Dictionary_ID) returns `Err`.
 //!
-//! ビルド構成:
-//! - ネイティブ (既定): `std` フィーチャ有効。テストとデバッグはこちら。
-//! - wasm 配布: `--no-default-features` で `no_std`。
+//! Build configurations:
+//! - native (default): the `std` feature is on. Tests and debugging live here.
+//! - wasm distribution: `no_std` via `--no-default-features`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-// no_std でも alloc は常に使う。
+// alloc is always used, even under no_std.
 extern crate alloc;
 
-/// 復号中に通った経路を記録する。テストでのみ有効で、配布ビルドでは
-/// 呼び出しごと消える（フォーマットの分岐を実際に踏んだか検証するため）。
+/// Records which paths were taken during decoding. Enabled in tests only; in
+/// distribution builds the calls disappear entirely (this exists to verify that
+/// format branches were actually exercised).
 #[cfg(test)]
 macro_rules! stat {
     ($bit:expr) => {
@@ -39,14 +40,14 @@ mod xxh64;
 
 pub mod rt;
 
-// wasm ABI 入口（`ahiru_zstd_*` エクスポート関数）は、このクレートが単独の
-// wasm モジュールとして配布されるとき（`standalone`）だけ要る。`ahiru-core`
-// にライブラリとしてリンクされるときは `ahiru-core` 自身の ABI だけを
-// 公開したいので、ここは含めない。
+// The wasm ABI entry points (the `ahiru_zstd_*` exported functions) are only
+// needed when this crate ships as a standalone wasm module (`standalone`). When
+// it is linked into `ahiru-core` as a library, only `ahiru-core`'s own ABI should
+// be exposed, so this is left out.
 #[cfg(all(target_arch = "wasm32", feature = "standalone"))]
 pub mod abi;
 
-/// クレート内で共通に使う import。
+/// The imports shared across the crate.
 pub(crate) mod prelude {
     #![allow(unused_imports)]
 
@@ -56,59 +57,59 @@ pub(crate) mod prelude {
 
 use prelude::*;
 
-/// エラーは数値コードで表現する。`core::fmt` を引かないのが目的で、
-/// wasm ABI ではこの値を負数にして返す。
-// Debug はネイティブのテストでのみ導出する（wasm で導出すると core::fmt が
-// リンクされて数十 KB を失う）。
+/// Errors are expressed as numeric codes. The point is to avoid pulling in
+/// `core::fmt`; the wasm ABI returns these values negated.
+// Debug is derived only for native tests (deriving it on wasm links `core::fmt`
+// and costs tens of KB).
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 #[repr(i32)]
 pub enum Error {
-    /// 入力が構造の途中で尽きた。
+    /// Input ran out in the middle of a structure.
     UnexpectedEof = 1,
-    /// フレームマジックが合わない。
+    /// The frame magic does not match.
     BadMagic = 2,
-    /// フレームヘッダの予約ビット / 宣言サイズの不一致。
+    /// Reserved bits in the frame header, or a declared-size mismatch.
     BadFrameHeader = 3,
-    /// 辞書付きフレーム。非対応。
+    /// A frame with a dictionary. Unsupported.
     DictionaryUnsupported = 4,
-    /// ブロックヘッダが不正（予約タイプ、サイズ超過）。
+    /// Invalid block header (reserved type, oversized).
     BadBlock = 5,
-    /// リテラル部の破損。
+    /// Corrupt literals section.
     BadLiterals = 6,
-    /// ハフマン表 / ストリームの破損。
+    /// Corrupt Huffman table / stream.
     BadHuffman = 7,
-    /// FSE 表の破損。
+    /// Corrupt FSE table.
     BadFse = 8,
-    /// シーケンス部の破損。
+    /// Corrupt sequences section.
     BadSequence = 9,
-    /// 出力先頭より前を指すオフセット。
+    /// An offset pointing before the start of the output.
     BadOffset = 10,
-    /// Content_Checksum 不一致。
+    /// Content_Checksum mismatch.
     ChecksumMismatch = 11,
-    /// 展開結果が呼び出し側の宣言サイズを超える。
+    /// The decompressed result exceeds the caller's declared size.
     LimitExceeded = 12,
-    /// ビットストリームの終端マーカが無い。
+    /// The bitstream has no end marker.
     BadBitstream = 13,
 }
 
-/// `src` を展開する。`out_len` は呼び出し側が知っている展開後サイズで、
-/// デコーダはこれを超えて書き込まない（信用できない入力に対する上限）。
+/// Decompresses `src`. `out_len` is the decompressed size the caller knows, and
+/// the decoder never writes beyond it (an upper bound against untrusted input).
 pub fn decompress(src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
-    // 宣言サイズ分だけ先に確保する。壊れた入力で青天井に伸びることはない。
+    // Reserve the declared size up front. Corrupt input cannot make this grow without bound.
     out.try_reserve_exact(out_len).map_err(|_| Error::LimitExceeded)?;
     frame::decompress_into(src, &mut out, out_len)?;
     Ok(out)
 }
 
-/// `src` を展開して `out` の末尾に追記する。追記できるのは最大 `max_len` バイト。
+/// Decompresses `src` and appends to the end of `out`. At most `max_len` bytes are appended.
 pub fn decompress_into(src: &[u8], out: &mut Vec<u8>, max_len: usize) -> Result<(), Error> {
     frame::decompress_into(src, out, max_len)
 }
 
-/// 経路カウンタ。テストでフォーマットの分岐を実際に踏んだか検証するためだけの
-/// 仕組みなので、配布ビルドには一切残さない。
+/// Path counters. Purely a mechanism for verifying in tests that format branches
+/// were actually exercised, so nothing of it remains in distribution builds.
 #[cfg(test)]
 pub(crate) mod stats {
     pub const BLOCK_RAW: u32 = 0;
@@ -131,14 +132,14 @@ pub(crate) mod stats {
     pub const CHECKSUM: u32 = 17;
 
     use std::cell::Cell;
-    // テストは並列に走るのでスレッドローカルに持つ。
+    // Tests run in parallel, so this is thread-local.
     std::thread_local! {
         static SEEN: Cell<u32> = const { Cell::new(0) };
     }
     pub fn hit(bit: u32) {
         SEEN.with(|c| c.set(c.get() | (1 << bit)));
     }
-    /// これまでに踏んだ経路のビットマスクを取り出して 0 に戻す。
+    /// Takes the bitmask of paths taken so far and resets it to 0.
     pub fn take() -> u32 {
         SEEN.with(|c| c.replace(0))
     }

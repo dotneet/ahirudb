@@ -1,15 +1,15 @@
-//! 文字列（Bytes 出力）
+//! Strings (Bytes output)
 use super::datetime::strftime;
 use super::json::{json_extract_or_whole, write_json_scalar};
 use super::numeric::{pow10, round_half_up};
 use super::*;
 
-/// UTF-8 のコードポイント数。継続バイトを数えないだけ。
+/// The number of UTF-8 code points. It merely does not count continuation bytes.
 pub(super) fn cp_count(s: &[u8]) -> usize {
     s.iter().filter(|&&b| (b & 0xc0) != 0x80).count()
 }
 
-/// 先頭から `k` 個目のコードポイント境界のバイト位置。範囲外は `s.len()`。
+/// The byte position of the `k`-th code point boundary from the start. Out of range gives `s.len()`.
 fn cp_byte(s: &[u8], k: usize) -> usize {
     let mut seen = 0usize;
     for (i, &b) in s.iter().enumerate() {
@@ -23,7 +23,7 @@ fn cp_byte(s: &[u8], k: usize) -> usize {
     s.len()
 }
 
-/// `i` 位置から始まるコードポイントのバイト数。
+/// The byte length of the code point starting at position `i`.
 fn cp_width(s: &[u8], i: usize) -> usize {
     let mut w = 1;
     while i + w < s.len() && (s[i + w] & 0xc0) == 0x80 {
@@ -32,7 +32,7 @@ fn cp_width(s: &[u8], i: usize) -> usize {
     w
 }
 
-/// `hi` で終わるコードポイントの開始位置。
+/// The start position of the code point ending at `hi`.
 fn cp_back(s: &[u8], hi: usize) -> usize {
     let mut lo = hi - 1;
     while lo > 0 && (s[lo] & 0xc0) == 0x80 {
@@ -41,7 +41,7 @@ fn cp_back(s: &[u8], hi: usize) -> usize {
     lo
 }
 
-/// `set` に含まれるコードポイントか（`trim` の文字集合）。
+/// Whether the code point is in `set` (`trim`'s character set).
 fn in_set(set: &[u8], c: &[u8]) -> bool {
     let mut i = 0;
     while i < set.len() {
@@ -54,7 +54,7 @@ fn in_set(set: &[u8], c: &[u8]) -> bool {
     false
 }
 
-/// `hay` の中の `needle` の先頭バイト位置。無ければ `None`。空針は 0。
+/// The starting byte position of `needle` within `hay`. `None` if absent. An empty needle gives 0.
 pub(super) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
@@ -65,11 +65,11 @@ pub(super) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-/// 1 行ぶんの文字列関数。`false` を返した行は NULL。
+/// One row's worth of a string function. A row returning `false` becomes NULL.
 pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
     match id {
         F_UPPER | F_LOWER => {
-            // ASCII のみ。Unicode の大小文字テーブルは 1MiB 予算に入らない。
+            // ASCII only. Unicode case tables do not fit the 1 MiB budget.
             let s = a.bytes(0);
             out.extend_from_slice(s);
             for c in out.iter_mut() {
@@ -78,7 +78,7 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
         }
         F_TRIM | F_LTRIM | F_RTRIM => {
             let s = a.bytes(0);
-            // 1 引数版が落とすのは**空白のみ**（DuckDB と同じ。タブは残る）。
+            // The one-argument form drops **whitespace only** (the same as DuckDB; tabs remain).
             let set: &[u8] = if a.n() >= 2 { a.bytes(1) } else { b" " };
             let (mut lo, mut hi) = (0usize, s.len());
             if id != F_RTRIM {
@@ -104,13 +104,13 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
         F_SUBSTR => {
             let s = a.bytes(0);
             let mut start = a.int(1);
-            // 負の開始位置は末尾から数える（DuckDB）。
+            // A negative start position counts from the end (DuckDB).
             if start < 0 {
                 start += cp_count(s) as i64 + 1;
             }
             let (mut from, mut to) = if a.n() >= 3 {
                 let e = start.saturating_add(a.int(2));
-                // 負の長さは「開始位置から手前へ」（DuckDB は範囲を反転する）。
+                // A negative length means "backwards from the start position" (DuckDB reverses the range).
                 if a.int(2) < 0 {
                     (e, start)
                 } else {
@@ -149,7 +149,7 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             ensure!(want <= MAX_STR, LimitExceeded);
             let cl = cp_count(s) as i64;
             if want <= cl {
-                // 目標長より長ければ切り詰める（DuckDB）。
+                // Longer than the target length is truncated (DuckDB).
                 let cut = cp_byte(s, want.max(0) as usize);
                 out.extend_from_slice(&s[..cut]);
                 return Ok(true);
@@ -157,7 +157,7 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             let pad = a.bytes(2);
             let mut fill = Vec::new();
             if !pad.is_empty() {
-                // 埋め草は繰り返し、最後は途中で切る。
+                // The padding repeats and is cut off partway at the end.
                 let pl = cp_count(pad);
                 let mut need = (want - cl) as usize;
                 while need > 0 {
@@ -185,7 +185,7 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
         }
         F_SPLIT_PART => {
             let (s, d, k) = (a.bytes(0), a.bytes(1), a.int(2));
-            // 添字は 1 始まり。負なら末尾から。0 と範囲外は空文字列。
+            // The index is 1-based. Negative counts from the end. 0 and out of range give the empty string.
             if k == 0 {
                 return Ok(true);
             }
@@ -295,11 +295,11 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                 None => Ok(false),
             };
         }
-        // NULL 伝播は呼び出し元の `call()`（`live(i)` 判定）に任せる既定どおり
-        // でよいので、`json_array`/`concat` と違い `call()` 直下へバイパス
-        // する必要が無い（可変長引数でも `A` は `args: &[&Vector]` 全体を
-        // 持っているので、`eval_str` の中だけで完結する）。対応する書式指定子
-        // は `printf_scan`/`format_scan` のコメント参照。
+        // NULL propagation can be left to the default in the caller's `call()` (the `live(i)`
+        // check), so unlike `json_array`/`concat` there is no need to bypass directly under
+        // `call()` (even with variadic arguments, `A` holds all of `args: &[&Vector]`, so it stays
+        // contained within `eval_str`). See the comments on `printf_scan`/`format_scan` for the
+        // supported format specifiers.
         F_PRINTF => printf_scan(a.bytes(0), a, out)?,
         F_FORMAT => format_scan(a.bytes(0), a, out)?,
         _ => err!(Internal),
@@ -307,35 +307,34 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
     Ok(true)
 }
 
-/// `printf` の最大精度（`%.<N>f` の `N`）。`kernels::fmt_int` の内部バッファ
-/// は 48 バイトしかないので、これを大きく超える scale を渡すとバッファ
-/// 添字が範囲外になる（=panic）。32 は安全側に十分な余裕を残した値。
+/// `printf`'s maximum precision (the `N` of `%.<N>f`). `kernels::fmt_int`'s internal buffer is only
+/// 48 bytes, so passing a scale much larger than this would index the buffer out of range (=
+/// panic). 32 leaves ample safety margin.
 const MAX_PRINTF_PREC: u32 = 32;
 
-/// `printf`/`format` の幅指定の上限。悪意あるクエリが `%<巨大な数字>d` の
-/// ような幅を書いてメモリ・時間を食い潰さないための上限（`repeat`/`lpad`
-/// の `MAX_STR` と同じ動機）。
+/// The cap on `printf`/`format`'s width specification. A limit so a malicious query cannot eat
+/// memory and time by writing a width like `%<huge number>d` (the same motivation as `MAX_STR` for
+/// `repeat`/`lpad`).
 const MAX_PRINTF_WIDTH: usize = 1 << 16;
 
-/// `printf(fmt, args...)`。C 由来の `%` 書式のうち、次だけに対応する:
+/// `printf(fmt, args...)`. Of C's `%` formats, only the following are supported:
 ///
-/// - `%%`  リテラルの `%`
-/// - `%[-][0][<幅>]d`  整数。対応する実引数は BOOLEAN（0/1）・整数型。
-///   浮動小数は 0 方向へ切り捨てる。
-/// - `%[-][0][<幅>][.<精度>]f`  浮動小数点数の固定小数点表記。精度既定 6 桁
-///   （C の `printf` と同じ。`duckdb -c "select printf('%f', 3.5)"` が
-///   `3.500000` になることを確認済み）、`MAX_PRINTF_PREC` まで指定できる。
-/// - `%[-][<幅>]s`  `write_display` と同じ規則で文字列化する。
+/// - `%%`  a literal `%`
+/// - `%[-][0][<width>]d`  an integer. The corresponding actual argument is BOOLEAN (0/1) or an
+///   integer type. Floating point is truncated toward zero.
+/// - `%[-][0][<width>][.<precision>]f`  fixed-point notation for floating point. The precision
+///   defaults to 6 digits (the same as C's `printf`; confirmed that
+///   `duckdb -c "select printf('%f', 3.5)"` gives `3.500000`) and can go up to `MAX_PRINTF_PREC`.
+/// - `%[-][<width>]s`  stringified by the same rules as `write_display`.
 ///
-/// DuckDB との既知の違い: DuckDB は `%d` に FLOAT を、`%s` に INTEGER を
-/// 渡すとエラーにする（`fmt` ライブラリの型厳格性）が、ここでは実用上の
-/// 都合を優先してどちらも受け付ける（`%s` はどんな対応物理型でも文字列化
-/// する）。`%x`/`%o` などの基数変換、`*` による幅の実引数指定、`%1$d`
-/// 形式の引数番号付けは非対応（`UnsupportedFeature`）。指定子の数より
-/// 実引数が少なければ `WrongArgCount`（DuckDB と同じ。余った実引数は無視
-/// してよい: `duckdb -c "select printf('%d', 1, 2)"` は `1`）。
+/// A known difference from DuckDB: DuckDB errors when a FLOAT is passed to `%d` or an INTEGER to
+/// `%s` (the `fmt` library's type strictness), whereas here practicality wins and both are accepted
+/// (`%s` stringifies any supported physical type). Base conversions such as `%x`/`%o`, a width
+/// given by an actual argument via `*`, and `%1$d`-style argument numbering are unsupported
+/// (`UnsupportedFeature`). Fewer actual arguments than specifiers gives `WrongArgCount` (the same
+/// as DuckDB. Surplus arguments may be ignored: `duckdb -c "select printf('%d', 1, 2)"` gives `1`).
 fn printf_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
-    let mut ai = 1usize; // args[0] は fmt 自身
+    let mut ai = 1usize; // args[0] is fmt itself
     let mut i = 0usize;
     while i < fmt.len() {
         if fmt[i] != b'%' {
@@ -387,8 +386,8 @@ fn printf_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
         ensure!(i < fmt.len(), SyntaxError);
         let conv = fmt[i];
         i += 1;
-        // 未対応の変換文字は、実引数が足りているかより先にチェックする
-        // （`%x` はいくら実引数を積んでも `UnsupportedFeature` であるべき）。
+        // An unsupported conversion character is checked before whether there are enough actual
+        // arguments (`%x` should be `UnsupportedFeature` no matter how many arguments are supplied).
         ensure!(matches!(conv, b'd' | b'f' | b's'), UnsupportedFeature);
         ensure!(ai < a.n(), WrongArgCount);
         let (v, row) = match a.at(ai) {
@@ -414,15 +413,15 @@ fn printf_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// `format(fmt, args...)`。Python 風の `{}`/`{<n>}` プレースホルダのみ対応
-/// する（`{:.2f}` のような書式ミニ言語は非対応: `UnsupportedFeature`）。
-/// `{{`/`}}` はそれぞれリテラルの `{`/`}` になる
-/// （`duckdb -c "select format('{{literal}}')"` が `{literal}` になることを
-/// 確認済み）。値の文字列化は printf の `%s` と同じ `write_display` を使う
-/// （`format` には型ごとの指定子が無いので常にこれ 1 種類）。
+/// `format(fmt, args...)`. Only Python-style `{}`/`{<n>}` placeholders are supported (a format
+/// mini-language such as `{:.2f}` is unsupported: `UnsupportedFeature`).
+/// `{{`/`}}` become a literal `{`/`}` respectively (confirmed that
+/// `duckdb -c "select format('{{literal}}')"` gives `{literal}`).
+/// Values are stringified with the same `write_display` as printf's `%s`
+/// (`format` has no per-type specifiers, so it is always this one).
 ///
-/// `{}` は出現順に実引数を消費し、`{<n>}` は 0 始まりの明示添字（自動採番
-/// とは独立にカウントする）。指定子が指す実引数が無ければ `WrongArgCount`。
+/// `{}` consumes actual arguments in order, and `{<n>}` is an explicit 0-based index (counted
+/// independently of the automatic numbering). A specifier pointing at a missing argument gives `WrongArgCount`.
 fn format_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
     let mut auto_idx = 0usize;
     let mut i = 0usize;
@@ -448,7 +447,7 @@ fn format_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
                     parse_format_index(&fmt[start..i])
                 };
                 i += 1; // '}'
-                let ai = idx.saturating_add(1); // args[0] は fmt 自身
+                let ai = idx.saturating_add(1); // args[0] is fmt itself
                 ensure!(ai < a.n(), WrongArgCount);
                 let (v, row) = match a.at(ai) {
                     Some(x) => x,
@@ -470,9 +469,8 @@ fn format_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// `{<digits>}` の添字部分を読む。桁あふれは飽和させる（後段の
-/// `ai < a.n()` チェックでどのみち `WrongArgCount` になるので、パースの
-/// 時点でオーバーフローを気にする必要は無い）。
+/// Reads the index part of `{<digits>}`. Overflow saturates (the later `ai < a.n()` check gives
+/// `WrongArgCount` anyway, so overflow need not be worried about at parse time).
 fn parse_format_index(digits: &[u8]) -> usize {
     let mut v: usize = 0;
     for &b in digits {
@@ -481,8 +479,8 @@ fn parse_format_index(digits: &[u8]) -> usize {
     v
 }
 
-/// `%d`。BOOLEAN・整数型のみ対応。浮動小数は 0 方向へ切り捨てる
-/// （Rust の `f64 as i64` は範囲外を飽和させるだけで panic しない）。
+/// `%d`. Only BOOLEAN and integer types are supported. Floating point is truncated toward zero
+/// (Rust's `f64 as i64` merely saturates out of range and does not panic).
 fn numeric_i64(v: &Vector, row: usize) -> Result<i64> {
     Ok(match v.data() {
         Data::Bool(b) => b.get(row) as i64,
@@ -493,7 +491,7 @@ fn numeric_i64(v: &Vector, row: usize) -> Result<i64> {
     })
 }
 
-/// `%f`。BOOLEAN・整数型・浮動小数に対応。
+/// `%f`. BOOLEAN, integer types, and floating point are supported.
 fn numeric_f64(v: &Vector, row: usize) -> Result<f64> {
     Ok(match v.data() {
         Data::Bool(b) => b.get(row) as i64 as f64,
@@ -504,12 +502,12 @@ fn numeric_f64(v: &Vector, row: usize) -> Result<f64> {
     })
 }
 
-/// `%s`（printf）・`{}`（format）が使う汎用の文字列化。対応する物理型は
-/// BOOLEAN・整数（I32/I64）・浮動小数（F64）・バイト列（VARCHAR/JSON は
-/// そのまま出す）。DATE/TIME/TIMESTAMP/DECIMAL/INTERVAL/HUGEINT（物理型
-/// I128、または DECIMAL のスケール）は内部表現をそのまま数値として出す
-/// だけで、暦・小数点の変換はしない（範囲を絞る設計判断。カレンダー等の
-/// 表示が要る場合は呼び出し側で `CAST(.. AS VARCHAR)` してから渡すこと）。
+/// The general stringification used by `%s` (printf) and `{}` (format). The supported physical
+/// types are BOOLEAN, integers (I32/I64), floating point (F64), and byte sequences (VARCHAR/JSON
+/// are emitted as is). DATE/TIME/TIMESTAMP/DECIMAL/INTERVAL/HUGEINT (physical type I128, or
+/// DECIMAL's scale) merely emit the internal representation as a number, with no calendar or
+/// decimal-point conversion (a design decision to narrow the scope. If a calendar rendering is
+/// needed, the caller should `CAST(.. AS VARCHAR)` first).
 fn write_display(v: &Vector, row: usize, out: &mut Vec<u8>) -> Result<()> {
     match v.data() {
         Data::Bool(b) => out.extend_from_slice(if b.get(row) { b"true" } else { b"false" }),
@@ -522,10 +520,10 @@ fn write_display(v: &Vector, row: usize, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// `%f` の固定小数点表記。`10^prec` 倍してから 0 から遠ざける丸めで整数化し
-/// `kernels::fmt_int` に渡す（`fmt_int` が小数点の挿入まで面倒を見てくれる）。
-/// `prec` は呼び出し元（`printf_scan`）が `MAX_PRINTF_PREC` 以下に丸め済み
-/// なので、`fmt_int` 内部バッファ（48 バイト）を溢れさせない。
+/// `%f`'s fixed-point notation. It multiplies by `10^prec`, turns it into an integer by rounding
+/// away from zero, and hands it to `kernels::fmt_int` (which takes care of inserting the decimal point).
+/// `prec` is already clamped to `MAX_PRINTF_PREC` by the caller (`printf_scan`), so `fmt_int`'s
+/// internal 48-byte buffer cannot overflow.
 fn fmt_fixed(x: f64, prec: u8, out: &mut Vec<u8>) {
     if x.is_nan() {
         out.extend_from_slice(b"nan");
@@ -541,8 +539,8 @@ fn fmt_fixed(x: f64, prec: u8, out: &mut Vec<u8>) {
         return;
     }
     let scaled = round_half_up(ax * pow10(prec as u32));
-    // u128 に収まらないほど巨大な値は諦めて簡易表記にフォールバックする
-    // （`fmt_int` へ渡す前に u128 のレンジ内であることを確認しておく）。
+    // A value too large to fit u128 gives up and falls back to a simple rendering
+    // (being within u128's range is confirmed before handing it to `fmt_int`).
     if scaled >= 1.0e33 {
         if neg {
             out.push(b'-');
@@ -553,9 +551,9 @@ fn fmt_fixed(x: f64, prec: u8, out: &mut Vec<u8>) {
     kernels::fmt_int(scaled as u128, neg, prec, out);
 }
 
-/// 幅・0 埋め・左寄せを適用する（`%d`/`%f`/`%s` 共通）。`body` は変換済みの
-/// 中身（符号込み）。`%s` は多バイト文字を渡せるので、幅はコードポイント
-/// 単位で数える（`lpad`/`rpad` と同じ判断）。
+/// Applies width, zero padding, and left alignment (shared by `%d`/`%f`/`%s`). `body` is the
+/// converted content (including the sign). `%s` can be given multi-byte characters, so the width is
+/// counted in code points (the same judgment as `lpad`/`rpad`).
 fn pad_field(out: &mut Vec<u8>, body: &[u8], width: usize, left: bool, zero: bool) {
     let len = cp_count(body);
     if len >= width {
@@ -569,7 +567,7 @@ fn pad_field(out: &mut Vec<u8>, body: &[u8], width: usize, left: bool, zero: boo
             out.push(b' ');
         }
     } else if zero {
-        // 符号を残してから 0 を詰める（`-0003` のような形にする）。
+        // The sign is kept before the zeros are packed in (giving forms like `-0003`).
         let (sign, rest): (&[u8], &[u8]) = match body.first() {
             Some(b'-') | Some(b'+') => (&body[..1], &body[1..]),
             _ => (&body[..0], body),

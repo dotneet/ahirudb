@@ -1,10 +1,9 @@
-//! `ddl`/`dml` フィーチャの統合テスト。
+//! Integration tests for the `ddl`/`dml` features.
 //!
-//! CREATE TABLE → INSERT → SELECT → UPDATE → SELECT → DELETE → SELECT の
-//! 一連の流れを、公開 API（`Session::prepare`/`Session::step`）だけを使って
-//! 通しで確認する。読み取り専用の Parquet/CSV テーブルには一切触れず、
-//! DDL/DML がインメモリ表にしか効かないこと（DESIGN.md §16）もあわせて
-//! 検証する。
+//! Verifies the full flow of CREATE TABLE -> INSERT -> SELECT -> UPDATE -> SELECT ->
+//! DELETE -> SELECT end-to-end, using only the public API (`Session::prepare`/
+//! `Session::step`). Never touches read-only Parquet/CSV tables, and also verifies that
+//! DDL/DML only ever affects in-memory tables (DESIGN.md §16).
 
 #![cfg(feature = "dml")]
 
@@ -13,9 +12,9 @@ use ahiru_core::session::{Prepared, QueryStep, Session};
 use ahiru_core::vector::Value;
 use ahiru_core::FormatKind;
 
-/// `sql` を実行し、結果を `Vec<Vec<Value>>` として取り出す。
-/// DDL/DML はメモリ上のデータしか扱わないので `NeedIo`/`NeedCodec` は
-/// 絶対に起きない（起きたら実装のバグ）。
+/// Runs `sql` and extracts the result as `Vec<Vec<Value>>`.
+/// Since DDL/DML only ever handles in-memory data, `NeedIo`/`NeedCodec` never occur
+/// (if they do, it's an implementation bug).
 fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     let mut q = match session.prepare(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
         Prepared::Ready(q) => q,
@@ -39,7 +38,7 @@ fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     rows
 }
 
-/// 影響行数（`count_result` が返す 1 行 1 列）を取り出す。
+/// Extracts the affected row count (the 1-row, 1-column result `count_result` returns).
 fn affected(session: &mut Session, sql: &str) -> i64 {
     let rows = run(session, sql);
     assert_eq!(rows.len(), 1);
@@ -73,11 +72,11 @@ fn full_ddl_dml_lifecycle() {
     assert_eq!(updated, 2);
     let rows = run(&mut s, "SELECT balance FROM accounts WHERE id = 1");
     match &rows[0][0] {
-        Value::I64(v) => assert_eq!(*v, 12500), // DECIMAL(10,2) は I64 格納、下 2 桁がスケール
+        Value::I64(v) => assert_eq!(*v, 12500), // DECIMAL(10,2) is stored as I64, with the last 2 digits as scale
         other => panic!("expected decimal-as-i64, got {other:?}"),
     }
 
-    // SELECT (更新後)
+    // SELECT (after the update)
     let rows = run(&mut s, "SELECT id FROM accounts WHERE balance > 100.00 ORDER BY id");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], Value::I32(1));
@@ -86,7 +85,7 @@ fn full_ddl_dml_lifecycle() {
     let deleted = affected(&mut s, "DELETE FROM accounts WHERE balance = 0.00");
     assert_eq!(deleted, 1);
 
-    // SELECT (削除後)
+    // SELECT (after the delete)
     let rows = run(&mut s, "SELECT id FROM accounts ORDER BY id");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0], Value::I32(1));
@@ -108,13 +107,13 @@ fn create_table_as_select_then_insert_select_and_view() {
     let rows = run(&mut s, "SELECT id, val FROM snap ORDER BY id");
     assert_eq!(rows.len(), 2);
 
-    // INSERT INTO ... SELECT からもう一つのインメモリ表に流し込む。
+    // Feed into another in-memory table via INSERT INTO ... SELECT.
     s.prepare("CREATE TABLE dst (id INTEGER, val INTEGER)", &[]).unwrap();
     let n = affected(&mut s, "INSERT INTO dst SELECT id, val FROM snap");
     assert_eq!(n, 2);
     assert_eq!(run(&mut s, "SELECT count(*) FROM dst")[0][0].as_i64(), Some(2));
 
-    // ビューは常に最新のインメモリ表を反映する。
+    // A view always reflects the current state of the in-memory table.
     s.prepare("CREATE VIEW dst_v AS SELECT id, val FROM dst", &[]).unwrap();
     assert_eq!(run(&mut s, "SELECT count(*) FROM dst_v")[0][0].as_i64(), Some(2));
     affected(&mut s, "INSERT INTO dst VALUES (99, 999)");
@@ -132,7 +131,7 @@ fn dml_on_file_backed_table_is_rejected_as_read_only() {
     assert_eq!(code_of(s.prepare("INSERT INTO t VALUES (3)", &[])), Some(Code::ReadOnlyTable));
     assert_eq!(code_of(s.prepare("UPDATE t SET id = 9", &[])), Some(Code::ReadOnlyTable));
     assert_eq!(code_of(s.prepare("DELETE FROM t", &[])), Some(Code::ReadOnlyTable));
-    // Parquet/CSV 側のデータは無傷のまま。
+    // The Parquet/CSV-side data is left untouched.
     assert_eq!(run(&mut s, "SELECT count(*) FROM t")[0][0].as_i64(), Some(2));
 }
 
@@ -141,14 +140,14 @@ fn create_table_conflicts_are_rejected_unless_if_not_exists() {
     let mut s = Session::new();
     s.register_bytes_as("t", b"id\n1\n".to_vec(), FormatKind::Csv).unwrap();
 
-    // ファイルテーブルと同名のインメモリ表は作れない。
+    // Cannot create an in-memory table with the same name as a file-backed table.
     assert_eq!(code_of(s.prepare("CREATE TABLE t (id INTEGER)", &[])), Some(Code::DuplicateTable));
 
     s.prepare("CREATE TABLE u (id INTEGER)", &[]).unwrap();
     assert_eq!(code_of(s.prepare("CREATE TABLE u (id INTEGER)", &[])), Some(Code::DuplicateTable));
-    // IF NOT EXISTS なら黙って成功する。
+    // With IF NOT EXISTS, it silently succeeds.
     s.prepare("CREATE TABLE IF NOT EXISTS u (id INTEGER)", &[]).unwrap();
-    // OR REPLACE なら置き換わる（スキーマが変わることも確認）。
+    // With OR REPLACE, it's replaced (also verify the schema can change).
     s.prepare("CREATE OR REPLACE TABLE u (id INTEGER, name VARCHAR)", &[]).unwrap();
     assert!(run(&mut s, "SELECT * FROM u").is_empty());
 }
@@ -166,7 +165,7 @@ fn alter_table_add_column_variants() {
     s.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
     affected(&mut s, "INSERT INTO t VALUES (1), (2), (3)");
 
-    // DEFAULT ありなら既存行全部にその値が入る。
+    // With a DEFAULT, all existing rows get that value.
     affected(&mut s, "ALTER TABLE t ADD COLUMN grade INTEGER DEFAULT 100");
     let rows = run(&mut s, "SELECT id, grade FROM t ORDER BY id");
     assert_eq!(
@@ -178,7 +177,7 @@ fn alter_table_add_column_variants() {
         ]
     );
 
-    // DEFAULT 無しなら既存行は NULL になる。新しい INSERT はそのまま使える。
+    // Without a DEFAULT, existing rows become NULL. A new INSERT works as-is.
     affected(&mut s, "ALTER TABLE t ADD COLUMN note VARCHAR");
     let rows = run(&mut s, "SELECT note FROM t ORDER BY id");
     assert!(rows.iter().all(|r| r[0] == Value::Null));
@@ -186,7 +185,7 @@ fn alter_table_add_column_variants() {
     let rows = run(&mut s, "SELECT note FROM t WHERE id = 4");
     assert_eq!(rows, vec![vec![Value::Bytes(b"ok".to_vec())]]);
 
-    // 列名の重複は拒否する。
+    // Duplicate column names are rejected.
     assert_eq!(
         code_of(s.prepare("ALTER TABLE t ADD COLUMN grade VARCHAR", &[])),
         Some(Code::DuplicateColumn)
@@ -200,12 +199,12 @@ fn alter_table_drop_column_removes_it_from_schema_and_every_row() {
     affected(&mut s, "INSERT INTO t VALUES (1, 2, 3), (4, 5, 6)");
 
     affected(&mut s, "ALTER TABLE t DROP COLUMN b");
-    // 残った列の値は正しくスライドしている（`b` を落としても `a`/`c` は無事）。
+    // The remaining columns' values shift correctly (dropping `b` leaves `a`/`c` intact).
     let rows = run(&mut s, "SELECT a, c FROM t ORDER BY a");
     assert_eq!(rows, vec![vec![Value::I32(1), Value::I32(3)], vec![Value::I32(4), Value::I32(6)]]);
-    // 落とした列はもう参照できない。
+    // The dropped column can no longer be referenced.
     assert_eq!(code_of(s.prepare("SELECT b FROM t", &[])), Some(Code::ColumnNotFound));
-    // 存在しない列を DROP しようとするとエラー。
+    // Trying to DROP a nonexistent column is an error.
     assert_eq!(
         code_of(s.prepare("ALTER TABLE t DROP COLUMN nope", &[])),
         Some(Code::ColumnNotFound)
@@ -218,24 +217,24 @@ fn alter_table_rename_column_and_table() {
     s.prepare("CREATE TABLE accounts (id INTEGER, balance INTEGER)", &[]).unwrap();
     affected(&mut s, "INSERT INTO accounts VALUES (1, 100)");
 
-    // RENAME COLUMN: 名前だけ変わり、型・データは不変。
+    // RENAME COLUMN: only the name changes; type and data are unchanged.
     affected(&mut s, "ALTER TABLE accounts RENAME COLUMN balance TO bal");
     assert_eq!(run(&mut s, "SELECT bal FROM accounts")[0][0], Value::I32(100));
     assert_eq!(code_of(s.prepare("SELECT balance FROM accounts", &[])), Some(Code::ColumnNotFound));
-    // 既存の別列と同名にはリネームできない。
+    // Cannot rename to a name already used by another column.
     assert_eq!(
         code_of(s.prepare("ALTER TABLE accounts RENAME COLUMN bal TO id", &[])),
         Some(Code::DuplicateColumn)
     );
 
-    // RENAME TO: カタログ内の位置は変えず、表の名前だけが変わる。
+    // RENAME TO: only the table's name changes; its position in the catalog is unchanged.
     affected(&mut s, "ALTER TABLE accounts RENAME TO ledger");
     assert!(!s.table_names().iter().any(|n| n == "accounts"));
     assert!(s.table_names().iter().any(|n| n == "ledger"));
     assert_eq!(run(&mut s, "SELECT id, bal FROM ledger")[0], vec![Value::I32(1), Value::I32(100)]);
     assert_eq!(code_of(s.prepare("SELECT * FROM accounts", &[])), Some(Code::TableNotFound));
 
-    // 既に使われている表名へはリネームできない。
+    // Cannot rename to a table name that's already in use.
     s.prepare("CREATE TABLE other (x INTEGER)", &[]).unwrap();
     assert_eq!(
         code_of(s.prepare("ALTER TABLE ledger RENAME TO other", &[])),
@@ -258,6 +257,6 @@ fn alter_table_on_file_backed_table_is_rejected_as_read_only() {
         Some(Code::ReadOnlyTable)
     );
     assert_eq!(code_of(s.prepare("ALTER TABLE t RENAME TO u", &[])), Some(Code::ReadOnlyTable));
-    // ファイル側のデータは無傷のまま。
+    // The file-side data is left untouched.
     assert_eq!(run(&mut s, "SELECT count(*) FROM t")[0][0].as_i64(), Some(2));
 }

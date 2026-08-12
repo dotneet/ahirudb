@@ -5,33 +5,33 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-# `cdylib` は既定で持たせない。Cargo は依存クレートでも `[lib]` に
-# 並んだ crate-type を全部ビルドしてしまうため、`ahiru-core` がこれを
-# ライブラリとして（`rlib` として）リンクするだけのつもりでも、
-# `cdylib`（wasm モジュール単独リンク）まで同時にビルドしようとして
-# アロケータ/パニックハンドラの重複無し状態でリンクに失敗する
-# （`standalone` フィーチャ参照）。単独 wasm モジュールとしてビルドする
-# ときは `scripts/size.sh` が `cargo rustc --crate-type cdylib` で
-# 明示的に上書きする。
+# Do not give this crate `cdylib` by default. Cargo builds every crate-type
+# listed in `[lib]` even for dependency crates, so when `ahiru-core` only
+# means to link this as a library (as an `rlib`), Cargo would also try to
+# build the `cdylib` (a standalone wasm module link), which fails to link
+# without an allocator / panic handler of its own (see the `standalone`
+# feature). When building it as a standalone wasm module, `scripts/size.sh`
+# overrides this explicitly with `cargo rustc --crate-type cdylib`.
+#
 crate-type = ["rlib"]
 
 [features]
-# ネイティブ開発・テスト時のみ std を有効化する。
-# wasm 配布は --no-default-features で no_std になる。
+# std is enabled only for native development and testing.
+# wasm distribution uses --no-default-features, leaving no_std.
 default = ["std"]
 std = []
-# `ahiru-core` がこのクレートをライブラリとしてリンクする（既定の配布経路、
-# DESIGN.md §6）ときは無効のままにする。グローバルアロケータ・パニック
-# ハンドラ・wasm ABI 入口（`abi` モジュール）はどれも「単独の wasm モジュール
-# として自分がトップレベルである」ことを前提にしており、`ahiru-core` 側も
-# 同じものを定義しているため、両方リンクすると重複定義でリンクエラーになる。
-# `zstd` フィーチャを外して `ahiru-core` から独立させ、旧来どおりホストが
-# 別読み込みする配布形にしたいときだけ、このクレートを単独ビルドする側で
-# 有効にする（`scripts/size.sh` 参照）。
+# Leave this off when `ahiru-core` links this crate as a library (the default
+# distribution path, DESIGN.md §6). The global allocator, the panic handler,
+# and the wasm ABI entry points (the `abi` module) all assume this crate is
+# the top level of a standalone wasm module, and `ahiru-core` defines the same
+# items, so linking both yields duplicate-definition link errors. Enable this
+# only on the standalone-build side, when you want to drop the `zstd` feature
+# to decouple from `ahiru-core` and ship the older shape where the host loads
+# this module separately (see `scripts/size.sh`).
 standalone = []
 
 [dependencies]
-# 依存クレートゼロ。サイドモジュールはコアより更に小さく保つ（DESIGN.md §6）。
+# Zero dependencies. Keep the side module even smaller than the core (DESIGN.md §6).
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

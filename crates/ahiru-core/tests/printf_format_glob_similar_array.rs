@@ -1,13 +1,14 @@
-//! 配列リテラル `[..]`・`printf`/`format`・`GLOB`/`SIMILAR TO` の統合テスト。
+//! Integration tests for the array literal `[..]`, `printf`/`format`, and `GLOB`/`SIMILAR TO`.
 //!
-//! 期待値は `duckdb -c "SELECT ..."` の実際の出力と突き合わせて決めている。
-//! サポート範囲・既知の制限は `sql::parser`（`array_literal`/`similar_to`）・
-//! `expr::funcs`（`printf_scan`/`format_scan`/`glob_match`/
-//! `regexp_full_match_build`）のコメントを参照。
+//! Expected values are decided by cross-checking against the actual output of
+//! `duckdb -c "SELECT ..."`.
+//! For supported scope and known limitations, see the comments on `sql::parser`
+//! (`array_literal`/`similar_to`) and `expr::funcs`
+//! (`printf_scan`/`format_scan`/`glob_match`/`regexp_full_match_build`).
 //!
-//! `FROM` 無しの `SELECT <expr>` は v1 未対応（`plan::bind`）なので、行を
-//! 1 本だけ得るために `tests/data/basic.parquet` を `LIMIT 1` で使う
-//! （`json_functions.rs` と同じ流儀）。
+//! A `SELECT <expr>` with no `FROM` is unsupported in v1 (`plan::bind`), so we use
+//! `tests/data/basic.parquet` with `LIMIT 1` to get exactly one row
+//! (same convention as `json_functions.rs`).
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -56,22 +57,21 @@ fn s(v: &str) -> Value {
     Value::Bytes(v.as_bytes().to_vec())
 }
 
-// --- 配列リテラル ------------------------------------------------------------
+// --- Array literal ------------------------------------------------------------
 
 #[test]
 fn array_literal_is_sugar_for_list_value() {
     let mut sess = session_with_basic();
     // duckdb: [1,2,3] = list_value(1,2,3) -> true
     assert_eq!(one(&mut sess, "[1, 2, 3] = list_value(1, 2, 3)"), Value::Bool(true));
-    // duckdb: [1,2,3][1] -> 1（1 始まり。list_extract 経由で確認）。
-    // `list_extract` の結果は Ty::Json（生の JSON テキスト）を返す設計
-    // なので、期待値もテキストの "10" になる（`list_extract` のモジュール
-    // 冒頭 doc・`funcs.rs` の `list_extract_is_one_based_with_negative_from_end`
-    // ユニットテスト参照）。
+    // duckdb: [1,2,3][1] -> 1 (1-based; confirmed via list_extract).
+    // `list_extract`'s result is designed to return Ty::Json (raw JSON text), so the
+    // expected value is also the text "10" (see the module-top doc on `list_extract` and the
+    // `list_extract_is_one_based_with_negative_from_end` unit test in `funcs.rs`).
     assert_eq!(one(&mut sess, "list_extract([10, 20, 30], 1)"), s("10"));
-    // duckdb: [] は有効な式（空配列）。json_array_length([]) = 0。
+    // duckdb: [] is a valid expression (an empty array). json_array_length([]) = 0.
     assert_eq!(one(&mut sess, "json_array_length([])"), Value::I64(0));
-    // 混在型も許す（`list_value`/`json_array` と同じ）。
+    // Mixed types are also allowed (same as `list_value`/`json_array`).
     assert_eq!(one(&mut sess, "to_json([1, 'x', true])"), s(r#"[1,"x",true]"#));
 }
 
@@ -115,26 +115,26 @@ fn printf_matches_duckdb_on_common_specifiers() {
     assert_eq!(one(&mut sess, "printf('%d-%s', 42, 'x')"), s("42-x"));
     // duckdb: printf('%%') = '%'
     assert_eq!(one(&mut sess, "printf('%%')"), s("%"));
-    // duckdb: printf('%05d', 3) = '00003'、printf('%05d', -3) = '-0003'
+    // duckdb: printf('%05d', 3) = '00003', printf('%05d', -3) = '-0003'
     assert_eq!(one(&mut sess, "printf('%05d', 3)"), s("00003"));
     assert_eq!(one(&mut sess, "printf('%05d', -3)"), s("-0003"));
     // duckdb: printf('%-5d|', 3) = '3    |'
     assert_eq!(one(&mut sess, "printf('%-5d|', 3)"), s("3    |"));
-    // duckdb: printf('%.2f', 3.14159) = '3.14'、printf('%f', 3.5) = '3.500000'
+    // duckdb: printf('%.2f', 3.14159) = '3.14', printf('%f', 3.5) = '3.500000'
     assert_eq!(one(&mut sess, "printf('%.2f', 3.14159)"), s("3.14"));
     assert_eq!(one(&mut sess, "printf('%f', 3.5)"), s("3.500000"));
-    // NULL 引数は結果全体を NULL にする（既定の NULL 伝播）。
+    // A NULL argument makes the whole result NULL (the default NULL propagation).
     assert_eq!(one(&mut sess, "printf('%s', NULL)"), Value::Null);
-    // 表の列を実引数として使える（定数畳み込みだけでなく実データでも動く）。
+    // A table column can be used as a real argument (works with real data, not just constant folding).
     assert_eq!(one(&mut sess, "printf('id=%d name=%s', id, name)"), s("id=0 name=name_0"));
 }
 
 #[test]
 fn printf_rejects_unsupported_specifiers_and_short_arg_lists() {
     let mut sess = session_with_basic();
-    // 書式文字列は定数とは限らない（列にもできる）ので、`%x` のような
-    // 対応外の変換文字が混ざっていても `prepare`（型検査だけ）の時点では
-    // 分からず、実行時（`step`）で初めてエラーになる。
+    // The format string isn't necessarily constant (it can be a column too), so mixing in an
+    // unsupported conversion character like `%x` cannot be caught at `prepare` (type checking
+    // only) time; it only becomes an error at runtime (`step`).
     let mut q = match sess.prepare("SELECT printf('%x', 1) FROM t", &[]).unwrap() {
         Prepared::Ready(q) => q,
         Prepared::NeedIo(_) => panic!("unexpected NeedIo"),
@@ -152,7 +152,10 @@ fn printf_rejects_unsupported_specifiers_and_short_arg_lists() {
             }
         }
     }
-    assert!(saw_error, "printf('%x', ..) は対応外の変換文字なのでエラーになるはず");
+    assert!(
+        saw_error,
+        "printf('%x', ..) uses an unsupported conversion character, so it should error"
+    );
 }
 
 #[test]
@@ -174,13 +177,13 @@ fn glob_matches_shell_patterns_over_table_rows() {
     // duckdb: 'name_0' GLOB 'name_?' = true, 'name_0' GLOB 'name_1' = false
     assert_eq!(one(&mut sess, "name GLOB 'name_?'"), Value::Bool(true));
     assert_eq!(one(&mut sess, "'name_0' GLOB 'name_1'"), Value::Bool(false));
-    // 実データに対しても正しくフィルタできる（`WHERE` 句での利用）。
-    // `basic.parquet` は `name_0`..`name_6` の 7 種類の値を 1000 行に
-    // わたって繰り返すだけの表なので、`DISTINCT` で候補集合だけを見る。
+    // Filtering works correctly against real data too (used in a `WHERE` clause).
+    // `basic.parquet` is just a table repeating 7 distinct values `name_0`..`name_6` over 1000
+    // rows, so use `DISTINCT` to look at just the candidate set.
     let rows =
         run(&mut sess, "SELECT DISTINCT name FROM t WHERE name GLOB 'name_[01]' ORDER BY name");
     assert_eq!(rows, vec![vec![s("name_0")], vec![s("name_1")]]);
-    // `NOT (x GLOB y)` は書けるが `x NOT GLOB y` は DuckDB 同様に構文エラー。
+    // `NOT (x GLOB y)` can be written, but `x NOT GLOB y` is a syntax error just like DuckDB.
     assert_eq!(one(&mut sess, "NOT ('abc' GLOB 'x*')"), Value::Bool(true));
     assert_eq!(
         code_of(sess.prepare("SELECT 'abc' NOT GLOB 'x*' FROM t", &[]).map(|_| ())),
@@ -191,34 +194,34 @@ fn glob_matches_shell_patterns_over_table_rows() {
 #[test]
 fn similar_to_is_full_match_regexp() {
     let mut sess = session_with_basic();
-    // duckdb: 'abc' similar to 'a.c' = true、'Xabc' similar to 'a.c' = false
-    // （部分一致ではなく完全一致）。
+    // duckdb: 'abc' similar to 'a.c' = true, 'Xabc' similar to 'a.c' = false
+    // (a full match, not a partial one).
     assert_eq!(one(&mut sess, "'abc' SIMILAR TO 'a.c'"), Value::Bool(true));
     assert_eq!(one(&mut sess, "'Xabc' SIMILAR TO 'a.c'"), Value::Bool(false));
     assert_eq!(one(&mut sess, "'Xabc' NOT SIMILAR TO 'a.c'"), Value::Bool(true));
-    // 実データに対するフィルタ（`basic.parquet` は `name_0`..`name_6` の
-    // 7 種類の値を繰り返すだけなので `DISTINCT` で候補集合だけを見る）。
+    // A filter against real data (`basic.parquet` just repeats 7 distinct values
+    // `name_0`..`name_6`, so use `DISTINCT` to look at just the candidate set).
     let rows = run(
         &mut sess,
         "SELECT DISTINCT name FROM t WHERE name SIMILAR TO 'name_[0-1]' ORDER BY name",
     );
     assert_eq!(rows, vec![vec![s("name_0")], vec![s("name_1")]]);
-    // ESCAPE 句は DuckDB 自身も未実装として拒否するので、ここでも拒否する。
+    // The ESCAPE clause is rejected here too, since DuckDB itself rejects it as unimplemented.
     assert_eq!(
         code_of(sess.prepare(r"SELECT 'a' SIMILAR TO 'a' ESCAPE '\' FROM t", &[]).map(|_| ())),
         Some(Code::UnsupportedFeature)
     );
 }
 
-// --- 追加のエッジケース ---------------------------------------------------------
+// --- Additional edge cases ---------------------------------------------------------
 
 #[test]
 fn printf_too_few_args_is_a_runtime_error() {
     let mut sess = session_with_basic();
     // duckdb: printf('%d-%d', 1) => Invalid Input Error ("Argument index ...
-    // out of range")。書式文字列は列にもなり得るので、このエンジンでも
-    // 実行時（`step`）エラーとして検出される（`printf_rejects_unsupported_
-    // specifiers_and_short_arg_lists` と同じ理由）。
+    // out of range"). Since the format string can also be a column, this engine likewise
+    // detects it as a runtime (`step`) error (same reason as
+    // `printf_rejects_unsupported_specifiers_and_short_arg_lists`).
     let mut q = match sess.prepare("SELECT printf('%d-%d', 1) FROM t", &[]).unwrap() {
         Prepared::Ready(q) => q,
         Prepared::NeedIo(_) => panic!("unexpected NeedIo"),
@@ -236,22 +239,22 @@ fn printf_too_few_args_is_a_runtime_error() {
             }
         }
     }
-    assert!(saw_error, "printf('%d-%d', 1) は引数不足なのでエラーになるはず");
+    assert!(saw_error, "printf('%d-%d', 1) has too few arguments, so it should error");
 }
 
 #[test]
 fn printf_extra_args_are_ignored_like_duckdb() {
     let mut sess = session_with_basic();
-    // duckdb: printf('%d', 1, 2) = '1'（余った引数は無視される）。
+    // duckdb: printf('%d', 1, 2) = '1' (leftover arguments are ignored).
     assert_eq!(one(&mut sess, "printf('%d', 1, 2)"), s("1"));
 }
 
 #[test]
 fn format_too_few_args_and_out_of_range_index_are_runtime_errors() {
     let mut sess = session_with_basic();
-    // duckdb: format('{} {} {}', 1, 2) => 引数が足りずエラー。書式文字列は
-    // 列にもなり得るので `prepare`（型検査）自体はここでは成功し、実行時
-    // （`step`）で初めて検出される。
+    // duckdb: format('{} {} {}', 1, 2) => an error for too few arguments. Since the format
+    // string can also be a column, `prepare` (type checking) itself succeeds here, and it
+    // is only detected at runtime (`step`).
     let mut q = match sess.prepare("SELECT format('{} {} {}', 1, 2) FROM t", &[]).unwrap() {
         Prepared::Ready(q) => q,
         Prepared::NeedIo(_) => panic!("unexpected NeedIo"),
@@ -270,8 +273,8 @@ fn format_too_few_args_and_out_of_range_index_are_runtime_errors() {
         }
     }
     assert!(saw_error);
-    // duckdb: format('{2}', 1, 2) => インデックス 2 は範囲外でエラー
-    // （0 始まりなので有効なのは {0}/{1} のみ）。
+    // duckdb: format('{2}', 1, 2) => index 2 is out of range, an error
+    // (0-based, so only {0}/{1} are valid).
     let mut q2 = match sess.prepare("SELECT format('{2}', 1, 2) FROM t", &[]).unwrap() {
         Prepared::Ready(q) => q,
         Prepared::NeedIo(_) => panic!("unexpected NeedIo"),
@@ -295,14 +298,14 @@ fn format_too_few_args_and_out_of_range_index_are_runtime_errors() {
 #[test]
 fn glob_supports_negated_character_classes_and_escaping() {
     let mut sess = session_with_basic();
-    // duckdb: 'abc' GLOB '[!a]*' = false（先頭が 'a' なので否定クラスに
-    // マッチしない）、'xbc' GLOB '[!a]*' = true。
+    // duckdb: 'abc' GLOB '[!a]*' = false (starts with 'a', so it doesn't match the negated
+    // class), 'xbc' GLOB '[!a]*' = true.
     assert_eq!(one(&mut sess, "'abc' GLOB '[!a]*'"), Value::Bool(false));
     assert_eq!(one(&mut sess, "'xbc' GLOB '[!a]*'"), Value::Bool(true));
-    // duckdb: 'a*b' GLOB 'a\*b' = true（バックスラッシュで `*` をリテラル
-    // 扱いにエスケープできる）。
+    // duckdb: 'a*b' GLOB 'a\*b' = true (a backslash can escape `*` to be treated
+    // literally).
     assert_eq!(one(&mut sess, r"'a*b' GLOB 'a\*b'"), Value::Bool(true));
-    // 文字クラスの範囲指定も動く。
+    // Character-class range specs work too.
     assert_eq!(one(&mut sess, "'c' GLOB '[a-z]'"), Value::Bool(true));
     assert_eq!(one(&mut sess, "'C' GLOB '[a-z]'"), Value::Bool(false));
 }
@@ -310,8 +313,8 @@ fn glob_supports_negated_character_classes_and_escaping() {
 #[test]
 fn similar_to_supports_alternation_and_quantifiers() {
     let mut sess = session_with_basic();
-    // duckdb: 'abc' similar to '(a|x)bc' = true、'aaab' similar to
-    // 'a{2,3}b' = true、'ab' similar to 'a+b?' = true。
+    // duckdb: 'abc' similar to '(a|x)bc' = true, 'aaab' similar to
+    // 'a{2,3}b' = true, 'ab' similar to 'a+b?' = true.
     assert_eq!(one(&mut sess, "'abc' SIMILAR TO '(a|x)bc'"), Value::Bool(true));
     assert_eq!(one(&mut sess, "'aaab' SIMILAR TO 'a{2,3}b'"), Value::Bool(true));
     assert_eq!(one(&mut sess, "'ab' SIMILAR TO 'a+b?'"), Value::Bool(true));
@@ -320,22 +323,22 @@ fn similar_to_supports_alternation_and_quantifiers() {
 #[test]
 fn array_literal_allows_mixed_numeric_types_and_nesting() {
     let mut sess = session_with_basic();
-    // 整数と浮動小数の混在も特に変換せずそのまま JSON へ乗る
-    // （`Ty::Json` は動的型付けなので duckdb のような数値統一は行わない。
-    // `array_literal_is_sugar_for_list_value` の混在型テストと同じ方針）。
+    // Mixing integers and floats also just rides along into JSON without any special
+    // conversion (`Ty::Json` is dynamically typed, so unlike duckdb it does not unify numeric
+    // types; same policy as the mixed-type test in `array_literal_is_sugar_for_list_value`).
     assert_eq!(one(&mut sess, "to_json([1, 2.5])"), s("[1,2.5]"));
-    // NULL 要素を含む配列。
+    // An array containing a NULL element.
     assert_eq!(one(&mut sess, "to_json([1, NULL, 3])"), s("[1,null,3]"));
-    // 配列の配列（ネスト）。
+    // An array of arrays (nested).
     assert_eq!(one(&mut sess, "to_json([1, [2, 3]])"), s("[1,[2,3]]"));
 }
 
-// --- 相互作用: WHERE/JOIN/集約との組み合わせ ------------------------------------
+// --- Interaction: combined with WHERE/JOIN/aggregation ------------------------------
 
 #[test]
 fn glob_and_similar_to_work_as_join_conditions() {
     let mut sess = session_with_basic();
-    // `GLOB`/`SIMILAR TO` は普通の bool 式なので `JOIN ... ON` にも書ける。
+    // `GLOB`/`SIMILAR TO` are ordinary bool expressions, so they can also be written in `JOIN ... ON`.
     let rows = run(
         &mut sess,
         "SELECT DISTINCT a.name FROM t a JOIN t b ON a.name GLOB b.name \
@@ -347,8 +350,8 @@ fn glob_and_similar_to_work_as_join_conditions() {
 #[test]
 fn array_literal_can_feed_an_aggregate_input() {
     let mut sess = session_with_basic();
-    // 配列リテラルの要素数（`json_array_length`）を集約する
-    // — 新機能（配列リテラル）を既存の集約パイプラインと組み合わせる。
+    // Aggregate the array literal's element count (`json_array_length`)
+    // -- combines the new feature (array literals) with the existing aggregation pipeline.
     let rows = run(&mut sess, "SELECT sum(json_array_length([id, id, id])) FROM t WHERE id < 4");
     assert_eq!(rows, vec![vec![Value::I128(12)]]);
 }

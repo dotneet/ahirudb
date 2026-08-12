@@ -1,14 +1,14 @@
-//! CSV / TSV を `TableFormat` に適合させる読み取り器。
+//! A reader adapting CSV / TSV to `TableFormat`.
 //!
-//! 行指向フォーマットなので、Parquet アダプタと違って「統計で分割を落とす」も
-//! 「射影で取得バイトを減らす」もできない。できるのは次の 2 つだけ:
+//! Being a row-oriented format, unlike the Parquet adapter it can neither "drop splits by
+//! statistics" nor "reduce fetched bytes by projection". Only two things are possible:
 //!
-//! 1. 固定長バイトチャンクで分割し、I/O を分割境界に刻む
-//! 2. 射影されていない列の**変換**を省く（走査はどのみち必要）
+//! 1. Split into fixed-length byte chunks, cutting I/O at split boundaries
+//! 2. Skip **converting** columns that are not projected (scanning is needed regardless)
 //!
-//! スキーマは先頭 `SAMPLE_BYTES` からの推定なので後続行で外れることがある。
-//! 外れた値はエラーにせず NULL にする。1 行の異常でクエリ全体を落とすより、
-//! その 1 セルを NULL にする方が実用上ましだから。
+//! The schema is inferred from the leading `SAMPLE_BYTES`, so later rows can fall outside it.
+//! A value that falls outside is not an error but NULL. Making that one cell NULL is more
+//! practical than failing the whole query over one anomalous row.
 
 use crate::catalog::Source;
 use crate::format::{get_or_internal, ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
@@ -16,34 +16,34 @@ use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
-/// スキーマ推定のために先頭から要求するバイト数。
+/// How many leading bytes are requested for schema inference.
 ///
-/// 大きいほど推定は当たるが、最初のクエリの待ち時間がそのまま伸びる。
+/// The larger it is the better the inference, but the first query's wait grows accordingly.
 const SAMPLE_BYTES: u64 = 256 * 1024;
 
-/// 型推定に使う最大行数。サンプルバイトの方が先に尽きることもある。
+/// The maximum number of rows used for type inference. The sample bytes may run out first.
 const SAMPLE_ROWS: usize = 1000;
 
-/// 列バッファの初期確保行数。入力は信用できないので、行数の見積りから
-/// 確保量を決めることはしない（巨大な確保を仕込まれないため）。
+/// The initial row capacity of a column buffer. The input is untrusted, so the allocation is not
+/// sized from an estimated row count (so a huge allocation cannot be planted).
 const ROW_CAP: usize = 256;
 
 pub struct CsvFormat {
     delimiter: u8,
     schema: Vec<Field>,
-    /// ヘッダ行の直後（= 最初のデータレコードの先頭）の絶対オフセット。
+    /// The absolute offset just after the header row (= the start of the first data record).
     data_start: u64,
     total_len: u64,
     resolved: bool,
-    /// 1 分割のバイト数。既定は [`TEXT_SPLIT_BYTES`]。
+    /// The bytes per split. Defaults to [`TEXT_SPLIT_BYTES`].
     ///
-    /// 小さくすると I/O の往復が増える代わりに 1 分割のメモリが減る。
-    /// テストで複数分割を作るのにも使う。
+    /// Making it smaller reduces one split's memory at the cost of more I/O round trips.
+    /// It is also used in tests to create several splits.
     pub split_bytes: u64,
-    /// 1 レコードの上限バイト数。既定は [`TEXT_MAX_RECORD`]。
+    /// The maximum bytes in one record. Defaults to [`TEXT_MAX_RECORD`].
     ///
-    /// 分割境界をまたぐレコードを読み切るための「読み越し量」でもあるので、
-    /// これを超えるレコードがあるファイルは分割して読めない（`LimitExceeded`）。
+    /// It also doubles as the "overread amount" for finishing a record that straddles a split
+    /// boundary, so a file with a record exceeding it cannot be read split (`LimitExceeded`).
     pub max_record: u64,
 }
 
@@ -64,28 +64,28 @@ impl CsvFormat {
         self.delimiter
     }
 
-    /// データ領域（ヘッダを除いた部分）のバイト数。
+    /// The byte count of the data region (everything but the header).
     fn data_len(&self) -> u64 {
         self.total_len.saturating_sub(self.data_start)
     }
 
-    /// 0 は分割数の計算を壊すので、常に 1 以上に丸めて使う。
+    /// 0 would break the split-count computation, so it is always rounded up to at least 1.
     fn chunk_size(&self) -> u64 {
         self.split_bytes.max(1)
     }
 
-    /// 分割 `split` の境界。
+    /// The boundaries of split `split`.
     ///
-    /// 返すのは `(所有区間の開始, 所有区間の終了, 取得開始, 取得終了)`。
-    /// 所有区間は半開区間で、**そこで始まる**レコードがこの分割のもの。
+    /// It returns `(owned interval start, owned interval end, fetch start, fetch end)`.
+    /// The owned interval is half-open, and records **starting within it** belong to this split.
     ///
-    /// 取得範囲が所有区間より広いのには 2 つ理由がある:
+    /// There are two reasons the fetch range is wider than the owned interval:
     ///
-    /// - 後ろ側: 所有区間の末尾で始まったレコードを読み切るための読み越し。
-    /// - 前側 1 バイト: 「直前のバイトが行終端か」を知るため。これが無いと、
-    ///   レコードがちょうど所有区間の先頭から始まるとき、その 1 行が
-    ///   どの分割にも属さずに消える（先頭の行終端まで読み飛ばす規則と、
-    ///   半開区間の所有規則が食い違うため）。
+    /// - On the back: the overread needed to finish a record that started at the owned interval's end.
+    /// - One byte on the front: to know "whether the preceding byte was a line terminator".
+    ///   Without it, when a record starts exactly at the owned interval's beginning, that one row
+    ///   belongs to no split and vanishes (because "skip to the first line terminator" and the
+    ///   half-open ownership rule would disagree).
     fn chunk(&self, split: usize) -> Result<(u64, u64, u64, u64)> {
         ensure!(split < self.num_splits(), Internal);
         let size = self.chunk_size();
@@ -111,7 +111,7 @@ impl TableFormat for CsvFormat {
         }
         self.total_len = src.total_len;
         if src.total_len == 0 {
-            // 空ファイル。列 0・分割 0 として解決済みにする。エラーにはしない。
+            // An empty file. Resolved as 0 columns and 0 splits. Not an error.
             self.data_start = 0;
             self.resolved = true;
             return Ok(Ok(()));
@@ -123,11 +123,11 @@ impl TableFormat for CsvFormat {
             None => return Ok(Err((0, n))),
         };
 
-        // UTF-8 BOM は落とす。残すと先頭列の名前に混ざって列参照が引けなくなる。
+        // A UTF-8 BOM is dropped. Leaving it would mix into the first column's name and break column references.
         let bom = if sample.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
         let body = &sample[bom..];
 
-        // --- ヘッダ行 -------------------------------------------------------
+        // --- The header row -------------------------------------------------
         let mut sc = Scanner::new(body, self.delimiter);
         let mut raw: Vec<Vec<u8>> = Vec::new();
         let mut scratch = Vec::new();
@@ -138,17 +138,17 @@ impl TableFormat for CsvFormat {
                 break f.term == Term::Record;
             }
         };
-        // ヘッダがサンプルに収まらないのは異常入力。要求範囲を広げ続けるより
-        // 上限として弾く方が、進まないループを作らずに済む。
+        // A header not fitting the sample is anomalous input. Rejecting it as a limit is better
+        // than growing the requested range forever and creating a loop that never advances.
         ensure!(terminated || n == src.total_len, LimitExceeded);
         self.data_start = bom as u64 + sc.pos() as u64;
 
         let names = column_names(&raw);
 
-        // --- 型推定 ---------------------------------------------------------
-        // 途中で切れた末尾レコードを推定に混ぜないよう、最後の行終端で切る。
-        // （引用符内の改行で切ってしまうこともあるが、その場合に起きるのは
-        //   「その列が VARCHAR に広がる」だけで、安全側に倒れる。）
+        // --- Type inference ---------------------------------------------------
+        // Cut at the last line terminator so a truncated trailing record does not enter the inference.
+        // (It may cut at a newline inside quotes, but all that happens then is "that column widens
+        //  to VARCHAR", which errs safe.)
         let rest = &body[sc.pos()..];
         let rest = if n < src.total_len {
             match rest.iter().rposition(|&c| c == b'\n') {
@@ -168,15 +168,15 @@ impl TableFormat for CsvFormat {
             }
             let mut fi = 0;
             loop {
-                // 壊れたレコードで推定を止めるだけにする。実際に読むときに
-                // 同じ場所でエラーになるので、ここで落とす必要はない。
+                // A broken record merely stops the inference. When actually reading it later,
+                // it will fail at the same spot, so there's no need to bail out here.
                 let f = match sc.field() {
                     Ok(f) => f,
                     Err(_) => break 'sample,
                 };
                 if let Some(slot) = cands.get_mut(fi) {
                     let v = field_value(rest, &f, &mut scratch);
-                    // 空セルは NULL 扱いなので型の証拠にしない。
+                    // An empty cell is treated as NULL, so it does not count as evidence for a type.
                     if !v.is_empty() {
                         *slot = widen(*slot, classify(v));
                     }
@@ -189,7 +189,7 @@ impl TableFormat for CsvFormat {
             rows += 1;
         }
 
-        // CSV には NOT NULL を表す手段が無いので全列 nullable。
+        // CSV has no way to express NOT NULL, so every column is nullable.
         self.schema =
             names.into_iter().zip(cands).map(|(name, c)| Field::new(name, c.ty(), true)).collect();
         self.resolved = true;
@@ -216,7 +216,7 @@ impl TableFormat for CsvFormat {
         len.div_ceil(size) as usize
     }
 
-    /// 行数は読むまで分からない。見積りにしか使われないので `None` でよい。
+    /// The row count is unknown until the data is read. Since this is only used for estimation, `None` is fine.
     fn split_rows(&self, _split: usize) -> Option<u64> {
         None
     }
@@ -227,8 +227,8 @@ impl TableFormat for CsvFormat {
         _projection: &[usize],
         out: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
-        // 射影は無視する。行指向なので、どの列が欲しくても分割の全バイトを
-        // 走査しないとフィールド境界すら決まらない。
+        // Projection is ignored: since this is row-oriented, all bytes of the split are needed
+        // Without scanning, not even the field boundaries are settled.
         let (_, _, fetch_start, fetch_end) = self.chunk(split)?;
         out.push((fetch_start, fetch_end));
         Ok(())
@@ -240,8 +240,8 @@ impl TableFormat for CsvFormat {
         let buf = get_or_internal(src, fetch_start, fetch_end)?;
         let ncols = self.schema.len();
 
-        // 射影に同じ列が 2 度現れても長さの揃った列を返せるよう、まず重複を
-        // 除いた集合で組み立てて、最後に並べ直す。
+        // So that columns of equal length can be returned even when the projection names the same
+        // column twice, it is built over a deduplicated set first and reordered at the end.
         let mut uniq: Vec<usize> = Vec::with_capacity(projection.len());
         for &c in projection {
             ensure!(c < ncols, Internal);
@@ -264,22 +264,22 @@ impl TableFormat for CsvFormat {
         let lead = (own_start - fetch_start) as usize;
         let mut sc = Scanner::new(buf, self.delimiter);
         if lead > 0 {
-            // 所有区間の直前が行終端なら、先頭からレコードが始まっている。
-            // そうでなければ最初の行終端の直後まで読み飛ばす（そのレコードは
-            // 前の分割が読み切っている）。
+            // If the byte just before the owned interval is a line terminator, a record starts at
+            // the beginning. Otherwise it skips to just after the first line terminator (that
+            // record was finished by the previous split).
             //
-            // ここが引用符の唯一の弱点で、この走査は引用状態を知り得ない。
-            // 引用符の内側の改行を行終端と誤認する可能性があり、
-            // 「レコード長 <= max_record」だけでは防げない。分割してよいのは
-            // 「引用符内の改行が分割境界の直後に来ない」場合に限られる、
-            // というのが残る制約（RFC 4180 の CSV を並列に読む実装が共通して
-            // 抱えるもので、ここでも解決していない）。
+            // This is quoting's one weak point: this scan cannot know the quoting state. It may
+            // mistake a newline inside quotes for a line terminator, and "record length <=
+            // max_record" alone cannot prevent that. The remaining constraint is that splitting is
+            // only safe when "no newline inside quotes lands right after a split boundary"
+            // (a limitation every implementation that reads RFC 4180 CSV in parallel shares, and
+            // not solved here either).
             match buf.first() {
                 Some(&b'\n') => sc.seek(1),
                 _ => match buf.iter().skip(1).position(|&c| c == b'\n') {
                     Some(i) => sc.seek(i + 2),
-                    // 読み越し範囲内に行終端が無い＝この分割で始まるレコードは
-                    // 無い（あるいはレコードが長すぎる）。空を返す。
+                    // No line terminator within the overread range = no record starts in this split
+                    // (or the record is too long). Return empty.
                     None => return finish(cols, &uniq, projection),
                 },
             }
@@ -289,7 +289,7 @@ impl TableFormat for CsvFormat {
         let at_file_end = fetch_end >= self.total_len;
         let mut scratch = Vec::new();
         while sc.pos() < limit && !sc.at_end() {
-            // 空行は行として数えない（末尾の改行が 1 行増やさないのと同じ扱い）。
+            // Blank lines do not count as rows (the same treatment as a trailing newline not adding a row).
             if sc.skip_blank_line() {
                 continue;
             }
@@ -298,7 +298,7 @@ impl TableFormat for CsvFormat {
                 let f = match sc.field() {
                     Ok(f) => f,
                     Err(e) => {
-                        // バッファ末尾で切れたのなら構文誤りではなく長すぎるレコード。
+                        // Cut off at the buffer's end means not a syntax error but too long a record.
                         ensure!(at_file_end, LimitExceeded);
                         return Err(e);
                     }
@@ -308,16 +308,16 @@ impl TableFormat for CsvFormat {
                     if let Some(col) = cols.get_mut(*slot) {
                         col.push(v, f.quoted);
                     }
-                } // 射影外の列は変換しない。走査だけは済んでいる。
+                } // Columns outside the projection are not converted. Only the scan is done.
                 fi += 1;
                 if f.term != Term::Field {
-                    // 行終端に出会わずバッファが尽きた場合、ファイル末尾なら
-                    // それが最終レコード、そうでなければ読み越し不足。
+                    // If the buffer runs out without meeting a line terminator: at end of file that
+                    // is the final record; otherwise the overread was insufficient.
                     ensure!(f.term != Term::Eof || at_file_end, LimitExceeded);
                     break;
                 }
             }
-            // フィールドが足りない行は残りを NULL にする（多い分は捨てる）。
+            // A row with too few fields has the rest set to NULL (surplus fields are discarded).
             for c in fi..ncols {
                 if let Some(Some(slot)) = slot_of.get(c) {
                     if let Some(col) = cols.get_mut(*slot) {
@@ -331,11 +331,11 @@ impl TableFormat for CsvFormat {
     }
 }
 
-/// 列バッファを射影の並びに戻す。
+/// Restores the column buffers into the projection's order.
 fn finish(cols: Vec<ColBuf>, uniq: &[usize], projection: &[usize]) -> Result<Vec<Vector>> {
     let vecs: Vec<Vector> = cols.into_iter().map(|c| c.finish()).collect();
     if uniq.len() == projection.len() {
-        // 重複が無ければ uniq は projection そのもの。複製は要らない。
+        // With no duplicates, uniq is the projection itself. No copy is needed.
         return Ok(vecs);
     }
     let mut out = Vec::with_capacity(projection.len());
@@ -348,12 +348,12 @@ fn finish(cols: Vec<ColBuf>, uniq: &[usize], projection: &[usize]) -> Result<Vec
     Ok(out)
 }
 
-// --- 列名 --------------------------------------------------------------------
+// --- Column names --------------------------------------------------------------
 
-/// ヘッダから列名を決める。
+/// Decides the column names from the header.
 ///
-/// 空・非 UTF-8・重複は `columnN` に置き換える。重複を放置すると列参照が
-/// どちらを指すか決められなくなるので、必ず一意にしてから返す。
+/// Empty, non-UTF-8, and duplicate names are replaced with `columnN`. Leaving duplicates would
+/// make it impossible to decide which one a column reference means, so they are always made unique.
 fn column_names(raw: &[Vec<u8>]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
     for (i, r) in raw.iter().enumerate() {
@@ -364,8 +364,8 @@ fn column_names(raw: &[Vec<u8>]) -> Vec<String> {
         if out.iter().any(|p| eq_ascii_ci(p.as_bytes(), name.as_bytes())) {
             name = generated_name(i);
         }
-        // 生成名がさらに衝突する（先の列が literally "column3" だった等）
-        // 場合に備える。長さが毎回伸びるので必ず有限回で止まる。
+        // In case a generated name collides again (an earlier column was literally "column3", say).
+        // The length grows each time, so it always terminates.
         while out.iter().any(|p| eq_ascii_ci(p.as_bytes(), name.as_bytes())) {
             name.push('_');
         }
@@ -374,7 +374,7 @@ fn column_names(raw: &[Vec<u8>]) -> Vec<String> {
     out
 }
 
-/// `column0`, `column1` … を作る。`format!` は使えないので桁を自前で書く。
+/// Builds `column0`, `column1`, and so on. `format!` is unavailable, so the digits are written by hand.
 fn generated_name(i: usize) -> String {
     let mut s = String::from("column");
     let mut digits = [0u8; 20];
@@ -398,24 +398,24 @@ fn generated_name(i: usize) -> String {
     s
 }
 
-// --- 走査 --------------------------------------------------------------------
+// --- Scanning ------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Term {
-    /// 区切り文字。まだフィールドが続く。
+    /// A delimiter. More fields follow.
     Field,
-    /// 行終端。
+    /// A line terminator.
     Record,
-    /// バッファ末尾。
+    /// The end of the buffer.
     Eof,
 }
 
-/// 1 フィールドの位置。`start..end` は引用符を外した値本体を指す。
+/// One field's position. `start..end` points at the value body with quotes removed.
 struct Span {
     start: usize,
     end: usize,
     quoted: bool,
-    /// `""` を含むので取り出すときに畳む必要がある。
+    /// It contains `""`, so it must be folded when extracted.
     escaped: bool,
     term: Term,
 }
@@ -443,7 +443,7 @@ impl<'a> Scanner<'a> {
         self.p >= self.buf.len()
     }
 
-    /// 現在位置が空行なら読み飛ばして真を返す。
+    /// If the current position is a blank line, skips it and returns true.
     fn skip_blank_line(&mut self) -> bool {
         match self.buf.get(self.p) {
             Some(&b'\n') => {
@@ -458,11 +458,11 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// 1 フィールドを走査する。
+    /// Scans one field.
     ///
-    /// RFC 4180: `"` で始まるフィールドは引用され、内側の `""` は 1 個の `"`、
-    /// 区切り文字・`\n`・`\r` は値の一部になる。**引用符の内側の改行は行終端
-    /// ではない**。
+    /// RFC 4180: a field starting with `"` is quoted, an inner `""` is one `"`, and the delimiter,
+    /// `\n`, and `\r` become part of the value. **A newline inside quotes is not a line
+    /// terminator**.
     fn field(&mut self) -> Result<Span> {
         if self.buf.get(self.p) == Some(&b'"') {
             self.p += 1;
@@ -470,8 +470,8 @@ impl<'a> Scanner<'a> {
             let mut escaped = false;
             loop {
                 match self.buf.get(self.p) {
-                    // 閉じない引用符。ここで打ち切らないと残り全部を 1 セルとして
-                    // 抱え込むので、構文エラーにする。
+                    // An unclosed quote. Without cutting off here the whole remainder would be held
+                    // as one cell, so it is a syntax error.
                     None => err!(SyntaxError, self.p),
                     Some(&b'"') => {
                         if self.buf.get(self.p + 1) == Some(&b'"') {
@@ -501,8 +501,8 @@ impl<'a> Scanner<'a> {
                 self.p += 1;
                 return Ok(Span { start, end, quoted: false, escaped: false, term: Term::Record });
             }
-            // CRLF。単独の `\r` は行終端にしない（分割境界の走査が `\n` しか
-            // 見ないので、両者の解釈を一致させておく）。
+            // CRLF. A lone `\r` is not a line terminator (the split-boundary scan looks only at
+            // `\n`, so the two interpretations are kept consistent).
             if c == b'\r' && self.buf.get(self.p + 1) == Some(&b'\n') {
                 let end = self.p;
                 self.p += 2;
@@ -513,8 +513,8 @@ impl<'a> Scanner<'a> {
         Ok(Span { start, end: self.buf.len(), quoted: false, escaped: false, term: Term::Eof })
     }
 
-    /// 閉じ引用符の後ろから区切り／行終端まで進む。
-    /// RFC 4180 では引用符の後ろにバイトが続くのは不正だが、捨てて先へ進む。
+    /// Advances from after a closing quote to the delimiter or line terminator.
+    /// RFC 4180 forbids bytes after a closing quote, but they are discarded and it moves on.
     fn skip_to_term(&mut self) -> Term {
         while let Some(&c) = self.buf.get(self.p) {
             if c == self.delim {
@@ -535,7 +535,7 @@ impl<'a> Scanner<'a> {
     }
 }
 
-/// フィールドの値バイト列。`""` を含むときだけ `scratch` に畳んで返す。
+/// A field's value bytes. Folded into `scratch` and returned only when it contains `""`.
 fn field_value<'b>(buf: &'b [u8], f: &Span, scratch: &'b mut Vec<u8>) -> &'b [u8] {
     if !f.escaped {
         return buf.get(f.start..f.end).unwrap_or(&[]);
@@ -546,7 +546,7 @@ fn field_value<'b>(buf: &'b [u8], f: &Span, scratch: &'b mut Vec<u8>) -> &'b [u8
         match buf.get(i) {
             Some(&b'"') => {
                 scratch.push(b'"');
-                i += 2; // `""` を 1 個に畳む
+                i += 2; // fold `""` into one
             }
             Some(&c) => {
                 scratch.push(c);
@@ -558,16 +558,16 @@ fn field_value<'b>(buf: &'b [u8], f: &Span, scratch: &'b mut Vec<u8>) -> &'b [u8
     scratch
 }
 
-// --- 型推定 ------------------------------------------------------------------
+// --- Type inference ------------------------------------------------------------
 
-/// 推定中の候補型。
+/// The candidate type during inference.
 ///
-/// 広がる順は BOOLEAN → BIGINT → DOUBLE → VARCHAR。DATE と TIMESTAMP は
-/// 別の枝で、混ざれば TIMESTAMP に寄る。VARCHAR は吸収状態。
+/// It widens in the order BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR. DATE and TIMESTAMP are a
+/// separate branch, and mixing them settles on TIMESTAMP. VARCHAR is an absorbing state.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 enum Cand {
-    /// まだ非空の値を 1 つも見ていない。
+    /// Not a single non-empty value has been seen yet.
     Empty,
     Bool,
     Int,
@@ -580,7 +580,7 @@ enum Cand {
 impl Cand {
     fn ty(self) -> Ty {
         match self {
-            // 全部空の列は VARCHAR にしておく。数値だと決める根拠が無い。
+            // An all-empty column is left as VARCHAR. There is no basis for deciding it is numeric.
             Cand::Empty | Cand::Text => Ty::Varchar,
             Cand::Bool => Ty::Boolean,
             Cand::Int => Ty::BigInt,
@@ -607,10 +607,10 @@ fn classify(v: &[u8]) -> Cand {
     }
 }
 
-/// 候補型を広げる。格子の外に出る組み合わせはすべて VARCHAR。
+/// Widens the candidate type. Any combination leaving the lattice becomes VARCHAR.
 ///
-/// BOOLEAN + BIGINT が BIGINT になるのは格子の定義どおり。`true` は BIGINT に
-/// 収まらないので、その行は読み出し時に NULL になる。
+/// BOOLEAN + BIGINT becoming BIGINT is exactly as the lattice defines. `true` does not fit BIGINT,
+/// so that row becomes NULL when read.
 fn widen(a: Cand, b: Cand) -> Cand {
     use Cand::*;
     if a == b {
@@ -626,7 +626,7 @@ fn widen(a: Cand, b: Cand) -> Cand {
     }
 }
 
-// --- 値の変換 ----------------------------------------------------------------
+// --- Value conversion ----------------------------------------------------------
 
 fn parse_bool(v: &[u8]) -> Option<bool> {
     if eq_ascii_ci(v, b"true") {
@@ -647,7 +647,7 @@ fn parse_i64(v: &[u8]) -> Option<i64> {
     if ds.is_empty() {
         return None;
     }
-    // 負側で累算する。そうしないと i64::MIN が表現できない。
+    // Accumulated on the negative side; otherwise i64::MIN is not representable.
     let mut acc: i64 = 0;
     for &c in ds {
         let d = c.wrapping_sub(b'0');
@@ -664,7 +664,7 @@ fn parse_i64(v: &[u8]) -> Option<i64> {
 }
 
 fn parse_f64(v: &[u8]) -> Option<f64> {
-    // 形は自前で検査する。`inf` / `NaN` / 16 進を弾き、CSV の数値だけ通したい。
+    // The shape is checked in-house. `inf` / `NaN` / hex are rejected so only CSV numbers pass.
     let mut i = if matches!(v.first(), Some(b'+') | Some(b'-')) { 1 } else { 0 };
     let mut digits = 0usize;
     while let Some(&c) = v.get(i) {
@@ -707,8 +707,8 @@ fn parse_f64(v: &[u8]) -> Option<f64> {
     if i != v.len() {
         return None;
     }
-    // 値そのものの変換は core の `f64::from_str` に任せる。正しく丸める
-    // 10 進→2 進変換を自作すると、誤差かコードサイズのどちらかを損なう。
+    // The value conversion itself is left to core's `f64::from_str`. Writing a correctly rounding
+    // decimal-to-binary conversion in-house would cost either accuracy or code size.
     core::str::from_utf8(v).ok()?.parse::<f64>().ok()
 }
 
@@ -731,19 +731,19 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
-/// エポック (1970-01-01) からの日数。Howard Hinnant の days_from_civil。
+/// Days since the epoch (1970-01-01). Howard Hinnant's days_from_civil.
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    // 3 月始まりに寄せると閏日が年の末尾に来て、場合分けが消える。
+    // Shifting to a March-based year puts the leap day at the year's end and removes the case split.
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
-    let mp = ((m + 9) % 12) as i64; // 3 月 = 0
+    let mp = ((m + 9) % 12) as i64; // March = 0
     let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146097 + doe - 719468
 }
 
-/// 10 進数字列を読む。数字以外が混ざれば `None`。
+/// Reads a decimal digit string. `None` if anything but digits is mixed in.
 fn dec(b: &[u8]) -> Option<u32> {
     if b.is_empty() {
         return None;
@@ -759,7 +759,7 @@ fn dec(b: &[u8]) -> Option<u32> {
     Some(a)
 }
 
-/// 先頭 10 バイトの `YYYY-MM-DD` を読む。
+/// Reads the leading 10 bytes as `YYYY-MM-DD`.
 fn parse_ymd(v: &[u8]) -> Option<(i64, u32, u32)> {
     if v.len() < 10 || v.get(4) != Some(&b'-') || v.get(7) != Some(&b'-') {
         return None;
@@ -773,7 +773,7 @@ fn parse_ymd(v: &[u8]) -> Option<(i64, u32, u32)> {
     Some((y, m, d))
 }
 
-/// DATE はエポックからの日数 (I32)。
+/// DATE is days since the epoch (I32).
 fn parse_date(v: &[u8]) -> Option<i32> {
     if v.len() != 10 {
         return None;
@@ -786,8 +786,8 @@ fn parse_date(v: &[u8]) -> Option<i32> {
     Some(days as i32)
 }
 
-/// TIMESTAMP はエポックからのマイクロ秒 (I64)。
-/// 受け付ける形は `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]`。タイムゾーンは非対応。
+/// TIMESTAMP is microseconds since the epoch (I64).
+/// The accepted form is `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]`. Time zones are unsupported.
 fn parse_ts(v: &[u8]) -> Option<i64> {
     if v.len() < 19 {
         return None;
@@ -814,7 +814,7 @@ fn parse_ts(v: &[u8]) -> Option<i64> {
             if !c.is_ascii_digit() {
                 break;
             }
-            // 7 桁目以降は捨てる（マイクロ秒精度に正規化する）。
+            // The 7th digit onward is discarded (normalized to microsecond precision).
             if scale > 0 {
                 us += (c - b'0') as i64 * scale;
                 scale /= 10;
@@ -831,13 +831,13 @@ fn parse_ts(v: &[u8]) -> Option<i64> {
     let secs = days_from_civil(y, m, d)
         .checked_mul(86_400)?
         .checked_add((h * 3600 + mi * 60 + s) as i64)?;
-    // 負の時刻でも `秒 * 1e6 + 端数` で正しい向きになる（-1 秒 + 999999us = -1us）。
+    // Even for negative times, `seconds * 1e6 + fraction` gets the direction right (-1 s + 999999 us = -1 us).
     secs.checked_mul(1_000_000)?.checked_add(us)
 }
 
-// --- 列バッファ --------------------------------------------------------------
+// --- Column buffers ------------------------------------------------------------
 
-/// 1 列分の組み立て中バッファ。`Value` を経由しないので行あたりの確保が無い。
+/// The under-construction buffer for one column. It does not go through `Value`, so there is no per-row allocation.
 struct ColBuf {
     ty: Ty,
     data: Data,
@@ -865,11 +865,11 @@ impl ColBuf {
         self.validity.push(false);
     }
 
-    /// 1 セルを積む。
+    /// Pushes one cell.
     ///
-    /// 引用符の無い空セルは NULL、`""` は空文字列。両者を区別できるのが
-    /// CSV で NULL を表せる唯一の手段なので、ここは崩さない。
-    /// 推定した型に合わない値はエラーにせず NULL にする。
+    /// An unquoted empty cell is NULL and `""` is the empty string. Being able to distinguish them
+    /// is the only way CSV can express NULL, so that is not broken here.
+    /// A value not matching the inferred type is not an error but NULL.
     fn push(&mut self, v: &[u8], quoted: bool) {
         if v.is_empty() && !quoted {
             self.push_null();
@@ -920,7 +920,7 @@ impl ColBuf {
                 }
             },
             Data::I128(d) => {
-                // 推定が I128 を選ぶことは無い。念のため NULL で埋める。
+                // Inference never picks I128. Filled with NULL just in case.
                 d.push(0);
                 false
             }
@@ -934,7 +934,7 @@ impl ColBuf {
 
     fn finish(self) -> Vector {
         let mut v = Vector::from_data(self.ty, self.data, Some(self.validity));
-        // NULL が無ければビットマップを捨てて後段の演算を軽くする。
+        // With no NULLs the bitmap is dropped to lighten later operations.
         v.compact_validity();
         v
     }
@@ -955,11 +955,11 @@ mod tests {
         std::fs::read(data_path(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
     }
 
-    /// 全分割を読んで縦に連結する。列は `projection` の並び。
+    /// Reads every split and concatenates them vertically. The columns follow `projection`'s order.
     fn read_all(fmt: &CsvFormat, src: &Source, projection: &[usize]) -> Vec<Vec<Value>> {
         let mut out: Vec<Vec<Value>> = projection.iter().map(|_| Vec::new()).collect();
         for s in 0..fmt.num_splits() {
-            // 取得範囲の契約どおりのバイトが揃っていることも確かめる。
+            // It also checks that the bytes contracted by the fetch range are present.
             let mut ranges = Vec::new();
             fmt.split_ranges(s, projection, &mut ranges).expect("split_ranges");
             for (a, b) in &ranges {
@@ -969,7 +969,7 @@ mod tests {
             assert_eq!(cols.len(), projection.len());
             let n = cols.first().map_or(0, |c| c.len());
             for c in &cols {
-                assert_eq!(c.len(), n, "split {s}: 列長が揃っていない");
+                assert_eq!(c.len(), n, "split {s}: the column lengths do not agree");
             }
             for (i, c) in cols.iter().enumerate() {
                 for r in 0..n {
@@ -980,13 +980,13 @@ mod tests {
         out
     }
 
-    /// メモリ上の CSV を解決する。
+    /// Resolves an in-memory CSV.
     fn open(bytes: &[u8], delim: u8) -> (CsvFormat, Source) {
         let src = Source::from_bytes(bytes.to_vec());
         let mut f = CsvFormat::new(delim);
         match f.resolve(&src).expect("resolve") {
             Ok(()) => {}
-            Err(r) => panic!("メモリ上のソースで I/O 要求 {r:?}"),
+            Err(r) => panic!("an I/O request {r:?} from an in-memory source"),
         }
         (f, src)
     }
@@ -1008,19 +1008,19 @@ mod tests {
     fn text(v: &Value) -> String {
         match v {
             Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
-            _ => panic!("bytes ではない"),
+            _ => panic!("not bytes"),
         }
     }
 
-    // --- ヘッダ -------------------------------------------------------------
+    // --- Headers ------------------------------------------------------------
 
     #[test]
     fn header_names_are_made_unique() {
         let (f, _) = open(b"a,,a,B,column2\n1,2,3,4,5\n", b',');
-        // 空 → column1、重複（大小無視）→ column2。5 列目は自分より前に
-        // 生成された "column2" と衝突するので、こちらが column4 になる。
+        // Empty -> column1; a duplicate (ignoring case) -> column2. The fifth column collides with
+        // the "column2" generated before it, so it becomes column4.
         assert_eq!(names(&f), vec!["a", "column1", "column2", "B", "column4"]);
-        // 生成名どうしがさらに衝突する場合は `_` を足して一意にする。
+        // When generated names collide with one another, a `_` is added to make them unique.
         let (g, _) = open(b"x,column1,x\n1,2,3\n", b',');
         assert_eq!(names(&g), vec!["x", "column1", "column2"]);
         let (h, _) = open(b"column2,a,a\n1,2,3\n", b',');
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!(types(&f), vec![Ty::BigInt, Ty::Varchar]);
         let got = read_all(&f, &src, &[0, 1]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
-        // `\r` が値に残っていないこと。
+        // No `\r` remains in the value.
         assert_eq!(text(&got[1][0]), "x");
         assert_eq!(text(&got[1][1]), "y");
     }
@@ -1107,7 +1107,7 @@ mod tests {
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
     }
 
-    // --- 型推定 -------------------------------------------------------------
+    // --- Type inference -----------------------------------------------------
 
     #[test]
     fn infers_each_type() {
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn widening_transitions() {
-        // BOOLEAN → BIGINT → DOUBLE → VARCHAR、および DATE → TIMESTAMP。
+        // BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR, and DATE -> TIMESTAMP.
         let cases: &[(&[u8], Ty)] = &[
             (b"c\ntrue\nfalse\n", Ty::Boolean),
             (b"c\ntrue\n1\n", Ty::BigInt),
@@ -1136,9 +1136,9 @@ mod tests {
             (b"c\n2024-01-01\n2024-01-02 00:00:00\n", Ty::Timestamp),
             (b"c\n2024-01-01\n1\n", Ty::Varchar),
             (b"c\n2024-01-01 00:00:00\nx\n", Ty::Varchar),
-            // i64 に収まらない整数は DOUBLE に落ちる。
+            // An integer that does not fit i64 falls to DOUBLE.
             (b"c\n99999999999999999999\n", Ty::Double),
-            // 全部空なら VARCHAR のまま。
+            // All-empty stays VARCHAR.
             (b"c\n\n\n", Ty::Varchar),
         ];
         for (csv, ty) in cases {
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn inference_uses_only_the_first_rows() {
-        // 先頭 SAMPLE_ROWS 行は整数、その後に文字列を混ぜる。
+        // The first SAMPLE_ROWS rows are integers, with strings mixed in afterwards.
         let mut s = String::from("c\n");
         for i in 0..SAMPLE_ROWS {
             s.push_str(&std::format!("{i}\n"));
@@ -1157,7 +1157,7 @@ mod tests {
         s.push_str("oops\n");
         let (f, src) = open(s.as_bytes(), b',');
         assert_eq!(types(&f), vec![Ty::BigInt]);
-        // 推定を外した行はエラーではなく NULL。
+        // A row the inference missed is NULL rather than an error.
         let got = read_all(&f, &src, &[0]);
         assert_eq!(got[0].len(), SAMPLE_ROWS + 1);
         assert_eq!(got[0][SAMPLE_ROWS], Value::Null);
@@ -1188,13 +1188,13 @@ mod tests {
         assert_eq!(parse_ts(b"2024-01-01 00:00:00"), Some(1_704_067_200_000_000));
         assert_eq!(parse_ts(b"2024-01-01T00:00:00"), Some(1_704_067_200_000_000));
         assert_eq!(parse_ts(b"1969-12-31 23:59:59.999999"), Some(-1));
-        // 7 桁目以降は切り捨て。
+        // The 7th digit onward is truncated.
         assert_eq!(parse_ts(b"1970-01-01 00:00:00.1234567"), Some(123_456));
         assert_eq!(parse_ts(b"2024-01-01 24:00:00"), None);
         assert_eq!(parse_ts(b"2024-01-01 00:00:00Z"), None);
     }
 
-    // --- 引用符 -------------------------------------------------------------
+    // --- Quotes -------------------------------------------------------------
 
     #[test]
     fn quoted_file() {
@@ -1205,7 +1205,7 @@ mod tests {
         let got = read_all(&f, &src, &[0, 1, 2]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
         assert_eq!(text(&got[1][0]), "he said \"hi\"");
-        // 引用符の内側の改行は行終端ではない。
+        // A newline inside quotes is not a line terminator.
         assert_eq!(text(&got[1][1]), "multi\nline");
         assert_eq!(got[1][2], Value::Null);
         assert_eq!(got[2], vec![Value::F64(2.5), Value::F64(3.5), Value::F64(4.5)]);
@@ -1223,7 +1223,7 @@ mod tests {
     fn empty_versus_quoted_empty() {
         let (f, src) = open(b"a,b\n,\"\"\n", b',');
         let got = read_all(&f, &src, &[0, 1]);
-        // 引用符なしの空は NULL、`""` は空文字列。
+        // An unquoted empty is NULL and `""` is the empty string.
         assert_eq!(got[0][0], Value::Null);
         assert_eq!(got[1][0], Value::Bytes(vec![]));
     }
@@ -1236,7 +1236,7 @@ mod tests {
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
     }
 
-    // --- 分割 ---------------------------------------------------------------
+    // --- Splits -------------------------------------------------------------
 
     #[test]
     fn split_ranges_ask_for_the_overhang() {
@@ -1253,10 +1253,10 @@ mod tests {
         f.split_ranges(1, &[0], &mut r).unwrap();
         let (a, b) = r[0];
         let ds = f.data_start;
-        // 直前 1 バイトを含み、後ろは max_record ぶん読み越す。
+        // It includes the preceding byte and overreads max_record on the back.
         assert_eq!(a, ds + 100 - 1);
         assert_eq!(b, ds + 200 + 50);
-        // 射影を変えても範囲は変わらない（行指向なので減らせない）。
+        // Changing the projection does not change the range (row-oriented, so it cannot be reduced).
         let mut r2 = Vec::new();
         f.split_ranges(1, &[], &mut r2).unwrap();
         assert_eq!(r2[0], (a, b));
@@ -1266,24 +1266,24 @@ mod tests {
     fn single_split_reads_basic_csv() {
         let bytes = read_data("basic.csv");
         let (f, src) = open(&bytes, b',');
-        assert_eq!(f.num_splits(), 1, "8MiB 分割なら 1 つに収まる");
+        assert_eq!(f.num_splits(), 1, "it fits in one split at 8 MiB per split");
         assert_eq!(names(&f), vec!["id", "name", "score", "flag", "big", "d"]);
-        // duckdb の DESCRIBE と一致する（id は BIGINT に推定される）。
+        // It agrees with duckdb's DESCRIBE (id is inferred as BIGINT).
         assert_eq!(
             types(&f),
             vec![Ty::BigInt, Ty::Varchar, Ty::Double, Ty::Boolean, Ty::BigInt, Ty::Timestamp]
         );
         let got = read_all(&f, &src, &[0, 4]);
         assert_eq!(got[0].len(), 1000);
-        // duckdb: count(big) = 800、5 行おきに NULL。
+        // duckdb: count(big) = 800, with a NULL every five rows.
         let nulls = got[1].iter().filter(|v| **v == Value::Null).count();
         assert_eq!(nulls, 200);
     }
 
     #[test]
     fn basic_csv_matches_the_parquet_file() {
-        // Parquet 側も `TableFormat` 越しに読む。両者を同じ入口で比べられるのが
-        // この抽象を挟んだ意味なので、テストもその形にしておく。
+        // The Parquet side is read through `TableFormat` too. Being able to compare both through
+        // the same entry point is the point of this abstraction, so the test takes that shape.
         let psrc = Source::from_bytes(read_data("basic.parquet"));
         let mut pf = crate::format::parquet::ParquetFormat::new();
         assert_eq!(pf.resolve(&psrc).expect("parquet resolve"), Ok(()));
@@ -1299,20 +1299,20 @@ mod tests {
         }
 
         let bytes = read_data("basic.csv");
-        // 分割をまたいでも一致すること（境界の取りこぼしを検出する）。
+        // It must agree across splits too (detecting rows dropped at boundaries).
         let (f, src) = open_split(&bytes, b',', 4096);
         assert!(f.num_splits() > 5);
         let got = read_all(&f, &src, &[0, 1, 2, 3, 4, 5]);
 
         for c in 0..6 {
-            assert_eq!(got[c].len(), 1000, "列 {c} の行数");
+            assert_eq!(got[c].len(), 1000, "the row count of column {c}");
             for r in 0..1000 {
-                // Parquet 側の id は INTEGER なので i64 に揃えて比べる。
+                // The Parquet side's id is INTEGER, so it is aligned to i64 for comparison.
                 let e = match &expect[c][r] {
                     Value::I32(x) if c == 0 => Value::I64(*x as i64),
                     v => v.clone(),
                 };
-                assert_eq!(got[c][r], e, "列 {c} 行 {r}");
+                assert_eq!(got[c][r], e, "column {c} row {r}");
             }
         }
     }
@@ -1320,19 +1320,19 @@ mod tests {
     #[test]
     fn multi_split_row_counts_and_boundary_values() {
         let bytes = read_data("multi_rg.csv");
-        // 既定の分割サイズでは 1 分割なので、小さくして境界を作る。
+        // At the default split size it is one split, so it is shrunk to create boundaries.
         let (f, src) = open_split(&bytes, b',', 64 * 1024);
-        assert!(f.num_splits() >= 16, "分割数 {}", f.num_splits());
+        assert!(f.num_splits() >= 16, "split count {}", f.num_splits());
 
-        // 分割ごとの行数を足すと全体になること、境界の行が欠けも重複もしないこと。
+        // The per-split row counts must add up to the whole, with no boundary row missing or duplicated.
         let mut total = 0usize;
         let mut next = 0i64;
         for s in 0..f.num_splits() {
             let cols = f.read_split(&src, s, &[0, 3]).expect("read_split");
             let n = cols[0].len();
             for r in 0..n {
-                // id は 0 から連番。1 つでもずれれば境界処理の誤り。
-                assert_eq!(cols[0].value_at(r), Value::I64(next), "split {s} 行 {r}");
+                // id runs consecutively from 0. Any deviation is a boundary-handling error.
+                assert_eq!(cols[0].value_at(r), Value::I64(next), "split {s} row {r}");
                 assert_eq!(cols[1].value_at(r), Value::F64(next as f64 * 0.25));
                 next += 1;
             }
@@ -1352,14 +1352,14 @@ mod tests {
         assert!(f2.num_splits() > f1.num_splits());
         for c in 0..4 {
             assert_eq!(a[c].len(), 50_000);
-            assert_eq!(a[c], b[c], "列 {c}");
+            assert_eq!(a[c], b[c], "column {c}");
         }
     }
 
     #[test]
     fn records_straddling_every_boundary() {
-        // 1 レコード 8 バイト、分割 8 バイトだと境界がレコード先頭に一致する。
-        // 半開区間の所有規則を守れていないと、ここで 1 行ずつ消える。
+        // With 8-byte records and 8-byte splits, boundaries coincide with record starts.
+        // Without honoring the half-open ownership rule, one row would vanish at each boundary.
         let mut s = String::from("a,b\n");
         for i in 0..64 {
             s.push_str(&std::format!("{i:03},{i:03}\n"));
@@ -1393,13 +1393,13 @@ mod tests {
         let (mut f, src) = open(s.as_bytes(), b',');
         f.split_bytes = 8;
         f.max_record = 16;
-        // 長いレコードにぶつかる分割が LimitExceeded を返す。
+        // The split that runs into a long record returns LimitExceeded.
         let bad =
             (0..f.num_splits()).filter_map(|s| code_of(f.read_split(&src, s, &[0, 1]))).next();
         assert_eq!(bad, Some(Code::LimitExceeded));
     }
 
-    // --- 射影 ---------------------------------------------------------------
+    // --- Projection ---------------------------------------------------------
 
     #[test]
     fn projection_returns_requested_columns_in_order() {
@@ -1408,18 +1408,18 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], vec![Value::F64(2.5), Value::F64(4.5)]);
         assert_eq!(got[1], vec![Value::I64(1), Value::I64(3)]);
-        // 空の射影でも列 0 個を返す（行数は呼び出し側が知る術が無い）。
+        // An empty projection returns 0 columns too (the caller has no way to know the row count).
         let cols = f.read_split(&src, 0, &[]).unwrap();
         assert!(cols.is_empty());
-        // 同じ列を 2 度要求しても長さの揃った列が返る。
+        // Requesting the same column twice still returns columns of equal length.
         let dup = read_all(&f, &src, &[1, 1]);
         assert_eq!(dup[0], dup[1]);
         assert_eq!(text(&dup[0][0]), "x");
-        // 範囲外の列は内部エラー。
+        // An out-of-range column is an internal error.
         assert_eq!(code_of(f.read_split(&src, 0, &[9])), Some(Code::Internal));
     }
 
-    // --- 異常入力 -----------------------------------------------------------
+    // --- Anomalous input ----------------------------------------------------
 
     #[test]
     fn unterminated_quote_is_a_syntax_error() {
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn short_and_long_rows() {
-        // 足りないフィールドは NULL、多い分は捨てる。
+        // Missing fields are NULL and surplus ones are discarded.
         let (f, src) = open(b"a,b,c\n1,x,2.5\n2\n3,y,4.5,extra\n", b',');
         let got = read_all(&f, &src, &[0, 1, 2]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
@@ -1440,21 +1440,21 @@ mod tests {
 
     #[test]
     fn values_that_do_not_match_the_inferred_type_become_null() {
-        // 推定はサンプル行しか見ないので、外れる行はサンプルより後ろに置く。
+        // Inference sees only the sample rows, so the rows that fall outside are placed after the sample.
         let mut s = String::from("i,b,d,t\n");
         for _ in 0..SAMPLE_ROWS {
             s.push_str("1,true,2024-01-01,2024-01-01 00:00:00\n");
         }
         s.push_str("x,x,x,x\n");
-        // 引用符付きの空文字列も、VARCHAR 以外の列では NULL になる。
+        // A quoted empty string also becomes NULL in columns other than VARCHAR.
         s.push_str("\"\",\"\",\"\",\"\"\n");
         let (f, src) = open(s.as_bytes(), b',');
         assert_eq!(types(&f), vec![Ty::BigInt, Ty::Boolean, Ty::Date, Ty::Timestamp]);
         let got = read_all(&f, &src, &[0, 1, 2, 3]);
         for (c, col) in got.iter().enumerate() {
-            assert_ne!(col[0], Value::Null, "列 {c}");
-            assert_eq!(col[SAMPLE_ROWS], Value::Null, "列 {c}");
-            assert_eq!(col[SAMPLE_ROWS + 1], Value::Null, "列 {c}");
+            assert_ne!(col[0], Value::Null, "column {c}");
+            assert_eq!(col[SAMPLE_ROWS], Value::Null, "column {c}");
+            assert_eq!(col[SAMPLE_ROWS + 1], Value::Null, "column {c}");
         }
     }
 
@@ -1482,7 +1482,7 @@ mod tests {
         }
     }
 
-    // --- 解決の I/O ---------------------------------------------------------
+    // --- Resolution I/O -----------------------------------------------------
 
     #[test]
     fn resolve_requests_the_sample_range_first() {
@@ -1493,7 +1493,7 @@ mod tests {
                 assert_eq!(off, 0);
                 assert_eq!(len, SAMPLE_BYTES);
             }
-            Ok(()) => panic!("バイトが無いのに解決できるはずがない"),
+            Ok(()) => panic!("it cannot possibly resolve with no bytes"),
         }
         assert!(!f.is_resolved());
         assert_eq!(f.num_splits(), 0);
@@ -1512,7 +1512,7 @@ mod tests {
         let body = b"a,b\n1,x\n";
         let mut src = Source::remote(body.len() as u64);
         let mut f = CsvFormat::new(b',');
-        let (off, len) = f.resolve(&src).unwrap().expect_err("最初は要求");
+        let (off, len) = f.resolve(&src).unwrap().expect_err("a request the first time");
         src.insert(off, body[off as usize..(off + len) as usize].to_vec());
         assert_eq!(f.resolve(&src).unwrap(), Ok(()));
         assert_eq!(names(&f), vec!["a", "b"]);
@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn header_longer_than_the_sample_is_rejected() {
-        // ヘッダに改行が無いまま SAMPLE_BYTES を超えるファイル。
+        // A file exceeding SAMPLE_BYTES with no newline in the header.
         let mut bytes = std::vec![b'a'; (SAMPLE_BYTES + 10) as usize];
         bytes[SAMPLE_BYTES as usize + 5] = b'\n';
         let src = Source::from_bytes(bytes);

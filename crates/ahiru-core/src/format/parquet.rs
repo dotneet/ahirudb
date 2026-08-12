@@ -1,7 +1,7 @@
-//! Parquet を `TableFormat` に適合させるアダプタ。
+//! The adapter fitting Parquet to `TableFormat`.
 //!
-//! Parquet 固有の概念（RowGroup、列チャンク、Thrift 統計）はこのファイルの
-//! 内側で完結する。実行エンジンからは「統計を持つ分割」に見えるだけ。
+//! Parquet-specific concepts (RowGroups, column chunks, Thrift statistics) are contained within
+//! this file. To the execution engine it merely looks like "a split carrying statistics".
 
 use crate::catalog::Source;
 use crate::format::{
@@ -25,31 +25,31 @@ use crate::vector::{Field, PhysType, Ty, Value, Vector};
 
 pub struct ParquetFormat {
     file: Option<ParquetFile>,
-    /// 実行側に見せるスキーマ。`ParquetFile` から 1 度だけ写しておく。
+    /// The schema shown to the execution side. Copied from `ParquetFile` exactly once.
     schema: Vec<Field>,
-    /// 直近の `refine_with_index` が確定した、現在の分割のページ選択結果。
-    /// `split`/`projection` が一致する呼び出しにだけ使う（一致しなければ
-    /// 「絞り込み無し」の従来経路にフォールバックする）。
+    /// The current split's page selection result, as settled by the most recent `refine_with_index`.
+    /// Used only for calls whose `split`/`projection` match (otherwise it falls back to the
+    /// conventional "no filtering" path).
     page_plan: Option<PagePlan>,
 }
 
-/// 1 分割（RowGroup）ぶんのページ選択結果。
+/// The page selection result for one split (RowGroup).
 struct PagePlan {
     split: usize,
     projection: Vec<usize>,
-    /// RowGroup 内の絶対行番号での「残す」区間（昇順・マージ済み・重複無し）。
+    /// The "keep" intervals in absolute row numbers within the RowGroup (ascending, merged, no duplicates).
     kept_ranges: Vec<(u64, u64)>,
-    /// `projection` と同じ並び。列ごとに `Some` ならページ選択が効く
-    /// （バイト量が減る）、`None` ならその列だけ列チャンク全体を読み、
-    /// 復号後に `kept_ranges` へ gather して行数を揃える。
+    /// In the same order as `projection`. `Some` per column means page selection applies (fewer
+    /// bytes); `None` means that column alone reads the whole column chunk and gathers into
+    /// `kept_ranges` after decoding to line the row counts up.
     columns: Vec<Option<ColumnPagePlan>>,
 }
 
 struct ColumnPagePlan {
-    /// 辞書ページ（あれば）のバイト範囲。
+    /// The byte range of the dictionary page (if any).
     dict_range: Option<(u64, u64)>,
-    /// 読むデータページの `(開始, 終了, 先頭行の RowGroup 内絶対行番号)`。
-    /// バイトオフセット昇順。
+    /// The data pages to read, as `(start, end, the absolute RowGroup row number of the first row)`.
+    /// In ascending byte-offset order.
     pages: Vec<(u64, u64, i64)>,
 }
 
@@ -65,11 +65,11 @@ impl ParquetFormat {
         }
     }
 
-    /// 論理列 `col`（`self.schema`/`f.schema.columns` の添字）の `ColumnDesc`。
+    /// The `ColumnDesc` of logical column `col` (an index into `self.schema`/`f.schema.columns`).
     ///
-    /// 入れ子列（LIST/MAP 等）は 1 本の論理列が複数の物理列チャンクを
-    /// 消費するので、`col` は物理列チャンク番号とは限らない。物理番号は
-    /// `ColumnDesc::phys_cols` から引く。
+    /// A nested column (LIST/MAP and so on) has one logical column consuming several physical
+    /// column chunks, so `col` is not necessarily a physical column chunk number. Physical numbers
+    /// come from `ColumnDesc::phys_cols`.
     fn desc(&self, col: usize) -> Result<&ColumnDesc> {
         let f = self.file()?;
         match f.schema.columns.get(col) {
@@ -78,8 +78,8 @@ impl ParquetFormat {
         }
     }
 
-    /// 分割 `split` の物理列チャンク番号 `phys`（`row_group.columns` の
-    /// 添字そのもの）のメタデータ。
+    /// The metadata of physical column chunk number `phys` (an index into `row_group.columns`
+    /// itself) of split `split`.
     fn chunk_phys(&self, split: usize, phys: usize) -> Result<&ColumnMetaData> {
         let f = self.file()?;
         let rg = match f.meta.row_groups.get(split) {
@@ -92,11 +92,11 @@ impl ParquetFormat {
         }
     }
 
-    /// 分割 `split` の論理列 `col` の代表物理列チャンクのメタデータ。
-    /// 統計・pruning は代表列（先頭リーフ）だけを見る簡略化で、フラット列
-    /// では常に唯一の物理列と一致する。入れ子列は元々 pruning の対象外
-    /// （`Ty::Json` の統計は `stat_value` が常に `None` を返す）なので、
-    /// 代表列だけで安全に「判断できないので絞り込まない」に倒れる。
+    /// The metadata of the representative physical column chunk of logical column `col` of split `split`.
+    /// Statistics and pruning look only at the representative column (the first leaf), a
+    /// simplification that always coincides with the sole physical column for flat columns. Nested
+    /// columns are outside pruning's scope to begin with (`stat_value` always returns `None` for
+    /// `Ty::Json` statistics), so the representative column alone safely errs to "cannot decide, so no filtering".
     fn chunk(&self, split: usize, col: usize) -> Result<&ColumnMetaData> {
         let phys = match self.desc(col)?.phys_cols.first() {
             Some(&p) => p,
@@ -105,9 +105,9 @@ impl ParquetFormat {
         self.chunk_phys(split, phys)
     }
 
-    /// 分割 `split` の論理列 `col` の代表物理列チャンクの `ColumnChunk`
-    /// （ColumnIndex/OffsetIndex のオフセットはここにある）。`chunk` と同じ
-    /// 代表列の簡略化。
+    /// The `ColumnChunk` of the representative physical column chunk of logical column `col` of
+    /// split `split` (the ColumnIndex/OffsetIndex offsets live here). The same representative-column
+    /// simplification as `chunk`.
     fn column_chunk(&self, split: usize, col: usize) -> Result<&crate::parquet::meta::ColumnChunk> {
         let phys = match self.desc(col)?.phys_cols.first() {
             Some(&p) => p,
@@ -132,8 +132,8 @@ impl ParquetFormat {
         }
     }
 
-    /// キャッシュ済みのページ選択結果を、`split`/`projection` が一致する
-    /// ときだけ返す。一致しなければ「絞り込み無し」の従来経路を使うのが安全。
+    /// Returns the cached page selection result only when `split`/`projection` match.
+    /// On a mismatch it is safest to use the conventional "no filtering" path.
     fn matching_plan(&self, split: usize, projection: &[usize]) -> Option<&PagePlan> {
         let plan = self.page_plan.as_ref()?;
         if plan.split == split && plan.projection == projection {
@@ -143,8 +143,8 @@ impl ParquetFormat {
         }
     }
 
-    /// 論理列 `col` の全物理列チャンクの範囲を `out` に積む。フラット列は
-    /// 1 個、入れ子列（LIST/MAP 等）は `ColumnDesc::phys_cols` の全リーフぶん。
+    /// Pushes into `out` the ranges of every physical column chunk of logical column `col`. One for
+    /// a flat column, and every leaf of `ColumnDesc::phys_cols` for a nested one (LIST/MAP and so on).
     fn push_full_chunk_ranges(
         &self,
         split: usize,
@@ -158,10 +158,10 @@ impl ParquetFormat {
         Ok(())
     }
 
-    /// 論理列 `col` の全物理列チャンクぶん、ホスト委譲が要るページを集めて
-    /// `out` に積む。入れ子列の物理リーフは REPEATED を含みうるので、
-    /// `num_rows` 到達ではなくバッファを使い切ることを終了条件にする
-    /// （`collect_codec_pages_all`）。フラット列は従来どおり行数駆動。
+    /// Collects, for every physical column chunk of logical column `col`, the pages needing host
+    /// delegation and pushes them into `out`. A nested column's physical leaves can contain
+    /// REPEATED, so the termination condition is exhausting the buffer rather than reaching
+    /// `num_rows` (`collect_codec_pages_all`). Flat columns stay row-count-driven as before.
     fn push_full_chunk_codec_tasks(
         &self,
         src: &Source,
@@ -192,8 +192,8 @@ impl ParquetFormat {
         Ok(())
     }
 
-    /// 入れ子列 (LIST/MAP 等) の全物理リーフをそれぞれ列チャンク全体ぶん
-    /// 取得し、Dremel 組み立てで 1 本の `Ty::Json` ベクタにする。
+    /// Fetches every physical leaf of a nested column (LIST/MAP and so on) as a whole column chunk
+    /// each and assembles them into a single `Ty::Json` vector via Dremel assembly.
     fn read_full_nested_column(
         &self,
         src: &Source,
@@ -228,7 +228,7 @@ impl TableFormat for ParquetFormat {
         }
         ensure!(src.total_len >= 12, BadMagic);
 
-        // フッタは末尾にあるので、まず末尾 64 KiB を投機的に要求する。
+        // The footer is at the end, so the last 64 KiB is requested speculatively first.
         let (off, len) = footer_probe_range(src.total_len);
         let tail = match src.get(off, len as usize) {
             Some(t) => t,
@@ -245,7 +245,7 @@ impl TableFormat for ParquetFormat {
                 self.file = Some(f);
                 Ok(Ok(()))
             }
-            // 投機取得に収まらなかった。正確な範囲を要求し直す。
+            // It did not fit the speculative fetch. The exact range is requested again.
             Err(range) => Ok(Err(range)),
         }
     }
@@ -284,15 +284,15 @@ impl TableFormat for ParquetFormat {
                             out.push((s, e));
                         }
                     }
-                    // この列は絞り込めなかった（入れ子列は常にここ）。
-                    // 従来どおり列チャンク全体 ―― 入れ子列は複数ぶん。
+                    // This column could not be filtered (nested columns always land here).
+                    // The whole column chunk as before -- several of them for a nested column.
                     None => self.push_full_chunk_ranges(split, c, out)?,
                 }
             }
             return Ok(());
         }
-        // 列指向なので、射影された列チャンクの範囲だけを要求する。
-        // ここが「読むバイトを減らす」最も効く場所。
+        // Being columnar, only the ranges of the projected column chunks are requested.
+        // This is the single most effective place for "reading fewer bytes".
         for &c in projection {
             self.push_full_chunk_ranges(split, c, out)?;
         }
@@ -329,7 +329,7 @@ impl TableFormat for ParquetFormat {
                         collect_codec_pages_selected(meta, dict, &bufs, &mut pages)?;
                         push_codec_tasks(&pages, out);
                     }
-                    // この列は絞り込めなかった（入れ子列は常にここ）。
+                    // This column could not be filtered (nested columns always land here).
                     None => {
                         self.push_full_chunk_codec_tasks(src, split, c, nrows, &mut pages, out)?
                     }
@@ -344,16 +344,16 @@ impl TableFormat for ParquetFormat {
         Ok(())
     }
 
-    /// RowGroup 統計 (min_value/max_value) だけで `pruners` を評価する。
-    /// 統計が無い・型が分からない等、判断できない場合はその pruner を
-    /// スキップする（安全側 = 「絞り込めない」扱い）。
+    /// Evaluates `pruners` using RowGroup statistics (min_value/max_value) alone.
+    /// When it cannot decide -- no statistics, unknown type, and so on -- that pruner is skipped
+    /// (erring safe = treated as "cannot filter").
     fn may_match(&self, split: usize, pruners: &[Pruner], projection: &[usize]) -> bool {
         for p in pruners {
             let Some(&col) = projection.get(p.column) else { continue };
             let Ok(meta) = self.chunk(split, col) else { continue };
             let Some(stats) = &meta.statistics else { continue };
-            // min/max (フィールド 1,2) は符号の扱いが writer 依存で信用できない
-            // ので使わない。min_value/max_value (5,6) だけを見る。
+            // min/max (fields 1 and 2) cannot be trusted, as the sign handling is writer-dependent,
+            // so they are not used. Only min_value/max_value (5 and 6) are consulted.
             let (Some(min), Some(max)) = (&stats.min_value, &stats.max_value) else {
                 continue;
             };
@@ -378,7 +378,7 @@ impl TableFormat for ParquetFormat {
         if pruners.is_empty() {
             return Ok(());
         }
-        // Pruner が刺さる列だけ ColumnIndex（min/max）と Bloom フィルタを取る。
+        // ColumnIndex (min/max) and the Bloom filter are fetched only for columns a pruner touches.
         for p in pruners {
             let Some(&col) = projection.get(p.column) else { continue };
             let Ok(cc) = self.column_chunk(split, col) else { continue };
@@ -393,10 +393,10 @@ impl TableFormat for ParquetFormat {
                 }
             }
         }
-        // 射影された全列の OffsetIndex を取る。ページ選択で確定した「残す
-        // 行範囲」を、Pruner の無い列にも適用してバイトを減らすため。
-        // 入れ子列は複数の物理列チャンクにまたがりページ選択の対象外
-        // （常に列チャンク全体を読む）なので、ここでは取りに行かない。
+        // The OffsetIndex of every projected column is fetched, so the "rows to keep" settled by
+        // page selection can be applied to columns without a pruner as well, reducing bytes.
+        // Nested columns span several physical column chunks and are outside page selection's scope
+        // (they always read whole column chunks), so nothing is fetched for them here.
         for &c in projection {
             if self.desc(c).is_ok_and(|d| d.nested.is_some()) {
                 continue;
@@ -417,24 +417,24 @@ impl TableFormat for ParquetFormat {
         pruners: &[Pruner],
         projection: &[usize],
     ) -> Result<bool> {
-        // 前回のキャッシュは無条件で捨てる。この呼び出しの結果だけを信じる。
+        // The previous cache is discarded unconditionally. Only this call's result is trusted.
         self.page_plan = None;
         if pruners.is_empty() {
             return Ok(true);
         }
 
-        // 1) Bloom フィルタ: 等号・IN pruner の値が確実に無いなら分割ごと落とす。
-        //    RowGroup 統計の min/max では拾えない「範囲は広いが実際の値は
-        //    疎」なケースを追加で拾える。IN は「候補のどれかが存在すれば残す」
-        //    という OR 判定になる。
+        // 1) The Bloom filter: if an equality/IN pruner's value is definitely absent, the whole
+        //    split is dropped. It additionally catches the "wide range but sparse actual values"
+        //    case that RowGroup min/max statistics cannot. IN becomes an OR decision, "keep if any
+        //    candidate exists".
         for p in pruners {
             if p.op != PruneOp::Eq && p.op != PruneOp::In {
                 continue;
             }
             let Some(&col) = projection.get(p.column) else { continue };
-            // 入れ子列 (Ty::Json) には統計・Bloom フィルタによる絞り込みが
-            // 意味を持たない（比較可能な物理値が 1 つに定まらない）ので、
-            // 代表リーフの Bloom フィルタを誤って使わないよう明示的に除外する。
+            // Filtering by statistics or a Bloom filter is meaningless for a nested column
+            // (`Ty::Json`), since no single comparable physical value exists, so it is explicitly
+            // excluded to avoid mistakenly using the representative leaf's Bloom filter.
             if self.desc(col)?.nested.is_some() {
                 continue;
             }
@@ -444,7 +444,7 @@ impl TableFormat for ParquetFormat {
             let Ok((hdr, used)) = decode_bloom_filter_header(buf) else { continue };
             let need = used + hdr.num_bytes as usize;
             if need > buf.len() {
-                // 投機取得が実サイズに届かなかった。安全側に諦める。
+                // The speculative fetch did not reach the actual size. It errs safe and gives up.
                 continue;
             }
             let Some(bf) = BloomFilter::new(&buf[used..need]) else { continue };
@@ -457,9 +457,9 @@ impl TableFormat for ParquetFormat {
                 self.file().ok().and_then(|f| f.schema.columns.get(col)).map(|d| d.type_length);
             let Some(type_length) = type_length else { continue };
 
-            // 候補全部がエンコードできて、かつ全部フィルタに無いと分かって
-            // 初めて分割を落とせる。1 つでもエンコードできない候補があれば
-            // 「あり得る」扱いにして安全側に倒す。
+            // The split can be dropped only once every candidate is encodable and every one is
+            // known to be absent from the filter. If even one candidate cannot be encoded, it
+            // errs safe and is treated as "possible".
             let mut any_maybe_present = false;
             let mut all_encoded = true;
             for v in core::iter::once(&p.value).chain(p.in_values.iter()) {
@@ -477,7 +477,7 @@ impl TableFormat for ParquetFormat {
             }
         }
 
-        // 2) ページ単位の min/max: 残る行範囲を Pruner のある列から絞り込む。
+        // 2) Page-level min/max: the surviving row ranges are narrowed from the columns with pruners.
         let num_rows = self.num_rows(split)? as u64;
         let mut kept: Option<Vec<(u64, u64)>> = None;
         for p in pruners {
@@ -507,19 +507,19 @@ impl TableFormat for ParquetFormat {
         }
 
         let Some(kept_ranges) = kept else {
-            // どの pruner もページ単位で判定できなかった。以前の挙動のまま。
+            // No pruner could decide at page level. Behavior stays as before.
             return Ok(true);
         };
         if kept_ranges.is_empty() {
-            // どのページも一致し得ない。RowGroup 丸ごと読み飛ばせる。
+            // No page can match. The whole RowGroup can be skipped.
             return Ok(false);
         }
 
-        // 3) 射影された各列について、残る行範囲を自分の OffsetIndex に写す。
-        //    OffsetIndex が無い列は列チャンク全体を読み、あとで gather する。
-        //    入れ子列 (LIST/MAP 等) は複数の物理列チャンクにまたがり、
-        //    `ColumnPagePlan` は 1 列チャンクぶんの選択しか表現できないので、
-        //    常に列チャンク全体を読ませる（`None`）。
+        // 3) For each projected column, the surviving row ranges are mapped onto its own OffsetIndex.
+        //    A column without an OffsetIndex reads the whole column chunk and gathers afterwards.
+        //    A nested column (LIST/MAP and so on) spans several physical column chunks, and
+        //    `ColumnPagePlan` can only express a selection for one column chunk, so it is always
+        //    made to read the whole column chunk (`None`).
         let mut columns = Vec::with_capacity(projection.len());
         for &c in projection {
             if self.desc(c)?.nested.is_some() {
@@ -557,8 +557,8 @@ impl TableFormat for ParquetFormat {
                     pages.push((start, end, loc.first_row_index));
                 }
                 if pages.is_empty() {
-                    // 選択されたページが無い＝この列は読む必要が無い。
-                    // ただし空ベクタを作れるよう、フォールバックはしない。
+                    // No page was selected = this column need not be read at all.
+                    // It does not fall back, though, so an empty vector can still be built.
                     return Some(ColumnPagePlan { dict_range: None, pages });
                 }
                 Some(ColumnPagePlan { dict_range: meta.dictionary_page_range(), pages })
@@ -599,7 +599,7 @@ impl TableFormat for ParquetFormat {
                         cols.push(v.gather(&idx));
                     }
                     Some(_) => {
-                        // 選択されたページが 0 枚: この列に残る行は無い。
+                        // Zero pages selected: no rows of this column survive.
                         cols.push(Vector::with_capacity(desc.ty, 0));
                     }
                     None if desc.nested.is_some() => {
@@ -632,29 +632,29 @@ impl TableFormat for ParquetFormat {
             let meta = self.chunk(split, c)?;
             let (start, end) = meta.byte_range();
             let buf = get_or_internal(src, start, end)?;
-            // 展開済みページのキャッシュは `Source` が持つ。内蔵コーデックの
-            // ファイルでは一度も引かれない。
+            // The cache of decompressed pages is held by `Source`. For a file using only built-in
+            // codecs it is never consulted.
             cols.push(read_column_chunk(desc, meta, buf, start, nrows, src)?);
         }
         Ok(cols)
     }
 }
 
-/// `CodecPage` 列を `CodecTask` に変換して `out` に積む。
+/// Converts a sequence of `CodecPage`s into `CodecTask`s and pushes them into `out`.
 fn push_codec_tasks(pages: &[CodecPage], out: &mut Vec<CodecTask>) {
     for p in pages {
         out.push(CodecTask { codec: p.codec, offset: p.offset, len: p.len, out_len: p.out_len });
     }
 }
 
-/// `[start, end)` が `ranges`（昇順・マージ済み）のどれかと重なるか。
+/// Whether `[start, end)` overlaps any of `ranges` (ascending and merged).
 fn ranges_overlap(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
-    // ranges は小さい（RowGroup 内のページ数程度）ので線形探索で十分。
+    // ranges is small (about the number of pages in a RowGroup), so a linear scan suffices.
     ranges.iter().any(|&(s, e)| s < end && start < e)
 }
 
-/// 1 本の pruner から、その列のページ min/max を見て「残す」行範囲を作る。
-/// 統計が使えないページ（`null_pages` や型不一致）は安全側に残す。
+/// From one pruner, builds the "keep" row ranges by consulting that column's per-page min/max.
+/// A page whose statistics are unusable (`null_pages` or a type mismatch) errs safe and is kept.
 fn page_ranges_for_pruner(
     p: &Pruner,
     ty: Ty,
@@ -668,7 +668,7 @@ fn page_ranges_for_pruner(
         let row_end =
             oi.page_locations.get(i + 1).map(|n| n.first_row_index as u64).unwrap_or(num_rows);
         let keep = if ci.null_pages.get(i).copied().unwrap_or(true) {
-            // 統計が無い（全 NULL 等）ページは判定できないので残す。
+            // A page with no statistics (all NULL, say) cannot be decided and is kept.
             true
         } else {
             let min = ci.min_values.get(i).and_then(|b| stat_value(ty, b));
@@ -685,7 +685,7 @@ fn page_ranges_for_pruner(
     out
 }
 
-/// 昇順に来る区間を、直前の区間と隣接していれば結合しながら積む。
+/// Pushes intervals arriving in ascending order, merging with the previous one when adjacent.
 fn push_merged(out: &mut Vec<(u64, u64)>, start: u64, end: u64) {
     if start >= end {
         return;
@@ -699,7 +699,7 @@ fn push_merged(out: &mut Vec<(u64, u64)>, start: u64, end: u64) {
     out.push((start, end));
 }
 
-/// 2 つの昇順マージ済み区間集合の積集合。両方に含まれる行だけを残す。
+/// The intersection of two ascending, merged interval sets. Only the rows in both are kept.
 fn intersect_ranges(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let (mut i, mut j) = (0usize, 0usize);
@@ -717,8 +717,8 @@ fn intersect_ranges(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
     out
 }
 
-/// 昇順の絶対行番号 `abs_rows` のうち `kept`（昇順・マージ済み）に含まれる
-/// 位置だけを、`abs_rows` 上の添字（= 復号済みベクタの添字）として返す。
+/// Of the ascending absolute row numbers `abs_rows`, returns only the positions contained in
+/// `kept` (ascending, merged) as indices into `abs_rows` (= indices into the decoded vector).
 fn select_indices(abs_rows: &[u64], kept: &[(u64, u64)]) -> Vec<u32> {
     let mut out = Vec::with_capacity(abs_rows.len());
     let mut ki = 0usize;
@@ -733,9 +733,9 @@ fn select_indices(abs_rows: &[u64], kept: &[(u64, u64)]) -> Vec<u32> {
     out
 }
 
-/// `0..nrows` の連番に対して `kept` 区間だけを展開した添字列。
-/// 列チャンク全体を復号した（絶対行番号 = 0..nrows の連番の）フォールバック
-/// 列に使う。
+/// The index sequence expanding only the `kept` intervals against the consecutive `0..nrows`.
+/// Used for a fallback column whose whole column chunk was decoded (where absolute row numbers are
+/// the consecutive 0..nrows).
 fn select_indices_full(nrows: usize, kept: &[(u64, u64)]) -> Vec<u32> {
     let mut out = Vec::new();
     for &(s, e) in kept {
@@ -746,15 +746,15 @@ fn select_indices_full(nrows: usize, kept: &[(u64, u64)]) -> Vec<u32> {
     out
 }
 
-/// `Value` を、その列の Parquet 物理型に合わせた PLAIN バイト列にする。
-/// Bloom フィルタは物理型のバイト列に対してハッシュを取るので、
-/// 論理型向けに広げた `Value` を巻き戻す必要がある。
+/// Turns a `Value` into PLAIN bytes matching that column's Parquet physical type.
+/// A Bloom filter hashes the physical type's byte sequence, so a `Value` widened for the logical
+/// type has to be unwound.
 ///
-/// 変換の正しさを確認できていない組み合わせ（BOOLEAN、INT96、
-/// FIXED_LEN_BYTE_ARRAY の DECIMAL 等）は `None` を返して Bloom 判定を諦める
-/// （安全側 = 「多分一致する」扱い）。widening の対応表は
-/// `format::parquet::stat_value` の逆写像で、そこでカバーされている
-/// INT32/INT64/FLOAT/DOUBLE/BYTE_ARRAY だけを扱う。
+/// Combinations whose conversion has not been verified (BOOLEAN, INT96, a FIXED_LEN_BYTE_ARRAY
+/// DECIMAL, and so on) return `None` and give up on the Bloom check (erring safe = treated as
+/// "probably matches"). The widening correspondence is the inverse map of
+/// `format::parquet::stat_value`, and only the INT32/INT64/FLOAT/DOUBLE/BYTE_ARRAY covered there
+/// are handled.
 fn plain_encode_for_bloom(ptype: PType, type_length: usize, ty: Ty, v: &Value) -> Option<Vec<u8>> {
     let _ = ty;
     match ptype {
@@ -784,17 +784,17 @@ fn plain_encode_for_bloom(ptype: PType, type_length: usize, ty: Ty, v: &Value) -
             Value::Bytes(b) if b.len() == type_length => Some(b.clone()),
             _ => None,
         },
-        // BOOLEAN・INT96 は widening の逆変換が自明でない
-        // （INT96 はエポック起点のマイクロ秒へ変換済みで巻き戻しが非自明）ため、
-        // 誤判定を避けて Bloom フィルタを使わない。
+        // For BOOLEAN and INT96 the inverse of widening is not obvious
+        // (INT96 is already converted to microseconds from the epoch and unwinding is nontrivial),
+        // so the Bloom filter is not used, avoiding a misjudgment.
         PType::Boolean | PType::Int96 => None,
     }
 }
 
-/// 統計バイト列を、その列の型に合わせて比較可能な `Value` にする。
+/// Turns statistics bytes into a comparable `Value` according to that column's type.
 ///
-/// Parquet の統計は物理型のリトルエンディアン表現で書かれる。論理型が
-/// INT64 相当でも物理型が INT32 なら 4 バイトしかない（DATE、TIME_MILLIS）。
+/// Parquet statistics are written in the physical type's little-endian representation. Even when
+/// the logical type is INT64-equivalent, a physical INT32 gives only 4 bytes (DATE, TIME_MILLIS).
 pub fn stat_value(ty: Ty, bytes: &[u8]) -> Option<Value> {
     match ty.phys() {
         PhysType::I32 => {
@@ -821,7 +821,7 @@ pub fn stat_value(ty: Ty, bytes: &[u8]) -> Option<Value> {
             ]))),
             _ => None,
         },
-        // 文字列統計は writer が切り詰めることがあるので枝刈りに使わない。
+        // String statistics can be truncated by the writer, so they are not used for pruning.
         _ => None,
     }
 }
@@ -834,14 +834,14 @@ mod tests {
     fn stat_value_reads_physical_width() {
         assert_eq!(stat_value(Ty::Int, &7i32.to_le_bytes()), Some(Value::I32(7)));
         assert_eq!(stat_value(Ty::BigInt, &7i64.to_le_bytes()), Some(Value::I64(7)));
-        // DATE は論理的に I32 だが、TIME_MILLIS のように物理 INT32 で
-        // 論理 I64 の列もある。4 バイトを 64 ビットに広げて読む。
+        // DATE is logically I32, but there are also columns like TIME_MILLIS that are physically
+        // INT32 and logically I64. The 4 bytes are widened to 64 bits when read.
         assert_eq!(stat_value(Ty::Time, &7i32.to_le_bytes()), Some(Value::I64(7)));
         assert_eq!(stat_value(Ty::Double, &1.5f64.to_le_bytes()), Some(Value::F64(1.5)));
         assert_eq!(stat_value(Ty::Float, &1.5f32.to_le_bytes()), Some(Value::F64(1.5)));
-        // 文字列は使わない。
+        // Strings are not used.
         assert_eq!(stat_value(Ty::Varchar, b"abc"), None);
-        // 短すぎる統計は読まない。
+        // Statistics that are too short are not read.
         assert_eq!(stat_value(Ty::BigInt, &[1, 2]), None);
     }
 
@@ -864,32 +864,32 @@ mod tests {
     #[test]
     fn resolve_requests_the_footer_probe_range() {
         let mut f = ParquetFormat::new();
-        // バイトが 1 つも無いので、末尾 64 KiB を要求して戻るはず。
+        // With not a single byte present, it should request the last 64 KiB and return.
         let src = Source::remote(1_000_000);
         match f.resolve(&src).unwrap() {
             Err((off, len)) => {
                 assert_eq!(off + len, 1_000_000);
                 assert_eq!(len, 64 * 1024);
             }
-            Ok(()) => panic!("バイトが無いのに解決できるはずがない"),
+            Ok(()) => panic!("it cannot possibly resolve with no bytes"),
         }
     }
 
-    // --- ページ単位の絞り込み（実ファイル: tests/data/pagetest.parquet）------
+    // --- Page-level filtering (a real file: tests/data/pagetest.parquet) ----
     //
-    // pyarrow (parquet-cpp) が ColumnIndex/OffsetIndex/Bloom フィルタ付きで
-    // 書いた、id 0..50000 の昇順ファイル。`scripts/gen-testdata.sh` に生成
-    // 方法を記している。DuckDB のこの環境の版は Bloom フィルタを書けない
-    // ため、実 writer 検証にはこちらを使う。
+    // A file with id ascending over 0..50000, written by pyarrow (parquet-cpp) with
+    // ColumnIndex/OffsetIndex/Bloom filters. `scripts/gen-testdata.sh` records how it is generated.
+    // The DuckDB version in this environment cannot write Bloom filters, so this is used for
+    // verification against a real writer.
 
     fn pagetest_bytes() -> Vec<u8> {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/pagetest.parquet");
         std::fs::read(p).unwrap_or_else(|e| panic!("tests/data/pagetest.parquet: {e}"))
     }
 
-    /// `Source::remote` に対し、`ranges` のうち未取得の部分をホストから
-    /// 取ってきたことにして登録する。実際に転送したバイト数の合計を返す
-    /// （`NEED_IO` で要求されるバイト数に相当する）。
+    /// For a `Source::remote`, registers the not-yet-fetched parts of `ranges` as though they had
+    /// been fetched from the host. Returns the total bytes actually transferred
+    /// (equivalent to the bytes requested via `NEED_IO`).
     fn fetch_missing(src: &mut Source, bytes: &[u8], ranges: &[(u64, u64)]) -> u64 {
         let mut total = 0u64;
         for &(start, end) in ranges {
@@ -901,8 +901,8 @@ mod tests {
         total
     }
 
-    /// フッタ解決を「投機取得 → 足りなければ再取得」のループで
-    /// `Source::remote` 上で行う（本番の I/O 往復と同じ形）。
+    /// Resolves the footer on a `Source::remote` with a "speculative fetch -> refetch if short"
+    /// loop (the same shape as the production I/O round trips).
     fn resolve_remote(fmt: &mut ParquetFormat, bytes: &[u8]) -> Source {
         let mut src = Source::remote(bytes.len() as u64);
         loop {
@@ -945,9 +945,9 @@ mod tests {
 
         let cols = fmt.read_split(&src, 0, &projection).unwrap();
         assert_eq!(cols[0].len(), cols[1].len());
-        // このデータセットは id が一意なので、ちょうど 1 行だけ生存ページに
-        // 残っているはず（ページ選択がそもそも効いていないと、この後の
-        // バイト比較が意味を持たない ―― まず結果の妥当性を先に確認する）。
+        // id is unique in this dataset, so exactly one row should remain in the surviving pages
+        // (if page selection were not working at all, the later byte comparison would be
+        // meaningless -- the result's validity is confirmed first).
         let hit = (0..cols[0].len()).find(|&i| cols[0].value_at(i) == Value::I32(12345));
         let hit = hit.expect("id=12345 must be present in the selected pages");
         assert_eq!(cols[1].value_at(hit), Value::Bytes(b"v12345".to_vec()));
@@ -956,10 +956,10 @@ mod tests {
         let full_s = fmt.chunk(0, 1).unwrap().total_compressed_size as u64;
         let full_total = full_id + full_s;
 
-        // 索引バイト（ColumnIndex/OffsetIndex/Bloom）自体は小さいはず。
+        // The index bytes themselves (ColumnIndex/OffsetIndex/Bloom) should be small.
         assert!(index_bytes < 128 * 1024, "index bytes unexpectedly large: {index_bytes}");
-        // これが本命の回帰: 選択的な等号述語では、列チャンク全体よりずっと
-        // 少ないバイト数しか要求してはならない。
+        // This is the main regression: for a selective equality predicate it must request far fewer
+        // bytes than the whole column chunk.
         assert!(
             data_bytes * 10 < full_total,
             "expected order-of-magnitude reduction: fetched {data_bytes} of {full_total} bytes total"
@@ -968,13 +968,12 @@ mod tests {
 
     #[test]
     fn bloom_filter_skips_the_whole_split_for_a_provably_absent_value() {
-        // 999_999_999 は RowGroup の min/max (0..49999) の外なので、実際には
-        // `may_match`（RowGroup 統計）だけでも落ちる。「範囲内だが疎」という
-        // Bloom フィルタでしか拾えないケースは、このデータセットが 0..50000
-        // を隙間無く含むため再現できない（単体の Bloom フィルタが偽陰性を
-        // 返さないことは `parquet::bloom` のテストで別途検証済み）。ここでは
-        // Bloom フィルタ照合を含む `refine_with_index` の経路全体が、
-        // 不一致を正しく `false` として伝えることを確認する。
+        // 999_999_999 is outside the RowGroup's min/max (0..49999), so in practice `may_match`
+        // (RowGroup statistics) alone already rejects it. The "within range but sparse" case only a
+        // Bloom filter can catch cannot be reproduced, since this dataset covers 0..50000 with no
+        // gaps (that a Bloom filter alone returns no false negatives is verified separately in
+        // `parquet::bloom`'s tests). What is confirmed here is that the whole `refine_with_index`
+        // path, Bloom filter check included, correctly reports a non-match as `false`.
         let bytes = pagetest_bytes();
         let mut fmt = ParquetFormat::new();
         let mut src = resolve_remote(&mut fmt, &bytes);
@@ -997,8 +996,8 @@ mod tests {
 
     #[test]
     fn in_predicate_skips_the_split_when_every_candidate_is_absent() {
-        // `IN` は複数候補の OR なので、全候補が「無い」と分かって初めて
-        // 分割を落とせる。全候補を範囲外の値にして確認する。
+        // `IN` is an OR over several candidates, so the split can be dropped only once every
+        // candidate is known absent. Every candidate is set out of range to confirm that.
         let bytes = pagetest_bytes();
         let mut fmt = ParquetFormat::new();
         let mut src = resolve_remote(&mut fmt, &bytes);
@@ -1021,7 +1020,7 @@ mod tests {
 
     #[test]
     fn in_predicate_keeps_the_split_when_one_candidate_is_present() {
-        // 候補の 1 つだけが実在する値なら、他が全部無くても分割は残す。
+        // If just one candidate is a value that exists, the split is kept even when all the others are absent.
         let bytes = pagetest_bytes();
         let mut fmt = ParquetFormat::new();
         let mut src = resolve_remote(&mut fmt, &bytes);
@@ -1063,11 +1062,11 @@ mod tests {
 
     #[test]
     fn page_pruned_results_are_a_superset_containing_every_exact_match() {
-        // ページ選択は may_match と同じ「安全側」の絞り込みで、選ばれた
-        // ページの中に述語に一致しない行が混ざっていてもよい（正確な絞り込み
-        // は上位の Filter オペレータの仕事）。ここでは「絞り込み無しで得た
-        // 正解集合が、ページ選択後の結果に過不足なく（値も含めて）
-        // 含まれること」を確認する。
+        // Page selection is the same "err safe" filtering as may_match, and the selected pages may
+        // contain rows that do not satisfy the predicate (exact filtering is the Filter operator
+        // above's job). What is confirmed here is that "the correct set obtained without filtering
+        // is contained, neither more nor less (values included), in the result after page
+        // selection".
         let bytes = pagetest_bytes();
 
         let full: std::collections::BTreeMap<i32, Value> = {
@@ -1103,7 +1102,7 @@ mod tests {
         fetch_missing(&mut src, &bytes, &data_ranges);
         let cols = fmt.read_split(&src, 0, &projection).unwrap();
 
-        // 何かしら絞り込みが効いていること（50000 行丸ごとではない）。
+        // Some filtering must be in effect (it is not all 50000 rows).
         assert!(cols[0].len() < 50_000);
 
         let mut got = std::collections::BTreeMap::new();
@@ -1119,9 +1118,9 @@ mod tests {
 
     #[test]
     fn fallback_matches_when_the_column_lacks_a_page_index() {
-        // 古いファイル・非対応 writer を模して、id 列だけ ColumnIndex/
-        // OffsetIndex が無いことにする。以前どおり列チャンク全体を読む
-        // フォールバックのままであることを確認する。
+        // Emulating an old file or an unsupported writer, the id column is made to have no
+        // ColumnIndex/OffsetIndex. This confirms it stays on the fallback of reading whole column
+        // chunks as before.
         let bytes = pagetest_bytes();
         let mut fmt = ParquetFormat::new();
         let src = Source::from_bytes(bytes.clone());
@@ -1145,11 +1144,11 @@ mod tests {
 
         let mut idx_ranges = Vec::new();
         fmt.index_ranges(0, &pruners, &projection, &mut idx_ranges).unwrap();
-        // Bloom フィルタの範囲だけは残る（列メタデータ側は変えていないため）。
+        // Only the Bloom filter's range remains (the column metadata side is unchanged).
         assert!(!idx_ranges.is_empty());
 
         assert!(fmt.refine_with_index(&src, 0, &pruners, &projection).unwrap());
-        assert!(fmt.matching_plan(0, &projection).is_none(), "no page index → no plan");
+        assert!(fmt.matching_plan(0, &projection).is_none(), "no page index -> no plan");
 
         let mut ranges = Vec::new();
         fmt.split_ranges(0, &projection, &mut ranges).unwrap();
@@ -1164,11 +1163,11 @@ mod tests {
     fn corrupted_index_bytes_fall_back_instead_of_panicking() {
         let bytes = pagetest_bytes();
         let mut fmt = ParquetFormat::new();
-        // フッタはメモリ上の全バイトから解決するが、テスト対象の `src` には
-        // 索引バイトの範囲だけをゴミとして与える。フッタ投機取得の範囲と
-        // 索引バイトの範囲が重なっていると `Source::insert` は「先着優先」
-        // で本物のバイトを残してしまう（意図的な壊し方が効かなくなる）ため、
-        // 解決用の `Source` とは別に用意する。
+        // The footer is resolved from all the in-memory bytes, but the `src` under test is given
+        // only the index-byte ranges, as garbage. If the speculative footer fetch's range overlaps
+        // the index-byte range, `Source::insert` keeps the real bytes on a "first arrival wins"
+        // basis (and the deliberate corruption stops working), so a separate `Source` is prepared
+        // for resolution.
         let full_src = Source::from_bytes(bytes.clone());
         fmt.resolve(&full_src).unwrap().unwrap();
 
@@ -1188,7 +1187,7 @@ mod tests {
             src.insert(*start, vec![0xFFu8; (end - start) as usize]);
         }
 
-        // パニックせず、安全側（絞り込み無し）に倒れる。
+        // It does not panic and errs safe (no filtering).
         let keep = fmt.refine_with_index(&src, 0, &pruners, &projection).unwrap();
         assert!(keep);
         assert!(fmt.matching_plan(0, &projection).is_none());
@@ -1200,8 +1199,8 @@ mod tests {
 
     #[test]
     fn no_pruners_never_activates_a_page_plan() {
-        // pruners が無いクエリ（`SELECT *` など）は、以前どおり 1 バイトも
-        // 余分な索引アクセスをせずに列チャンク全体を読む。
+        // A query with no pruners (`SELECT *` and the like) reads whole column chunks as before,
+        // without a single extra index access.
         let bytes = pagetest_bytes();
         let mut fmt = ParquetFormat::new();
         let src = Source::from_bytes(bytes);

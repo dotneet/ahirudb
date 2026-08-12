@@ -1,10 +1,11 @@
-//! `PIVOT`/`UNPIVOT` の統合テスト。
+//! Integration tests for `PIVOT`/`UNPIVOT`.
 //!
-//! 期待値はすべて `duckdb -c "..."` の実際の出力と突き合わせて決めている
-//! （`tests/data/pivot.parquet`/`pivot_small.parquet` は DuckDB が書いた実
-//! ファイル。生成手順は `scripts/gen-testdata.sh` 参照）。
-//! `ddl`/`dml` フィーチャは要らない（読み取り専用の Parquet だけで足りる）ので、
-//! 既定フィーチャの `cargo test` でも必ず走る。
+//! All expected values are decided by cross-checking against the actual output of
+//! `duckdb -c "..."`
+//! (`tests/data/pivot.parquet`/`pivot_small.parquet` are real files written by DuckDB.
+//! See `scripts/gen-testdata.sh` for how they were generated).
+//! The `ddl`/`dml` features are not needed (read-only Parquet is enough), so this always
+//! runs even under the default-features `cargo test`.
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -21,9 +22,8 @@ fn session_with(file: &str) -> Session {
     s
 }
 
-/// `sql` を実行し、結果を `Vec<Vec<Value>>` として取り出す。
-/// テストで使うファイルはメモリ上にまるごと乗るので `NeedIo`/`NeedCodec` は
-/// 出ない。
+/// Runs `sql` and extracts the result as `Vec<Vec<Value>>`.
+/// Files used by the tests fit entirely in memory, so `NeedIo`/`NeedCodec` never occur.
 fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     let mut q = match session.prepare(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
         Prepared::Ready(q) => q,
@@ -64,7 +64,7 @@ const NULL: Value = Value::Null;
 // --- PIVOT -------------------------------------------------------------------
 
 /// `PIVOT t ON category IN (...) USING sum(amount) GROUP BY region`:
-/// 明示 `GROUP BY` + 明示 `IN` の基本形。
+/// The basic form: explicit `GROUP BY` + explicit `IN`.
 /// duckdb: PIVOT 'pivot.parquet' ON category IN ('a','b','c') USING sum(amount)
 ///         GROUP BY region ORDER BY region;
 #[test]
@@ -86,8 +86,8 @@ fn pivot_explicit_group_by_and_in_list() {
     );
 }
 
-/// `GROUP BY` 省略時は「`ON`/`USING` が参照する列以外の全列」が既定の
-/// グルーピング対象になる（DuckDB と同じ規則）。
+/// When `GROUP BY` is omitted, "every column other than those referenced by `ON`/`USING`"
+/// becomes the default grouping target (same rule as DuckDB).
 /// duckdb: PIVOT 'pivot_small.parquet' ON category IN ('a','b','c') USING sum(amount)
 ///         ORDER BY region;
 #[test]
@@ -104,7 +104,7 @@ fn pivot_default_group_by_uses_all_other_columns() {
     );
 }
 
-/// `USING` 省略時は DuckDB と同じく既定で `count(*)`。
+/// When `USING` is omitted, the default is `count(*)`, same as DuckDB.
 /// duckdb: PIVOT 'pivot_small.parquet' ON category IN ('a','b','c') GROUP BY region
 ///         ORDER BY region;
 #[test]
@@ -118,8 +118,8 @@ fn pivot_without_using_defaults_to_count_star() {
     );
 }
 
-/// `IN (値 AS 別名, ...)`: 別名を指定すれば列名はそれになる（値の文字列化は
-/// 使わない）。
+/// `IN (value AS alias, ...)`: if an alias is given, the column name becomes that alias
+/// (the value is not stringified).
 /// duckdb: PIVOT 'pivot_small.parquet' ON category IN ('a' AS alpha, 'b' AS beta)
 ///         USING sum(amount) GROUP BY region ORDER BY region;
 #[test]
@@ -136,7 +136,7 @@ fn pivot_in_list_aliases_become_column_names() {
     );
 }
 
-/// `ON` は裸の列だけでなく任意の式でよい。
+/// `ON` accepts any expression, not just a bare column.
 /// duckdb: PIVOT 'pivot.parquet' ON id % 2 IN (0, 1) USING sum(amount) GROUP BY region
 ///         ORDER BY region;
 #[test]
@@ -157,7 +157,7 @@ fn pivot_on_accepts_arbitrary_expression() {
     );
 }
 
-/// `PIVOT` は末尾の `ORDER BY`/`LIMIT`/`OFFSET` を受け付ける（DuckDB と同じ）。
+/// `PIVOT` accepts a trailing `ORDER BY`/`LIMIT`/`OFFSET` (same as DuckDB).
 #[test]
 fn pivot_supports_trailing_order_by_limit_offset() {
     let mut sess = session_with("pivot.parquet");
@@ -175,9 +175,9 @@ fn pivot_supports_trailing_order_by_limit_offset() {
     );
 }
 
-/// 値の自動検出（`IN` 省略）は、束縛時点では対象列の実データを読めず
-/// （スキーマ解決までしかしていない）DISTINCT が取れないため非対応。
-/// 明確に `UnsupportedFeature` を返すことを確認する。
+/// Auto-detecting values (omitting `IN`) is unsupported because at bind time the target
+/// column's actual data cannot be read (only schema resolution has happened), so DISTINCT
+/// cannot be taken. Verify it clearly returns `UnsupportedFeature`.
 #[test]
 fn pivot_without_in_list_is_unsupported() {
     let mut sess = session_with("pivot_small.parquet");
@@ -185,8 +185,8 @@ fn pivot_without_in_list_is_unsupported() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 複数集約関数（`USING sum(a), avg(a)`）は列名決定に式の文字列化が要り
-/// 非対応。
+/// Multiple aggregate functions (`USING sum(a), avg(a)`) are unsupported because determining
+/// the column name would require stringifying the expression.
 #[test]
 fn pivot_multiple_using_aggregates_is_unsupported() {
     let mut sess = session_with("pivot_small.parquet");
@@ -199,9 +199,9 @@ fn pivot_multiple_using_aggregates_is_unsupported() {
 
 // --- UNPIVOT -----------------------------------------------------------------
 
-/// `UNPIVOT t ON col1, col2, ... INTO NAME .. VALUE ..`: 複数対象列を
-/// 「列名の列 + 値の列」の2列に畳み込む。対象以外の列（id/region/category）は
-/// そのまま素通しする。
+/// `UNPIVOT t ON col1, col2, ... INTO NAME .. VALUE ..`: folds multiple target columns into
+/// two columns, a "column name" column and a "value" column. Non-target columns
+/// (id/region/category) pass through unchanged.
 /// duckdb: SELECT * FROM (UNPIVOT 'pivot.parquet' ON q1, q2, q3, q4
 ///         INTO NAME quarter VALUE amt) WHERE id < 2 ORDER BY id, quarter;
 #[test]
@@ -227,7 +227,8 @@ fn unpivot_basic_folds_columns_into_name_value_pairs() {
     );
 }
 
-/// 行数は「元の行数 × 対象列数」になる（q1..q4 の 4 列 × 60 行）。
+/// The row count is "original row count x number of target columns" (4 columns q1..q4 x 60
+/// rows).
 #[test]
 fn unpivot_row_count_multiplies_by_target_column_count() {
     let mut sess = session_with("pivot.parquet");
@@ -235,8 +236,8 @@ fn unpivot_row_count_multiplies_by_target_column_count() {
     assert_eq!(rows.len(), 60 * 4);
 }
 
-/// `INTO NAME .. VALUE ..` を省略すると DuckDB と同じく `name`/`value` が
-/// 既定の列名になる。
+/// Omitting `INTO NAME .. VALUE ..` makes `name`/`value` the default column names, same as
+/// DuckDB.
 /// duckdb: UNPIVOT 'pivot_small.parquet' ON amount ORDER BY region, category;
 #[test]
 fn unpivot_default_name_and_value_columns() {
@@ -254,7 +255,7 @@ fn unpivot_default_name_and_value_columns() {
     );
 }
 
-/// `UNPIVOT` も末尾の `ORDER BY`/`LIMIT`/`OFFSET` を受け付ける。
+/// `UNPIVOT` also accepts a trailing `ORDER BY`/`LIMIT`/`OFFSET`.
 #[test]
 fn unpivot_supports_trailing_order_by_limit_offset() {
     let mut sess = session_with("pivot_small.parquet");
@@ -268,7 +269,8 @@ fn unpivot_supports_trailing_order_by_limit_offset() {
     );
 }
 
-/// 対象列は修飾子なしの裸の列参照のみ。式は非対応。
+/// Target columns must be bare, unqualified column references only. Expressions are
+/// unsupported.
 #[test]
 fn unpivot_target_must_be_a_bare_column_reference() {
     let mut sess = session_with("pivot.parquet");
@@ -276,9 +278,9 @@ fn unpivot_target_must_be_a_bare_column_reference() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 対象列の型が非互換（暗黙変換できない）なら、通常の `UNION ALL` と同じ
-/// 型エラーになる（DuckDB も同じ状況で "an explicit cast is required" と拒否
-/// する。エラーコードの意味は通常の集合演算と揃える）。
+/// If the target columns' types are incompatible (no implicit conversion), it becomes the
+/// same type error as an ordinary `UNION ALL` (DuckDB also rejects the same situation with
+/// "an explicit cast is required"; the error code's meaning matches ordinary set operations).
 #[test]
 fn unpivot_incompatible_column_types_is_type_mismatch() {
     let mut sess = session_with("pivot.parquet");
@@ -286,25 +288,26 @@ fn unpivot_incompatible_column_types_is_type_mismatch() {
     assert_eq!(code_of(err), Some(Code::TypeMismatch));
 }
 
-// --- 発見した不具合の回帰テスト -----------------------------------------------
+// --- Regression tests for discovered bugs --------------------------------------
 
-/// `IN (...)` に同じ値を 2 回書くと、別名の有無に関わらず `duckdb` は
-/// "The value ... was specified multiple times in the IN clause" として
-/// 拒否する（`duckdb -c "PIVOT ... ON category IN ('a','a') ..."` で確認済み）。
+/// Writing the same value twice in `IN (...)`, regardless of whether aliases are given,
+/// `duckdb` rejects with
+/// "The value ... was specified multiple times in the IN clause" (confirmed with
+/// `duckdb -c "PIVOT ... ON category IN ('a','a') ..."`).
 ///
-/// 修正前の不具合: このチェックが無く、`PIVOT t ON category IN ('a', 'a')
-/// USING sum(amount) GROUP BY region` が黙って通ってしまい、同じ `FILTER`
-/// 条件を持つ列が `"a"` という同じ名前で 2 本できていた（`plan::bind::
-/// desugar_pivot` に重複検出を追加して修正）。
+/// Bug before the fix: this check was missing, so `PIVOT t ON category IN ('a', 'a')
+/// USING sum(amount) GROUP BY region` silently went through, producing two columns with
+/// the same `FILTER` condition both named `"a"` (fixed by adding duplicate detection to
+/// `plan::bind::desugar_pivot`).
 #[test]
 fn pivot_rejects_duplicate_values_in_the_in_list() {
     let mut sess = session_with("pivot_small.parquet");
     let err =
         sess.prepare("PIVOT t ON category IN ('a', 'a') USING sum(amount) GROUP BY region", &[]);
     assert_eq!(code_of(err), Some(Code::SyntaxError));
-    // 別名を付けていても、元の値が重複していれば同じく拒否される
-    // （`duckdb` は別名の衝突自体は `_1` サフィックスで自動リネームするだけ
-    // だが、値そのものの重複は許さない）。
+    // Even with aliases given, it is likewise rejected if the underlying values are
+    // duplicated (`duckdb` only auto-renames a pure alias collision with a `_1` suffix,
+    // but does not allow a duplicate of the value itself).
     let err = sess.prepare(
         "PIVOT t ON category IN ('a' AS x, 'a' AS y) USING sum(amount) GROUP BY region",
         &[],
@@ -312,7 +315,7 @@ fn pivot_rejects_duplicate_values_in_the_in_list() {
     assert_eq!(code_of(err), Some(Code::SyntaxError));
 }
 
-/// 値が異なれば問題なく通る（重複チェックが誤爆していないことの確認）。
+/// Distinct values pass through fine (confirms the duplicate check has no false positives).
 #[test]
 fn pivot_distinct_values_in_the_in_list_are_fine() {
     let mut sess = session_with("pivot_small.parquet");
@@ -326,17 +329,17 @@ fn pivot_distinct_values_in_the_in_list_are_fine() {
     );
 }
 
-/// `PIVOT`/`UNPIVOT` はこのエンジンでは文の先頭でしか展開されない糖衣構文
-/// なので、派生表（`FROM (PIVOT ...)`）や CTE 本体、集合演算の項としては
-/// 使えない（`plan::bind::desugar_pivot`/`desugar_unpivot` が `Session::
-/// prepare` の入り口で 1 回だけ展開する設計。`session.rs` 参照）。`duckdb`
-/// はこれを許すが、対応範囲外。
+/// `PIVOT`/`UNPIVOT` are syntax sugar that, in this engine, is only expanded at the start of a
+/// statement, so it cannot be used as a derived table (`FROM (PIVOT ...)`), a CTE body, or a
+/// term of a set operation (`plan::bind::desugar_pivot`/`desugar_unpivot` is designed to
+/// expand exactly once at the entry point of `Session::prepare`; see `session.rs`). `duckdb`
+/// allows this, but it is out of scope here.
 ///
-/// 修正前の不具合: このケースは `sql::parser::select_body` が `SELECT` を
-/// 期待するところまで読み進んでから初めて `UnexpectedToken` になっており、
-/// 「`PIVOT` 自体は書けるのになぜ subquery だと構文エラーになるのか」が
-/// 分かりにくかった。`select_body` の先頭で `PIVOT`/`UNPIVOT` を検出し、
-/// 意味の分かる `UnsupportedFeature` を返すように修正した。
+/// Bug before the fix: in this case, `sql::parser::select_body` only turned into an
+/// `UnexpectedToken` after reading ahead to the point where it expected `SELECT`, which made
+/// it confusing why "`PIVOT` itself can be written, but a subquery gives a syntax error".
+/// Fixed by detecting `PIVOT`/`UNPIVOT` at the start of `select_body` and returning a
+/// meaningful `UnsupportedFeature` instead.
 #[test]
 fn pivot_as_a_derived_table_is_a_clear_unsupported_error_not_a_confusing_syntax_error() {
     let mut sess = session_with("pivot.parquet");
@@ -359,8 +362,8 @@ fn unpivot_as_a_cte_body_is_a_clear_unsupported_error() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 一方、top-level の `PIVOT`/`UNPIVOT` 自体はリグレッションなく今までどおり
-/// 動く。
+/// Meanwhile, top-level `PIVOT`/`UNPIVOT` itself still works exactly as before, without
+/// regression.
 #[test]
 fn top_level_pivot_is_unaffected_by_the_derived_table_check() {
     let mut sess = session_with("pivot.parquet");
@@ -372,9 +375,10 @@ fn top_level_pivot_is_unaffected_by_the_derived_table_check() {
     assert_eq!(rows.len(), 4);
 }
 
-/// `PIVOT` の `FROM` は表名だけでなく、`JOIN` を含む任意の派生表でもよい
-/// （`desugar_pivot` は `from` をそのまま `SelectStmt::from` へ渡すだけで、
-/// `UNPIVOT` のように複製する必要が無いため制約が無い）。
+/// `PIVOT`'s `FROM` accepts not just a table name but any derived table, including one
+/// containing a `JOIN` (`desugar_pivot` just passes `from` straight through to
+/// `SelectStmt::from`, so there's no constraint since it doesn't need to duplicate it the
+/// way `UNPIVOT` does).
 #[test]
 fn pivot_from_accepts_a_derived_table_containing_a_join() {
     let mut sess = session_with("pivot.parquet");
@@ -386,9 +390,9 @@ fn pivot_from_accepts_a_derived_table_containing_a_join() {
     assert!(!rows.is_empty());
 }
 
-/// `UNPIVOT` は対象列 1 本ごとに `from` を複製する必要があり（`clone_from_item`
-/// 参照）、`JOIN`/`Subquery` は複製できないプランを持ちうるため明示的に
-/// 拒否する。クラッシュせずクリーンなエラーになることを確認する。
+/// `UNPIVOT` needs to duplicate `from` once per target column (see `clone_from_item`), and
+/// since `JOIN`/`Subquery` can have plans that cannot be duplicated, it is explicitly
+/// rejected. Verify it produces a clean error instead of crashing.
 #[test]
 fn unpivot_from_a_join_is_rejected_cleanly() {
     let mut sess = session_with("pivot.parquet");

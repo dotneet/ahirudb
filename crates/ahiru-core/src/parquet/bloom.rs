@@ -1,19 +1,22 @@
-//! Parquet の Split Block Bloom Filter (SBBF) 読み取り専用実装。
+//! Parquet's Split Block Bloom Filter (SBBF), read-only implementation.
 //!
-//! `BloomFilterHeader`（`meta.rs`）に続くビットセット本体を扱う。フォーマットは
-//! 「32 バイト（= 8 × u32）のブロックが `num_bytes / 32` 個並ぶ」もので、各ブロック
-//! は 8 個のマスクを持つ独立した小さい Bloom フィルタ（Apache Parquet Format 仕様
-//! `BloomFilter.md` の Split Block Bloom Filter）。
+//! Handles the bitset body that follows the `BloomFilterHeader` (`meta.rs`).
+//! The format is "`num_bytes / 32` blocks of 32 bytes (= 8 x u32) laid out in
+//! sequence," where each block is an independent small Bloom filter with 8
+//! masks (the Split Block Bloom Filter from the Apache Parquet Format spec's
+//! `BloomFilter.md`).
 //!
-//! ハッシュは XXH64（seed 0）を PLAIN エンコードした値バイト列に対して掛ける。
-//! `ahiru-zstd` crate に XXH64 実装があるが、DESIGN.md §6 の通り
-//! `ahiru-zstd`/`ahiru-core` は互いに依存させない設計方針のため、ここでは
-//! 同じアルゴリズムを ~40 行だけ複製する（クレートをまたいだ依存を 1 本足す
-//! ためだけに、双方が「他方が無くても壊れない」という性質を失うのは割に合わない）。
+//! The hash is XXH64 (seed 0) applied to the PLAIN-encoded value byte
+//! sequence. The `ahiru-zstd` crate has an XXH64 implementation, but per the
+//! design policy in DESIGN.md §6 of keeping `ahiru-zstd`/`ahiru-core` free of
+//! dependencies on each other, this duplicates the same algorithm in about 40
+//! lines (adding one cross-crate dependency just for this isn't worth losing
+//! the property that either crate keeps working without the other).
 
 // --- XXH64 (seed = 0) -------------------------------------------------------
-// `crates/ahiru-zstd/src/xxh64.rs` と同一アルゴリズムの複製。展開結果は
-// 全て手元にあるので、逐次更新版ではなく一発計算で足りる。
+// A duplicate of the same algorithm as `crates/ahiru-zstd/src/xxh64.rs`. The
+// decompressed output is always fully available here, so a one-shot
+// computation suffices instead of an incremental streaming version.
 
 const P1: u64 = 0x9E37_79B1_85EB_CA87;
 const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
@@ -101,10 +104,11 @@ fn xxh64(data: &[u8]) -> u64 {
 
 // --- Split Block Bloom Filter -----------------------------------------------
 
-/// SBBF の各ブロック内で使う 8 個のソルト定数。
-/// Apache Parquet Format 仕様 (`BloomFilter.md` の "Block-based Bloom filter"
-/// 節) が参照する Impala のブロック分割 Bloom フィルタ実装に由来する固定値で、
-/// parquet-mr / parquet-cpp / arrow-rs のリファレンス実装も同じ値を使う。
+/// The 8 salt constants used within each block of the SBBF.
+/// These fixed values come from the Impala block-split Bloom filter
+/// implementation referenced by the Apache Parquet Format spec
+/// (`BloomFilter.md`'s "Block-based Bloom filter" section); the parquet-mr /
+/// parquet-cpp / arrow-rs reference implementations use the same values.
 const SALT: [u32; 8] = [
     0x47b6_137b,
     0x4497_4d91,
@@ -116,21 +120,21 @@ const SALT: [u32; 8] = [
     0x5c6b_fb31,
 ];
 
-/// 1 ブロックのバイト数（8 個の u32 ワード）。
+/// Byte size of one block (8 u32 words).
 const BLOCK_BYTES: usize = 32;
 
-/// 読み取り専用の Split Block Bloom Filter。
+/// A read-only Split Block Bloom Filter.
 ///
-/// `bits` は `BloomFilterHeader.num_bytes` ぶんのビットセット本体（ヘッダは
-/// 含まない）。長さは `BLOCK_BYTES` の倍数でなければならない
-/// （`decode_bloom_filter_header` が `num_bytes % 32 == 0` を検証済み）。
+/// `bits` is the bitset body of `BloomFilterHeader.num_bytes` bytes (not
+/// including the header). Its length must be a multiple of `BLOCK_BYTES`
+/// (`decode_bloom_filter_header` has already verified `num_bytes % 32 == 0`).
 pub struct BloomFilter<'a> {
     bits: &'a [u8],
 }
 
 impl<'a> BloomFilter<'a> {
-    /// `bits.len()` が 0 または 32 の倍数でなければ `None`
-    /// （呼び出し側は「使わない」で安全側に倒せる）。
+    /// `None` if `bits.len()` is not 0 or a multiple of 32 (the caller can
+    /// safely fall back to "not used").
     pub fn new(bits: &'a [u8]) -> Option<Self> {
         if bits.is_empty() || !bits.len().is_multiple_of(BLOCK_BYTES) {
             return None;
@@ -138,15 +142,16 @@ impl<'a> BloomFilter<'a> {
         Some(BloomFilter { bits })
     }
 
-    /// `key_bytes_in_plain_encoding` が挿入されている可能性があるか。
+    /// Whether `key_bytes_in_plain_encoding` may have been inserted.
     ///
-    /// 偽陽性はあり得る（`true` を返しても実際には無いことがある）が、
-    /// 偽陰性は無い（挿入済みの値に対して `false` を返すことは無い）。
+    /// False positives are possible (returning `true` doesn't guarantee it
+    /// was actually inserted), but there are no false negatives (this never
+    /// returns `false` for a value that was actually inserted).
     pub fn contains(&self, key_bytes_in_plain_encoding: &[u8]) -> bool {
         let h = xxh64(key_bytes_in_plain_encoding);
         let num_blocks = (self.bits.len() / BLOCK_BYTES) as u64;
-        // ブロック選択: ハッシュの上位 32 ビットを [0, num_blocks) に写像する
-        // "multiply-shift" 手法（Lemire 法）。仕様の参照実装と同じ式。
+        // Block selection: maps the hash's upper 32 bits into [0, num_blocks)
+        // using the "multiply-shift" technique (Lemire's method). Same formula as the spec's reference implementation.
         let block_idx = (((h >> 32).wrapping_mul(num_blocks)) >> 32) as usize;
         let base = block_idx * BLOCK_BYTES;
         let block = &self.bits[base..base + BLOCK_BYTES];
@@ -168,9 +173,9 @@ impl<'a> BloomFilter<'a> {
 mod tests {
     use super::*;
 
-    /// テスト専用のビルダ。`contains` と同じマスク計算を使って該当ビットを
-    /// 立てる（本番コードは Bloom フィルタを書き出さないので、これは
-    /// フィクスチャ構築用に留める）。
+    /// A test-only builder. Sets the corresponding bit using the same mask
+    /// calculation as `contains` (production code never writes out a Bloom
+    /// filter, so this is kept limited to building fixtures).
     fn insert(bits: &mut [u8], key: &[u8]) {
         let h = xxh64(key);
         let num_blocks = (bits.len() / BLOCK_BYTES) as u64;
@@ -188,7 +193,7 @@ mod tests {
 
     #[test]
     fn xxh64_matches_known_vectors() {
-        // XXH64(seed=0) の公式リファレンス値（xxHash テストベクタ）。
+        // Official reference values for XXH64(seed=0) (xxHash test vectors).
         assert_eq!(xxh64(b""), 0xEF46_DB37_51D8_E999);
         assert_eq!(xxh64(b"a"), 0xd24e_c4f1_a98c_6e5b);
     }
@@ -202,7 +207,7 @@ mod tests {
 
     #[test]
     fn inserted_keys_are_never_reported_absent() {
-        // 2 ブロック(64 バイト)に、複数の異なる型のキーを挿入する。
+        // Insert keys of several different types into 2 blocks (64 bytes).
         let mut bits = [0u8; 64];
         let keys: &[&[u8]] = &[
             &42i32.to_le_bytes(),
@@ -223,8 +228,8 @@ mod tests {
 
     #[test]
     fn absent_key_is_reported_absent_in_a_sparse_filter() {
-        // 疎なフィルタ（1 件だけ挿入）なら、無関係な値が偶然衝突する確率は
-        // 実用上無視できる。具体的な非衝突を 1 つ確認しておく。
+        // In a sparse filter (only one entry inserted), the odds of an
+        // unrelated value colliding by chance are negligible in practice. Confirm one concrete non-collision here.
         let mut bits = [0u8; 32];
         insert(&mut bits, &1i32.to_le_bytes());
         let bf = BloomFilter::new(&bits).unwrap();

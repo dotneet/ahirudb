@@ -57,7 +57,7 @@ fn or_branches_are_not_pruned() {
     let e = a.push(Expr::Binary { op: BinaryOp::Or, lhs: c1, rhs: c2 });
     let mut out = Vec::new();
     extract_pruners(&a, e, &scope(), &mut out);
-    assert!(out.is_empty(), "OR の下の条件で枝刈りしてはいけない");
+    assert!(out.is_empty(), "a condition under an OR must not be used for pruning");
 }
 
 #[test]
@@ -94,7 +94,10 @@ fn negated_between_is_not_pruned() {
     let e = a.push(Expr::Between { arg, low, high, negated: true });
     let mut out = Vec::new();
     extract_pruners(&a, e, &scope(), &mut out);
-    assert!(out.is_empty(), "NOT BETWEEN は範囲の外側なので統計だけでは絞れない");
+    assert!(
+        out.is_empty(),
+        "NOT BETWEEN falls outside the range, so statistics alone cannot narrow it"
+    );
 }
 
 #[test]
@@ -110,7 +113,7 @@ fn in_list_of_literals_becomes_a_single_in_pruner() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].op, PruneOp::In);
     assert_eq!(out[0].column, 0);
-    // 先頭が `value`、残りが `in_values` に入る。
+    // The first goes into `value`; the rest go into `in_values`.
     assert_eq!(out[0].in_values.len(), 2);
 }
 
@@ -137,7 +140,7 @@ fn in_list_with_non_literal_element_is_not_pruned() {
     let e = a.push(Expr::InList { arg, list: vec![v1, other_col], negated: false });
     let mut out = Vec::new();
     extract_pruners(&a, e, &scope(), &mut out);
-    assert!(out.is_empty(), "候補に非リテラルがあれば集合が確定しないので枝刈りしない");
+    assert!(out.is_empty(), "with a non-literal candidate the set is not settled, so no pruning");
 }
 
 #[test]
@@ -148,7 +151,10 @@ fn negated_in_list_is_not_pruned() {
     let e = a.push(Expr::InList { arg, list: vec![v1], negated: true });
     let mut out = Vec::new();
     extract_pruners(&a, e, &scope(), &mut out);
-    assert!(out.is_empty(), "NOT IN は候補以外の全てにマッチしうるので統計だけでは絞れない");
+    assert!(
+        out.is_empty(),
+        "NOT IN can match anything outside the candidates, so statistics alone cannot narrow it"
+    );
 }
 
 #[test]
@@ -177,7 +183,7 @@ fn conjuncts_are_split_on_and_only() {
     let or = a.push(Expr::Binary { op: BinaryOp::Or, lhs: x, rhs: y });
     let mut out2 = Vec::new();
     split_conjuncts(&a, or, &mut out2, 0).unwrap();
-    assert_eq!(out2, vec![or], "OR は分解しない");
+    assert_eq!(out2, vec![or], "an OR is not decomposed");
 }
 
 fn join_scope() -> Scope {
@@ -198,7 +204,7 @@ fn equi_key_detects_both_orientations() {
     let e = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: lk, rhs: rk });
     assert_eq!(equi_key(&a, &s, 2, e).unwrap(), Some((lk, rk)));
 
-    // 逆向きに書かれていても左右を入れ替えて拾う。
+    // Picked up with the operands swapped even when written the other way around.
     let e2 = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: rk, rhs: lk });
     assert_eq!(equi_key(&a, &s, 2, e2).unwrap(), Some((lk, rk)));
 }
@@ -212,12 +218,12 @@ fn same_side_equality_is_not_a_join_key() {
     let e = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: lk, rhs: lv });
     assert_eq!(equi_key(&a, &s, 2, e).unwrap(), None);
 
-    // 定数との比較も結合キーではない。
+    // A comparison against a constant is not a join key either.
     let lit = a.push(Expr::Literal(Value::I32(1)));
     let e2 = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: lk, rhs: lit });
     assert_eq!(equi_key(&a, &s, 2, e2).unwrap(), None);
 
-    // 不等号も等値結合にはならない（残余述語に回る）。
+    // An inequality is not an equi-join either (it becomes a residual predicate).
     let rk = a.push(Expr::ColumnRef { qualifier: Some("r".into()), name: "k".into() });
     let e3 = a.push(Expr::Binary { op: BinaryOp::Lt, lhs: lk, rhs: rk });
     assert_eq!(equi_key(&a, &s, 2, e3).unwrap(), None);
@@ -237,7 +243,7 @@ fn single_rel_ownership_for_pushdown() {
     let both = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: lk, rhs: rk });
     assert_eq!(single_rel_of(&a, &s, &ranges, both).unwrap(), None);
 
-    // 定数だけの条件はどの関係にも属さない。
+    // A condition made only of constants belongs to no relation.
     let c = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: lit, rhs: lit });
     assert_eq!(single_rel_of(&a, &s, &ranges, c).unwrap(), None);
 }
@@ -264,7 +270,7 @@ fn aggregates_are_collected_and_deduplicated() {
     let e = a.push(Expr::Binary { op: BinaryOp::Add, lhs: c1, rhs: c2 });
     let mut out = Vec::new();
     collect_aggregates(&a, e, &mut out, 0).unwrap();
-    // 構造が同じ集約は 1 つにまとめる（2 度計算しない）。
+    // Structurally identical aggregates are merged into one (not computed twice).
     assert_eq!(out.len(), 1);
 }
 
@@ -295,15 +301,15 @@ fn ungrouped_column_is_rejected() {
     let mut a = ExprArena::new();
     let g = col(&mut a, "id");
     let other = col(&mut a, "score");
-    // GROUP BY id なのに score を裸で参照している。
+    // GROUP BY id, yet score is referenced bare.
     assert_eq!(code_of(check_grouped(&a, &scope(), other, &[g], &[], 0)), Some(Code::NotGrouped));
-    // GROUP BY した列そのものは通る。
+    // The grouped column itself passes.
     assert!(check_grouped(&a, &scope(), g, &[g], &[], 0).is_ok());
 }
 
 #[test]
 fn grouped_expression_matches_structurally() {
-    // GROUP BY id + 1 に対して SELECT id + 1 は許される。
+    // SELECT id + 1 is allowed against GROUP BY id + 1.
     let mut a = ExprArena::new();
     let c1 = col(&mut a, "id");
     let l1 = a.push(Expr::Literal(Value::I32(1)));

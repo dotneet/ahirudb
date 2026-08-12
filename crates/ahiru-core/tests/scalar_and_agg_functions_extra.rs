@@ -365,9 +365,9 @@ fn decimal_plus_decimal_widens_precision_and_matches_scale() {
     assert_eq!(got, Some(Value::I64(24645)));
 }
 
-/// `HUGEINT` は 39 桁ないと端まで表せない。10 進パーサが 38 桁で打ち切って
-/// 残りを指数へ逃がしていた頃は、上限が `…105720` に丸まった値として
-/// **黙って** 通っていた（範囲外の `…105728` すら同じ値で受理していた）。
+/// `HUGEINT` needs the full 39 digits to represent its extremes. Back when the decimal parser
+/// truncated at 38 digits and let the rest escape into an exponent, the boundary used to
+/// **silently** pass as a value rounded to `...105720` (even the out-of-range `...105728` was accepted as the same value).
 #[test]
 fn hugeint_string_cast_is_exact_at_the_i128_boundaries() {
     let mut sess = session_with_basic();
@@ -381,9 +381,9 @@ fn hugeint_string_cast_is_exact_at_the_i128_boundaries() {
         one(&mut sess, "CAST('-170141183460469231731687303715884105728' AS HUGEINT)"),
         Value::I128(i128::MIN)
     );
-    // 範囲外は NULL。duckdb は CAST でエラー / TRY_CAST で NULL、この
-    // エンジンは常に NULL 側に倒す（docs/sql/types.md の変換方針）。
-    // 丸めた値を返すのは「黙って桁が化ける」ので不可。
+    // Out of range is NULL. duckdb errors on CAST / returns NULL on TRY_CAST; this engine
+    // always falls to the NULL side (the conversion policy in docs/sql/types.md).
+    // Returning a rounded value is not acceptable, since that's "silently mangling digits".
     assert_eq!(
         one(&mut sess, "CAST('170141183460469231731687303715884105728' AS HUGEINT)"),
         Value::Null
@@ -392,13 +392,13 @@ fn hugeint_string_cast_is_exact_at_the_i128_boundaries() {
         one(&mut sess, "CAST('-170141183460469231731687303715884105729' AS HUGEINT)"),
         Value::Null
     );
-    // 38 桁までは元から正確だった。回帰していないことを押さえる。
+    // Up to 38 digits was already accurate before. Pin down that this hasn't regressed.
     assert_eq!(
         one(&mut sess, "CAST('12345678901234567890123456789012345678' AS HUGEINT)"),
         Value::I128(12345678901234567890123456789012345678)
     );
-    // 浮動小数点は仮数の外なので、桁あふれしても近似値を返し続ける
-    // （duckdb: 1e50）。整数側の NULL 化を巻き込んでいないこと。
+    // Floating point is outside the mantissa, so it keeps returning an approximate value even
+    // on overflow (duckdb: 1e50). Verify it doesn't get dragged into the integer side's NULLing.
     assert_eq!(
         one(&mut sess, "CAST('99999999999999999999999999999999999999999999999999' AS DOUBLE)"),
         Value::F64(1e50)
@@ -437,8 +437,10 @@ fn unicode_string_functions_match_duckdb_over_literals() {
     // (duckdb: length('café')=4, substr('café',4,1)='é').
     assert_eq!(one(&mut sess, "length('café')"), Value::I64(4));
     assert_eq!(one(&mut sess, "substr('café', 4, 1)"), s("é"));
-    // duckdb: instr('あいうえお','う') = 3 (codepoint position).
-    assert_eq!(one(&mut sess, "instr('あいうえお', 'う')"), Value::I64(3));
+    // duckdb: instr() on non-ASCII text returns the codepoint position, not the byte offset.
+    // Using Greek letters here to exercise the same multi-byte behavior duckdb would show:
+    // instr('αβγδε', 'γ') = 3 (codepoint position).
+    assert_eq!(one(&mut sess, "instr('αβγδε', 'γ')"), Value::I64(3));
 }
 
 #[test]

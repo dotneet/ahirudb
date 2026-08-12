@@ -1,10 +1,10 @@
-//! 名前解決のスコープ。
+//! The name-resolution scope.
 //!
-//! 結合が入ると「同じ列名が複数のテーブルにある」状況が普通に起きるので、
-//! 列は `(修飾子, フィールド)` の組で持つ。修飾子はテーブル名か別名。
+//! With joins, "the same column name exists in several tables" is routine, so columns are
+//! held as `(qualifier, field)` pairs. The qualifier is a table name or alias.
 //!
-//! 添字はそのままバッチ内の列番号になる。結合の出力は「左のスキーマ ++
-//! 右のスキーマ」なので、スコープも同じ順で連結すればよい。
+//! The index doubles as the column number within a batch. A join's output is "the left
+//! schema ++ the right schema", so concatenating scopes in the same order suffices.
 
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
@@ -21,7 +21,7 @@ impl Scope {
         Scope { quals: Vec::new(), fields: Vec::new() }
     }
 
-    /// 修飾子を持たないスコープ。集約やソートの中間結果に使う。
+    /// A scope with no qualifier. Used for the intermediate results of aggregation and sorting.
     pub fn from_fields(fields: Vec<Field>) -> Self {
         Scope { quals: vec![None; fields.len()], fields }
     }
@@ -31,7 +31,7 @@ impl Scope {
         self.fields.push(field);
     }
 
-    /// 別のスコープを右側に連結する。結合の出力スキーマを作るのに使う。
+    /// Concatenates another scope on the right. Used to build a join's output schema.
     pub fn extend(&mut self, other: &Scope) {
         self.quals.extend_from_slice(&other.quals);
         self.fields.extend_from_slice(&other.fields);
@@ -53,14 +53,14 @@ impl Scope {
         self.fields.is_empty()
     }
 
-    /// この修飾子を持つ列が 1 つでもあるか。`t.*` の検証に使う。
+    /// Whether at least one column carries this qualifier. Used to validate `t.*`.
     pub fn has_qualifier(&self, qual: &str) -> bool {
         self.quals
             .iter()
             .any(|q| q.as_deref().is_some_and(|q| eq_ascii_ci(q.as_bytes(), qual.as_bytes())))
     }
 
-    /// 修飾子付きの列だけを列挙する。`t.*` の展開に使う。
+    /// Enumerates only the qualified columns. Used to expand `t.*`.
     pub fn indices_for_qualifier(&self, qual: &str) -> Vec<usize> {
         self.quals
             .iter()
@@ -72,11 +72,11 @@ impl Scope {
             .collect()
     }
 
-    /// 列を解決する。
+    /// Resolves a column.
     ///
-    /// 修飾子があればその修飾子を持つ列だけを見る。無ければ全体から探し、
-    /// 2 つ以上一致したら `AmbiguousColumn`。名前の比較は大文字小文字を
-    /// 区別しない（識別子の綴りは出力名として保つが、照合はしない）。
+    /// With a qualifier, only columns carrying it are considered. Without one, the whole
+    /// scope is searched, and two or more matches give `AmbiguousColumn`. Name comparison is
+    /// case-insensitive (identifier spelling is preserved as the output name, but not for matching).
     pub fn resolve(&self, qual: Option<&str>, name: &str) -> Result<usize> {
         let mut found = None;
         for i in 0..self.fields.len() {
@@ -97,8 +97,8 @@ impl Scope {
         match found {
             Some(i) => Ok(i),
             None => {
-                // 修飾子が付いていて、その修飾子自体が存在しないなら
-                // 「テーブルが無い」と言う方が原因に近い。
+                // If a qualifier is present but the qualifier itself does not exist,
+                // "no such table" is closer to the cause.
                 if let Some(q) = qual {
                     if !self.has_qualifier(q) {
                         err!(TableNotFound);
@@ -130,7 +130,7 @@ mod tests {
         let s = scope();
         assert_eq!(s.resolve(Some("a"), "id").unwrap(), 0);
         assert_eq!(s.resolve(Some("b"), "id").unwrap(), 2);
-        // 大文字小文字は区別しない。
+        // Case-insensitive.
         assert_eq!(s.resolve(Some("B"), "ID").unwrap(), 2);
     }
 
@@ -138,7 +138,7 @@ mod tests {
     fn unqualified_duplicate_is_ambiguous() {
         let s = scope();
         assert_eq!(code_of(s.resolve(None, "id")), Some(Code::AmbiguousColumn));
-        // 片方にしか無い名前なら曖昧ではない。
+        // A name present on only one side is not ambiguous.
         assert_eq!(s.resolve(None, "score").unwrap(), 3);
     }
 
@@ -146,7 +146,7 @@ mod tests {
     fn unknown_qualifier_reports_missing_table() {
         let s = scope();
         assert_eq!(code_of(s.resolve(Some("z"), "id")), Some(Code::TableNotFound));
-        // 修飾子はあるが列が無い場合は列の問題。
+        // With a qualifier present but no such column, the column is the problem.
         assert_eq!(code_of(s.resolve(Some("a"), "score")), Some(Code::ColumnNotFound));
     }
 

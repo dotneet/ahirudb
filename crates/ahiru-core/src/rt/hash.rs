@@ -1,9 +1,9 @@
-//! ハッシュ関数。
+//! Hash functions.
 //!
-//! 暗号学的強度も HashDoS 耐性も持たない。埋め込み解析エンジンとして
-//! 敵対的なキーを想定しないため、速度とコードサイズを優先する。
+//! Neither cryptographically strong nor HashDoS resistant. An embedded analytics
+//! engine does not assume adversarial keys, so speed and code size come first.
 
-/// splitmix64 の finalizer。整数キーの撹拌に使う。
+/// The splitmix64 finalizer. Used to mix integer keys.
 #[inline]
 pub fn hash_u64(mut x: u64) -> u64 {
     x ^= x >> 30;
@@ -15,7 +15,7 @@ pub fn hash_u64(mut x: u64) -> u64 {
 
 const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
-/// FxHash 系のバイト列ハッシュ。8 バイトずつ読んで乗算・回転で混ぜる。
+/// An FxHash-style byte-sequence hash. Reads 8 bytes at a time and mixes by multiplication and rotation.
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h: u64 = SEED ^ (bytes.len() as u64);
     let mut chunks = bytes.chunks_exact(8);
@@ -33,7 +33,7 @@ pub fn hash_bytes(bytes: &[u8]) -> u64 {
     hash_u64(h)
 }
 
-/// ASCII 大文字小文字を無視するハッシュ。SQL の識別子・キーワード用。
+/// A hash that ignores ASCII case. For SQL identifiers and keywords.
 pub fn hash_ascii_ci(bytes: &[u8]) -> u64 {
     let mut h: u64 = SEED ^ (bytes.len() as u64);
     for &b in bytes {
@@ -42,7 +42,7 @@ pub fn hash_ascii_ci(bytes: &[u8]) -> u64 {
     hash_u64(h)
 }
 
-/// ASCII 大文字小文字を無視した比較。
+/// ASCII case-insensitive comparison.
 #[inline]
 pub fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))

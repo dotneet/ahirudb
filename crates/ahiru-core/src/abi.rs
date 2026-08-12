@@ -1,7 +1,7 @@
-//! wasm ABI。
+//! The wasm ABI.
 //!
-//! ホストとのやり取りは「実行を止めて必要なバイト範囲を返す」ループで表現する。
-//! Asyncify を使わないので生成コードが膨らまない（DESIGN.md §6）。
+//! Interaction with the host is expressed as a loop that "stops execution and returns the byte ranges needed".
+//! Avoiding Asyncify keeps the generated code from bloating (DESIGN.md §6).
 //!
 //! ```text
 //! for (;;) {
@@ -12,9 +12,9 @@
 //! }
 //! ```
 //!
-//! 文字列は UTF-8 のポインタ + 長さで渡す。エラーはコード（`u32`）だけを返し、
-//! メッセージ文字列は JS 側のテーブルで組み立てる。これだけで wasm から
-//! 20 KB 前後のメッセージ文字列を追い出せる。
+//! Strings are passed as a UTF-8 pointer plus length. Errors return only a code
+//! (`u32`), and message strings are assembled by the table on the JS side. That
+//! alone keeps roughly 20 KB of message strings out of the wasm.
 
 use alloc::string::ToString;
 use core::cell::UnsafeCell;
@@ -28,18 +28,18 @@ pub const STATUS_BATCH_READY: i32 = 0;
 pub const STATUS_NEED_IO: i32 = 1;
 pub const STATUS_DONE: i32 = 2;
 pub const STATUS_ERROR: i32 = 3;
-/// 内蔵しないコーデックの展開をホストに依頼する。
+/// Asks the host to decompress a codec that is not built in.
 pub const STATUS_NEED_CODEC: i32 = 4;
 
-/// 結果バッファの先頭に置くマジック。JS 側のデコーダと同期させる。
+/// The magic placed at the head of the result buffer. Kept in sync with the JS-side decoder.
 const RESULT_MAGIC: u32 = 0x4148_5231; // "AHR1"
 
 struct State {
     sessions: Vec<Option<Session>>,
     queries: Vec<Option<QuerySlot>>,
     last_error: u32,
-    /// `ahiru_result` / `ahiru_io_requests` が返すバッファ。
-    /// 次の呼び出しまで生存させる必要があるのでここに置く。
+    /// The buffer returned by `ahiru_result` / `ahiru_io_requests`.
+    /// It must stay alive until the next call, hence living here.
     out: Vec<u8>,
 }
 
@@ -50,7 +50,7 @@ struct QuerySlot {
 }
 
 struct Cell(UnsafeCell<Option<State>>);
-// wasm32 は単一スレッド。
+// wasm32 is single-threaded.
 unsafe impl Sync for Cell {}
 static STATE: Cell = Cell(UnsafeCell::new(None));
 
@@ -67,7 +67,7 @@ fn state() -> &'static mut State {
     }
     match slot {
         Some(s) => s,
-        // 直前に必ず Some を入れているので到達しない。
+        // Unreachable, since a Some is always stored just before this.
         None => unreachable!(),
     }
 }
@@ -77,8 +77,8 @@ fn fail<T>(e: crate::error::Error, fallback: T) -> T {
     fallback
 }
 
-/// 入口ごとに直前のエラーを消す。消さないと、成功した呼び出しの後に
-/// 古いコードが読めてしまう。
+/// Clears the previous error at each entry point. Without this, a stale code could
+/// be read after a successful call.
 fn clear_error() {
     state().last_error = 0;
 }
@@ -88,9 +88,9 @@ fn fail_code<T>(code: crate::error::Code, fallback: T) -> T {
     fallback
 }
 
-// --- メモリ -----------------------------------------------------------------
+// --- Memory -----------------------------------------------------------------
 
-/// ホストが書き込むためのバッファを確保する。
+/// Reserves a buffer for the host to write into.
 #[no_mangle]
 pub extern "C" fn ahiru_alloc(len: usize) -> *mut u8 {
     let mut v = Vec::<u8>::with_capacity(len);
@@ -99,10 +99,10 @@ pub extern "C" fn ahiru_alloc(len: usize) -> *mut u8 {
     p
 }
 
-/// `ahiru_alloc` で確保した領域を返す。
+/// Returns a region reserved by `ahiru_alloc`.
 ///
 /// # Safety
-/// `ptr` は同じ `len` で `ahiru_alloc` が返したものでなければならない。
+/// `ptr` must be what `ahiru_alloc` returned for the same `len`.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
@@ -118,7 +118,7 @@ unsafe fn slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     }
 }
 
-// --- セッション -------------------------------------------------------------
+// --- Session ----------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn ahiru_session_new() -> i32 {
@@ -135,10 +135,10 @@ pub extern "C" fn ahiru_session_free(h: i32) {
     }
 }
 
-/// クエリ開始時刻を設定する（エポックからのマイクロ秒、UTC）。wasm コアは
-/// 時計を持たないので、ホストが `prepare`/`query` のたびに現在時刻で
-/// 呼ぶ想定（`CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 用、DESIGN.md §2）。
-/// 一度も呼ばなければエポック（1970-01-01）のまま。
+/// Sets the query start time (microseconds since the epoch, UTC). The wasm core has
+/// no clock, so the host is expected to call this with the current time on every
+/// `prepare`/`query` (for `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()`, DESIGN.md §2).
+/// Never calling it leaves the time at the epoch (1970-01-01).
 #[no_mangle]
 pub extern "C" fn ahiru_set_now(h: i32, now_micros: i64) -> i32 {
     clear_error();
@@ -155,7 +155,7 @@ fn session(h: i32) -> Option<&'static mut Session> {
     state().sessions.get_mut(h as usize)?.as_mut()
 }
 
-/// フォーマットコード。JS 側の定数と 1:1 で対応する。
+/// Format codes. These map 1:1 to the constants on the JS side.
 fn format_kind(v: u32) -> Result<crate::format::FormatKind> {
     use crate::format::FormatKind::*;
     Ok(match v {
@@ -168,11 +168,11 @@ fn format_kind(v: u32) -> Result<crate::format::FormatKind> {
     })
 }
 
-/// ホストがレンジ取得で供給するテーブルを登録する。返り値はテーブル添字。
-/// フォーマットは名前（拡張子）から推定する。
+/// Registers a table the host supplies via range fetching. Returns the table index.
+/// The format is inferred from the name (its extension).
 ///
 /// # Safety
-/// `name` は `name_len` バイトの有効な UTF-8 を指していること。
+/// `name` must point at `name_len` bytes of valid UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_register(
     h: i32,
@@ -183,15 +183,14 @@ pub unsafe extern "C" fn ahiru_register(
     unsafe { ahiru_register_as(h, name, name_len, total_len, 0) }
 }
 
-/// フォーマットを明示して登録する。
+/// Registers with an explicit format.
 ///
-/// 拡張子推定では、テーブル名が拡張子を持つことを強制してしまう
-/// （`FROM "logs.csv"` と書かざるを得ない）。名前と読み方を分けられるように、
-/// 明示指定の入口を用意する。`format` は 0=Auto, 1=Parquet, 2=Csv, 3=Tsv,
-/// 4=Jsonl。
+/// Extension inference forces the table name to carry an extension (you would have to
+/// write `FROM "logs.csv"`). This entry point exists so the name and how it is read
+/// can be separated. `format` is 0=Auto, 1=Parquet, 2=Csv, 3=Tsv, 4=Jsonl.
 ///
 /// # Safety
-/// `name` は `name_len` バイトの有効な UTF-8 を指していること。
+/// `name` must point at `name_len` bytes of valid UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_register_as(
     h: i32,
@@ -219,14 +218,14 @@ pub unsafe extern "C" fn ahiru_register_as(
     }
 }
 
-/// 取得したバイト列をセッションに渡す。
+/// Hands fetched bytes to the session.
 ///
-/// `part` は複数ファイルテーブルの何ファイル目かを指す。単一ファイルの
-/// テーブル（`ahiru_register` / `ahiru_register_as` で登録したもの）は常に 0。
-/// `ahiru_io_requests` が返した要求の `part` フィールドをそのまま渡すこと。
+/// `part` says which file of a multi-file table is meant. Single-file tables
+/// (registered via `ahiru_register` / `ahiru_register_as`) are always 0.
+/// Pass back the `part` field of the request `ahiru_io_requests` returned, unchanged.
 ///
 /// # Safety
-/// `data` は `len` バイトの有効な領域を指していること。
+/// `data` must point at a valid region of `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_provide(
     h: i32,
@@ -247,12 +246,12 @@ pub unsafe extern "C" fn ahiru_provide(
     }
 }
 
-/// ホストが展開した圧縮ブロックを渡す。`offset` と `len` は
-/// `STATUS_NEED_CODEC` で返した要求のものと一致していなければならない。
-/// `part` の意味は `ahiru_provide` と同じ。
+/// Hands over a compressed block the host decompressed. `offset` and `len` must match
+/// those of the request returned with `STATUS_NEED_CODEC`.
+/// `part` means the same thing as in `ahiru_provide`.
 ///
 /// # Safety
-/// `data` は `data_len` バイトの有効な領域を指していること。
+/// `data` must point at a valid region of `data_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_provide_codec(
     h: i32,
@@ -274,21 +273,20 @@ pub unsafe extern "C" fn ahiru_provide_codec(
     }
 }
 
-/// 複数ファイルを 1 論理テーブルとして登録する。返り値はテーブル添字。
+/// Registers several files as one logical table. Returns the table index.
 ///
-/// ホストがレンジ取得で供給する前提（`ahiru_register_as` と同じ）。各パート
-/// のパスはフォーマット自動判定と Hive パーティション列の抽出
-/// （`year=2024/month=01/...` のようなディレクトリ）の両方に使われる。
+/// Assumes the host supplies them via range fetching (same as `ahiru_register_as`).
+/// Each part's path is used both for automatic format detection and for extracting
+/// Hive partition columns (directories such as `year=2024/month=01/...`).
 ///
-/// ワイヤ形式（`files`）: `decode_params` と同じ「長さ接頭辞 + 可変長エントリ」
-/// の形にしてある。
+/// Wire format (`files`): the same "length prefix plus variable-length entries" shape as `decode_params`.
 /// ```text
 /// [count:u32] { path_len:u32, path_bytes, total_len:u64 } ...
 /// ```
 ///
 /// # Safety
-/// `name` は `name_len` バイトの有効な UTF-8、`files` は `files_len` バイトの
-/// 上記形式のデータを指していること。
+/// `name` must point at `name_len` bytes of valid UTF-8, and `files` at `files_len`
+/// bytes of data in the format above.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_register_multi(
     h: i32,
@@ -322,12 +320,12 @@ pub unsafe extern "C" fn ahiru_register_multi(
     }
 }
 
-// --- クエリ -----------------------------------------------------------------
+// --- Queries ----------------------------------------------------------------
 
-/// SQL を受け取りクエリハンドルを返す。失敗時は負値。
+/// Takes SQL and returns a query handle. A negative value on failure.
 ///
 /// # Safety
-/// `sql` は `sql_len` バイトの有効な UTF-8 を指していること。
+/// `sql` must point at `sql_len` bytes of valid UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_query_start(
     h: i32,
@@ -356,7 +354,7 @@ pub unsafe extern "C" fn ahiru_query_start(
             st.queries.push(Some(QuerySlot { session: h as usize, query: q, io: Vec::new() }));
             (st.queries.len() - 1) as i32
         }
-        // フッタ取得が必要な段階。ホストは要求を満たしてから呼び直す。
+        // The stage where the footer must be fetched. The host satisfies the request and calls again.
         Ok(Prepared::NeedIo(io)) => {
             let st = state();
             st.out = encode_io(&io);
@@ -375,7 +373,7 @@ pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
         None => return STATUS_ERROR,
     };
     let sidx = slot.session;
-    // セッションとクエリを同時に可変借用できないので、いったん取り出す。
+    // The session and the query cannot be mutably borrowed at once, so take it out first.
     let mut query = match core::mem::replace(&mut st.queries[q as usize], None) {
         Some(s) => s,
         None => return STATUS_ERROR,
@@ -387,8 +385,8 @@ pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
     let r = session.step(&mut query.query);
     let status = match r {
         Ok(QueryStep::Batch(mut b)) => {
-            // selection vector を実体化してから直列化する。これを忘れると
-            // `LIMIT ... OFFSET` が先頭から返ってしまう。
+            // Materialize the selection vector before serializing. Forgetting this
+            // makes `LIMIT ... OFFSET` return rows from the very beginning.
             b.materialize();
             st.out = encode_batch(&b);
             STATUS_BATCH_READY
@@ -421,7 +419,7 @@ pub extern "C" fn ahiru_query_close(q: i32) {
     }
 }
 
-/// 直前の `ahiru_query_step` / `ahiru_query_start` が用意したバッファ。
+/// The buffer prepared by the preceding `ahiru_query_step` / `ahiru_query_start`.
 #[no_mangle]
 pub extern "C" fn ahiru_out_ptr() -> *const u8 {
     state().out.as_ptr()
@@ -437,13 +435,13 @@ pub extern "C" fn ahiru_last_error() -> u32 {
     state().last_error
 }
 
-/// 現在ヒープが保持しているバイト数。
+/// How many bytes the heap currently holds.
 #[no_mangle]
 pub extern "C" fn ahiru_heap_used() -> usize {
     crate::rt::alloc::heap_used()
 }
 
-// --- 直列化 -----------------------------------------------------------------
+// --- Serialization ----------------------------------------------------------
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -453,7 +451,7 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-/// コーデック展開要求の列。`[count][{table,part,codec,offset,len,out_len}...]`
+/// The list of codec decompression requests. `[count][{table,part,codec,offset,len,out_len}...]`
 fn encode_codec(reqs: &[crate::exec::CodecRequest]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + reqs.len() * 28);
     put_u32(&mut out, reqs.len() as u32);
@@ -468,13 +466,13 @@ fn encode_codec(reqs: &[crate::exec::CodecRequest]) -> Vec<u8> {
     out
 }
 
-/// `[count:u32]{ path_len:u32, path_bytes, total_len:u64 }...` を読む。
-/// `decode_params` と同じ「長さ接頭辞 + 可変長エントリ」の形。
+/// Reads `[count:u32]{ path_len:u32, path_bytes, total_len:u64 }...`.
+/// The same "length prefix plus variable-length entries" shape as `decode_params`.
 fn decode_multi_files(buf: &[u8]) -> Result<Vec<(String, u64)>> {
     ensure!(buf.len() >= 4, UnexpectedEof);
     let n = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    // ファイル数の上限は `decode_params` のパラメータ数上限と同じ考え方
-    // （壊れた/悪意ある入力で巨大確保を強いられないようにする）。
+    // The cap on the file count follows the same reasoning as `decode_params`'
+    // parameter cap (so corrupt or malicious input cannot force a huge allocation).
     ensure!(n <= 4096, LimitExceeded);
     let mut pos = 4usize;
     let mut out = Vec::with_capacity(n);
@@ -499,7 +497,7 @@ fn decode_multi_files(buf: &[u8]) -> Result<Vec<(String, u64)>> {
     Ok(out)
 }
 
-/// パラメータ列を読む。`[count][{tag}{payload}...]`
+/// Reads the parameter list. `[count][{tag}{payload}...]`
 ///
 /// tag: 0=NULL, 1=BOOL(1B), 2=I64(8B), 3=F64(8B), 4=BYTES(u32 len + bytes)
 fn decode_params(buf: &[u8]) -> Result<Vec<crate::vector::Value>> {
@@ -552,7 +550,7 @@ fn decode_params(buf: &[u8]) -> Result<Vec<crate::vector::Value>> {
     Ok(out)
 }
 
-/// I/O 要求の列。`[count][{table,part,offset,len}...]`
+/// The list of I/O requests. `[count][{table,part,offset,len}...]`
 fn encode_io(io: &[IoRequest]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + io.len() * 24);
     put_u32(&mut out, io.len() as u32);
@@ -565,16 +563,16 @@ fn encode_io(io: &[IoRequest]) -> Vec<u8> {
     out
 }
 
-/// 1 バッチの列指向表現。
+/// The columnar representation of one batch.
 ///
 /// ```text
 /// magic:u32 num_cols:u32 num_rows:u32
-/// 列ごとに: phys:u32 validity_len:u32 [validity bytes] data_len:u32 [data bytes]
-///           Bytes 型のみ offsets_len:u32 [offsets] が data の前に入る
+/// Per column: phys:u32 validity_len:u32 [validity bytes] data_len:u32 [data bytes]
+///             for Bytes only, offsets_len:u32 [offsets] comes before data
 /// ```
 ///
-/// Arrow IPC 互換にするのは今後の課題。まずは JS 側が TypedArray として
-/// そのまま読める最小の形にしてある。
+/// Arrow IPC compatibility is future work. For now this is the minimal shape the JS
+/// side can read directly as TypedArrays.
 fn encode_batch(b: &Batch) -> Vec<u8> {
     let mut out = Vec::new();
     put_u32(&mut out, RESULT_MAGIC);
@@ -618,18 +616,18 @@ fn encode_batch(b: &Batch) -> Vec<u8> {
     out
 }
 
-/// 固定幅の数値配列をリトルエンディアンで書く。
+/// Writes a fixed-width numeric array in little-endian order.
 fn put_slice<T: Copy>(out: &mut Vec<u8>, v: &[T], width: usize) {
     put_u32(out, (v.len() * width) as u32);
-    // wasm はリトルエンディアンなので、そのままバイト列として写せる。
+    // wasm is little-endian, so the bytes can be copied straight across.
     let bytes = unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * width) };
     out.extend_from_slice(bytes);
 }
 
-/// 出力スキーマ（列名と型）を書く。`ahiru_query_start` の直後に呼ぶ。
+/// Writes the output schema (column names and types). Called right after `ahiru_query_start`.
 ///
-/// 返り値は書き込んだバイト数。ハンドルが不正な場合は `-1`（列が 0 個の
-/// 正常な場合と区別できるようにするため）。
+/// Returns the number of bytes written, or `-1` for an invalid handle (so it stays
+/// distinguishable from the valid case of zero columns).
 #[no_mangle]
 pub extern "C" fn ahiru_schema(q: i32) -> isize {
     clear_error();
@@ -648,8 +646,8 @@ fn encode_schema(fields: &[Field]) -> Vec<u8> {
     for f in fields {
         put_u32(&mut out, ty_code(f.ty));
         put_u32(&mut out, f.ty.phys() as u32);
-        // DECIMAL は precision/scale が無いと値を復元できない。
-        // 型コードだけ送ると、スケール前の整数がそのまま出てしまう。
+        // DECIMAL values cannot be reconstructed without precision/scale.
+        // Sending only the type code would surface the pre-scale integer as is.
         let (p, sc) = match f.ty {
             crate::vector::Ty::Decimal { precision, scale } => (precision as u32, scale as u32),
             _ => (0, 0),
@@ -662,7 +660,7 @@ fn encode_schema(fields: &[Field]) -> Vec<u8> {
     out
 }
 
-/// 論理型のコード。JS 側の型名テーブルと 1:1 で対応する。
+/// Logical type codes. These map 1:1 to the type-name table on the JS side.
 fn ty_code(t: crate::vector::Ty) -> u32 {
     use crate::vector::Ty::*;
     match t {
@@ -692,20 +690,20 @@ fn ty_code(t: crate::vector::Ty) -> u32 {
     }
 }
 
-// 物理型コードが JS 側の想定とずれていないかを固定する。
+// Pins the physical type codes against what the JS side assumes.
 const _: () = {
     assert!(PhysType::Bool as u32 == 0);
     assert!(PhysType::Bytes as u32 == 5);
 };
 
-// このモジュールは `#[cfg(target_arch = "wasm32")]` でしか組み込まれない
-// （`lib.rs` 参照）ので、これらのテストはネイティブの `cargo test` では
-// 実行されない。wasm32 向けにテストランナーを用意したときに有効になる。
+// This module is only compiled under `#[cfg(target_arch = "wasm32")]` (see
+// `lib.rs`), so these tests do not run under native `cargo test`. They become
+// active once a test runner for wasm32 is set up.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `decode_multi_files` の逆関数。テスト専用のエンコーダ。
+    /// The inverse of `decode_multi_files`. A test-only encoder.
     fn encode_multi_files(files: &[(&str, u64)]) -> Vec<u8> {
         let mut out = Vec::new();
         put_u32(&mut out, files.len() as u32);
@@ -773,7 +771,7 @@ mod tests {
     fn ahiru_register_multi_rejects_garbage_wire_data() {
         let h = ahiru_session_new();
         let name = b"t";
-        let garbage = [0xFFu8; 3]; // count フィールドすら読めない長さ
+        let garbage = [0xFFu8; 3]; // too short to even read the count field
         let idx = unsafe {
             ahiru_register_multi(h, name.as_ptr(), name.len(), garbage.as_ptr(), garbage.len(), 0)
         };

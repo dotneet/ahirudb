@@ -2,14 +2,14 @@
 //! expansion, literal/type-name lookups, and INTERVAL text parsing.
 use super::*;
 
-// --- GROUP BY の拡張構文 -----------------------------------------------------
+// --- Extended GROUP BY syntax ------------------------------------------------
 
-/// `CUBE` の列数上限。2^n 個のグルーピングセット（= `Node::Aggregate` を
-/// UNION ALL で束ねた本数）に展開されるため、無制限だとプランが爆発する。
+/// The column-count cap for `CUBE`. It expands into 2^n grouping sets (= that many
+/// `Node::Aggregate` bundled with UNION ALL), so unbounded input would blow up the plan.
 const MAX_CUBE_COLS: usize = 8;
 
-/// `ROLLUP (a, b, c)` を `GROUPING SETS ((a,b,c),(a,b),(a),())` に展開する。
-/// 列の多い方から少ない方へ、階層的な部分集合を作る。
+/// Expands `ROLLUP (a, b, c)` into `GROUPING SETS ((a,b,c),(a,b),(a),())`.
+/// Builds hierarchical subsets from more columns to fewer.
 pub(super) fn rollup_sets(cols: Vec<ExprId>) -> Vec<Vec<ExprId>> {
     let mut sets = Vec::with_capacity(cols.len() + 1);
     for k in (0..=cols.len()).rev() {
@@ -18,16 +18,16 @@ pub(super) fn rollup_sets(cols: Vec<ExprId>) -> Vec<Vec<ExprId>> {
     sets
 }
 
-/// `CUBE (a, b)` を `GROUPING SETS ((a,b),(a),(b),())` に展開する。
-/// 全部分集合（2^n 個）を作る。
+/// Expands `CUBE (a, b)` into `GROUPING SETS ((a,b),(a),(b),())`.
+/// Builds every subset (2^n of them).
 pub(super) fn cube_sets(cols: Vec<ExprId>, pos: usize) -> Result<Vec<Vec<ExprId>>> {
     ensure!(cols.len() <= MAX_CUBE_COLS, ExpressionTooDeep, pos);
     let n = cols.len();
     let mut sets = Vec::with_capacity(1usize << n);
-    // 先頭の列ほど上位ビットに割り当てる。こうすると `(a,b),(a),(b),()` の
-    // ように「先頭に近い列を優先して残す」順になり、`ROLLUP` の階層的な
-    // 部分集合の並びとも感覚が揃う（実行結果には影響しない: どの順で
-    // UNION ALL しても集合として同じ）。
+    // Earlier columns are assigned higher bits. That yields an order that "prefers to
+    // keep the columns nearest the front", as in `(a,b),(a),(b),()`, matching the feel of
+    // `ROLLUP`'s hierarchical subset ordering (it has no effect on results: any UNION ALL
+    // order gives the same set).
     for mask in (0..(1usize << n)).rev() {
         let mut set = Vec::new();
         for (i, &c) in cols.iter().enumerate() {
@@ -40,26 +40,26 @@ pub(super) fn cube_sets(cols: Vec<ExprId>, pos: usize) -> Result<Vec<Vec<ExprId>
     Ok(sets)
 }
 
-// --- ラムダ ------------------------------------------------------------------
+// --- Lambdas ------------------------------------------------------------------
 
-/// 引数位置の `->` をラムダとして解釈してよい関数名か。
+/// Whether this function name may interpret a `->` in argument position as a lambda.
 ///
-/// duckdb CLI で実測した限り、ラムダとして解釈されるのは「ラムダを受け取ると
-/// 分かっている関数」の引数位置だけで、他の関数（`coalesce` 等）の引数では
-/// `->` は素通りして通常の JSON パス演算子のままになる（`coalesce(doc -> 'a',
-/// 'x')` は JSON 抽出として解決される一方、`abs(x -> x+1)` はラムダとして
-/// 解釈されて「この関数はラムダを受け取らない」というエラーになる）。
-/// この実装では関数名を固定集合として持つことで同じ区別を再現する。
+/// As measured with the duckdb CLI, `->` is interpreted as a lambda only in the argument
+/// positions of functions known to take a lambda; in the arguments of other functions
+/// (`coalesce` and so on) `->` passes through as the ordinary JSON path operator
+/// (`coalesce(doc -> 'a', 'x')` resolves as JSON extraction, while `abs(x -> x+1)` is
+/// interpreted as a lambda and errors with "this function does not take a lambda").
+/// This implementation reproduces that distinction by keeping the function names as a fixed set.
 pub(super) fn is_lambda_func(name: &str) -> bool {
     eq_ascii_ci(name.as_bytes(), b"list_transform")
         || eq_ascii_ci(name.as_bytes(), b"list_filter")
         || eq_ascii_ci(name.as_bytes(), b"list_reduce")
 }
 
-/// `self.cur` が比較演算子トークンなら対応する `BinaryOp` を返す。
-/// `x <op> ANY|ALL|SOME (SELECT ...)` の量化比較を認識するための、
-/// `expr_body` の中置ループ・`peek_quantifier` 共通の判定
-/// （6 種類の比較演算子だけが `ANY`/`ALL`/`SOME` を続けられる）。
+/// Returns the corresponding `BinaryOp` if `self.cur` is a comparison operator token.
+/// The shared check used by `expr_body`'s infix loop and by `peek_quantifier` to
+/// recognize the quantified comparison `x <op> ANY|ALL|SOME (SELECT ...)` (only the six
+/// comparison operators may be followed by `ANY`/`ALL`/`SOME`).
 pub(super) fn comparison_binop(t: Tok<'_>) -> Option<BinaryOp> {
     match t {
         Tok::Eq => Some(BinaryOp::Eq),
@@ -72,16 +72,16 @@ pub(super) fn comparison_binop(t: Tok<'_>) -> Option<BinaryOp> {
     }
 }
 
-// --- リテラル・型名 ---------------------------------------------------------
+// --- Literals and type names -------------------------------------------------
 
-/// 引用符の中身を展開する。二重化された引用符を 1 個に畳むだけ。
+/// Expands the contents of a quoted lexeme. It only folds doubled quotes into one.
 pub(super) fn unquote(raw: &str, q: u8) -> String {
     let b = raw.as_bytes();
     let mut out = String::new();
     let (mut i, mut start) = (0usize, 0usize);
     while i < b.len() {
         if b[i] == q {
-            // 引用符は ASCII なので、この範囲は必ず文字境界に乗る。
+            // Quotes are ASCII, so this range always lands on a character boundary.
             out.push_str(&raw[start..i + 1]);
             i += 2;
             start = i;
@@ -95,7 +95,7 @@ pub(super) fn unquote(raw: &str, q: u8) -> String {
     out
 }
 
-/// 整数リテラル。収まる最小の型（I32 → I64 → I128）を選ぶ。
+/// An integer literal. Picks the smallest type that fits (I32 -> I64 -> I128).
 pub(super) fn int_literal(text: &str, negative: bool, pos: usize) -> Result<Value> {
     let mut mag: u128 = 0;
     for &d in text.as_bytes() {
@@ -104,7 +104,7 @@ pub(super) fn int_literal(text: &str, negative: bool, pos: usize) -> Result<Valu
             None => err!(NumberOverflow, pos),
         };
     }
-    // i128::MIN は絶対値が i128::MAX より 1 大きい。符号を見て上限を変える。
+    // i128::MIN has an absolute value one greater than i128::MAX. The limit depends on the sign.
     let limit = if negative { 1u128 << 127 } else { (1u128 << 127) - 1 };
     ensure!(mag <= limit, NumberOverflow, pos);
     let v = if negative { (mag as i128).wrapping_neg() } else { mag as i128 };
@@ -124,8 +124,8 @@ pub(super) fn float_literal(text: &str, pos: usize) -> Result<Value> {
     }
 }
 
-/// `USING SAMPLE`/`TABLESAMPLE` の手法名。一致しなければ `None`
-/// （呼び出し側が「サンプル手法ではなく別の何か」として扱う）。
+/// The method name of `USING SAMPLE`/`TABLESAMPLE`. `None` when it does not match
+/// (the caller then treats it as "something other than a sampling method").
 pub(super) fn sample_method_from_ident(word: &[u8]) -> Option<SampleMethod> {
     if eq_ascii_ci(word, b"bernoulli") {
         Some(SampleMethod::Bernoulli)
@@ -138,8 +138,8 @@ pub(super) fn sample_method_from_ident(word: &[u8]) -> Option<SampleMethod> {
     }
 }
 
-/// CAST の型名表。CAST はホットパスではないので、(長さ, 先頭バイト) で
-/// 絞り込む線形走査で十分。予約語表と違い二分探索の順序制約を持たない。
+/// The CAST type-name table. CAST is not a hot path, so a linear scan narrowed by
+/// (length, first byte) is enough. Unlike the reserved-word table, it has no binary-search ordering constraint.
 static TYPES: &[(&[u8], Ty)] = &[
     (b"boolean", Ty::Boolean),
     (b"bool", Ty::Boolean),
@@ -156,7 +156,7 @@ static TYPES: &[(&[u8], Ty)] = &[
     (b"float", Ty::Float),
     (b"real", Ty::Float),
     (b"double", Ty::Double),
-    // 括弧なしの DECIMAL は (18,3)。I64 に収まる精度を既定にする。
+    // A DECIMAL without parentheses is (18,3). The default precision is one that fits in I64.
     (b"decimal", Ty::Decimal { precision: 18, scale: 3 }),
     (b"numeric", Ty::Decimal { precision: 18, scale: 3 }),
     (b"varchar", Ty::Varchar),
@@ -218,10 +218,10 @@ pub(super) fn lookup_type(name: &[u8]) -> Option<Ty> {
     None
 }
 
-// --- INTERVAL リテラル -------------------------------------------------------
-// DESIGN.md §7 に載る 8 単位（年・月・日・時・分・秒・ミリ秒・マイクロ秒）だけ
-// を単数形・複数形の両方で受け付ける。DuckDB にある他の略記（`mon`/`y`/`wk` 等）
-// は対象外（テーブルを絞ることでコードサイズを増やさない）。
+// --- INTERVAL literals -------------------------------------------------------
+// Only the 8 units listed in DESIGN.md §7 (year, month, day, hour, minute, second,
+// millisecond, microsecond) are accepted, in both singular and plural. DuckDB's other
+// abbreviations (`mon`/`y`/`wk` and so on) are out of scope (a smaller table keeps code size down).
 
 #[derive(Clone, Copy)]
 pub(super) enum IntervalUnit {
@@ -263,7 +263,7 @@ pub(super) fn lookup_interval_unit(name: &[u8]) -> Option<IntervalUnit> {
     None
 }
 
-/// 符号付き 10 進整数。前後の空白は許す（`INTERVAL` の数値片用）。
+/// A signed decimal integer. Surrounding whitespace is allowed (for the numeric pieces of `INTERVAL`).
 pub(super) fn parse_signed_int(s: &str) -> Option<i64> {
     let b = s.trim().as_bytes();
     if b.is_empty() {
@@ -284,7 +284,7 @@ pub(super) fn parse_signed_int(s: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
-/// 1 単位ぶんを `(months, days, micros)` の累積へ足し込む。
+/// Adds one unit's worth into the `(months, days, micros)` accumulator.
 fn add_interval_unit(
     u: IntervalUnit,
     n: i64,
@@ -317,7 +317,7 @@ fn add_interval_unit(
     }
 }
 
-/// `months`/`days` が `i32` に収まることを確認してから詰める。
+/// Packs after confirming that `months`/`days` fit in `i32`.
 fn pack_interval_checked(months: i64, days: i64, micros: i64, pos: usize) -> Result<i128> {
     let m = match i32::try_from(months) {
         Ok(v) => v,
@@ -330,15 +330,15 @@ fn pack_interval_checked(months: i64, days: i64, micros: i64, pos: usize) -> Res
     Ok(crate::vector::pack_interval(m, d, micros))
 }
 
-/// `n UNIT` 1 個ぶんの INTERVAL。
+/// One `n UNIT` worth of INTERVAL.
 pub(super) fn unit_to_interval(u: IntervalUnit, n: i64, pos: usize) -> Result<i128> {
     let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
     add_interval_unit(u, n, &mut months, &mut days, &mut micros, pos)?;
     pack_interval_checked(months, days, micros, pos)
 }
 
-/// `'<n> <unit> [<n> <unit> ...]'` の複合形式。同じ単位が複数回出てきても
-/// 単純に加算する（DuckDB も `'1 month 1 month'` を `2 months` として扱う）。
+/// The compound form `'<n> <unit> [<n> <unit> ...]'`. Repeated units are simply added
+/// (DuckDB likewise treats `'1 month 1 month'` as `2 months`).
 pub(super) fn parse_interval_text(text: &str, pos: usize) -> Result<i128> {
     let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
     let mut any = false;

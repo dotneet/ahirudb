@@ -1,13 +1,13 @@
-//! `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`CURRENT_TIME`/`now()`/`today()` の
-//! 統合テスト。`Session::set_now` で固定値を渡し、`sql::now::substitute_now`
-//! が実際の `Session::prepare` 経路を通しても正しく効くことを確認する
-//! （`crates/ahiru-core/src/sql/now.rs` の単体テストは AST レベルの確認のみ）。
+//! Integration tests for `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`CURRENT_TIME`/`now()`/`today()`.
+//! Passes a fixed value via `Session::set_now`, verifying that `sql::now::substitute_now`
+//! actually works correctly when going through the real `Session::prepare` path
+//! (the unit tests in `crates/ahiru-core/src/sql/now.rs` only verify at the AST level).
 
 use ahiru_core::format::FormatKind;
 use ahiru_core::session::{Prepared, QueryStep, Session};
 use ahiru_core::vector::Value;
 
-// 2024-01-15 12:30:00 UTC。
+// 2024-01-15 12:30:00 UTC.
 const NOW: i64 = 1_705_321_800_000_000;
 const TODAY_DAYS: i32 = 19737;
 
@@ -56,8 +56,8 @@ fn bare_forms_and_call_forms_all_resolve_to_the_configured_now() {
 
 #[test]
 fn current_timestamp_is_evaluated_once_per_query_not_per_row() {
-    // SQL 標準の契約: CURRENT_TIMESTAMP はクエリ開始時に 1 回だけ評価され、
-    // 複数行に渡って同じ値になる（行ごとに再評価されない）。
+    // The SQL standard contract: CURRENT_TIMESTAMP is evaluated exactly once at the start of
+    // the query, staying the same value across multiple rows (not re-evaluated per row).
     let mut s = Session::new();
     s.register_bytes_as("t", b"id\n1\n2\n3\n".to_vec(), FormatKind::Csv).unwrap();
     s.set_now(NOW);
@@ -71,15 +71,15 @@ fn current_timestamp_is_evaluated_once_per_query_not_per_row() {
 #[test]
 fn typed_literals_can_be_used_in_expressions() {
     let mut s = session_with_dual();
-    // CURRENT_DATE + 整数日数は既存の DATE 演算と同じように使えるべき。
+    // CURRENT_DATE plus an integer day count should work just like existing DATE arithmetic.
     let rows = run(&mut s, "SELECT CURRENT_DATE + 1 FROM dual");
     assert_eq!(rows[0][0], Value::I32(TODAY_DAYS + 1));
 }
 
 #[test]
 fn unset_now_defaults_to_the_unix_epoch() {
-    // set_now を一度も呼ばなければエポック（1970-01-01）になる
-    // （時計を持たないコアが黙って嘘の時刻を返さないようにする既定値）。
+    // If `set_now` is never called, it defaults to the epoch (1970-01-01)
+    // (a default so a core with no clock doesn't silently return a fake time).
     let mut s = Session::new();
     s.register_bytes_as("dual", b"x\n1\n".to_vec(), FormatKind::Csv).unwrap();
     let rows = run(&mut s, "SELECT CURRENT_DATE FROM dual");
@@ -88,25 +88,25 @@ fn unset_now_defaults_to_the_unix_epoch() {
 
 #[test]
 fn a_real_column_named_current_date_is_shadowed_by_the_bare_keyword_form() {
-    // 既知のトレードオフ: `current_date`/`current_timestamp`/`current_time`
-    // は裸の識別子として現れた時点で無条件にキーワード扱いする
-    // （SQL標準でこれらは実質予約語であり、実データに同名の列が来る可能性は
-    // 極めて低いと判断した。`sql/now.rs` のモジュール doc 参照）。
-    // その結果、同名の実列があっても関数呼び出し扱いが優先されることを
-    // 明示的に固定しておく（「なぜかテーブルの値が返らない」と将来
-    // 混乱しないように）。
+    // A known tradeoff: `current_date`/`current_timestamp`/`current_time` are treated
+    // unconditionally as keywords the moment they appear as a bare identifier
+    // (they are effectively reserved words under the SQL standard, and we judged the odds of
+    // real data having a column with the same name to be extremely low; see the module doc on
+    // `sql/now.rs`). As a result, this test explicitly pins down that the function-call
+    // interpretation wins even when a real column shares the name (so nobody gets confused
+    // later by "why isn't the table's value coming back").
     let mut s = Session::new();
     s.register_bytes_as("t", b"current_date\n2000-01-01\n".to_vec(), FormatKind::Csv).unwrap();
     s.set_now(NOW);
     let rows = run(&mut s, "SELECT current_date FROM t");
-    assert_eq!(rows[0][0], Value::I32(TODAY_DAYS), "列の値ではなく今日の日付になる");
+    assert_eq!(rows[0][0], Value::I32(TODAY_DAYS), "becomes today's date, not the column's value");
 }
 
 #[test]
 fn current_date_works_as_a_join_and_where_condition() {
-    // `CURRENT_DATE`/`CURRENT_TIMESTAMP` は準備時に定数へ置き換わるだけなので、
-    // `WHERE`/`JOIN ON` の任意の式の一部として普通に使える
-    // （新機能同士ではなく、既存の JOIN/WHERE パイプラインとの組み合わせ）。
+    // Since `CURRENT_DATE`/`CURRENT_TIMESTAMP` are just replaced with a constant at prepare
+    // time, they can be used normally as part of any expression in `WHERE`/`JOIN ON`
+    // (combining with the existing JOIN/WHERE pipeline, rather than two new features together).
     let mut s = Session::new();
     s.register_bytes_as("t", b"id\n1\n2\n3\n".to_vec(), FormatKind::Csv).unwrap();
     s.set_now(NOW);
@@ -120,7 +120,7 @@ fn current_date_works_as_a_join_and_where_condition() {
 
 #[test]
 fn current_timestamp_stays_constant_across_group_by_aggregation() {
-    // 集約後も 1 回だけ評価された同じ値のまま（グループごとに再評価されない）。
+    // Stays the same, once-evaluated value even after aggregation (not re-evaluated per group).
     let mut s = Session::new();
     s.register_bytes_as("t", b"id,g\n1,a\n2,a\n3,b\n".to_vec(), FormatKind::Csv).unwrap();
     s.set_now(NOW);
@@ -134,9 +134,9 @@ fn current_timestamp_stays_constant_across_group_by_aggregation() {
 
 #[test]
 fn a_real_column_named_today_or_now_is_not_shadowed() {
-    // `today`/`now` は括弧を伴わない裸の識別子としては特別扱いしない
-    // （関数形は `today()`/`now()` のみ対象）。実データの列名との衝突を
-    // 避けるための意図的な線引き。
+    // `today`/`now` get no special treatment as bare identifiers without parentheses
+    // (only the function forms `today()`/`now()` are targeted). A deliberate line drawn to
+    // avoid colliding with real data's column names.
     let mut s = Session::new();
     s.register_bytes_as("t", b"today,now\nhello,world\n".to_vec(), FormatKind::Csv).unwrap();
     s.set_now(NOW);

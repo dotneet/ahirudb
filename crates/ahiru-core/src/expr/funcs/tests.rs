@@ -1,13 +1,13 @@
-// `civil_from_days` の再エクスポートは `export` フィーチャ有りのときだけ
-// （消費側が `write::csv`/`write::jsonl` しか無いため）。ここは実装元から
-// 直接取って、フィーチャの有無に関わらずテストが通るようにする。
+// The re-export of `civil_from_days` exists only with the `export` feature (its only consumers are
+// `write::csv`/`write::jsonl`). Here it is taken directly from the implementation so the tests pass
+// regardless of the feature.
 use super::datetime::civil_from_days;
 use super::numeric::{f_exp, f_ln, f_pow, f_sqrt};
 use super::*;
 use crate::error::code_of;
 use crate::vector::Value;
 
-// --- 組み立てヘルパ -----------------------------------------------------
+// --- Construction helpers -----------------------------------------------
 
 fn vs(vals: &[Option<&str>]) -> Vector {
     let mut v = Vector::new(Ty::Varchar);
@@ -43,13 +43,13 @@ fn vf(vals: &[Option<f64>]) -> Vector {
     v
 }
 
-/// `resolve` して `call` する。引数はすでに解決後の型で渡す。
+/// `resolve`s and then `call`s. The arguments are passed already in the resolved types.
 fn run(name: &str, args: &[&Vector]) -> Result<Vector> {
     let tys: Vec<Ty> = args.iter().map(|a| a.ty()).collect();
     let (id, want, ret) = resolve(name, &tys)?;
     assert_eq!(want.len(), args.len());
     for (i, w) in want.iter().enumerate() {
-        assert_eq!(*w, tys[i], "{name}: 引数 {i} の型が違う");
+        assert_eq!(*w, tys[i], "{name}: argument {i} has the wrong type");
     }
     call(id, ret, args)
 }
@@ -88,7 +88,7 @@ fn i128_at(v: &Vector, i: usize) -> Option<i128> {
     }
 }
 
-/// 文字列 1 引数（+ 追加引数）の結果を 1 行ぶん取り出す近道。
+/// A shortcut for extracting one row's result from a one-string-argument (plus extras) call.
 fn s1(name: &str, s: Option<&str>) -> Option<String> {
     str_at(&run(name, &[&vs(&[s])]).unwrap(), 0)
 }
@@ -101,7 +101,7 @@ fn part(name: &str, p: &str, lit: &str) -> Option<i64> {
     int_at(&run(name, &[&vs(&[Some(p)]), &ts(lit)]).unwrap(), 0)
 }
 
-// --- 文字列 -------------------------------------------------------------
+// --- Strings ------------------------------------------------------------
 
 #[test]
 fn string_basics() {
@@ -110,10 +110,13 @@ fn string_basics() {
     assert_eq!(s1("upper", Some("")).as_deref(), Some(""));
     assert_eq!(s1("upper", None), None);
     assert_eq!(s1("reverse", Some("abc")).as_deref(), Some("cba"));
-    // reverse はコードポイント単位（duckdb: reverse('あいう') = 'ういあ'）。
-    assert_eq!(s1("reverse", Some("あいう")).as_deref(), Some("ういあ"));
+    // reverse works in code points (duckdb: reverse('\u{3b1}\u{3b2}\u{3b3}') = '\u{3b3}\u{3b2}\u{3b1}').
+    assert_eq!(
+        s1("reverse", Some("\u{3b1}\u{3b2}\u{3b3}")).as_deref(),
+        Some("\u{3b3}\u{3b2}\u{3b1}")
+    );
     assert_eq!(s1("reverse", Some("")).as_deref(), Some(""));
-    // duckdb: trim('  ab  ') = 'ab'、既定はスペースのみ（タブは残る）。
+    // duckdb: trim('  ab  ') = 'ab'; the default is spaces only (tabs remain).
     assert_eq!(s1("trim", Some("  ab  ")).as_deref(), Some("ab"));
     assert_eq!(s1("trim", Some("\tab\t")).as_deref(), Some("\tab\t"));
     assert_eq!(s1("ltrim", Some("  ab  ")).as_deref(), Some("ab  "));
@@ -135,13 +138,16 @@ fn trim_with_charset() {
 
 #[test]
 fn length_and_strpos_are_codepoint_based() {
-    // duckdb: length('あいう') = 3, strpos('あいう','い') = 2
-    assert_eq!(int_at(&run("length", &[&vs(&[Some("あいう")])]).unwrap(), 0), Some(3));
+    // duckdb: length('\u{3b1}\u{3b2}\u{3b3}') = 3, strpos('\u{3b1}\u{3b2}\u{3b3}','\u{3b2}') = 2
+    assert_eq!(
+        int_at(&run("length", &[&vs(&[Some("\u{3b1}\u{3b2}\u{3b3}")])]).unwrap(), 0),
+        Some(3)
+    );
     assert_eq!(int_at(&run("length", &[&vs(&[Some("")])]).unwrap(), 0), Some(0));
     assert_eq!(int_at(&run("length", &[&vs(&[None])]).unwrap(), 0), None);
     let p =
         |s: &str, n: &str| int_at(&run("strpos", &[&vs(&[Some(s)]), &vs(&[Some(n)])]).unwrap(), 0);
-    assert_eq!(p("あいう", "い"), Some(2));
+    assert_eq!(p("\u{3b1}\u{3b2}\u{3b3}", "\u{3b2}"), Some(2));
     assert_eq!(p("abc", "b"), Some(2));
     assert_eq!(p("abc", "z"), Some(0));
     // duckdb: strpos('abc','') = 1
@@ -160,7 +166,7 @@ fn substr_edges_match_duckdb() {
         };
         str_at(&out.unwrap(), 0).unwrap()
     };
-    // すべて duckdb v1.4 の実測値。
+    // All of them are values measured with duckdb v1.4.
     assert_eq!(f("hello", 2, None), "ello");
     assert_eq!(f("hello", 2, Some(3)), "ell");
     assert_eq!(f("hello", -2, None), "lo");
@@ -173,9 +179,9 @@ fn substr_edges_match_duckdb() {
     assert_eq!(f("hello", -10, Some(3)), "");
     assert_eq!(f("hello", 2, Some(-1)), "h");
     assert_eq!(f("", 1, Some(3)), "");
-    // duckdb: substr('あいうえお',2,2) = 'いう'（コードポイント単位）
-    assert_eq!(f("あいうえお", 2, Some(2)), "いう");
-    // NULL 引数は NULL。
+    // duckdb: substr('\u{3b1}\u{3b2}\u{3b3}\u{3b4}\u{3b5}',2,2) = '\u{3b2}\u{3b3}' (code points)
+    assert_eq!(f("\u{3b1}\u{3b2}\u{3b3}\u{3b4}\u{3b5}", 2, Some(2)), "\u{3b2}\u{3b3}");
+    // A NULL argument gives NULL.
     let n = run("substr", &[&vs(&[None]), &vi(Ty::BigInt, &[Some(1)])]).unwrap();
     assert_eq!(str_at(&n, 0), None);
 }
@@ -201,8 +207,8 @@ fn replace_repeat_split_pad() {
     assert_eq!(pad("rpad", "ab", 5, "xy"), "abxyx");
     assert_eq!(pad("lpad", "abcdef", 3, "x"), "abc");
     assert_eq!(pad("lpad", "ab", 0, "x"), "");
-    // duckdb: lpad('あ',3,'x') = 'xxあ'（コードポイント単位）
-    assert_eq!(pad("lpad", "あ", 3, "x"), "xxあ");
+    // duckdb: lpad('\u{3b1}',3,'x') = 'xx\u{3b1}' (code points)
+    assert_eq!(pad("lpad", "\u{3b1}", 3, "x"), "xx\u{3b1}");
 
     let sp = |s: &str, d: &str, k: i64| {
         str_at(
@@ -255,7 +261,7 @@ fn prefix_suffix_contains() {
     assert!(!n.is_valid(0));
 }
 
-// --- 数値 ---------------------------------------------------------------
+// --- Numbers ------------------------------------------------------------
 
 #[test]
 fn numeric_integer_domain() {
@@ -281,7 +287,7 @@ fn numeric_integer_domain() {
     assert_eq!(r(15, -1), Some(20));
     assert_eq!(r(25, -1), Some(30));
     assert_eq!(r(12345, 2), Some(12345));
-    // duckdb: mod(-7,3) = -1, mod(7,-3) = 1、0 除算は NULL。
+    // duckdb: mod(-7,3) = -1, mod(7,-3) = 1; division by zero gives NULL.
     let m = |x: i64, y: i64| {
         int_at(&run("mod", &[&vi(Ty::BigInt, &[Some(x)]), &vi(Ty::BigInt, &[Some(y)])]).unwrap(), 0)
     };
@@ -347,7 +353,7 @@ fn factorial_resolve_accepts_only_integer_input() {
 #[test]
 fn numeric_float_domain() {
     let f = |name: &str, x: f64| flt_at(&run(name, &[&vf(&[Some(x)])]).unwrap(), 0);
-    // duckdb: round(2.5)=3, round(3.5)=4, round(-2.5)=-3（0 から遠ざかる）
+    // duckdb: round(2.5)=3, round(3.5)=4, round(-2.5)=-3 (away from zero)
     assert_eq!(f("round", 2.5), Some(3.0));
     assert_eq!(f("round", 3.5), Some(4.0));
     assert_eq!(f("round", -2.5), Some(-3.0));
@@ -362,7 +368,7 @@ fn numeric_float_domain() {
     assert_eq!(f("trunc", -2.7), Some(-2.0));
     assert_eq!(f("sqrt", 4.0), Some(2.0));
     assert_eq!(f("sqrt", 0.0), Some(0.0));
-    // duckdb はエラーにするが、ここは NULL（式の途中で落とさない）。
+    // duckdb errors, but here it gives NULL (it does not fail mid-expression).
     assert_eq!(f("sqrt", -1.0), None);
     assert_eq!(f("ln", 0.0), None);
     assert_eq!(f("log", 0.0), None);
@@ -381,17 +387,17 @@ fn numeric_float_domain() {
     assert_eq!(r(1234.5678, -2), Some(1200.0));
 
     let p = |x: f64, y: f64| flt_at(&run("pow", &[&vf(&[Some(x)]), &vf(&[Some(y)])]).unwrap(), 0);
-    // 整数指数は繰り返し二乗なので厳密に一致する。
+    // Integer exponents use repeated squaring and match exactly.
     assert_eq!(p(2.0, 3.0), Some(8.0));
     assert_eq!(p(2.0, -2.0), Some(0.25));
     assert_eq!(p(5.0, 0.0), Some(1.0));
-    // 非整数指数は exp(y ln x) 経由なので数 ulp ずれる。
+    // Non-integer exponents go through exp(y ln x) and differ by a few ulps.
     assert!((p(9.0, 0.5).unwrap() - 3.0).abs() < 1e-14);
 }
 
 #[test]
 fn transcendental_accuracy() {
-    // 自前の exp / ln / sqrt が倍精度でどれだけ合うか（相対誤差 1e-15 以内）。
+    // How closely the in-house exp / ln / sqrt agree in double precision (relative error within 1e-15).
     let close = |a: f64, b: f64| ((a - b) / b).abs() < 1e-15;
     assert!(close(f_exp(1.0), core::f64::consts::E));
     assert!(close(f_exp(10.0), 22026.465794806718));
@@ -403,12 +409,12 @@ fn transcendental_accuracy() {
     assert!(close(f_sqrt(1e300), 1e150));
     assert_eq!(f_sqrt(0.0), 0.0);
     assert_eq!(f_sqrt(4.0), 2.0);
-    // 非正規化数（指数部 0）も 2^64 倍して扱えている。
+    // Subnormals (exponent 0) are handled by scaling by 2^64 too.
     assert!(f_ln(1e-310) < -713.0 && f_ln(1e-310) > -714.0);
     assert!((f_pow(2.0, 0.5) - core::f64::consts::SQRT_2).abs() < 1e-15);
 }
 
-// --- NULL 系 ------------------------------------------------------------
+// --- The NULL family ----------------------------------------------------
 
 #[test]
 fn null_handling_functions() {
@@ -441,7 +447,7 @@ fn greatest_least_skip_nulls() {
     assert_eq!(str_at(&g, 0).as_deref(), Some("b"));
 }
 
-// --- 日時 ---------------------------------------------------------------
+// --- Date and time ------------------------------------------------------
 
 #[test]
 fn civil_roundtrip() {
@@ -459,7 +465,7 @@ fn date_trunc_matches_duckdb() {
         fmt_timestamp(int_at(&v, 0).unwrap(), &mut o);
         String::from_utf8(o).unwrap()
     };
-    // エポック前（負のマイクロ秒）。切り捨てだと 1 単位ずれる境目。
+    // Before the epoch (negative microseconds). The boundary where truncation would be off by one unit.
     assert_eq!(f("year", "1969-07-20 20:17:40"), "1969-01-01 00:00:00");
     assert_eq!(f("quarter", "1969-07-20 20:17:40"), "1969-07-01 00:00:00");
     assert_eq!(f("month", "1969-07-20 20:17:40"), "1969-07-01 00:00:00");
@@ -468,7 +474,7 @@ fn date_trunc_matches_duckdb() {
     assert_eq!(f("hour", "1969-07-20 20:17:40"), "1969-07-20 20:00:00");
     assert_eq!(f("minute", "1969-07-20 20:17:40"), "1969-07-20 20:17:00");
     assert_eq!(f("second", "1969-07-20 20:17:40.123456"), "1969-07-20 20:17:40");
-    // うるう日と年境界。
+    // Leap days and year boundaries.
     assert_eq!(f("week", "2024-02-29 12:34:56"), "2024-02-26 00:00:00");
     assert_eq!(f("YEAR", "2024-12-31 23:59:59"), "2024-01-01 00:00:00");
     assert_eq!(f("month", "2024-01-01 00:00:00"), "2024-01-01 00:00:00");
@@ -481,7 +487,7 @@ fn date_part_matches_duckdb() {
     assert_eq!(part("date_part", "quarter", "2024-02-29 00:00:00"), Some(1));
     assert_eq!(part("date_part", "epoch", "1969-07-20 20:17:40"), Some(-14_182_940));
     assert_eq!(part("date_part", "dow", "1969-07-20 00:00:00"), Some(0));
-    // ISO 週番号。年をまたぐ週が前年の 52/53 週になる境目を確認する。
+    // ISO week numbers. Checks the boundary where a week spanning years becomes week 52/53 of the previous year.
     assert_eq!(part("date_part", "week", "2024-01-01 00:00:00"), Some(1));
     assert_eq!(part("date_part", "week", "2023-01-01 00:00:00"), Some(52));
     assert_eq!(part("date_part", "week", "2021-01-03 00:00:00"), Some(53));
@@ -489,10 +495,10 @@ fn date_part_matches_duckdb() {
     assert_eq!(part("date_part", "week", "1969-07-20 00:00:00"), Some(29));
     assert_eq!(part("date_part", "minute", "1969-07-20 20:17:40"), Some(17));
     assert_eq!(part("date_part", "second", "2024-01-01 10:20:30.5"), Some(30));
-    // 大文字・複数形・extract の別名も受ける。
+    // Uppercase, plurals, and extract's aliases are accepted too.
     assert_eq!(part("extract", "HOUR", "1969-07-20 20:17:40"), Some(20));
     assert_eq!(part("date_part", "years", "1900-01-01 00:00:00"), Some(1900));
-    // 略記。
+    // The shorthands.
     let sh = |name: &str, lit: &str| int_at(&run(name, &[&ts(lit)]).unwrap(), 0);
     assert_eq!(sh("year", "1900-01-01 00:00:00"), Some(1900));
     assert_eq!(sh("month", "2024-02-29 00:00:00"), Some(2));
@@ -500,7 +506,7 @@ fn date_part_matches_duckdb() {
     assert_eq!(sh("hour", "1969-07-20 20:17:40"), Some(20));
     assert_eq!(sh("minute", "1969-07-20 20:17:40"), Some(17));
     assert_eq!(sh("second", "2024-01-01 10:20:30.5"), Some(30));
-    // NULL 伝播。
+    // NULL propagation.
     let n = run("year", &[&vi(Ty::Timestamp, &[None])]).unwrap();
     assert_eq!(int_at(&n, 0), None);
 }
@@ -510,7 +516,7 @@ fn date_diff_and_add() {
     let d = |p: &str, a: &str, b: &str| {
         int_at(&run("date_diff", &[&vs(&[Some(p)]), &ts(a), &ts(b)]).unwrap(), 0)
     };
-    // すべて duckdb 実測値（境界を跨いだ回数）。
+    // All are values measured with duckdb (how many boundaries were crossed).
     assert_eq!(d("day", "2024-01-01 00:00:00", "2024-03-01 00:00:00"), Some(60));
     assert_eq!(d("month", "2024-01-31 00:00:00", "2024-03-01 00:00:00"), Some(2));
     assert_eq!(d("year", "2020-12-31 00:00:00", "2021-01-01 00:00:00"), Some(1));
@@ -520,7 +526,7 @@ fn date_diff_and_add() {
     assert_eq!(d("quarter", "2024-01-01 00:00:00", "2024-07-01 00:00:00"), Some(2));
     assert_eq!(d("day", "2024-01-01 23:00:00", "2024-01-02 01:00:00"), Some(1));
     assert_eq!(d("second", "2024-01-01 00:00:00.9", "2024-01-01 00:00:01.1"), Some(1));
-    // エポック前をまたぐ。
+    // Crossing the epoch.
     assert_eq!(d("day", "1969-12-31 00:00:00", "1970-01-01 00:00:00"), Some(1));
 
     let a = |p: &str, k: i64, lit: &str| {
@@ -529,7 +535,7 @@ fn date_diff_and_add() {
         fmt_timestamp(int_at(&v, 0).unwrap(), &mut o);
         String::from_utf8(o).unwrap()
     };
-    // duckdb の INTERVAL 加算と同じく、日は月末で切り詰める。
+    // As with duckdb's INTERVAL addition, the day is clamped to the month's end.
     assert_eq!(a("month", 1, "2024-01-31 00:00:00"), "2024-02-29 00:00:00");
     assert_eq!(a("month", -1, "2024-03-31 00:00:00"), "2024-02-29 00:00:00");
     assert_eq!(a("year", 1, "2024-02-29 00:00:00"), "2025-02-28 00:00:00");
@@ -546,10 +552,10 @@ fn add_interval_to_ts_matches_duckdb() {
         fmt_timestamp(v, &mut o);
         String::from_utf8(o).unwrap()
     };
-    // すべて duckdb 実測値。
+    // All are values measured with duckdb.
     assert_eq!(a("2024-01-01 00:00:00", 0, 3, 0), "2024-01-04 00:00:00");
     assert_eq!(a("2024-01-01 00:00:00", 0, 0, 3_600_000_000), "2024-01-01 01:00:00");
-    // 月末クランプ: 1 月が 31 日で 2 月は 29 日しかないので繰り上がらず 29 日止まり。
+    // Month-end clamping: January has 31 days and February only 29, so it does not carry and stops at the 29th.
     assert_eq!(a("2024-01-31 00:00:00", 1, 0, 0), "2024-02-29 00:00:00");
     assert_eq!(a("2024-01-31 00:00:00", 2, 0, 0), "2024-03-31 00:00:00");
     assert_eq!(a("2024-01-31 00:00:00", 1, 1, 0), "2024-03-01 00:00:00");
@@ -557,7 +563,7 @@ fn add_interval_to_ts_matches_duckdb() {
     assert_eq!(a("2024-03-31 00:00:00", -1, 0, 0), "2024-02-29 00:00:00");
     assert_eq!(a("2024-01-31 00:00:00", -1, -1, 0), "2023-12-30 00:00:00");
     assert_eq!(a("1970-01-01 00:00:00", 0, -1, 0), "1969-12-31 00:00:00");
-    // 月加算のあと時刻はそのまま保たれ、マイクロ秒の加算で日を跨ぐ。
+    // After adding months the time is preserved, and adding microseconds crosses into the next day.
     assert_eq!(a("2024-01-31 23:30:00", 1, 0, 45 * 60 * 1_000_000), "2024-03-01 00:15:00");
 }
 
@@ -587,7 +593,7 @@ fn to_date_and_to_timestamp() {
     assert_eq!(t("bad"), None);
 }
 
-// --- パーサ / フォーマッタ（kernels のキャストからも使われる） ------------
+// --- Parsers / formatters (used by kernels' casts too) ------------------
 
 #[test]
 fn parse_and_format_roundtrip() {
@@ -604,9 +610,9 @@ fn parse_and_format_roundtrip() {
         "1900-12-31 12:00:00.1",
     ] {
         let us = parse_timestamp(lit.as_bytes()).unwrap();
-        assert_eq!(fmt(us), lit, "往復に失敗: {lit}");
+        assert_eq!(fmt(us), lit, "round trip failed: {lit}");
     }
-    // duckdb の VARCHAR 表現に合わせる。
+    // Matches duckdb's VARCHAR representation.
     assert_eq!(fmt(parse_timestamp(b"2024-01-01").unwrap()), "2024-01-01 00:00:00");
     assert_eq!(fmt(parse_timestamp(b"2024-01-05T10:20:30").unwrap()), "2024-01-05 10:20:30");
     assert_eq!(fmt(parse_timestamp(b" 2024-01-05 ").unwrap()), "2024-01-05 00:00:00");
@@ -621,7 +627,7 @@ fn parse_rejects_bad_input() {
     assert_eq!(parse_date(b""), None);
     assert_eq!(parse_date(b"abc"), None);
     assert_eq!(parse_date(b"2024-01-01x"), None);
-    // うるう年は通す。
+    // Leap years pass.
     assert!(parse_date(b"2024-02-29").is_some());
     assert_eq!(parse_date(b"2023-02-29"), None);
     assert_eq!(parse_timestamp(b"2024-01-01 25:00:00"), None);
@@ -637,7 +643,7 @@ fn parse_rejects_bad_input() {
     assert_eq!(String::from_utf8(o).unwrap(), "01:02:03.5");
 }
 
-// --- 文字列 ↔ 日時のキャスト（kernels 側の実装をここから検証する） ------
+// --- String <-> date-time casts (the kernels-side implementation is verified from here) ---
 
 #[test]
 fn string_to_temporal_cast() {
@@ -645,7 +651,7 @@ fn string_to_temporal_cast() {
         vs(&[Some("2024-02-29"), Some("not a date"), Some("2024-13-01"), Some("2024-02-30"), None]);
     let out = kernels::cast(Ty::Varchar, Ty::Date, &src).unwrap();
     assert_eq!(int_at(&out, 0), Some(days_from_civil(2024, 2, 29)));
-    // 読めない・範囲外はエラーではなくその行だけ NULL。
+    // Unreadable or out of range is not an error; just that row becomes NULL.
     assert_eq!(int_at(&out, 1), None);
     assert_eq!(int_at(&out, 2), None);
     assert_eq!(int_at(&out, 3), None);
@@ -654,7 +660,7 @@ fn string_to_temporal_cast() {
     let src = vs(&[Some("2024-01-05 10:20:30"), Some("2024-01-05"), Some("x")]);
     let out = kernels::cast(Ty::Varchar, Ty::Timestamp, &src).unwrap();
     assert_eq!(int_at(&out, 0), Some(parse_timestamp(b"2024-01-05 10:20:30").unwrap()));
-    // 日付だけの文字列は深夜 0 時として読む。
+    // A date-only string is read as midnight.
     assert_eq!(int_at(&out, 1), Some(days_from_civil(2024, 1, 5) * US_PER_DAY));
     assert_eq!(int_at(&out, 2), None);
 
@@ -666,7 +672,7 @@ fn string_to_temporal_cast() {
 
 #[test]
 fn temporal_to_string_cast() {
-    // duckdb の VARCHAR 表現と一致させる。
+    // Made to match duckdb's VARCHAR representation.
     let d = vi(Ty::Date, &[Some(days_from_civil(2024, 1, 1)), Some(0), None]);
     let out = kernels::cast(Ty::Date, Ty::Varchar, &d).unwrap();
     assert_eq!(str_at(&out, 0).as_deref(), Some("2024-01-01"));
@@ -702,15 +708,15 @@ fn timestamp_string_roundtrip_through_cast() {
     let s = kernels::cast(Ty::Timestamp, Ty::Varchar, &v).unwrap();
     let back = kernels::cast(Ty::Varchar, Ty::Timestamp, &s).unwrap();
     for (i, lit) in lits.iter().enumerate() {
-        assert_eq!(int_at(&back, i), int_at(&v, i), "{lit} で往復に失敗");
+        assert_eq!(int_at(&back, i), int_at(&v, i), "round trip failed for {lit}");
     }
 }
 
-// --- ベクタ／定数の扱い -------------------------------------------------
+// --- Handling vectors and constants -------------------------------------
 
 #[test]
 fn constant_folding_keeps_length_one() {
-    // 全引数が長さ 1 なら結果も長さ 1（stride 0 に潰さない）。
+    // If every argument has length 1 the result has length 1 too (it is not collapsed to stride 0).
     let out = run("upper", &[&vs(&[Some("ab")])]).unwrap();
     assert_eq!(out.len(), 1);
     let out = run("substr", &[&vs(&[Some("hello")]), &vi(Ty::BigInt, &[Some(2)])]).unwrap();
@@ -721,7 +727,7 @@ fn constant_folding_keeps_length_one() {
 
 #[test]
 fn constant_operand_broadcasts() {
-    // 長さ 3 の列と長さ 1 の定数を混ぜると、結果は 3 行。
+    // Mixing a length-3 column with a length-1 constant gives 3 rows.
     let col = vs(&[Some("aa"), None, Some("cc")]);
     let k = vi(Ty::BigInt, &[Some(2)]);
     let out = run("substr", &[&col, &k]).unwrap();
@@ -729,7 +735,7 @@ fn constant_operand_broadcasts() {
     assert_eq!(str_at(&out, 0).as_deref(), Some("a"));
     assert_eq!(str_at(&out, 1), None);
     assert_eq!(str_at(&out, 2).as_deref(), Some("c"));
-    // 空ベクタは結果も空。
+    // An empty vector gives an empty result.
     let empty = Vector::new(Ty::Varchar);
     let out = run("upper", &[&empty]).unwrap();
     assert_eq!(out.len(), 0);
@@ -773,7 +779,7 @@ fn json_extract_follows_dollar_paths_like_duckdb() {
     assert_eq!(out.ty(), Ty::Json);
     assert_eq!(str_at(&out, 0).as_deref(), Some("2"));
 
-    // duckdb: json_extract('{"a":1}', '$.b') -> NULL（キー無し）
+    // duckdb: json_extract('{"a":1}', '$.b') -> NULL (no such key)
     let doc = vj(&[Some(r#"{"a":1}"#)]);
     let path = vs(&[Some("$.b")]);
     assert_eq!(str_at(&run("json_extract", &[&doc, &path]).unwrap(), 0), None);
@@ -781,9 +787,9 @@ fn json_extract_follows_dollar_paths_like_duckdb() {
 
 #[test]
 fn json_extract_operator_desugars_at_parse_time_not_tested_here() {
-    // `->`/`->>` は sql::parser が json_extract(_string) へ展開するだけで、
-    // この関数自体には演算子固有のロジックが無い（parser 側のテスト
-    // `sql::parser::tests` で precedence 込みに確認する）。
+    // `->`/`->>` are merely expanded by sql::parser into json_extract(_string); this function itself
+    // has no operator-specific logic (the parser-side test `sql::parser::tests` checks it together
+    // with precedence).
     let doc = vj(&[Some(r#"{"a":1}"#)]);
     let path = vs(&[Some("$.a")]);
     assert_eq!(str_at(&run("json_extract", &[&doc, &path]).unwrap(), 0).as_deref(), Some("1"));
@@ -829,7 +835,7 @@ fn json_type_matches_duckdb_strings() {
         let d = vj(&[Some(doc)]);
         assert_eq!(str_at(&run("json_type", &[&d]).unwrap(), 0).as_deref(), Some(*want));
     }
-    // パス付き 2 引数形。
+    // The two-argument form with a path.
     let doc = vj(&[Some(r#"{"a":{"b":1}}"#)]);
     let path = vs(&[Some("$.a")]);
     assert_eq!(str_at(&run("json_type", &[&doc, &path]).unwrap(), 0).as_deref(), Some("OBJECT"));
@@ -842,7 +848,7 @@ fn json_array_length_is_zero_for_non_arrays_and_null_for_missing_path() {
     assert_eq!(int_at(&run("json_array_length", &[&a]).unwrap(), 0), Some(3));
     let o = vj(&[Some(r#"{"a":1}"#)]);
     assert_eq!(int_at(&run("json_array_length", &[&o]).unwrap(), 0), Some(0));
-    // duckdb: json_array_length('{"a":1}', '$.b') -> NULL（パス無し）
+    // duckdb: json_array_length('{"a":1}', '$.b') -> NULL (no such path)
     let path = vs(&[Some("$.b")]);
     assert_eq!(int_at(&run("json_array_length", &[&o, &path]).unwrap(), 0), None);
 }
@@ -1024,7 +1030,7 @@ fn to_json_covers_the_documented_scalar_types() {
     let mut d = Vector::new(Ty::Date);
     d.push_value(&Value::I32(19723)); // 2024-01-01
     assert_eq!(str_at(&run("to_json", &[&d]).unwrap(), 0).as_deref(), Some("\"2024-01-01\""));
-    // duckdb: to_json(NULL) は SQL NULL のまま（既定の NULL 伝播）。
+    // duckdb: to_json(NULL) stays SQL NULL (the default NULL propagation).
     let n = vi(Ty::BigInt, &[None]);
     assert_eq!(str_at(&run("to_json", &[&n]).unwrap(), 0), None);
 }
@@ -1063,7 +1069,7 @@ fn json_array_and_json_object_match_duckdb_construction() {
     .unwrap();
     assert_eq!(str_at(&out, 0).as_deref(), Some(r#"{"a":1,"b":"x"}"#));
 
-    // duckdb: json_object('a', NULL) -> {"a":null}（NULL 値は埋め込む）
+    // duckdb: json_object('a', NULL) -> {"a":null} (a NULL value is embedded)
     let out = run("json_object", &[&vs(&[Some("a")]), &vi(Ty::BigInt, &[None])]).unwrap();
     assert_eq!(str_at(&out, 0).as_deref(), Some(r#"{"a":null}"#));
 }
@@ -1077,7 +1083,7 @@ fn list_value_is_an_alias_for_json_array() {
 
 #[test]
 fn malformed_json_source_is_an_error_not_a_silent_null() {
-    // duckdb: json_extract('{not valid json', '$.a') -> エラー
+    // duckdb: json_extract('{not valid json', '$.a') -> an error
     let doc = vj(&[Some("{not valid json")]);
     let path = vs(&[Some("$.a")]);
     assert_eq!(code_of(run("json_extract", &[&doc, &path])), Some(Code::SyntaxError));
@@ -1087,18 +1093,18 @@ fn malformed_json_source_is_an_error_not_a_silent_null() {
 fn json_resolve_errors() {
     assert_eq!(code_of(resolve("json_extract", &[Ty::Json])), Some(Code::WrongArgCount));
     assert_eq!(code_of(resolve("to_json", &[])), Some(Code::WrongArgCount));
-    // BLOB/INTERVAL は to_json/json_array の対象外。
+    // BLOB/INTERVAL are outside the scope of to_json/json_array.
     assert_eq!(code_of(resolve("to_json", &[Ty::Blob])), Some(Code::TypeMismatch));
     assert_eq!(code_of(resolve("to_json", &[Ty::Interval])), Some(Code::TypeMismatch));
     assert_eq!(
         code_of(resolve("json_object", &[Ty::Varchar])),
         Some(Code::WrongArgCount),
-        "奇数個の引数は拒否"
+        "an odd number of arguments is rejected"
     );
     assert_eq!(code_of(resolve("json_array", &[])), Some(Code::WrongArgCount));
 }
 
-// --- エラー -------------------------------------------------------------
+// --- Errors -------------------------------------------------------------
 
 #[test]
 fn resolve_errors() {
@@ -1110,7 +1116,7 @@ fn resolve_errors() {
     assert_eq!(code_of(resolve("mod", &[Ty::Int, Ty::Varchar])), Some(Code::TypeMismatch));
     assert_eq!(code_of(resolve("greatest", &[Ty::Int, Ty::Varchar])), Some(Code::TypeMismatch));
     assert_eq!(code_of(resolve("nosuchfunc", &[])), Some(Code::FunctionNotFound));
-    // 時計が無いので未実装（モジュール冒頭のコメント参照）。
+    // Not implemented, since there is no clock (see the comments at the top of the module).
     assert_eq!(code_of(resolve("now", &[])), Some(Code::FunctionNotFound));
     assert_eq!(code_of(resolve("current_timestamp", &[])), Some(Code::FunctionNotFound));
     assert_eq!(code_of(resolve("current_date", &[])), Some(Code::FunctionNotFound));
@@ -1118,12 +1124,12 @@ fn resolve_errors() {
 
 #[test]
 fn resolve_coerces_argument_types() {
-    // INT 引数は BIGINT へ、FLOAT 混在は DOUBLE へ寄せる。
+    // INT arguments settle on BIGINT, and a FLOAT mixed in settles on DOUBLE.
     assert_eq!(resolve("abs", &[Ty::Int]).unwrap().1, vec![Ty::BigInt]);
     assert_eq!(resolve("abs", &[Ty::Double]).unwrap().1, vec![Ty::Double]);
     assert_eq!(resolve("abs", &[Ty::Decimal { precision: 9, scale: 2 }]).unwrap().2, Ty::Double);
     assert_eq!(resolve("length", &[Ty::Varchar]).unwrap().2, Ty::BigInt);
-    // 日時関数は TIMESTAMP に寄せる（DATE 列も VARCHAR も Cast 経由で入る）。
+    // Date-time functions settle on TIMESTAMP (DATE columns and VARCHARs both arrive via a Cast).
     assert_eq!(resolve("year", &[Ty::Date]).unwrap().1, vec![Ty::Timestamp]);
     assert_eq!(
         resolve("date_trunc", &[Ty::Varchar, Ty::Date]).unwrap().1,
@@ -1138,7 +1144,7 @@ fn call_errors_on_bad_part() {
     let bad = vs(&[Some("fortnight")]);
     let t = ts("2024-01-01 00:00:00");
     assert_eq!(code_of(call(id, ret, &[&bad, &t])), Some(Code::TypeMismatch));
-    // 引数無しで呼ばれてもパニックしない。
+    // It does not panic even when called with no arguments.
     assert_eq!(code_of(call(id, ret, &[])), Some(Code::WrongArgCount));
 }
 
@@ -1164,14 +1170,14 @@ fn glob_matches_shell_patterns_like_duckdb() {
     assert_eq!(g("abc", "a*c"), Some(true));
     assert_eq!(g("abc", "a?c"), Some(true));
     assert_eq!(g("abc", "ab"), Some(false));
-    // duckdb: 'ABC' glob 'a*c' = false（大小区別する）
+    // duckdb: 'ABC' glob 'a*c' = false (case-sensitive)
     assert_eq!(g("ABC", "a*c"), Some(false));
     // duckdb: 'abc' glob 'a[bx]c' = true, 'abc' glob '[!x]bc' = true,
-    // 'abc' glob '[^x]bc' = false（`^` は否定にならずリテラル扱い）
+    // 'abc' glob '[^x]bc' = false (`^` does not negate and is treated as a literal)
     assert_eq!(g("abc", "a[bx]c"), Some(true));
     assert_eq!(g("abc", "[!x]bc"), Some(true));
     assert_eq!(g("abc", "[^x]bc"), Some(false));
-    // duckdb: 'a]c' glob 'a[]]c' = true（先頭の `]` はリテラル）
+    // duckdb: 'a]c' glob 'a[]]c' = true (a leading `]` is a literal)
     assert_eq!(g("a]c", "a[]]c"), Some(true));
     // duckdb: 'a1c' glob 'a[0-9]c' = true
     assert_eq!(g("a1c", "a[0-9]c"), Some(true));
@@ -1181,9 +1187,9 @@ fn glob_matches_shell_patterns_like_duckdb() {
     // duckdb: '' glob '' = true, '' glob '*' = true
     assert_eq!(g("", ""), Some(true));
     assert_eq!(g("", "*"), Some(true));
-    // duckdb: 'a[bc' glob 'a[bc' = false（閉じていない `[` は常に不一致）
+    // duckdb: 'a[bc' glob 'a[bc' = false (an unclosed `[` never matches)
     assert_eq!(g("a[bc", "a[bc"), Some(false));
-    // NULL はどちらの引数でも NULL 伝播。
+    // NULL propagates from either argument.
     let n = run("glob", &[&vs(&[None]), &vs(&[Some("a*")])]).unwrap();
     assert!(!n.is_valid(0));
 }
@@ -1193,19 +1199,19 @@ fn regexp_full_match_backs_similar_to() {
     let f = |s: &str, p: &str| {
         bool_at(&run("regexp_full_match", &[&vs(&[Some(s)]), &vs(&[Some(p)])]).unwrap(), 0)
     };
-    // duckdb: 'abc' similar to 'a.c' = true、'Xabc' similar to 'a.c' = false
-    // （部分一致ではなく完全一致）。
+    // duckdb: 'abc' similar to 'a.c' = true, 'Xabc' similar to 'a.c' = false
+    // (a full match rather than a partial one).
     assert_eq!(f("abc", "a.c"), Some(true));
     assert_eq!(f("Xabc", "a.c"), Some(false));
     // duckdb: 'a%c' similar to 'a%c' = true, 'aXc' similar to 'a%c' = false
-    // （SIMILAR TO の正規表現方言では `%`/`_` は特別扱いされない）。
+    // (in SIMILAR TO's regex dialect, `%`/`_` are not special).
     assert_eq!(f("a%c", "a%c"), Some(true));
     assert_eq!(f("aXc", "a%c"), Some(false));
-    // duckdb: 'aaa' similar to 'a{1,2}' = false（3 個は範囲外で全体一致しない）。
+    // duckdb: 'aaa' similar to 'a{1,2}' = false (3 is out of range, so it does not match fully).
     assert_eq!(f("aaa", "a{1,2}"), Some(false));
     assert_eq!(f("aa", "a{1,2}"), Some(true));
-    // 病的なパターンでもパニックせずエラーを返す
-    // （`expr::regex` の上限をそのまま経由することの確認）。
+    // Even a pathological pattern returns an error rather than panicking
+    // (confirming it goes straight through `expr::regex`'s limits).
     let huge = "a{1001}";
     assert_eq!(
         code_of(run("regexp_full_match", &[&vs(&[Some("a")]), &vs(&[Some(huge)])])),
@@ -1216,8 +1222,8 @@ fn regexp_full_match_backs_similar_to() {
 // --- printf / format ------------------------------------------------------
 
 #[test]
-// 3.14159 は printf の `%.2f` 丸めを確かめるためのテスト値であって
-// 円周率のつもりではない（clippy::approx_constant の誤検出）。
+// 3.14159 is a test value for checking printf's `%.2f` rounding and is not meant as pi
+// (a false positive from clippy::approx_constant).
 #[allow(clippy::approx_constant)]
 fn printf_supports_documented_specifiers() {
     let f = |fmt: &str, args: &[&Vector]| {
@@ -1247,10 +1253,10 @@ fn printf_supports_documented_specifiers() {
     assert_eq!(f("%05d", &[&neg3]), Some("-0003".to_string()));
     // duckdb: printf('%.2f', 3.14159) = '3.14'
     assert_eq!(f("%.2f", &[&d]), Some("3.14".to_string()));
-    // duckdb: printf('%f', 3.5) = '3.500000'（既定精度 6 桁）
+    // duckdb: printf('%f', 3.5) = '3.500000' (the default precision of 6 digits)
     let half = vf(&[Some(3.5)]);
     assert_eq!(f("%f", &[&half]), Some("3.500000".to_string()));
-    // NULL 引数はどれかが NULL なら結果全体が NULL（既定の伝播）。
+    // If any argument is NULL the whole result is NULL (the default propagation).
     let null_s = vs(&[None]);
     assert_eq!(f("%s", &[&null_s]), None);
 }
@@ -1262,7 +1268,7 @@ fn printf_rejects_malformed_or_unsupported_specifiers() {
     assert_eq!(code_of(call(id, ret, &[&fmt])), Some(Code::SyntaxError));
     let fmt = vs(&[Some("%x")]);
     assert_eq!(code_of(call(id, ret, &[&fmt])), Some(Code::UnsupportedFeature));
-    // 指定子の数より実引数が少なければ WrongArgCount。
+    // Fewer actual arguments than specifiers gives WrongArgCount.
     let (id, _, ret) = resolve("printf", &[Ty::Varchar]).unwrap();
     let fmt = vs(&[Some("%d")]);
     assert_eq!(code_of(call(id, ret, &[&fmt])), Some(Code::WrongArgCount));

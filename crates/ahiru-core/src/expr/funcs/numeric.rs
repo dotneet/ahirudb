@@ -1,18 +1,18 @@
-//! 整数出力・浮動小数出力
+//! Integer output and floating-point output
 use super::datetime::{civil, date_add, date_diff, date_part, date_trunc, days_in_month};
 use super::json::json_extract_or_whole;
 use super::string::{cp_count, find};
 use super::*;
 
 pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
-    // year() などの略記。part 番号は ID に埋まっている。
+    // Shorthands such as year(). The part number is embedded in the ID.
     if id >= F_PART_BASE {
         return Ok(date_part((id - F_PART_BASE) as u8, a.int(0)));
     }
     Ok(match id {
         F_LENGTH => Some(cp_count(a.bytes(0)) as i64),
         F_STRPOS => {
-            // 1 始まり、無ければ 0。位置はコードポイント単位。
+            // 1-based, or 0 if absent. The position is in code points.
             let (s, p) = (a.bytes(0), a.bytes(1));
             Some(match find(s, p) {
                 Some(b) => cp_count(&s[..b]) as i64 + 1,
@@ -32,7 +32,7 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
         }
         F_MOD_I => {
             let (x, y) = (a.int(0), a.int(1));
-            // 0 除算と MIN % -1 は NULL（kernels の Mod と同じ判断）。
+            // Division by zero and MIN % -1 give NULL (the same judgment as kernels' Mod).
             if y == 0 || (y == -1 && x == i64::MIN) {
                 None
             } else {
@@ -41,8 +41,8 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
         }
         F_BIT_AND => Some(a.int(0) & a.int(1)),
         F_BIT_OR => Some(a.int(0) | a.int(1)),
-        // シフト量が負、または語幅（64）以上は未定義。NULL にする
-        // （ゼロ除算と同じ「未定義演算は NULL」の方針）。
+        // A negative shift amount, or one at or above the word width (64), is undefined. It gives
+        // NULL (the same "undefined operations are NULL" policy as division by zero).
         F_BIT_SHL => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shl(n)),
         F_BIT_SHR => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shr(n)),
         F_BIT_NOT => Some(!a.int(0)),
@@ -114,7 +114,7 @@ fn factorial(n: i64) -> Result<i128> {
     Ok(acc)
 }
 
-/// 10 の冪へ 0 から遠ざかる向きに丸める（`round(12345, -2)` → 12300）。
+/// Rounds away from zero to a power of ten (`round(12345, -2)` -> 12300).
 fn round_int(x: i64, k: i64) -> Option<i64> {
     if k > 18 {
         return Some(0);
@@ -153,8 +153,8 @@ pub(super) fn eval_f64(id: FuncId, a: &A) -> Result<Option<f64>> {
         F_CEIL_F => Some(f_ceil(x)),
         F_FLOOR_F => Some(f_floor(x)),
         F_TRUNC_F => Some(f_trunc(x)),
-        // DuckDB は定義域外をエラーにするが、ここは 0 除算と同じく NULL に
-        // する（式の途中で失敗してもクエリ全体を落とさない）。
+        // DuckDB errors outside the domain; here it gives NULL like division by zero
+        // (a failure mid-expression should not bring down the whole query).
         F_SQRT => {
             if x < 0.0 {
                 None
@@ -183,7 +183,7 @@ pub(super) fn eval_f64(id: FuncId, a: &A) -> Result<Option<f64>> {
     })
 }
 
-/// `expr::kernels` とも共有する実装。
+/// An implementation shared with `expr::kernels`.
 pub(crate) fn f_abs(x: f64) -> f64 {
     if x < 0.0 {
         -x
@@ -192,13 +192,13 @@ pub(crate) fn f_abs(x: f64) -> f64 {
     }
 }
 
-/// 0 方向への切り捨て。`f64::trunc` は std 専用なので自前で持つ。
-/// `expr::kernels` とも共有する実装。
+/// Truncation toward zero. `f64::trunc` is std-only, so this is in-house.
+/// An implementation shared with `expr::kernels`.
 pub(crate) fn f_trunc(x: f64) -> f64 {
     if f_abs(x) < 9_223_372_036_854_775_808.0 {
         (x as i64) as f64
     } else {
-        // 2^63 以上の f64 は既に整数。
+        // An f64 at or above 2^63 is already an integer.
         x
     }
 }
@@ -221,8 +221,8 @@ fn f_ceil(x: f64) -> f64 {
     }
 }
 
-/// 0 から遠ざかる丸め。DuckDB の `round` はこちらで、キャストの銀行丸め
-/// (`kernels::f_round`) とは規則が違う（`round(2.5)` = 3、`round(3.5)` = 4）。
+/// Rounding away from zero. DuckDB's `round` uses this, and its rule differs from the banker's
+/// rounding used for casts (`kernels::f_round`) (`round(2.5)` = 3, `round(3.5)` = 4).
 pub(super) fn round_half_up(x: f64) -> f64 {
     let t = f_trunc(x);
     let frac = x - t;
@@ -235,7 +235,7 @@ pub(super) fn round_half_up(x: f64) -> f64 {
     }
 }
 
-/// `round(x, d)`。DuckDB と同じく 10^d を掛けて丸め、割り戻す。
+/// `round(x, d)`. Like DuckDB it multiplies by 10^d, rounds, and divides back.
 fn round_f64(x: f64, d: i64) -> f64 {
     if !x.is_finite() {
         return x;
@@ -260,8 +260,8 @@ pub(super) fn pow10(k: u32) -> f64 {
     r
 }
 
-/// 平方根。`core` に `f64::sqrt` は無い（libm 側）。指数部を半分にした
-/// 初期値から Newton 法で 5 回反復すれば倍精度で厳密になる。
+/// Square root. `core` has no `f64::sqrt` (it is in libm). Five Newton iterations from an initial
+/// value with a halved exponent are exact in double precision.
 pub(super) fn f_sqrt(x: f64) -> f64 {
     if x == 0.0 || !x.is_finite() {
         return x;
@@ -273,13 +273,13 @@ pub(super) fn f_sqrt(x: f64) -> f64 {
     y
 }
 
-/// 自然対数。`x = m * 2^e`（`m ∈ [√2/2, √2)`）に分解し、
-/// `ln(m) = 2*atanh((m-1)/(m+1))` の級数で求める。|z| <= 0.1716、
-/// z² <= 0.0295 なので、16 項で打ち切り誤差が 1e-22 まで落ちる。
+/// The natural logarithm. Decomposed as `x = m * 2^e` (with `m` in `[sqrt(2)/2, sqrt(2))`), it is
+/// computed with the series `ln(m) = 2*atanh((m-1)/(m+1))`. Since |z| <= 0.1716 and
+/// z^2 <= 0.0295, truncating at 16 terms drops the error to 1e-22.
 pub(super) fn f_ln(x: f64) -> f64 {
     let mut bits = x.to_bits();
     let mut e = 0i32;
-    // 非正規化数は 2^64 倍してから扱う。
+    // Subnormals are scaled by 2^64 before being handled.
     if (bits >> 52) & 0x7ff == 0 {
         bits = (x * 18_446_744_073_709_551_616.0).to_bits();
         e -= 64;
@@ -299,15 +299,15 @@ pub(super) fn f_ln(x: f64) -> f64 {
     2.0 * z * s + e as f64 * core::f64::consts::LN_2
 }
 
-/// `2^k` を掛ける。指数部が一度に振り切れないよう 2 回に分ける。
+/// Multiplies by `2^k`. Split into two steps so the exponent does not overflow at once.
 fn scale2(m: f64, k: i32) -> f64 {
     let p = |e: i32| f64::from_bits(((e + 1023) as u64) << 52);
     let k1 = k.clamp(-700, 700);
     m * p(k1) * p(k - k1)
 }
 
-/// 指数関数。`x = k*ln2 + r` に分け、`exp(r)` を Taylor 展開（14 項）で
-/// 求めて `2^k` を掛ける。|r| <= ln2/2 なので 14 項で倍精度に届く。
+/// The exponential function. Split as `x = k*ln2 + r`, `exp(r)` is computed by a Taylor expansion
+/// (14 terms) and multiplied by `2^k`. Since |r| <= ln2/2, 14 terms reach double precision.
 pub(super) fn f_exp(x: f64) -> f64 {
     if x.is_nan() {
         return x;
@@ -319,7 +319,7 @@ pub(super) fn f_exp(x: f64) -> f64 {
         return 0.0;
     }
     let k = round_half_up(x / core::f64::consts::LN_2);
-    // ln2 を上位・下位に分けて引くと、大きな x でも桁落ちしない。
+    // Subtracting ln2 in a high and a low part avoids cancellation even for large x.
     const LN2_HI: f64 = 0.693_147_180_369_123_8;
     const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
     let r = (x - k * LN2_HI) - k * LN2_LO;
@@ -330,8 +330,8 @@ pub(super) fn f_exp(x: f64) -> f64 {
     scale2(s, k as i32)
 }
 
-/// べき乗。整数指数は繰り返し二乗で厳密に出す（`pow(2,3)` を
-/// 7.999… にしないため）。それ以外は `exp(y * ln x)`。
+/// Exponentiation. Integer exponents are computed exactly by repeated squaring (so `pow(2,3)` does
+/// not come out as 7.999...). Everything else uses `exp(y * ln x)`.
 pub(super) fn f_pow(x: f64, y: f64) -> f64 {
     if y == 0.0 {
         return 1.0;
@@ -354,7 +354,7 @@ pub(super) fn f_pow(x: f64, y: f64) -> f64 {
         return r;
     }
     if x < 0.0 {
-        // 負の底に非整数の指数は実数解を持たない。
+        // A negative base with a non-integer exponent has no real solution.
         return f64::NAN;
     }
     if x == 0.0 {

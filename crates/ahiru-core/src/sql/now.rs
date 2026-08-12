@@ -1,15 +1,15 @@
-//! `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`CURRENT_TIME`/`now()`/`today()` の
-//! 束縛前置換。
+//! Pre-binding substitution of
+//! `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`CURRENT_TIME`/`now()`/`today()`.
 //!
-//! wasm コアは時計を持たない（「ホストでできることはホストでやる」という
-//! このエンジン全体の方針そのもの、DESIGN.md §2）。クエリ開始時刻は
-//! ホストが `Session::set_now` で一度だけ渡し、束縛前にこのモジュールが
-//! 構文木を書き換える。書き換え後はただの定数（`Expr::TypedLiteral`）に
-//! なるので、`plan::bind`/`plan::compile` は特別扱いを一切要らない。
+//! The wasm core has no clock (exactly this engine's overall policy of "do on the host
+//! what the host can do", DESIGN.md §2). The host passes the query start time once via
+//! `Session::set_now`, and this module rewrites the syntax tree before binding. After
+//! the rewrite they are plain constants (`Expr::TypedLiteral`), so `plan::bind`/
+//! `plan::compile` need no special handling at all.
 //!
-//! `CURRENT_TIMESTAMP` は SQL 標準では時刻を 1 回だけ評価する（クエリ内の
-//! 全行で同じ値になる）契約なので、構文木を書き換える方式はこの意味論と
-//! 自然に一致する。行ごとに再評価される心配がない。
+//! The SQL standard contracts `CURRENT_TIMESTAMP` to be evaluated exactly once (the
+//! same value for every row in the query), so rewriting the syntax tree agrees with
+//! that semantics naturally. There is no risk of re-evaluation per row.
 
 use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{Expr, ExprArena};
@@ -23,11 +23,11 @@ enum Kind {
     Time,
 }
 
-/// 裸の識別子（`CURRENT_DATE` のように括弧無し）として書ける名前。
-/// SQL 標準で実質予約語相当のこの 3 つだけに絞る。`now`/`today` のような
-/// 関数形は必ず `()` を伴うので、列名との衝突が原理的に起きない
-/// （過去の ROWS/RANGE/QUALIFY 事故は「括弧を伴わない裸の識別子」を
-/// 安易にキーワード扱いしたことが原因だったので、ここは慎重にする）。
+/// Names writable as a bare identifier (without parentheses, as in `CURRENT_DATE`).
+/// Limited to these three, which are effectively reserved in the SQL standard. Function
+/// forms such as `now`/`today` always carry `()`, so they cannot in principle collide
+/// with a column name (the past ROWS/RANGE/QUALIFY incidents were caused by casually
+/// treating "bare identifiers without parentheses" as keywords, so this stays careful).
 fn bare_kind(name: &str) -> Option<Kind> {
     let b = name.as_bytes();
     if eq_ascii_ci(b, b"current_date") {
@@ -41,8 +41,8 @@ fn bare_kind(name: &str) -> Option<Kind> {
     }
 }
 
-/// `name()` の形（引数無しの関数呼び出し）でしか現れない名前。括弧を伴う
-/// ので列名との衝突が起きない分、`bare_kind` より広く受け付けてよい。
+/// Names that only appear in the `name()` form (a call with no arguments). Carrying
+/// parentheses means no collision with column names, so this can be broader than `bare_kind`.
 fn call_kind(name: &str) -> Option<Kind> {
     let b = name.as_bytes();
     if eq_ascii_ci(b, b"current_date") || eq_ascii_ci(b, b"today") {
@@ -56,11 +56,11 @@ fn call_kind(name: &str) -> Option<Kind> {
     }
 }
 
-/// `arena` 内の該当ノードを `now_micros`（エポックからのマイクロ秒、UTC）
-/// を使った定数に置き換える。DuckDB の `CURRENT_TIMESTAMP`/`now()` と同じく
-/// `Ty::Timestamptz` を返す（物理表現は `Ty::Timestamp` と同一の UTC
-/// マイクロ秒だが、`now_micros` は元々ホストの壁時計から得た UTC の瞬間
-/// なので、意味的にも `Timestamptz` の方が正確）。
+/// Replaces the corresponding node in `arena` with a constant built from `now_micros`
+/// (microseconds since the epoch, UTC). Like DuckDB's `CURRENT_TIMESTAMP`/`now()`, it
+/// returns `Ty::Timestamptz` (physically the same UTC microseconds as `Ty::Timestamp`,
+/// but `now_micros` originates from the host's wall clock as a UTC instant, so
+/// `Timestamptz` is also the semantically accurate choice).
 pub fn substitute_now(arena: &mut ExprArena, now_micros: i64) {
     let date_days = now_micros.div_euclid(MICROS_PER_DAY) as i32;
     let time_micros = now_micros.rem_euclid(MICROS_PER_DAY);
@@ -97,8 +97,8 @@ mod tests {
         p.arena.get(sel.items[0].expr).clone_for_test()
     }
 
-    // `Expr` は導出 Clone を持たない（サブクエリを含むと木ごと複製に
-    // なりかねないため）ので、テスト専用に軽い複製だけ許す。
+    // `Expr` does not derive Clone (with subqueries involved, cloning one expression
+    // could clone a whole tree), so only a lightweight test-only copy is permitted.
     impl Expr {
         fn clone_for_test(&self) -> Expr {
             match self {
@@ -106,12 +106,12 @@ mod tests {
                 Expr::ColumnRef { qualifier, name } => {
                     Expr::ColumnRef { qualifier: qualifier.clone(), name: name.clone() }
                 }
-                _ => panic!("clone_for_test: 未対応の形"),
+                _ => panic!("clone_for_test: unsupported shape"),
             }
         }
     }
 
-    // 2024-01-15 12:30:00 UTC (エポック秒 1705321800) をマイクロ秒で。
+    // 2024-01-15 12:30:00 UTC (epoch second 1705321800) in microseconds.
     const T: i64 = 1_705_321_800_000_000;
 
     #[test]
@@ -145,9 +145,9 @@ mod tests {
 
     #[test]
     fn unrelated_column_names_are_left_alone() {
-        // 括弧を伴わない裸の識別子は current_date/current_timestamp/
-        // current_time の 3 つだけを対象にする。他の名前（列名でありうる
-        // もの）は触らない。
+        // Only current_date/current_timestamp/current_time are targeted as bare
+        // identifiers without parentheses. Other names (which could be column names)
+        // are left alone.
         assert!(matches!(
             literal_of("SELECT today", T),
             Expr::ColumnRef { qualifier: None, name } if name == "today"

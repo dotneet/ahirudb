@@ -1,7 +1,7 @@
-//! スカラ値。定数畳み込み、統計値の比較、結果の取り出しに使う。
+//! Scalar values. Used for constant folding, comparing statistics, and extracting results.
 //!
-//! ホットループでは使わない（1 行ごとに `Value` を作るのは遅い）。
-//! ベクタ化カーネルが扱えない境界だけで使うこと。
+//! Not for hot loops (building a `Value` per row is slow).
+//! Use it only at boundaries the vectorized kernels cannot handle.
 
 use crate::prelude::*;
 use crate::vector::Ty;
@@ -22,7 +22,7 @@ impl Value {
         matches!(self, Value::Null)
     }
 
-    /// 整数として取り出す。範囲外・型違いは `None`。
+    /// Extracts as an integer. Out of range or of the wrong type gives `None`.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::I32(v) => Some(*v as i64),
@@ -57,7 +57,7 @@ impl Value {
         }
     }
 
-    /// リテラルから推論される既定の型。
+    /// The default type inferred from a literal.
     pub fn default_ty(&self) -> Ty {
         match self {
             Value::Null => Ty::Null,
@@ -70,8 +70,8 @@ impl Value {
         }
     }
 
-    /// 同じ物理型同士の順序比較。NULL が絡む場合は `None`。
-    /// 統計を使った枝刈り（min/max 比較）で使う。
+    /// Ordering comparison between the same physical type. `None` when NULL is involved.
+    /// Used by statistics-based pruning (min/max comparison).
     pub fn partial_cmp_same(&self, other: &Value) -> Option<core::cmp::Ordering> {
         use Value::*;
         match (self, other) {
@@ -96,8 +96,8 @@ impl PartialEq for Value {
             (I32(a), I32(b)) => a == b,
             (I64(a), I64(b)) => a == b,
             (I128(a), I128(b)) => a == b,
-            // 定数畳み込みの同一性判定用。NaN == NaN を真とする点で SQL の
-            // 比較演算とは意図的に異なる。
+            // For identity checks in constant folding. Treating NaN == NaN as true
+            // deliberately differs from SQL's comparison operators.
             (F64(a), F64(b)) => a == b || (a.is_nan() && b.is_nan()),
             (Bytes(a), Bytes(b)) => a == b,
             _ => false,

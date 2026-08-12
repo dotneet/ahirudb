@@ -1,33 +1,38 @@
-//! LIST/MAP など REPEATED を含む列を Dremel 方式で組み立て、`Ty::Json`
-//! （物理表現は UTF-8 の JSON テキスト、`PhysType::Bytes`）の 1 列にする。
+//! Assemble columns containing REPEATED fields (LIST/MAP, etc.) via the Dremel
+//! algorithm into a single `Ty::Json` column (physical representation: UTF-8
+//! JSON text, `PhysType::Bytes`).
 //!
-//! ## Dremel 組み立ての要点
+//! ## Key points of Dremel assembly
 //!
-//! Parquet の REPEATED フィールドは、値ごとに repetition level（どの階層で
-//! 新しいくり返しが始まったか）と definition level（NULL ならどこで
-//! 経路が途切れたか）が付く。あるノードの「存在するか」は
-//! `def_level >= node.def_depth` で判定でき、REPEATED ノードの「まだ同じ
-//! 配列の続きか」は `next.rep_level >= node.rep_depth` で判定できる
-//! （`node.def_depth`/`node.rep_depth` はスキーマ解決時に
-//! `schema::build_nested_node` が経路全体から積算済み）。
+//! Each value of a Parquet REPEATED field carries a repetition level (which
+//! level a new repetition started at) and a definition level (where along the
+//! path it broke off, if NULL). Whether a given node "is present" can be
+//! determined by `def_level >= node.def_depth`, and whether a REPEATED node
+//! "is still the same array" can be determined by
+//! `next.rep_level >= node.rep_depth` (`node.def_depth`/`node.rep_depth` are
+//! precomputed during schema resolution by accumulating the entire path in
+//! `schema::build_nested_node`).
 //!
-//! これを使うと、1 つのリーフの中身は「代表リーフを 1 つ覗き見て、存在
-//! しなければ配下の全リーフから境界エントリを 1 つずつ捨てて NULL、
-//! 存在すれば中身を組み立てる（REPEATED ならこれを配列としてくり返す）」
-//! という単純な再帰に落ちる。複数のリーフ（STRUCT のフィールド、MAP の
-//! key/value）は互いのカーソルを一切参照せず、それぞれが自分の
-//! def_level/rep_level だけを見て独立に消費個数を決める
-//! （Parquet のシュレッディング規約がそれを保証する）。
+//! Using this, the content of one leaf reduces to a simple recursion: "peek
+//! at one representative leaf; if it's absent, discard one boundary entry
+//! from every leaf underneath and produce NULL; if it's present, assemble the
+//! contents (and if REPEATED, repeat this as an array)". Multiple leaves
+//! (STRUCT fields, MAP key/value) never reference each other's cursors at
+//! all -- each independently decides how many entries to consume, looking
+//! only at its own def_level/rep_level (guaranteed by Parquet's shredding
+//! convention).
 //!
-//! ## I/O バリアとの関係
+//! ## Relation to the I/O barrier
 //!
-//! ページ読み取り自体は既存の仕組み（ページヘッダは非圧縮なので復号前に
-//! 走査できる、内蔵していないコーデックはホストに委譲する）に従う。
-//! 入れ子列は複数の物理列チャンクにまたがるので、`format::parquet` 側が
-//! 分割の開始時点で全リーフぶんのバイト範囲を確定させ、ここには常に
-//! 「そのリーフの列チャンク全体」を渡す（ページ単位の絞り込みはしない。
-//! REPEATED 列は 1 ページの値数と行数が一致しないため、既存のページ選択
-//! ロジック（`first_row_index` 前提）をそのまま使い回せない）。
+//! Page reading itself follows the existing mechanism (page headers are
+//! uncompressed, so they can be scanned before decoding; codecs that aren't
+//! built in are delegated to the host). Since a nested column spans multiple
+//! physical column chunks, `format::parquet` determines the byte range for
+//! every leaf up front, at the start of the split, and always passes "the
+//! entire column chunk for that leaf" here (there is no per-page narrowing:
+//! REPEATED columns don't have a 1:1 ratio between a page's value count and
+//! the row count, so the existing page-selection logic, which assumes
+//! `first_row_index`, can't be reused as-is).
 
 use alloc::borrow::Cow;
 
@@ -40,22 +45,24 @@ use crate::parquet::*;
 use crate::prelude::*;
 use crate::vector::{Ty, Value, Vector};
 
-/// 動的に組み立てる JSON 値。数値は事前に整形したトークンのバイト列を
-/// そのまま埋め込む（自前の 10 進変換は行わず `expr::kernels::fmt_int`/
-/// `fmt_f64`、日時は `expr::funcs::fmt_*` を再利用する。どちらもこの
-/// クレート内 `pub(crate)` の既存実装で、`format!`/`core::fmt` は使わない）。
+/// A JSON value assembled dynamically. Numbers are embedded directly as
+/// pre-formatted token byte sequences (we reuse the existing
+/// `expr::kernels::fmt_int`/`fmt_f64` rather than rolling our own decimal
+/// conversion, and `expr::funcs::fmt_*` for date/time; both are existing
+/// `pub(crate)` implementations within this crate, and neither uses
+/// `format!`/`core::fmt`).
 enum JsonValue {
     Null,
     Bool(bool),
-    /// 妥当な JSON 数値トークン（符号・数字・小数点・指数部のみ）。
+    /// A valid JSON number token (sign, digits, decimal point, exponent only).
     Num(Vec<u8>),
-    /// 生バイト列。直列化時にエスケープする。
+    /// Raw byte string. Escaped at serialization time.
     Str(Vec<u8>),
     Array(Vec<JsonValue>),
     Object(Vec<(String, JsonValue)>),
 }
 
-// --- 直列化 ------------------------------------------------------------
+// --- Serialization ------------------------------------------------------
 
 fn write_json(v: &JsonValue, out: &mut Vec<u8>) {
     match v {
@@ -125,10 +132,11 @@ fn hex_encode(bytes: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// リーフの `Value` を、その論理型に応じて JSON 表現へ変換する。
-/// 数値の整形は `expr::kernels`、日時は `expr::funcs` の既存実装に委ねる
-/// （このクレートの CAST や CSV/JSONL 書き出しと同じ土台を使うことで、
-/// 独自の丸め・書式の食い違いを避ける）。
+/// Convert a leaf's `Value` into its JSON representation according to its
+/// logical type. Number formatting is delegated to `expr::kernels`, and
+/// date/time to the existing `expr::funcs` implementations (using the same
+/// foundation as this crate's CAST and CSV/JSONL export avoids discrepancies
+/// from a separate rounding/formatting implementation).
 fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
     match v {
         Value::Null => JsonValue::Null,
@@ -158,7 +166,7 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
             if x.is_finite() {
                 kernels::fmt_f64(x, &mut b);
             } else {
-                // JSON に NaN/Infinity は無い。DuckDB の to_json も NULL に潰す。
+                // JSON has no NaN/Infinity. DuckDB's to_json collapses these to NULL too.
                 b.extend_from_slice(b"null");
             }
             JsonValue::Num(b)
@@ -172,7 +180,7 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
                 }
                 JsonValue::Str(h)
             }
-            // BLOB は JSON に直接の対応が無いので 16 進文字列にする。
+            // BLOB has no direct JSON equivalent, so it becomes a hex string.
             _ => {
                 let mut h = Vec::new();
                 hex_encode(&b, &mut h);
@@ -202,18 +210,18 @@ fn int_like_to_json(ty: Ty, x: i128) -> JsonValue {
     }
 }
 
-// --- リーフごとのレベル + 値の読み取り -------------------------------------
+// --- Reading levels + values per leaf --------------------------------------
 
-/// 1 リーフ列ぶんの、全ページを通した repetition/definition level と、
-/// 値が存在するエントリだけを詰めた密な値ベクタ。
+/// The repetition/definition levels across every page for one leaf column,
+/// plus a dense value vector packed with only the entries that have a value.
 struct LeafRuns {
     rep: Vec<u16>,
     def: Vec<u16>,
     values: Vector,
 }
 
-/// v1: 4 バイト長前置の RLE レベルストリームを読む。`max_level == 0` なら
-/// ストリーム自体が省略される（全エントリ 0 と決め打つ）。
+/// v1: read a 4-byte-length-prefixed RLE level stream. When `max_level == 0`
+/// the stream itself is omitted (every entry is assumed to be 0).
 fn read_levels_v1(page: &[u8], n: usize, max_level: u16) -> Result<(Vec<u16>, usize)> {
     if max_level == 0 {
         return Ok((vec![0u16; n], 0));
@@ -228,7 +236,7 @@ fn read_levels_v1(page: &[u8], n: usize, max_level: u16) -> Result<(Vec<u16>, us
     Ok((raw.into_iter().map(|v| v as u16).collect(), 4 + len))
 }
 
-/// v2: 長さは `DataPageHeaderV2` のフィールドで既知なので前置は無い。
+/// v2: the length is already known from a `DataPageHeaderV2` field, so there is no prefix.
 fn read_levels_v2(data: &[u8], n: usize, max_level: u16) -> Result<Vec<u16>> {
     if max_level == 0 {
         return Ok(vec![0u16; n]);
@@ -240,10 +248,10 @@ fn read_levels_v2(data: &[u8], n: usize, max_level: u16) -> Result<Vec<u16>> {
     Ok(raw.into_iter().map(|v| v as u16).collect())
 }
 
-/// データページ v1 を 1 枚読み、repetition level → definition level → 値
-/// の順で消費する（v1 のページ内レイアウト）。`reader::read_data_page_v1`
-/// と違い repetition level を読む点、値を NULL 込みで散らばせず密なまま
-/// 追記する点が異なる。
+/// Read a single v1 data page, consuming repetition level -> definition
+/// level -> values in that order (the v1 in-page layout). Unlike
+/// `reader::read_data_page_v1`, this also reads the repetition level, and it
+/// appends values densely instead of scattering them with NULLs interleaved.
 #[allow(clippy::too_many_arguments)]
 fn read_nested_page_v1(
     desc: &ColumnDesc,
@@ -284,8 +292,8 @@ fn read_nested_page_v1(
     Ok(())
 }
 
-/// データページ v2 を 1 枚読む。レベルは非圧縮でページ先頭に置かれ、値
-/// 部分だけが（あれば）圧縮される。
+/// Read a single v2 data page. The levels sit uncompressed at the start of
+/// the page, and only the value portion is compressed (if at all).
 #[allow(clippy::too_many_arguments)]
 fn read_nested_page_v2(
     desc: &ColumnDesc,
@@ -328,11 +336,12 @@ fn read_nested_page_v2(
     Ok(())
 }
 
-/// 1 リーフの列チャンク全体（辞書ページ + データページ群）を読み、
-/// repetition/definition level と密な値ベクタにする。フラット列の
-/// `reader::read_column_chunk` と違い、行数ではなくバッファを使い切る
-/// ことをループの終了条件にする（REPEATED 列は 1 ページの値数がそのまま
-/// 行数にならないため）。
+/// Read one leaf's entire column chunk (dictionary page + data pages) into
+/// repetition/definition levels and a dense value vector. Unlike the flat
+/// column's `reader::read_column_chunk`, the loop's termination condition is
+/// exhausting the buffer rather than reaching the row count (because a
+/// REPEATED column's per-page value count doesn't map directly onto the row
+/// count).
 fn read_nested_leaf_chunk(
     info: &LeafDecodeInfo,
     meta: &ColumnMetaData,
@@ -340,8 +349,8 @@ fn read_nested_leaf_chunk(
     chunk_start: u64,
     cache: &dyn PageCache,
 ) -> Result<LeafRuns> {
-    // decode_dense 等の再利用のためだけの一時 ColumnDesc。物理デコードに
-    // 必要な情報 (ty/ptype/type_length/time_unit) だけを埋める。
+    // A throwaway ColumnDesc, only for reusing decode_dense and friends.
+    // Only the information needed for physical decoding (ty/ptype/type_length/time_unit) is filled in.
     let desc = ColumnDesc {
         name: String::new(),
         ty: info.ty,
@@ -402,17 +411,18 @@ fn read_nested_leaf_chunk(
                 &mut values,
                 cache,
             )?,
-            // 実際には書かれないページ種別。読み飛ばす。
+            // A page type that is never actually written. Skip it.
             PageType::IndexPage => {}
         }
     }
     Ok(LeafRuns { rep, def, values })
 }
 
-// --- Dremel 組み立て ---------------------------------------------------
+// --- Dremel assembly -----------------------------------------------------
 
-/// 1 リーフを読み進めるためのカーソル。`pos` は生エントリ（NULL 含む）の
-/// 添字、`val_idx` は値が存在するエントリだけを数える別添字。
+/// A cursor for advancing through one leaf. `pos` indexes raw entries
+/// (including NULLs); `val_idx` is a separate index counting only entries
+/// that have a value.
 struct LeafCursor<'a> {
     ty: Ty,
     rep: &'a [u16],
@@ -423,8 +433,9 @@ struct LeafCursor<'a> {
 }
 
 impl<'a> LeafCursor<'a> {
-    /// 今の位置の `(repetition level, definition level)`。行の途中で尽きる
-    /// のは壊れたファイル（宣言された行数と実際のレベル列が食い違う）。
+    /// The `(repetition level, definition level)` at the current position.
+    /// Running out mid-row means a corrupted file (the declared row count
+    /// disagrees with the actual level arrays).
     #[inline]
     fn peek(&self) -> Result<(u16, u16)> {
         match (self.rep.get(self.pos), self.def.get(self.pos)) {
@@ -433,8 +444,9 @@ impl<'a> LeafCursor<'a> {
         }
     }
 
-    /// くり返し継続判定用。列の終端（次のリーフ/行が無い）は正常系なので
-    /// `None` を返す。
+    /// Used to decide whether repetition continues. Reaching the end of the
+    /// column (no next leaf/row) is a normal condition, so this returns
+    /// `None`.
     #[inline]
     fn peek_opt(&self) -> Option<(u16, u16)> {
         match (self.rep.get(self.pos), self.def.get(self.pos)) {
@@ -456,8 +468,8 @@ impl<'a> LeafCursor<'a> {
     }
 }
 
-/// ノード 1 個ぶんを組み立てる。REPEATED なら配列、それ以外なら
-/// 単発の値（NULL もあり得る）。
+/// Assemble one node. An array if REPEATED, otherwise a single value
+/// (which may be NULL).
 fn assemble(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     if node.repetition == Repetition::Repeated {
         assemble_repeated(node, cursors)
@@ -466,9 +478,9 @@ fn assemble(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> 
     }
 }
 
-/// 非 REPEATED ノード。代表リーフの definition level がこのノードの
-/// `def_depth` に届いていなければ、配下の全リーフから境界エントリを 1 つ
-/// ずつ消費して NULL を返す。
+/// A non-REPEATED node. If the representative leaf's definition level
+/// doesn't reach this node's `def_depth`, consume one boundary entry from
+/// every leaf underneath and return NULL.
 fn assemble_single(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     let (_, def) = cursors[node.rep_leaf].peek()?;
     if def < node.def_depth {
@@ -478,9 +490,10 @@ fn assemble_single(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<Json
     render_present(node, cursors)
 }
 
-/// REPEATED ノード。0 要素なら空配列（境界エントリを 1 つ消費するだけ）。
-/// 1 要素以上なら、代表リーフの repetition level がこのノードの
-/// `rep_depth` 以上である限り「同じ配列の続き」として要素を読み続ける。
+/// A REPEATED node. Zero elements yields an empty array (just consuming one
+/// boundary entry). With one or more elements, keep reading elements as
+/// "continuations of the same array" for as long as the representative
+/// leaf's repetition level is at least this node's `rep_depth`.
 fn assemble_repeated(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     let mut items = Vec::new();
     loop {
@@ -498,9 +511,10 @@ fn assemble_repeated(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<Js
     Ok(JsonValue::Array(items))
 }
 
-/// ノードが「存在しない」と確定したとき、配下の全リーフから境界エントリを
-/// ちょうど 1 つずつ消費する（Parquet のシュレッディング規約により、
-/// 経路のどこで途切れても配下のリーフは必ずこの 1 エントリを持つ）。
+/// Once a node is determined to be "absent", consume exactly one boundary
+/// entry from every leaf underneath it (Parquet's shredding convention
+/// guarantees that, no matter where along the path things broke off, every
+/// leaf underneath always has this one entry).
 fn consume_boundary(node: &NestedNode, cursors: &mut [LeafCursor]) {
     match &node.content {
         NestedContent::Leaf(idx) => cursors[*idx].advance_raw(),
@@ -512,9 +526,10 @@ fn consume_boundary(node: &NestedNode, cursors: &mut [LeafCursor]) {
     }
 }
 
-/// 非 REPEATED ノードの「存在する」中身を描画する。子が 1 個かつそれ自身が
-/// REPEATED なら（LIST/MAP ラッパー group）名前を作らずそのまま委譲する
-/// （でなければ `{"list": [...]}` のような余計な階層ができてしまう）。
+/// Render the "present" contents of a non-REPEATED node. If it has exactly
+/// one child and that child is itself REPEATED (a LIST/MAP wrapper group),
+/// delegate straight through without creating a name (otherwise we'd get an
+/// extra layer of nesting like `{"list": [...]}`).
 fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
         NestedContent::Leaf(idx) => Ok(take_leaf_value(*idx, cursors)),
@@ -531,11 +546,12 @@ fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonV
     }
 }
 
-/// REPEATED ノードの「1 要素ぶん」を描画する。子が 1 個なら（3 段/2 段
-/// エンコーディングの中間 group、または LIST<STRUCT> の element）その子を
-/// そのまま要素として使う（`render_present` と違い、REPEATED かどうかは
-/// 問わない ―― repeated ノード自身の唯一の子は常にラップせず透過する）。
-/// 子が 2 個以上なら（MAP の key/value など）名前つきオブジェクトにする。
+/// Render "one element's worth" of a REPEATED node. If it has exactly one
+/// child (the intermediate group of 3-level/2-level encoding, or the element
+/// of a LIST<STRUCT>), use that child directly as the element (unlike
+/// `render_present`, this doesn't care whether it's REPEATED -- the sole
+/// child of a repeated node is always passed through unwrapped). If it has
+/// two or more children (e.g. a MAP's key/value), it becomes a named object.
 fn render_element(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
         NestedContent::Leaf(idx) => Ok(take_leaf_value(*idx, cursors)),
@@ -559,15 +575,15 @@ fn take_leaf_value(idx: usize, cursors: &mut [LeafCursor]) -> JsonValue {
     leaf_value_to_json(ty, v)
 }
 
-// --- 入口 ----------------------------------------------------------------
+// --- Entry point ----------------------------------------------------------
 
-/// 入れ子列 (LIST/MAP など REPEATED を含む部分木) を組み立てて 1 本の
-/// `Ty::Json` ベクタにする。
+/// Assemble a nested column (a subtree containing REPEATED fields like
+/// LIST/MAP) into a single `Ty::Json` vector.
 ///
-/// `chunks` は `desc.leaves`/`desc.phys_cols` と同じ順序で、各リーフの
-/// `(列メタデータ, 列チャンク全体のバイト列, ファイル上の開始オフセット)`。
-/// ページ選択はしない（呼び出し側は常に列チャンク全体を渡す。理由は
-/// モジュール冒頭のコメントを参照）。
+/// `chunks` is in the same order as `desc.leaves`/`desc.phys_cols`: for each
+/// leaf, `(column metadata, entire column chunk byte range, file offset where
+/// it starts)`. No page selection happens here (the caller always passes the
+/// whole column chunk; see the comment at the top of the module for why).
 pub fn read_nested_column(
     desc: &ColumnDesc,
     chunks: &[(&ColumnMetaData, &[u8], u64)],
@@ -611,8 +627,9 @@ pub fn read_nested_column(
         }
     }
 
-    // 全リーフのカーソルが厳密に使い切られているか（宣言された行数ぶん
-    // 過不足なく消費できたか）を確認する。壊れたファイルの検出に使う。
+    // Verify that every leaf's cursor has been exactly exhausted (that
+    // consumption matched the declared row count with nothing left over or
+    // missing). Used to detect corrupted files.
     for c in &cursors {
         ensure!(c.pos == c.rep.len() && c.pos == c.def.len(), BadCompressedData);
     }

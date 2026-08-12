@@ -1,35 +1,35 @@
-//! 集合演算（UNION / INTERSECT / EXCEPT）。
+//! Set operations (UNION / INTERSECT / EXCEPT).
 //!
-//! 行の同一判定は `exec::rowkey::encode_key` に寄せる。集約・結合と同じ関数を
-//! 使うことで NULL / -0.0 / NaN の扱いがずれない。とくに集合演算では
-//! **NULL は NULL と等しい**（`=` とは違う）必要があり、`encode_key` は
-//! ちょうどその意味論を実装している。ハッシュ表も `rowkey::HashIndex` を使う。
-//! 表を 2 つ持つとコードサイズを損するだけで得が無い。
+//! Row identity is delegated to `exec::rowkey::encode_key`. Using the same function as
+//! aggregation and joins keeps the handling of NULL / -0.0 / NaN from drifting. In particular,
+//! set operations need **NULL to equal NULL** (unlike `=`), and `encode_key` implements exactly
+//! those semantics. The hash table is `rowkey::HashIndex` too.
+//! Carrying two tables would only cost code size with nothing gained.
 //!
-//! ## ブロッキングの度合いと再開
+//! ## How much it blocks, and resumption
 //!
-//! - `UNION ALL` は重複を残すので**素通し**。左を流し切ってから右を流すだけで、
-//!   1 行も溜めない（`Phase::Left → Right`）。
-//! - `UNION`（DISTINCT）も行は溜めない。既出キーの集合だけ持って、左右の
-//!   バッチを selection で絞りながら流す。行バッファを持つより明確に軽い。
-//! - `INTERSECT` / `EXCEPT` は**右を読み切ってから**でないと左の 1 行目を
-//!   判定できない。`Phase::BuildRight` で右のキーと出現数を作り、その後
-//!   `Phase::Left` で左を流す。
+//! - `UNION ALL` keeps duplicates and is a **pass-through**. It streams the left through and
+//!   then the right, buffering not a single row (`Phase::Left -> Right`).
+//! - `UNION` (DISTINCT) buffers no rows either. It keeps only the set of seen keys and streams
+//!   both sides' batches while narrowing them with selection. Clearly lighter than a row buffer.
+//! - `INTERSECT` / `EXCEPT` cannot judge the left's first row **until the right is read
+//!   through**. `Phase::BuildRight` builds the right's keys and occurrence counts, after which
+//!   `Phase::Left` streams the left.
 //!
-//! どの段でも入力は `Step::NeedIo` / `NeedCodec` を返しうる。中断はそのまま
-//! 上へ返し、途中状態（フェーズ・ハッシュ表・出現数）は `self` に残るので、
-//! 次の `next()` は同じ場所から入力を引き直す（DESIGN.md §6）。1 バッチは
-//! 「丸ごと処理した」か「まだ触っていない」かのどちらかしかない。
+//! At any stage the input can return `Step::NeedIo` / `NeedCodec`. Interruptions are returned
+//! straight up, and the partial state (phase, hash table, occurrence counts) stays in `self`, so
+//! the next `next()` pulls the input again from the same place (DESIGN.md §6). A batch is either
+//! "fully processed" or "not touched yet".
 //!
-//! ## 重複の数（DuckDB で照合済み）
+//! ## Duplicate counts (cross-checked with DuckDB)
 //!
-//! - `INTERSECT ALL` は `min(左の出現数, 右の出現数)` 件残す。
-//! - `EXCEPT ALL` は `max(0, 左の出現数 - 右の出現数)` 件残す。
-//! - DISTINCT 版は出力自体も重複除去する。
+//! - `INTERSECT ALL` keeps `min(left count, right count)`.
+//! - `EXCEPT ALL` keeps `max(0, left count - right count)`.
+//! - The DISTINCT versions also deduplicate the output itself.
 //!
-//! ## メモリ
+//! ## Memory
 //!
-//! スピルは持たない。キー集合が `MAX_STATE_BYTES` を超えたら `Oom` を返す。
+//! There is no spilling. Once the key set exceeds `MAX_STATE_BYTES` it returns `Oom`.
 
 use crate::exec::rowkey::{encode_key, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
@@ -37,17 +37,17 @@ use crate::plan::SetOpKind;
 use crate::prelude::*;
 use crate::vector::{Batch, PhysType, Vector};
 
-/// キー集合に許すおおよそのバイト数。超えたら `Oom`。
-/// 集約（64MiB）と同じ水準に揃える。行本体は持たずキーだけなので、
-/// これで足りない入力は集約でも通らない。
+/// The approximate byte budget allowed for the key set. Exceeding it gives `Oom`.
+/// Set to the same level as aggregation (64 MiB). Only keys, not the rows themselves, are held,
+/// so any input for which this is not enough would not pass aggregation either.
 const MAX_STATE_BYTES: usize = 64 << 20;
 
 enum Phase {
-    /// INTERSECT / EXCEPT で、右のキー集合を作っている。
+    /// For INTERSECT / EXCEPT, building the right's key set.
     BuildRight,
-    /// 左を流している。
+    /// Streaming the left.
     Left,
-    /// UNION で、右を流している。
+    /// For UNION, streaming the right.
     Right,
     Done,
 }
@@ -59,18 +59,18 @@ pub struct SetOp {
     all: bool,
     phase: Phase,
 
-    /// 左右の列の物理型。最初に見たバッチで決め、以降は照合する。
-    /// バインダが型を揃えている前提だが、ずれるとキーの長さが変わって
-    /// 「一致しない」という形で静かに壊れるので実行時にも見る。
+    /// The physical types of the left and right columns. Decided from the first batch seen and checked thereafter.
+    /// The binder is assumed to have aligned the types, but a mismatch would change the key
+    /// length and break things silently as "no match", so it is checked at runtime too.
     shape: Option<Vec<PhysType>>,
 
-    /// 右のキー → `counts` の添字（INTERSECT / EXCEPT のみ）。
+    /// The right's key -> an index into `counts` (INTERSECT / EXCEPT only).
     index: HashIndex,
-    /// 右におけるキーの残り出現数。ALL の件数調整で減らしていく。
+    /// The remaining occurrences of a key on the right. Decremented to adjust counts for ALL.
     counts: Vec<u32>,
-    /// 出力の重複除去（DISTINCT 系のみ）。
+    /// Output deduplication (the DISTINCT family only).
     seen: HashIndex,
-    /// `encode_key` の書き込み先。行ごとに確保しないよう使い回す。
+    /// The destination `encode_key` writes to. Reused rather than allocated per row.
     keybuf: Vec<u8>,
 }
 
@@ -81,7 +81,7 @@ impl SetOp {
         op: SetOpKind,
         all: bool,
     ) -> Result<Self> {
-        // UNION は右を溜める必要が無いので、いきなり左から流し始める。
+        // UNION need not buffer the right, so it starts streaming from the left immediately.
         let phase = if op == SetOpKind::Union { Phase::Left } else { Phase::BuildRight };
         Ok(SetOp {
             left,
@@ -97,18 +97,18 @@ impl SetOp {
         })
     }
 
-    /// 重複を一切見ない素通しか。
+    /// Whether it is a pass-through that never looks at duplicates.
     #[inline]
     fn pass_through(&self) -> bool {
         self.op == SetOpKind::Union && self.all
     }
 
-    /// おおよそのメモリ使用量。上限判定にしか使わない。
+    /// The approximate memory usage. Used only for the cap check.
     fn mem_used(&self) -> usize {
         self.index.approx_bytes() + self.counts.len() * 4 + self.seen.approx_bytes()
     }
 
-    /// 列数と物理型が左右で揃っていることを確かめる。
+    /// Confirms the column count and physical types agree between left and right.
     fn check_shape(&mut self, batch: &Batch) -> Result<()> {
         match &self.shape {
             Some(s) => {
@@ -122,13 +122,13 @@ impl SetOp {
         Ok(())
     }
 
-    /// 右バッチ 1 つをキー集合へ取り込む。**途中で抜けない**。
+    /// Takes one right batch into the key set. **It never bails out midway**.
     fn absorb_right(&mut self, mut batch: Batch) -> Result<()> {
         if batch.card() == 0 {
             return Ok(());
         }
         self.check_shape(&batch)?;
-        // 以降は行番号で引くので selection をここで畳む。
+        // From here on lookups are by row number, so selection is materialized now.
         batch.materialize();
         let rows = batch.num_rows();
         let refs: Vec<&Vector> = batch.cols.iter().collect();
@@ -140,7 +140,7 @@ impl SetOp {
             }
             match self.counts.get_mut(slot as usize) {
                 Some(c) => {
-                    // 出現数は u32。これを超える重複は諦める。
+                    // The occurrence count is u32. Duplication beyond that is given up on.
                     ensure!(*c < u32::MAX, LimitExceeded);
                     *c += 1;
                 }
@@ -151,13 +151,13 @@ impl SetOp {
         Ok(())
     }
 
-    /// 左（または UNION の右）のバッチ 1 つを絞り込む。
-    /// `None` は「出力は無いが状態は進んだ」。
+    /// Narrows one batch of the left (or, for UNION, the right).
+    /// `None` means "no output, but state advanced".
     fn filter(&mut self, mut batch: Batch) -> Result<Option<Step>> {
         if batch.card() == 0 {
             return Ok(None);
         }
-        // 列数・物理型の検査は selection と無関係なので畳む前に済ませる。
+        // The column-count and physical-type checks are independent of selection, so they run before materializing.
         self.check_shape(&batch)?;
         if self.pass_through() {
             return Ok(Some(Step::Ready(batch)));
@@ -174,7 +174,7 @@ impl SetOp {
         }
         ensure!(self.mem_used() <= MAX_STATE_BYTES, Oom);
         if sel.is_empty() {
-            // 空バッチは上へ返さない。
+            // An empty batch is not returned upstream.
             return Ok(None);
         }
         if sel.len() < rows {
@@ -183,10 +183,10 @@ impl SetOp {
         Ok(Some(Step::Ready(batch)))
     }
 
-    /// `keybuf` の行を出力するか。ALL では出現数も同時に消費する。
+    /// Whether to emit `keybuf`'s row. Under ALL it also consumes an occurrence.
     ///
-    /// UNION では右側もここを通るが、UNION の判定は左右で同じなので
-    /// どちら側かを渡す必要はない（INTERSECT / EXCEPT は右を流さない）。
+    /// Under UNION the right side passes through here too, but UNION's decision is the same for
+    /// both sides, so there is no need to say which side it is (INTERSECT / EXCEPT never stream the right).
     fn keep(&mut self) -> bool {
         let qualifies = match self.op {
             SetOpKind::Union => true,
@@ -196,7 +196,7 @@ impl SetOp {
                     if !self.all {
                         true
                     } else {
-                        // 右の在庫がある間だけ出す → min(左, 右) 件。
+                        // Emit only while the right's stock lasts -> min(left, right) rows.
                         match self.counts.get_mut(slot as usize) {
                             Some(c) if *c > 0 => {
                                 *c -= 1;
@@ -213,8 +213,8 @@ impl SetOp {
                     if !self.all {
                         false
                     } else {
-                        // 右の在庫を先に食い潰し、余った分だけ出す
-                        // → max(0, 左 - 右) 件。
+                        // Consume the right's stock first and emit only the surplus
+                        // -> max(0, left - right) rows.
                         match self.counts.get_mut(slot as usize) {
                             Some(c) if *c > 0 => {
                                 *c -= 1;
@@ -229,7 +229,7 @@ impl SetOp {
         if !qualifies {
             return false;
         }
-        // DISTINCT 版は出力自体も重複除去する。
+        // The DISTINCT versions deduplicate the output itself too.
         self.all || self.seen.get_or_insert(&self.keybuf).1
     }
 }
@@ -240,7 +240,7 @@ impl Operator for SetOp {
             match self.phase {
                 Phase::BuildRight => match self.right.next(ctx)? {
                     Step::Ready(b) => self.absorb_right(b)?,
-                    // 作りかけのキー集合を保ったまま抜ける。次回はここから再開。
+                    // Exits with the partially built key set intact. Next time it resumes from here.
                     Step::NeedIo => return Ok(Step::NeedIo),
                     Step::NeedCodec => return Ok(Step::NeedCodec),
                     Step::Done => self.phase = Phase::Left,
@@ -254,7 +254,7 @@ impl Operator for SetOp {
                     Step::NeedIo => return Ok(Step::NeedIo),
                     Step::NeedCodec => return Ok(Step::NeedCodec),
                     Step::Done => {
-                        // UNION だけが右も出力する。
+                        // Only UNION emits the right as well.
                         self.phase =
                             if self.op == SetOpKind::Union { Phase::Right } else { Phase::Done };
                     }
@@ -282,7 +282,7 @@ mod tests {
     use crate::expr::vm::Vm;
     use crate::vector::{Ty, Value, BATCH_SIZE};
 
-    // --- 組み立てヘルパ -----------------------------------------------------
+    // --- Construction helpers -----------------------------------------------
 
     fn ints(vals: &[Option<i32>]) -> Vector {
         let mut v = Vector::new(Ty::Int);
@@ -306,7 +306,7 @@ mod tests {
         v
     }
 
-    // --- モック入力 ---------------------------------------------------------
+    // --- Mock inputs --------------------------------------------------------
 
     enum Script {
         Rows(Vec<Vector>),
@@ -333,7 +333,7 @@ mod tests {
             }
             let i = self.pos;
             self.pos += 1;
-            // 中断は「ホストの応答を待った」ことにして消費する。
+            // An interruption is consumed as though "the host's response was awaited".
             Ok(match &self.steps[i] {
                 Script::NeedIo => Step::NeedIo,
                 Script::NeedCodec => Step::NeedCodec,
@@ -342,12 +342,12 @@ mod tests {
         }
     }
 
-    /// 1 列（INT）1 バッチの台本。
+    /// A script of one column (INT) in one batch.
     fn one(vals: &[Option<i32>]) -> Vec<Script> {
         vec![Script::Rows(vec![ints(vals)])]
     }
 
-    // --- 実行ヘルパ ---------------------------------------------------------
+    // --- Execution helpers --------------------------------------------------
 
     fn drive(l: Vec<Script>, r: Vec<Script>, op: SetOpKind, all: bool) -> Vec<Vec<Value>> {
         let mut o = SetOp::new(Mock::new(l), Mock::new(r), op, all).unwrap();
@@ -355,13 +355,13 @@ mod tests {
         let mut vm = Vm::new();
         let mut rows = Vec::new();
         for guard in 0..100_000 {
-            assert!(guard < 99_999, "終わらない");
+            assert!(guard < 99_999, "does not terminate");
             let mut ctx =
                 ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
             match o.next(&mut ctx).unwrap() {
                 Step::Ready(b) => {
                     let n = b.card();
-                    assert!(n > 0, "空バッチを返してはいけない");
+                    assert!(n > 0, "an empty batch must not be returned");
                     assert!(n <= BATCH_SIZE);
                     for i in 0..n {
                         let r = match &b.sel {
@@ -378,7 +378,7 @@ mod tests {
         rows
     }
 
-    /// 出力を「第 1 列の値」の昇順（NULL は末尾）で並べた比較しやすい形に落とす。
+    /// Flattens the output into an easily compared form, sorted ascending by the first column's value (NULLs last).
     fn sorted(rows: Vec<Vec<Value>>) -> Vec<Option<i64>> {
         let mut v: Vec<Option<i64>> = rows.iter().map(|r| r[0].as_i64()).collect();
         v.sort_by(|a, b| match (a, b) {
@@ -394,7 +394,7 @@ mod tests {
         sorted(drive(one(l), one(r), op, all))
     }
 
-    // --- 6 通り（DuckDB で照合済み） ----------------------------------------
+    // --- All six variants (cross-checked with DuckDB) -----------------------
 
     // a = [1,1,1,2,NULL,NULL,3] / b = [1,1,2,2,NULL,4]
     const A: [Option<i32>; 7] = [Some(1), Some(1), Some(1), Some(2), None, None, Some(3)];
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn union_distinct() {
-        // NULL は NULL と同じ行とみなすので 1 つだけ残る。
+        // NULL counts as the same row as NULL, so only one survives.
         assert_eq!(
             run(&A, &B, SetOpKind::Union, false),
             vec![Some(1), Some(2), Some(3), Some(4), None]
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn except_all_keeps_left_minus_right_count() {
-        // 1: 3-2=1 / 2: 1-2→0 / NULL: 2-1=1 / 3: 1-0=1
+        // 1: 3-2=1 / 2: 1-2->0 / NULL: 2-1=1 / 3: 1-0=1
         assert_eq!(run(&A, &B, SetOpKind::Except, true), vec![Some(1), Some(3), None]);
     }
 
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(run(&A, &B, SetOpKind::Except, false), vec![Some(3)]);
     }
 
-    // --- 中断と再開（最重要） -----------------------------------------------
+    // --- Interruption and resumption (the most important) -------------------
 
     #[test]
     fn need_io_and_need_codec_match_uninterrupted_run() {
@@ -465,7 +465,7 @@ mod tests {
         let script = |v: &[Option<i32>], interrupted: bool| {
             let mut out = Vec::new();
             for (i, c) in chunks(v).into_iter().enumerate() {
-                // 入力の途中（先頭でも末尾でもない位置）に両方の中断を挟む。
+                // Both interruptions are interposed mid-input (neither at the start nor at the end).
                 if interrupted && i == 1 {
                     out.push(Script::NeedIo);
                 }
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(sorted(drive(l, r, SetOpKind::Intersect, false)), vec![Some(1)]);
     }
 
-    /// 中断がそのまま呼び出し元へ伝わること（握り潰していない）。
+    /// Interruptions must propagate to the caller as they are (not swallowed).
     #[test]
     fn interrupts_are_forwarded_unchanged() {
         let mut o = SetOp::new(
@@ -509,14 +509,14 @@ mod tests {
         let mut vm = Vm::new();
         let mut ctx =
             ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
-        // まず右（ビルド側）の中断。
+        // First an interruption on the right (the build side).
         assert!(matches!(o.next(&mut ctx).unwrap(), Step::NeedIo));
-        // 次に左の中断。
+        // Then one on the left.
         assert!(matches!(o.next(&mut ctx).unwrap(), Step::NeedCodec));
         assert!(matches!(o.next(&mut ctx).unwrap(), Step::Ready(_)));
     }
 
-    // --- 空入力 -------------------------------------------------------------
+    // --- Empty inputs -------------------------------------------------------
 
     #[test]
     fn empty_left_side() {
@@ -536,7 +536,11 @@ mod tests {
         assert_eq!(run(&A, &e, SetOpKind::Union, false).len(), 4);
         assert!(run(&A, &e, SetOpKind::Intersect, true).is_empty());
         assert!(run(&A, &e, SetOpKind::Intersect, false).is_empty());
-        assert_eq!(run(&A, &e, SetOpKind::Except, true).len(), 7, "右が空なら左そのまま");
+        assert_eq!(
+            run(&A, &e, SetOpKind::Except, true).len(),
+            7,
+            "an empty right leaves the left unchanged"
+        );
         assert_eq!(run(&A, &e, SetOpKind::Except, false), vec![Some(1), Some(2), Some(3), None]);
     }
 
@@ -550,7 +554,7 @@ mod tests {
         }
     }
 
-    /// 0 行のバッチだけが来ても壊れない。
+    /// It does not break when only 0-row batches arrive.
     #[test]
     fn zero_row_batches_are_ignored() {
         let l = vec![Script::Rows(vec![ints(&[])]), Script::Rows(vec![ints(&[Some(1)])])];
@@ -560,7 +564,7 @@ mod tests {
 
     // --- NULL ---------------------------------------------------------------
 
-    /// 集合演算では NULL は NULL と一致する（`=` とは違う）。
+    /// In set operations NULL matches NULL (unlike `=`).
     #[test]
     fn nulls_match_each_other() {
         let n = [None, None];
@@ -571,7 +575,7 @@ mod tests {
         assert_eq!(run(&n, &[None], SetOpKind::Union, false), vec![None]);
     }
 
-    // --- 複数列 -------------------------------------------------------------
+    // --- Several columns ----------------------------------------------------
 
     #[test]
     fn multi_column_rows() {
@@ -584,7 +588,7 @@ mod tests {
             strs(&[Some("a"), Some("z"), Some("a")]),
         ])];
         let got = drive(l, r, SetOpKind::Except, true);
-        // (1,a) と (NULL,a) は右にある。(1,b) と (2,a) が残る。
+        // (1,a) and (NULL,a) are on the right. (1,b) and (2,a) survive.
         let mut pairs: Vec<(Option<i64>, Option<String>)> = got
             .iter()
             .map(|row| {
@@ -598,8 +602,8 @@ mod tests {
         assert_eq!(pairs, vec![(Some(1), Some("b".into())), (Some(2), Some("a".into()))]);
     }
 
-    /// 列の長さで区切らずに繋いだキーだと ("a","bc") と ("ab","c") が衝突する。
-    /// `encode_key` が長さを前置しているので分かれること。
+    /// A key concatenated without length delimiters would make ("a","bc") and ("ab","c") collide.
+    /// `encode_key` prefixes the length, so they stay separate.
     #[test]
     fn multi_column_keys_are_not_confusable() {
         let l = vec![Script::Rows(vec![strs(&[Some("a")]), strs(&[Some("bc")])])];
@@ -607,18 +611,18 @@ mod tests {
         assert_eq!(drive(l, r, SetOpKind::Except, false).len(), 1);
     }
 
-    // --- 大きさ -------------------------------------------------------------
+    // --- Size ---------------------------------------------------------------
 
     #[test]
     fn more_rows_than_batch_size() {
         const N: i32 = BATCH_SIZE as i32 * 2 + 37;
-        // 左: 0..N / 右: 偶数のみ。
+        // Left: 0..N / right: the even numbers only.
         let mut l = Vec::new();
         let mut i = 0i32;
         while i < N {
             let end = (i + 500).min(N);
             l.push(Script::Rows(vec![ints(&(i..end).map(Some).collect::<Vec<_>>())]));
-            // バッチの間で毎回中断しても結果が変わらないこと。
+            // The result must not change even with an interruption between every batch.
             l.push(Script::NeedIo);
             i = end;
         }
@@ -633,7 +637,7 @@ mod tests {
 
     #[test]
     fn union_all_over_many_batches_is_streamed() {
-        // 素通しなので入力のバッチ構成がそのまま出る（溜め込まない）。
+        // Being a pass-through, the input's batch structure comes out as is (nothing is buffered).
         let l = vec![
             Script::Rows(vec![ints(&[Some(1), Some(2)])]),
             Script::Rows(vec![ints(&[Some(3)])]),
@@ -655,7 +659,7 @@ mod tests {
         assert_eq!(sizes, vec![2, 1, 1]);
     }
 
-    // --- 契約違反の検出 -----------------------------------------------------
+    // --- Detecting contract violations --------------------------------------
 
     #[test]
     fn mismatched_column_count_is_rejected() {

@@ -1,21 +1,21 @@
-//! バイトコード VM の実行ループ。
+//! The bytecode VM's execution loop.
 //!
-//! 1 命令 = 1 カーネル呼び出し。分岐命令は持たないので、実行は命令列の
-//! 単純な線形走査になる（mod.rs の設計判断を参照）。
+//! One instruction = one kernel call. There are no branch instructions, so execution is a simple
+//! linear walk of the instruction sequence (see the design decision in mod.rs).
 //!
-//! VM 側の責務は 3 つだけ:
-//! - selection の解消。`LoadCol` で gather してしまい、以降のカーネルは
-//!   常に密なベクタだけを見る（カーネルを selection の有無で 2 倍にしない）。
-//! - 定数を長さ 1 のベクタとして持ち込むこと。stride 計算はカーネル側。
-//! - 論理型の持ち回り。カーネルは物理型でしか動かないので、結果の論理型
-//!   （DECIMAL のスケールなど）は VM が決めて渡す。
+//! The VM has only three responsibilities:
+//! - Resolving selection. `LoadCol` gathers, so every kernel afterwards sees only dense vectors
+//!   (kernels are not doubled by the presence of selection).
+//! - Bringing constants in as length-1 vectors. Stride computation is the kernels' job.
+//! - Carrying the logical types. Kernels work only on physical types, so the result's logical
+//!   type (DECIMAL scale and the like) is decided and passed by the VM.
 
 use crate::expr::kernels;
 use crate::expr::{Instr, OpCode, Program, Reg};
 use crate::prelude::*;
 use crate::vector::{Batch, PhysType, Ty, Value, Vector};
 
-/// レジスタファイル。クエリ中は使い回してアロケーションを抑える。
+/// The register file. Reused across a query to keep allocations down.
 pub struct Vm {
     regs: Vec<Vector>,
 }
@@ -25,8 +25,8 @@ impl Vm {
         Vm { regs: Vec::new() }
     }
 
-    /// `batch` に対して `p` を評価し、結果ベクタを返す。
-    /// 返るベクタの長さは `batch.card()`。
+    /// Evaluates `p` against `batch` and returns the result vector.
+    /// The returned vector's length is `batch.card()`.
     pub fn eval(&mut self, p: &Program, batch: &Batch) -> Result<Vector> {
         let n = batch.card();
         while self.regs.len() < p.num_regs as usize {
@@ -37,29 +37,29 @@ impl Vm {
         }
         let r = p.result as usize;
         ensure!(r < self.regs.len(), Internal);
-        // 取り出してレジスタは空に戻す。次回の eval で必ず上書きされる。
+        // Taken out, leaving the register empty. The next eval always overwrites it.
         let out = core::mem::replace(&mut self.regs[r], Vector::new(Ty::Null));
         if out.len() == n {
             Ok(out)
         } else if out.len() == 1 {
-            // 定数だけの式。行数ぶんに広げてから返す。
+            // A constant-only expression. Broadcast to the row count before returning.
             Ok(kernels::broadcast(&out, n))
         } else {
             err!(Internal)
         }
     }
 
-    /// フィルタ用。Bool 結果のうち TRUE の行だけを `out` に積む。
-    /// NULL は SQL の意味論どおり偽として扱う。
+    /// For filtering. Pushes only the TRUE rows of a Bool result into `out`.
+    /// NULL counts as false, per SQL semantics.
     pub fn eval_filter(&mut self, p: &Program, batch: &Batch, out: &mut Vec<u32>) -> Result<()> {
         let v = self.eval(p, batch)?;
         ensure!(v.data().phys() == PhysType::Bool, TypeMismatch);
         let bits = v.bools();
-        // レジスタは gather 済みなので、結果の i 番目は sel[i] 行目に対応する。
-        // 積むのは元のバッチ行番号。
+        // The registers are already gathered, so result element i corresponds to row sel[i].
+        // What is pushed is the original batch row number.
         match &batch.sel {
             Some(sel) => {
-                // 添字は結果ビットと selection の両方を引くのに使う。
+                // The index is used to look up both the result bit and the selection.
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..v.len() {
                     if bits.get(i) && v.is_valid(i) {
@@ -92,7 +92,7 @@ fn reg(regs: &[Vector], i: Reg) -> Result<&Vector> {
     }
 }
 
-/// 物理型に対応する既定の論理型。型情報が失われた場合の受け皿。
+/// The default logical type for a physical type. A fallback for when type information is lost.
 fn default_ty(p: PhysType) -> Ty {
     match p {
         PhysType::Bool => Ty::Boolean,
@@ -104,8 +104,8 @@ fn default_ty(p: PhysType) -> Ty {
     }
 }
 
-/// 二項演算の結果論理型。binder が両辺を揃えている前提だが、揃っていない
-/// （＝ 統合できない）場合は物理型から決まる既定型に落とす。
+/// The result logical type of a binary operation. The binder is assumed to have aligned both
+/// sides, but when they are not (= cannot be unified) it falls back to the physical type's default.
 fn binary_ty(phys: PhysType, a: Ty, b: Ty) -> Ty {
     match Ty::unify(a, b) {
         Some(t) if t.phys() == phys => t,
@@ -113,7 +113,7 @@ fn binary_ty(phys: PhysType, a: Ty, b: Ty) -> Ty {
     }
 }
 
-/// 定数プールの 1 要素を長さ 1 のベクタにする。NULL 定数は validity 0 の 1 行。
+/// Turns one element of the constant pool into a length-1 vector. A NULL constant is one row with validity 0.
 fn const_vector(ty: Ty, v: &Value) -> Result<Vector> {
     let mut out = Vector::new(ty);
     if v.is_null() {
@@ -132,8 +132,7 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
             let c = ins.aux as usize;
             ensure!(c < batch.cols.len(), Internal);
             match &batch.sel {
-                // ここで selection を解消しておくと、以降のカーネルは
-                // selection を一切知らなくて済む。
+                // Resolving selection here means no kernel afterwards has to know about selection at all.
                 Some(sel) => batch.cols[c].gather(sel),
                 None => batch.cols[c].clone(),
             }
@@ -146,7 +145,7 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
         }
         Add | Sub | Mul | Div | Mod | Neg => {
             let a = reg(regs, ins.a)?;
-            // 単項の Neg は b を使わない。未初期化レジスタを読まないよう a を渡す。
+            // Unary Neg does not use b. `a` is passed so an uninitialized register is never read.
             let b = if ins.op == Neg { a } else { reg(regs, ins.b)? };
             kernels::arith(ins.op, binary_ty(ins.ty, a.ty(), b.ty()), a, b)?
         }
@@ -176,10 +175,10 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
             let src = reg(regs, ins.a)?;
             match kernels::try_cast(spec.from, spec.to, src) {
                 Ok(v) => v,
-                // 組み合わせ自体が変換不能（`InvalidCast` 等）。行単位の失敗は
-                // `kernels::cast` がエラーにせず NULL を返すので、ここに来るのは
-                // 「その型ペアはそもそも変換できない」場合だけ。エラーを伝播
-                // せず、全行 NULL のベクタに落とす。
+                // The combination itself is unconvertible (`InvalidCast` and so on). Per-row
+                // failures are returned as NULL rather than an error by `kernels::cast`, so
+                // reaching here means only "that type pair simply cannot be converted". The error
+                // is not propagated; it falls to an all-NULL vector.
                 Err(_) => {
                     let n = src.len();
                     let mut out = Vector::new(spec.to);
@@ -194,15 +193,15 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
             let c = ins.aux as usize;
             ensure!(c < p.calls.len(), Internal);
             let spec = &p.calls[c];
-            // 引数は別表にあるので、レジスタから参照を集めてから渡す。
+            // The arguments live in a separate table, so the references are collected from the registers before being passed.
             let mut args = Vec::with_capacity(spec.args.len());
             for &r in &spec.args {
                 args.push(reg(regs, r)?);
             }
             match spec.lambda {
-                // `list_transform`/`list_filter`/`list_reduce`。ベクタ化された
-                // 1 命令には落とせない（配列の要素ごと・行ごとに長さが違う）ので
-                // 専用の実行経路へ渡す（`expr::funcs::call_lambda` の doc 参照）。
+                // `list_transform`/`list_filter`/`list_reduce`. They cannot be lowered to one
+                // vectorized instruction (the length varies per array element and per row), so they
+                // go to a dedicated execution path (see the `expr::funcs::call_lambda` docs).
                 Some(li) => {
                     let body = match p.lambdas.get(li as usize) {
                         Some(b) => b,
@@ -247,7 +246,7 @@ mod tests {
     use crate::error::code_of;
     use crate::vector::Data;
 
-    // --- 組み立てヘルパ -----------------------------------------------------
+    // --- Construction helpers -----------------------------------------------
 
     fn col(ty: Ty, vals: &[Option<Value>]) -> Vector {
         let mut v = Vector::new(ty);
@@ -272,7 +271,7 @@ mod tests {
         col(Ty::Boolean, &vals.iter().map(|v| v.map(Value::Bool)).collect::<Vec<_>>())
     }
 
-    /// `col0 op col1` を評価する。
+    /// Evaluates `col0 op col1`.
     fn eval2(op: OpCode, ty: PhysType, a: Vector, b: Vector) -> Vector {
         let mut p = Program::new();
         let r0 = p.alloc_reg();
@@ -286,7 +285,7 @@ mod tests {
         Vm::new().eval(&p, &batch).unwrap()
     }
 
-    /// `col0 op const` / `const op col0` を評価する。`const_first` で順序を入れ替える。
+    /// Evaluates `col0 op const` / `const op col0`. `const_first` swaps the order.
     fn eval_const(
         op: OpCode,
         ty: PhysType,
@@ -326,12 +325,12 @@ mod tests {
         v.i32s().to_vec()
     }
 
-    /// Bool ベクタを (値, valid) の組で取り出す。NULL の値は無視する。
+    /// Extracts a Bool vector as (value, valid) pairs. The value is ignored for NULLs.
     fn tri(v: &Vector) -> Vec<Option<bool>> {
         (0..v.len()).map(|i| if v.is_valid(i) { Some(v.bools().get(i)) } else { None }).collect()
     }
 
-    // --- 算術 ---------------------------------------------------------------
+    // --- Arithmetic ---------------------------------------------------------
 
     #[test]
     fn arith_i32_vec_vec() {
@@ -356,7 +355,7 @@ mod tests {
             false,
         );
         assert_eq!(i32s_of(&r), vec![7, 17, 27]);
-        // 3 - col （定数が左でも同じカーネル）
+        // 3 - col (the same kernel even with the constant on the left)
         let r = eval_const(
             OpCode::Sub,
             PhysType::I32,
@@ -381,7 +380,7 @@ mod tests {
         let b = col(Ty::Double, &[Some(Value::F64(0.5)), Some(Value::F64(4.0))]);
         assert_eq!(eval2(OpCode::Add, PhysType::F64, a, b).f64s(), &[2.0, 2.0]);
 
-        // 定数側のストライド（I64 / F64）。
+        // The constant side's stride (I64 / F64).
         let r = eval_const(
             OpCode::Add,
             PhysType::I64,
@@ -420,7 +419,7 @@ mod tests {
         assert!(!r.is_valid(0));
         assert_eq!(r.i32s()[1], 1);
 
-        // MIN / -1 は 2 の補数で表現できないのでパニックさせず NULL。
+        // MIN / -1 is not representable in two's complement, so it gives NULL rather than panicking.
         let r = eval2(OpCode::Div, PhysType::I32, ints(&[i32::MIN]), ints(&[-1]));
         assert!(!r.is_valid(0));
         let a = col(Ty::BigInt, &[Some(Value::I64(i64::MIN))]);
@@ -430,7 +429,7 @@ mod tests {
         let b = col(Ty::HugeInt, &[Some(Value::I128(-1))]);
         assert!(!eval2(OpCode::Mod, PhysType::I128, a, b).is_valid(0));
 
-        // 浮動小数は IEEE のまま。
+        // Floating point stays IEEE.
         let a = col(Ty::Double, &[Some(Value::F64(1.0)), Some(Value::F64(0.0))]);
         let b = col(Ty::Double, &[Some(Value::F64(0.0)), Some(Value::F64(0.0))]);
         let r = eval2(OpCode::Div, PhysType::F64, a, b);
@@ -446,18 +445,18 @@ mod tests {
         assert!(!r.is_valid(1));
         assert_eq!(r.i32s()[0], 2);
 
-        // NULL 定数を足すと全行 NULL。
+        // Adding a NULL constant makes every row NULL.
         let a = ints(&[1, 2]);
         let r = eval_const(OpCode::Add, PhysType::I32, a, (Ty::Int, Value::Null), false);
         assert!(!r.is_valid(0) && !r.is_valid(1));
     }
 
-    // --- 比較 ---------------------------------------------------------------
+    // --- Comparison ---------------------------------------------------------
 
     const ALL_CMP: [OpCode; 6] =
         [OpCode::Eq, OpCode::Ne, OpCode::Lt, OpCode::Le, OpCode::Gt, OpCode::Ge];
 
-    /// (a<b, a=b, a>b) の 3 行に対する 6 比較の期待値。
+    /// The expected results of the six comparisons over the three rows (a<b, a=b, a>b).
     const EXPECT: [[bool; 3]; 6] = [
         [false, true, false], // Eq
         [true, false, true],  // Ne
@@ -494,12 +493,12 @@ mod tests {
             col(Ty::Double, &[Some(Value::F64(1.0)), Some(Value::F64(2.0)), Some(Value::F64(3.0))]),
             col(Ty::Double, &[Some(Value::F64(2.0)), Some(Value::F64(2.0)), Some(Value::F64(2.0))]),
         );
-        // Bytes は辞書順。
+        // Bytes compare lexicographically.
         let mid = || bytes(&[&b"abd"[..], &b"abd"[..], &b"abd"[..]]);
         check_cmp(PhysType::Bytes, bytes(&[&b"abc"[..], &b"abd"[..], &b"abe"[..]]), mid());
-        // 前方一致する長短も辞書順（短いほうが小さい）。
+        // A common prefix of differing lengths is lexicographic too (the shorter is smaller).
         check_cmp(PhysType::Bytes, bytes(&[&b"ab"[..], &b"abd"[..], &b"abdx"[..]]), mid());
-        // Bool は false < true。
+        // For Bool, false < true.
         check_cmp(
             PhysType::Bool,
             bools(&[Some(false), Some(true), Some(true)]),
@@ -524,11 +523,11 @@ mod tests {
         for op in ALL_CMP.iter() {
             let r = eval2(*op, PhysType::I32, a.clone(), b.clone());
             assert!(r.is_valid(0));
-            assert!(!r.is_valid(1), "NULL 比較は NULL のまま");
+            assert!(!r.is_valid(1), "a NULL comparison stays NULL");
         }
     }
 
-    // --- 三値論理 -----------------------------------------------------------
+    // --- Three-valued logic -------------------------------------------------
 
     const T: Option<bool> = Some(true);
     const F: Option<bool> = Some(false);
@@ -552,7 +551,7 @@ mod tests {
 
     #[test]
     fn logic_with_constant_operand() {
-        // NULL AND FALSE = FALSE、NULL OR TRUE = TRUE（定数側 stride 0 でも同じ）。
+        // NULL AND FALSE = FALSE, NULL OR TRUE = TRUE (the same with stride 0 on the constant side).
         let r = eval_const(
             OpCode::And,
             PhysType::Bool,
@@ -571,18 +570,18 @@ mod tests {
         assert_eq!(tri(&r), vec![T, T, T]);
     }
 
-    // --- NULL 述語・選択 ----------------------------------------------------
+    // --- NULL predicates and selection --------------------------------------
 
     #[test]
     fn is_null_and_is_not_null() {
         let c = col(Ty::Int, &[Some(Value::I32(1)), None, Some(Value::I32(3))]);
         let r = unary(OpCode::IsNull, PhysType::I32, c.clone());
         assert_eq!(tri(&r), vec![F, T, F]);
-        assert!(!r.has_nulls(), "IsNull の結果は決して NULL にならない");
+        assert!(!r.has_nulls(), "IsNull's result is never NULL");
         let r = unary(OpCode::IsNotNull, PhysType::I32, c);
         assert_eq!(tri(&r), vec![T, F, T]);
 
-        // NULL の無い列でも動く。
+        // It works on a column with no NULLs too.
         let r = unary(OpCode::IsNull, PhysType::I32, ints(&[1, 2]));
         assert_eq!(tri(&r), vec![F, F]);
     }
@@ -605,7 +604,7 @@ mod tests {
             col(Ty::Int, &[Some(Value::I32(10)), Some(Value::I32(20)), Some(Value::I32(30))]),
         ]);
         let r = Vm::new().eval(&p, &batch).unwrap();
-        // 条件が NULL / FALSE のときは else（長さ 1 の定数）を採る。
+        // When the condition is NULL / FALSE it takes the else side (a length-1 constant).
         assert_eq!(i32s_of(&r), vec![10, -1, -1]);
         assert!(!r.has_nulls());
     }
@@ -670,7 +669,7 @@ mod tests {
         );
         assert_eq!(tri(&r), vec![T, T, F, F]);
 
-        // NULL 入力は NULL のまま。
+        // NULL input stays NULL.
         let s = col(Ty::Varchar, &[None]);
         let r = eval_const(
             OpCode::Like,
@@ -682,7 +681,7 @@ mod tests {
         assert!(!r.is_valid(0));
     }
 
-    // --- キャスト -----------------------------------------------------------
+    // --- Casts --------------------------------------------------------------
 
     fn cast_of(from: Ty, to: Ty, v: Vector) -> Result<Vector> {
         let mut p = Program::new();
@@ -704,7 +703,7 @@ mod tests {
         assert_eq!(r.ty(), Ty::BigInt);
         let r = cast_of(Ty::Int, Ty::HugeInt, ints(&[7])).unwrap();
         assert_eq!(r.i128s(), &[7]);
-        // 収まらない縮小はエラーではなくその行だけ NULL。
+        // A narrowing that does not fit is not an error; just that row becomes NULL.
         let src = col(Ty::BigInt, &[Some(Value::I64(5)), Some(Value::I64(i64::MAX))]);
         let r = cast_of(Ty::BigInt, Ty::Int, src).unwrap();
         assert_eq!(r.i32s()[0], 5);
@@ -715,7 +714,7 @@ mod tests {
     fn cast_between_int_and_float() {
         let r = cast_of(Ty::Int, Ty::Double, ints(&[3, -4])).unwrap();
         assert_eq!(r.f64s(), &[3.0, -4.0]);
-        // 浮動小数 → 整数は切り捨てではなく丸める（DuckDB / PostgreSQL と同じ）。
+        // Floating point -> integer rounds rather than truncates (the same as DuckDB / PostgreSQL).
         let src = col(
             Ty::Double,
             &[Some(Value::F64(3.9)), Some(Value::F64(-3.9)), Some(Value::F64(1e30))],
@@ -723,9 +722,9 @@ mod tests {
         let r = cast_of(Ty::Double, Ty::Int, src).unwrap();
         assert_eq!(r.i32s()[0], 4);
         assert_eq!(r.i32s()[1], -4);
-        assert!(!r.is_valid(2), "範囲外は NULL");
+        assert!(!r.is_valid(2), "out of range gives NULL");
 
-        // ちょうど半端は偶数側へ（銀行丸め）。1.5 → 2、4.5 → 4。
+        // Exactly halfway goes to the even side (banker's rounding). 1.5 -> 2, 4.5 -> 4.
         let src = col(
             Ty::Double,
             &[
@@ -737,7 +736,7 @@ mod tests {
         );
         let r = cast_of(Ty::Double, Ty::Int, src).unwrap();
         assert_eq!(r.i32s(), &[2, 4, -2, -4]);
-        // NaN / inf も NULL。
+        // NaN / inf give NULL too.
         let src = col(Ty::Double, &[Some(Value::F64(f64::NAN)), Some(Value::F64(f64::INFINITY))]);
         let r = cast_of(Ty::Double, Ty::BigInt, src).unwrap();
         assert!(!r.is_valid(0) && !r.is_valid(1));
@@ -747,24 +746,24 @@ mod tests {
     fn cast_decimal_rescale() {
         let d2 = Ty::Decimal { precision: 10, scale: 2 };
         let d4 = Ty::Decimal { precision: 12, scale: 4 };
-        // 12.34 → スケール 4 へ（10^2 倍）
+        // 12.34 -> to scale 4 (multiplied by 10^2)
         let src = col(Ty::Decimal { precision: 10, scale: 2 }, &[Some(Value::I64(1234))]);
         assert_eq!(cast_of(d2, d4, src).unwrap().i64s(), &[123_400]);
-        // 逆向きは 0 から遠ざかる向きに丸める（DuckDB と同じ）。
-        // 12.3456 → 12.35、-12.3456 → -12.35。
+        // The other direction rounds away from zero (the same as DuckDB).
+        // 12.3456 -> 12.35, -12.3456 -> -12.35.
         let src = col(d4, &[Some(Value::I64(123_456)), Some(Value::I64(-123_456))]);
         assert_eq!(cast_of(d4, d2, src).unwrap().i64s(), &[1235, -1235]);
-        // ちょうど半端も 0 から遠ざける。1.235 → 1.24。
+        // Exactly halfway also goes away from zero. 1.235 -> 1.24.
         let d3 = Ty::Decimal { precision: 10, scale: 3 };
         let src = col(d3, &[Some(Value::I64(1235)), Some(Value::I64(-1235))]);
         assert_eq!(cast_of(d3, d2, src).unwrap().i64s(), &[124, -124]);
-        // DECIMAL → DOUBLE はスケールで割る。
+        // DECIMAL -> DOUBLE divides by the scale.
         let src = col(d2, &[Some(Value::I64(1234))]);
         assert_eq!(cast_of(d2, Ty::Double, src).unwrap().f64s(), &[12.34]);
-        // DOUBLE → DECIMAL はスケール倍して丸める。12.349 → 12.35。
+        // DOUBLE -> DECIMAL multiplies by the scale and rounds. 12.349 -> 12.35.
         let src = col(Ty::Double, &[Some(Value::F64(12.349))]);
         assert_eq!(cast_of(Ty::Double, d2, src).unwrap().i64s(), &[1235]);
-        // 整数 → DECIMAL。
+        // Integer -> DECIMAL.
         let src = col(Ty::BigInt, &[Some(Value::I64(3))]);
         assert_eq!(cast_of(Ty::BigInt, d2, src).unwrap().i64s(), &[300]);
     }
@@ -787,7 +786,7 @@ mod tests {
         assert_eq!(r.bytes().get(0), b"1.5");
         assert_eq!(r.bytes().get(1), b"-0.25");
 
-        // VARCHAR → 数値。読めない行だけ NULL。
+        // VARCHAR -> numeric. Only unreadable rows become NULL.
         let src = bytes(&[b"42", b" -7 ", b"abc", b"1.9"]);
         let r = cast_of(Ty::Varchar, Ty::Int, src).unwrap();
         assert_eq!(r.i32s()[0], 42);
@@ -822,13 +821,13 @@ mod tests {
 
     #[test]
     fn cast_date_timestamp_roundtrip() {
-        // 1970-01-03 とその前日以前（負の日数）。
+        // 1970-01-03 and the day before and earlier (negative day counts).
         let src = col(Ty::Date, &[Some(Value::I32(2)), Some(Value::I32(-1))]);
         let ts = cast_of(Ty::Date, Ty::Timestamp, src).unwrap();
         assert_eq!(ts.i64s(), &[2 * 86_400_000_000, -86_400_000_000]);
         let back = cast_of(Ty::Timestamp, Ty::Date, ts).unwrap();
         assert_eq!(back.i32s(), &[2, -1]);
-        // 端数のある TIMESTAMP は床除算（前日に落ちない）。
+        // A TIMESTAMP with a remainder uses floor division (so it does not fall to the previous day).
         let src = col(Ty::Timestamp, &[Some(Value::I64(-1))]);
         assert_eq!(cast_of(Ty::Timestamp, Ty::Date, src).unwrap().i32s(), &[-1]);
     }
@@ -837,17 +836,17 @@ mod tests {
     fn cast_identity_and_unsupported() {
         let r = cast_of(Ty::Int, Ty::Int, ints(&[1, 2])).unwrap();
         assert_eq!(i32s_of(&r), vec![1, 2]);
-        // VARCHAR ↔ BLOB は表現が同じなので複製。
+        // VARCHAR <-> BLOB share a representation, so it is a copy.
         let r = cast_of(Ty::Varchar, Ty::Blob, bytes(&[b"x"])).unwrap();
         assert_eq!(r.ty(), Ty::Blob);
-        // 型未定の NULL は何にでもキャストできる（結果は NULL）。
+        // A type-undetermined NULL can be cast to anything (the result is NULL).
         let src = col(Ty::Null, &[None]);
         let r = cast_of(Ty::Null, Ty::Varchar, src).unwrap();
         assert!(!r.is_valid(0));
-        // 日付の文字列化は funcs のフォーマッタで実装済み。
+        // Date stringification is implemented by the formatter in funcs.
         let r = cast_of(Ty::Date, Ty::Varchar, col(Ty::Date, &[Some(Value::I32(0))])).unwrap();
         assert_eq!(r.bytes().get(0), b"1970-01-01");
-        // DATE ↔ TIME は意味が無いので未対応のまま。黙って壊さずエラーにする。
+        // DATE <-> TIME is meaningless and stays unsupported. It errors rather than breaking silently.
         let e = cast_of(Ty::Date, Ty::Time, col(Ty::Date, &[Some(Value::I32(0))]));
         assert_eq!(code_of(e), Some(Code::InvalidCast));
         let e = cast_of(Ty::Timestamp, Ty::Double, col(Ty::Timestamp, &[Some(Value::I64(0))]));
@@ -879,18 +878,18 @@ mod tests {
 
     #[test]
     fn try_cast_turns_row_level_parse_failure_into_null() {
-        // 通常の CAST でも「行単位」の変換失敗（数値として読めない文字列）は
-        // 元々エラーにせず NULL にする（`kernels::cast` の契約）。TRY_CAST でも
-        // 同じ挙動になることを確かめる。
+        // Even under an ordinary CAST, a "per-row" conversion failure (a string unreadable as a
+        // number) is not an error and becomes NULL (the `kernels::cast` contract). This confirms
+        // TRY_CAST behaves the same.
         let r = try_cast_of(Ty::Varchar, Ty::Int, bytes(&[b"abc", b"42"])).unwrap();
-        assert!(!r.is_valid(0), "'abc' は整数として読めないので NULL");
+        assert!(!r.is_valid(0), "'abc' is unreadable as an integer, so NULL");
         assert_eq!(r.i32s()[1], 42);
     }
 
     #[test]
     fn try_cast_turns_unsupported_combination_into_null_instead_of_erroring() {
-        // 通常の CAST ならエラーになる組み合わせ（`cast_identity_and_unsupported`
-        // 参照）。TRY_CAST はエラーを伝播せず、行数ぶんの NULL に落とす。
+        // A combination that would error under an ordinary CAST (see
+        // `cast_identity_and_unsupported`). TRY_CAST does not propagate the error and falls to as many NULLs as there are rows.
         let r = try_cast_of(
             Ty::Timestamp,
             Ty::Double,
@@ -906,52 +905,51 @@ mod tests {
         assert_eq!(
             code_of(e),
             Some(Code::InvalidCast),
-            "普通の CAST は同じ組み合わせでエラーのまま"
+            "an ordinary CAST still errors on the same combination"
         );
     }
 
-    // --- VARCHAR ⇄ JSON -------------------------------------------------------
+    // --- VARCHAR <-> JSON -----------------------------------------------------
 
     #[test]
     fn cast_varchar_to_json_validates_and_json_to_varchar_passes_through() {
-        // duckdb: CAST('{"a":1}' AS JSON) は成功し、CAST('not json' AS JSON) は
-        // Conversion Error になる（TRY_CAST は NULL）。
+        // duckdb: CAST('{"a":1}' AS JSON) succeeds while CAST('not json' AS JSON) is a
+        // Conversion Error (TRY_CAST gives NULL).
         let r =
             cast_of(Ty::Varchar, Ty::Json, bytes(&[br#"{"a":1}"#, b"[1,2]", b"\"x\""])).unwrap();
         assert_eq!(r.ty(), Ty::Json);
         assert_eq!(r.bytes().get(0), br#"{"a":1}"#);
         assert_eq!(r.bytes().get(1), b"[1,2]");
 
-        // 通常の CAST は不正な JSON をその場でエラーにする（他の型と違い、
-        // 行単位の失敗を NULL に丸めない例外。`kernels::cast_str_to_json` の
-        // doc 参照）。
+        // An ordinary CAST errors on invalid JSON on the spot (unlike other types, an exception
+        // that does not round a per-row failure to NULL; see the `kernels::cast_str_to_json` docs).
         let e = cast_of(Ty::Varchar, Ty::Json, bytes(&[b"not json"]));
         assert_eq!(code_of(e), Some(Code::InvalidCast));
 
-        // TRY_CAST はその行だけ NULL にし、他の妥当な行は活かす。
+        // TRY_CAST makes just that row NULL and keeps the other valid rows.
         let r = try_cast_of(Ty::Varchar, Ty::Json, bytes(&[br#"{"a":1}"#, b"not json"])).unwrap();
         assert_eq!(r.ty(), Ty::Json);
         assert!(r.is_valid(0));
         assert_eq!(r.bytes().get(0), br#"{"a":1}"#);
         assert!(!r.is_valid(1));
 
-        // JSON → VARCHAR はテキストをそのまま返す（検証済みなので失敗しない）。
+        // JSON -> VARCHAR returns the text unchanged (already validated, so it cannot fail).
         let j = col(Ty::Json, &[Some(Value::Bytes(br#"{"a":1}"#.to_vec())), None]);
         let back = cast_of(Ty::Json, Ty::Varchar, j).unwrap();
         assert_eq!(back.ty(), Ty::Varchar);
         assert_eq!(back.bytes().get(0), br#"{"a":1}"#);
         assert!(!back.is_valid(1));
 
-        // NULL 行は検証をすり抜けて NULL のまま（空文字列は不正な JSON だが
-        // NULL 行なので CAST はエラーにならない）。
+        // NULL rows slip past validation and stay NULL (the empty string is invalid JSON, but a
+        // NULL row does not make the CAST error).
         let r = cast_of(Ty::Varchar, Ty::Json, col(Ty::Varchar, &[None])).unwrap();
         assert!(!r.is_valid(0));
     }
 
     #[test]
     fn json_only_casts_with_varchar_and_blob_are_rejected() {
-        // BLOB ⇄ JSON、数値 → JSON などは非対応（`to_json` 関数を使うべき、
-        // という設計判断。モジュール doc 参照）。
+        // BLOB <-> JSON, numeric -> JSON, and so on are unsupported (the design decision is that
+        // `to_json` should be used; see the module docs).
         let e = cast_of(Ty::Blob, Ty::Json, bytes(&[b"{}"]));
         assert_eq!(code_of(e), Some(Code::InvalidCast));
         let e = cast_of(Ty::Json, Ty::Blob, col(Ty::Json, &[Some(Value::Bytes(b"{}".to_vec()))]));
@@ -960,7 +958,7 @@ mod tests {
         assert_eq!(code_of(e), Some(Code::InvalidCast));
     }
 
-    // --- フィルタ・複合プログラム -------------------------------------------
+    // --- Filters and composite programs -------------------------------------
 
     #[test]
     fn eval_filter_returns_original_row_indices() {
@@ -986,14 +984,14 @@ mod tests {
                 Some(Value::I32(40)),
             ],
         )]);
-        // 事前 selection 付き。行 0,3,5 だけを見る。
+        // With a prior selection. Only rows 0, 3, and 5 are looked at.
         batch.sel = Some(vec![0, 3, 5]);
         let mut out = Vec::new();
         let mut vm = Vm::new();
         vm.eval_filter(&p, &batch, &mut out).unwrap();
-        assert_eq!(out, vec![3, 5], "元のバッチ行番号を返す");
+        assert_eq!(out, vec![3, 5], "returns the original batch row numbers");
 
-        // selection なしなら行番号そのもの。NULL は偽。
+        // Without selection they are just row numbers. NULL is false.
         batch.sel = None;
         out.clear();
         vm.eval_filter(&p, &batch, &mut out).unwrap();
@@ -1027,7 +1025,7 @@ mod tests {
         let c1 = p.add_const(Ty::Int, Value::I32(1));
         let c2 = p.add_const(Ty::Int, Value::I32(2));
         p.push(Instr::with_aux(OpCode::LoadConst, PhysType::I32, rk, 0, 0, c1));
-        p.push(Instr::new(OpCode::Add, PhysType::I32, ra, ra, rk)); // ra を再利用
+        p.push(Instr::new(OpCode::Add, PhysType::I32, ra, ra, rk)); // reusing ra
         p.push(Instr::with_aux(OpCode::LoadConst, PhysType::I32, rk, 0, 0, c2));
         p.push(Instr::new(OpCode::Mul, PhysType::I32, ra, ra, rk));
         p.push(Instr::new(OpCode::Gt, PhysType::I32, rt, ra, rb));
@@ -1041,12 +1039,12 @@ mod tests {
             ints(&[5, 5, 100, 0]),
             col(Ty::Int, &[Some(Value::I32(0)), Some(Value::I32(0)), Some(Value::I32(0)), None]),
         ]);
-        // (1+1)*2=4 > 5 → F / (10+1)*2=22 > 5 → T / (5+1)*2=12 > 100 → F / c が NULL → F
+        // (1+1)*2=4 > 5 -> F / (10+1)*2=22 > 5 -> T / (5+1)*2=12 > 100 -> F / c is NULL -> F
         let mut vm = Vm::new();
         let r = vm.eval(&p, &batch).unwrap();
         assert_eq!(tri(&r), vec![F, T, F, F]);
 
-        // 同じ Vm を使い回しても結果は変わらない（レジスタの持ち越し無し）。
+        // Reusing the same Vm does not change the result (no register carryover).
         let r2 = vm.eval(&p, &batch).unwrap();
         assert_eq!(tri(&r2), vec![F, T, F, F]);
     }
@@ -1062,7 +1060,7 @@ mod tests {
         let r = Vm::new().eval(&p, &batch).unwrap();
         assert_eq!(i32s_of(&r), vec![7, 7, 7]);
 
-        // NULL 定数も同様。
+        // The same for a NULL constant.
         let mut p = Program::new();
         let r0 = p.alloc_reg();
         let ci = p.add_const(Ty::Int, Value::Null);
@@ -1091,7 +1089,7 @@ mod tests {
 
     #[test]
     fn bad_program_reports_internal_error() {
-        // 存在しない列。
+        // A column that does not exist.
         let mut p = Program::new();
         let r0 = p.alloc_reg();
         p.push(Instr::with_aux(OpCode::LoadCol, PhysType::I32, r0, 0, 0, 9));
@@ -1099,7 +1097,7 @@ mod tests {
         let batch = Batch::new(vec![ints(&[1])]);
         assert_eq!(code_of(Vm::new().eval(&p, &batch)), Some(Code::Internal));
 
-        // 物理型が命令と食い違う。
+        // The physical type disagrees with the instruction.
         let mut p = Program::new();
         let r0 = p.alloc_reg();
         let r1 = p.alloc_reg();
@@ -1109,7 +1107,7 @@ mod tests {
         assert_eq!(code_of(Vm::new().eval(&p, &batch)), Some(Code::TypeMismatch));
     }
 
-    /// `Data` を直接触る経路（Vector の生成）が壊れていないことの確認。
+    /// Confirms the path that touches `Data` directly (building a Vector) is not broken.
     #[test]
     fn vector_from_data_shape() {
         let v = Vector::from_data(Ty::Int, Data::I32(vec![1, 2]), None);

@@ -1,16 +1,15 @@
-//! `UNNEST`（set-returning オペレータ）。
+//! `UNNEST` (a set-returning operator).
 //!
-//! 入力の 1 行を、対象列（`Ty::Json` の配列）の要素数ぶんの行に展開する。
-//! 他のオペレータと違い「1 行入力 → N 行出力」なので、1 回の `next()` が
-//! 生む行数を `BATCH_SIZE` に収めるため、`self` に「今展開中の入力行」と
-//! 「その行の中で次に出す要素の添字」を持ち、複数回の `next()` 呼び出しに
-//! またがって再開できるようにしてある（`exec::recursive::RecursiveCte` と
-//! 同じ流儀）。
+//! Expands one input row into as many rows as the target column (a `Ty::Json` array) has
+//! elements. Unlike other operators it is "1 row in -> N rows out", so to keep the rows produced
+//! by one `next()` within `BATCH_SIZE`, `self` holds "the input row being expanded" and "the
+//! index of the next element to emit within that row", so it can resume across several `next()`
+//! calls (the same style as `exec::recursive::RecursiveCte`).
 //!
-//! 入力側の `NeedIo`/`NeedCodec` は素通しするだけでよい ―― JSON のパース
-//! 自体はメモリ上のバイト列に対してしか行わないので、このオペレータ自身が
-//! `NeedIo`/`NeedCodec` を生むことは無い。中断・再開をまたいでも結果が
-//! 変わらないことは `tests` モジュールと `tests/unnest.rs` の両方で検証する。
+//! `NeedIo`/`NeedCodec` from the input side merely pass through -- JSON parsing itself only ever
+//! runs against in-memory bytes, so this operator never generates `NeedIo`/`NeedCodec` itself.
+//! That the result does not change across an interruption and resumption is verified in both the
+//! `tests` module and `tests/unnest.rs`.
 
 use crate::exec::{ExecContext, Operator, Step};
 use crate::expr::Program;
@@ -20,26 +19,26 @@ use crate::vector::{Batch, Ty, Value, Vector, BATCH_SIZE};
 
 pub struct Unnest {
     input: Box<dyn Operator>,
-    /// 展開対象の配列を入力行に対して評価する式。結果型は必ず `Ty::Json`
-    /// （`plan::bind` が保証する）。
+    /// The expression evaluated per input row to produce the array to expand. Its result type is
+    /// always `Ty::Json` (guaranteed by `plan::bind`).
     expr: Program,
-    /// 展開後の要素列の宣言型。`Node::Unnest::elem_ty` のドキュメント参照。
+    /// The declared type of the expanded element column. See the docs on `Node::Unnest::elem_ty`.
     elem_ty: Ty,
-    /// 展開中の入力バッチ。使い切ったら `None` に戻り、次回の `next()` で
-    /// 新しい入力バッチを引く。
+    /// The input batch being expanded. It returns to `None` once used up, and the next `next()`
+    /// pulls a new input batch.
     cur: Option<Cur>,
 }
 
-/// 展開中の 1 入力バッチぶんの状態。
+/// The state for one input batch being expanded.
 struct Cur {
-    /// 複製して出力する入力列（materialize 済み、密な 0..rows 添字）。
+    /// The input columns duplicated into the output (materialized, with dense 0..rows indices).
     cols: Vec<Vector>,
-    /// 展開対象の配列列（`Ty::Json`、`cols` と同じ行数）。
+    /// The column of arrays to expand (`Ty::Json`, the same row count as `cols`).
     arr: Vector,
     rows: usize,
-    /// 次に展開する行。
+    /// The next row to expand.
     row: usize,
-    /// `row` の中で、次に出す要素の添字（0 始まり）。行が変わるたびに戻す。
+    /// The index (0-based) of the next element to emit within `row`. Reset whenever the row changes.
     elem_pos: usize,
 }
 
@@ -59,9 +58,9 @@ impl Operator for Unnest {
                     Step::NeedCodec => return Ok(Step::NeedCodec),
                     Step::Done => return Ok(Step::Done),
                 };
-                // selection を畳んで、以降は密な 0..rows 添字で行を指す
-                // （`arr`/`cols` の行番号を一致させるため。`exec::recursive`
-                // の `process` と同じ理由）。
+                // Selection is materialized so rows are addressed by dense 0..rows indices from
+                // here on (so `arr`'s and `cols`'s row numbers line up; the same reason as
+                // `process` in `exec::recursive`).
                 batch.materialize();
                 let arr = ctx.vm.eval(&self.expr, &batch)?;
                 ensure!(matches!(arr.ty(), Ty::Json), TypeMismatch);
@@ -78,19 +77,17 @@ impl Operator for Unnest {
             let mut scratch = Vec::new();
             while cur.row < cur.rows && out_elem.len() < BATCH_SIZE {
                 if !cur.arr.is_valid(cur.row) {
-                    // NULL 配列は 0 行（duckdb で確認済み）。
+                    // A NULL array gives 0 rows (confirmed with duckdb).
                     cur.row += 1;
                     cur.elem_pos = 0;
                     continue;
                 }
                 let doc = cur.arr.bytes().get(cur.row).to_vec();
-                // 行ごとに再パースする。1 回の `next()` の途中で行をまたいで
-                // 状態を持ち越すのは `row`/`elem_pos`（プレーンな usize）だけ
-                // にして、パース結果への借用を `self` に持たせる自己参照を
-                // 避けている（要素数が `BATCH_SIZE` を超える 1 行は複数回の
-                // `next()` にまたがるので、そのたびに再パースし直す。単発の
-                // 行なら O(n) 一発、`BATCH_SIZE` 超えの巨大配列だけ再パースが
-                // 数回に増えるだけで済む）。
+                // Reparsed per row. The only state carried across rows within one `next()` is
+                // `row`/`elem_pos` (plain usize), avoiding a self-reference that would put a borrow
+                // of the parse result into `self` (a row with more elements than `BATCH_SIZE` spans
+                // several `next()` calls and is reparsed each time. A one-off row costs O(n) once,
+                // and only huge arrays exceeding `BATCH_SIZE` see a handful of extra reparses).
                 let elems = json::array_elements(&doc)?.unwrap_or_default();
                 if cur.elem_pos >= elems.len() {
                     cur.row += 1;
@@ -110,7 +107,7 @@ impl Operator for Unnest {
             }
 
             if out_elem.is_empty() {
-                // この入力バッチ全体が NULL/空配列だけだった。次の入力を引く。
+                // This entire input batch was nothing but NULLs and empty arrays. Pull the next input.
                 self.cur = None;
                 continue;
             }
@@ -124,11 +121,11 @@ impl Operator for Unnest {
     }
 }
 
-/// 配列要素 1 個を宣言型 `elem_ty` に従って `out` に積む。JSON `null` は
-/// SQL NULL（`json::write_extracted_text` と同じ判断）。要素の実際の種別が
-/// 宣言型と食い違う場合（`elem_ty` の絞り込みが静的な保証を経ていない
-/// 場合や、将来の呼び出し口の誤りに備えた防御）は NULL にする ―― パニック
-/// もエラーも起こさない。
+/// Pushes one array element into `out` according to the declared type `elem_ty`. JSON `null`
+/// becomes SQL NULL (the same judgment as `json::write_extracted_text`). When an element's
+/// actual kind disagrees with the declared type (when `elem_ty`'s narrowing did not go through a
+/// static guarantee, or as a defense against a future caller's mistake) it becomes NULL -- with
+/// neither a panic nor an error.
 fn push_elem(
     out: &mut Vector,
     elem_ty: Ty,
@@ -162,8 +159,8 @@ fn push_elem(
             Kind::Bool => out.push_value(&Value::Bool(span.first() == Some(&b't'))),
             _ => out.push_null(),
         },
-        // Ty::Json、あるいは想定外の宣言型（絞り込みロジックのバグに備えた
-        // 安全側フォールバック）は生の JSON テキストをそのまま積む。
+        // Ty::Json, or an unexpected declared type (a safe fallback in case of a bug in the
+        // narrowing logic), pushes the raw JSON text unchanged.
         _ => out.push_value(&Value::Bytes(span.to_vec())),
     }
     Ok(())
@@ -195,7 +192,7 @@ mod tests {
         v
     }
 
-    /// 列 `idx` をそのまま返すプログラム。`col0` の型は呼び出し側が渡す。
+    /// A program that returns column `idx` unchanged. `col0`'s type is supplied by the caller.
     fn load(idx: u16, ty: Ty) -> Program {
         let mut p = Program::new();
         let r = p.alloc_reg();
@@ -229,16 +226,16 @@ mod tests {
         }
     }
 
-    /// `Unnest` を最後まで駆動し、`(id, 展開値)` のペアの列を返す。
-    /// `id` は入力の 0 列目（複製列）、展開値は最後の列。
+    /// Drives `Unnest` to completion and returns the sequence of `(id, expanded value)` pairs.
+    /// `id` is the input's column 0 (a duplicated column) and the expanded value is the last column.
     fn drive(steps: Vec<Script>, elem_ty: Ty) -> Vec<(i32, Value)> {
-        let expr = load(1, Ty::Json); // 1 列目（配列）を展開する
+        let expr = load(1, Ty::Json); // expands column 1 (the array)
         let mut op = Unnest::new(Box::new(Mock { steps, pos: 0 }), expr, elem_ty);
         let mut cat = Catalog::new();
         let mut vm = Vm::new();
         let mut rows = Vec::new();
         for guard in 0..10_000 {
-            assert!(guard < 9_999, "終わらない");
+            assert!(guard < 9_999, "does not terminate");
             let mut ctx =
                 ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
             match op.next(&mut ctx).unwrap() {
@@ -246,8 +243,8 @@ mod tests {
                     b.materialize();
                     for r in 0..b.num_rows() {
                         let Value::I32(id) = b.cols[0].value_at(r) else { panic!("expected I32") };
-                        // 出力列は「入力の全列（id, 元の配列列）++ 展開要素」
-                        // なので、展開値は常に末尾列。
+                        // The output columns are "every input column (id, the original array
+                        // column) ++ the expanded element", so the expanded value is always last.
                         let last = b.cols.len() - 1;
                         rows.push((id, b.cols[last].value_at(r)));
                     }
@@ -284,7 +281,7 @@ mod tests {
 
     #[test]
     fn null_and_empty_arrays_produce_zero_rows() {
-        // duckdb: UNNEST(NULL::INT[]) / UNNEST([]) はどちらも 0 行。
+        // duckdb: UNNEST(NULL::INT[]) and UNNEST([]) both give 0 rows.
         let steps =
             vec![Script::Rows(vec![ints(&[1, 2, 3]), json_col(&[None, Some("[]"), Some("[7]")])])];
         let rows = drive(steps, Ty::BigInt);
@@ -311,8 +308,8 @@ mod tests {
 
     #[test]
     fn spans_multiple_output_batches_when_a_single_row_exceeds_batch_size() {
-        // 1 行に BATCH_SIZE を超える要素数を持たせ、複数回の `next()`
-        // （＝出力バッチ境界）にまたがる「行の途中から再開」を検証する。
+        // Gives one row more elements than BATCH_SIZE, exercising "resume mid-row" across several
+        // `next()` calls (= output batch boundaries).
         let n = BATCH_SIZE + 500;
         let mut arr = String::from("[");
         for i in 0..n {
@@ -333,9 +330,9 @@ mod tests {
 
     #[test]
     fn need_io_between_input_batches_does_not_change_the_result() {
-        // `Unnest` 自身が読み進めているのは入力オペレータであって、`NeedIo`
-        // は入力側が返す。それをまたいでも「今展開中の行/添字」（`Cur`）が
-        // 保たれ、結果が変わらないことを確認する。
+        // What `Unnest` itself advances through is the input operator, and `NeedIo` comes from the
+        // input side. This confirms that across one, "the row/index being expanded" (`Cur`) is
+        // preserved and the result does not change.
         let make = |interrupt: bool| {
             let mut steps = Vec::new();
             steps.push(Script::Rows(vec![ints(&[1, 2]), json_col(&[Some("[1,2]"), Some("[3]")])]));
@@ -347,18 +344,17 @@ mod tests {
         };
         let plain = drive(make(false), Ty::BigInt);
         let interrupted = drive(make(true), Ty::BigInt);
-        assert_eq!(plain, interrupted, "NeedIo をまたいでも結果が変わってはいけない");
+        assert_eq!(plain, interrupted, "the result must not change across a NeedIo");
         assert_eq!(plain.len(), 6);
     }
 
     #[test]
     fn need_io_mid_row_does_not_change_the_result() {
-        // 巨大な 1 行を複数バッチに分けて出している最中（`elem_pos` が
-        // 途中）に、次の `next()` 呼び出しの前に上流が `NeedIo` を返しても
-        // （＝この `next()` 自体は input を呼ばない＝影響しない）結果が
-        // 変わらないことを、直接 `NeedIo` を挟めない代わりに「同じ入力を
-        // 2 バッチに割った場合」と「1 バッチにまとめた場合」で突き合わせて
-        // 検証する。
+        // While a huge single row is being emitted across several batches (with `elem_pos` partway
+        // through), an upstream `NeedIo` before the next `next()` call cannot matter (this `next()`
+        // does not call input at all). Since a `NeedIo` cannot be interposed directly, that is
+        // verified instead by cross-checking "the same input split across 2 batches" against "the
+        // same input in 1 batch".
         let n = BATCH_SIZE + 200;
         let mut arr = String::from("[");
         for i in 0..n {
@@ -377,8 +373,8 @@ mod tests {
 
     #[test]
     fn falls_back_to_json_when_declared_type_mismatches_the_actual_element() {
-        // `elem_ty` の絞り込みが誤って narrow 側になった場合の防御的な
-        // フォールバック（パニックせず NULL にする）を確認する。
+        // Confirms the defensive fallback (NULL rather than a panic) for the case where `elem_ty`'s
+        // narrowing wrongly landed on the narrow side.
         let steps = vec![Script::Rows(vec![ints(&[1]), json_col(&[Some(r#"["not a number"]"#)])])];
         let rows = drive(steps, Ty::BigInt);
         assert_eq!(rows, vec![(1, Value::Null)]);

@@ -1,15 +1,15 @@
-//! `WHERE` の `IN` / `BETWEEN` 述語が RowGroup/PageIndex/Bloom フィルタの
-//! プルーニングを正しく通ることの SQL レベルでの確認。
+//! SQL-level verification that `WHERE`'s `IN`/`BETWEEN` predicates correctly go through
+//! RowGroup/PageIndex/Bloom-filter pruning.
 //!
-//! `format::parquet` の単体テストは `ParquetFormat` を直接叩いてバイト削減
-//! そのものを検証しているが、ここでは `Session` 越しの実行経路（束縛 →
-//! pruner 抽出 → 実行）が正しく配線されていること、特に「絞り込みすぎて
-//! 本来ヒットすべき行を消していないか」を実データで確認する。期待値は
-//! `duckdb -c "SELECT ..."` の実際の出力と突き合わせて決めている。
+//! `format::parquet`'s unit tests verify the byte reduction itself by hitting
+//! `ParquetFormat` directly, but here we verify against real data that the execution path
+//! through `Session` (bind -> pruner extraction -> execution) is wired correctly, especially
+//! whether it has pruned too aggressively and dropped a row that should have hit. Expected
+//! values are decided by cross-checking against the actual output of `duckdb -c "SELECT ..."`.
 //!
-//! `tests/data/pagetest.parquet` は id が `0..50000` を隙間なく埋める
-//! 50000 行・複数 RowGroup/複数ページのファイル（`format::parquet` の
-//! ページ単位プルーニングのテストで使っているものと同じ）。
+//! `tests/data/pagetest.parquet` is a 50000-row file with multiple RowGroups/multiple pages
+//! whose `id` densely fills `0..50000` (the same fixture used by `format::parquet`'s
+//! per-page pruning tests).
 
 use ahiru_core::format::FormatKind;
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -49,10 +49,9 @@ fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     rows
 }
 
-/// `register_remote_as` で登録し、`NeedIo` が要求した範囲だけをそのつど
-/// `provide` して駆動する（`sample.rs::run_id_with_lazy_io` と同じ手口）。
-/// プルーニングでバイト取得範囲が変わっても `NeedIo` の駆動が壊れないことを
-/// 一緒に確認する。
+/// Registers with `register_remote_as` and drives it by `provide`-ing exactly the range each
+/// `NeedIo` requests (the same trick as `sample.rs::run_id_with_lazy_io`). Also verifies
+/// that driving `NeedIo` doesn't break even when pruning changes the byte fetch range.
 fn run_with_lazy_io(bytes: &[u8], sql: &str) -> Vec<Vec<Value>> {
     let mut s = Session::new();
     s.register_remote_as("t", bytes.len() as u64, FormatKind::Parquet).unwrap();
@@ -63,7 +62,7 @@ fn run_with_lazy_io(bytes: &[u8], sql: &str) -> Vec<Vec<Value>> {
             Prepared::Ready(q) => break q,
             Prepared::NeedIo(reqs) => {
                 rounds += 1;
-                assert!(rounds < 1000, "resolve_query が終わらない");
+                assert!(rounds < 1000, "resolve_query never finished");
                 for r in reqs {
                     let (start, end) = (r.offset as usize, (r.offset + r.len) as usize);
                     s.provide(r.table, r.part, r.offset, bytes[start..end].to_vec()).unwrap();
@@ -76,7 +75,7 @@ fn run_with_lazy_io(bytes: &[u8], sql: &str) -> Vec<Vec<Value>> {
     let mut steps = 0u32;
     loop {
         steps += 1;
-        assert!(steps < 10_000, "step が終わらない");
+        assert!(steps < 10_000, "step never finished");
         match s.step(&mut q).unwrap() {
             QueryStep::Batch(mut b) => {
                 b.materialize();
@@ -87,7 +86,7 @@ fn run_with_lazy_io(bytes: &[u8], sql: &str) -> Vec<Vec<Value>> {
             QueryStep::Done => break,
             QueryStep::NeedIo(reqs) => {
                 rounds += 1;
-                assert!(rounds < 1000, "step が終わらない");
+                assert!(rounds < 1000, "step never finished");
                 for r in reqs {
                     let (start, end) = (r.offset as usize, (r.offset + r.len) as usize);
                     s.provide(r.table, r.part, r.offset, bytes[start..end].to_vec()).unwrap();
@@ -149,14 +148,14 @@ fn in_list_result_is_identical_whether_or_not_pruning_narrows_the_io() {
     assert_eq!(want, vec![vec![Value::I32(5)], vec![Value::I32(12345)], vec![Value::I32(39999)],]);
 
     let got = run_with_lazy_io(&bytes, sql);
-    assert_eq!(got, want, "NeedIo を挟んでも IN プルーニングの結果は変わってはいけない");
+    assert_eq!(got, want, "the IN-pruning result must not change across a NeedIo");
 }
 
 #[test]
 fn in_list_on_a_non_literal_candidate_still_returns_correct_rows_without_pruning() {
-    // 候補にリテラル以外（列参照）が混ざるケース。pruner は作られない
-    // （`plan::bind::tests::in_list_with_non_literal_element_is_not_pruned`
-    // で確認済み）が、実行結果そのものは正しくなければならない。
+    // A case where a non-literal (a column reference) is mixed into the candidates. No
+    // pruner gets built (confirmed by
+    // `plan::bind::tests::in_list_with_non_literal_element_is_not_pruned`), but the actual result must still be correct.
     let mut s = session_with_pagetest();
     let rows = run(&mut s, "SELECT id FROM t WHERE id IN (12345, id) ORDER BY id LIMIT 3");
     assert_eq!(rows, vec![vec![Value::I32(0)], vec![Value::I32(1)], vec![Value::I32(2)]]);

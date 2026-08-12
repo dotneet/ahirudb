@@ -1,58 +1,58 @@
-//! JSON の共通基盤: トークナイザ・パス演算子・シリアライズ。
+//! Shared JSON foundation: tokenizer, path operators, and serialization.
 //!
-//! `Ty::Json` の物理表現は UTF-8 の JSON テキスト (`vector::types` の doc 参照)。
-//! この値をパースし直さず「その場で読み飛ばして目的の部分だけ取り出す」
-//! ことで、DOM を組み立てるための入れ子データ構造（LIST/STRUCT 相当の
-//! 物理型）を増やさずに済ませる。
+//! The physical representation of `Ty::Json` is UTF-8 JSON text (see the docs in `vector::types`).
+//! Rather than reparsing that value, this "skips along in place and extracts only
+//! the part wanted", which avoids adding nested data structures (LIST/STRUCT-like
+//! physical types) just to build a DOM.
 //!
-//! ## `format::jsonl` との関係
+//! ## Relationship to `format::jsonl`
 //!
-//! `format::jsonl` は NDJSON の 1 行 1 オブジェクトを読み、列指向データへ
-//! 組み立てるためのモジュールで、キー/値の走査（`Members`/`Member`）は
-//! そのユースケースに特化している。一方このモジュールが要るのは
-//! 「値の途中まで読み飛ばして特定の部分木だけ取り出す」ナビゲーションで、
-//! 上位の反復子より下の**トークナイザそのもの**（空白・文字列・数値・
-//! スカラ・任意の値 1 個の読み飛ばし、エスケープ展開）だけが両者で
-//! 完全に共通する。そこでトークナイザ部分のみをこのモジュールへ切り出し、
-//! `format::jsonl` はここから `use` する（`Members`/`Member`/スキーマ推論用の
-//! 型束・日付パーサなど、NDJSON 固有の部分は元のまま `format::jsonl` に残す）。
+//! `format::jsonl` reads NDJSON one object per line and assembles columnar data; its
+//! key/value traversal (`Members`/`Member`) is specialized for that use case. What
+//! this module needs instead is navigation that "skips partway into a value and
+//! extracts one particular subtree". Only the **tokenizer itself** below those
+//! higher-level iterators -- skipping whitespace, strings, numbers, scalars, and any
+//! single value, plus escape expansion -- is entirely common to both. So only the
+//! tokenizer lives here, and `format::jsonl` `use`s it (the NDJSON-specific parts --
+//! `Members`/`Member`, the type lattice for schema inference, the date parser, and so
+//! on -- stay in `format::jsonl` as they were).
 //!
-//! ## 入力は信用しない
+//! ## The input is untrusted
 //!
-//! 壊れた JSON は `Err` になる（no_std/panic=abort なのでパニックや範囲外
-//! 参照は起こさない）。ただしパス走査は**見に行った部分だけ**を検証する
-//! 設計上の簡略化がある（下記「既知の制限」参照）。
+//! Broken JSON yields `Err` (under no_std/panic=abort there are no panics and no
+//! out-of-bounds accesses). Path traversal does carry a design simplification: it
+//! validates **only the parts it visits** (see "Known limitations" below).
 //!
-//! ## パス構文（サポート範囲）
+//! ## Path syntax (what is supported)
 //!
-//! DuckDB の `$.a.b[0]` 形式を素直に実装し、加えて先頭の `$` を省略できる
-//! （`a.b[0]` も同じ意味。これは DuckDB 非互換の意図的な簡略化）。
+//! DuckDB's `$.a.b[0]` form, implemented straightforwardly, plus the ability to omit
+//! the leading `$` (`a.b[0]` means the same; a deliberate simplification that is not DuckDB-compatible).
 //!
-//! - `$` または省略: ルート全体
-//! - `.key` / 裸の `key`: オブジェクトのメンバ
-//! - `."quoted key"`: `.`/`[` を含むキー用。エスケープは `\"` `\\` のみ対応
-//!   （JSON 文字列の `\uXXXX` 等の完全なエスケープ集合は非対応の簡略化）
-//! - `[N]`: 配列の要素。0 始まり、負数は末尾から（DuckDB と同じ）
-//! - 上記を任意個連結できる（`$.a[0].b` 等）
+//! - `$` or omitted: the whole root
+//! - `.key` / a bare `key`: an object member
+//! - `."quoted key"`: for keys containing `.`/`[`. Only `\"` and `\\` escapes are supported
+//!   (a simplification: the full JSON string escape set, `\uXXXX` and friends, is not supported)
+//! - `[N]`: an array element. 0-based, and negative counts from the end (as in DuckDB)
+//! - any number of the above can be chained (`$.a[0].b` and so on)
 //!
-//! **非対応**: JSON Pointer 記法 (`/a/b/0`)。
+//! **Unsupported**: JSON Pointer notation (`/a/b/0`).
 //!
-//! ## 既知の制限
+//! ## Known limitations
 //!
-//! - パス走査は「たどった経路上の兄弟要素」までしか構造検証しない。
-//!   目的の値が見つかった後に続く兄弟や、開かなかった部分木の中身が
-//!   壊れていても検出されないことがある（`whole`/`validate` は逆に
-//!   ドキュメント全体を検証する。CAST 時の検証はこちらを使う）。
-//! - オブジェクトの等価比較 (`=`)・キー順序の正規化は行わない
-//!   （呼び出し元 `expr::kernels::compare` がバイト列比較するだけ）。
+//! - Path traversal only validates structure as far as "the siblings along the path
+//!   walked". Siblings following the target value, or the contents of subtrees never
+//!   opened, may be broken without being detected (`whole`/`validate`, by contrast,
+//!   validate the whole document; CAST-time validation uses those).
+//! - No equality comparison of objects (`=`) and no key-order normalization
+//!   (the caller, `expr::kernels::compare`, merely compares bytes).
 
 use crate::prelude::*;
 
-/// 値の入れ子の上限。`format::jsonl` と同じ値・同じ理由
-/// （開いているコンテナ種別を `u32` のビットスタックで持てる）。
+/// The nesting limit for values. Same value and same reason as `format::jsonl`
+/// (the kinds of open containers fit in a `u32` bit stack).
 pub(crate) const MAX_DEPTH: u32 = 32;
 
-/// JSON 値の種別。
+/// The kind of a JSON value.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub(crate) enum Kind {
@@ -76,7 +76,7 @@ pub(crate) fn kind_of(c: u8) -> Kind {
 }
 
 // =========================================================================
-// トークナイザ（`format::jsonl` と共有する下回り）
+// The tokenizer (the lower layer shared with `format::jsonl`)
 // =========================================================================
 
 pub(crate) fn byte_at(b: &[u8], i: usize) -> Result<u8> {
@@ -93,7 +93,7 @@ pub(crate) fn skip_ws(b: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// `b[i]` は `"`。`(本体, エスケープ有無, 閉じ引用符の次)` を返す。
+/// `b[i]` is `"`. Returns `(body, whether escaped, the position after the closing quote)`.
 pub(crate) fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
     let mut j = i + 1;
     let mut esc = false;
@@ -101,7 +101,7 @@ pub(crate) fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
         match byte_at(b, j)? {
             b'"' => return Ok((&b[i + 1..j], esc, j + 1)),
             b'\\' => {
-                // 次の 1 バイトは必ず消費する。`\"` を終端と誤認しないため。
+                // The next byte is always consumed, so `\"` is not mistaken for the terminator.
                 byte_at(b, j + 1)?;
                 esc = true;
                 j += 2;
@@ -160,7 +160,7 @@ pub(crate) fn skip_scalar(b: &[u8], i: usize) -> Result<usize> {
     }
 }
 
-/// `"key" :` を読み飛ばし、値の開始位置を返す。
+/// Skips `"key" :` and returns the position where the value starts.
 pub(crate) fn skip_member_key(b: &[u8], i: usize) -> Result<usize> {
     let i = skip_ws(b, i);
     ensure!(byte_at(b, i)? == b'"', SyntaxError, i);
@@ -170,13 +170,13 @@ pub(crate) fn skip_member_key(b: &[u8], i: usize) -> Result<usize> {
     Ok(ni + 1)
 }
 
-/// `b[i]` から始まる値 1 つを読み飛ばし、その直後の位置を返す。
+/// Skips one value starting at `b[i]` and returns the position just after it.
 ///
-/// 再帰しない。開いているコンテナの種別は `u32` のビットスタックで持ち、
-/// 深さは `MAX_DEPTH` で頭打ちにする（`u32` のビット数と一致させてある）。
+/// Non-recursive. The kinds of open containers live in a `u32` bit stack, and depth
+/// is capped by `MAX_DEPTH` (kept equal to the bit width of `u32`).
 pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
     let mut i = start;
-    // ビット 1 = オブジェクト、0 = 配列。最下位ビットが現在のコンテナ。
+    // Bit 1 = object, 0 = array. The lowest bit is the current container.
     let mut stack: u32 = 0;
     let mut depth: u32 = 0;
 
@@ -191,7 +191,7 @@ pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
             i = skip_ws(b, i + 1);
             let n = byte_at(b, i)?;
             if (obj && n == b'}') || (!obj && n == b']') {
-                // 空コンテナ。値を 1 つ消費したものとして下の閉じ処理へ落ちる。
+                // An empty container. Falls through to the closing logic below as though one value had been consumed.
                 i += 1;
                 stack >>= 1;
                 depth -= 1;
@@ -205,7 +205,7 @@ pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
             i = skip_scalar(b, i)?;
         }
 
-        // 値を 1 つ消費した。区切り／閉じ括弧を処理する。
+        // One value consumed. Handle the separator or closing bracket.
         loop {
             if depth == 0 {
                 return Ok(i);
@@ -252,7 +252,7 @@ pub(crate) fn hex4(b: &[u8], i: usize) -> Result<u32> {
     Ok(v)
 }
 
-/// 文字列本体のエスケープを展開して UTF-8 として `out` に書く。
+/// Expands the escapes in a string body and writes it to `out` as UTF-8.
 pub(crate) fn decode_string(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let mut i = 0;
     while i < body.len() {
@@ -278,21 +278,21 @@ pub(crate) fn decode_string(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
                 let hi = hex4(body, i)?;
                 i += 4;
                 let cp = if (0xD800..0xDC00).contains(&hi) {
-                    // 上位サロゲート。直後が下位サロゲートなら結合する。
+                    // A high surrogate. Combine if a low surrogate follows immediately.
                     match (body.get(i), body.get(i + 1)) {
                         (Some(b'\\'), Some(b'u')) => match hex4(body, i + 2) {
                             Ok(lo) if (0xDC00..0xE000).contains(&lo) => {
                                 i += 6;
                                 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                             }
-                            // 対になっていない上位サロゲートはエラーにせず
-                            // U+FFFD に潰す（壊れた入力で行ごと失いたくない）。
+                            // An unpaired high surrogate is collapsed to U+FFFD rather
+                            // than made an error (losing a whole row to broken input is worse).
                             _ => 0xFFFD,
                         },
                         _ => 0xFFFD,
                     }
                 } else if (0xDC00..0xE000).contains(&hi) {
-                    // 単独の下位サロゲート。
+                    // A lone low surrogate.
                     0xFFFD
                 } else {
                     hi
@@ -308,13 +308,13 @@ pub(crate) fn decode_string(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
 }
 
 // =========================================================================
-// 全体検証（CAST 用）
+// Whole-document validation (for CAST)
 // =========================================================================
 
-/// 先頭・末尾の空白を許して、ちょうど 1 個の JSON 値からなることを検証し、
-/// そのスパンと種別を返す。パス無しの `json_type`/`json_array_length` や
-/// `VARCHAR → JSON` の CAST 検証で使う（**ドキュメント全体**を検証する
-/// 経路。パス経由のナビゲーションより厳密）。
+/// Allowing leading and trailing whitespace, validates that the input consists of
+/// exactly one JSON value and returns its span and kind. Used by the path-less
+/// `json_type`/`json_array_length` and by `VARCHAR -> JSON` cast validation (the path
+/// that validates **the whole document**; stricter than path-based navigation).
 pub(crate) fn whole(doc: &[u8]) -> Result<(&[u8], Kind)> {
     let start = skip_ws(doc, 0);
     let end = skip_value(doc, start)?;
@@ -323,14 +323,14 @@ pub(crate) fn whole(doc: &[u8]) -> Result<(&[u8], Kind)> {
     Ok((&doc[start..end], kind))
 }
 
-/// `doc` が妥当な JSON テキスト 1 個かどうかだけを見る。
+/// Only checks whether `doc` is exactly one piece of valid JSON text.
 pub(crate) fn validate(doc: &[u8]) -> Result<()> {
     whole(doc)?;
     Ok(())
 }
 
 // =========================================================================
-// パス
+// Paths
 // =========================================================================
 
 enum Seg {
@@ -338,7 +338,7 @@ enum Seg {
     Index(i64),
 }
 
-/// パス文字列をセグメント列へ。構文はモジュール doc の「パス構文」参照。
+/// Turns a path string into a sequence of segments. See "Path syntax" in the module docs.
 fn parse_path(p: &[u8]) -> Result<Vec<Seg>> {
     let mut i = if p.first() == Some(&b'$') { 1 } else { 0 };
     let mut segs = Vec::new();
@@ -387,7 +387,7 @@ fn parse_path(p: &[u8]) -> Result<Vec<Seg>> {
                 i = j + 1;
             }
             _ => {
-                // 先頭セグメントが `.`/`[` 無しで始まる簡略化パス（`a.b[0]`）。
+                // A shorthand path whose first segment starts without `.`/`[` (`a.b[0]`).
                 let start = i;
                 while i < p.len() && !matches!(p[i], b'.' | b'[') {
                     i += 1;
@@ -400,12 +400,12 @@ fn parse_path(p: &[u8]) -> Result<Vec<Seg>> {
     Ok(segs)
 }
 
-/// オブジェクト `b[obj_start]`（`{`）の中から `want` に一致するメンバの
-/// 値の開始位置を探す。見つからなければ `None`。
+/// Searches the object at `b[obj_start]` (`{`) for the member matching `want` and
+/// returns where its value starts. `None` if not found.
 ///
-/// 目的のキーの手前にあるメンバは、読み飛ばすために構造を検証する
-/// （壊れていれば `Err`）。手前に無ければ検証されない（モジュール doc の
-/// 「既知の制限」参照）。
+/// Members preceding the target key are structurally validated in order to be skipped
+/// (broken ones give `Err`). Anything not preceding it is left unvalidated (see
+/// "Known limitations" in the module docs).
 fn find_member(b: &[u8], obj_start: usize, want: &[u8]) -> Result<Option<usize>> {
     let mut i = skip_ws(b, obj_start + 1);
     if byte_at(b, i)? == b'}' {
@@ -438,7 +438,7 @@ fn find_member(b: &[u8], obj_start: usize, want: &[u8]) -> Result<Option<usize>>
     }
 }
 
-/// 配列 `b[arr_start]`（`[`）の要素数。
+/// The element count of the array at `b[arr_start]` (`[`).
 fn count_elements(b: &[u8], arr_start: usize) -> Result<i64> {
     let mut i = skip_ws(b, arr_start + 1);
     if byte_at(b, i)? == b']' {
@@ -457,8 +457,8 @@ fn count_elements(b: &[u8], arr_start: usize) -> Result<i64> {
     }
 }
 
-/// 配列 `b[arr_start]`（`[`）の `want` 番目（0 始まり、負数は末尾から）の
-/// 要素の開始位置。範囲外は `None`。
+/// Where element `want` (0-based, negative counting from the end) of the array at
+/// `b[arr_start]` (`[`) starts. Out of range gives `None`.
 fn nth_element(b: &[u8], arr_start: usize, want: i64) -> Result<Option<usize>> {
     let count = count_elements(b, arr_start)?;
     let real = if want < 0 { count + want } else { want };
@@ -482,10 +482,10 @@ fn nth_element(b: &[u8], arr_start: usize, want: i64) -> Result<Option<usize>> {
     }
 }
 
-/// `json_extract`/`json_extract_string`/`json_type`/`json_array_length` の
-/// パス付き形の本体。`path` が空（または `$` のみ）ならドキュメント全体を
-/// 返す。セグメントの種別が実際のコンテナと合わない、またはキー/添字が
-/// 見つからない場合は `Ok(None)`（呼び出し側は SQL NULL にする）。
+/// The body of the path-taking forms of
+/// `json_extract`/`json_extract_string`/`json_type`/`json_array_length`. An empty
+/// `path` (or just `$`) returns the whole document. If a segment's kind disagrees with
+/// the actual container, or the key/index is not found, the result is `Ok(None)` (the caller turns it into SQL NULL).
 pub(crate) fn extract<'a>(doc: &'a [u8], path: &[u8]) -> Result<Option<(&'a [u8], Kind)>> {
     let segs = parse_path(path)?;
     if segs.is_empty() {
@@ -521,8 +521,8 @@ pub(crate) fn extract<'a>(doc: &'a [u8], path: &[u8]) -> Result<Option<(&'a [u8]
     Ok(Some((&doc[vs..end], kind)))
 }
 
-/// `list_extract` の本体。1 始まり、負数は末尾から。範囲外・非配列は
-/// `None`。
+/// The body of `list_extract`. 1-based, with negatives counting from the end.
+/// Out of range gives `None`.
 pub(crate) fn list_index(doc: &[u8], idx: i64) -> Result<Option<&[u8]>> {
     let start = skip_ws(doc, 0);
     if idx == 0 || byte_at(doc, start)? != b'[' {
@@ -538,33 +538,33 @@ pub(crate) fn list_index(doc: &[u8], idx: i64) -> Result<Option<&[u8]>> {
     }
 }
 
-/// `list_slice` の本体。1 始まり、両端含む、負数は末尾から。`list_index`
-/// （`list_extract`）と違って範囲外は **NULL にせず切り詰める**（DuckDB の
-/// `expr[i:j]` 構文と同じ規則。`duckdb -c "select [1,2,3,4,5][10:20],
-/// [1,2,3,4,5][-10:3]"` が `[]`/`[1, 2, 3]` を返すことで確認済み ——
-/// 完全に範囲外なら空配列、一部だけはみ出すなら残った部分だけ返す）。
-/// 非配列は `None`（呼び出し元で SQL NULL）。
+/// The body of `list_slice`. 1-based, inclusive on both ends, with negatives counting
+/// from the end. Unlike `list_index` (`list_extract`), out-of-range does **not** give
+/// NULL but clamps (the same rule as DuckDB's `expr[i:j]` syntax; confirmed by
+/// `duckdb -c "select [1,2,3,4,5][10:20], [1,2,3,4,5][-10:3]"` returning `[]`/`[1, 2, 3]`
+/// -- fully out of range gives an empty array, partly out of range gives what remains).
+/// A non-array gives `None` (SQL NULL at the call site).
 ///
-/// 戻り値は `doc` 内の半開区間 `(lo, hi)`。`doc[lo..hi]` を `[` `]` で
-/// 包めば結果になる（`lo == hi` は空配列 `[]` を意味する）。配列要素は
-/// 連続したバイト列なので、要素ごとに書き出し直さずこの区間をまるごと
-/// コピーするだけで済む（`nth_element`/`skip_value` を先頭要素・末尾要素の
-/// 位置決めにだけ使う）。
+/// The return value is the half-open interval `(lo, hi)` within `doc`. Wrapping
+/// `doc[lo..hi]` in `[` `]` gives the result (`lo == hi` means the empty array `[]`).
+/// Array elements are contiguous bytes, so rather than re-emitting element by element
+/// this just copies the whole interval (`nth_element`/`skip_value` are used only to
+/// locate the first and last elements).
 pub(crate) fn list_slice(doc: &[u8], start: i64, end: i64) -> Result<Option<(usize, usize)>> {
     let arr_start = skip_ws(doc, 0);
     if byte_at(doc, arr_start)? != b'[' {
         return Ok(None);
     }
     let count = count_elements(doc, arr_start)?;
-    // 空配列の書き出し先（`[` の直後、`]` の手前の空白終わり）。
+    // Where an empty array is written (just after `[`, at the end of the whitespace before `]`).
     let empty_at = skip_ws(doc, arr_start + 1);
     if count == 0 {
         return Ok(Some((empty_at, empty_at)));
     }
-    // 1 始まり・両端含む区間へ正規化してからクランプする。0 は 1 として
-    // 扱う（`duckdb -c "select [1,2,3,4,5][0:2]"` が `[1,2,3,4,5][1:2]` と
-    // 同じ `[1, 2]` を返すことで確認済み）。負数は `saturating_add` で
-    // オーバーフローを避ける（信用できない入力からの巨大な負の添字対策）。
+    // Normalize to a 1-based inclusive interval before clamping. 0 is treated as 1
+    // (confirmed by `duckdb -c "select [1,2,3,4,5][0:2]"` returning the same `[1, 2]`
+    // as `[1,2,3,4,5][1:2]`). Negatives use `saturating_add` to avoid overflow
+    // (guarding against huge negative indices from untrusted input).
     let norm = |v: i64| -> i64 {
         if v == 0 {
             1
@@ -579,8 +579,8 @@ pub(crate) fn list_slice(doc: &[u8], start: i64, end: i64) -> Result<Option<(usi
     if s > e {
         return Ok(Some((empty_at, empty_at)));
     }
-    // クランプ後の s/e は必ず [1, count] 内に収まるので、`nth_element` は
-    // 常に `Some` を返す（0 始まりへ変換してから渡す）。
+    // After clamping, s/e always fall within [1, count], so `nth_element` always
+    // returns `Some` (converted to 0-based before being passed in).
     let (Some(lo), Some(hi_start)) =
         (nth_element(doc, arr_start, s - 1)?, nth_element(doc, arr_start, e - 1)?)
     else {
@@ -590,8 +590,8 @@ pub(crate) fn list_slice(doc: &[u8], start: i64, end: i64) -> Result<Option<(usi
     Ok(Some((lo, hi)))
 }
 
-/// `map_extract` の本体。直接のメンバ名検索（パス構文は使わない）。
-/// 非オブジェクト・キー無しは `None`。
+/// The body of `map_extract`. A direct member-name lookup (no path syntax).
+/// A non-object, or a missing key, gives `None`.
 pub(crate) fn map_get<'a>(doc: &'a [u8], key: &[u8]) -> Result<Option<&'a [u8]>> {
     let start = skip_ws(doc, 0);
     if byte_at(doc, start)? != b'{' {
@@ -606,7 +606,7 @@ pub(crate) fn map_get<'a>(doc: &'a [u8], key: &[u8]) -> Result<Option<&'a [u8]>>
     }
 }
 
-/// `json_array_length` の本体。配列でなければ 0（DuckDB と同じ）。
+/// The body of `json_array_length`. 0 for anything that is not an array (as in DuckDB).
 pub(crate) fn array_length(span: &[u8], kind: Kind) -> Result<i64> {
     if kind != Kind::Array {
         return Ok(0);
@@ -615,13 +615,13 @@ pub(crate) fn array_length(span: &[u8], kind: Kind) -> Result<i64> {
     count_elements(span, start)
 }
 
-/// 配列要素 1 個のスパンと種別。
+/// The span and kind of one array element.
 pub(crate) type Elem<'a> = (&'a [u8], Kind);
 
-/// `doc`（前後の空白は許容）が配列なら、その要素を先頭から順に返す。
-/// 配列でなければ `None`（`exec::unnest::Unnest` はこれを「展開結果 0 行」
-/// として扱う。`nth_element` の走査を要素数ぶん繰り返す（O(n^2)）のを避け、
-/// 1 パスで全要素のスパンを集める）。
+/// If `doc` (surrounding whitespace allowed) is an array, returns its elements in order.
+/// `None` otherwise (`exec::unnest::Unnest` treats that as "0 rows produced"). This
+/// collects every element's span in one pass, avoiding repeating `nth_element`'s walk
+/// once per element (O(n^2)).
 pub(crate) fn array_elements(doc: &[u8]) -> Result<Option<Vec<Elem<'_>>>> {
     let start = skip_ws(doc, 0);
     if byte_at(doc, start)? != b'[' {
@@ -645,9 +645,9 @@ pub(crate) fn array_elements(doc: &[u8]) -> Result<Option<Vec<Elem<'_>>>> {
     }
 }
 
-/// JSON 数値トークンを `i64` に。小数点・指数付き、または範囲外なら
-/// `None`（呼び出し側は SQL NULL にする。`format::jsonl::parse_i64` と同じ
-/// 判断だが、こちらは UNNEST のネイティブ型復元専用に `json` 側へ置く）。
+/// A JSON number token as an `i64`. With a decimal point or exponent, or out of range,
+/// gives `None` (the caller turns it into SQL NULL). The same judgment as
+/// `format::jsonl::parse_i64`, but placed on the `json` side specifically for UNNEST's native type recovery.
 pub(crate) fn parse_i64(s: &[u8]) -> Option<i64> {
     let (neg, ds) = match s.first() {
         Some(b'-') => (true, &s[1..]),
@@ -656,7 +656,7 @@ pub(crate) fn parse_i64(s: &[u8]) -> Option<i64> {
     if ds.is_empty() {
         return None;
     }
-    // 負側で累算する。i64::MIN を特別扱いせずに済む。
+    // Accumulate on the negative side. That avoids special-casing i64::MIN.
     let mut acc: i64 = 0;
     for &c in ds {
         if !c.is_ascii_digit() {
@@ -671,15 +671,15 @@ pub(crate) fn parse_i64(s: &[u8]) -> Option<i64> {
     }
 }
 
-/// 浮動小数は core の `str::parse::<f64>()`（dec2flt）に任せる。
+/// Floating point is left to core's `str::parse::<f64>()` (dec2flt).
 pub(crate) fn parse_f64(s: &[u8]) -> Option<f64> {
     core::str::from_utf8(s).ok()?.parse::<f64>().ok()
 }
 
-/// `json_type` の型名。DuckDB の実際の文字列に合わせるが、数値は
-/// 符号・桁あふれで UBIGINT/DOUBLE を出し分ける DuckDB の挙動までは
-/// 再現せず、整数はすべて `"BIGINT"` に単純化する（モジュール doc 外の
-/// 追加の簡略化。詳細は `expr::funcs` 側のテスト・ドキュメントを参照）。
+/// The type name for `json_type`. Matches DuckDB's actual strings, except that
+/// DuckDB's behavior of picking UBIGINT/DOUBLE for numbers based on sign and overflow
+/// is not reproduced: every integer is simplified to `"BIGINT"` (an additional
+/// simplification beyond the module docs; see the tests and docs in `expr::funcs`).
 pub(crate) fn type_name(kind: Kind, span: &[u8]) -> &'static str {
     match kind {
         Kind::Null => "NULL",
@@ -697,10 +697,10 @@ pub(crate) fn type_name(kind: Kind, span: &[u8]) -> &'static str {
     }
 }
 
-/// `json_extract_string` のテキスト化。JSON `null` は SQL NULL（`false`）。
-/// 文字列はエスケープを展開し、それ以外はスパンをそのまま書く
-/// （数値の正規化はしない: `1e3` はそのまま `1e3`。DuckDB は正規化した
-/// 数値表記を返すが、ここでは行わない簡略化）。
+/// The stringification for `json_extract_string`. JSON `null` becomes SQL NULL (`false`).
+/// Strings have their escapes expanded; everything else has its span written verbatim
+/// (numbers are not normalized: `1e3` stays `1e3`. DuckDB returns a normalized numeric
+/// form; this is a simplification that does not).
 pub(crate) fn write_extracted_text(span: &[u8], kind: Kind, out: &mut Vec<u8>) -> Result<bool> {
     match kind {
         Kind::Null => Ok(false),
@@ -717,7 +717,7 @@ pub(crate) fn write_extracted_text(span: &[u8], kind: Kind, out: &mut Vec<u8>) -
 }
 
 // =========================================================================
-// シリアライズ
+// Serialization
 // =========================================================================
 
 fn hex_digit(n: u8) -> u8 {
@@ -728,9 +728,9 @@ fn hex_digit(n: u8) -> u8 {
     }
 }
 
-/// 任意のバイト列（UTF-8 の VARCHAR 内容）を JSON 文字列リテラルとして書く。
-/// 制御文字だけエスケープし、非 ASCII の UTF-8 バイトはそのまま埋め込む
-/// （DuckDB の既定と同じで `\uXXXX` へは変換しない）。
+/// Writes arbitrary bytes (the contents of a UTF-8 VARCHAR) as a JSON string literal.
+/// Only control characters are escaped; non-ASCII UTF-8 bytes are embedded as they are
+/// (the same as DuckDB's default -- no conversion to `\uXXXX`).
 pub(crate) fn write_json_string(s: &[u8], out: &mut Vec<u8>) {
     out.push(b'"');
     for &c in s {
@@ -777,7 +777,7 @@ mod tests {
 
     #[test]
     fn extract_bare_path_is_our_simplification() {
-        // DuckDB では 'a.b[1]' は NULL になるが、ここでは $ 省略を許す。
+        // In DuckDB 'a.b[1]' is NULL, but here omitting $ is allowed.
         assert_eq!(ext(r#"{"a":{"b":[1,2,3]}}"#, "a.b[1]").unwrap().0, "2");
     }
 
@@ -940,16 +940,16 @@ mod tests {
         assert_eq!(parse_f64(b"nope"), None);
     }
 
-    // --- 境界値・壊れた入力 ----------------------------------------------------
+    // --- Boundary values and corrupt input --------------------------------------
 
     #[test]
     fn nesting_exactly_at_max_depth_succeeds_one_more_fails() {
-        // `skip_value` は非再帰（`u32` ビットスタック）なので深いネストで
-        // スタックオーバーフローはしないが、MAX_DEPTH（32）自体は明示的な
-        // 上限として効くはず。
+        // `skip_value` is non-recursive (a `u32` bit stack), so deep nesting cannot
+        // overflow the stack, but MAX_DEPTH (32) itself should still act as an
+        // explicit limit.
         let mut at_limit = vec![b'['; MAX_DEPTH as usize];
         at_limit.extend(vec![b']'; MAX_DEPTH as usize]);
-        assert!(whole(&at_limit).is_ok(), "MAX_DEPTH ちょうどは通る");
+        assert!(whole(&at_limit).is_ok(), "exactly MAX_DEPTH passes");
 
         let mut over_limit = vec![b'['; MAX_DEPTH as usize + 1];
         over_limit.extend(vec![b']'; MAX_DEPTH as usize + 1]);
@@ -958,8 +958,8 @@ mod tests {
 
     #[test]
     fn very_deeply_nested_input_errors_without_panicking_or_hanging() {
-        // MAX_DEPTH の何倍も深い入力でも（非再帰実装なので）panic せず、
-        // ただの SyntaxError/NestingTooDeep で終わることを確認する。
+        // Confirm that input many times deeper than MAX_DEPTH does not panic (the
+        // implementation is non-recursive) and ends in a plain SyntaxError/NestingTooDeep.
         let deep: Vec<u8> = vec![b'['; 10_000];
         assert!(whole(&deep).is_err());
     }
@@ -979,7 +979,7 @@ mod tests {
 
     #[test]
     fn decode_string_reassembles_surrogate_pairs_into_one_codepoint() {
-        // U+1F600 (😀) は UTF-16 で高位・低位サロゲートのペアになる。
+        // U+1F600 becomes a high/low surrogate pair in UTF-16.
         let mut out = Vec::new();
         decode_string(b"\\ud83d\\ude00", &mut out).unwrap();
         assert_eq!(core::str::from_utf8(&out).unwrap(), "\u{1F600}");
@@ -987,8 +987,8 @@ mod tests {
 
     #[test]
     fn decode_string_replaces_unpaired_surrogates_with_replacement_char() {
-        // 対にならない上位/下位サロゲートはエラーにせず U+FFFD に潰す
-        // （壊れた入力で他のフィールドの読み取りごと失いたくないため）。
+        // Unpaired high/low surrogates are collapsed to U+FFFD rather than made errors
+        // (losing the reads of other fields to broken input is worse).
         let mut out = Vec::new();
         decode_string(b"\\ud83d", &mut out).unwrap();
         assert_eq!(core::str::from_utf8(&out).unwrap(), "\u{FFFD}");
@@ -999,11 +999,11 @@ mod tests {
 
     #[test]
     fn raw_control_bytes_in_a_string_are_accepted_without_escaping() {
-        // RFC 8259 は文字列中の生の制御文字（0x00-0x1F）を許さないが、
-        // `scan_string` は `"` と `\` の位置しか見ておらず、これを検査しない。
-        // 誤って壊すよりゆるく通す方を選んだ既知の簡略化で、意図的な挙動
-        // として固定しておく（誤って構文エラーになるよう「厳格化」しても
-        // 気づけるように）。
+        // RFC 8259 disallows raw control characters (0x00-0x1F) inside strings, but
+        // `scan_string` only looks at the positions of `"` and `\` and does not check
+        // for them. This is a known simplification -- being lenient was preferred over
+        // corrupting things by mistake -- pinned here as deliberate behavior (so that
+        // "tightening" it into a syntax error would be noticed).
         assert!(whole(b"\"a\x01b\"").is_ok());
     }
 }

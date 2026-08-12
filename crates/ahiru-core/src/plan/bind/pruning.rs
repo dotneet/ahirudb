@@ -4,12 +4,12 @@
 
 use super::*;
 
-// --- 枝刈り述語の抽出 --------------------------------------------------------
+// --- Extracting pruning predicates -------------------------------------------
 
-/// `列 <op> 定数` の形を取り出す。
+/// Extracts the shape `column <op> constant`.
 ///
-/// AND で連結された枝だけを辿る。OR の下では「片方が真なら通る」ため、
-/// 個々の条件で分割を落とすと結果が変わってしまう。
+/// Only branches joined by AND are walked. Under an OR, "if either side is true it passes",
+/// so dropping a split on an individual condition would change the result.
 pub(super) fn extract_pruners(arena: &ExprArena, id: ExprId, scope: &Scope, out: &mut Vec<Pruner>) {
     match arena.get(id) {
         Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
@@ -40,12 +40,12 @@ pub(super) fn extract_pruners(arena: &ExprArena, id: ExprId, scope: &Scope, out:
     }
 }
 
-/// `列 IN (定数, ...)` を 1 つの `PruneOp::In` pruner にまとめる。
+/// Bundles `column IN (constant, ...)` into a single `PruneOp::In` pruner.
 ///
-/// リストの要素が 1 つでもリテラル以外（列参照・部分式）なら、その要素が
-/// 何に等しくなるか分からず候補集合を確定できないため、pruner ごと諦める
-/// （安全側 = 枝刈りしない）。NULL リテラルは `x = NULL` が真になり得ない
-/// ので候補から除くだけでよい。
+/// If even one element of the list is not a literal (a column reference or subexpression),
+/// what it equals is unknown and the candidate set cannot be settled, so the whole pruner is
+/// abandoned (erring safe = no pruning). A NULL literal can simply be dropped from the
+/// candidates, since `x = NULL` can never be true.
 fn as_in_pruner(arena: &ExprArena, arg: ExprId, list: &[ExprId], scope: &Scope) -> Option<Pruner> {
     let (qual, name) = match arena.get(arg) {
         Expr::ColumnRef { qualifier, name } => (qualifier.as_deref(), name),
@@ -85,7 +85,7 @@ fn as_pruner(
         _ => return None,
     };
     let column = scope.resolve(qual, name).ok()?;
-    // 文字列統計は writer による切り詰めがあるため、v1 では数値・時刻のみ扱う。
+    // String statistics can be truncated by the writer, so v1 handles only numeric and temporal types.
     let ty = scope.fields()[column].ty;
     if !(ty.is_numeric() || ty.is_temporal()) {
         return None;
@@ -96,7 +96,7 @@ fn as_pruner(
         BinaryOp::Le => PruneOp::Le,
         BinaryOp::Gt => PruneOp::Gt,
         BinaryOp::Ge => PruneOp::Ge,
-        // `<>` は統計で落とせない（範囲内のどこかに他の値がありうる）。
+        // `<>` cannot be pruned by statistics (some other value may exist anywhere in the range).
         _ => return None,
     };
     Some(Pruner { column, op, value, in_values: Vec::new() })

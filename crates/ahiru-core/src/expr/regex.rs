@@ -1,117 +1,112 @@
-//! `regexp_matches` / `regexp_extract` / `regexp_replace` 用の正規表現エンジン。
+//! The regular expression engine for `regexp_matches` / `regexp_extract` / `regexp_replace`.
 //!
-//! 外部クレートを使わない自前実装。素朴な再帰バックトラックは
-//! `(a+)+b` のようなパターンで指数時間になりうるため採用せず、
-//! **Thompson NFA + Pike's VM**（Russ Cox の一連の記事で解説されている手法）
-//! で実装する。パターンを NFA へコンパイルし、入力バイトごとに「今生きている
-//! 状態の集合」を並行して前進させる。状態は 1 バイトあたり高々 命令数ぶんしか
-//! 増えない（同じ命令番号への到達は 1 回だけ数える）ので、最悪計算量は
-//! `O(命令数 × 入力長)` に収まり、バックトラックによる爆発が原理的に起きない。
-//! `LIKE` (`expr/kernels.rs` の `like_match`) が 2 ポインタ法で同じ問題を
-//! 避けているのと動機は同じ。
+//! An in-house implementation using no external crate. Naive recursive backtracking can go
+//! exponential on patterns like `(a+)+b`, so it is not used; instead this is a
+//! **Thompson NFA + Pike's VM** (the technique explained in Russ Cox's series of articles).
+//! The pattern is compiled into an NFA, and "the set of currently live states" advances in
+//! parallel per input byte. The states grow by at most the instruction count per byte (reaching
+//! the same instruction number counts only once), so the worst case stays within
+//! `O(instructions x input length)` and a backtracking blowup cannot occur in principle.
+//! The motivation is the same as `LIKE` (`like_match` in `expr/kernels.rs`) avoiding the same
+//! problem with a two-pointer method.
 //!
-//! ## 対応する構文（これ以外は `Err(UnsupportedFeature)` か `Err(SyntaxError)`）
+//! ## Supported syntax (anything else gives `Err(UnsupportedFeature)` or `Err(SyntaxError)`)
 //!
-//! - リテラル文字（**バイト単位**。`upper`/`lower` 等と違い UTF-8 の
-//!   コードポイントは意識しない。マルチバイト文字はバイト列の完全一致として
-//!   扱われるので、リテラルとしては問題なく動くが `.` は「バイト 1 個」に
-//!   一致する点に注意）。
-//! - `.`（改行以外の任意の 1 バイト）
-//! - `*` `+` `?`（貪欲な量指定子）
-//! - `{n}` `{n,}` `{n,m}`（有界繰り返し。DuckDB の内部エンジン RE2 と同じく
-//!   `n`,`m` は 1000 まで）
-//! - 文字クラス `[abc]` `[^abc]`、範囲 `[a-z]`、短縮形 `\d \D \w \W \s \S`
-//! - アンカー `^` `$`（`(?m)` 相当のマルチライン化はしない。`^` は入力の
-//!   先頭、`$` は入力の末尾にのみ一致する）
-//! - 選択 `|`
-//! - グループ `(...)`（捕獲）と `(?:...)`（非捕獲）
-//! - メタ文字のエスケープ `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\`
+//! - Literal characters (**byte-wise**. Unlike `upper`/`lower` and friends it is unaware of
+//!   UTF-8 code points. A multi-byte character is treated as an exact byte-sequence match, so it
+//!   works fine as a literal, but note that `.` matches "one byte").
+//! - `.` (any single byte other than a newline)
+//! - `*` `+` `?` (greedy quantifiers)
+//! - `{n}` `{n,}` `{n,m}` (bounded repetition. As in RE2, DuckDB's internal engine, `n` and `m`
+//!   go up to 1000)
+//! - Character classes `[abc]` `[^abc]`, ranges `[a-z]`, and the shorthands `\d \D \w \W \s \S`
+//! - Anchors `^` `$` (no `(?m)`-style multiline. `^` matches only the start of the input and `$`
+//!   only its end)
+//! - Alternation `|`
+//! - Groups `(...)` (capturing) and `(?:...)` (non-capturing)
+//! - Escaped metacharacters `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\`
 //!
-//! **非対応**（`resolve`/コンパイル時に必ずエラーにする。黙って別の意味に
-//! 解釈してしまうと「間違った検索結果」という一番まずい failure mode になる
-//! ため）:
-//! - 先読み・後読み `(?=...)` `(?!...)` `(?<=...)` `(?<!...)`
-//! - パターン内バックリファレンス `\1`（**置換文字列側の** `\1`/`\2` は別物で
-//!   `regexp_replace` に必須の機能として対応する。詳細は `parse_repl` 参照）
-//! - 名前付きグループ `(?P<name>...)` `(?<name>...)`
-//! - 非貪欲量指定子 `*?` `+?` `??` `{n,m}?`
-//! - 単語境界 `\b` `\B`
-//! - 大文字小文字を無視するマッチ（`(?i)` やフラグ引数）。DuckDB は対応するが
-//!   実装コストと引き換えるほどの頻度ではないと判断し v1 では見送る。
-//!   ASCII 大小無視だけなら安く足せるが、`LIKE` 同様この単位でも需要が
-//!   確認できるまでは増やさない。
+//! **Unsupported** (always an error at `resolve`/compile time; silently interpreting them
+//! differently would give the worst failure mode of all, "wrong search results"):
+//! - Lookahead and lookbehind `(?=...)` `(?!...)` `(?<=...)` `(?<!...)`
+//! - In-pattern backreferences `\1` (the `\1`/`\2` **in the replacement string** are a different
+//!   thing and are supported as essential to `regexp_replace`; see `parse_repl`)
+//! - Named groups `(?P<name>...)` `(?<name>...)`
+//! - Lazy quantifiers `*?` `+?` `??` `{n,m}?`
+//! - Word boundaries `\b` `\B`
+//! - Case-insensitive matching (`(?i)` or a flags argument). DuckDB supports it, but it was
+//!   judged not frequent enough to be worth the implementation cost, so it is deferred in v1.
+//!   ASCII-only case folding alone could be added cheaply, but as with `LIKE`, nothing is added
+//!   at this granularity until demand is confirmed.
 //!
-//! ## サイズ・実行時間の上限
+//! ## Size and runtime caps
 //!
-//! すべて「小さいコードで確実に上限を掛けられる」値を選んでいる。
-//! 個々の理由はコード中の定数コメントを参照。
+//! Every one is a value that "caps things reliably with little code".
+//! See the comments on each constant for the individual reasons.
 //!
-//! ## `resolve`/`call` との関係
+//! ## Relationship to `resolve`/`call`
 //!
-//! `resolve` は型しか見られず、パターン文字列（多くの場合クエリ全体で
-//! 定数）を見られない。そのため「1 クエリに 1 回だけコンパイルする」ことは
-//! 計画時にはできない。代わりに `call` の中で、パターン列の stride が 0
-//! （＝定数列）なら行ループの外で 1 回だけ `compile` し、そうでなければ
-//! （パターンが列ごとに変わる稀なケース）行ごとに再コンパイルする。
-//! `LIKE` は現状パターンを毎行スキャンしているだけなので、これでも既存水準
-//! より悪化はしない。
+//! `resolve` can only see types, not the pattern string (which is usually a constant across the
+//! whole query). So "compile exactly once per query" cannot be arranged at planning time.
+//! Instead, inside `call`, if the pattern column's stride is 0 (= a constant column) it
+//! `compile`s once outside the row loop, and otherwise (the rare case where the pattern varies
+//! per row) recompiles per row.
+//! `LIKE` currently just rescans the pattern every row, so this is no worse than the existing level.
 
 use crate::expr::funcs;
 use crate::prelude::*;
 use crate::vector::{Bitmap, BytesData, Data, Ty, Vector};
 
 // ============================================================================
-// 上限値
+// Limits
 // ============================================================================
 
-/// パターン文字列の最大バイト数。これより長い場合はコンパイルに掛ける前に
-/// 拒否する。以降の上限（命令数など）から見て、これより長くても意味のある
-/// パターンは書けない。
+/// The maximum byte length of a pattern string. Anything longer is rejected before compilation.
+/// Given the later limits (the instruction count and so on), no meaningful pattern can be
+/// written that is longer than this.
 const MAX_PATTERN_LEN: usize = 4096;
 
-/// コンパイル後の命令列の最大長。「数千命令」という指示に沿って 4096 に
-/// 設定。`{n,m}` の展開や入れ子repeatはこの値を超えた時点で即座に打ち切る
-/// ので、`(a{1000}){1000}` のような入れ子でも実際に確保するメモリは
-/// この上限に比例した量で頭打ちになる（詳細は `Compiler::emit` 参照）。
+/// The maximum length of the compiled instruction sequence. Set to 4096, following the
+/// "a few thousand instructions" instruction. `{n,m}` expansion and nested repeats abort the
+/// moment this value is exceeded, so even a nesting like `(a{1000}){1000}` allocates memory
+/// bounded in proportion to this cap (see `Compiler::emit` for details).
 const MAX_PROG_INSTS: usize = 4096;
 
-/// 捕獲グループの最大数。スレッドごとに持つ捕獲位置配列
-/// `[u32; SLOTS]`（`SLOTS = (MAX_GROUPS+1)*2`）のサイズを決める値なので、
-/// 大きくするほど NFA シミュレーションの 1 ステップが重くなる。32 は
-/// 実用的なパターンでまず超えない数。
+/// The maximum number of capture groups. It sizes the per-thread capture-position array
+/// `[u32; SLOTS]` (`SLOTS = (MAX_GROUPS+1)*2`), so raising it makes each step of the NFA
+/// simulation heavier. 32 is a count practical patterns essentially never exceed.
 const MAX_GROUPS: usize = 32;
 
-/// 捕獲位置配列のサイズ。group 0 は全体一致用に予約する。
+/// The size of the capture-position array. Group 0 is reserved for the whole match.
 const SLOTS: usize = (MAX_GROUPS + 1) * 2;
 
-/// 括弧の入れ子の最大深さ。パーサ・コンパイラとも再帰で書いているので、
-/// これでネイティブスタックの深さを間接的に抑える（wasm はスタックが
-/// 小さいホストもある）。
+/// The maximum nesting depth of parentheses. Both the parser and the compiler are written
+/// recursively, so this indirectly bounds the native stack depth (some wasm hosts have a small
+/// stack).
 const MAX_NEST_DEPTH: u32 = 64;
 
-/// `{n,m}` の `n`/`m` の最大値。DuckDB が内部で使う RE2 も同じ 1000 を
-/// 上限にしている（`duckdb -c "select regexp_matches('a','a{1001}')"` が
-/// `invalid repetition size` で弾かれることを確認済み）ので、それに揃える。
+/// The maximum value of `n`/`m` in `{n,m}`. RE2, which DuckDB uses internally, caps at the same
+/// 1000 (confirmed that `duckdb -c "select regexp_matches('a','a{1001}')"` is rejected with
+/// `invalid repetition size`), so this matches it.
 const MAX_REPEAT: u32 = 1000;
 
-/// 1 回の NFA シミュレーション（`exec` 1 呼び出し＝1 回のマッチ試行）で
-/// 許す「命令に到達した」延べ回数。Thompson NFA の最悪計算量は
-/// `O(命令数 × 入力長)` なので、命令数上限 4096 と掛け合わせると
-/// 8,000,000 は「上限いっぱいの命令数のパターンを ~2000 バイトの入力に
-/// 掛ける」「20 命令程度の普通のパターンを ~400KB の入力に掛ける」の
-/// どちらも許容しつつ、変な入力（`regexp_replace` の `g` 付きグローバル
-/// 置換で `exec` を繰り返し呼ぶケースなど）で 1 回のマッチ試行が
-/// wasm 上で数十 ms を超えないよう頭打ちにする値として選んだ。
-/// バッチ全体ではなく `exec` 呼び出し単位の上限であることに注意
-/// （行数分の正当な作業量まで制限すると通常のクエリが動かなくなるため）。
+/// The cumulative number of "instruction reached" events allowed in one NFA simulation (one
+/// `exec` call = one match attempt). A Thompson NFA's worst case is
+/// `O(instructions x input length)`, so multiplied by the 4096 instruction cap, 8,000,000 was
+/// chosen as a value allowing both "a pattern at the instruction cap applied to ~2000 bytes of
+/// input" and "an ordinary ~20-instruction pattern applied to ~400 KB of input", while capping
+/// things so that one match attempt does not exceed tens of milliseconds on wasm under odd input
+/// (such as `regexp_replace`'s global `g` replacement calling `exec` repeatedly).
+/// Note that it is a cap per `exec` call rather than per batch
+/// (limiting the legitimate work of every row would stop ordinary queries from running).
 const MAX_STEPS: u32 = 8_000_000;
 
 // ============================================================================
-// 文字クラス
+// Character classes
 // ============================================================================
 
-/// 256 バイト値の集合をビットマスクで持つ。範囲・否定・和集合のどれも
-/// 固定長ループで済み、パターンのサイズに関わらずコード量が増えない。
+/// Holds a set of the 256 byte values as a bitmask. Ranges, negation, and union all take
+/// fixed-length loops, so the amount of code does not grow with the pattern's size.
 #[derive(Clone, Copy)]
 struct ClassSet([u64; 4]);
 
@@ -166,8 +161,8 @@ fn word_set() -> ClassSet {
     s
 }
 
-/// RE2 の `\s` は `[\t\n\f\r ]`（`\v` を含まない）。DuckDB 経由で実測して
-/// 確認済み（`chr(11)`（`\v`）は不一致、`chr(12)`（`\f`）は一致）。
+/// RE2's `\s` is `[\t\n\f\r ]` (it does not include `\v`). Confirmed by measuring through DuckDB
+/// (`chr(11)` (`\v`) does not match while `chr(12)` (`\f`) does).
 fn space_set() -> ClassSet {
     let mut s = ClassSet::new();
     for &b in &[b' ', b'\t', b'\n', 0x0c, b'\r'] {
@@ -177,7 +172,7 @@ fn space_set() -> ClassSet {
 }
 
 // ============================================================================
-// AST とパーサ
+// The AST and the parser
 // ============================================================================
 
 enum Ast {
@@ -191,7 +186,7 @@ enum Ast {
     Plus(Box<Ast>),
     Quest(Box<Ast>),
     Repeat(Box<Ast>, u32, Option<u32>),
-    /// `Some(g)` は捕獲グループ（`g` は 1 始まり）、`None` は非捕獲。
+    /// `Some(g)` is a capture group (`g` is 1-based); `None` is non-capturing.
     Group(Box<Ast>, Option<u16>),
     Bol,
     Eol,
@@ -233,10 +228,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// 原子 1 つ＋末尾の量指定子（あれば 1 つだけ）を読む。
+    /// Reads one atom plus a trailing quantifier (at most one, if present).
     fn parse_repeat(&mut self) -> Result<Ast> {
         let atom = self.parse_atom()?;
-        // まず「量指定子を適用するかどうか」だけを、atom を消費せずに決める。
+        // First, decide only "whether a quantifier applies", without consuming the atom.
         enum Q {
             None,
             Star,
@@ -266,9 +261,9 @@ impl<'a> Parser<'a> {
                     }
                     Q::Repeat(n, m)
                 }
-                // 有効な `{n,m}` の形をしていない `{` は単なるリテラル文字
-                // （RE2/DuckDB の挙動。`self.i` は '{' の手前のまま戻すので
-                // 次の parse_repeat 呼び出しで通常の原子として読み直される）。
+                // A `{` not forming a valid `{n,m}` is just a literal character (RE2/DuckDB's
+                // behavior. `self.i` is rewound to just before the '{', so the next parse_repeat
+                // call rereads it as an ordinary atom).
                 None => Q::None,
             },
             _ => Q::None,
@@ -276,9 +271,9 @@ impl<'a> Parser<'a> {
         if matches!(q, Q::None) {
             return Ok(atom);
         }
-        // 量指定子の直後にさらに量指定子は許さない。`*?` 等の非貪欲
-        // 記法は非対応として明示的に拒否する（黙って貪欲扱いすると
-        // 「間違った結果」になってしまうため、それだけは絶対に避ける）。
+        // Another quantifier immediately after a quantifier is not allowed. Lazy notations such as
+        // `*?` are explicitly rejected as unsupported (silently treating them as greedy would give
+        // "wrong results", which is the one thing to avoid at all costs).
         match self.peek() {
             Some(b'?') => err!(UnsupportedFeature),
             Some(b'*') | Some(b'+') | Some(b'{') => err!(SyntaxError),
@@ -293,7 +288,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `{n}` / `{n,}` / `{n,m}` を読む。形が違えば `self.i` を戻して `None`。
+    /// Reads `{n}` / `{n,}` / `{n,m}`. On a different shape it rewinds `self.i` and gives `None`.
     fn try_parse_bound(&mut self) -> Option<(u32, Option<u32>)> {
         let start = self.i;
         self.i += 1; // '{'
@@ -325,8 +320,8 @@ impl<'a> Parser<'a> {
             if !c.is_ascii_digit() {
                 break;
             }
-            // MAX_REPEAT より十分大きい値で早々に飽和させる（オーバーフロー
-            // 回避。後段の ensure! でどのみち LimitExceeded になる）。
+            // Saturate early at a value well above MAX_REPEAT (avoiding overflow; the later
+            // ensure! makes it LimitExceeded anyway).
             v = v.saturating_mul(10).saturating_add((c - b'0') as u32);
             self.i += 1;
         }
@@ -343,7 +338,7 @@ impl<'a> Parser<'a> {
             None => err!(SyntaxError),
         };
         match c {
-            b'*' | b'+' | b'?' => err!(SyntaxError), // 対象がない量指定子
+            b'*' | b'+' | b'?' => err!(SyntaxError), // a quantifier with nothing to apply to
             b'.' => {
                 self.i += 1;
                 Ok(Ast::Any)
@@ -359,9 +354,9 @@ impl<'a> Parser<'a> {
             b'[' => self.parse_class(),
             b'(' => self.parse_group(),
             b'\\' => self.parse_escape(),
-            // '{' はここでは常にリテラル（有効な {n,m} は parse_repeat 側で
-            // 先に処理される。ここに来るのは「原子の先頭に来た {」なので
-            // 対象がなく、常にリテラル扱いで良い）。
+            // '{' is always a literal here (a valid {n,m} is handled earlier by parse_repeat.
+            // Reaching here means a `{` at the head of an atom, with nothing to apply to, so
+            // treating it as a literal is always right).
             _ => {
                 self.i += 1;
                 Ok(Ast::Char(c))
@@ -376,7 +371,7 @@ impl<'a> Parser<'a> {
                 self.i += 2;
                 false
             } else {
-                // (?=  (?!  (?<  (?P  など、非捕獲以外の拡張構文はすべて非対応。
+                // (?=  (?!  (?<  (?P  and every other extension besides non-capturing are unsupported.
                 err!(UnsupportedFeature);
             }
         } else {
@@ -426,7 +421,7 @@ impl<'a> Parser<'a> {
                 s.negate();
                 Ast::Class(s)
             }
-            // パターン内バックリファレンス・単語境界は非対応（モジュール冒頭参照）。
+            // In-pattern backreferences and word boundaries are unsupported (see the top of the module).
             b'1'..=b'9' | b'b' | b'B' => err!(UnsupportedFeature),
             _ => err!(SyntaxError),
         })
@@ -473,9 +468,9 @@ impl<'a> Parser<'a> {
                             t.negate();
                             set.union(&t);
                         }
-                        // クラス内では `]` `\` `^` `-` などをエスケープする
-                        // 必要が実務上あるので、それ以外の文字もリテラルとして
-                        // 許す（クラス外の厳格なエスケープ規則とは別）。
+                        // Inside a class, escaping `]` `\` `^` `-` and so on is a practical need,
+                        // so other characters are allowed as literals too (separate from the strict
+                        // escape rules outside a class).
                         _ => set.set(c),
                     }
                     first = false;
@@ -483,8 +478,8 @@ impl<'a> Parser<'a> {
                 Some(lo) => {
                     self.i += 1;
                     first = false;
-                    // 範囲 `a-z`。末尾の `-`（次が `]`）や先頭の `-` は
-                    // リテラルとして扱う。
+                    // A range `a-z`. A trailing `-` (with `]` next) or a leading `-` is treated as a
+                    // literal.
                     if self.peek() == Some(b'-')
                         && self.s.get(self.i + 1).is_some()
                         && self.s.get(self.i + 1) != Some(&b']')
@@ -509,7 +504,7 @@ impl<'a> Parser<'a> {
 }
 
 // ============================================================================
-// コンパイル（AST → NFA 命令列）
+// Compilation (AST -> NFA instruction sequence)
 // ============================================================================
 
 #[derive(Clone, Copy)]
@@ -538,10 +533,10 @@ struct Compiler {
 
 impl Compiler {
     fn emit(&mut self, inst: Inst) -> Result<u32> {
-        // ここが唯一の増加点。`{n,m}` や入れ子 repeat の展開はすべて
-        // `compile` の再帰呼び出し経由でここを通るので、パターンがどれだけ
-        // 入れ子になっていても実際に確保する命令数はこの上限で頭打ちになる
-        // （AST 自体を複製して膨らませることは一切しない設計のため）。
+        // This is the sole point of growth. `{n,m}` and nested-repeat expansion all pass through
+        // here via recursive `compile` calls, so however deeply a pattern nests, the instructions
+        // actually allocated are capped here (the design never duplicates and inflates the AST
+        // itself).
         ensure!(self.prog.len() < MAX_PROG_INSTS, LimitExceeded);
         self.prog.push(inst);
         Ok((self.prog.len() - 1) as u32)
@@ -608,7 +603,7 @@ impl Compiler {
         Ok(())
     }
 
-    /// 貪欲な `x*`。「続ける」を先、「抜ける」を後にした `Split` で貪欲優先を表す。
+    /// Greedy `x*`. A `Split` with "continue" first and "exit" second expresses greedy priority.
     fn compile_star(&mut self, x: &Ast) -> Result<()> {
         let l1 = self.emit(Inst::Split(0, 0))?;
         self.compile(x)?;
@@ -634,13 +629,12 @@ impl Compiler {
         Ok(())
     }
 
-    /// `{n,m}` は `x` を `n` 回並べたあと、`x?` を `m-n` 回並べる
-    /// （`{n,}` は `m` を省略して `x* ` を続ける）だけで表せる。
-    /// 各 `x?` は独立した Split なので、貪欲優先の順序も自然に保たれる。
-    /// AST を複製して展開するのではなく、同じ `x` を指す参照へ
-    /// `compile` を繰り返し呼ぶだけなので、展開後のサイズは
-    /// （`emit` が数える）命令数として現れる分だけで、入れ子になっていても
-    /// メモリ上で先に膨れ上がることが無い。
+    /// `{n,m}` is expressed as `x` repeated `n` times followed by `x?` repeated `m-n` times
+    /// (`{n,}` omits `m` and continues with `x*`).
+    /// Each `x?` is an independent Split, so greedy priority is preserved naturally.
+    /// Rather than duplicating and expanding the AST, `compile` is simply called repeatedly on a
+    /// reference to the same `x`, so the expanded size shows up only as the instruction count
+    /// (which `emit` counts) and never balloons in memory beforehand, even when nested.
     fn compile_repeat(&mut self, x: &Ast, n: u32, m: Option<u32>) -> Result<()> {
         for _ in 0..n {
             self.compile(x)?;
@@ -657,14 +651,13 @@ impl Compiler {
     }
 }
 
-/// パターン文字列をコンパイルする。呼び出し側（`funcs.rs`）はパターン列の
-/// stride が 0（定数列）ならこれを行ループの外で 1 回だけ呼ぶ。
+/// Compiles a pattern string. The caller (`funcs.rs`) calls this once outside the row loop when
+/// the pattern column's stride is 0 (a constant column).
 pub fn compile(pattern: &[u8]) -> Result<Program> {
     ensure!(pattern.len() <= MAX_PATTERN_LEN, LimitExceeded);
     let mut p = Parser { s: pattern, i: 0, depth: 0, n_groups: 0 };
     let ast = p.parse_alt()?;
-    // 消費しきれなかった残りがあるのは、対応する '(' の無い ')' が
-    // 混ざっていたとき。
+    // A leftover remainder means a `)` with no matching `(` was mixed in.
     ensure!(p.i == pattern.len(), SyntaxError);
     let mut c = Compiler { prog: Vec::new(), classes: Vec::new() };
     c.emit(Inst::Save(0))?;
@@ -675,7 +668,7 @@ pub fn compile(pattern: &[u8]) -> Result<Program> {
 }
 
 // ============================================================================
-// Pike's VM によるシミュレーション
+// Simulation with Pike's VM
 // ============================================================================
 
 #[derive(Clone, Copy)]
@@ -684,18 +677,18 @@ struct Thread {
     saves: [u32; SLOTS],
 }
 
-/// `pc` から到達できる「バイトを 1 つ消費する」命令（`Char`/`Any`/`Class`）と
-/// `Match` まで、ε 遷移（`Split`/`Jmp`/`Save`/`Bol`/`Eol`）を辿って `list` に
-/// 積む（NFA の ε-閉包）。
+/// Follows the epsilon transitions (`Split`/`Jmp`/`Save`/`Bol`/`Eol`) from `pc` and pushes onto
+/// `list` the instructions that consume a byte (`Char`/`Any`/`Class`) and `Match` (the NFA's
+/// epsilon closure).
 ///
-/// `gen`/`gen_id` は「この位置で既にこの命令番号を追加したか」を覚えるための
-/// もの。これにより同じ命令番号が 1 ステップに 2 回積まれることが無くなり、
-/// `Split` がいくつ入れ子になっていても 1 ステップの計算量は命令数で頭打ちに
-/// なる（＝バックトラック法のような指数的な再訪問が起きない）。
+/// `gen`/`gen_id` remember "whether this instruction number was already added at this position".
+/// That prevents the same instruction number from being pushed twice in one step, so however
+/// deeply `Split`s nest, one step's cost is capped by the instruction count (= no exponential
+/// revisiting as in backtracking).
 ///
-/// 再帰ではなく明示スタックで書いているのは、`Split` の枝を再帰で辿ると
-/// パターン次第でネイティブスタックを命令数ぶん消費しうるため
-/// （wasm はホストによってスタックが小さいことがある）。
+/// It uses an explicit stack rather than recursion, because following `Split` branches
+/// recursively could consume native stack proportional to the instruction count depending on the
+/// pattern (some wasm hosts have a small stack).
 #[allow(clippy::too_many_arguments)]
 fn add_thread(
     prog: &Program,
@@ -719,8 +712,8 @@ fn add_thread(
         match prog.insts[pc as usize] {
             Inst::Jmp(x) => stack.push((x, saves)),
             Inst::Split(a, b) => {
-                // 貪欲優先: 先に積んだほうが「あと」に処理される LIFO なので、
-                // 優先度の高い枝 `a` をあとに積んで先に取り出させる。
+                // Greedy priority: the list is LIFO, so what is pushed first is processed later;
+                // the higher-priority branch `a` is pushed last so it is taken first.
                 stack.push((b, saves));
                 stack.push((a, saves));
             }
@@ -748,14 +741,13 @@ fn add_thread(
     Ok(())
 }
 
-/// 入力中の最左マッチを探す。見つかれば捕獲位置（group 0 = 全体一致、
-/// スロット値 `u32::MAX` は「未捕獲」）を返す。
+/// Finds the leftmost match in the input. On success it returns the capture positions (group 0 =
+/// the whole match; the slot value `u32::MAX` means "not captured").
 ///
-/// アンカーされた探索ではなく、開始位置を 1 バイトずつ後ろへずらしながら
-/// 探す「検索」。ただし専用のループを回すのではなく、まだマッチが
-/// 見つかっていない間は新しい開始スレッドを**既存スレッドより低い優先度**で
-/// 追加し続けるだけで実現する（Pike's VM の定石）。これにより
-/// 「最初に見つかった＝最左」が自動的に保証される。
+/// This is a "search" that shifts the start position one byte at a time, not an anchored match.
+/// Rather than running a dedicated loop, it simply keeps adding a new starting thread at **lower
+/// priority than the existing threads** while no match has been found (the standard Pike's VM
+/// technique). That automatically guarantees "the first one found = the leftmost".
 pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
     let mut gen = vec![0u32; prog.insts.len()];
     let mut gen_id: u32 = 0;
@@ -829,14 +821,14 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
                     }
                 }
                 Inst::Match => {
-                    // これより優先度の低い（＝ clist の後ろにある）スレッドは
-                    // 採用されえないので打ち切る。優先度の高いスレッドは
-                    // このループより前で既に nlist へ積み終えている。
+                    // Threads of lower priority (further back in clist) can no longer be chosen, so
+                    // it breaks off. Higher-priority threads were already pushed into nlist before
+                    // this loop.
                     matched = Some(th.saves);
                     break;
                 }
                 Inst::Jmp(_) | Inst::Split(_, _) | Inst::Save(_) | Inst::Bol | Inst::Eol => {
-                    // ε 命令は add_thread が展開済みなのでスレッドとしては現れない。
+                    // Epsilon instructions are already expanded by add_thread and never appear as threads.
                 }
             }
             idx += 1;
@@ -869,7 +861,7 @@ pub fn is_match(prog: &Program, input: &[u8]) -> Result<bool> {
 }
 
 // ============================================================================
-// SQL 関数本体（Vector 単位）
+// The SQL function bodies (per Vector)
 // ============================================================================
 
 fn geti(v: &Vector, i: usize) -> i64 {
@@ -880,7 +872,7 @@ fn geti(v: &Vector, i: usize) -> i64 {
     }
 }
 
-/// `regexp_matches(str, pattern)`。
+/// `regexp_matches(str, pattern)`.
 pub fn eval_matches(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 2, WrongArgCount);
     let (n, s) = funcs::strides(args)?;
@@ -911,13 +903,12 @@ pub fn eval_matches(args: &[&Vector]) -> Result<Vector> {
     Ok(out)
 }
 
-/// `regexp_extract(str, pattern[, group])`。
+/// `regexp_extract(str, pattern[, group])`.
 ///
-/// DuckDB は「マッチしない」「グループがそのマッチでは捕獲されなかった」
-/// 「グループ番号がパターンの捕獲数を超える（ただし 0〜9 の範囲内）」の
-/// いずれも **NULL ではなく空文字列** を返す（`duckdb -c "select
-/// regexp_extract('xxx','foo')"` 等で実測）。NULL になるのは str/pattern/
-/// group 引数そのものが NULL のときだけ。
+/// DuckDB returns **the empty string rather than NULL** for all of "no match", "the group was not
+/// captured in that match", and "the group number exceeds the pattern's capture count (but stays
+/// within 0-9)" (measured with `duckdb -c "select regexp_extract('xxx','foo')"` and the like).
+/// It becomes NULL only when the str/pattern/group argument itself is NULL.
 pub fn eval_extract(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 2 || args.len() == 3, WrongArgCount);
     let (n, s) = funcs::strides(args)?;
@@ -942,9 +933,9 @@ pub fn eval_extract(args: &[&Vector]) -> Result<Vector> {
             }
         };
         let g = if args.len() == 3 { geti(args[2], i * s[2]) } else { 0 };
-        // DuckDB 実測: group は 0〜9 のみ許され、範囲外は行ではなくクエリ
-        // 自体のエラーになる（`select regexp_extract('a','a',10)` は
-        // Invalid Input Error）。
+        // Measured in DuckDB: group is allowed only in 0-9, and out of range is an error for the
+        // query itself rather than for the row (`select regexp_extract('a','a',10)` is an
+        // Invalid Input Error).
         ensure!((0..=9).contains(&g), ValueOutOfRange);
         let text = sv.bytes().get(i * s[0]);
         match find(prog, text)? {
@@ -968,24 +959,23 @@ pub fn eval_extract(args: &[&Vector]) -> Result<Vector> {
     Ok(v)
 }
 
-/// 置換文字列のトークン。`\0`〜`\9` はグループ参照、`\\` はリテラル `\`、
-/// それ以外の `\X` は不正。
+/// A token of the replacement string. `\0`-`\9` are group references, `\\` is a literal `\`, and
+/// any other `\X` is invalid.
 enum ReplTok {
     Lit(u8),
     Group(u8),
 }
 
-/// 置換文字列を構文解析する。DuckDB（内部の RE2）実測では、置換文字列が
-/// 不正（末尾が `\` で終わる／`\` の次が数字でも `\` でもない）だったり、
-/// 参照しているグループ番号がパターンの実際の捕獲数を超えていたりすると、
-/// **エラーにはならず、その行の結果は入力文字列がそのまま返る**
-/// （置換が一切行われない）。`select regexp_replace('abc','b','X\9')` が
-/// `'abc'` を返す、`select regexp_replace('a','(a)','X\2Y')` が `'a'` を
-/// 返す、等で確認済み。ここではその「無効なら `None`」をそのまま
-/// `replace_into` 側の「無効なら丸ごと素通し」に対応させる。
+/// Parses the replacement string. Measured against DuckDB (RE2 internally): when the replacement
+/// string is invalid (it ends with `\`, or `\` is followed by neither a digit nor `\`), or when a
+/// referenced group number exceeds the pattern's actual capture count, **it is not an error; that
+/// row's result is simply the input string** (no replacement happens at all).
+/// Confirmed by `select regexp_replace('abc','b','X\9')` returning `'abc'` and
+/// `select regexp_replace('a','(a)','X\2Y')` returning `'a'`, among others. Here that "invalid
+/// gives `None`" maps directly onto `replace_into`'s "invalid passes everything through".
 ///
-/// 戻り値の第 2 要素は参照された最大グループ番号（`prog.n_groups` との
-/// 比較は呼び出し側で行う。ここではパターンを知らないため）。
+/// The second element of the return value is the largest group number referenced (the comparison
+/// against `prog.n_groups` is the caller's job, since the pattern is unknown here).
 fn parse_repl(repl: &[u8]) -> Option<(Vec<ReplTok>, u8)> {
     let mut toks = Vec::with_capacity(repl.len());
     let mut max_g: u8 = 0;
@@ -1014,8 +1004,8 @@ fn parse_repl(repl: &[u8]) -> Option<(Vec<ReplTok>, u8)> {
     Some((toks, max_g))
 }
 
-/// `COLUMNS(...) AS '<template>'` の出力列名を 1 列ぶん組み立てる
-/// （DuckDB のスター式における捕獲グループ改名。`plan::bind` から呼ぶ）。
+/// Builds one output column name for `COLUMNS(...) AS '<template>'`
+/// (capture-group renaming in DuckDB's star expressions. Called from `plan::bind`).
 ///
 /// Semantics below are all verified against `duckdb` v1.4.4:
 ///
@@ -1063,10 +1053,9 @@ fn emit_repl(toks: &[ReplTok], text: &[u8], saves: &[u32; SLOTS], out: &mut Vec<
             ReplTok::Lit(b) => out.push(*b),
             ReplTok::Group(g) => {
                 let (st, en) = (saves[2 * *g as usize], saves[2 * *g as usize + 1]);
-                // 宣言はされているが今回のマッチでは捕獲されなかったグループ
-                // （例: `(a)|(b)` で `a` 側にマッチしたときの group 2）は
-                // 空文字列扱い（DuckDB 実測: `select regexp_replace('a',
-                // '(a)|(b)', 'X\2Y')` は `'XY'`）。
+                // A group that is declared but was not captured in this match (for example group 2
+                // when `(a)|(b)` matched on the `a` side) counts as the empty string (measured in
+                // DuckDB: `select regexp_replace('a', '(a)|(b)', 'X\2Y')` gives `'XY'`).
                 if st != u32::MAX && en != u32::MAX {
                     out.extend_from_slice(&text[st as usize..en as usize]);
                 }
@@ -1075,15 +1064,15 @@ fn emit_repl(toks: &[ReplTok], text: &[u8], saves: &[u32; SLOTS], out: &mut Vec<
     }
 }
 
-/// `regexp_replace` 本体。`global=false` なら最初の 1 致だけ、`true` なら
-/// 全マッチを置換する。
+/// The body of `regexp_replace`. With `global=false` only the first match is replaced; with
+/// `true`, every match.
 ///
-/// グローバル置換で空文字列にマッチしうるパターン（例: `'x*'`）を扱う際、
-/// 「直前に採用したマッチの終端と同じ位置に始まる空マッチ」は無視して
-/// 1 バイトそのまま出力して先へ進める。これを入れないと `'aXbXc'` に対する
-/// `regexp_replace(.., 'X*', '-', 'g')` が `-a--b--c-` になってしまうが、
-/// DuckDB の実測は `-a-b-c-`（Python の `re.sub` 等と同じ「直前のマッチに
-/// 隣接する空マッチは採用しない」規則）だったため、それに合わせている。
+/// When handling a pattern that can match the empty string (such as `'x*'`) under global
+/// replacement, an empty match starting at the same position as the previously accepted match's
+/// end is ignored, and one byte is emitted as is before advancing. Without that,
+/// `regexp_replace(.., 'X*', '-', 'g')` on `'aXbXc'` would give `-a--b--c-`, whereas DuckDB
+/// measures `-a-b-c-` (the same "an empty match adjacent to the previous match is not accepted"
+/// rule as Python's `re.sub` and others), so this matches that.
 fn replace_into(prog: &Program, text: &[u8], repl: &[u8], global: bool, out: &mut Vec<u8>) {
     let toks = match parse_repl(repl) {
         Some((t, mg)) if mg as u16 <= prog.n_groups => t,
@@ -1141,7 +1130,7 @@ fn replace_into(prog: &Program, text: &[u8], repl: &[u8], global: bool, out: &mu
     out.extend_from_slice(&text[pos.min(len)..]);
 }
 
-/// `regexp_replace(str, pattern, replacement[, 'g'])`。
+/// `regexp_replace(str, pattern, replacement[, 'g'])`.
 pub fn eval_replace(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 3 || args.len() == 4, WrongArgCount);
     let (n, s) = funcs::strides(args)?;
@@ -1183,7 +1172,7 @@ pub fn eval_replace(args: &[&Vector]) -> Result<Vector> {
 }
 
 // ============================================================================
-// テスト
+// Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -1210,7 +1199,7 @@ mod tests {
         })
     }
 
-    // --- 個々の構文 ----------------------------------------------------------
+    // --- Individual syntax ---------------------------------------------------
 
     #[test]
     fn literal_and_any() {
@@ -1263,7 +1252,7 @@ mod tests {
         assert!(m("x", "\\D"));
         assert!(m("_", "\\w"));
         assert!(m(" ", "\\s"));
-        assert!(!m("\u{0b}", "^\\s$")); // RE2 の \s は \v を含まない（実測済み）
+        assert!(!m("\u{0b}", "^\\s$")); // RE2's \s does not include \v (measured)
         assert!(m("\u{0c}", "^\\s$"));
         assert!(m("!", "\\S"));
         assert!(m("3.14", "\\d+\\.\\d+"));
@@ -1274,7 +1263,7 @@ mod tests {
         assert!(m("bar", "^bar"));
         assert!(!m("foobar", "^bar"));
         assert!(m("ab", "ab$"));
-        assert!(!m("\n", "^$")); // $ は入力末尾のみ（改行の手前ではない）
+        assert!(!m("\n", "^$")); // $ matches only the end of the input (not before a newline)
         assert!(m("", "^$"));
     }
 
@@ -1296,21 +1285,21 @@ mod tests {
         }
     }
 
-    // --- 貪欲・最左優先の意味論（DuckDB と突き合わせ済み） --------------------
+    // --- Greedy / leftmost-first semantics (cross-checked with DuckDB) -------
 
     #[test]
     fn greedy_and_leftmost() {
         // duckdb: regexp_extract('aaa','a*') = 'aaa'
         assert_eq!(ext("aaa", "a*", 0).as_deref(), Some("aaa"));
-        // duckdb: regexp_extract('xaaay','a*') = ''（先頭 'x' の位置で 0 回一致）
+        // duckdb: regexp_extract('xaaay','a*') = '' (zero-length match at the leading 'x')
         assert_eq!(ext("xaaay", "a*", 0).as_deref(), Some(""));
-        // duckdb: regexp_extract('abc','a|ab') = 'a'（選択は左優先、最長優先ではない）
+        // duckdb: regexp_extract('abc','a|ab') = 'a' (alternation is leftmost-first, not longest)
         assert_eq!(ext("abc", "a|ab", 0).as_deref(), Some("a"));
         // duckdb: regexp_extract('xabcx','ab|abc') = 'ab'
         assert_eq!(ext("xabcx", "ab|abc", 0).as_deref(), Some("ab"));
     }
 
-    // --- コンパイルエラー ------------------------------------------------------
+    // --- Compilation errors --------------------------------------------------
 
     #[test]
     fn rejects_unsupported_constructs() {
@@ -1336,12 +1325,12 @@ mod tests {
         assert!(compile(b"foobar").is_ok());
     }
 
-    // --- 病的な入力でも高速に完了すること ---------------------------------------
+    // --- Pathological input must still finish quickly ------------------------
 
     #[test]
     fn pathological_pattern_is_not_exponential() {
-        // (a+)+b は素朴な再帰バックトラックだと典型的に指数時間になるパターン。
-        // Thompson NFA なら O(命令数 × 入力長) で完了するはず。
+        // (a+)+b is the classic pattern that goes exponential under naive recursive backtracking.
+        // A Thompson NFA should finish in O(instructions x input length).
         let subject = "a".repeat(5000);
         let prog = compile(b"(a+)+b").unwrap();
         let start = Instant::now();
@@ -1353,17 +1342,15 @@ mod tests {
 
     #[test]
     fn step_limit_triggers_on_adversarial_input() {
-        // 典型的な NFA スレッド爆発パターン `a?{n}a{n}` を長大な非マッチ入力に
-        // 当てて MAX_STEPS に到達させる。命令数自体は MAX_PROG_INSTS
-        // (4096) に収まる範囲（1000*2 + 1000 + 3 = 3003）に抑えつつ、
-        // 1 ステップあたりの生存スレッド数が最大 ~1000 になるようにして
-        // 長い入力なら早々に MAX_STEPS を超えるようにする。
+        // Applies the classic NFA thread-explosion pattern `a?{n}a{n}` to a long non-matching
+        // input to reach MAX_STEPS. The instruction count itself stays within MAX_PROG_INSTS
+        // (4096) at 1000*2 + 1000 + 3 = 3003, while the live thread count per step reaches ~1000,
+        // so a long input exceeds MAX_STEPS early.
         let pat: String = "a?".repeat(1000) + &"a".repeat(1000);
         let prog = compile(pat.as_bytes()).unwrap();
-        // 999 個の 'a' ごとに 'b' を挟み、連続する 'a' が 1000 個未満にしか
-        // ならないようにする（マッチしない）。これにより探索は最後まで
-        // 「あと少しで届かない」状態を延々繰り返し、早期にマッチが見つかって
-        // 打ち切られることなく MAX_STEPS 判定まで到達する。
+        // A 'b' is interposed every 999 'a's so that consecutive 'a's never reach 1000 (no match).
+        // That keeps the search endlessly "just short" all the way through, so it reaches the
+        // MAX_STEPS check rather than being cut off early by finding a match.
         let block = "a".repeat(999) + "b";
         let subject = block.repeat(5000);
         let start = Instant::now();
@@ -1375,15 +1362,15 @@ mod tests {
 
     #[test]
     fn prog_size_limit_triggers() {
-        // {1000} を何個も連結して命令数上限を超えさせる。
+        // Several {1000}s concatenated to exceed the instruction cap.
         let pat = "a{1000}".repeat(10);
         assert_eq!(code_of(compile(pat.as_bytes()).map(|_| ())), Some(Code::LimitExceeded));
     }
 
     #[test]
     fn nested_repeat_does_not_blow_up_before_limit_check() {
-        // 展開すると 1000^3 命令相当になるはずのパターンでも、即座に
-        // LimitExceeded で終わること（AST を複製していないので OOM しない）。
+        // Even a pattern that would expand to the equivalent of 1000^3 instructions ends
+        // immediately with LimitExceeded (it does not OOM, since the AST is never duplicated).
         let start = Instant::now();
         let r = compile(b"((a{1000}){1000}){1000}");
         let elapsed = start.elapsed();
@@ -1391,7 +1378,7 @@ mod tests {
         assert!(elapsed.as_millis() < 2000, "took too long: {elapsed:?}");
     }
 
-    // --- Vector 単位の SQL 関数 -------------------------------------------------
+    // --- The SQL functions, per Vector ---------------------------------------
 
     fn vs(vals: &[Option<&str>]) -> Vector {
         let mut v = Vector::new(Ty::Varchar);
@@ -1458,10 +1445,10 @@ mod tests {
         let p = vs(&[Some("foo"), Some("(foo)(bar)"), Some("(foo)(bar)")]);
         let g = vi(&[Some(0), Some(1), Some(9)]);
         let r = eval_extract(&[&s, &p, &g]).unwrap();
-        // マッチしない場合も空文字列（NULL ではない）。DuckDB 実測どおり。
+        // A non-match also gives the empty string (not NULL), exactly as measured in DuckDB.
         assert_eq!(str_at(&r, 0).as_deref(), Some(""));
         assert_eq!(str_at(&r, 1).as_deref(), Some("foo"));
-        // group=9 は 0〜9 の範囲内だが、このパターンの捕獲数(2)を超えるので空文字列。
+        // group=9 is within 0-9 but exceeds this pattern's capture count (2), so the empty string.
         assert_eq!(str_at(&r, 2).as_deref(), Some(""));
     }
 
@@ -1511,8 +1498,8 @@ mod tests {
 
     #[test]
     fn sql_replace_invalid_backreference_is_noop() {
-        // DuckDB 実測: グループ参照がパターンの捕獲数を超えると置換自体が
-        // 行われず元の文字列がそのまま返る。
+        // Measured in DuckDB: when a group reference exceeds the pattern's capture count, no
+        // replacement happens and the original string is returned.
         let s = vs(&[Some("abc")]);
         let p = vs(&[Some("b")]);
         let r = vs(&[Some("X\\9")]);

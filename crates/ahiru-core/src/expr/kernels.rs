@@ -1,21 +1,21 @@
-//! 物理型ごとの実行カーネル。
+//! The execution kernels, per physical type.
 //!
-//! カーネルは**物理型 6 種に対してのみ**書く（DESIGN.md §8, §11）。論理型ごとに
-//! カーネルを持つと単相化爆発で 1MiB 予算が飛ぶ。サイズを抑える具体策は 4 つ:
+//! Kernels are written **only against the six physical types** (DESIGN.md §8, §11). Having a
+//! kernel per logical type would blow the 1 MiB budget through monomorphization. There are four concrete measures:
 //!
-//! 1. **定数専用カーネルを作らない。** 定数は長さ 1 のベクタとして表し、
-//!    オペランドごとの stride（長さ 1 なら 0、それ以外は 1）をループの外で決める。
-//!    これで vec-vec / vec-const / const-vec / const-const の 4 通りが 1 本に畳まれる。
-//! 2. **比較 6 種を 1 本に畳む。** 3 値比較（+ NaN 用の「順序なし」）をビットで表し、
-//!    演算子ごとのマスクと AND を取る。物理型 1 種につき比較カーネルは 1 本。
-//! 3. **selection は見ない。** VM が `LoadCol` で gather 済みなので、カーネルが
-//!    受け取るベクタは常に密。selection の有無を型パラメータにしない。
-//! 4. **算術は物理型ごとに 1 本。** 演算子はループ内の `match` で分ける
-//!    （分岐予測が効くうえ、コードは演算子数ぶん増えない）。
+//! 1. **No constant-specific kernels.** A constant is represented as a length-1 vector, and each
+//!    operand's stride (0 when the length is 1, otherwise 1) is decided outside the loop.
+//!    That folds vec-vec / vec-const / const-vec / const-const into one.
+//! 2. **The six comparisons fold into one.** A three-way comparison (plus "unordered" for NaN) is
+//!    represented in bits and ANDed with a per-operator mask. One comparison kernel per physical type.
+//! 3. **Selection is never consulted.** The VM has already gathered via `LoadCol`, so the vectors
+//!    a kernel receives are always dense. The presence of selection is not a type parameter.
+//! 4. **One arithmetic kernel per physical type.** Operators are distinguished by a `match`
+//!    inside the loop (branch prediction handles it, and the code does not grow with the operator count).
 //!
-//! NULL は「値の計算」と切り離す。ほとんどの演算では結果の validity は入力の
-//! validity の AND で、値の中身は NULL 行では意味を持たない。例外は三値論理の
-//! `AND`/`OR`（`logic`）とゼロ除算（値と同時に NULL を立てる）。
+//! NULLs are decoupled from "computing values". For most operations the result's validity is the
+//! AND of the inputs' validity, and the value's contents are meaningless on NULL rows. The
+//! exceptions are three-valued `AND`/`OR` (`logic`) and division by zero (which sets the value and the NULL together).
 
 use crate::expr::{funcs, OpCode};
 use crate::prelude::*;
@@ -23,16 +23,16 @@ use crate::vector::{
     pack_interval, unpack_interval, Bitmap, BytesData, Data, PhysType, Ty, Vector,
 };
 
-/// 1 日のマイクロ秒。DATE(I32,日) ↔ TIMESTAMP(I64,マイクロ秒)。
+/// Microseconds in a day. DATE(I32, days) <-> TIMESTAMP(I64, microseconds).
 const MICROS_PER_DAY: i128 = 86_400_000_000;
 
-/// 2^127。f64 → i128 の範囲判定に使う（i128::MAX を f64 にすると丸め上がるため）。
+/// 2^127. Used for range checks on f64 -> i128 (converting i128::MAX to f64 rounds it up).
 const I128_LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
 
-// --- ストライドと validity --------------------------------------------------
+// --- Strides and validity ---------------------------------------------------
 
-/// 長さ `l` のオペランドを `n` 行として読むときの stride。
-/// 長さ 1（＝定数）は 0 を返し、同じループで vec/const 両方を扱えるようにする。
+/// The stride for reading an operand of length `l` as `n` rows.
+/// Length 1 (= a constant) gives 0, so one loop handles both vectors and constants.
 fn stride(l: usize, n: usize) -> Result<usize> {
     if l == n {
         Ok(1)
@@ -43,20 +43,20 @@ fn stride(l: usize, n: usize) -> Result<usize> {
     }
 }
 
-/// 2 項演算の行数と stride。どちらかが空なら結果も空。
+/// The row count and strides of a binary operation. If either is empty the result is empty too.
 pub fn strides2(la: usize, lb: usize) -> Result<(usize, usize, usize)> {
     let n = if la == 0 || lb == 0 { 0 } else { core::cmp::max(la, lb) };
     Ok((n, stride(la, n)?, stride(lb, n)?))
 }
 
-/// 3 項演算（`Select`）版。
+/// The ternary (`Select`) version.
 fn strides3(la: usize, lb: usize, lc: usize) -> Result<(usize, usize, usize, usize)> {
     let n =
         if la == 0 || lb == 0 || lc == 0 { 0 } else { core::cmp::max(core::cmp::max(la, lb), lc) };
     Ok((n, stride(la, n)?, stride(lb, n)?, stride(lc, n)?))
 }
 
-/// 入力 validity の AND。どちらも NULL 無しなら `None`（ビットマップを作らない）。
+/// The AND of the inputs' validity. `None` (no bitmap built) when neither has NULLs.
 fn combine_validity(a: &Vector, sa: usize, b: &Vector, sb: usize, n: usize) -> Option<Bitmap> {
     if !a.has_nulls() && !b.has_nulls() {
         return None;
@@ -68,7 +68,7 @@ fn combine_validity(a: &Vector, sa: usize, b: &Vector, sb: usize, n: usize) -> O
     Some(m)
 }
 
-/// カーネルが作った追加 NULL を入力由来の validity にマージして仕上げる。
+/// Merges the extra NULLs a kernel produced into the input-derived validity to finish up.
 fn finish(ty: Ty, data: Data, validity: Option<Bitmap>, extra: Option<Bitmap>) -> Vector {
     let v = match (validity, extra) {
         (Some(mut a), Some(b)) => {
@@ -83,9 +83,9 @@ fn finish(ty: Ty, data: Data, validity: Option<Bitmap>, extra: Option<Bitmap>) -
     out
 }
 
-// --- 算術 -------------------------------------------------------------------
-// 整数は wrapping。オーバーフローでパニックさせない（checked 意味論が要るなら
-// 将来 OpCode を分ける）。ゼロ除算と MIN / -1 は NULL（mod.rs の設計判断）。
+// --- Arithmetic ---------------------------------------------------------------
+// Integers wrap. Overflow does not panic (if checked semantics are ever needed, a separate OpCode
+// can be added). Division by zero and MIN / -1 give NULL (the design decision in mod.rs).
 
 macro_rules! int_arith {
     ($name:ident, $t:ty) => {
@@ -107,7 +107,7 @@ macro_rules! int_arith {
                     OpCode::Sub => x.wrapping_sub(y),
                     OpCode::Mul => x.wrapping_mul(y),
                     OpCode::Neg => (0 as $t).wrapping_sub(x),
-                    // Div / Mod。0 除算と MIN / -1 は結果を NULL にする。
+                    // Div / Mod. Division by zero and MIN / -1 make the result NULL.
                     _ => {
                         if y == 0 || (y == -1 && x == <$t>::MIN) {
                             funcs::set_null(bad, i, n);
@@ -130,7 +130,7 @@ int_arith!(arith_i32, i32);
 int_arith!(arith_i64, i64);
 int_arith!(arith_i128, i128);
 
-/// 浮動小数は IEEE 準拠。0 除算は NULL ではなく inf/NaN。
+/// Floating point follows IEEE. Division by zero gives inf/NaN rather than NULL.
 fn arith_f64(op: OpCode, a: &[f64], sa: usize, b: &[f64], sb: usize, n: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -148,10 +148,10 @@ fn arith_f64(op: OpCode, a: &[f64], sa: usize, b: &[f64], sb: usize, n: usize) -
     out
 }
 
-/// `Add`/`Sub`/`Mul`/`Div`/`Mod`/`Neg`。`Neg` は VM が b にも a を渡す。
+/// `Add`/`Sub`/`Mul`/`Div`/`Mod`/`Neg`. For `Neg` the VM passes a as b as well.
 ///
-/// DECIMAL は生の整数として計算する。`Add`/`Sub` はスケールが揃っていれば
-/// これで正しく、`Mul`/`Div` のスケール調整は binder が `Cast` で行う。
+/// DECIMAL is computed as a raw integer. `Add`/`Sub` are correct this way once the scales are
+/// aligned, and the scale adjustment for `Mul`/`Div` is done by the binder with a `Cast`.
 pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(
         matches!(
@@ -174,13 +174,13 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
     Ok(finish(out_ty, data, combine_validity(a, sa, b, sb, n), bad))
 }
 
-// --- 比較 -------------------------------------------------------------------
-// 3 値比較コード（+ NaN の「順序なし」）とマスクの AND で 6 演算子を 1 本に畳む。
+// --- Comparison ---------------------------------------------------------------
+// A three-way comparison code (plus "unordered" for NaN) ANDed with a mask folds the six operators into one.
 
 const C_LT: u8 = 1;
 const C_EQ: u8 = 2;
 const C_GT: u8 = 4;
-/// NaN が絡んで順序が付かない状態。`<>` だけがこれを真とする（IEEE 準拠）。
+/// The state where NaN makes the comparison unordered. Only `<>` treats it as true (per IEEE).
 const C_UN: u8 = 8;
 
 fn cmp_mask(op: OpCode) -> Result<u8> {
@@ -256,7 +256,7 @@ fn cmp_bool(a: &Bitmap, sa: usize, b: &Bitmap, sb: usize, n: usize, mask: u8) ->
     out
 }
 
-/// バイト列は辞書順（memcmp 順）。VARCHAR も同じ扱いで、照合順序は持たない。
+/// Byte sequences compare lexicographically (memcmp order). VARCHAR is treated the same and carries no collation.
 fn cmp_bytes(a: &BytesData, sa: usize, b: &BytesData, sb: usize, n: usize, mask: u8) -> Bitmap {
     let mut out = Bitmap::with_capacity(n);
     for i in 0..n {
@@ -266,7 +266,7 @@ fn cmp_bytes(a: &BytesData, sa: usize, b: &BytesData, sb: usize, n: usize, mask:
     out
 }
 
-/// 6 種の比較。入力は `phys`、出力は Bool。
+/// The six comparisons. The input is `phys` and the output is Bool.
 pub fn compare(op: OpCode, phys: PhysType, a: &Vector, b: &Vector) -> Result<Vector> {
     let mask = cmp_mask(op)?;
     ensure!(a.data().phys() == phys && b.data().phys() == phys, TypeMismatch);
@@ -282,12 +282,12 @@ pub fn compare(op: OpCode, phys: PhysType, a: &Vector, b: &Vector) -> Result<Vec
     Ok(finish(Ty::Boolean, Data::Bool(bits), combine_validity(a, sa, b, sb, n), None))
 }
 
-// --- 三値論理 ---------------------------------------------------------------
+// --- Three-valued logic -------------------------------------------------------
 
-/// `AND`/`OR`。値と validity を同時に決める必要があるので比較などと共通化できない。
+/// `AND`/`OR`. The value and the validity have to be decided together, so it cannot share code with comparison.
 ///
-/// - AND: 両方 TRUE なら TRUE、**どちらかが** FALSE なら（他方が NULL でも）FALSE。
-/// - OR : **どちらかが** TRUE なら（他方が NULL でも）TRUE、両方 FALSE なら FALSE。
+/// - AND: TRUE when both are TRUE; FALSE when **either** is FALSE (even if the other is NULL).
+/// - OR : TRUE when **either** is TRUE (even if the other is NULL); FALSE when both are FALSE.
 pub fn logic(op: OpCode, a: &Vector, b: &Vector) -> Result<Vector> {
     let is_and = match op {
         OpCode::And => true,
@@ -306,13 +306,13 @@ pub fn logic(op: OpCode, a: &Vector, b: &Vector) -> Result<Vector> {
         let (bt, bf) = (pb && bv.get(ib), pb && !bv.get(ib));
         let (t, f) = if is_and { (at && bt, af || bf) } else { (at || bt, af && bf) };
         vals.push(t);
-        // TRUE でも FALSE でも無ければ NULL。
+        // Neither TRUE nor FALSE means NULL.
         valid.push(t || f);
     }
     Ok(finish(Ty::Boolean, Data::Bool(vals), Some(valid), None))
 }
 
-/// `NOT`。NULL は NULL のまま。
+/// `NOT`. NULL stays NULL.
 pub fn not(a: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::Bool, TypeMismatch);
     let mut bits = a.bools().clone();
@@ -320,7 +320,7 @@ pub fn not(a: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Boolean, Data::Bool(bits), a.validity().cloned(), None))
 }
 
-/// `IsNull` / `IsNotNull`。結果は決して NULL にならない。
+/// `IsNull` / `IsNotNull`. The result is never NULL.
 pub fn is_null(a: &Vector, want_null: bool) -> Vector {
     let n = a.len();
     let mut bits = Bitmap::with_capacity(n);
@@ -335,9 +335,9 @@ pub fn is_null(a: &Vector, want_null: bool) -> Vector {
     Vector::from_data(Ty::Boolean, Data::Bool(bits), None)
 }
 
-// --- 行コピー ---------------------------------------------------------------
+// --- Row copying --------------------------------------------------------------
 
-/// `src` の行 `i` を `dst` の末尾に足す。物理型の一致は呼び出し側で検査済み。
+/// Appends row `i` of `src` to the end of `dst`. The caller has already checked the physical types match.
 fn push_row(dst: &mut Data, src: &Data, i: usize) {
     match (dst, src) {
         (Data::Bool(d), Data::Bool(s)) => d.push(s.get(i)),
@@ -350,7 +350,7 @@ fn push_row(dst: &mut Data, src: &Data, i: usize) {
     }
 }
 
-/// ダミー行（NULL 行のプレースホルダ）。
+/// A dummy row (a placeholder for a NULL row).
 fn push_default(dst: &mut Data) {
     match dst {
         Data::Bool(d) => d.push(false),
@@ -362,7 +362,7 @@ fn push_default(dst: &mut Data) {
     }
 }
 
-/// 長さ 1 のベクタを `n` 行へ広げる。定数だけの式の結果を返すときに使う。
+/// Broadcasts a length-1 vector to `n` rows. Used when returning the result of a constant-only expression.
 pub fn broadcast(v: &Vector, n: usize) -> Vector {
     debug_assert_eq!(v.len(), 1);
     let mut data = Data::with_capacity(v.ty().phys(), n);
@@ -373,8 +373,8 @@ pub fn broadcast(v: &Vector, n: usize) -> Vector {
     Vector::from_data(v.ty(), data, validity)
 }
 
-/// `Select` と `Coalesce`。`cond` が `None` なら「`t` が有効か」を条件にする
-/// （＝ COALESCE）。条件が NULL または FALSE なら `e` 側を採る。
+/// `Select` and `Coalesce`. When `cond` is `None` the condition becomes "is `t` valid"
+/// (= COALESCE). A NULL or FALSE condition takes the `e` side.
 pub fn pick(cond: Option<&Vector>, t: &Vector, e: &Vector, out_ty: Ty) -> Result<Vector> {
     let phys = out_ty.phys();
     ensure!(t.data().phys() == phys && e.data().phys() == phys, TypeMismatch);
@@ -397,9 +397,9 @@ pub fn pick(cond: Option<&Vector>, t: &Vector, e: &Vector, out_ty: Ty) -> Result
     Ok(finish(out_ty, data, Some(valid), None))
 }
 
-// --- Bytes 演算 -------------------------------------------------------------
+// --- Bytes operations ---------------------------------------------------------
 
-/// `a || b`。バイト列の連結。
+/// `a || b`. Byte-sequence concatenation.
 pub fn concat(a: &Vector, b: &Vector, out_ty: Ty) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::Bytes && b.data().phys() == PhysType::Bytes, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
@@ -408,25 +408,25 @@ pub fn concat(a: &Vector, b: &Vector, out_ty: Ty) -> Result<Vector> {
     for i in 0..n {
         out.data.extend_from_slice(ad.get(i * sa));
         out.data.extend_from_slice(bd.get(i * sb));
-        // offsets は u32。これを超える結果は扱えない。
+        // offsets are u32. Results beyond that cannot be handled.
         ensure!(out.data.len() <= u32::MAX as usize, LimitExceeded);
         out.offsets.push(out.data.len() as u32);
     }
     Ok(finish(out_ty, Data::Bytes(out), combine_validity(a, sa, b, sb, n), None))
 }
 
-/// SQL `LIKE`。`%` は 0 文字以上、`_` は**ちょうど 1 バイト**に一致する。
+/// SQL `LIKE`. `%` matches zero or more characters and `_` matches **exactly one byte**.
 ///
-/// `_` がコードポイント単位でなくバイト単位なのは、UTF-8 の境界判定を持ち込むと
-/// コードが増えるため。ASCII 以外を含む文字列では期待とずれる（既知の制限）。
-/// `ESCAPE` 句も未対応。
+/// `_` is byte-wise rather than code-point-wise because bringing in UTF-8 boundary detection would
+/// grow the code. Strings containing non-ASCII will differ from expectations (a known limitation).
+/// The `ESCAPE` clause is unsupported too.
 ///
-/// バックトラックは「最後に出た `%` の位置」を 1 つ覚えるだけの 2 ポインタ法。
-/// 再帰しないのでスタックを消費せず、`%a%a%a...` のようなパターンでも
-/// 最悪 O(|s| * |p|) で済む（素朴な再帰だと指数時間になる）。
+/// Backtracking is a two-pointer method remembering only "the position of the last `%` seen".
+/// It does not recurse, so it consumes no stack, and even a pattern like `%a%a%a...` costs at
+/// worst O(|s| * |p|) (naive recursion would go exponential).
 fn like_match(s: &[u8], p: &[u8]) -> bool {
     let (mut si, mut pi) = (0usize, 0usize);
-    // `star_p == usize::MAX` は「まだ `%` を見ていない」。
+    // `star_p == usize::MAX` means "no `%` seen yet".
     let (mut star_p, mut star_s) = (usize::MAX, 0usize);
     while si < s.len() {
         if pi < p.len() && (p[pi] == b'_' || p[pi] == s[si]) {
@@ -437,7 +437,7 @@ fn like_match(s: &[u8], p: &[u8]) -> bool {
             star_s = si;
             pi += 1;
         } else if star_p != usize::MAX {
-            // 直前の `%` に 1 バイト多く食わせてやり直す。
+            // Feed the previous `%` one more byte and retry.
             pi = star_p + 1;
             star_s += 1;
             si = star_s;
@@ -462,9 +462,9 @@ pub fn like(a: &Vector, b: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Boolean, Data::Bool(bits), combine_validity(a, sa, b, sb, n), None))
 }
 
-// --- キャスト ---------------------------------------------------------------
+// --- Casts --------------------------------------------------------------------
 
-/// 変換の族。物理型から決まるので、論理型ごとに分岐を増やさない。
+/// The family of conversions. It follows from the physical type, so no extra branching per logical type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fam {
     Int,
@@ -506,13 +506,13 @@ fn pow10_f64(k: u8) -> f64 {
     r
 }
 
-/// 最近接偶数への丸め（銀行丸め）。`core` に `f64::round_ties_even` は無い。
+/// Rounding to the nearest even (banker's rounding). `core` has no `f64::round_ties_even`.
 ///
-/// 浮動小数 → 整数のキャストは切り捨てではなく丸める。SQL 標準は実装依存と
-/// しているが、DuckDB も PostgreSQL もここは丸める。ちょうど 0.5 のときに
-/// 偶数側へ寄せるのも両者に合わせてある（`1.5 → 2`、`4.5 → 4`）。
-/// 0 から遠ざける丸めにすると、正の値ばかりのデータで合計が系統的に
-/// 上振れするので、統計処理では偶数丸めの方が望ましい。
+/// Casting floating point to an integer rounds rather than truncates. The SQL standard calls it
+/// implementation-defined, but DuckDB and PostgreSQL both round here. Leaning to the even side
+/// at exactly 0.5 matches both as well (`1.5 -> 2`, `4.5 -> 4`).
+/// Rounding away from zero would systematically inflate sums over all-positive data, so
+/// round-half-to-even is preferable for statistics.
 fn f_round(x: f64) -> f64 {
     let t = funcs::f_trunc(x);
     let frac = x - t;
@@ -525,8 +525,8 @@ fn f_round(x: f64) -> f64 {
     if frac != 0.5 && frac != -0.5 {
         return t;
     }
-    // ちょうど半端。`t` が偶数ならそのまま、奇数なら 0 から遠ざける。
-    // ここに来る時点で |x| は 2^52 未満なので i64 への変換は安全。
+    // Exactly halfway. If `t` is even it stays; if odd it moves away from zero.
+    // By this point |x| is below 2^52, so converting to i64 is safe.
     if (t as i64) % 2 == 0 {
         t
     } else if frac > 0.0 {
@@ -547,7 +547,7 @@ fn load_i128(d: &Data, i: usize) -> i128 {
     }
 }
 
-/// 整数を出力先の物理型へ書く。範囲外なら既定値を積んで `false`（＝ NULL）。
+/// Writes an integer into the destination physical type. Out of range pushes a default and gives `false` (= NULL).
 fn store_i128(d: &mut Data, y: i128) -> bool {
     match d {
         Data::Bool(b) => {
@@ -589,20 +589,20 @@ fn store_i128(d: &mut Data, y: i128) -> bool {
     }
 }
 
-/// 整数系どうしの変換係数 `(mul, div, floor)`。
-/// `floor` は床除算（TIMESTAMP→DATE のみ。エポック前で 1 日ずれないように）。
+/// The conversion factors `(mul, div, floor)` between integer families.
+/// `floor` is floor division (only for TIMESTAMP->DATE, so dates before the epoch are not off by one).
 fn int_conv(from: Ty, to: Ty) -> Result<(i128, i128, bool)> {
     use Ty::*;
     if from.is_temporal() || to.is_temporal() {
         return Ok(match (from, to) {
             (Date, Timestamp) | (Date, Timestamptz) => (MICROS_PER_DAY, 1, false),
             (Timestamp, Date) | (Timestamptz, Date) => (1, MICROS_PER_DAY, true),
-            // `Timestamp` と `Timestamptz` は物理表現が完全に同じ（UTC の
-            // マイクロ秒）なので、値はそのまま素通しでよい
-            // (`Ty::unify` が `Date`/`Timestamp` を `Timestamptz` に寄せた
-            // ときの片側キャストがここを通る)。
+            // `Timestamp` and `Timestamptz` have exactly the same physical representation (UTC
+            // microseconds), so the value passes straight through
+            // (the one-sided cast when `Ty::unify` settles `Date`/`Timestamp` on `Timestamptz`
+            // comes through here).
             (Timestamp, Timestamptz) | (Timestamptz, Timestamp) => (1, 1, false),
-            // 時刻系と整数は生値のまま。BOOLEAN や DECIMAL との変換は意味が無い。
+            // Temporal types and integers keep their raw values. Conversion with BOOLEAN or DECIMAL is meaningless.
             (f, t)
                 if (f.is_temporal() && t.is_integer()) || (f.is_integer() && t.is_temporal()) =>
             {
@@ -611,7 +611,7 @@ fn int_conv(from: Ty, to: Ty) -> Result<(i128, i128, bool)> {
             _ => err!(InvalidCast),
         });
     }
-    // DECIMAL は 10^scale 倍された整数。スケール差だけ掛け／割りする。
+    // DECIMAL is an integer scaled by 10^scale. Multiply/divide by the scale difference.
     let s1 = dec_scale(from) as i32;
     let s2 = dec_scale(to) as i32;
     if s2 > s1 {
@@ -638,18 +638,17 @@ fn rescale_i128(x: i128, mul: i128, div: i128, floor: bool) -> Option<i128> {
         let q = y / div;
         let r = y % div;
         y = if floor {
-            // TIMESTAMP → DATE は床関数でなければならない。切り捨てると
-            // エポック以前の値が 1 日ずれる。
+            // TIMESTAMP -> DATE must be a floor. Truncating would shift pre-epoch values by a day.
             if r != 0 && (y < 0) != (div < 0) {
                 q - 1
             } else {
                 q
             }
         } else {
-            // DECIMAL のスケール縮小は 0 から遠ざかる向きに丸める（DuckDB と
-            // 同じ）。切り捨てると金額計算で系統的に過小評価になる。
-            // `r * 2 >= div` ではなく半分と比較するのは、`r * 2` が i128 を
-            // 溢れさせうるため。
+            // Reducing DECIMAL scale rounds away from zero (the same as DuckDB). Truncating would
+            // systematically underestimate in monetary computation.
+            // The comparison is against half rather than `r * 2 >= div` because `r * 2` could
+            // overflow i128.
             let half = (div + 1) / 2;
             if r >= half {
                 q + 1
@@ -663,7 +662,7 @@ fn rescale_i128(x: i128, mul: i128, div: i128, floor: bool) -> Option<i128> {
     Some(y)
 }
 
-/// 符号なし絶対値 + スケールで 10 進表記する。`format!` は使えない（サイズ）。
+/// Renders an unsigned magnitude plus a scale as decimal. `format!` is unavailable (size).
 pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
     let mut buf = [0u8; 48];
     let mut k = 0usize;
@@ -676,7 +675,7 @@ pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
         u /= 10;
         k += 1;
     }
-    // 0.05 のように整数部が無い場合の先頭 0 を補う。
+    // Supplies the leading 0 when there is no integer part, as with 0.05.
     while k <= scale as usize {
         buf[k] = b'0';
         k += 1;
@@ -692,8 +691,8 @@ pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
     }
 }
 
-/// f64 の 10 進表記。最短往復表現（Ryu/Grisu）はサイズが重いので採らず、
-/// 15 桁に丸めて末尾 0 を落とす近似表記にする。
+/// The decimal rendering of an f64. The shortest round-trip representation (Ryu/Grisu) is too
+/// heavy in size, so this is an approximate rendering rounded to 15 digits with trailing zeros dropped.
 pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
     if x.is_nan() {
         out.extend_from_slice(b"NaN");
@@ -711,7 +710,7 @@ pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
         out.push(b'0');
         return;
     }
-    // v = m * 10^e10 を保ったまま m を [1e14, 1e15) に正規化する。
+    // Normalizes m into [1e14, 1e15) while preserving v = m * 10^e10.
     let mut m = v;
     let mut e10: i32 = 0;
     while m >= 1e15 {
@@ -750,7 +749,7 @@ pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
     // v = 0.d1..dk × 10^p
     let p = e10 + 15;
     if !(-3..=17).contains(&p) {
-        // 指数表記。
+        // Exponential notation.
         out.push(digits[0]);
         if k > 1 {
             out.push(b'.');
@@ -780,17 +779,17 @@ pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
     }
 }
 
-/// `mant * 10^exp` として 10 進数を読む。読めなければ `None`（＝ NULL）。
+/// Reads a decimal number as `mant * 10^exp`. `None` (= NULL) if it cannot be read.
 ///
-/// 3 つめの返り値は「整数部の桁を仮数に収めきれずに捨てたか」。捨てた場合
-/// `mant * 10^exp` は元の値を丸めたものになるので、正確さが要る整数系の
-/// キャストはそれを見て NULL に倒す（丸めた値をそのまま返すと
-/// `CAST('…105727' AS HUGEINT)` が `…105720` に化ける）。浮動小数点は
-/// もともと仮数の精度しか持たないので無視してよい。
+/// The third return value is "whether integer digits were dropped because they did not fit the
+/// mantissa". When they were, `mant * 10^exp` is a rounded version of the original, so integer
+/// casts that need exactness consult it and fall to NULL (returning the rounded value would turn
+/// `CAST('...105727' AS HUGEINT)` into `...105720`). Floating point has only mantissa precision to
+/// begin with, so it can ignore this.
 ///
-/// 仮数は**負の側に積む**。`i128::MIN` の絶対値は正の `i128` では表せないため、
-/// 正の側に積むと下限ちょうどの値
-/// （`-170141183460469231731687303715884105728`）だけ読めなくなる。
+/// The mantissa is **accumulated on the negative side**. `i128::MIN`'s magnitude is not
+/// representable as a positive `i128`, so accumulating positively would make exactly the lower
+/// bound (`-170141183460469231731687303715884105728`) unreadable.
 fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
     let mut lo = 0usize;
     let mut hi = s.len();
@@ -807,7 +806,7 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
         neg = s[i] == b'-';
         i += 1;
     }
-    // 負の側に積む（関数の doc 参照）。
+    // Accumulated on the negative side (see the function's docs).
     let mut mant: i128 = 0;
     let mut exp: i32 = 0;
     let mut inexact = false;
@@ -817,7 +816,7 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
         let d = (s[i] - b'0') as i128;
         match mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
             Some(m) => mant = m,
-            // 仮数に入らない桁は指数へ逃がす（精度は落ちるので inexact）。
+            // Digits that do not fit the mantissa escape into the exponent (precision is lost, hence inexact).
             None => {
                 exp += 1;
                 inexact = true;
@@ -830,8 +829,8 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
         while i < s.len() && s[i].is_ascii_digit() {
             seen = true;
             let d = (s[i] - b'0') as i128;
-            // 小数部の末尾を落としても整数としての値は変わらないので、
-            // ここでは inexact を立てない（整数キャストの結果に影響しない）。
+            // Dropping trailing fractional digits does not change the value as an integer, so
+            // inexact is not set here (it does not affect the integer cast's result).
             if let Some(m) = mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
                 mant = m;
                 exp -= 1;
@@ -871,9 +870,9 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
     } else {
         match mant.checked_neg() {
             Some(m) => m,
-            // `+|i128::MIN|` ちょうど。正の側には収まらないので 1 桁だけ
-            // 指数へ逃がす（inexact なので整数キャストは NULL になり、
-            // 浮動小数点では f64 の精度に対して差が出ない）。
+            // Exactly `+|i128::MIN|`. It does not fit on the positive side, so exactly one digit
+            // escapes into the exponent (being inexact, the integer cast becomes NULL, and for
+            // floating point it makes no difference at f64's precision).
             None => {
                 inexact = true;
                 exp += 1;
@@ -884,7 +883,7 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
     Some((mant, exp, inexact))
 }
 
-/// `m * 10^e`。2 進分解で掛けるので、10 を e 回掛けるより誤差が小さい。
+/// `m * 10^e`. Multiplied via binary decomposition, so the error is smaller than multiplying by 10 e times.
 fn scale_f64(mut m: f64, e: i32) -> f64 {
     const TAB: [f64; 9] = [1e1, 1e2, 1e4, 1e8, 1e16, 1e32, 1e64, 1e128, 1e256];
     let neg = e < 0;
@@ -916,16 +915,15 @@ fn parse_bool(s: &[u8]) -> Option<bool> {
     }
 }
 
-/// `VARCHAR → JSON`。各行を `crate::json::validate` で検証する。
+/// `VARCHAR -> JSON`. Each row is validated with `crate::json::validate`.
 ///
-/// ここだけ他の CAST と違い、行単位の失敗の扱いが `CAST`/`TRY_CAST` で
-/// 分かれる: `lenient == false`（通常の `CAST`）は不正な JSON をエラーに
-/// する（DuckDB の実測 `CAST('not json' AS JSON)` がエラーになる挙動に
-/// 合わせた）。`lenient == true`（`TRY_CAST`）はその行だけ NULL にする
-/// （他の型の TRY_CAST・行単位パース失敗と同じ規則に揃える）。
-/// 他の CAST 全般は「行単位の失敗は常に NULL、CAST/TRY_CAST で差が無い」
-/// 設計だが、JSON はドキュメント全体が壊れているかどうかの 2 値しか
-/// 無いため、DuckDB の実際の挙動に寄せてここだけ例外にした。
+/// Only here does the handling of a per-row failure differ between `CAST` and `TRY_CAST`:
+/// `lenient == false` (an ordinary `CAST`) makes invalid JSON an error (matching DuckDB's measured
+/// behavior where `CAST('not json' AS JSON)` errors). `lenient == true` (`TRY_CAST`) makes just
+/// that row NULL (aligning with other types' TRY_CAST and with per-row parse failures).
+/// Casts in general are designed so that "a per-row failure is always NULL, with no difference
+/// between CAST and TRY_CAST", but JSON has only the binary question of whether the whole document
+/// is broken, so this alone is made an exception to match DuckDB's actual behavior.
 fn cast_str_to_json(a: &Vector, lenient: bool) -> Result<Vector> {
     let n = a.len();
     let sv = a.bytes();
@@ -949,10 +947,10 @@ fn cast_str_to_json(a: &Vector, lenient: bool) -> Result<Vector> {
     Ok(finish(Ty::Json, Data::Bytes(out), a.validity().cloned(), bad))
 }
 
-/// `VARCHAR → UUID`。行単位のパース失敗は `DATE`/`TIME`/`TIMESTAMP` と同じ
-/// 慣習でその行だけ NULL にする（`CAST`/`TRY_CAST` の両方、`lenient` に
-/// 関わらず）。`VARCHAR → JSON` だけがこの慣習の例外であり（`cast_str_to_json`
-/// の doc 参照）、UUID はそちらには倣わない。
+/// `VARCHAR -> UUID`. A per-row parse failure makes just that row NULL, by the same convention as
+/// `DATE`/`TIME`/`TIMESTAMP` (for both `CAST` and `TRY_CAST`, regardless of `lenient`).
+/// Only `VARCHAR -> JSON` is an exception to that convention (see the `cast_str_to_json` docs),
+/// and UUID does not follow it.
 fn cast_str_to_uuid(a: &Vector) -> Result<Vector> {
     let n = a.len();
     let sv = a.bytes();
@@ -974,22 +972,20 @@ fn cast_str_to_uuid(a: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Uuid, Data::Bytes(out), a.validity().cloned(), bad))
 }
 
-/// `Cast`。実装していない組み合わせは黙って壊れた値を返さず `InvalidCast`。
-/// 行単位の変換失敗（範囲外・パース不能）はエラーにせず、その行だけ NULL。
+/// `Cast`. Unimplemented combinations give `InvalidCast` rather than silently returning a broken value.
+/// A per-row conversion failure (out of range, unparsable) is not an error; just that row becomes NULL.
 ///
-/// `VARCHAR → JSON` だけは例外で、行単位の失敗（妥当な JSON でない）を
-/// `TRY_CAST` のときだけ NULL にする（他の型と違い、通常の `CAST` は
-/// エラーにする。DuckDB の実際の挙動に合わせた意図的な例外。詳細は
-/// [`try_cast`] の doc を参照）。
+/// `VARCHAR -> JSON` alone is the exception: a per-row failure (not valid JSON) becomes NULL only
+/// under `TRY_CAST` (unlike other types, an ordinary `CAST` errors. A deliberate exception matching
+/// DuckDB's actual behavior; see the docs on [`try_cast`] for details).
 pub fn cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
     cast_impl(from, to, a, false)
 }
 
-/// `TRY_CAST`。ほとんどの型では [`cast`] と完全に同じ（行単位の変換失敗は
-/// どのみち `cast` がエラーにせず NULL にする契約のため）。唯一の違いは
-/// `VARCHAR → JSON` の行単位検証: `CAST` は不正な JSON をエラーにするが、
-/// `TRY_CAST` はその行だけ NULL にする（型ペア自体が非対応の場合は従来どおり
-/// `expr::vm` 側が catch して全行 NULL に落とす）。
+/// `TRY_CAST`. For most types it is exactly [`cast`] (a per-row conversion failure is contracted to
+/// be NULL rather than an error in `cast` anyway). The only difference is `VARCHAR -> JSON`'s
+/// per-row validation: `CAST` errors on invalid JSON while `TRY_CAST` makes just that row NULL
+/// (when the type pair itself is unsupported, `expr::vm` still catches it and falls to all-NULL as before).
 pub fn try_cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
     cast_impl(from, to, a, true)
 }
@@ -1001,17 +997,17 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         return Ok(a.clone());
     }
     if from == Ty::Null {
-        // 型未定の NULL リテラル。値は全行 NULL なので変換規則は不要。
+        // A NULL literal with no settled type. Every row is NULL, so no conversion rule is needed.
         let mut out = Vector::new(to);
         for _ in 0..n {
             out.push_null();
         }
         return Ok(out);
     }
-    // JSON は fam() だと VARCHAR/BLOB と同じ Bytes 系に丸められてしまうので、
-    // 汎用の (Fam, Fam) マッチに乗せる前に個別に弾く。対応するのは
-    // VARCHAR ↔ JSON のみ（BLOB や数値・日時からの CAST は非対応のまま
-    // `InvalidCast` にする。`to_json` 関数を使うべき、という設計判断）。
+    // Under `fam()` JSON would collapse into the same Bytes family as VARCHAR/BLOB, so it is
+    // handled separately before reaching the general (Fam, Fam) match. Only VARCHAR <-> JSON is
+    // supported (casting from BLOB, numbers, or temporals stays unsupported and gives
+    // `InvalidCast`; the design decision is that `to_json` should be used instead).
     if to == Ty::Json {
         ensure!(from == Ty::Varchar, InvalidCast);
         return cast_str_to_json(a, lenient);
@@ -1022,12 +1018,12 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         out.retype(to);
         return Ok(out);
     }
-    // UUID も同じ理由で個別に弾く: 対応するのは VARCHAR ↔ UUID のみ。
-    // 物理表現は VARCHAR/BLOB と同じ `Bytes` だが、UUID のテキスト表現
-    // （ハイフン付き 16 進）は生バイト列とは異なるので、汎用の `(Fam::Str,
-    // Fam::Str)` の単純コピーには乗せられない（`BLOB ↔ UUID` は非対応の
-    // まま `InvalidCast` にする。生バイトを扱いたければ `BLOB` 経由ではなく
-    // 素直に `UUID` を使う、という設計判断）。
+    // UUID is handled separately for the same reason: only VARCHAR <-> UUID is supported.
+    // Its physical representation is `Bytes`, the same as VARCHAR/BLOB, but UUID's text form
+    // (hyphenated hex) differs from the raw bytes, so it cannot ride the generic `(Fam::Str,
+    // Fam::Str)` straight copy (`BLOB <-> UUID` stays unsupported and gives `InvalidCast`; the
+    // design decision is that if you want raw bytes you should use `UUID` directly rather than
+    // going through `BLOB`).
     if to == Ty::Uuid {
         ensure!(from == Ty::Varchar, InvalidCast);
         return cast_str_to_uuid(a);
@@ -1085,7 +1081,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             ensure!(!to.is_temporal(), InvalidCast);
             let s = dec_scale(to);
             let sv = a.f64s();
-            // 添字は値の取得だけでなく `set_null` の行指定にも使う。
+            // The index is used not only to fetch the value but also to name the row for `set_null`.
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 let mut f = sv[i];
@@ -1105,10 +1101,10 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         }
         (Fam::Flt, Fam::Flt) => {
             let sv = a.f64s();
-            // `n` は stride 適用後の行数で `sv.len()` とは限らない。
+            // `n` is the row count after strides are applied and is not necessarily `sv.len()`.
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
-                // DOUBLE → FLOAT は f32 の精度へ落とす（保持は f64 のまま）。
+                // DOUBLE -> FLOAT drops to f32 precision (while still stored as f64).
                 let f = if to == Ty::Float { sv[i] as f32 as f64 } else { sv[i] };
                 push_f64(&mut data, f);
             }
@@ -1124,7 +1120,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     if is_bool {
                         buf.extend_from_slice(if x != 0 { &b"true"[..] } else { &b"false"[..] });
                     } else if from.is_temporal() {
-                        // 日付の書式化は funcs 側に置く（パーサと対で使うため）。
+                        // Date formatting lives on the funcs side (it pairs with the parser).
                         let y = x as i64;
                         match from {
                             Ty::Date => funcs::fmt_date(y, &mut buf),
@@ -1152,7 +1148,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             }
         }
         (Fam::Str, Fam::Str) => {
-            // VARCHAR ↔ BLOB。表現は同じなのでそのまま複製する。
+            // VARCHAR <-> BLOB. The representation is the same, so it is copied as is.
             let mut out = a.clone();
             out.retype(to);
             return Ok(out);
@@ -1161,7 +1157,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             let sv = a.bytes();
             for i in 0..n {
                 match parse_dec(sv.get(i)) {
-                    // 仮数からあふれた桁は f64 の精度の外なので無視してよい。
+                    // Digits overflowing the mantissa are outside f64's precision and can be ignored.
                     Some((m, e, _)) => {
                         let mut f = scale_f64(m as f64, e);
                         if to == Ty::Float {
@@ -1177,7 +1173,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             }
         }
         (Fam::Str, Fam::Int) if to.is_temporal() => {
-            // 読めない文字列はエラーにせず、その行だけ NULL（数値パースと同じ）。
+            // An unreadable string is not an error; just that row becomes NULL (as with numeric parsing).
             let sv = a.bytes();
             for i in 0..n {
                 let b = sv.get(i);
@@ -1212,14 +1208,14 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     }
                 }
                 if !ok {
-                    // BOOLEAN でも 'true'/'false' 以外は数値として読み、0 以外を真とする。
+                    // For BOOLEAN too, anything but 'true'/'false' is read as a number and counts as true when non-zero.
                     ok = match parse_dec(b) {
                         Some((m, e, inexact)) => {
                             let k = e + scale;
-                            // 整数部の桁を落としていたら丸めた値しか無い。
-                            // 範囲外と同じ扱いで NULL にする（丸めた値を返すと
-                            // 桁が黙って化ける）。DuckDB は CAST でエラー、
-                            // TRY_CAST で NULL。このエンジンは常に NULL 側。
+                            // If integer digits were dropped, only a rounded value exists.
+                            // It is treated like out of range and becomes NULL (returning the rounded
+                            // value would silently mangle the digits). DuckDB errors under CAST and
+                            // gives NULL under TRY_CAST. This engine always takes the NULL side.
                             let y = if inexact {
                                 None
                             } else if k >= 0 {
@@ -1258,14 +1254,13 @@ fn push_f64(d: &mut Data, f: f64) {
     }
 }
 
-// --- INTERVAL 演算 -----------------------------------------------------------
-// 物理型は 3 つとも I128 系だが、フィールド境界を跨ぐ桁上がりを起こしては
-// いけない（`1 month + 3 days` は `4 ...` にはならない）ので、生の i128
-// 二進演算では表現できない。専用カーネルにしてある理由はこれ。
+// --- INTERVAL operations ------------------------------------------------------
+// All three physical types are I128-family, but a carry must never cross a field boundary
+// (`1 month + 3 days` must not become `4 ...`), which raw i128 binary arithmetic cannot express.
+// That is why these are dedicated kernels.
 
-/// TIMESTAMP(I64, マイクロ秒) + INTERVAL(I128)。DATE は呼び出し側が
-/// TIMESTAMP へキャストしてから渡す（DuckDB も DATE ± INTERVAL は
-/// TIMESTAMP を返す）。
+/// TIMESTAMP(I64, microseconds) + INTERVAL(I128). DATE is cast to TIMESTAMP by the caller before
+/// being passed in (DuckDB also returns TIMESTAMP for DATE +- INTERVAL).
 pub fn ts_add_interval(a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I64 && b.data().phys() == PhysType::I128, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
@@ -1285,8 +1280,8 @@ pub fn ts_add_interval(a: &Vector, b: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Timestamp, Data::I64(out), combine_validity(a, sa, b, sb, n), bad))
 }
 
-/// INTERVAL ± INTERVAL。フィールドごとの加算（繰り上がりなし。DuckDB も
-/// `1 month + 3 days` は `1 month 3 days` のまま正規化しない）。
+/// INTERVAL +- INTERVAL. Field-wise addition (no carrying; DuckDB likewise leaves
+/// `1 month + 3 days` as `1 month 3 days` without normalizing).
 pub fn interval_add(a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I128, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
@@ -1300,8 +1295,8 @@ pub fn interval_add(a: &Vector, b: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Interval, Data::I128(out), combine_validity(a, sa, b, sb, n), None))
 }
 
-/// INTERVAL の符号反転。フィールドごとに反転する（生の 128bit 二の補数の
-/// 反転は桁境界を跨いで壊れるため使えない）。
+/// Negating an INTERVAL. Done field-wise (negating the raw 128-bit two's complement would break
+/// across field boundaries and cannot be used).
 pub fn interval_neg(a: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128, TypeMismatch);
     let mut out = Vec::with_capacity(a.len());
@@ -1312,7 +1307,7 @@ pub fn interval_neg(a: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Interval, Data::I128(out), a.validity().cloned(), None))
 }
 
-/// INTERVAL * BIGINT。フィールドごとの乗算（繰り上がりなし。DuckDB と同じ）。
+/// INTERVAL * BIGINT. Field-wise multiplication (no carrying; the same as DuckDB).
 pub fn interval_mul(a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I64, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
@@ -1355,7 +1350,7 @@ mod tests {
 
     #[test]
     fn like_pathological_is_not_exponential() {
-        // 素朴な再帰実装だと指数時間になるパターン。線形バックトラックなら一瞬。
+        // A pattern that would go exponential under a naive recursive implementation. Linear backtracking finishes instantly.
         let subject = vec![b'a'; 4096];
         assert!(!like_match(&subject, b"%a%a%a%a%a%a%a%b"));
         let mut ok = subject.clone();
@@ -1412,8 +1407,8 @@ mod tests {
         assert_eq!(parse_dec(b"1e"), None);
     }
 
-    /// i128 の端。仮数を負の側に積んでいるので下限ちょうども正確に読める。
-    /// 39 桁を 38 桁で打ち切っていた頃は上限が `…105720` に丸まっていた。
+    /// The i128 extremes. Since the mantissa accumulates on the negative side, even the exact lower
+    /// bound reads correctly. Back when 39 digits were truncated at 38, the upper bound rounded to `...105720`.
     #[test]
     fn parse_dec_i128_boundaries() {
         assert_eq!(
@@ -1424,18 +1419,18 @@ mod tests {
             parse_dec(b"-170141183460469231731687303715884105728"),
             Some((i128::MIN, 0, false))
         );
-        // 上限 +1 / 下限 -1 は仮数に収まらない。丸めた値は返るが inexact が立ち、
-        // 整数キャスト側はそれを見て NULL にする。
+        // Upper + 1 / lower - 1 do not fit the mantissa. A rounded value comes back, but inexact is
+        // set and the integer cast side consults it and gives NULL.
         let (_, _, inexact) = parse_dec(b"170141183460469231731687303715884105728").unwrap();
         assert!(inexact);
         let (_, _, inexact) = parse_dec(b"-170141183460469231731687303715884105729").unwrap();
         assert!(inexact);
-        // 38 桁までは元から正確。
+        // Up to 38 digits it was exact all along.
         assert_eq!(
             parse_dec(b"12345678901234567890123456789012345678"),
             Some((12345678901234567890123456789012345678, 0, false))
         );
-        // 小数部を落とすのは整数としての値に影響しないので inexact にしない。
+        // Dropping the fractional part does not affect the value as an integer, so it is not inexact.
         let long_frac = b"1.000000000000000000000000000000000000000000000005";
         assert_eq!(parse_dec(long_frac).map(|(_, _, x)| x), Some(false));
     }
@@ -1460,7 +1455,7 @@ mod tests {
 
     #[test]
     fn ts_add_interval_is_calendar_aware() {
-        // 2024-01-31 00:00:00 + 1 month → 2024-02-29（うるう年、月末クランプ）。
+        // 2024-01-31 00:00:00 + 1 month -> 2024-02-29 (a leap year, clamped to month end).
         let jan31 = funcs::days_from_civil(2024, 1, 31) * 86_400_000_000;
         let a = tsvec(&[jan31]);
         let b = ivec(&[(1, 0, 0)]);
@@ -1489,14 +1484,13 @@ mod tests {
         assert_eq!(unpack_interval(r.i128s()[0]), (2, 6, 7_200_000_000));
     }
 
-    // 「整数は wrapping。オーバーフローで panic させない」という設計
-    // （このファイル冒頭の `int_arith!` のコメント参照）は INTERVAL の
-    // フィールドごとの演算にも一貫して適用されている。この境界での
-    // wrapping 挙動をここで固定しておく。
+    // The design decision "integers wrap; overflow does not panic" (see the `int_arith!` comment at
+    // the top of this file) applies consistently to INTERVAL's field-wise operations too.
+    // The wrapping behavior at this boundary is pinned down here.
     #[test]
     fn interval_neg_of_i32_min_stays_negative_due_to_two_s_complement_wraparound() {
-        // i32::MIN.wrapping_neg() == i32::MIN（正の i32::MAX+1 は表現できない）。
-        // 通常の整数 Neg カーネルと同じ、意図された wrapping 挙動。
+        // i32::MIN.wrapping_neg() == i32::MIN (a positive i32::MAX+1 is not representable).
+        // The same intended wrapping behavior as the ordinary integer Neg kernel.
         let a = ivec(&[(i32::MIN, i32::MIN, i64::MIN)]);
         let r = interval_neg(&a).unwrap();
         assert_eq!(unpack_interval(r.i128s()[0]), (i32::MIN, i32::MIN, i64::MIN));
@@ -1512,10 +1506,10 @@ mod tests {
 
     #[test]
     fn interval_mul_wraps_without_double_truncation_of_the_multiplier() {
-        // 乗算は i64 の中間精度で行ってから i32 へ切り詰める
-        // （`(m as i64).wrapping_mul(k) as i32`）。k 自体を先に i32 へ
-        // 切り詰めてから掛けるわけではないので、大きな k でも最終結果の
-        // 下位 32bit は一貫して同じ値になる（二重の切り詰めにはならない）。
+        // The multiplication happens at i64 intermediate precision and is then truncated to i32
+        // (`(m as i64).wrapping_mul(k) as i32`). k itself is not truncated to i32 before
+        // multiplying, so even for large k the low 32 bits of the final result are consistently the
+        // same value (there is no double truncation).
         let a = ivec(&[(1_000_000, 0, 0)]);
         let mut k = Vector::new(Ty::BigInt);
         k.push_value(&crate::vector::Value::I64(10_000));

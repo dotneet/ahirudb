@@ -1,12 +1,12 @@
-//! Hive スタイルのパーティション列を仮想的に付け足すデコレータ。
+//! A decorator that virtually appends Hive-style partition columns.
 //!
-//! `s3://bucket/year=2024/month=01/part.parquet` のようなパスの、ファイル名
-//! より前のディレクトリ部分から `key=value` セグメントを取り出し、ファイルの
-//! 中には存在しない列としてスキーマと読み出し結果に足し込む。
+//! It extracts `key=value` segments from the directory part (before the file name) of a path such
+//! as `s3://bucket/year=2024/month=01/part.parquet` and adds them to the schema and read results
+//! as columns that do not exist inside the file.
 //!
-//! `inner: Box<dyn TableFormat>` に丸ごと委譲する純粋なデコレータで、
-//! `parquet.rs` / `csv.rs` / `jsonl.rs` は 1 行も変更しなくてよい。
-//! これはこのファイルだけで完結させることが設計上の要点。
+//! It is a pure decorator delegating everything to `inner: Box<dyn TableFormat>`, so
+//! `parquet.rs` / `csv.rs` / `jsonl.rs` need not change by a single line.
+//! Keeping it contained to this one file is the design's key point.
 
 use alloc::string::ToString;
 
@@ -17,9 +17,9 @@ use crate::vector::{Field, Ty, Value, Vector};
 
 pub struct PartitionedFormat {
     inner: Box<dyn TableFormat>,
-    /// `(列名, 定数値)`。ファイルのパスから 1 度だけ抽出しておく。
+    /// `(column name, constant value)`. Extracted from the file's path exactly once.
     partition_cols: Vec<(String, Value)>,
-    /// `inner` のスキーマ + パーティション列。`resolve` が完了するまでは空。
+    /// `inner`'s schema plus the partition columns. Empty until `resolve` completes.
     schema: Vec<Field>,
 }
 
@@ -28,20 +28,19 @@ impl PartitionedFormat {
         PartitionedFormat { inner, partition_cols, schema: Vec::new() }
     }
 
-    /// パスのディレクトリ部分（ファイル名を除く各セグメント）から
-    /// `key=value` を取り出す。見つからなければ空を返す
-    /// （= Hive パーティションではない）。
+    /// Extracts `key=value` from the path's directory part (each segment except the file name).
+    /// Returns empty when nothing is found (= not Hive partitioned).
     ///
-    /// URL のクエリ文字列・フラグメントは `FormatKind::detect` と同じく
-    /// 事前に落とす。`key` か `value` が空のセグメントは無視する
-    /// （`=` を含むだけの飾りのディレクトリ名を誤検出しないため）。
+    /// A URL's query string and fragment are dropped beforehand, as in `FormatKind::detect`.
+    /// A segment with an empty `key` or `value` is ignored (so a merely decorative directory name
+    /// containing an `=` is not misdetected).
     pub fn parse_hive_path(path: &str) -> Vec<(String, Value)> {
         let path = path.split(['?', '#']).next().unwrap_or(path);
         let segs: Vec<&str> = path.split('/').collect();
         if segs.len() < 2 {
             return Vec::new();
         }
-        // 最後のセグメントはファイル名なので見ない。
+        // The last segment is the file name and is not examined.
         let mut out = Vec::new();
         for seg in &segs[..segs.len() - 1] {
             let Some(eq) = seg.find('=') else { continue };
@@ -54,13 +53,13 @@ impl PartitionedFormat {
         out
     }
 
-    /// `inner` の列だけを残した射影。パーティション列（`inner` の列数以上の
-    /// 添字）は実ファイルには存在しないので、`inner` には見せない。
+    /// A projection keeping only `inner`'s columns. Partition columns (indices at or beyond
+    /// `inner`'s column count) do not exist in the real file and are not shown to `inner`.
     ///
-    /// 1 本も残らない場合（パーティション列だけを選んだクエリ）でも、行数を
-    /// 知るために `inner` の列を最低 1 本は要求する。`plan/bind.rs` が
-    /// `COUNT(*)` 用にやっている「射影が空なら列 0 を足す」のと同じ発想を、
-    /// ここでは `inner`/パーティション列の境界に対して適用している。
+    /// Even when none remain (a query selecting only partition columns), at least one of `inner`'s
+    /// columns is still requested so the row count is known. The same idea as `plan/bind.rs`'s
+    /// "add column 0 when the projection is empty" for `COUNT(*)`, applied here to the
+    /// inner/partition column boundary.
     fn inner_projection(&self, projection: &[usize]) -> Vec<usize> {
         let inner_n = self.inner.schema().len();
         let mut v: Vec<usize> = projection.iter().copied().filter(|&c| c < inner_n).collect();
@@ -70,17 +69,17 @@ impl PartitionedFormat {
         v
     }
 
-    /// `pruners`/`projection` を `inner` の列空間に付け替える。パーティション
-    /// 列を触れる pruner は `inner` には見せられない（実ファイルにその列は
-    /// 無い）ので、その場で判定してしまう — パーティション列はファイル全体で
-    /// 1 定数なので、`min = max = その定数` として `range_may_match` に通せる。
+    /// Remaps `pruners`/`projection` into `inner`'s column space. A pruner touching a partition
+    /// column cannot be shown to `inner` (the real file has no such column), so it is decided on
+    /// the spot -- a partition column is one constant for the whole file, so it can be run through
+    /// `range_may_match` as `min = max = that constant`.
     ///
-    /// 戻り値は `(inner 射影, inner 向けに付け替えた pruners, 不一致確定)`。
-    /// 3 つ目が `true` なら、パーティション列の pruner だけでこの分割は
-    /// 丸ごと読み飛ばせることが分かっている（`inner` に問い合わせるまでもない）。
+    /// The return value is `(inner projection, pruners remapped for inner, definitely no match)`.
+    /// When the third is `true`, the partition-column pruners alone already show this split can be
+    /// skipped entirely (without even asking `inner`).
     ///
-    /// `may_match` / `index_ranges` / `refine_with_index` の 3 か所で同じ
-    /// 付け替えが要るので、ここに 1 度だけ書く。
+    /// The same remapping is needed in three places -- `may_match` / `index_ranges` /
+    /// `refine_with_index` -- so it is written once here.
     fn remap_pruners(
         &self,
         pruners: &[Pruner],
@@ -111,11 +110,11 @@ impl PartitionedFormat {
     }
 }
 
-/// パーティション値の `%XX` エスケープを元のバイトに戻す。Spark 等が
-/// パーティション値にスペースや記号を含めるとき URL エンコードして書き出す
-/// ため（`region=us%20east` のように）、DuckDB もここをデコードして返す
-/// （`duckdb` CLI で実測して確認済み）。不正な `%` シーケンス（16進数でない、
-/// 途中で文字列が終わる）はデコードを諦めてそのまま素通しする。
+/// Decodes `%XX` escapes in a partition value back to the original bytes. Spark and others URL-
+/// encode partition values containing spaces or symbols when writing them out (as in
+/// `region=us%20east`), and DuckDB decodes them here as well (confirmed by measuring with the
+/// `duckdb` CLI). An invalid `%` sequence (not hex, or the string ending partway) gives up on
+/// decoding and passes through unchanged.
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     if !b.contains(&b'%') {
@@ -146,10 +145,10 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// DuckDB の Hive パーティション型推定に合わせる: 数字だけの値は
-/// INTEGER（32bit に収まらなければ BIGINT）、それ以外は VARCHAR。
-/// 符号や小数点は「数字だけ」の対象外にしてある（`-1` や `1.5` を含む
-/// パーティションは実運用でもまれで、誤って数値扱いにする方が危険）。
+/// Matches DuckDB's Hive partition type inference: a value of digits only is INTEGER (or BIGINT if
+/// it does not fit 32 bits), and anything else is VARCHAR.
+/// Signs and decimal points are excluded from "digits only" (partitions containing `-1` or `1.5`
+/// are rare in practice, and wrongly treating them as numeric is the more dangerous mistake).
 fn infer_value(s: &str) -> Value {
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
         if let Ok(v) = s.parse::<i64>() {
@@ -166,12 +165,12 @@ fn value_ty(v: &Value) -> Ty {
     match v {
         Value::I32(_) => Ty::Int,
         Value::I64(_) => Ty::BigInt,
-        // `infer_value` はこれ以外を作らない。
+        // `infer_value` produces nothing else.
         _ => Ty::Varchar,
     }
 }
 
-/// 定数値で埋めた `rows` 行のベクタを作る。
+/// Builds a `rows`-row vector filled with a constant value.
 fn constant_vector(ty: Ty, v: &Value, rows: usize) -> Vector {
     let mut out = Vector::with_capacity(ty, rows);
     for _ in 0..rows {
@@ -186,11 +185,11 @@ impl TableFormat for PartitionedFormat {
         if step.is_ok() && self.schema.is_empty() {
             let mut schema = self.inner.schema().to_vec();
             for (name, v) in &self.partition_cols {
-                // パーティション列がファイル自身の列名と衝突すると、同じ名前の
-                // 列が2本並ぶスキーマになる。どちらを引くかは列解決の実装
-                // 詳細に依存してしまい、意図しない方の値が静かに返りかねない
-                // ので、位置ずれ結合を拒否した `catalog::unify_schema` と同じ
-                // 方針で明確に拒否する。
+                // If a partition column collides with one of the file's own column names, the schema
+                // ends up with two columns of the same name. Which one is looked up would depend on
+                // column-resolution implementation details, and the unintended value could silently
+                // come back, so it is clearly rejected -- the same policy as `catalog::unify_schema`
+                // rejecting misaligned joins.
                 ensure!(
                     !schema
                         .iter()
@@ -256,8 +255,8 @@ impl TableFormat for PartitionedFormat {
     ) -> Result<()> {
         let (inner_proj, inner_pruners, reject) = self.remap_pruners(pruners, projection);
         if reject {
-            // パーティション列の pruner だけで既に不一致が確定している。
-            // ページ選択用のバイトすら要らない。
+            // The partition-column pruners alone already settle a non-match.
+            // Not even the page-selection bytes are needed.
             return Ok(());
         }
         self.inner.index_ranges(split, &inner_pruners, &inner_proj, out)
@@ -289,8 +288,8 @@ impl TableFormat for PartitionedFormat {
             if col < inner_n {
                 let pos = match inner_proj.iter().position(|&c| c == col) {
                     Some(p) => p,
-                    // `inner_projection` は projection の inner 列をすべて含むので
-                    // 到達しないはず。
+                    // `inner_projection` contains every inner column of projection, so this should
+                    // be unreachable.
                     None => err!(Internal),
                 };
                 out.push(inner_cols[pos].clone());
@@ -320,7 +319,7 @@ mod tests {
 
     #[test]
     fn filename_is_never_treated_as_a_partition_segment() {
-        // ファイル名に `=` が含まれていても見ない。
+        // An `=` in the file name is not examined.
         let cols = PartitionedFormat::parse_hive_path("a=b.parquet");
         assert!(cols.is_empty());
     }
@@ -345,21 +344,21 @@ mod tests {
 
     #[test]
     fn percent_encoded_values_are_decoded() {
-        // duckdb で実測: `region=us%20east` は "us east" になる。
+        // Measured with duckdb: `region=us%20east` becomes "us east".
         let cols = PartitionedFormat::parse_hive_path("data/region=us%20east/f.parquet");
         assert!(matches!(&cols[0].1, Value::Bytes(b) if b == b"us east"));
     }
 
     #[test]
     fn malformed_percent_escape_is_left_as_is() {
-        // `%` の後ろが16進数でない、または途中で切れている場合は素通しする。
+        // When what follows `%` is not hex, or is cut off partway, it passes through.
         let cols = PartitionedFormat::parse_hive_path("data/x=100%off/f.parquet");
         assert!(matches!(&cols[0].1, Value::Bytes(b) if b == b"100%off"));
         let cols = PartitionedFormat::parse_hive_path("data/x=abc%2/f.parquet");
         assert!(matches!(&cols[0].1, Value::Bytes(b) if b == b"abc%2"));
     }
 
-    // --- 分離した TableFormat に対する動作確認用のフェイク --------------------
+    // --- A fake for verifying behavior against an isolated TableFormat -------
 
     struct FakeFormat {
         schema: Vec<Field>,
@@ -452,9 +451,9 @@ mod tests {
 
     #[test]
     fn partition_column_colliding_with_a_real_file_column_is_rejected() {
-        // ファイル自身に "year" 列があり、かつパスにも `year=...` があると、
-        // 同名の列が2本並ぶスキーマになってしまう。どちらを引くか未定義に
-        // なるくらいなら、明確なエラーで拒否するべき。
+        // If the file itself has a "year" column and the path also has `year=...`, the schema ends
+        // up with two columns of the same name. Rather than leaving which one is looked up
+        // undefined, it should be rejected with a clear error.
         let inner = Box::new(FakeFormat {
             schema: vec![Field::new("id", Ty::Int, false), Field::new("year", Ty::Int, false)],
             rows: 3,
@@ -465,7 +464,7 @@ mod tests {
 
     #[test]
     fn read_split_works_when_only_partition_columns_are_projected() {
-        // inner の列を 1 つも選んでいなくても、行数はちゃんと分かる。
+        // The row count is still known even when none of inner's columns are selected.
         let inner =
             Box::new(FakeFormat { schema: vec![Field::new("id", Ty::Int, false)], rows: 5 });
         let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), Value::I32(2024))]);

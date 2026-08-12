@@ -1,14 +1,14 @@
-//! WASM 用グローバルアロケータ。
+//! The global allocator for WASM.
 //!
-//! サイズクラス分離フリーリスト + バンプ。dlmalloc (約 10 KB) の代わりに
-//! 使うことで 1 KB 程度に収まる。wasm は単一スレッド前提なのでロックを持たない。
+//! A size-class-segregated free list plus a bump. Using it instead of dlmalloc
+//! (about 10 KB) keeps this to around 1 KB. wasm is assumed single-threaded, so there is no lock.
 //!
-//! 設計方針:
-//! - 16 B から 32 KB までを 12 個のサイズクラスに丸め、クラスごとのフリーリストで回す。
-//!   クラスは `dealloc` に渡される `Layout` から復元できるのでヘッダを持たない。
-//! - それより大きいブロックは 16 B 境界に丸めて単方向リストで first-fit。
-//! - 領域は `memory.grow` で 1 MiB ずつ確保する。解放は行わない（wasm の
-//!   線形メモリは縮められないため）。
+//! Design decisions:
+//! - 16 B through 32 KB are rounded into 12 size classes, each with its own free list.
+//!   No header is needed, since the class can be recovered from the `Layout` passed to `dealloc`.
+//! - Larger blocks are rounded to a 16 B boundary and served first-fit from a singly linked list.
+//! - Regions are reserved 1 MiB at a time via `memory.grow`, and never released
+//!   (wasm linear memory cannot shrink).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -19,7 +19,7 @@ const MIN_SHIFT: usize = 4;
 const NUM_CLASSES: usize = 12;
 /// 16 << 11 = 32768
 const MAX_SMALL: usize = 16 << (NUM_CLASSES - 1);
-/// 一度の `memory.grow` で確保する最小ページ数 (1 MiB)。
+/// The minimum number of pages reserved by one `memory.grow` (1 MiB).
 const GROW_PAGES: usize = 16;
 
 #[repr(C)]
@@ -38,7 +38,7 @@ struct Heap {
     large: *mut LargeNode,
     bump: usize,
     end: usize,
-    /// 統計用。`ahiru_heap_used` で公開する。
+    /// For statistics. Exposed through `ahiru_heap_used`.
     allocated: usize,
 }
 
@@ -72,7 +72,7 @@ fn round16(n: usize) -> usize {
 }
 
 impl Heap {
-    /// バンプ領域から `n` バイト (16 の倍数) を切り出す。
+    /// Carves `n` bytes (a multiple of 16) out of the bump region.
     unsafe fn carve(&mut self, n: usize) -> *mut u8 {
         if self.bump + n > self.end && !unsafe { self.grow(n) } {
             return ptr::null_mut();
@@ -90,11 +90,11 @@ impl Heap {
         }
         let start = prev * PAGE;
         if start == self.end {
-            // 直前の領域と連続しているので末尾を伸ばすだけでよい。
+            // Contiguous with the previous region, so just extend the end.
             self.end = start + pages * PAGE;
         } else {
-            // 連続していない場合は古い残余を捨てる。自分以外が memory.grow を
-            // 呼ばない限りここには来ない。
+            // Otherwise, discard the old remainder. This is unreachable unless
+            // something other than us calls memory.grow.
             self.bump = start;
             self.end = start + pages * PAGE;
         }
@@ -103,7 +103,7 @@ impl Heap {
 }
 
 struct HeapCell(UnsafeCell<Heap>);
-// wasm32 は単一スレッドで動かす前提。
+// wasm32 is assumed to run single-threaded.
 unsafe impl Sync for HeapCell {}
 
 static HEAP: HeapCell = HeapCell(UnsafeCell::new(empty_heap()));
@@ -132,8 +132,8 @@ unsafe impl GlobalAlloc for AhiruAlloc {
         }
 
         if align > 16 {
-            // 実際には到達しない (Rust の標準的な型で align > 16 はほぼ無い)。
-            // 再利用せずバンプから取り、解放時はリークさせる。
+            // Unreachable in practice (align > 16 is almost unheard of for standard Rust types).
+            // Take from the bump without reuse, and leak on free.
             let n = round16(size + align);
             let raw = unsafe { h.carve(n) };
             if raw.is_null() {
@@ -144,7 +144,7 @@ unsafe impl GlobalAlloc for AhiruAlloc {
             return aligned as *mut u8;
         }
 
-        // large: フリーリストを first-fit で探す。
+        // large: first-fit search of the free list.
         let need = round16(size);
         let mut prev: *mut *mut LargeNode = &mut h.large;
         let mut cur = h.large;
@@ -182,7 +182,7 @@ unsafe impl GlobalAlloc for AhiruAlloc {
             return;
         }
         if align > 16 {
-            return; // リーク (上記の通り実質到達しない)
+            return; // leak (effectively unreachable, as noted above)
         }
         let need = round16(size);
         let node = p as *mut LargeNode;
@@ -198,7 +198,7 @@ unsafe impl GlobalAlloc for AhiruAlloc {
         let old = layout.size().max(1);
         let align = layout.align();
 
-        // 同じサイズクラスに収まるなら何もしない。Vec の伸長で頻繁に効く。
+        // Nothing to do if it still fits the same size class. This pays off often as a Vec grows.
         if align <= 16
             && old <= MAX_SMALL
             && new_size <= MAX_SMALL
@@ -228,19 +228,19 @@ fn memory_grow(pages: usize) -> usize {
     core::arch::wasm32::memory_grow(0, pages)
 }
 
-/// wasm 以外 (アロケータの単体テスト用) では成長できない。
+/// Cannot grow off wasm (for unit-testing the allocator).
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn memory_grow(_pages: usize) -> usize {
     usize::MAX
 }
 
-/// 現在ヒープが保持しているバイト数。メモリ上限チェックに使う。
+/// How many bytes the heap currently holds. Used by the memory-limit check.
 pub fn heap_used() -> usize {
     unsafe { (*HEAP.0.get()).allocated }
 }
 
-/// `memory.grow` で確保済みの総バイト数。
+/// The total bytes reserved so far via `memory.grow`.
 pub fn heap_reserved() -> usize {
     let h = unsafe { &*HEAP.0.get() };
     h.end.saturating_sub(h.bump) + h.allocated

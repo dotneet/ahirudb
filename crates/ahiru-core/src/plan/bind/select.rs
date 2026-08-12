@@ -26,13 +26,13 @@ use crate::sql::ast::ColumnsSpec;
 
 // --- SAMPLE ------------------------------------------------------------------
 
-/// AST の `sql::ast::SampleSpec` を実行用に解決する。
+/// Resolves the AST's `sql::ast::SampleSpec` for execution.
 ///
-/// 手法（`BERNOULLI`/`SYSTEM`/`RESERVOIR`）の構文は受理するだけで、実装は
-/// `is_rows` の 2 択に落ちる（`exec::sample` モジュール doc 参照。タスクの
-/// 優先度どおり「パーセント指定 > 行数指定 > 手法の使い分け」という単純化）。
-/// パーセント・行数の値域チェックは既に `sql::parser::Parser::sample_amount`
-/// が済ませてあるので、ここではシードの解決だけを行う。
+/// The method syntax (`BERNOULLI`/`SYSTEM`/`RESERVOIR`) is only accepted; the implementation
+/// reduces to the two cases of `is_rows` (see the `exec::sample` module docs; the
+/// simplification "percentage > row count > distinguishing methods", per the task's priorities).
+/// Range checks on the percentage and row count are already done by
+/// `sql::parser::Parser::sample_amount`, so only the seed is resolved here.
 fn resolve_sample_spec(spec: &crate::sql::ast::SampleSpec) -> crate::plan::SampleSpec {
     let seed = match spec.seed {
         Some(s) => s as u64,
@@ -148,9 +148,8 @@ fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprI
     if !sel.group_by_all {
         return Ok(sel.group_by.clone());
     }
-    // `GROUP BY ALL` と `GROUPING SETS`/`ROLLUP`/`CUBE` は構文上も排他
-    // （パーサがどちらか一方しか立てない）。前提が崩れたら黙って片方を
-    // 無視せずに落とす。
+    // `GROUP BY ALL` and `GROUPING SETS`/`ROLLUP`/`CUBE` are syntactically exclusive too (the
+    // parser sets only one of them). If that premise breaks, fail rather than silently ignoring one.
     ensure!(sel.grouping_sets.is_none(), Internal);
     let mut out = Vec::new();
     for item in &sel.items {
@@ -164,13 +163,13 @@ fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprI
     Ok(out)
 }
 
-// --- 本体 --------------------------------------------------------------------
+// --- Main --------------------------------------------------------------------
 
-/// `outer_scope` が `Some` のとき、この SELECT は相関サブクエリとして
-/// バインドされる: WHERE の最上位 AND 節にある「外側スコープの式 = 内側の式」
-/// という等価述語を相関キーとして検出し、通常の述語処理からは除外した上で
-/// `Plan::correlated` に載せて返す（呼び出し側が結合キーとして使う）。
-/// `None` のとき（トップレベル・CTE・FROM 句の派生表）は従来どおり。
+/// When `outer_scope` is `Some`, this SELECT is bound as a correlated subquery: an equality
+/// predicate of the form "outer-scope expression = inner expression" in a top-level AND clause
+/// of WHERE is detected as a correlation key, excluded from the ordinary predicate handling,
+/// and returned on `Plan::correlated` (the caller uses it as a join key).
+/// With `None` (top level, a CTE, a FROM-clause derived table) behavior is as before.
 pub(super) fn bind_select_in(
     catalog: &Catalog,
     arena: &ExprArena,
@@ -181,19 +180,19 @@ pub(super) fn bind_select_in(
 ) -> Result<Plan> {
     let from = match &sel.from {
         Some(f) => f,
-        // `SELECT 1` のような FROM 無しは v1 では扱わない。
+        // A missing FROM, as in `SELECT 1`, is not handled in v1.
         None => err!(UnsupportedFeature),
     };
 
-    // `GROUP BY ALL` はここで一度だけ具体的な式リストへ解決し、以降は
-    // 普通の `GROUP BY a, b, ...` とまったく同じ経路を通す。
+    // `GROUP BY ALL` is resolved once here into a concrete expression list, and from then on
+    // takes exactly the same path as an ordinary `GROUP BY a, b, ...`.
     let group_by = resolve_group_by_all(arena, sel)?;
 
     let mut rels: Vec<Rel> = Vec::new();
     let tree = flatten_from(catalog, arena, params, from, &mut rels, ctes, 0)?;
     let scope_all = full_scope(&rels);
 
-    // --- 参照される列を集める（射影プッシュダウン） -------------------------
+    // --- Collect the referenced columns (projection pushdown) ---------------
     let mut refs: Vec<usize> = Vec::new();
     let mut star_all = false;
     let mut star_quals: Vec<String> = Vec::new();
@@ -215,10 +214,10 @@ pub(super) fn bind_select_in(
                     // `COLUMNS(*)` is exactly a plain `*`.
                     None | Some(ColumnsSpec::All) => star_all = true,
                 }
-                // `REPLACE (expr AS col, ...)` の `expr` は式木の外（`*` の
-                // 展開の中）にあるので、他の select item と同じく参照列を
-                // 拾っておかないと射影プッシュダウンから漏れる。
-                // `EXCLUDE` の列自体は逆に読む必要が無いので何もしない。
+                // The `expr` of `REPLACE (expr AS col, ...)` lives outside the expression tree
+                // (inside the `*` expansion), so unless its referenced columns are collected
+                // like any other select item, it would be missed by projection pushdown.
+                // `EXCLUDE`'s columns, conversely, need not be read, so nothing is done for them.
                 for &(e, _) in replace {
                     collect_refs(arena, &scope_all, e, &mut refs)?;
                 }
@@ -233,11 +232,11 @@ pub(super) fn bind_select_in(
             _ => collect_refs(arena, &scope_all, item.expr, &mut refs)?,
         }
     }
-    // 名前付きウィンドウ（`OVER w`）は `PARTITION BY`/`ORDER BY` の実体が
-    // 式木の外（`sel.windows`）にあるため、通常の再帰では見つからない。
-    // 実際に参照されている名前だけを拾って、その定義の列参照も射影
-    // プッシュダウン対象に加える（未定義の名前はここではエラーにしない。
-    // 後段の `build_window` が実際の束縛時に明確なエラーを出す）。
+    // A named window (`OVER w`) keeps the substance of its `PARTITION BY`/`ORDER BY` outside
+    // the expression tree (in `sel.windows`), so ordinary recursion does not find it.
+    // Only the names actually referenced are picked up, and their definitions' column
+    // references are added to projection pushdown as well (an undefined name is not an error
+    // here; the later `build_window` raises a clear error at actual bind time).
     if !sel.windows.is_empty() {
         let mut win_refs: Vec<ExprId> = Vec::new();
         for item in &sel.items {
@@ -265,19 +264,19 @@ pub(super) fn bind_select_in(
         }
     }
     for e in [sel.filter, sel.having].into_iter().flatten() {
-        // 相関サブクエリでは WHERE に外側スコープの列参照が混じりうる。
-        // ここでは射影プッシュダウン用の列集めをしているだけなので、
-        // 外側スコープで解決できる参照は黙ってプッシュダウン対象から外す
-        // （相関等価述語の抽出自体は後段の WHERE 分解で行う）。
+        // In a correlated subquery, WHERE may contain outer-scope column references.
+        // This is only collecting columns for projection pushdown, so references resolvable in
+        // the outer scope are silently excluded from pushdown (extracting the correlated
+        // equality predicates themselves happens in the later WHERE decomposition).
         collect_refs_tolerant(arena, &scope_all, outer_scope, e, &mut refs)?;
     }
     for e in &group_by {
-        // 序数指定（`GROUP BY 1`）はここでは列参照を持たない。
+        // An ordinal (`GROUP BY 1`) carries no column reference here.
         if ordinal_of(arena, *e).is_none() {
             collect_refs(arena, &scope_all, *e, &mut refs)?;
         }
     }
-    // `GROUPING SETS`/`ROLLUP`/`CUBE` も同様に射影プッシュダウンの対象に含める。
+    // `GROUPING SETS`/`ROLLUP`/`CUBE` are likewise included in projection pushdown.
     if let Some(sets) = &sel.grouping_sets {
         for set in sets {
             for &e in set {
@@ -288,22 +287,22 @@ pub(super) fn bind_select_in(
         }
     }
     for o in &sel.order_by {
-        // ORDER BY は出力別名も指しうるので、解決できなくてもここでは許す。
+        // ORDER BY may point at an output alias, so failing to resolve is allowed here.
         let _ = collect_refs(arena, &scope_all, o.expr, &mut refs);
     }
     if let Some(q) = sel.qualify {
-        // QUALIFY も SELECT の出力別名を指しうるので、解決できなくてもここでは許す。
+        // QUALIFY may point at a SELECT output alias too, so failing to resolve is allowed here.
         let _ = collect_refs(arena, &scope_all, q, &mut refs);
     }
     for &e in &sel.distinct_on {
-        // DISTINCT ON も出力別名を指しうるので、解決できなくてもここでは許す。
+        // DISTINCT ON may point at an output alias too, so failing to resolve is allowed here.
         let _ = collect_refs(arena, &scope_all, e, &mut refs);
     }
     collect_join_refs(arena, &scope_all, &tree, &mut refs)?;
-    // FROM 句の `UNNEST(expr) AS ...` の `expr` は `FromTree` の一部ではなく
-    // `Rel::unnest` に別置きなので、`collect_join_refs` の走査には乗らない。
-    // ここで拾わないと、参照される列（`t.tags` の `tags` など）が
-    // 射影プッシュダウンから漏れて `Scan` が読まなくなる。
+    // The `expr` of a FROM-clause `UNNEST(expr) AS ...` is not part of `FromTree` but is kept
+    // separately in `Rel::unnest`, so it is not covered by `collect_join_refs`'s traversal.
+    // Without collecting it here, the referenced columns (the `tags` of `t.tags`, say) would be
+    // missed by projection pushdown and the `Scan` would not read them.
     for r in rels.iter() {
         if let Some(u) = r.unnest {
             collect_refs(arena, &scope_all, u, &mut refs)?;
@@ -319,7 +318,7 @@ pub(super) fn bind_select_in(
     refs.sort_unstable();
     refs.dedup();
 
-    // グローバル添字を関係ごとに割り振る。
+    // Global indices are assigned per relation.
     {
         let mut off = 0usize;
         for r in rels.iter_mut() {
@@ -327,9 +326,9 @@ pub(super) fn bind_select_in(
             if r.subplan.is_none() {
                 r.needed =
                     refs.iter().filter(|&&g| g >= off && g < end).map(|&g| g - off).collect();
-                // 1 列も参照されない関係でも行数は要る（`COUNT(*)`）。最も安い列を
-                // 1 本だけ読む。空の射影を渡すと、行指向フォーマットは行数を
-                // 返す手段が無くなる。
+                // Even a relation with no referenced columns needs its row count (`COUNT(*)`).
+                // Exactly one, the cheapest, column is read. Passing an empty projection would
+                // leave a row-oriented format with no way to return the row count.
                 if r.needed.is_empty() && !r.all.is_empty() {
                     r.needed.push(0);
                 }
@@ -341,9 +340,9 @@ pub(super) fn bind_select_in(
     let scope = narrow_scope(&rels);
     let ranges = rel_ranges(&rels);
 
-    // --- WHERE の分解と押し下げ ---------------------------------------------
-    // 外部結合があると、片側だけの条件を先に適用すると NULL 補完の結果が
-    // 変わってしまう。安全側に倒して押し下げない。
+    // --- Decomposing and pushing down WHERE ---------------------------------
+    // With an outer join, applying a one-sided condition first would change the result of NULL
+    // padding. Erring safe, nothing is pushed down.
     let pushdown_ok = !tree.has_outer_join();
     let mut conjuncts = Vec::new();
     if let Some(w) = sel.filter {
@@ -351,10 +350,10 @@ pub(super) fn bind_select_in(
     }
     let mut per_rel: Vec<Vec<ExprId>> = (0..rels.len()).map(|_| Vec::new()).collect();
     let mut leftover: Vec<ExprId> = Vec::new();
-    // `EXISTS` / `IN (SELECT)` は半結合に書き換えるので、通常の述語とは分ける。
+    // `EXISTS` / `IN (SELECT)` are rewritten into semi-joins, so they are kept apart from ordinary predicates.
     let mut semijoins: Vec<ExprId> = Vec::new();
-    // 相関等価述語: (内側の式, 外側スコープの式) の組。相関サブクエリを
-    // 結合キー付きの結合に書き換えるために使う（下の「相関サブクエリ」節）。
+    // Correlated equality predicates: pairs of (inner expression, outer-scope expression). Used
+    // to rewrite a correlated subquery as a join with join keys (see the "correlated subquery" section below).
     let mut correlated_eq: Vec<(ExprId, ExprId)> = Vec::new();
     for c in conjuncts {
         if is_semijoin_predicate(arena, c) {
@@ -369,8 +368,8 @@ pub(super) fn bind_select_in(
                 continue;
             }
         }
-        // サブクエリを含む述語は押し下げない。参照する関係を正しく数えられず、
-        // 誤った側に落としてしまうため。
+        // A predicate containing a subquery is not pushed down: the relations it references
+        // cannot be counted correctly, and it could be dropped on the wrong side.
         let owner = if pushdown_ok && !contains_subquery(arena, c, 0) {
             single_rel_of(arena, &scope, &ranges, c)?
         } else {
@@ -382,11 +381,11 @@ pub(super) fn bind_select_in(
         }
     }
     if outer_scope.is_some() && !correlated_eq.is_empty() {
-        // 相関キーは「先頭の 1 行/グループを選ぶ」処理（DistinctOn か、
-        // 集約なら GROUP BY への合流）を経由するため、相関サブクエリ自身が
-        // 独自の ORDER BY/LIMIT/QUALIFY/ウィンドウ関数を持つと、その意味が
-        // 「相関キーごと」ではなく「デコリレーション後の全体」に対して
-        // 適用されてしまい結果が変わる。安全側に倒して明確に拒否する。
+        // A correlation key goes through a "pick the first row/group" step (DistinctOn, or
+        // merging into GROUP BY for an aggregate), so if the correlated subquery itself carries
+        // its own ORDER BY/LIMIT/QUALIFY/window function, that meaning would apply to "the
+        // whole thing after decorrelation" rather than "per correlation key" and change the
+        // result. Erring safe, it is explicitly rejected.
         ensure!(
             sel.limit.is_none()
                 && sel.offset.is_none()
@@ -401,29 +400,29 @@ pub(super) fn bind_select_in(
         ensure!(win_probe.is_empty(), UnsupportedFeature);
     }
 
-    // --- スキャンと結合を組み立てる -----------------------------------------
+    // --- Assembling scans and joins -----------------------------------------
     let mut node = build_tree(arena, &scope, &ranges, &mut rels, &tree, params, &per_rel, 0)?;
 
     // --- SAMPLE --------------------------------------------------------------
-    // `duckdb` CLI で確認した意味論: `USING SAMPLE`/`TABLESAMPLE` は結合後・
-    // フィルタ前の FROM 句の生データに効く（`a JOIN b USING SAMPLE 20 ROWS`
-    // は 100 行の結合結果から 20 行選ぶ、`WHERE` を先に書いても行数の実測は
-    // 変わらない）。ここで `WHERE`（`sel.filter`。下の「WHERE の適用」節）より
-    // 前に挟むのはそのため。
+    // The semantics confirmed with the `duckdb` CLI: `USING SAMPLE`/`TABLESAMPLE` applies to the
+    // FROM clause's raw data after joining and before filtering (`a JOIN b USING SAMPLE 20 ROWS`
+    // picks 20 rows out of a 100-row join result, and writing `WHERE` first does not change the
+    // measured row count). That is why it is interposed before `WHERE` (`sel.filter`; see the
+    // "applying WHERE" section below).
     //
-    // ただし単一テーブルに対する `WHERE` の一部は既に `per_rel` として
-    // `build_tree` 内の `Node::Scan` 直後まで押し下げ済み（射影プッシュダウンと
-    // 同時に行う設計、モジュール冒頭ドキュメント参照）なので、その部分だけは
-    // 厳密には duckdb と逆順（フィルタ→サンプル）になる。単純化のための
-    // 割り切り（タスクの優先度: パーセント指定 > 行数指定 > 手法の使い分け、
-    // に倣い、フィルタとの相互作用の完全な一致までは求めない）。
+    // That said, part of a `WHERE` against a single table has already been pushed down as
+    // `per_rel`, all the way to just after `Node::Scan` inside `build_tree` (by design it
+    // happens together with projection pushdown; see the module docs at the top), so that part
+    // strictly runs in the opposite order from duckdb (filter, then sample). A simplification
+    // (following the task's priorities -- percentage > row count > distinguishing methods -- it
+    // does not chase exact agreement on the interaction with filtering).
     if let Some(spec) = &sel.sample {
         node = Node::Sample { input: Box::new(node), spec: resolve_sample_spec(spec) };
     }
 
-    // --- サブクエリ ---------------------------------------------------------
-    // 相関の無いサブクエリは結合に書き換えられる。スカラサブクエリは
-    // 「1 行だけの表」との LEFT 結合、`EXISTS` / `IN` は半結合・反結合。
+    // --- Subqueries ---------------------------------------------------------
+    // An uncorrelated subquery can be rewritten as a join. A scalar subquery becomes a LEFT
+    // join against a "one-row table"; `EXISTS` / `IN` become semi-joins and anti-joins.
     let mut scope = scope;
     let mut subs: Vec<Substitution> = Vec::new();
     let mut scalars: Vec<ExprId> = Vec::new();
@@ -446,7 +445,7 @@ pub(super) fn bind_select_in(
         };
         let plan = bind_query_in(catalog, arena, q, params, ctes, Some(&scope))?;
         let k = plan.correlated.len();
-        // スカラサブクエリは（相関キー列を除いて）1 列でなければならない。
+        // A scalar subquery must have exactly one column (excluding correlation key columns).
         ensure!(plan.root.schema().len() - k == 1, TypeMismatch);
         let ty = plan.root.schema()[0].ty;
         let mut label = String::from("subq");
@@ -456,17 +455,17 @@ pub(super) fn bind_select_in(
         let mut left_keys = Vec::new();
         let mut right_keys = Vec::new();
         if k == 0 {
-            // 非相関: 1 行に絞ってから LEFT 結合する。空集合なら NULL になる。
-            // 2 行以上返る場合、SQL 標準はエラーだがここでは先頭を採る（制限）。
+            // Uncorrelated: narrowed to one row, then LEFT joined. An empty set gives NULL.
+            // With two or more rows the SQL standard says error, but here the first is taken (a limitation).
             right = Node::Limit { input: Box::new(right), limit: Some(1), offset: 0 };
         } else {
-            // 相関: 外側の行ごとに異なる相関キー値を持つので、右側全体を
-            // 1 行に絞る（＝ブランケットな LIMIT 1）と他の外側行が軒並み
-            // NULL になってしまう。相関キーの値ごとに「先頭の 1 行」に絞って
-            // から、そのキーで LEFT 結合する（非相関版の「複数行なら先頭を
-            // 採る」制限を相関キー単位に一般化したもの）。集約を経由した
-            // 相関の場合は呼び出し元で既に GROUP BY 済みで 1 行/キーなので、
-            // ここでの DistinctOn は実質的な no-op になる。
+            // Correlated: each outer row has a different correlation key value, so narrowing the
+            // whole right side to one row (= a blanket LIMIT 1) would leave nearly every other
+            // outer row NULL. It is narrowed to "the first row" per correlation key value and
+            // then LEFT joined on that key (generalizing the uncorrelated version's "take the
+            // first when there are several" limitation to per-correlation-key). For correlation
+            // via an aggregate, the caller has already grouped so there is one row per key, and
+            // the DistinctOn here is effectively a no-op.
             let corr_scope = Scope::from_fields(right.schema().to_vec());
             let mut dkeys = Vec::with_capacity(k);
             for i in 0..k {
@@ -495,12 +494,12 @@ pub(super) fn bind_select_in(
             schema: full_schema,
         };
         if k > 0 {
-            // 結合キーとして使い終えた相関キー列は落とす。
+            // The correlation key columns, having served as join keys, are dropped.
             node = drop_trailing_columns(node, k)?;
-            // 相関キーに一致する内側行が 1 行も無い外側行は、この LEFT JOIN で
-            // 値列が NULL になる。`count`/`count(*)` の相関スカラサブクエリ
-            // だけは「0 行を集約 → 0」であるべき（DuckDB で確認済み）なので、
-            // ここで NULL を 0 に補正する。
+            // An outer row with no matching inner row for its correlation key gets a NULL value
+            // column from this LEFT JOIN. Only for a `count`/`count(*)` correlated scalar
+            // subquery should it be "aggregate over 0 rows -> 0" (confirmed with DuckDB), so the
+            // NULL is corrected to 0 here.
             if matches!(as_bare_aggregate(arena, q), Some(AggKind::Count | AggKind::CountStar)) {
                 node = coalesce_count_column(node, col)?;
             }
@@ -509,11 +508,11 @@ pub(super) fn bind_select_in(
         subs.push(Substitution { expr: *id, column: col, structural: false });
     }
 
-    // `>`/`<`/`>=`/`<=` を伴う `ANY`/`ALL`（非相関のみ）。`= ANY`/`<> ALL` は
-    // `is_semijoin_predicate` 経由で下の `semijoins` ループが処理するので、
-    // ここには来ない（`collect_quantified_comparisons` の doc 参照）。
-    // スカラサブクエリと同じ「結合で 1 列足して `Substitution` で差し替える」
-    // パターンなので、位置は独立（`semijoins`/`leftover` より前ならどこでもよい）。
+    // `ANY`/`ALL` with `>`/`<`/`>=`/`<=` (uncorrelated only). `= ANY`/`<> ALL` are handled by
+    // the `semijoins` loop below via `is_semijoin_predicate` and never reach here (see the
+    // `collect_quantified_comparisons` docs).
+    // It follows the same "add one column with a join and swap it in with `Substitution`"
+    // pattern as a scalar subquery, so its position is independent (anywhere before `semijoins`/`leftover`).
     let mut quantifieds: Vec<ExprId> = Vec::new();
     for item in &sel.items {
         collect_quantified_comparisons(arena, item.expr, &mut quantifieds, 0)?;
@@ -552,17 +551,16 @@ pub(super) fn bind_select_in(
         node = Node::Filter { input: Box::new(node), pred };
     }
 
-    // --- 相関を伴う集約スカラサブクエリ（限定パターン） ---------------------
-    // 「裸の集約呼び出し 1 つだけを SELECT する」という限定形のみ、ここで
-    // 完結させる（マジックデコリレーションの基本形: 相関キーで GROUP BY
-    // した集約を組み立ててから、呼び出し元が相関キーで LEFT/SEMI/ANTI 結合
-    // する）。この関数の残り（670 行以降の通常の集約セクション、GROUPING
-    // SETS/ROLLUP/CUBE 実装と競合するため触れない）を経由せずに早期リターン
-    // する。それ以外の組み合わせ（集約サブクエリが独自の GROUP BY/HAVING/
-    // QUALIFY/DISTINCT/ウィンドウ関数を持つ場合など）は、相関キーを
-    // 集約のグルーピングへ合流させる手段が無いため、明確に拒否する
-    // （黙って相関述語を無視すると集約が外側行をまたいで混ざり、誤った
-    // 結果になってしまう）。
+    // --- Correlated aggregate scalar subqueries (a restricted pattern) ------
+    // Only the restricted form "SELECT exactly one bare aggregate call" is completed here (the
+    // basic form of magic decorrelation: build an aggregate grouped by the correlation key, then
+    // have the caller LEFT/SEMI/ANTI join on that key). It returns early without going through
+    // the rest of this function (the ordinary aggregate section from line 670 on, left untouched
+    // because it would conflict with the GROUPING SETS/ROLLUP/CUBE implementation). Every other
+    // combination (an aggregate subquery with its own GROUP BY/HAVING/QUALIFY/DISTINCT/window
+    // function, and so on) is explicitly rejected, since there is no way to merge the correlation
+    // key into the aggregate's grouping (silently ignoring the correlation predicate would mix
+    // the aggregate across outer rows and give a wrong result).
     if outer_scope.is_some() && !correlated_eq.is_empty() {
         let mut corr_agg_probe: Vec<ExprId> = Vec::new();
         for item in &sel.items {
@@ -603,13 +601,13 @@ pub(super) fn bind_select_in(
                 schema: out_fields,
                 having: None,
             };
-            // 「ある相関キー値に一致する内側行が 1 行も無い」場合は、GROUP BY
-            // の結果自体にその組が現れない（NULL 値の行ではなく、行そのものが
-            // 無い）。これは呼び出し側（スカラサブクエリなら LEFT JOIN）で
-            // 相関キーが一致せず NULL になる形で表れるので、count 系の
-            // 「0 行を集約 → 0」への補正はここではなく呼び出し側で行う
-            // （`as_bare_aggregate` 参照）。
-            // 呼び出し側の規約（index 0 = 値, 1.. = 相関キー）に列順を揃える。
+            // When "no inner row matches a given correlation key value", that combination does
+            // not appear in the GROUP BY result at all (not as a NULL-valued row -- the row
+            // itself is absent). That surfaces on the caller's side (a LEFT JOIN for a scalar
+            // subquery) as the correlation key not matching and becoming NULL, so the COUNT
+            // family's "aggregate over 0 rows -> 0" correction is done by the caller rather than
+            // here (see `as_bare_aggregate`).
+            // The column order matches the caller's convention (index 0 = value, 1.. = correlation keys).
             let s = Scope::from_fields(agg_node.schema().to_vec());
             let mut exprs = Vec::with_capacity(k + 1);
             let mut out_schema = Vec::with_capacity(k + 1);
@@ -624,21 +622,22 @@ pub(super) fn bind_select_in(
         }
     }
 
-    // --- UNNEST（SELECT リスト） ---------------------------------------------
-    // `FILTER`/`QUALIFY` と同様、集約でも通常のスカラ式でもない特殊な式として
-    // 拾う。対象列の JSON 配列を要素数ぶんの行に展開して他の列を複製するため
-    // 「行を増やす」効果があり、集約より前（FROM/WHERE の直後、GROUP BY の前）
-    // に割り込ませる。展開後の行に対して集約する意味論は実装していないので
-    // 集約とは同時に使えない。複数の `UNNEST` を同じ SELECT リストに書いた
-    // ときの DuckDB の挙動（列ごとの zip、要素数が違えば NULL 埋め）は複雑
-    // すぎるためスコープ外とし、1 個だけ許して残りは明確に拒否する。
+    // --- UNNEST (in the SELECT list) ----------------------------------------
+    // Like `FILTER`/`QUALIFY`, it is picked up as a special expression that is neither an
+    // aggregate nor an ordinary scalar expression. Because it expands the target column's JSON
+    // array into as many rows as it has elements and duplicates the other columns, it "adds
+    // rows", so it is interposed before aggregation (right after FROM/WHERE, before GROUP BY).
+    // The semantics of aggregating over the expanded rows is not implemented, so it cannot be
+    // used together with aggregation. DuckDB's behavior for several `UNNEST`s in one SELECT list
+    // (per-column zip, NULL padding when element counts differ) is too complex, so it is out of
+    // scope: exactly one is allowed and the rest are explicitly rejected.
     let mut unnest_calls: Vec<ExprId> = Vec::new();
     for item in &sel.items {
         collect_unnests(arena, item.expr, &mut unnest_calls, 0)?;
     }
     if !unnest_calls.is_empty() {
-        // 相関サブクエリ内での UNNEST（デコリレーションとの相互作用が
-        // 複雑になる）は対象外として明確に拒否する。
+        // UNNEST inside a correlated subquery (whose interaction with decorrelation gets
+        // complicated) is out of scope and explicitly rejected.
         ensure!(outer_scope.is_none(), UnsupportedFeature);
         ensure!(unnest_calls.len() == 1, UnsupportedFeature);
         for e in [sel.filter, sel.having, sel.qualify].into_iter().flatten() {
@@ -678,7 +677,7 @@ pub(super) fn bind_select_in(
         subs.push(Substitution { expr: unnest_id, column: scope.len() - 1, structural: false });
     }
 
-    // --- 集約 ---------------------------------------------------------------
+    // --- Aggregation --------------------------------------------------------
     let mut agg_calls: Vec<ExprId> = Vec::new();
     for item in &sel.items {
         collect_aggregates(arena, item.expr, &mut agg_calls, 0)?;
@@ -689,15 +688,15 @@ pub(super) fn bind_select_in(
     for o in &sel.order_by {
         collect_aggregates(arena, o.expr, &mut agg_calls, 0)?;
     }
-    // WHERE に集約は書けない（HAVING がそのためにある）。
+    // Aggregates cannot be written in WHERE (HAVING exists for that).
     if let Some(w) = sel.filter {
         let mut in_where = Vec::new();
         collect_aggregates(arena, w, &mut in_where, 0)?;
         ensure!(in_where.is_empty(), NotAggregate);
     }
 
-    // `GROUPING`/`GROUPING_ID` 呼び出しを集める。集約と違い引数は評価せず、
-    // グルーピングセットごとに定まる定数（ビットマスク）に置き換える。
+    // Collects the `GROUPING`/`GROUPING_ID` calls. Unlike aggregates, their arguments are not
+    // evaluated; they are replaced by a constant (a bitmask) fixed per grouping set.
     let mut grouping_calls: Vec<ExprId> = Vec::new();
     for item in &sel.items {
         collect_grouping_calls(arena, item.expr, &mut grouping_calls, 0)?;
@@ -710,13 +709,13 @@ pub(super) fn bind_select_in(
     }
 
     let aggregating = !agg_calls.is_empty() || !group_by.is_empty() || sel.grouping_sets.is_some();
-    // GROUPING() は集約の外では意味を持たない。
+    // GROUPING() is meaningless outside aggregation.
     ensure!(aggregating || grouping_calls.is_empty(), NotAggregate);
     let mut item_scope = scope.clone();
 
     if aggregating && sel.grouping_sets.is_none() && grouping_calls.is_empty() {
-        // 単純な `GROUP BY a, b, ...`（GROUPING SETS 系拡張なし）。
-        // 既存の 1 本の Node::Aggregate に havings を直接埋め込む従来経路。
+        // A plain `GROUP BY a, b, ...` (no GROUPING SETS-family extension).
+        // The conventional path, embedding havings directly into a single existing Node::Aggregate.
         let mut group_exprs = Vec::new();
         for g in &group_by {
             group_exprs.push(resolve_select_ref(arena, sel, *g)?);
@@ -740,7 +739,7 @@ pub(super) fn bind_select_in(
             aggs.push(a);
         }
 
-        // GROUP BY に無い裸の列参照を弾く。集約の外に出た列は値が定まらない。
+        // Rejects bare column references absent from GROUP BY. A column outside the aggregate has no determined value.
         for item in &sel.items {
             check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, 0)?;
         }
@@ -756,24 +755,22 @@ pub(super) fn bind_select_in(
         node = Node::Aggregate { input: Box::new(node), groups, aggs, schema: out_fields, having };
         item_scope = agg_scope;
     } else if aggregating {
-        // `GROUPING SETS`/`ROLLUP`/`CUBE`、あるいは単純な GROUP BY に
-        // `GROUPING()` が付いたケース。単純な GROUP BY も「グルーピングセットが
-        // 1 個だけ」として同じ経路で扱う。
+        // `GROUPING SETS`/`ROLLUP`/`CUBE`, or a plain GROUP BY carrying a `GROUPING()`. A plain
+        // GROUP BY is handled by the same path as "exactly one grouping set".
         //
-        // グルーピングセットの数だけ Node::Aggregate を作り、UNION ALL
-        // （Node::SetOp）で束ねる。あるセットに含まれない列は NULL 定数で
-        // 埋める（DuckDB と同じ挙動）。FROM/WHERE 側の入力はどのセットでも
-        // 同じなので、`node`（この時点で WHERE まで適用済み）をセットの数だけ
-        // 複製する。
+        // One Node::Aggregate is built per grouping set and they are bundled with UNION ALL
+        // (Node::SetOp). Columns not in a given set are filled with a NULL constant (the same
+        // behavior as DuckDB). The FROM/WHERE input is identical for every set, so `node` (with
+        // WHERE already applied at this point) is duplicated once per set.
         let sets: Vec<Vec<ExprId>> = match &sel.grouping_sets {
             Some(sets) => sets.clone(),
             None => vec![group_by.clone()],
         };
         ensure!(!sets.is_empty(), Internal);
 
-        // グルーピング列の全セットにわたる和集合を「グルーピング列」として扱う
-        // （構造的に等しい列は 1 本にまとめる）。GROUP BY 序数・別名も
-        // 通常の GROUP BY と同じく解決する。
+        // The union of the grouping columns across all sets is treated as "the grouping columns"
+        // (structurally equal columns are merged into one). GROUP BY ordinals and aliases are
+        // resolved as in an ordinary GROUP BY.
         let mut resolved_sets: Vec<Vec<ExprId>> = Vec::with_capacity(sets.len());
         let mut group_exprs: Vec<ExprId> = Vec::new();
         for set in &sets {
@@ -788,9 +785,8 @@ pub(super) fn bind_select_in(
             resolved_sets.push(rs);
         }
 
-        // 列ごとに 1 度だけコンパイルする。入力スコープ（`scope`）はどの
-        // セットでも同じなので、そのままセット間で使い回せる（`Program` は
-        // `Clone`）。
+        // Each column is compiled exactly once. The input scope (`scope`) is the same for every
+        // set, so it can be reused across them as is (`Program` is `Clone`).
         let mut group_progs: Vec<Program> = Vec::with_capacity(group_exprs.len());
         for &g in &group_exprs {
             group_progs.push(compile(arena, &scope, params, g)?);
@@ -805,7 +801,7 @@ pub(super) fn bind_select_in(
             out_fields.push(Field::new(group_name(arena, g, i), group_progs[i].result_ty, true));
         }
 
-        // 集約も入力スコープが共通なので 1 度だけ組み立て、セットごとに複製する。
+        // Aggregates share the same input scope too, so they are built once and cloned per set.
         let mut aggs: Vec<Agg> = Vec::with_capacity(agg_calls.len());
         for (j, &call) in agg_calls.iter().enumerate() {
             let a = build_agg(arena, &scope, params, call)?;
@@ -815,9 +811,9 @@ pub(super) fn bind_select_in(
         }
         let base_cols = ngroups + agg_calls.len();
 
-        // GROUP BY に無い裸の列参照を弾く。GROUPING SETS では全セットの和集合が
-        // 「グルーピング列」なので、あるセットに無い列を SELECT で裸参照しても
-        // エラーにはしない（その行では NULL になるだけ。DuckDB と同じ）。
+        // Rejects bare column references absent from GROUP BY. Under GROUPING SETS the union
+        // across sets counts as "the grouping columns", so referencing bare in SELECT a column
+        // absent from one set is not an error (it is simply NULL in those rows, as in DuckDB).
         for item in &sel.items {
             check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, 0)?;
         }
@@ -825,9 +821,9 @@ pub(super) fn bind_select_in(
             check_grouped(arena, &scope, h, &group_exprs, &agg_calls, 0)?;
         }
 
-        // GROUPING()/GROUPING_ID() の引数はグルーピング列でなければならない。
-        // 引数がどの列（`group_exprs` の添字）を指すかだけ覚えておき、値は
-        // セットごとに計算する（先頭引数が最上位ビット、DuckDB と同じ並び）。
+        // The arguments of GROUPING()/GROUPING_ID() must be grouping columns.
+        // Only which column (an index into `group_exprs`) each argument points at is remembered;
+        // the value is computed per set (the first argument is the highest bit, as in DuckDB).
         let mut grouping_arg_idx: Vec<Vec<usize>> = Vec::with_capacity(grouping_calls.len());
         for &gc in &grouping_calls {
             let args = match arena.get(gc) {
@@ -851,10 +847,10 @@ pub(super) fn bind_select_in(
             subs.push(Substitution { expr: gc, column: base_cols + k, structural: true });
         }
 
-        // HAVING はグルーピング列・集約結果・GROUPING() 定数がすべて揃った
-        // 最終スキーマに対して評価する。各セットの Aggregate には埋め込まず、
-        // UNION ALL で束ねた後にまとめて 1 回だけ Filter として掛ける
-        // （行ごとの評価なのでどちらでも結果は同じ）。
+        // HAVING is evaluated against the final schema, once the grouping columns, aggregate
+        // results, and GROUPING() constants are all present. It is not embedded into each set's
+        // Aggregate but applied once as a Filter after the UNION ALL bundle (evaluation is
+        // per-row, so either gives the same result).
         let agg_scope = Scope::from_fields(out_fields.clone());
         let having = match sel.having {
             Some(h) => Some(compile_predicate_with_subs(arena, &agg_scope, params, &subs, h)?),
@@ -882,9 +878,9 @@ pub(super) fn bind_select_in(
             let branch = if grouping_calls.is_empty() {
                 agg_node
             } else {
-                // GROUPING() の結果はグループキー・集約結果ではないので
-                // Node::Aggregate のスキーマには乗らない。Project で定数列として
-                // 追加で載せる。
+                // GROUPING()'s result is neither a group key nor an aggregate result, so it does
+                // not appear in Node::Aggregate's schema. It is added as a constant column by a
+                // Project.
                 let branch_scope = Scope::from_fields(base_fields.clone());
                 let mut exprs = Vec::with_capacity(out_fields.len());
                 for i in 0..base_cols {
@@ -907,7 +903,7 @@ pub(super) fn bind_select_in(
         }
 
         let mut iter = branches.into_iter();
-        // `sets` を空にしていない（上の ensure! 参照）ので必ず 1 個は取れる。
+        // `sets` was never emptied (see the ensure! above), so at least one is always available.
         let mut combined = iter.next().unwrap();
         for b in iter {
             combined = Node::SetOp {
@@ -927,9 +923,9 @@ pub(super) fn bind_select_in(
         ensure!(sel.having.is_none(), NotAggregate);
     }
 
-    // --- ウィンドウ関数 -----------------------------------------------------
-    // 集約の**後**に評価する。`sum(x) OVER ()` の x は集約結果を指しうるので、
-    // 入力スコープは集約の出力（集約が無ければスキャン/結合の出力）になる。
+    // --- Window functions ---------------------------------------------------
+    // Evaluated **after** aggregation. The x in `sum(x) OVER ()` may point at an aggregate
+    // result, so the input scope is the aggregate's output (or the scan/join output if there is no aggregate).
     let mut win_calls: Vec<ExprId> = Vec::new();
     for item in &sel.items {
         collect_windows(arena, item.expr, &mut win_calls, 0)?;
@@ -938,10 +934,10 @@ pub(super) fn bind_select_in(
         collect_windows(arena, o.expr, &mut win_calls, 0)?;
     }
     if let Some(q) = sel.qualify {
-        // QUALIFY はウィンドウ関数の結果を直接書ける唯一の SELECT 外の場所。
+        // QUALIFY is the only place outside SELECT where a window function's result can be written directly.
         collect_windows(arena, q, &mut win_calls, 0)?;
     }
-    // WHERE と HAVING にウィンドウ関数は書けない（評価順が後なので）。
+    // Window functions cannot be written in WHERE or HAVING (they are evaluated later).
     for e in [sel.filter, sel.having].into_iter().flatten() {
         let mut found = Vec::new();
         collect_windows(arena, e, &mut found, 0)?;
@@ -959,20 +955,20 @@ pub(super) fn bind_select_in(
             specs.push(spec);
         }
         node = Node::Window { input: Box::new(node), windows: specs, schema: fields.clone() };
-        // ウィンドウ出力は「入力の列 ++ ウィンドウ列」なので、既存の列番号は
-        // ずれない。集約の置き換えもそのまま使える。
+        // The window output is "the input's columns ++ the window columns", so existing column
+        // numbers do not shift and the aggregate replacements still apply.
         item_scope = Scope::from_fields(fields);
     }
 
     // --- QUALIFY --------------------------------------------------------------
-    // GROUP BY/HAVING の後・ORDER BY の前、ウィンドウ関数の結果に対して
-    // 効くフィルタ。`item_scope`（集約・ウィンドウの出力）に対して評価する。
+    // A filter that applies after GROUP BY/HAVING and before ORDER BY, against window function
+    // results. Evaluated against `item_scope` (the aggregate and window output).
     //
-    // QUALIFY は SELECT の出力別名（`... AS rn ... QUALIFY rn = 1`）も指せる。
-    // 別名の実体（GROUP BY 式・集約呼び出し・ウィンドウ呼び出し）は既に
-    // `subs` に列番号として登録済みなので、QUALIFY 側で見つけた同名の
-    // 裸の列参照ノードにも同じ列番号を指す `Substitution` を追加で登録する
-    // だけで済む（式木は複製せず、既存の置き換え機構にそのまま乗せる）。
+    // QUALIFY can also point at a SELECT output alias (`... AS rn ... QUALIFY rn = 1`).
+    // The alias's substance (a GROUP BY expression, an aggregate call, a window call) is already
+    // registered in `subs` as a column number, so it suffices to register an additional
+    // `Substitution` pointing at the same column number for the same-named bare column reference
+    // nodes found on the QUALIFY side (the expression tree is not duplicated; it rides the existing replacement mechanism).
     if let Some(q) = sel.qualify {
         let mut alias_refs = Vec::new();
         collect_unqualified_colrefs(arena, q, &mut alias_refs, 0)?;
@@ -1006,13 +1002,13 @@ pub(super) fn bind_select_in(
         node = Node::Filter { input: Box::new(node), pred };
     }
 
-    // --- 射影 ---------------------------------------------------------------
+    // --- Projection ---------------------------------------------------------
     let mut exprs = Vec::new();
     let mut schema = Vec::new();
     for item in &sel.items {
         match arena.get(item.expr) {
             Expr::Star { qualifier, columns, exclude, replace, rename } => {
-                // 集約後に `*` は展開できない（元の行が残っていない）。
+                // `*` cannot be expanded after aggregation (the original rows are gone).
                 ensure!(!aggregating, NotGrouped);
                 // For a `COLUMNS(...)` item the select-item alias is a name
                 // *template* applied per expanded column, not a single output
@@ -1027,8 +1023,8 @@ pub(super) fn bind_select_in(
                         idx.into_iter().map(|i| (i, None)).collect()
                     }
                 };
-                // `EXCLUDE`/`REPLACE` に書かれた列名が実在するかを検証する
-                // （`duckdb` は "Column ... not found" として束縛時に拒否する）。
+                // Validates that the column names written in `EXCLUDE`/`REPLACE` really exist
+                // (`duckdb` rejects them at bind time as "Column ... not found").
                 for name in exclude {
                     ensure!(
                         expanded.iter().any(|&(i, _)| eq_ascii_ci(
@@ -1078,9 +1074,9 @@ pub(super) fn bind_select_in(
                     });
                     match rexpr {
                         Some(rexpr) => {
-                            // REPLACE の式は通常の select item と同じスコープ
-                            // （集約・ウィンドウ出力を含みうる `item_scope`）で
-                            // コンパイルする。列名自体は元のまま変えない。
+                            // A REPLACE expression is compiled in the same scope as an ordinary
+                            // select item (`item_scope`, which may include aggregate and window
+                            // output). The column name itself is left unchanged.
                             let p = compile_with_subs(arena, &item_scope, params, &subs, rexpr)?;
                             schema.push(Field::new(out_name, p.result_ty, true));
                             exprs.push(p);
@@ -1106,16 +1102,16 @@ pub(super) fn bind_select_in(
         }
     }
     ensure!(!exprs.is_empty(), SyntaxError);
-    // `ORDER BY ALL` が並べ替え対象にする列数。相関キー列（下で付け足す
-    // 実装用の隠し列）を含めないよう、ここで確定させておく。
+    // How many columns `ORDER BY ALL` sorts by. It is settled here so the correlation key
+    // columns (implementation hidden columns appended below) are not included.
     let projected = exprs.len();
-    // 相関キー列を出力の末尾に付加する（非集約の場合。集約を伴う相関は
-    // 上の早期リターン経路で完結しているのでここには来ない）。呼び出し側
-    // （相関スカラサブクエリ / `EXISTS` / `IN` の束縛）が結合キーとして
-    // 使い、`Plan::correlated` の個数分だけ末尾から読む。DISTINCT や
-    // ORDER BY の隠し列と同じ「`visible` を超えた分は最後に落とす」機構に
-    // 相乗りさせないよう、`visible` はこれらの列を含めてから確定させる
-    // （そうしないと最後の隠し列トリムで一緒に落ちてしまう）。
+    // The correlation key columns are appended at the end of the output (in the non-aggregate
+    // case; correlation with aggregation is completed on the early-return path above and never
+    // reaches here). The caller (binding of a correlated scalar subquery / `EXISTS` / `IN`) uses
+    // them as join keys, reading as many from the end as `Plan::correlated` has. To keep them
+    // off the "anything beyond `visible` is dropped at the end" mechanism used by DISTINCT and
+    // ORDER BY hidden columns, `visible` is settled after including these columns (otherwise the
+    // final hidden-column trim would drop them too).
     for &(inner_e, _) in &correlated_eq {
         let p = compile(arena, &scope, params, inner_e)?;
         schema.push(Field::new(String::new(), p.result_ty, true));
@@ -1124,13 +1120,13 @@ pub(super) fn bind_select_in(
     let visible = exprs.len();
 
     // --- ORDER BY -----------------------------------------------------------
-    // 出力に無い式で並べ替えるときは、隠し列として射影に足してから落とす。
+    // When sorting by an expression absent from the output, it is added to the projection as a hidden column and dropped afterwards.
     let mut keys = Vec::new();
-    // `ORDER BY ALL`: 出力列を左から順に、すべて同じ向き・同じ NULL 位置で
-    // 並べ替える。ここまで来れば `*` は既に展開済みなので、`SELECT * ...
-    // ORDER BY ALL` も展開後の全列が対象になる（DuckDB と同じ）。集約の
-    // 結果列も対象に含まれる（`duckdb -c "select h, sum(x) from t group by h
-    // order by all"` が h → sum(x) の順で並ぶことを確認済み）。
+    // `ORDER BY ALL`: sorts by the output columns left to right, all in the same direction and
+    // with the same NULL placement. By this point `*` is already expanded, so
+    // `SELECT * ... ORDER BY ALL` targets every expanded column too (as in DuckDB). Aggregate
+    // result columns are included as well (confirmed that `duckdb -c "select h, sum(x) from t
+    // group by h order by all"` sorts by h then sum(x)).
     if let Some(oa) = &sel.order_by_all {
         for col in 0..projected {
             keys.push((col, oa.desc, oa.nulls_first));
@@ -1150,10 +1146,10 @@ pub(super) fn bind_select_in(
     }
 
     // --- DISTINCT ON ---------------------------------------------------------
-    // ON 式も ORDER BY と同じ「まず出力列と構造的に一致するか見て、無ければ
-    // 隠し列として足す」規則で解決する。実際の重複除去は Sort の後、
-    // 「入力の並びでキーごとに最初の行だけ通す」ストリーミングフィルタで行う
-    // （DuckDB で確認済み: ORDER BY が無ければ到着順が「最初の行」になる）。
+    // ON expressions are resolved by the same rule as ORDER BY -- first check for a structural
+    // match with an output column, and add a hidden column otherwise. The actual deduplication
+    // happens after the Sort, in a streaming filter that passes only the first row per key in
+    // the input's order (confirmed with DuckDB: without ORDER BY, arrival order is "the first row").
     let mut distinct_on_cols: Vec<usize> = Vec::with_capacity(sel.distinct_on.len());
     for &on_expr in &sel.distinct_on {
         let col = match distinct_on_output_column(arena, sel, on_expr, &schema) {
@@ -1174,8 +1170,8 @@ pub(super) fn bind_select_in(
 
     // --- DISTINCT -----------------------------------------------------------
     if sel.distinct {
-        // 出力列すべてをグループキーにした集約に落とす。隠しソート列もキーに
-        // 含める（含めないと、可視部分が同じ行が複数残ることがある）。
+        // Lowered to an aggregate whose group keys are all the output columns. Hidden sort
+        // columns are included as keys too (without them, several rows with the same visible part could survive).
         let mut groups = Vec::new();
         let mut out_fields = Vec::new();
         for i in 0..project_scope.len() {
@@ -1191,7 +1187,7 @@ pub(super) fn bind_select_in(
         };
     }
 
-    // --- ソート -------------------------------------------------------------
+    // --- Sorting ------------------------------------------------------------
     if !keys.is_empty() {
         let mut sort_keys = Vec::with_capacity(keys.len());
         for (col, desc, nulls_first) in keys {
@@ -1201,10 +1197,10 @@ pub(super) fn bind_select_in(
                 nulls_first,
             });
         }
-        // `ORDER BY ... LIMIT n OFFSET k` は上位 n+k 件だけ持てば足りる。
-        // Top-N に落とすことで全件バッファせずに済む。ただし DISTINCT ON が
-        // 有る場合は「並べ替えた後の重複除去」でどの行が勝つかが決まるので、
-        // 先に Top-N で切り捨てると別グループの正しい代表行を取りこぼす。
+        // `ORDER BY ... LIMIT n OFFSET k` only needs to hold the top n+k. Lowering to a Top-N
+        // avoids buffering everything. With DISTINCT ON present, though, which row wins is
+        // decided by "deduplication after sorting", so truncating with Top-N first would drop the
+        // correct representative row of another group.
         let topn = if sel.distinct_on.is_empty() {
             sel.limit
                 .map(|l| l.saturating_add(sel.offset.unwrap_or(0)).min(usize::MAX as u64) as usize)
@@ -1214,7 +1210,7 @@ pub(super) fn bind_select_in(
         node = Node::Sort { input: Box::new(node), keys: sort_keys, limit: topn };
     }
 
-    // --- DISTINCT ON（実体） ---------------------------------------------------
+    // --- DISTINCT ON (the substance) ------------------------------------------
     if !distinct_on_cols.is_empty() {
         let s = Scope::from_fields(node.schema().to_vec());
         let mut on_progs = Vec::with_capacity(distinct_on_cols.len());
@@ -1233,7 +1229,7 @@ pub(super) fn bind_select_in(
         };
     }
 
-    // 隠しソート列を落とす。
+    // Drops the hidden sort columns.
     if visible < node.schema().len() {
         let s = Scope::from_fields(node.schema().to_vec());
         let mut trim = Vec::with_capacity(visible);

@@ -1,18 +1,18 @@
-//! DDL 実行（`ddl` フィーチャ）。
+//! DDL execution (the `ddl` feature).
 //!
 //! `CREATE TABLE` / `CREATE TABLE AS SELECT` / `DROP TABLE` / `CREATE VIEW` /
-//! `DROP VIEW`。効果はすべて `catalog::MemTable`・ビュー表（`Catalog` 内の
-//! `(名前, SQL)` 表）にしか及ばない。読み取り専用の `Source`/`TableFormat`
-//! には一切触れない（DESIGN.md §16）。
+//! `DROP VIEW`. Every effect lands only on `catalog::MemTable` and the view table (the
+//! `(name, SQL)` table inside `Catalog`). The read-only `Source`/`TableFormat` are
+//! never touched (DESIGN.md §16).
 //!
-//! `Session::prepare` から直接呼ばれる（DDL/DML は 1 発実行の文で、
-//! Volcano のストリーミング実行に乗らないため）。
+//! Called directly from `Session::prepare` (DDL/DML are one-shot statements and do not
+//! ride the Volcano streaming execution).
 //!
-//! ## `CREATE TABLE AS SELECT` は非再開設計
+//! ## `CREATE TABLE AS SELECT` is not resumable
 //!
-//! `write::export_all` と同じ理由・同じ制約: 実行中に `NEED_IO`/`NEED_CODEC`
-//! が起きたら `IoFailed` で失敗する。全データがメモリ上にある場合にしか
-//! 使えない（`write` モジュールのドキュメント参照）。
+//! Same reason and same constraint as `write::export_all`: a `NEED_IO`/`NEED_CODEC`
+//! during execution fails with `IoFailed`. It can only be used when all the data is in
+//! memory (see the `write` module docs).
 
 use crate::error::Code;
 use crate::exec::{build, ExecContext, Step};
@@ -68,14 +68,14 @@ pub(crate) fn drop_table(session: &mut Session, name: &str, if_exists: bool) -> 
     }
 }
 
-/// `ALTER TABLE t <action>`。効くのは `catalog::MemTable` のみ。ファイル
-/// テーブルは `Catalog::mem_index_writable`（`dml::mem_index_writable` と
-/// 同じ規則）が `ReadOnlyTable` で拒否する。
+/// `ALTER TABLE t <action>`. Applies only to `catalog::MemTable`. File-backed tables
+/// are rejected with `ReadOnlyTable` by `Catalog::mem_index_writable` (the same rule as
+/// `dml::mem_index_writable`).
 ///
-/// スキーマ・行の実際の書き換えは `catalog::Catalog` の `mem_add_column` 等に
-/// 委譲する（`CREATE TABLE`/`DROP TABLE` が `mem_create`/`mem_drop` に
-/// 委譲するのと同じ分担）。ここでは DEFAULT 式の評価（VM が要る）と、
-/// 影響行数の組み立てだけを担当する。
+/// The actual rewriting of schema and rows is delegated to `catalog::Catalog`'s
+/// `mem_add_column` and friends (the same division of labor as `CREATE TABLE`/`DROP
+/// TABLE` delegating to `mem_create`/`mem_drop`). This function only evaluates the
+/// DEFAULT expression (which needs the VM) and assembles the affected row count.
 pub(crate) fn alter_table(
     session: &mut Session,
     arena: &ExprArena,
@@ -98,25 +98,24 @@ pub(crate) fn alter_table(
             session.catalog.mem_rename_table(idx, new_name)?;
         }
     }
-    // CREATE VIEW/DROP TABLE/DROP VIEW と同じく、スキーマだけを変える文には
-    // 「影響行数」に意味が無いので常に 0 を返す。
+    // As with CREATE VIEW/DROP TABLE/DROP VIEW, "affected rows" is meaningless for a
+    // statement that only changes the schema, so this always returns 0.
     Ok(Prepared::Ready(count_result(0)))
 }
 
-/// `ADD COLUMN col ty [NOT NULL] [DEFAULT expr]`。`DEFAULT` は
-/// `dml::insert` の値評価と同じパターンで既存のバイトコード VM を使って
-/// 1 度だけ評価し（専用のスカラ評価器は書かない）、同じ値を既存の全行に
-/// 積む。
+/// `ADD COLUMN col ty [NOT NULL] [DEFAULT expr]`. `DEFAULT` is evaluated exactly once
+/// using the existing bytecode VM, in the same pattern as `dml::insert`'s value
+/// evaluation (no dedicated scalar evaluator is written), and the same value is
+/// appended to every existing row.
 ///
-/// **NOT NULL かつ DEFAULT 無しの扱い**: `duckdb` CLI で確認したところ、
-/// DuckDB は `ADD COLUMN` への `NOT NULL` 制約そのものを未対応として
-/// 一律に拒否する（`DEFAULT` を付けても同様、"Adding columns with
-/// constraints not yet supported"）。このエンジンでは DEFAULT と組み合わせた
-/// 場合や、既存行が 0 件で実際には NULL がどの行にも入らない場合まで
-/// 一律拒否する理由が無いため、`dml::insert`/`dml::update` と同じ
-/// 「NOT NULL 列に実際に NULL が入るときだけエラー」という規則に合わせる:
-/// 新しい列に実際に積む値（DEFAULT があればその値、無ければ NULL）が
-/// NULL で、かつ既存行が 1 行以上あれば `TypeMismatch`。
+/// **NOT NULL without DEFAULT**: checking with the `duckdb` CLI, DuckDB rejects a
+/// `NOT NULL` constraint on `ADD COLUMN` outright as unsupported (the same with a
+/// `DEFAULT`: "Adding columns with constraints not yet supported"). This engine has no
+/// reason to reject uniformly -- including combined with a DEFAULT, or when there are
+/// zero existing rows so no row actually receives NULL -- so it follows the same rule
+/// as `dml::insert`/`dml::update`: an error only when a NOT NULL column actually
+/// receives NULL. That is, `TypeMismatch` when the value being appended to the new
+/// column (the DEFAULT if present, NULL otherwise) is NULL and there is at least one existing row.
 #[allow(clippy::too_many_arguments)]
 fn add_column(
     session: &mut Session,
@@ -137,9 +136,9 @@ fn add_column(
     session.catalog.mem_add_column(idx, Field::new(col_name, ty, nullable), value)
 }
 
-/// 単一の式を空スコープ（列参照なし）でコンパイルし、`target_ty` へ
-/// キャストしたうえで 1 行のバッチに対して評価する。`dml`（`INSERT ...
-/// VALUES` の値評価、値レベルの型変換）とも共有する。
+/// Compiles a single expression in an empty scope (no column references), casts it to
+/// `target_ty`, and evaluates it against a one-row batch. Shared with `dml` (value
+/// evaluation for `INSERT ... VALUES`, and value-level type conversion).
 pub(crate) fn eval_scalar(
     session: &mut Session,
     arena: &ExprArena,
@@ -175,20 +174,20 @@ pub(crate) fn drop_view(session: &mut Session, name: &str, if_exists: bool) -> R
     }
 }
 
-/// `SELECT` を非再開で最後まで実行し、結果を行列として取り出す。
-/// `CREATE TABLE AS` と `INSERT INTO ... SELECT`（`dml`）の両方から使う。
+/// Runs a `SELECT` to completion without resuming and extracts the result as rows.
+/// Used by both `CREATE TABLE AS` and `INSERT INTO ... SELECT` (`dml`).
 ///
-/// **非再開**: モジュール doc 参照。スキーマ解決・スキャンの途中で
-/// `NEED_IO`/`NEED_CODEC` が起きたら `IoFailed`。
+/// **Not resumable**: see the module docs. A `NEED_IO`/`NEED_CODEC` during schema
+/// resolution or scanning gives `IoFailed`.
 pub(crate) fn run_query_to_rows(
     session: &mut Session,
     arena: &ExprArena,
     q: &QueryStmt,
     params: &[Value],
 ) -> Result<(Vec<Field>, Vec<Vec<Value>>)> {
-    // ファイルテーブルのスキーマを先に解決する。足りなければ非再開なので
-    // IoFailed（`Session::prepare` の `resolve_query` に相当する処理を
-    // ここで簡略化して行う）。
+    // Resolve file-backed table schemas first. Anything missing gives IoFailed, since
+    // this is not resumable (a simplified version of what `resolve_query` does in
+    // `Session::prepare`).
     let mut tables = Vec::new();
     referenced_in_query(&session.catalog, arena, q, &mut tables, 0)?;
     for t in tables {
@@ -223,7 +222,7 @@ pub(crate) fn run_query_to_rows(
     Ok((schema, rows))
 }
 
-/// 影響行数などを 1 行 1 列（`count`）で返す。DDL/DML の完了通知に使う。
+/// Returns the affected row count and the like as one row, one column (`count`). Used as the DDL/DML completion notice.
 pub(crate) fn count_result(n: i64) -> Query {
     let mut v = Vector::with_capacity(Ty::BigInt, 1);
     v.push_value(&Value::I64(n));
@@ -265,14 +264,14 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
-    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    // CSV is used as the fixture, so `csv` is required (resolving `FormatKind::Csv`
+    // gives UnsupportedFeature without it).
     #[cfg(feature = "csv")]
     #[test]
     fn create_table_as_select_materializes_rows() {
         let mut s = Session::new();
-        // このエンジンは `SELECT 1`（FROM 無し）を扱わないので、CTAS の
-        // ソースには登録済みテーブルを使う。
+        // This engine does not handle `SELECT 1` (without FROM), so CTAS uses a
+        // registered table as its source.
         s.register_bytes_as("u", b"x,y\n1,a\n2,b\n".to_vec(), crate::format::FormatKind::Csv)
             .unwrap();
         s.prepare("CREATE TABLE t AS SELECT x, y FROM u WHERE x = 1", &[]).unwrap();
@@ -342,7 +341,7 @@ mod tests {
             vec![vec![Value::I32(1), Value::I32(7)], vec![Value::I32(2), Value::I32(7)]]
         );
 
-        // DEFAULT 無しは既存行に NULL を詰める。
+        // Without a DEFAULT, existing rows are filled with NULL.
         s.prepare("ALTER TABLE t ADD COLUMN note VARCHAR", &[]).unwrap();
         let rows = ready_rows(&mut s, "SELECT note FROM t");
         assert!(rows.iter().all(|r| r[0].is_null()));
@@ -350,14 +349,17 @@ mod tests {
 
     #[test]
     fn alter_table_add_column_default_with_aggregate_is_rejected_not_ice() {
-        // DEFAULT は `Scope::new()`（列参照なしの空スコープ）で `compile()` に
-        // 直接通す設計なので、集約関数はそもそも構文的に解決できない
-        // （`count`/`sum` はバインダの集約束縛経路でのみ認識される）。
-        // 明確なエラーになり、内部矛盾（Internal）や panic にならないことを確認する。
+        // DEFAULT is passed straight to `compile()` with `Scope::new()` (an empty scope
+        // with no column references), so aggregate functions cannot even be resolved
+        // syntactically (`count`/`sum` are only recognized on the binder's aggregate
+        // binding path). This confirms it becomes a clear error rather than an internal inconsistency (Internal) or a panic.
         let mut s = Session::new();
         s.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
         let r = s.prepare("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT count(*)", &[]);
-        assert!(crate::error::code_of(r).is_some(), "集約を含む DEFAULT は明確なエラーになるべき");
+        assert!(
+            crate::error::code_of(r).is_some(),
+            "a DEFAULT containing an aggregate should be a clear error"
+        );
     }
 
     #[test]
@@ -375,11 +377,11 @@ mod tests {
     fn alter_table_add_not_null_column_without_default_needs_empty_table() {
         let mut s = Session::new();
         s.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
-        // 行が無ければ NOT NULL を新規追加してよい（NULL がどの行にも入らない）。
+        // With no rows, adding a NOT NULL column is fine (no row receives NULL).
         s.prepare("ALTER TABLE t ADD COLUMN score INTEGER NOT NULL", &[]).unwrap();
 
         s.prepare("INSERT INTO t VALUES (1, 10)", &[]).unwrap();
-        // 行があるのに DEFAULT 無しの NOT NULL は、既存行が NULL になるので拒否。
+        // With rows present, NOT NULL without a DEFAULT is rejected, since existing rows would become NULL.
         assert_eq!(
             crate::error::code_of(s.prepare("ALTER TABLE t ADD COLUMN note VARCHAR NOT NULL", &[])),
             Some(Code::TypeMismatch)
@@ -407,10 +409,10 @@ mod tests {
     #[test]
     #[cfg(feature = "dml")]
     fn view_referencing_a_dropped_or_renamed_column_fails_cleanly_not_a_panic() {
-        // ビューは生 SQL テキストとして持ち、参照されるたびに再パース・再束縛
-        // する設計（`catalog::views`）。ベース表の列を DROP/RENAME した後に
-        // ビューを引いたときも、束縛時に普通に ColumnNotFound で失敗する
-        // べきで、panic やダングリング参照になってはいけない。
+        // Views are held as raw SQL text and reparsed and rebound on every reference
+        // (`catalog::views`). Querying a view after DROP/RENAME of a base table column
+        // should simply fail with ColumnNotFound at bind time, and must not panic or
+        // leave a dangling reference.
         let mut s = Session::new();
         s.prepare("CREATE TABLE t (a INTEGER, b INTEGER)", &[]).unwrap();
         s.prepare("INSERT INTO t VALUES (1, 10)", &[]).unwrap();
@@ -430,7 +432,7 @@ mod tests {
         assert_eq!(
             crate::error::code_of(s.prepare("SELECT a2 FROM v", &[])),
             Some(Code::ColumnNotFound),
-            "ビュー本体はまだ古い列名 `a` を参照しているので、新しい名前 `a2` 越しでは引けない"
+            "the view body still refers to the old column name `a`, so it cannot be queried through the new name `a2`"
         );
     }
 
@@ -490,8 +492,8 @@ mod tests {
         );
     }
 
-    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
-    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    // CSV is used as the fixture, so `csv` is required (resolving `FormatKind::Csv`
+    // gives UnsupportedFeature without it).
     #[cfg(feature = "csv")]
     #[test]
     fn alter_table_on_file_backed_table_is_read_only() {

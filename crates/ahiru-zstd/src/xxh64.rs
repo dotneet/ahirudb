@@ -1,6 +1,6 @@
-//! XXH64。フレーム末尾の Content_Checksum 検証にだけ使う。
+//! XXH64. Used only to verify the Content_Checksum at the end of a frame.
 //!
-//! 展開結果は全て手元にあるので、逐次更新版は要らず一発計算で足りる。
+//! The whole decompressed result is on hand, so a streaming version is unnecessary; one shot suffices.
 
 const P1: u64 = 0x9E37_79B1_85EB_CA87;
 const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;

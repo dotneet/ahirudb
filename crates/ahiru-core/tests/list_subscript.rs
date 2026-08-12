@@ -1,22 +1,22 @@
-//! `expr[i]`（添字アクセス）/ `expr[i:j]`（スライス）の統合テスト。
+//! Integration tests for `expr[i]` (subscript access) / `expr[i:j]` (slicing).
 //!
-//! 構文・脱糖先は `sql::parser::Parser::subscript`
-//! （`crates/ahiru-core/src/sql/parser.rs`）、実行本体は
-//! `crate::json::list_index`（既存の `list_extract`。今回は変更していない）
-//! と `crate::json::list_slice`（今回追加、`crates/ahiru-core/src/json.rs`）。
+//! The syntax and its desugaring target live in `sql::parser::Parser::subscript`
+//! (`crates/ahiru-core/src/sql/parser.rs`); execution itself is
+//! `crate::json::list_index` (the existing `list_extract`, unchanged here) and
+//! `crate::json::list_slice` (new here, in `crates/ahiru-core/src/json.rs`).
 //!
-//! 期待値はすべて `duckdb` CLI の実際の出力と突き合わせて決めている
-//! （各テストのコメントに実行したコマンドを併記）。
+//! All expected values are decided by cross-checking against the actual output of the
+//! `duckdb` CLI (each test's comment also records the command run).
 //!
-//! スコープ外: VARCHAR への `[i]`/`[i:j]`（部分文字列抽出）。DuckDB では
-//! `'hello'[1]` が `'h'` になるが、この実装は LIST/MAP/JSON を単一の
-//! `Ty::Json` 物理型に統合しており（`docs/DESIGN.md` §8）、`[i]`/`[i:j]` は
-//! その JSON 表現専用の `list_extract`/`list_slice` への糖衣構文としてのみ
-//! 実装した。VARCHAR は `list_extract`/`list_slice` の第 1 引数として
-//! `Ty::Json` へ暗黙 CAST されるが、この CAST は「バイト列が妥当な JSON か」
-//! を検証する（`expr::kernels::cast_str_to_json`）ので、`'hello'[1]` は
-//! NULL にはならず CAST エラーになる（`varchar_subscript_is_a_cast_error_not_substring`
-//! で実際の挙動を記録している）。
+//! Out of scope: `[i]`/`[i:j]` on VARCHAR (substring extraction). In DuckDB,
+//! `'hello'[1]` becomes `'h'`, but this implementation unifies LIST/MAP/JSON into a single
+//! `Ty::Json` physical type (`docs/DESIGN.md` §8), and `[i]`/`[i:j]` are implemented only as
+//! sugar for `list_extract`/`list_slice`, which are specific to that JSON representation.
+//! VARCHAR is implicitly CAST to `Ty::Json` as `list_extract`/`list_slice`'s first argument,
+//! but that CAST validates "is this byte string valid JSON"
+//! (`expr::kernels::cast_str_to_json`), so `'hello'[1]` does not become NULL; it's a CAST
+//! error (the actual behavior is recorded by
+//! `varchar_subscript_is_a_cast_error_not_substring`).
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::format::FormatKind;
@@ -28,10 +28,10 @@ fn data(name: &str) -> Vec<u8> {
     std::fs::read(format!("{p}{name}")).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-/// `basic.parquet`（`id` 0..999 の 1000 行）を `t` として登録したセッション。
-/// `FROM` 無しの `SELECT <expr>` は v1 未対応（`plan::bind`）なので、式だけを
-/// 評価したいテストは `one()` 経由で `LIMIT 1` を使う（`json_functions.rs`
-/// と同じ迂回）。
+/// A session with `basic.parquet` (1000 rows, `id` 0..999) registered as `t`.
+/// A `SELECT <expr>` with no `FROM` is unsupported in v1 (`plan::bind`), so tests that just
+/// want to evaluate an expression use `one()`, which goes through `LIMIT 1` (same workaround
+/// as `json_functions.rs`).
 fn session_with_basic() -> Session {
     let mut s = Session::new();
     s.register_bytes("t", data("basic.parquet")).unwrap();
@@ -67,9 +67,9 @@ fn one(session: &mut Session, expr: &str) -> Value {
     rows[0][0].clone()
 }
 
-/// JSON トークンのバイト列そのもの（数値ならクォート無しの数字テキスト）
-/// で比較するヘルパー。`Ty::Json` の値はネイティブ型へ復元されない
-/// （`unnest.rs::json_tok` と同じ理由）。
+/// A helper that compares against the raw JSON token byte sequence (for numbers, unquoted
+/// numeric text). `Ty::Json` values are not restored to a native type
+/// (same reason as `unnest.rs::json_tok`).
 fn j(v: &str) -> Value {
     Value::Bytes(v.as_bytes().to_vec())
 }
@@ -81,7 +81,7 @@ fn i32v(v: i32) -> Value {
 const NULL: Value = Value::Null;
 
 // =========================================================================
-// 基本の添字アクセス（`[i]` -> `list_extract`）
+// Basic subscript access (`[i]` -> `list_extract`)
 // =========================================================================
 
 #[test]
@@ -126,7 +126,7 @@ fn subscript_and_cast_interleave_by_written_order() {
 }
 
 // =========================================================================
-// スライス（`[i:j]` -> `list_slice`）
+// Slicing (`[i:j]` -> `list_slice`)
 // =========================================================================
 
 #[test]
@@ -196,7 +196,7 @@ fn list_slice_function_propagates_null_bounds_unlike_omitted_ones() {
 }
 
 // =========================================================================
-// Parquet の LIST 型カラムに対する添字/スライス
+// Subscript/slice on a Parquet LIST-typed column
 // =========================================================================
 
 #[test]
@@ -245,7 +245,7 @@ fn subscript_and_slice_on_a_nested_parquet_list_of_list_column() {
 }
 
 // =========================================================================
-// JOIN / GROUP BY / 集約との組み合わせ
+// Combined with JOIN / GROUP BY / aggregation
 // =========================================================================
 
 #[test]
@@ -300,7 +300,7 @@ fn slice_applied_to_array_agg_output() {
 }
 
 // =========================================================================
-// エラー・スコープ外
+// Errors / out of scope
 // =========================================================================
 
 #[test]

@@ -510,9 +510,15 @@ mod tests {
 
     #[test]
     fn matches_non_ascii() {
-        assert!(matches("*.parquet", "データ.parquet"));
-        assert!(matches("デ?タ.csv", "データ.csv"));
-        assert!(matches("[あ-ん]x", "いx"));
+        assert!(matches(
+            "*.parquet",
+            "\u{3b4}\u{3b5}\u{3b4}\u{3bf}\u{3bc}\u{3ad}\u{3bd}\u{3b1}.parquet"
+        ));
+        assert!(matches(
+            "\u{3b4}\u{3b5}?\u{3bf}\u{3bc}\u{3ad}\u{3bd}\u{3b1}.csv",
+            "\u{3b4}\u{3b5}\u{3b4}\u{3bf}\u{3bc}\u{3ad}\u{3bd}\u{3b1}.csv"
+        ));
+        assert!(matches("[\u{3b1}-\u{3c9}]x", "\u{3b2}x"));
         assert!(matches("😀*", "😀🎉"));
     }
 

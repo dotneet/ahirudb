@@ -1,11 +1,11 @@
 //! `SELECT * EXCLUDE (...)` / `SELECT * REPLACE (...)` / `SELECT * RENAME (...)`
-//! の統合テスト。
+//! Integration tests.
 //!
-//! 期待値はすべて `duckdb -c "SELECT ..."` の実際の出力と突き合わせて決めている
-//! （`tests/data/basic.parquet` は DuckDB が書いた実ファイル。列は
+//! All expected values are decided by cross-checking against the actual output of
+//! `duckdb -c "SELECT ..."` (`tests/data/basic.parquet` is a real file written by DuckDB. Columns are
 //! `id INTEGER, name VARCHAR, score DOUBLE, flag BOOLEAN, big BIGINT,
-//! d TIMESTAMP`）。読み取り専用の Parquet だけで足りるので、既定フィーチャの
-//! `cargo test` でも必ず走る。
+//! d TIMESTAMP`). Read-only Parquet is all that's needed, so this always runs under the default
+//! `cargo test` features too.
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -65,7 +65,7 @@ fn b(v: bool) -> Value {
     Value::Bool(v)
 }
 
-/// `EXCLUDE` は列挙結果から名前だけで除く。
+/// `EXCLUDE` drops columns from the enumerated result by name alone.
 /// duckdb: SELECT * EXCLUDE (score, big, d) FROM 'basic.parquet' WHERE id < 4 ORDER BY id
 #[test]
 fn exclude_drops_named_columns() {
@@ -86,7 +86,7 @@ fn exclude_drops_named_columns() {
     );
 }
 
-/// `REPLACE` は列名・位置を変えずに値だけ差し替える。
+/// `REPLACE` substitutes just the value, leaving the column name and position unchanged.
 /// duckdb: SELECT * REPLACE (score * 2 AS score) FROM 'basic.parquet' WHERE id < 4 ORDER BY id
 #[test]
 fn replace_substitutes_value_keeping_column_name_and_position() {
@@ -108,7 +108,7 @@ fn replace_substitutes_value_keeping_column_name_and_position() {
     );
 }
 
-/// `EXCLUDE` と `REPLACE` は同じ `*` に両方効かせられる（EXCLUDE が先）。
+/// `EXCLUDE` and `REPLACE` can both apply to the same `*` (EXCLUDE first).
 /// duckdb: SELECT * EXCLUDE (name, big, d) REPLACE (score * 2 AS score) FROM 'basic.parquet' WHERE id < 4 ORDER BY id
 #[test]
 fn exclude_and_replace_combine() {
@@ -128,7 +128,7 @@ fn exclude_and_replace_combine() {
     );
 }
 
-/// `t.* EXCLUDE (...)` のように修飾子付きの `*` にも効く。
+/// Also works on a qualified `*` like `t.* EXCLUDE (...)`.
 /// duckdb: SELECT t.* EXCLUDE (name, big, d) FROM 'basic.parquet' t WHERE id < 4 ORDER BY id
 #[test]
 fn qualified_star_supports_exclude() {
@@ -145,7 +145,7 @@ fn qualified_star_supports_exclude() {
     );
 }
 
-/// 括弧を省略した 1 個だけの形も動く（`duckdb` と同じ挙動）。
+/// The parenthesis-free single-item form also works (same behavior as `duckdb`).
 #[test]
 fn exclude_and_replace_allow_bare_single_item() {
     let mut s = session_with_basic();
@@ -157,8 +157,8 @@ fn exclude_and_replace_allow_bare_single_item() {
     assert_eq!(rows, vec![vec![i32(99), vc("name_1")]]);
 }
 
-/// 存在しない列を EXCLUDE/REPLACE に書くと束縛時に拒否される
-/// （`duckdb`: "Column ... not found"）。
+/// Writing an unknown column in EXCLUDE/REPLACE is rejected at bind time
+/// (`duckdb`: "Column ... not found").
 #[test]
 fn exclude_of_unknown_column_is_rejected() {
     let mut s = session_with_basic();
@@ -173,8 +173,8 @@ fn replace_of_unknown_column_is_rejected() {
     assert_eq!(code_of(err), Some(Code::ColumnNotFound));
 }
 
-/// 集約後は `*` を展開できない（元の行が残っていない）のは EXCLUDE/REPLACE
-/// を付けても変わらない。
+/// `*` cannot be expanded after aggregation (the original rows no longer exist); adding
+/// EXCLUDE/REPLACE doesn't change that.
 #[test]
 fn exclude_after_aggregation_is_still_rejected() {
     let mut s = session_with_basic();
@@ -182,11 +182,11 @@ fn exclude_after_aggregation_is_still_rejected() {
     assert_eq!(code_of(err), Some(Code::NotGrouped));
 }
 
-// --- 重複指定・境界値 -----------------------------------------------------------
+// --- Duplicate specs, boundary values -------------------------------------------
 
-/// `EXCLUDE`/`REPLACE` のリストに同じ列名が 2 回現れると `duckdb` は
-/// "Duplicate entry ... in EXCLUDE/REPLACE list" として拒否する
-/// (`duckdb -c "SELECT * EXCLUDE (id, id) FROM ..."` で確認済み)。
+/// If the same column name appears twice in an `EXCLUDE`/`REPLACE` list, `duckdb` rejects it
+/// with "Duplicate entry ... in EXCLUDE/REPLACE list"
+/// (confirmed with `duckdb -c "SELECT * EXCLUDE (id, id) FROM ..."`).
 #[test]
 fn exclude_rejects_a_duplicate_column_name() {
     let mut s = session_with_basic();
@@ -201,8 +201,8 @@ fn replace_rejects_a_duplicate_target_column() {
     assert_eq!(code_of(err), Some(Code::SyntaxError));
 }
 
-/// 全列を `EXCLUDE` すると選択リストが空になり、`duckdb` も
-/// "SELECT list is empty after resolving * expressions!" として拒否する。
+/// `EXCLUDE`-ing every column empties the select list, and `duckdb` also rejects it with
+/// "SELECT list is empty after resolving * expressions!".
 #[test]
 fn excluding_every_column_is_rejected() {
     let mut s = session_with_basic();
@@ -210,8 +210,8 @@ fn excluding_every_column_is_rejected() {
     assert!(code_of(err).is_some());
 }
 
-/// 列名は大文字小文字を区別しない（このエンジンの通常の列参照と同じ規則、
-/// `duckdb` も同様）。
+/// Column names are matched case-insensitively (same rule as this engine's ordinary column
+/// references; `duckdb` behaves the same way).
 #[test]
 fn exclude_column_name_matching_is_case_insensitive() {
     let mut s = session_with_basic();
@@ -221,10 +221,10 @@ fn exclude_column_name_matching_is_case_insensitive() {
     );
 }
 
-// --- JOIN との相互作用 ----------------------------------------------------------
+// --- Interaction with JOIN -------------------------------------------------------
 
-/// 修飾された `t.* EXCLUDE (...)` は、その表由来の列だけに効く
-/// （`JOIN` の相手側の同名列は残る）。
+/// A qualified `t.* EXCLUDE (...)` only affects columns from that table
+/// (a same-named column from the other side of the `JOIN` is kept).
 /// duckdb: SELECT a.* EXCLUDE (id) FROM 'basic.parquet' a JOIN 'basic.parquet' b
 ///         ON a.id = b.id LIMIT 1
 #[test]
@@ -238,8 +238,8 @@ fn qualified_star_exclude_only_affects_its_own_table_in_a_join() {
     );
 }
 
-/// 修飾されない `* EXCLUDE (...)` は両方の表から同名列を除く
-/// （`duckdb` の実測どおり: 曖昧な列参照と同じ扱いで両側に効く）。
+/// An unqualified `* EXCLUDE (...)` drops the same-named column from both tables
+/// (confirmed with `duckdb`: it's treated the same as an ambiguous column reference and affects both sides).
 /// duckdb: SELECT * EXCLUDE (id) FROM 'basic.parquet' a JOIN 'basic.parquet' b
 ///         ON a.id = b.id LIMIT 1
 #[test]
@@ -247,17 +247,17 @@ fn unqualified_star_exclude_affects_both_sides_of_a_join() {
     let mut s = session_with_basic();
     let rows = run(&mut s, "SELECT * EXCLUDE (id) FROM t a JOIN t b ON a.id = b.id WHERE a.id = 0");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].len(), 10, "両側から id を除いた残り 5 列 x 2 表");
+    assert_eq!(rows[0].len(), 10, "the remaining 5 columns x 2 tables, with id dropped from both");
 }
 
 fn i64_ts(v: i64) -> Value {
     Value::I64(v)
 }
 
-// --- 集約の入力として使う --------------------------------------------------------
+// --- Feeding into an aggregate as input --------------------------------------------
 
-/// `EXCLUDE`/`REPLACE` を含む `SELECT *` をサブクエリにして、その結果を
-/// さらに集約する（新機能同士ではなく既存の集約パイプラインとの組み合わせ）。
+/// Turns a `SELECT *` with EXCLUDE/REPLACE into a subquery, then further aggregates its
+/// result (combining the new features with the existing aggregation pipeline).
 #[test]
 fn exclude_and_replace_result_can_feed_an_aggregate() {
     let mut s = session_with_basic();
@@ -267,8 +267,8 @@ fn exclude_and_replace_result_can_feed_an_aggregate() {
          GROUP BY flag ORDER BY flag",
     );
     assert_eq!(rows, vec![vec![b(false), f64(499000.5)], vec![b(true), f64(250249.5)]]);
-    // REPLACE は値だけ差し替わる（列名・位置は変わらない）ので、集約結果も
-    // 差し替えた値どおりに 2 倍になる。
+    // Since `REPLACE` only substitutes the value (column name/position unchanged), the
+    // aggregate result is likewise doubled per the substituted value.
     let rows2 = run(
         &mut s,
         "SELECT sum(score) FROM (SELECT * REPLACE (score * 2 AS score) FROM t WHERE id < 4)",

@@ -1,14 +1,14 @@
-//! リテラル用ハフマンデコーダ。
+//! The Huffman decoder for literals.
 //!
-//! 表は 2^max_bits の完全展開型（1 回の peek で 1 シンボル）。max_bits は
-//! 仕様上 11 までなので最大 2 KiB × 2 本で済み、木を辿る実装より小さく速い。
+//! The table is fully expanded to 2^max_bits (one symbol per peek). max_bits is at
+//! most 11 per the spec, so 2 KiB x 2 suffices -- smaller and faster than walking a tree.
 
 use crate::bits::Reverse;
 use crate::fse;
 use crate::prelude::*;
 use crate::Error;
 
-/// 仕様が許すコード長の上限。
+/// The maximum code length the spec allows.
 const MAX_BITS: u32 = 11;
 
 pub struct Huff {
@@ -23,18 +23,18 @@ fn highest_bit(v: u32) -> u32 {
     31u32.saturating_sub(v.leading_zeros())
 }
 
-/// ハフマン木記述を読み、表と消費バイト数を返す。
+/// Reads a Huffman tree description and returns the table and the bytes consumed.
 pub fn read_table(src: &[u8]) -> Result<(Huff, usize), Error> {
     let head = match src.first() {
         Some(v) => *v,
         None => return Err(Error::UnexpectedEof),
     };
-    // weight は最大 255 個 + 末尾 1 個を復元するので 256 要る。
+    // 256 weights are needed: up to 255 read plus the final one that is reconstructed.
     let mut w = [0u8; 256];
     let n;
     let used;
     if head < 128 {
-        // head は FSE ストリームのバイト数。
+        // head is the byte count of the FSE stream.
         let size = head as usize;
         let body = src.get(1..1 + size).ok_or(Error::UnexpectedEof)?;
         let (t, hdr) = fse::read_table(body, 6, 255)?;
@@ -43,7 +43,7 @@ pub fn read_table(src: &[u8]) -> Result<(Huff, usize), Error> {
         used = 1 + size;
         stat!(crate::stats::HUF_W_FSE);
     } else {
-        // 直接表現。4 ビット/weight、上位ニブルが先。
+        // Direct representation. 4 bits per weight, high nibble first.
         n = head as usize - 127;
         let bytes = n.div_ceil(2);
         let body = src.get(1..1 + bytes).ok_or(Error::UnexpectedEof)?;
@@ -57,10 +57,10 @@ pub fn read_table(src: &[u8]) -> Result<(Huff, usize), Error> {
     Ok((h, used))
 }
 
-/// weight 列から復号表を組む。
+/// Builds the decoding table from the weight sequence.
 ///
-/// 最後のシンボルの weight は書かれておらず、「総和を次の 2 のべきに満たす分」
-/// から復元する。ここが合わなければ壊れた入力。
+/// The last symbol's weight is not written; it is reconstructed as "whatever fills
+/// the sum up to the next power of two". If that does not work out, the input is corrupt.
 fn build(w: &mut [u8; 256], n: usize) -> Result<Huff, Error> {
     if n == 0 || n > 255 {
         return Err(Error::BadHuffman);
@@ -88,7 +88,7 @@ fn build(w: &mut [u8; 256], n: usize) -> Result<Huff, Error> {
     w[n] = (highest_bit(left) + 1) as u8;
     let num = n + 1;
 
-    // weight w のコード長は max_bits + 1 - w。weight 0 は不使用シンボル。
+    // The code length for weight w is max_bits + 1 - w. Weight 0 means an unused symbol.
     let mut bits = [0u8; 256];
     let mut rank_count = [0u32; MAX_BITS as usize + 1];
     for s in 0..num {
@@ -99,7 +99,7 @@ fn build(w: &mut [u8; 256], n: usize) -> Result<Huff, Error> {
         }
     }
 
-    // コードはビット長の長い順（= weight の小さい順）に 0 から詰める。
+    // Codes are packed from 0 in order of decreasing bit length (= increasing weight).
     let size = 1usize << max_bits;
     let mut rank_idx = [0u32; MAX_BITS as usize + 1];
     let mut i = max_bits as usize;
@@ -133,14 +133,14 @@ fn build(w: &mut [u8; 256], n: usize) -> Result<Huff, Error> {
 }
 
 impl Huff {
-    /// 逆向きストリームから `n` シンボル展開して `out` に追記する。
+    /// Expands `n` symbols from the backwards stream and appends them to `out`.
     ///
-    /// 追記量は呼び出し側が `out` の容量で保証済み（リテラル領域は
-    /// ブロック上限 128 KiB で切ってある）。
+    /// The caller has already guaranteed the appended amount against `out`'s capacity
+    /// (the literals region is capped at the 128 KiB block limit).
     pub fn decode_stream(&self, src: &[u8], n: usize, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut r = Reverse::new(src)?;
         for _ in 0..n {
-            // 1 シンボルは最低 1 ビット。残りが無ければ壊れている。
+            // One symbol is at least one bit. Running out means corruption.
             if r.off() <= 0 {
                 return Err(Error::BadHuffman);
             }
@@ -148,7 +148,7 @@ impl Huff {
             out.push(self.sym[i]);
             r.skip(self.nb[i] as u32);
         }
-        // ストリームはちょうど使い切る。余り/不足はどちらも破損。
+        // The stream is consumed exactly. Both leftover and shortfall are corruption.
         if r.off() != 0 {
             return Err(Error::BadHuffman);
         }

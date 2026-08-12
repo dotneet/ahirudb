@@ -1,13 +1,14 @@
-//! 相関サブクエリ（correlated subqueries）の統合テスト。
+//! Integration tests for correlated subqueries.
 //!
-//! `customers`/`orders` をインメモリ表として作り（`ddl`/`dml` フィーチャ)、
-//! 相関スカラサブクエリ・相関 `EXISTS`/`NOT EXISTS`・相関 `IN`/`NOT IN` を
-//! 検証する。期待値はすべて `duckdb -c "SELECT ..."` の実際の出力と
-//! 突き合わせて決めている。
+//! Creates `customers`/`orders` as in-memory tables (the `ddl`/`dml` features), and verifies
+//! correlated scalar subqueries, correlated `EXISTS`/`NOT EXISTS`, and correlated
+//! `IN`/`NOT IN`. All expected values are decided by cross-checking against the actual
+//! output of `duckdb -c "SELECT ..."`.
 //!
-//! サポート範囲外のパターン（非等価相関・OR の中の相関・NULL の可能性が
-//! ある相関 `NOT IN`・独自の GROUP BY を持つ相関集約サブクエリ・2 階層以上
-//! ネストした相関）が `panic` せず明確なエラーで拒否されることも確認する。
+//! Also verifies that patterns outside the supported scope (non-equality correlation,
+//! correlation inside `OR`, a correlated `NOT IN` where NULL is possible, a correlated
+//! aggregate subquery with its own GROUP BY, and correlation nested 2+ levels deep) are
+//! rejected with a clear error rather than panicking.
 
 #![cfg(feature = "dml")]
 
@@ -15,8 +16,8 @@ use ahiru_core::error::{code_of, Code};
 use ahiru_core::session::{Prepared, QueryStep, Session};
 use ahiru_core::vector::Value;
 
-/// `sql` を実行し、結果を `Vec<Vec<Value>>` として取り出す。
-/// インメモリ表しか使わないので `NeedIo`/`NeedCodec` は絶対に起きない。
+/// Runs `sql` and extracts the result as `Vec<Vec<Value>>`.
+/// Since only in-memory tables are used, `NeedIo`/`NeedCodec` never occur.
 fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     let mut q = match session.prepare(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
         Prepared::Ready(q) => q,
@@ -54,15 +55,16 @@ fn s(v: &str) -> Value {
 }
 const NULL: Value = Value::Null;
 
-/// customers(id, name, region) / orders(id, customer_id, amount, region) を
-/// 作り、DuckDB で検証したのと同じ内容を入れる:
+/// Creates customers(id, name, region) / orders(id, customer_id, amount, region), with the
+/// same content verified with DuckDB:
 ///
 /// ```text
 /// customers: (1,alice,east) (2,bob,west) (3,carol,east) (4,dave,NULL)
 /// orders:    (10,1,100.0,east) (11,1,50.0,NULL) (12,2,200.0,west) (13,NULL,10.0,east)
 /// ```
 ///
-/// alice は 2 件（東, 相関先 NULL 込み）、bob は 1 件、carol/dave は 0 件。
+/// alice has 2 orders (east, including one with a NULL correlation target), bob has 1,
+/// and carol/dave have 0.
 fn session_with_customers_orders() -> Session {
     let mut s = Session::new();
     s.prepare("CREATE TABLE customers (id INT, name VARCHAR, region VARCHAR)", &[]).unwrap();
@@ -84,9 +86,9 @@ fn session_with_customers_orders() -> Session {
     s
 }
 
-// --- 相関スカラサブクエリ -----------------------------------------------------
+// --- Correlated scalar subqueries -----------------------------------------------
 
-/// 集約を伴わない相関スカラサブクエリ: 相関キーごとに「先頭の 1 行」を採る。
+/// A correlated scalar subquery without aggregation: picks the "first row" per correlation key.
 /// duckdb: `SELECT c.id, c.name, (SELECT o.amount FROM orders o WHERE
 /// o.customer_id = c.id AND o.id = 10) FROM customers c ORDER BY c.id`
 #[test]
@@ -109,8 +111,8 @@ fn correlated_scalar_subquery_picks_first_row_per_key() {
     );
 }
 
-/// 集約を伴う相関スカラサブクエリ（`max`）。マジックデコリレーション
-/// （相関キーで GROUP BY してから LEFT JOIN）の基本形。
+/// A correlated scalar subquery with aggregation (`max`). The basic form of magic
+/// decorrelation (GROUP BY on the correlation key, then LEFT JOIN).
 /// duckdb: `SELECT c.id, c.name, (SELECT max(o.amount) FROM orders o
 /// WHERE o.customer_id = c.id) FROM customers c ORDER BY c.id`
 #[test]
@@ -132,10 +134,10 @@ fn correlated_scalar_subquery_aggregate_max() {
     );
 }
 
-/// 集約を伴う相関スカラサブクエリ（`count`）は、一致する内側行が無い
-/// ときに NULL ではなく 0 を返す（DuckDB で確認済み。素朴に GROUP BY へ
-/// 相関キーを合流させただけだと「その組が無い」→ LEFT JOIN で NULL に
-/// なってしまうので、COUNT 系だけは補正が要る）。
+/// A correlated scalar subquery with aggregation (`count`) returns 0 rather than NULL when
+/// there is no matching inner row (confirmed with DuckDB; if you naively merge the
+/// correlation key into the GROUP BY, "that group doesn't exist" turns into NULL via the
+/// LEFT JOIN, so COUNT alone needs a correction).
 /// duckdb: `SELECT c.id, c.name, (SELECT count(*) FROM orders o WHERE
 /// o.customer_id = c.id) FROM customers c ORDER BY c.id`
 #[test]
@@ -157,11 +159,11 @@ fn correlated_scalar_subquery_count_defaults_to_zero_not_null() {
     );
 }
 
-// --- 相関 EXISTS / NOT EXISTS -------------------------------------------------
+// --- Correlated EXISTS / NOT EXISTS -----------------------------------------
 
-/// 相関 `EXISTS` に非相関の追加条件（`o.amount > 60`）が混じっていても、
-/// 相関等価述語だけを結合キーに取り出し、残りは内側の WHERE として
-/// 普通に評価される。
+/// Even when a correlated `EXISTS` has an extra non-correlated condition mixed in
+/// (`o.amount > 60`), only the correlated equality predicate is extracted as the join key,
+/// and the rest is evaluated normally as the inner WHERE.
 /// duckdb: `SELECT c.id, c.name FROM customers c WHERE EXISTS
 /// (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 60)
 /// ORDER BY c.id`
@@ -177,7 +179,7 @@ fn correlated_exists_with_extra_local_predicate() {
     assert_eq!(rows, vec![vec![i32(1), s("alice")], vec![i32(2), s("bob")]]);
 }
 
-/// 相関 `NOT EXISTS`。
+/// Correlated `NOT EXISTS`.
 /// duckdb: `SELECT c.id, c.name FROM customers c WHERE NOT EXISTS
 /// (SELECT 1 FROM orders o WHERE o.customer_id = c.id) ORDER BY c.id`
 #[test]
@@ -191,10 +193,10 @@ fn correlated_not_exists() {
     assert_eq!(rows, vec![vec![i32(3), s("carol")], vec![i32(4), s("dave")]]);
 }
 
-// --- 相関 IN / NOT IN ---------------------------------------------------------
+// --- Correlated IN / NOT IN ---------------------------------------------------
 
-/// 相関 `IN`。`IN` の対象列（`customer_id`）と相関キー（`region`）の
-/// 複合キーによる半結合になる。
+/// Correlated `IN`. Becomes a semi-join on the composite key of `IN`'s target column
+/// (`customer_id`) and the correlation key (`region`).
 /// duckdb: `SELECT c.id, c.name FROM customers c WHERE c.id IN
 /// (SELECT o.customer_id FROM orders o WHERE o.region = c.region) ORDER BY c.id`
 #[test]
@@ -208,12 +210,12 @@ fn correlated_in() {
     assert_eq!(rows, vec![vec![i32(1), s("alice")], vec![i32(2), s("bob")]]);
 }
 
-/// 相関 `NOT IN` は、相関キーごとにスコープされた NULL 三値論理の判定が
-/// 必要だが、既存の `AntiNullAware`（`NOT IN` の NULL 対応）は結合全体に
-/// 対する判定しか持たない。対象列の NULL 可能性を束縛時に正確に判定する
-/// 手段も無い（SELECT リストの出力列は常に `nullable = true` として扱われる）
-/// ため、相関の有無に関わらず誤った結果を返しうる。曖昧な結果を返すくらい
-/// なら常に明確に拒否する。
+/// A correlated `NOT IN` needs a three-valued NULL judgment scoped per correlation key, but
+/// the existing `AntiNullAware` (`NOT IN`'s NULL handling) only judges over the whole join.
+/// There is also no way to precisely determine the target column's NULL possibility at bind
+/// time (a SELECT list's output column is always treated as `nullable = true`), so it could
+/// return a wrong result regardless of whether correlation is present. Rather than return an
+/// ambiguous result, always reject clearly.
 #[test]
 fn correlated_not_in_is_always_rejected() {
     let mut db = session_with_customers_orders();
@@ -226,9 +228,9 @@ fn correlated_not_in_is_always_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-// --- サポート外パターンの明確な拒否 -------------------------------------------
+// --- Clear rejection of unsupported patterns ---------------------------------
 
-/// 相関述語が非等価（`>`）だと結合キーに取り出せない。明確に拒否する。
+/// A non-equality correlation predicate (`>`) cannot be extracted into a join key. Rejected clearly.
 #[test]
 fn non_equality_correlation_is_rejected() {
     let mut db = session_with_customers_orders();
@@ -240,7 +242,7 @@ fn non_equality_correlation_is_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 相関参照が `OR` の中にあると、AND 分解では取り出せない。明確に拒否する。
+/// If a correlation reference sits inside an `OR`, AND-decomposition cannot extract it. Rejected clearly.
 #[test]
 fn correlation_inside_or_is_rejected() {
     let mut db = session_with_customers_orders();
@@ -252,9 +254,9 @@ fn correlation_inside_or_is_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 独自の GROUP BY を持つ相関集約サブクエリは、相関キーをそのグルーピングに
-/// 合流させる手段が無いため明確に拒否する（黙って相関を無視すると集約が
-/// 外側の行をまたいで混ざり、誤った結果になってしまうため）。
+/// A correlated aggregate subquery with its own GROUP BY is clearly rejected, since there is
+/// no way to merge the correlation key into that grouping (silently ignoring the correlation
+/// would let the aggregate mix across outer rows, producing a wrong result).
 #[test]
 fn correlated_aggregate_with_own_group_by_is_rejected() {
     let mut db = session_with_customers_orders();
@@ -266,9 +268,9 @@ fn correlated_aggregate_with_own_group_by_is_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 2 階層以上ネストした相関（内側の内側が、間の階層を飛び越して一番外側の
-/// 列を参照する）は 1 階層分の外側スコープしか伝播しないので、`panic` せず
-/// エラーになる（列が見つからない、という形で失敗する）。
+/// Correlation nested 2+ levels deep (the innermost level reaches past the middle level to
+/// reference the outermost column) only propagates one level of outer scope, so it does not
+/// `panic`; it fails as an error (failing in the form of "column not found").
 #[test]
 fn two_level_correlation_skip_fails_cleanly() {
     let mut db = session_with_customers_orders();
@@ -280,13 +282,13 @@ fn two_level_correlation_skip_fails_cleanly() {
          )",
         &[],
     );
-    // パニックせず、何らかの明確なエラーコードで失敗すること。
+    // Must not panic; must fail with some clear error code.
     assert!(err.is_err());
 }
 
-// --- 非相関サブクエリの回帰確認 -----------------------------------------------
+// --- Regression check for uncorrelated subqueries -----------------------------
 
-/// 相関のない（外側スコープを参照しない）サブクエリは従来どおり動く。
+/// A subquery with no correlation (does not reference the outer scope) still works as before.
 #[test]
 fn uncorrelated_subqueries_are_unaffected() {
     let mut db = session_with_customers_orders();

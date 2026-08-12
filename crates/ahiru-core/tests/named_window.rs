@@ -1,10 +1,10 @@
-//! `WINDOW name AS (...)` / `OVER name` の統合テスト。
+//! Integration tests for `WINDOW name AS (...)` / `OVER name`.
 //!
-//! 期待値はすべて `duckdb -c "SELECT ..."` の実際の出力と突き合わせて決めている
-//! （`tests/data/basic.parquet` は DuckDB が書いた実ファイル。列は
+//! All expected values are decided by cross-checking against the actual output of
+//! `duckdb -c "SELECT ..."` (`tests/data/basic.parquet` is a real file written by DuckDB. Columns are
 //! `id INTEGER, name VARCHAR, score DOUBLE, flag BOOLEAN, big BIGINT,
-//! d TIMESTAMP`）。読み取り専用の Parquet だけで足りるので、既定フィーチャの
-//! `cargo test` でも必ず走る。
+//! d TIMESTAMP`). Read-only Parquet is all that's needed, so this always runs under the default
+//! `cargo test` features too.
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -57,7 +57,7 @@ fn b(v: bool) -> Value {
     Value::Bool(v)
 }
 
-/// 複数のウィンドウ関数が同じ名前付き定義を共有する。
+/// Multiple window functions share the same named definition.
 /// duckdb:
 /// SELECT id, flag, sum(score) OVER w AS s, avg(score) OVER w AS a
 /// FROM 'basic.parquet' WHERE id < 6
@@ -84,7 +84,7 @@ fn named_window_shared_by_multiple_calls() {
     );
 }
 
-/// 名前付き参照（`OVER w`）とその場の指定（`OVER (...)`）は同じクエリで併用できる。
+/// A named reference (`OVER w`) and an inline spec (`OVER (...)`) can be used together in the same query.
 /// duckdb:
 /// SELECT id, flag, row_number() OVER w AS rn, count(*) OVER () AS total
 /// FROM 'basic.parquet' WHERE id < 6
@@ -111,7 +111,7 @@ fn named_and_inline_window_can_be_mixed() {
     );
 }
 
-/// 複数の名前付きウィンドウを定義して使い分けられる。
+/// Multiple named windows can be defined and used selectively.
 #[test]
 fn multiple_named_windows() {
     let mut s = session_with_basic();
@@ -133,8 +133,8 @@ fn multiple_named_windows() {
     );
 }
 
-/// 定義されていない名前を `OVER` で参照すると束縛時に拒否される
-/// （`duckdb` は "window ... does not exist" として拒否する）。
+/// Referencing an undefined name with `OVER` is rejected at bind time
+/// (`duckdb` rejects it as "window ... does not exist").
 #[test]
 fn undefined_named_window_is_rejected() {
     let mut s = session_with_basic();
@@ -142,8 +142,8 @@ fn undefined_named_window_is_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 同じ `WINDOW` 句の中で同名を 2 回定義すると束縛前（構文解析）の時点で
-/// 拒否される（`duckdb`: "Duplicate window name" 相当のエラー）。
+/// Defining the same name twice within the same `WINDOW` clause is rejected before binding
+/// (at parse time) (`duckdb`: an error equivalent to "Duplicate window name").
 #[test]
 fn duplicate_window_name_in_the_same_clause_is_rejected() {
     let mut s = session_with_basic();
@@ -151,10 +151,10 @@ fn duplicate_window_name_in_the_same_clause_is_rejected() {
     assert_eq!(code_of(err), Some(Code::SyntaxError));
 }
 
-/// `WINDOW` を予約語ではなく通常の識別子として使おうとする（列名としての
-/// `window`）と、この構文の文脈依存キーワードとは違い `Kw::Window` は
-/// グローバル予約語なので拒否される（`sql::lexer` のコメント参照。
-/// `QUALIFY` と同じ扱い）。
+/// Trying to use `WINDOW` as a plain identifier rather than a reserved word (as a column name
+/// `window`) is rejected, since unlike this construct's context-sensitive keywords,
+/// `Kw::Window` is a global reserved word (see the comment in `sql::lexer`; treated the same
+/// as `QUALIFY`).
 #[test]
 fn window_is_a_reserved_word_and_cannot_be_a_bare_column_name() {
     let mut s = session_with_basic();
@@ -162,7 +162,7 @@ fn window_is_a_reserved_word_and_cannot_be_a_bare_column_name() {
     assert!(code_of(err).is_some());
 }
 
-/// `WINDOW` 句が空でも（実際には使わない定義があっても）構文的には許される。
+/// A `WINDOW` clause is syntactically allowed even if empty (i.e. containing a definition that's never actually used).
 #[test]
 fn an_unused_named_window_definition_does_not_error() {
     let mut s = session_with_basic();
@@ -170,9 +170,9 @@ fn an_unused_named_window_definition_does_not_error() {
     assert_eq!(rows, vec![vec![i32(0)], vec![i32(1)]]);
 }
 
-/// 名前付きウィンドウは `WHERE`/`GROUP BY` を経由したフィルタ後の行に対して
-/// 計算される（普通の `OVER (...)` と同じ、通常のウィンドウ関数の意味論の
-/// リグレッション確認）。
+/// A named window is computed over rows after filtering through `WHERE`/`GROUP BY`
+/// (same as an ordinary `OVER (...)`; a regression check for ordinary window-function
+/// semantics).
 /// duckdb: SELECT id, flag, sum(score) OVER w AS s FROM 'basic.parquet'
 ///         WHERE id < 6 AND flag = false WINDOW w AS (ORDER BY id) ORDER BY id
 #[test]
@@ -194,8 +194,8 @@ fn named_window_operates_on_rows_after_the_where_filter() {
     );
 }
 
-/// `WINDOW` 句を経由した結果をさらに外側の `SELECT` で絞り込む（新機能を
-/// サブクエリと組み合わせる）。
+/// Further filters, in an outer `SELECT`, a result that went through a `WINDOW` clause
+/// (combining the new feature with a subquery).
 #[test]
 fn named_window_result_can_be_filtered_by_an_outer_query() {
     let mut s = session_with_basic();
@@ -215,8 +215,8 @@ fn named_window_result_can_be_filtered_by_an_outer_query() {
     );
 }
 
-/// `WINDOW` 句自体が無くても普通の `OVER (...)` は今までどおり動く
-/// （リグレッション確認）。
+/// An ordinary `OVER (...)` still works as before even without a `WINDOW` clause itself
+/// (regression check).
 #[test]
 fn plain_over_clause_is_unaffected() {
     let mut s = session_with_basic();

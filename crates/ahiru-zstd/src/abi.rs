@@ -1,19 +1,19 @@
-//! wasm ABI。
+//! The wasm ABI.
 //!
-//! コア (`ahiru-core::abi`) と同じ流儀に合わせる: 生ポインタ + 長さ、返り値は
-//! `i32` の数値コードだけ。メッセージ文字列は持たない（`core::fmt` をリンク
-//! させないため）。
+//! Follows the same conventions as the core (`ahiru-core::abi`): raw pointer plus
+//! length, and return values that are nothing but `i32` numeric codes. No message
+//! strings (so `core::fmt` is never linked).
 //!
 //! ```text
-//! const src = zstd_alloc(n);  // ホストが圧縮バイト列を書き込む
-//! const dst = zstd_alloc(m);  // m はページヘッダが宣言する展開後サイズ
+//! const src = zstd_alloc(n);  // the host writes the compressed bytes here
+//! const dst = zstd_alloc(m);  // m is the decompressed size declared by the page header
 //! const r = zstd_decompress(src, n, dst, m);
 //! if (r < 0) throw new Error("zstd " + (-r));
 //! ```
 
 use crate::prelude::*;
 
-/// ホストが書き込むためのバッファを確保する。
+/// Reserves a buffer for the host to write into.
 #[no_mangle]
 pub extern "C" fn zstd_alloc(len: usize) -> *mut u8 {
     let mut v = Vec::<u8>::new();
@@ -25,10 +25,10 @@ pub extern "C" fn zstd_alloc(len: usize) -> *mut u8 {
     p
 }
 
-/// `zstd_alloc` で確保した領域を返す。
+/// Returns a region reserved by `zstd_alloc`.
 ///
 /// # Safety
-/// `ptr` は同じ `len` で `zstd_alloc` が返したものでなければならない。
+/// `ptr` must be what `zstd_alloc` returned for the same `len`.
 #[no_mangle]
 pub unsafe extern "C" fn zstd_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
@@ -36,12 +36,12 @@ pub unsafe extern "C" fn zstd_free(ptr: *mut u8, len: usize) {
     }
 }
 
-/// 成功なら展開後バイト数、失敗なら負値（`Error` のコード）。
+/// The decompressed byte count on success, or a negative value (an `Error` code) on failure.
 ///
 /// # Safety
-/// `src`/`out` はそれぞれ `src_len`/`out_cap` バイトの有効な領域を指すこと。
-/// `out` は `zstd_alloc` が返したものであること（下で一時的に `Vec` として
-/// 包み直すため、レイアウトが一致している必要がある）。
+/// `src`/`out` must each point at a valid region of `src_len`/`out_cap` bytes.
+/// `out` must be what `zstd_alloc` returned (it is temporarily re-wrapped as a
+/// `Vec` below, so the layouts have to match).
 #[no_mangle]
 pub unsafe extern "C" fn zstd_decompress(
     src: *const u8,
@@ -54,12 +54,12 @@ pub unsafe extern "C" fn zstd_decompress(
     }
     let s = unsafe { core::slice::from_raw_parts(src, src_len) };
 
-    // 呼び出し側が所有するバッファを一時的に Vec として包む。`decompress_into`
-    // は `out_cap` を超えて書かないので再確保は起きず、元のポインタのまま。
+    // Temporarily wrap the caller-owned buffer as a Vec. `decompress_into` never
+    // writes past `out_cap`, so no reallocation happens and the pointer stays put.
     let mut v = unsafe { Vec::from_raw_parts(out, 0, out_cap) };
     let r = crate::decompress_into(s, &mut v, out_cap);
     let n = v.len();
-    // 領域の所有権はホストにあるので解放しない。
+    // The host owns the region, so do not free it.
     core::mem::forget(v);
 
     match r {

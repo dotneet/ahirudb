@@ -1,8 +1,8 @@
-//! 論理プラン。
+//! The logical plan.
 //!
-//! 最適化はルールベースのみ（コストベースは持たない）。効果の大半は
-//! 「読むバイト数を減らす」ことから来るので、射影プッシュダウンと述語による
-//! 分割枝刈りの 2 つに集中する（DESIGN.md §9）。
+//! Optimization is rule-based only (there is no cost model). Most of the benefit comes
+//! from "reading fewer bytes", so it concentrates on two things: projection pushdown and
+//! split pruning by predicate (DESIGN.md §9).
 
 pub mod bind;
 pub mod compile;
@@ -14,12 +14,12 @@ use crate::prelude::*;
 use crate::sql::ast::{ExprId, JoinKind};
 use crate::vector::{Field, Ty};
 
-// 枝刈り述語はフォーマット層との契約なので `format` 側に置いてある。
-// ここからは再エクスポートするだけ。
+// Pruning predicates are a contract with the format layer, so they live on the `format`
+// side. This only re-exports them.
 pub use crate::format::{range_may_match, PruneOp, Pruner};
 pub use scope::Scope;
 
-/// 集約関数。
+/// Aggregate functions.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum AggKind {
@@ -29,34 +29,35 @@ pub enum AggKind {
     Min,
     Max,
     Avg,
-    /// 標本標準偏差（`stddev` / `stddev_samp`）。
+    /// Sample standard deviation (`stddev` / `stddev_samp`).
     StdDev,
-    /// 標本分散（`variance` / `var_samp`）。
+    /// Sample variance (`variance` / `var_samp`).
     Variance,
-    /// 連続分布の中央値（線形補間）。`quantile_cont(x, 0.5)` と同じ。
+    /// The continuous-distribution median (linear interpolation). The same as `quantile_cont(x, 0.5)`.
     Median,
-    /// 最頻値。同数が複数あれば最初に見つかったものを返す（実装依存だが
-    /// DuckDB も同じ立場）。
+    /// The mode. On a tie, the first one found is returned (implementation-defined, but
+    /// DuckDB takes the same position).
     Mode,
-    /// 近似個数（実装は v1 では厳密カウントでよい。将来 HyperLogLog に
-    /// 差し替える余地として名前だけ分けてある）。
+    /// An approximate count (the v1 implementation may be an exact count; the name is kept
+    /// separate to leave room for swapping in HyperLogLog later).
     ApproxCountDistinct,
-    /// カンマ等の区切り文字で連結する。第 2 引数は区切り文字（既定は空文字）。
+    /// Concatenates with a separator such as a comma. The second argument is the separator (the default is the empty string).
     StringAgg,
-    /// 値を集めて JSON 風のテキストにする。LIST 型が無いための代替表現
-    /// （DESIGN.md のネスト型の扱いと同じ判断）。
+    /// Collects values into JSON-like text. A substitute representation, since there is no
+    /// LIST type (the same judgment as DESIGN.md's handling of nested types).
     ArrayAgg,
 }
 
 impl AggKind {
-    /// 引数の型から結果型を決める。
+    /// Determines the result type from the argument type.
     ///
-    /// **バインダと実行オペレータは必ずこの関数を通すこと。** 別々に決めると
-    /// 出力スキーマと実データの型がずれ、結果の読み出しが静かに壊れる。
+    /// **The binder and the execution operators must both go through this function.**
+    /// Deciding separately would make the output schema disagree with the real data's type
+    /// and silently break reading the result.
     pub fn result_ty(self, input: Ty) -> Result<Ty> {
         Ok(match self {
             AggKind::CountStar | AggKind::Count | AggKind::ApproxCountDistinct => Ty::BigInt,
-            // 整数の合計は 64 ビットで溢れやすいので 128 ビットに広げる。
+            // Integer sums overflow 64 bits easily, so they widen to 128 bits.
             AggKind::Sum => match input {
                 t if t.is_integer() => Ty::HugeInt,
                 Ty::Decimal { precision, scale } => {
@@ -70,25 +71,25 @@ impl AggKind {
                 t if t.is_numeric() || t == Ty::Null => Ty::Double,
                 _ => err!(TypeMismatch),
             },
-            // MIN/MAX/MODE は入力型をそのまま返す。
+            // MIN/MAX/MODE return the input type unchanged.
             AggKind::Min | AggKind::Max | AggKind::Mode => input,
             AggKind::StringAgg => Ty::Varchar,
             AggKind::ArrayAgg => Ty::Varchar,
         })
     }
 
-    /// 引数を取らない集約か。
+    /// Whether the aggregate takes no arguments.
     pub fn is_nullary(self) -> bool {
         self == AggKind::CountStar
     }
 
-    /// `StringAgg` のように 2 個目の引数（区切り文字など）を取りうるか。
-    /// 取れる場合、省略時の既定引数を返す。
+    /// Whether it may take a second argument (a separator and the like), as `StringAgg` does.
+    /// If so, returns the default argument used when it is omitted.
     ///
-    /// `string_agg(x)`（区切り文字省略）は DuckDB では `','` がデフォルト
-    /// （`duckdb -c "select string_agg(x) from (values ('p'),('q'),('r')) t(x)"`
-    /// が `p,q,r` になることを実測済み。`group_concat` エイリアスも同じ）。
-    /// 空文字列ではない。
+    /// In DuckDB, `string_agg(x)` (separator omitted) defaults to `','` (measured:
+    /// `duckdb -c "select string_agg(x) from (values ('p'),('q'),('r')) t(x)"` gives
+    /// `p,q,r`; the `group_concat` alias behaves the same).
+    /// It is not the empty string.
     pub fn optional_arg_default(self) -> Option<&'static [u8]> {
         match self {
             AggKind::StringAgg => Some(b","),
@@ -96,7 +97,7 @@ impl AggKind {
         }
     }
 
-    /// 名前から引く。大文字小文字は区別しない。
+    /// Looks up by name. Case-insensitive.
     pub fn from_name(name: &str) -> Option<AggKind> {
         use crate::rt::hash::eq_ascii_ci;
         let n = name.as_bytes();
@@ -133,20 +134,20 @@ impl AggKind {
 #[derive(Clone)]
 pub struct Agg {
     pub kind: AggKind,
-    /// `COUNT(*)` では `None`。
+    /// `None` for `COUNT(*)`.
     pub arg: Option<Program>,
     pub distinct: bool,
     pub name: String,
-    /// `string_agg(x, sep)` の区切り文字。定数リテラルのみ許す
-    /// （行ごとに変わる区切り文字は実用上ほぼ無く、実行を単純に保てる）。
+    /// The separator of `string_agg(x, sep)`. Only a constant literal is allowed
+    /// (a per-row separator has almost no practical use, and this keeps execution simple).
     pub separator: Vec<u8>,
-    /// `agg(...) FILTER (WHERE cond)`。集約前の入力スコープで評価する
-    /// BOOLEAN 式。偽・NULL の行はこの集約の更新から除外する。
+    /// `agg(...) FILTER (WHERE cond)`. A BOOLEAN expression evaluated in the pre-aggregation
+    /// input scope. Rows that are false or NULL are excluded from updating this aggregate.
     pub filter: Option<Program>,
 }
 
 impl Agg {
-    /// 引数の型。`COUNT(*)` は引数を持たないので `Ty::Null`。
+    /// The argument type. `COUNT(*)` takes no argument, so it is `Ty::Null`.
     pub fn input_ty(&self) -> Ty {
         self.arg.as_ref().map_or(Ty::Null, |p| p.result_ty)
     }
@@ -156,7 +157,7 @@ impl Agg {
     }
 }
 
-/// ウィンドウ関数の種類。
+/// The kind of window function.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum WindowKind {
@@ -167,7 +168,7 @@ pub enum WindowKind {
     Lead,
     FirstValue,
     LastValue,
-    /// 集約のウィンドウ版（`sum(x) OVER (...)`）。
+    /// The window version of an aggregate (`sum(x) OVER (...)`).
     Agg(AggKind),
 }
 
@@ -194,17 +195,17 @@ impl WindowKind {
         }
     }
 
-    /// 引数を取らない関数か。
+    /// Whether the function takes no arguments.
     pub fn is_nullary(self) -> bool {
         matches!(self, WindowKind::RowNumber | WindowKind::Rank | WindowKind::DenseRank)
     }
 }
 
-/// 1 つのウィンドウ関数呼び出し。
+/// One window function call.
 #[derive(Clone)]
 pub struct WindowSpec {
     pub kind: WindowKind,
-    /// 関数の引数。`row_number()` は空、`lag(x, n, d)` は 3 個まで。
+    /// The function's arguments. `row_number()` takes none; `lag(x, n, d)` takes up to three.
     pub args: Vec<Program>,
     pub partition_by: Vec<Program>,
     pub order_by: Vec<SortKey>,
@@ -213,7 +214,7 @@ pub struct WindowSpec {
     pub name: String,
 }
 
-/// 集合演算。
+/// Set operations.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum SetOpKind {
@@ -231,37 +232,36 @@ pub struct SortKey {
 
 #[derive(Clone)]
 pub struct ScanSpec {
-    /// カタログ上のテーブル添字。
+    /// The table index in the catalog.
     pub table: usize,
-    /// 読み出す列の添字。射影プッシュダウン後。
+    /// The indices of the columns to read. After projection pushdown.
     pub columns: Vec<usize>,
-    /// スキャンが出力するスキーマ（`columns` と同じ並び）。
+    /// The schema the scan outputs (in the same order as `columns`).
     pub schema: Vec<Field>,
-    /// 分割の枝刈り用の述語。
+    /// The predicate used for split pruning.
     pub pruners: Vec<Pruner>,
 }
 
-/// `catalog::MemTable`（インメモリ表）のスキャン。`ddl` フィーチャ専用。
+/// A scan of a `catalog::MemTable` (an in-memory table). Exclusive to the `ddl` feature.
 ///
-/// 常に全列を出す（射影プッシュダウンはしない）。CTE/派生表の `Rel` と同じ
-/// 扱いで、必要な列だけを選ぶのは上位の `Project` に任せる —
-/// メモリ上に全データがあるので、Parquet の「読むバイト数を減らす」最適化
-/// が効く場面がそもそも無い。
+/// It always emits every column (no projection pushdown). Treated like the `Rel` of a
+/// CTE or derived table, with choosing only the needed columns left to the `Project`
+/// above -- all the data is in memory, so there is simply no place for Parquet's
+/// "read fewer bytes" optimization to help.
 #[cfg(feature = "ddl")]
 #[derive(Clone)]
 pub struct MemScanSpec {
-    /// `Catalog::mem_get` に渡す添字（ファイルテーブルの `table` とは
-    /// 別の添字空間）。
+    /// The index passed to `Catalog::mem_get` (a different index space from a file table's `table`).
     pub table: usize,
     pub schema: Vec<Field>,
 }
 
-/// `Clone` は GROUPING SETS 対応で要る: FROM/WHERE まで束ねたプラン木を
-/// グルーピングセットの数だけ複製し、それぞれに別の `Node::Aggregate` を
-/// 被せて `Node::SetOp`（UNION ALL）で束ねる（`plan::bind` 参照）。複製する
-/// のは実行前の命令列であって実データではないが、結果として実行時には
-/// 同じ入力をセットの数だけスキャンし直すことになる。実行オペレータ
-/// （`exec/`）を増やさずに済む方を優先した割り切り。
+/// `Clone` is needed for GROUPING SETS support: the plan tree bundled up to FROM/WHERE is
+/// duplicated once per grouping set, each covered with its own `Node::Aggregate` and
+/// bundled with `Node::SetOp` (UNION ALL) (see `plan::bind`). What is duplicated is the
+/// pre-execution instruction sequence, not the real data, but as a consequence execution
+/// does rescan the same input once per set. A deliberate trade-off, preferring not to add
+/// execution operators (`exec/`).
 #[derive(Clone)]
 pub enum Node {
     Scan(Box<ScanSpec>),
@@ -280,41 +280,41 @@ pub enum Node {
         input: Box<Node>,
         groups: Vec<Program>,
         aggs: Vec<Agg>,
-        /// グループキー、続いて集約結果、の順。
+        /// Group keys first, then the aggregate results.
         schema: Vec<Field>,
-        /// `HAVING`。集約後のスキーマで評価する。
+        /// `HAVING`. Evaluated against the post-aggregation schema.
         having: Option<Program>,
     },
     Sort {
         input: Box<Node>,
         keys: Vec<SortKey>,
-        /// `ORDER BY ... LIMIT n` は Top-N に落とす。
+        /// `ORDER BY ... LIMIT n` is lowered to a Top-N.
         limit: Option<usize>,
     },
     Join {
         left: Box<Node>,
         right: Box<Node>,
         kind: JoinKind,
-        /// 等値結合のキー。左右で同じ個数。空ならネストループになる。
+        /// The equi-join keys. The same count on both sides. Empty means a nested loop.
         left_keys: Vec<Program>,
         right_keys: Vec<Program>,
-        /// 等値条件に落とせなかった残りの述語。結合後のスキーマで評価する。
+        /// The remaining predicates that could not be reduced to equality. Evaluated against the post-join schema.
         residual: Option<Program>,
-        /// 左のスキーマ、続いて右のスキーマ。
+        /// The left schema, followed by the right schema.
         schema: Vec<Field>,
     },
-    /// ウィンドウ関数。出力は入力の列に続けてウィンドウ列を並べる。
+    /// Window functions. The output places the window columns after the input's columns.
     Window {
         input: Box<Node>,
         windows: Vec<WindowSpec>,
         schema: Vec<Field>,
     },
-    /// 集合演算。左右のスキーマは列数と型が一致していなければならない。
+    /// A set operation. The left and right schemas must agree in column count and type.
     SetOp {
         left: Box<Node>,
         right: Box<Node>,
         op: SetOpKind,
-        /// `UNION ALL` のように重複を残すか。
+        /// Whether duplicates are kept, as with `UNION ALL`.
         all: bool,
         schema: Vec<Field>,
     },
@@ -323,95 +323,94 @@ pub enum Node {
         limit: Option<u64>,
         offset: u64,
     },
-    /// `DISTINCT ON (keys)`。入力の並び順で最初に見た行だけをキーごとに通す
-    /// ストリーミングフィルタ。呼び出し側が `ORDER BY` で希望の並びを先に
-    /// 確定させておく（DESIGN.md の「既存インフラの再利用」方針）。
+    /// `DISTINCT ON (keys)`. A streaming filter that passes only the first row seen per key
+    /// in the input's order. The caller settles the desired order first with `ORDER BY`
+    /// (DESIGN.md's "reuse the existing infrastructure" policy).
     DistinctOn {
         input: Box<Node>,
         keys: Vec<Program>,
     },
-    /// `WITH RECURSIVE name AS (anchor UNION [ALL] recursive_term)`。
+    /// `WITH RECURSIVE name AS (anchor UNION [ALL] recursive_term)`.
     ///
-    /// アンカーを 1 度だけ読み切って初期の作業集合にし、それを入力に
-    /// `recursive_term` を繰り返し実行して新規行が無くなるまで積み増す
-    /// （不動点反復）。`recursive_term` の中にある自己参照は
-    /// `Node::WorkingTable` として現れ、実行オペレータ
-    /// （`exec::recursive::RecursiveCte`）がイテレーションごとに直前の
-    /// 新規行を差し込んで再構築する（`plan::bind::split_recursive_cte`
-    /// 参照）。
+    /// The anchor is read to completion once to form the initial working set, and
+    /// `recursive_term` is then run repeatedly on that input, accumulating until no new rows
+    /// appear (fixed-point iteration). Self-references inside `recursive_term` appear as
+    /// `Node::WorkingTable`, and the execution operator (`exec::recursive::RecursiveCte`)
+    /// feeds in the previous iteration's new rows and rebuilds each round (see
+    /// `plan::bind::split_recursive_cte`).
     RecursiveCte {
         anchor: Box<Node>,
         recursive_term: Box<Node>,
-        /// `UNION ALL` なら重複を残す。`UNION` ならアンカー・全イテレーションを
-        /// 通して重複排除する。
+        /// With `UNION ALL`, duplicates are kept. With `UNION`, duplicates are removed
+        /// across the anchor and every iteration.
         union_all: bool,
         schema: Vec<Field>,
     },
-    /// `RecursiveCte` の `recursive_term` の中で自分自身を参照する箇所。
+    /// Where `recursive_term` references itself inside a `RecursiveCte`.
     ///
-    /// 論理プラン上はスキーマだけを持つ葉で、実データは持たない。
-    /// `exec::build` から素で（`RecursiveCte` の外側で）組み立てられることは
-    /// バインダのバグなので `Internal` エラーになる。
+    /// In the logical plan it is a leaf carrying only a schema, with no real data.
+    /// Being built bare by `exec::build` (outside a `RecursiveCte`) is a binder bug and
+    /// becomes an `Internal` error.
     WorkingTable {
         schema: Vec<Field>,
     },
-    /// `UNNEST`。入力の 1 行を、`expr`（`Ty::Json` の配列）の要素数ぶんの行に
-    /// 展開する（1 行 → N 行の set-returning オペレータ）。入力の他の列は
-    /// そのまま複製する。SELECT リストの `UNNEST(x)` と FROM 句の
-    /// `UNNEST(x) AS t(c)`（暗黙 LATERAL）はどちらもこのノードに落ちる
-    /// （`plan::bind` 参照）。
+    /// `UNNEST`. Expands one input row into as many rows as `expr` (a `Ty::Json` array) has
+    /// elements (a 1-row -> N-row set-returning operator). The input's other columns are
+    /// duplicated as they are. Both `UNNEST(x)` in a SELECT list and
+    /// `UNNEST(x) AS t(c)` in a FROM clause (implicitly LATERAL) lower to this node
+    /// (see `plan::bind`).
     Unnest {
         input: Box<Node>,
-        /// 展開対象の配列を入力行に対して評価する式。結果型は必ず `Ty::Json`。
+        /// The expression evaluated per input row to produce the array to expand. Its result type is always `Ty::Json`.
         expr: Program,
-        /// 展開後の要素列の宣言型。全行・全要素を通して常にこの型で出す
-        /// （`plan::bind::narrow_unnest_elem_ty` が静的に安全と判定できた
-        /// ときだけ `Ty::Json` 以外に絞り込む。実データを見ないと判定でき
-        /// ない一般のケース、たとえばテーブルの JSON 列そのものを対象に
-        /// する場合は `Ty::Json` のまま。実行側は宣言された型に厳密に
-        /// 従う ―― 値が型と食い違えば NULL にする、決してパニックしない）。
+        /// The declared type of the expanded element column. Every row and every element is
+        /// emitted with this type (`plan::bind::narrow_unnest_elem_ty` narrows it to
+        /// something other than `Ty::Json` only when it can prove that statically safe. The
+        /// general case, which cannot be decided without seeing the real data -- targeting a
+        /// table's JSON column itself, say -- stays `Ty::Json`. Execution follows the
+        /// declared type strictly: a value disagreeing with the type becomes NULL, never a panic).
         elem_ty: Ty,
-        /// 入力のスキーマ ++ 展開要素 1 列。
+        /// The input schema ++ one expanded element column.
         schema: Vec<Field>,
     },
     /// `generate_series(start, stop, step)` / `range(start, stop, step)`
-    /// テーブル関数。カタログ・I/O を一切経由しない「計算だけのソース」
-    /// （`exec::range::GenerateSeries` 参照）。
+    /// A table function. A "compute-only source" that goes through neither the catalog nor
+    /// I/O (see `exec::range::GenerateSeries`).
     GenerateSeries {
         start: i64,
         stop: i64,
         step: i64,
-        /// `true` なら `stop` を含む（`generate_series`）。
+        /// `true` includes `stop` (`generate_series`).
         inclusive: bool,
         schema: Vec<Field>,
     },
-    /// `USING SAMPLE` / `TABLESAMPLE`。入力の行を一定確率・一定行数で間引く。
-    /// 列は変えないので `input.schema()` をそのまま使う
-    /// （`exec::sample` 参照）。
+    /// `USING SAMPLE` / `TABLESAMPLE`. Thins the input rows at a fixed probability or to a
+    /// fixed row count. It does not change the columns, so `input.schema()` is used as is
+    /// (see `exec::sample`).
     Sample {
         input: Box<Node>,
         spec: SampleSpec,
     },
 }
 
-/// `Node::Sample` の実行時パラメタ。手法（`BERNOULLI`/`SYSTEM`/`RESERVOIR`）
-/// は構文として受理するだけで、実装は `is_rows` の 2 択に落ちる
-/// （`plan::bind::resolve_sample_spec` のドキュメント参照）。
+/// The runtime parameters of `Node::Sample`. The method
+/// (`BERNOULLI`/`SYSTEM`/`RESERVOIR`) is accepted syntactically only; the implementation
+/// reduces to the two cases of `is_rows` (see the docs on `plan::bind::resolve_sample_spec`).
 #[derive(Clone, Copy)]
 pub struct SampleSpec {
-    /// `false` ならパーセント指定（0.0..=100.0）、`true` なら行数指定。
+    /// `false` means a percentage (0.0..=100.0); `true` means a row count.
     pub is_rows: bool,
     pub amount: f64,
     pub seed: u64,
 }
 
-/// `USING SAMPLE`/`TABLESAMPLE` にシード省略時の既定値。呼び出しごとに
-/// 変える理由が無い（決定的な方がテストしやすく、`NeedIo` をまたいでも
-/// 結果の再現性を保てる。タスクの指示どおり「シードは決定的でよい」）。
+/// The default seed for `USING SAMPLE`/`TABLESAMPLE` when one is omitted. There is no
+/// reason to vary it per call (determinism is easier to test and keeps results reproducible
+/// across a `NeedIo`; per the task's instruction, "a deterministic seed is fine").
 pub const DEFAULT_SAMPLE_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 
 impl Node {
-    /// このノードが出力するスキーマ。
+    /// The schema this node outputs.
     pub fn schema(&self) -> &[Field] {
         match self {
             Node::Scan(s) => &s.schema,
@@ -437,8 +436,8 @@ impl Node {
 
 pub struct Plan {
     pub root: Node,
-    /// 相関サブクエリの場合、`root` のスキーマ末尾に付加された相関キー列に
-    /// 対応する外側スコープ側の式（`plan::bind` の相関検出結果）。
-    /// 非相関なら空で、`root` に余分な列は無い。
+    /// For a correlated subquery, the expressions in the outer scope corresponding to the
+    /// correlation key columns appended to the end of `root`'s schema (the result of
+    /// `plan::bind`'s correlation detection). Empty when uncorrelated, with no extra columns on `root`.
     pub correlated: Vec<ExprId>,
 }

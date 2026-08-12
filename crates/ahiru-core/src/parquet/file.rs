@@ -1,22 +1,23 @@
-//! ファイル単位の入口: フッタの位置決めとメタデータの解決。
+//! File-level entry point: locating the footer and resolving metadata.
 //!
-//! フッタは末尾にあるので、まず末尾 64 KiB を投機的に取得する。多くの
-//! ファイルはこれ 1 往復でフッタを読み切れる（DESIGN.md §5）。足りなければ
-//! `footer_retry_range` が示す正確な範囲をもう一度取りに行く。
+//! The footer sits at the end of the file, so we speculatively fetch the
+//! last 64 KiB first. Most files can have their footer fully read in this
+//! single round trip (DESIGN.md §5). If that's not enough, we go fetch the
+//! exact range indicated by `footer_retry_range`.
 
 use crate::parquet::meta::{decode_file_metadata, FileMetaData};
 use crate::parquet::schema::{resolve_schema, ParquetSchema};
 use crate::parquet::*;
 use crate::prelude::*;
 
-/// 末尾の投機取得サイズ。
+/// Speculative fetch size for the tail.
 pub const FOOTER_PROBE: u64 = 64 * 1024;
-/// フッタ長の上限。壊れた長さフィールドで巨大確保しないため。
+/// Upper bound on footer length. Prevents a huge allocation from a corrupted length field.
 pub const MAX_FOOTER_LEN: usize = 256 * 1024 * 1024;
-/// マジック 4 バイト + 長さ 4 バイト。
+/// Magic (4 bytes) + length (4 bytes).
 const TRAILER: usize = 8;
 
-/// 解決済みの Parquet ファイル。
+/// A resolved Parquet file.
 pub struct ParquetFile {
     pub meta: FileMetaData,
     pub schema: ParquetSchema,
@@ -32,17 +33,18 @@ impl ParquetFile {
     }
 }
 
-/// 末尾の投機取得で読むべき範囲 `[offset, len)`。
+/// The range `[offset, len)` to read for the tail's speculative fetch.
 pub fn footer_probe_range(file_len: u64) -> (u64, u64) {
     let len = FOOTER_PROBE.min(file_len);
     (file_len - len, len)
 }
 
-/// 投機取得したテール部分からフッタを解決する。
+/// Resolve the footer from a speculatively fetched tail portion.
 ///
-/// `tail` はファイル末尾のバイト列、`tail_offset` はそのファイル上の開始位置。
-/// テールにフッタ全体が収まっていなければ、必要な範囲を `Err` ではなく
-/// `Ok(Err(range))` として返す（呼び出し側が再取得する）。
+/// `tail` is the byte range at the end of the file, and `tail_offset` is
+/// where that starts in the file. If the entire footer doesn't fit within
+/// the tail, the needed range is returned as `Ok(Err(range))` rather than
+/// `Err` (so the caller can refetch it).
 pub fn parse_footer(
     tail: &[u8],
     tail_offset: u64,
@@ -67,7 +69,7 @@ pub fn parse_footer(
     let meta_start = meta_end - meta_len as u64;
 
     if meta_start < tail_offset {
-        // テールに収まらなかった。フッタ全体 + トレーラを取り直す。
+        // Didn't fit in the tail. Refetch the entire footer + trailer.
         return Ok(Err((meta_start, file_len - meta_start)));
     }
 
@@ -78,16 +80,16 @@ pub fn parse_footer(
     Ok(Ok(ParquetFile { meta, schema }))
 }
 
-/// ファイル全体がメモリにある場合の入口。
+/// Entry point for when the entire file is already in memory.
 pub fn open_bytes(bytes: &[u8]) -> Result<ParquetFile> {
     let file_len = bytes.len() as u64;
     let (off, _) = footer_probe_range(file_len);
     match parse_footer(&bytes[off as usize..], off, file_len)? {
         Ok(f) => Ok(f),
-        // メモリ上に全体があるので、再取得ではなくその場で読み直せばよい。
+        // The whole file is already in memory, so just re-read it in place instead of refetching.
         Err((start, _)) => match parse_footer(&bytes[start as usize..], start, file_len)? {
             Ok(f) => Ok(f),
-            // 2 度目は必ずフッタ全体を含む範囲なので、ここに来たら長さが矛盾している。
+            // The second attempt always covers a range that includes the entire footer, so reaching here means the lengths are inconsistent.
             Err(_) => err!(BadMagic),
         },
     }
@@ -127,7 +129,7 @@ mod tests {
 
     #[test]
     fn requests_refetch_when_footer_exceeds_probe() {
-        // ファイルは 200 KiB、フッタは 100 KiB。64 KiB の投機取得では届かない。
+        // The file is 200 KiB and the footer is 100 KiB. A 64 KiB speculative fetch doesn't reach it.
         let file_len = 200 * 1024u64;
         let mut tail = vec![0u8; FOOTER_PROBE as usize];
         let n = tail.len();

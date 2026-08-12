@@ -1,33 +1,36 @@
-//! Parquet のページエンコーディングのデコーダ。
+//! Decoders for Parquet page encodings.
 //!
-//! 扱うのは RLE/bit-packing hybrid（definition level と辞書インデックス）と
-//! DELTA_* 系。PLAIN は固定長のコピーで済むので `reader.rs` 側で処理する。
+//! Handles the RLE/bit-packing hybrid (definition levels and dictionary indices)
+//! and the DELTA_* family. PLAIN is just a fixed-length copy, so it's handled on
+//! the `reader.rs` side.
 //!
-//! 入力はネットワーク由来で信用できない。全ての読み取りは境界検査を行い、
-//! 破損に対しては必ず `Err` を返す（パニックも無限ループもしない）。
-//! 特に「値を 1 個も生まない run」が連続しても、ヘッダは必ず 1 バイト以上
-//! 消費するのでループは必ず終端する。
+//! Input comes from the network and cannot be trusted. Every read performs bounds
+//! checking, and any corruption always returns `Err` (never panics, never loops
+//! forever). In particular, even if a "run that produces zero values" repeats
+//! consecutively, the header always consumes at least one byte, so the loop is
+//! guaranteed to terminate.
 
 use crate::prelude::*;
 use crate::vector::{Bitmap, BytesData};
 
-/// `max_value` を表現するのに必要なビット数。
+/// Number of bits needed to represent `max_value`.
 pub fn bit_width(max_value: u32) -> u8 {
     (u32::BITS - max_value.leading_zeros()) as u8
 }
 
-/// 1 ストリームが宣言できる値数の上限。宣言値をそのまま `usize` にすると
-/// wasm32 (usize = 32 ビット) で切り捨てが起きるため、先に弾く。
+/// Upper bound on the number of values a single stream may declare. Casting the
+/// declared value directly to `usize` would truncate on wasm32 (usize = 32 bits),
+/// so we reject oversized values up front.
 const MAX_VALUES: u64 = 1 << 31;
 
-/// DELTA_BINARY_PACKED のブロックサイズ上限。ミニブロックの一時計算が
-/// 32 ビットで溢れない範囲に抑える。
+/// Upper bound on the DELTA_BINARY_PACKED block size. Kept small enough that the
+/// miniblock's intermediate calculations never overflow 32 bits.
 const MAX_BLOCK: u64 = 1 << 20;
 
-// --- ビット列の読み取り -----------------------------------------------------
+// --- Reading bit streams ----------------------------------------------------
 
-/// LSB-first のビット列リーダ。Parquet の bit-packing は全てこの順序で、
-/// 最初の値が先頭バイトの下位ビットに入る。
+/// An LSB-first bit-stream reader. All Parquet bit-packing uses this order: the
+/// first value goes into the low bits of the first byte.
 struct BitReader<'a> {
     buf: &'a [u8],
     bit_pos: usize,
@@ -39,8 +42,8 @@ impl<'a> BitReader<'a> {
         BitReader { buf, bit_pos: 0 }
     }
 
-    /// 次の `width` ビット（0..=64）を読む。`width == 0` は 1 ビットも
-    /// 消費せず 0 を返す（全値ゼロの run / ミニブロック）。
+    /// Reads the next `width` bits (0..=64). `width == 0` consumes no bits and
+    /// returns 0 (an all-zero run / miniblock).
     fn read(&mut self, width: u8) -> Result<u64> {
         let want = width as u32;
         let mut got = 0u32;
@@ -59,7 +62,7 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// ULEB128 可変長整数。`pos` を進める。10 バイトを超えたら破損とみなす。
+/// ULEB128 variable-length integer. Advances `pos`. Treated as corrupted past 10 bytes.
 fn uleb128(src: &[u8], pos: &mut usize) -> Result<u64> {
     let mut result = 0u64;
     let mut shift = 0u32;
@@ -76,7 +79,7 @@ fn uleb128(src: &[u8], pos: &mut usize) -> Result<u64> {
     }
 }
 
-/// zigzag デコード。DELTA_* のヘッダは全てこの形式。
+/// Zigzag decoding. Every DELTA_* header uses this format.
 #[inline]
 fn zigzag(u: u64) -> i64 {
     ((u >> 1) as i64) ^ -((u & 1) as i64)
@@ -84,29 +87,30 @@ fn zigzag(u: u64) -> i64 {
 
 // --- RLE / bit-packing hybrid -----------------------------------------------
 
-/// RLE / bit-packing hybrid のデコーダ。
-/// definition level と辞書インデックスの両方で使う。
+/// RLE / bit-packing hybrid decoder.
+/// Used for both definition levels and dictionary indices.
 ///
-/// run が要求より多くの値を持つことがあるので、ストリーミングできるよう
-/// 余りを内部に残す。bit-packed は 8 個単位（= `bit_width` バイト単位）で
-/// バイト境界に揃うため、持ち越しは 8 個のバッファ 1 つで足りる。
+/// A run can hold more values than requested, so leftovers are kept internally to
+/// support streaming. Bit-packed runs align to a byte boundary every 8 values
+/// (= `bit_width` bytes), so a single 8-value buffer is enough to carry the
+/// leftover.
 pub struct RleDecoder<'a> {
     data: &'a [u8],
     pos: usize,
     bit_width: u8,
-    /// 展開待ちの RLE run。
+    /// The RLE run waiting to be expanded.
     rle_value: u32,
     rle_left: usize,
-    /// bit-packed run に残っている未展開の値数（常に 8 の倍数）。
+    /// Number of unexpanded values remaining in the bit-packed run (always a multiple of 8).
     packed_left: usize,
-    /// 直近に展開した 8 個と、その未消費範囲。
+    /// The most recently expanded 8 values, and the range not yet consumed.
     group: [u32; 8],
     group_pos: usize,
     group_len: usize,
 }
 
 impl<'a> RleDecoder<'a> {
-    /// `data` は長さプレフィックスを除いた RLE ストリーム本体。
+    /// `data` is the RLE stream body, with the length prefix removed.
     pub fn new(data: &'a [u8], bit_width: u8) -> Self {
         RleDecoder {
             data,
@@ -121,21 +125,22 @@ impl<'a> RleDecoder<'a> {
         }
     }
 
-    /// 次の run ヘッダを読む。値を 0 個しか生まない run も仕様上は合法だが、
-    /// ヘッダで必ず 1 バイト以上進むので呼び出し側のループは停止する。
+    /// Reads the next run header. A run that produces zero values is technically
+    /// legal, but since the header always advances at least one byte, the caller's
+    /// loop still terminates.
     fn next_run(&mut self) -> Result<()> {
         let header = uleb128(self.data, &mut self.pos)?;
         let avail = (self.data.len() - self.pos) as u64;
         if header & 1 == 1 {
-            // bit-packed run。値数はグループ数 × 8 で、
-            // 1 グループがちょうど `bit_width` バイトを占める。
+            // A bit-packed run. The value count is groups x 8, where each group
+            // occupies exactly `bit_width` bytes.
             let groups = header >> 1;
             ensure!(groups <= MAX_VALUES >> 3, LimitExceeded, self.pos);
-            // run 全体の長さは確定しているので、ここでまとめて検査しておく。
+            // The full run length is already known, so check it all at once here.
             ensure!(groups * self.bit_width as u64 <= avail, UnexpectedEof, self.pos);
             self.packed_left = (groups as usize) * 8;
         } else {
-            // RLE run。値は ceil(bit_width / 8) バイトのリトルエンディアン。
+            // An RLE run. The value is ceil(bit_width / 8) bytes, little-endian.
             let count = header >> 1;
             ensure!(count <= MAX_VALUES, LimitExceeded, self.pos);
             let nbytes = (self.bit_width as usize).div_ceil(8);
@@ -151,7 +156,7 @@ impl<'a> RleDecoder<'a> {
         Ok(())
     }
 
-    /// bit-packed run から 8 個を展開して `group` に置く。
+    /// Expands 8 values from a bit-packed run into `group`.
     fn fill_group(&mut self) -> Result<()> {
         let nbytes = self.bit_width as usize;
         ensure!(nbytes <= self.data.len() - self.pos, UnexpectedEof, self.pos);
@@ -166,8 +171,8 @@ impl<'a> RleDecoder<'a> {
         Ok(())
     }
 
-    /// 値を 1 個以上取り出せる状態にする。持ち越し → RLE run →
-    /// 新しい run の順に用意する。
+    /// Ensures at least one value is available to take. Prepared in order: leftover
+    /// -> RLE run -> new run.
     fn ensure_available(&mut self) -> Result<()> {
         loop {
             if self.group_pos < self.group_len || self.rle_left > 0 {
@@ -181,9 +186,9 @@ impl<'a> RleDecoder<'a> {
         }
     }
 
-    /// 次の `n` 個の値を `out` に追記する。
+    /// Appends the next `n` values to `out`.
     pub fn read_u32(&mut self, n: usize, out: &mut Vec<u32>) -> Result<()> {
-        // 値は u32 に入れるので 32 ビットを超える幅は扱えない。
+        // Values are stored in u32, so widths beyond 32 bits are not supported.
         ensure!(self.bit_width <= 32, UnsupportedEncoding);
         let mut need = n;
         while need > 0 {
@@ -205,9 +210,9 @@ impl<'a> RleDecoder<'a> {
         Ok(())
     }
 
-    /// definition level を読み、`level == max_level`（= 値が存在する）を
-    /// validity ビットマップとして `out` に追記する。
-    /// 返り値は存在した値の個数。
+    /// Reads definition levels and appends `level == max_level` (= value is
+    /// present) to `out` as a validity bitmap.
+    /// Returns the number of values that were present.
     pub fn read_levels_into(
         &mut self,
         n: usize,
@@ -229,8 +234,8 @@ impl<'a> RleDecoder<'a> {
                 self.group_pos += take;
                 need -= take;
             } else {
-                // NULL が無い列は巨大な RLE run 1 本になる。ここが主要な経路
-                // なので、ビット単位ではなくワード単位でまとめて埋める。
+                // A column with no NULLs collapses into one giant RLE run. Since this is
+                // the dominant path, fill it word-at-a-time rather than bit-by-bit.
                 let take = core::cmp::min(need, self.rle_left);
                 let v = self.rle_value == max_level;
                 out.push_n(v, take);
@@ -247,11 +252,12 @@ impl<'a> RleDecoder<'a> {
 
 // --- DELTA_BINARY_PACKED ----------------------------------------------------
 
-/// i32 と i64 でデコーダ本体を 1 本に保つための出力側の抽象。
-/// 累算は常に i64 で行う。2 の補数では下位 32 ビットの折り返しが i32 での
-/// `wrapping_add` と一致するので、i32 列は最後に切り捨てるだけでよい。
+/// An output-side abstraction that keeps a single decoder body shared between i32
+/// and i64. Accumulation is always done in i64. Because two's-complement makes the
+/// lower-32-bit wraparound match i32's `wrapping_add`, an i32 column only needs a
+/// final truncation.
 trait DeltaSink {
-    /// ミニブロックのビット幅の上限。物理型の幅を超える宣言は破損。
+    /// Upper bound on a miniblock's bit width. A declaration exceeding the physical type's width is corrupted.
     const MAX_BITS: u8;
     fn push_delta(&mut self, v: i64);
 }
@@ -272,11 +278,12 @@ impl DeltaSink for Vec<i64> {
     }
 }
 
-/// DELTA_BINARY_PACKED の本体。返り値は消費したバイト数。
+/// The body of DELTA_BINARY_PACKED. Returns the number of bytes consumed.
 ///
-/// 最終ブロックは値数を切り上げてパディングされることがある。ヘッダの
-/// 総数を超えた分は値としては捨てるが、ミニブロックのバイトは消費する
-/// （消費バイト数が狂うと後続のバイト列の開始位置がずれる）。
+/// The final block may be padded, rounding the value count up. Values beyond the
+/// header's declared total are discarded, but the miniblock bytes are still
+/// consumed (if the consumed byte count were off, the start position of the
+/// following byte stream would be wrong).
 fn decode_delta<S: DeltaSink>(src: &[u8], n: usize, out: &mut S) -> Result<usize> {
     let mut pos = 0usize;
     let block_size = uleb128(src, &mut pos)?;
@@ -288,20 +295,20 @@ fn decode_delta<S: DeltaSink>(src: &[u8], n: usize, out: &mut S) -> Result<usize
     ensure!(miniblocks > 0 && miniblocks <= block_size, BadCompressedData, pos);
     ensure!(block_size % miniblocks == 0, BadCompressedData, pos);
     let per_mini = block_size / miniblocks;
-    // ミニブロックの値数は 32 の倍数。これでビット幅によらずミニブロックが
-    // バイト境界で終わることが保証される。
+    // The number of values per miniblock is a multiple of 32. This guarantees that
+    // a miniblock ends on a byte boundary regardless of bit width.
     ensure!(per_mini % 32 == 0, BadCompressedData, pos);
     ensure!(total <= MAX_VALUES, LimitExceeded, pos);
     ensure!(n as u64 <= total, UnexpectedEof, pos);
 
     let miniblocks = miniblocks as usize;
     let per_mini = per_mini as usize;
-    let mut remaining = total as usize; // 未処理の値数（先頭値を含む）
+    let mut remaining = total as usize; // Number of unprocessed values (including the first)
     let mut emitted = 0usize;
     let mut last = first;
 
     if remaining > 0 {
-        // 先頭値だけはヘッダに直接入っていて、デルタを足さない。
+        // Only the first value is embedded directly in the header; no delta is added to it.
         if n > 0 {
             out.push_delta(last);
             emitted = 1;
@@ -315,8 +322,8 @@ fn decode_delta<S: DeltaSink>(src: &[u8], n: usize, out: &mut S) -> Result<usize
         let widths_at = pos;
         pos += miniblocks;
         for k in 0..miniblocks {
-            // 最終ブロックで不要になったミニブロックはビット幅こそ書かれて
-            // いるが、データは 1 バイトも続かない。
+            // A miniblock that becomes unneeded in the final block still has its bit
+            // width written, but no data byte follows it at all.
             if remaining == 0 {
                 break;
             }
@@ -330,7 +337,7 @@ fn decode_delta<S: DeltaSink>(src: &[u8], n: usize, out: &mut S) -> Result<usize
                 let emit = core::cmp::min(take, n - emitted);
                 for _ in 0..emit {
                     let d = br.read(w)?;
-                    // 仕様上デルタの加算は折り返す。
+                    // Per spec, delta addition wraps.
                     last = last.wrapping_add(min_delta).wrapping_add(d as i64);
                     out.push_delta(last);
                 }
@@ -343,21 +350,21 @@ fn decode_delta<S: DeltaSink>(src: &[u8], n: usize, out: &mut S) -> Result<usize
     Ok(pos)
 }
 
-/// DELTA_BINARY_PACKED (INT32)。返り値は消費したバイト数。
-/// 後続のデータが続く DELTA_LENGTH_BYTE_ARRAY などで必要になる。
+/// DELTA_BINARY_PACKED (INT32). Returns the number of bytes consumed.
+/// Needed by things like DELTA_LENGTH_BYTE_ARRAY, where more data follows.
 pub fn decode_delta_binary_packed_i32(src: &[u8], n: usize, out: &mut Vec<i32>) -> Result<usize> {
     decode_delta(src, n, out)
 }
 
-/// DELTA_BINARY_PACKED (INT64)。返り値は消費したバイト数。
+/// DELTA_BINARY_PACKED (INT64). Returns the number of bytes consumed.
 pub fn decode_delta_binary_packed_i64(src: &[u8], n: usize, out: &mut Vec<i64>) -> Result<usize> {
     decode_delta(src, n, out)
 }
 
 // --- DELTA_*_BYTE_ARRAY -----------------------------------------------------
 
-/// DELTA_LENGTH_BYTE_ARRAY。
-/// 長さの列（DELTA_BINARY_PACKED）の直後に本体が連結されている。
+/// DELTA_LENGTH_BYTE_ARRAY.
+/// The body is concatenated immediately after the length column (DELTA_BINARY_PACKED).
 pub fn decode_delta_length_byte_array(src: &[u8], n: usize, out: &mut BytesData) -> Result<()> {
     let mut lens: Vec<i32> = Vec::new();
     let consumed = decode_delta_binary_packed_i32(src, n, &mut lens)?;
@@ -374,9 +381,9 @@ pub fn decode_delta_length_byte_array(src: &[u8], n: usize, out: &mut BytesData)
     Ok(())
 }
 
-/// DELTA_BYTE_ARRAY（前方共通接頭辞 + サフィックス）。
-/// 接頭辞長・サフィックス長がそれぞれ DELTA_BINARY_PACKED で並び、
-/// その後にサフィックス本体が連結されている。
+/// DELTA_BYTE_ARRAY (common leading prefix + suffix).
+/// The prefix lengths and suffix lengths are each laid out as DELTA_BINARY_PACKED,
+/// followed by the concatenated suffix bodies.
 pub fn decode_delta_byte_array(src: &[u8], n: usize, out: &mut BytesData) -> Result<()> {
     let mut prefixes: Vec<i32> = Vec::new();
     let c1 = decode_delta_binary_packed_i32(src, n, &mut prefixes)?;
@@ -386,15 +393,15 @@ pub fn decode_delta_byte_array(src: &[u8], n: usize, out: &mut BytesData) -> Res
 
     let data = &src[c1 + c2..];
     let mut off = 0usize;
-    // 直前の値は `out` の中にあるので、範囲だけ覚えて自身のバッファから
-    // コピーする。値ごとの一時バッファを持たずに済む。
+    // The previous value lives inside `out`, so we just remember its range and copy
+    // from our own buffer -- no need for a per-value temporary buffer.
     let mut prev_start = out.data.len();
     let mut prev_len = 0usize;
     for (&p, &s) in prefixes.iter().zip(suffixes.iter()) {
         ensure!(p >= 0 && s >= 0, ValueOutOfRange);
         let p = p as usize;
         let s = s as usize;
-        // 接頭辞が直前の値より長いのは破損。ここを通さないと範囲外コピーになる。
+        // A prefix longer than the previous value is corruption; without this check we'd copy out of range.
         ensure!(p <= prev_len, BadCompressedData);
         ensure!(s <= data.len() - off, UnexpectedEof, off);
         let start = out.data.len();
@@ -412,10 +419,10 @@ pub fn decode_delta_byte_array(src: &[u8], n: usize, out: &mut BytesData) -> Res
 mod tests {
     use super::*;
 
-    // --- テスト用のエンコーダ -----------------------------------------------
+    // --- Test encoders -----------------------------------------------------
 
-    /// LSB-first でパックする。デコーダとは独立に書いてあり、
-    /// 幅の小さいケースは下の手書きバイト列とも突き合わせている。
+    /// Packs LSB-first. Written independently of the decoder; small-width cases are
+    /// also cross-checked against the handwritten byte sequences below.
     fn pack(values: &[u32], width: u8) -> Vec<u8> {
         let mut out = vec![0u8; values.len() * width as usize / 8 + 1];
         let mut bit = 0usize;
@@ -431,14 +438,14 @@ mod tests {
         out
     }
 
-    /// bit-packed run（ヘッダ + 値）。`values.len()` は 8 の倍数であること。
+    /// A bit-packed run (header + values). `values.len()` must be a multiple of 8.
     fn bp_run(values: &[u32], width: u8) -> Vec<u8> {
         let mut out = vec![(((values.len() / 8) << 1) | 1) as u8];
         out.extend_from_slice(&pack(values, width));
         out
     }
 
-    /// RLE run（ヘッダ + 値）。
+    /// An RLE run (header + value).
     fn rle_run(value: u32, count: usize, width: u8) -> Vec<u8> {
         let mut out = Vec::new();
         let mut hdr = (count << 1) as u64;
@@ -481,20 +488,20 @@ mod tests {
 
     #[test]
     fn bitpacked_width1_handwritten() {
-        // ヘッダ 0x03 = (1 グループ << 1) | 1。値は 1 バイトに 8 個。
-        // 0b1001_0110 -> LSB から 0,1,1,0,1,0,0,1
+        // Header 0x03 = (1 group << 1) | 1. The value packs 8 into 1 byte.
+        // 0b1001_0110 -> from LSB: 0,1,1,0,1,0,0,1
         let data = [0x03u8, 0b1001_0110];
         assert_eq!(read_all(&data, 1, 8).unwrap(), vec![0, 1, 1, 0, 1, 0, 0, 1]);
     }
 
     #[test]
     fn bitpacked_width3_handwritten() {
-        // 値 0,1,2,3,4,5,6,7 を 3 ビット LSB-first で詰めると 3 バイト。
-        //   ビット列: 000 001 010 011 100 101 110 111 (下位から)
+        // Packing values 0,1,2,3,4,5,6,7 at 3 bits LSB-first yields 3 bytes.
+        //   bit stream: 000 001 010 011 100 101 110 111 (from the low end)
         //   byte0 = 10001000b = 0x88, byte1 = 11000110b = 0xc6, byte2 = 11111010b = 0xfa
         let data = [0x03u8, 0x88, 0xc6, 0xfa];
         assert_eq!(read_all(&data, 3, 8).unwrap(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
-        // 上のバイト列がテスト用エンコーダと一致することも確認する。
+        // Also confirm the above byte sequence matches the test encoder.
         assert_eq!(pack(&[0, 1, 2, 3, 4, 5, 6, 7], 3), vec![0x88, 0xc6, 0xfa]);
     }
 
@@ -506,7 +513,7 @@ mod tests {
 
     #[test]
     fn bitpacked_width0_yields_zeros_without_value_bytes() {
-        // 幅 0 では値バイトが存在しない。ヘッダ 1 バイトだけで 16 個読める。
+        // With width 0 there are no value bytes. A single header byte is enough to read 16 values.
         let data = [0x05u8];
         assert_eq!(read_all(&data, 0, 16).unwrap(), vec![0u32; 16]);
     }
@@ -526,7 +533,7 @@ mod tests {
                 .collect();
             let data = bp_run(&vals, w);
             assert_eq!(read_all(&data, w, vals.len()).unwrap(), vals, "width {w}");
-            // 端の値（0 と全ビット 1）も通す。
+            // Also exercise the edge values (0 and all-bits-1).
             let edge: Vec<u32> = (0..8).map(|i| if i % 2 == 0 { 0 } else { max }).collect();
             let data = bp_run(&edge, w);
             assert_eq!(read_all(&data, w, 8).unwrap(), edge, "width {w} edge");
@@ -537,16 +544,16 @@ mod tests {
 
     #[test]
     fn rle_run_handwritten() {
-        // ヘッダ 0x0a = 5 << 1（RLE, 5 個）、値 1 バイト。
+        // Header 0x0a = 5 << 1 (RLE, 5 values), value is 1 byte.
         let data = [0x0au8, 0x2a];
         assert_eq!(read_all(&data, 8, 5).unwrap(), vec![42u32; 5]);
     }
 
     #[test]
     fn rle_run_width0_consumes_no_value_bytes() {
-        // 幅 0 の RLE は値バイトを持たない。ヘッダ 1 バイトで 1000 個。
+        // A width-0 RLE has no value bytes. A single header byte covers 1000 values.
         let data = rle_run(0, 1000, 0);
-        assert_eq!(data.len(), 2, "ヘッダのみ (varint 2 バイト)");
+        assert_eq!(data.len(), 2, "header only (varint, 2 bytes)");
         assert_eq!(read_all(&data, 0, 1000).unwrap(), vec![0u32; 1000]);
     }
 
@@ -571,7 +578,7 @@ mod tests {
         assert_eq!(read_all(&data, 4, expect.len()).unwrap(), expect);
     }
 
-    // --- ストリーミング -------------------------------------------------------
+    // --- Streaming -------------------------------------------------------------
 
     #[test]
     fn successive_reads_split_a_single_rle_run() {
@@ -582,13 +589,13 @@ mod tests {
         assert_eq!(out, vec![3u32; 4]);
         d.read_u32(6, &mut out).unwrap();
         assert_eq!(out, vec![3u32; 10]);
-        // 使い切った後にさらに要求すれば EOF。
+        // Requesting more after it's exhausted should hit EOF.
         assert!(d.read_u32(1, &mut out).is_err());
     }
 
     #[test]
     fn successive_reads_split_a_bitpacked_group() {
-        // 1 グループ (8 個) を 3 + 2 + 3 に分けて読む。持ち越しが正しく残るか。
+        // Read one group (8 values) split into 3 + 2 + 3. Verify the leftover carries over correctly.
         let vals: Vec<u32> = vec![7, 6, 5, 4, 3, 2, 1, 0];
         let data = bp_run(&vals, 3);
         let mut d = RleDecoder::new(&data, 3);
@@ -605,7 +612,7 @@ mod tests {
         data.extend_from_slice(&rle_run(12, 5, 4));
         let mut d = RleDecoder::new(&data, 4);
         let mut out = Vec::new();
-        // 1 回目の要求が run をまたぐ。
+        // The first request spans across a run boundary.
         d.read_u32(10, &mut out).unwrap();
         assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8, 12, 12]);
         d.read_u32(3, &mut out).unwrap();
@@ -616,7 +623,7 @@ mod tests {
 
     #[test]
     fn read_levels_into_builds_validity() {
-        // max_level = 1。bit-packed で 0/1 が混ざり、その後 NULL でない RLE run。
+        // max_level = 1. Bit-packed with a mix of 0/1, followed by a non-NULL RLE run.
         let mut data = bp_run(&[1, 0, 1, 1, 0, 0, 1, 0], 1);
         data.extend_from_slice(&rle_run(1, 100, 1));
         data.extend_from_slice(&rle_run(0, 4, 1));
@@ -639,7 +646,7 @@ mod tests {
 
     #[test]
     fn read_levels_into_all_present_for_required_column() {
-        // REQUIRED 列は max_level = 0、幅 0。全行 valid になる。
+        // A REQUIRED column has max_level = 0, width 0. Every row is valid.
         let data = rle_run(0, 300, 0);
         let mut bm = Bitmap::new();
         let mut d = RleDecoder::new(&data, 0);
@@ -660,7 +667,7 @@ mod tests {
         assert!(bm.all_set());
     }
 
-    // --- RLE の異常系 ---------------------------------------------------------
+    // --- RLE error cases ---------------------------------------------------------
 
     #[test]
     fn rle_rejects_bit_width_over_32() {
@@ -673,40 +680,40 @@ mod tests {
 
     #[test]
     fn rle_rejects_truncated_input() {
-        // 空ストリーム。
+        // Empty stream.
         assert!(read_all(&[], 4, 1).is_err());
-        // ヘッダのみで値バイトが無い RLE。
+        // Header only, no value bytes for the RLE.
         assert!(read_all(&[0x0a], 8, 5).is_err());
-        // bit-packed の値バイトが足りない（4 グループ分の宣言に 1 バイト）。
+        // Not enough bit-packed value bytes (declaration for 4 groups, only 1 byte).
         assert!(read_all(&[0x09, 0xff], 8, 8).is_err());
-        // varint が終わらない。
+        // The varint never terminates.
         assert!(read_all(&[0x80, 0x80, 0x80], 8, 1).is_err());
     }
 
     #[test]
     fn rle_rejects_absurd_declared_counts() {
-        // RLE run 長 = u64 の上限付近。
+        // RLE run length near the u64 upper bound.
         let data = [0xfeu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00];
         assert!(read_all(&data, 8, 1).is_err());
-        // bit-packed グループ数が巨大。
+        // A huge bit-packed group count.
         let data = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00];
         assert!(read_all(&data, 8, 1).is_err());
     }
 
     #[test]
     fn rle_zero_length_runs_terminate() {
-        // 値を生まない run が並ぶだけのストリーム。無限ループせず EOF になる。
+        // A stream consisting only of runs that produce no values. Must hit EOF without looping forever.
         let data = [0x00u8, 0x00, 0x00, 0x01, 0x01, 0x00];
         assert!(read_all(&data, 0, 1).is_err());
         let mut bm = Bitmap::new();
         assert!(RleDecoder::new(&data, 0).read_levels_into(1, 0, &mut bm).is_err());
     }
 
-    // --- DELTA_BINARY_PACKED のフィクスチャ ----------------------------------
+    // --- DELTA_BINARY_PACKED fixtures ----------------------------------
     //
-    // 以下のバイト列は arrow-rs の parquet クレート (55.2) の
+    // The byte sequences below are exactly what arrow-rs's parquet crate (55.2)'s
     // DeltaBitPackEncoder / DeltaLengthByteArrayEncoder / DeltaByteArrayEncoder
-    // が出力したものをそのまま貼っている。
+    // encoders produced, pasted here verbatim.
     // D32_SMALL (10 bytes)
     const D32_SMALL: &[u8] = &[0x80, 0x01, 0x04, 0x0a, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00];
     // D32_NEG (36 bytes)
@@ -850,8 +857,9 @@ mod tests {
 
     #[test]
     fn delta_i32_constant_uses_zero_bit_width() {
-        // 定数列は min_delta が全てを吸収してビット幅 0 になる。
-        // ヘッダ + ブロックヘッダだけで、ミニブロックのデータは 0 バイト。
+        // For a constant sequence, min_delta absorbs everything and the bit width
+        // becomes 0. Only the header + block header are present; the miniblock data
+        // is 0 bytes.
         assert!(D32_CONST.len() < 20, "len = {}", D32_CONST.len());
         assert_eq!(dec32(D32_CONST, 40), vec![7i32; 40]);
     }
@@ -881,7 +889,7 @@ mod tests {
             dec64(D64_SMALL, 8),
             vec![-3, 0, 5, 5, 5, 1_000_000_000_000, -1_000_000_000_000, 7]
         );
-        // 複数ブロックにまたがり、最終ブロックがパディングされる長さ。
+        // Spans multiple blocks, with a length such that the final block is padded.
         let mut expect = Vec::new();
         let mut y: i64 = 5;
         for i in 0..300i64 {
@@ -898,12 +906,12 @@ mod tests {
 
     #[test]
     fn delta_partial_read_still_reports_full_consumption() {
-        // n がヘッダの総数より小さくても、消費バイト数はストリーム全体。
+        // Even when n is smaller than the header's declared total, bytes consumed cover the whole stream.
         let mut out = Vec::new();
         let consumed = decode_delta_binary_packed_i32(D32_BIG, 5, &mut out).unwrap();
         assert_eq!(out, dec32(D32_BIG, 300)[..5]);
         assert_eq!(consumed, D32_BIG.len());
-        // n = 0 でも同じ。
+        // Same for n = 0.
         let mut out = Vec::new();
         let consumed = decode_delta_binary_packed_i32(D32_BIG, 0, &mut out).unwrap();
         assert!(out.is_empty());
@@ -918,7 +926,7 @@ mod tests {
         assert_eq!(&out[1..], &(1..=10).collect::<Vec<i32>>()[..]);
     }
 
-    // --- DELTA_BINARY_PACKED の異常系 ----------------------------------------
+    // --- DELTA_BINARY_PACKED error cases ----------------------------------
 
     #[test]
     fn delta_rejects_truncated_stream() {
@@ -926,7 +934,7 @@ mod tests {
             let r = decode_delta_binary_packed_i32(&D32_BIG[..cut], 300, &mut Vec::new());
             assert!(r.is_err(), "cut = {cut}");
         }
-        // ヘッダ直後で切れている場合も同じ。
+        // Same when it's cut off right after the header.
         assert!(decode_delta_binary_packed_i64(&D64_BIG[..5], 200, &mut Vec::new()).is_err());
     }
 
@@ -943,31 +951,31 @@ mod tests {
             &mut Vec::new()
         )
         .is_err());
-        // block_size が miniblocks で割り切れない (128 / 7)
+        // block_size is not divisible by miniblocks (128 / 7)
         assert!(decode_delta_binary_packed_i32(
             &[0x80, 0x01, 0x07, 0x01, 0x00],
             1,
             &mut Vec::new()
         )
         .is_err());
-        // ミニブロックあたりの値数が 32 の倍数でない (32 / 2 = 16)
+        // Values per miniblock is not a multiple of 32 (32 / 2 = 16)
         assert!(
             decode_delta_binary_packed_i32(&[0x20, 0x02, 0x01, 0x00], 1, &mut Vec::new()).is_err()
         );
-        // block_size が上限超え
+        // block_size exceeds the upper bound
         assert!(decode_delta_binary_packed_i32(
             &[0x80, 0x80, 0x80, 0x80, 0x01, 0x01, 0x01, 0x00],
             1,
             &mut Vec::new()
         )
         .is_err());
-        // 空入力
+        // Empty input
         assert!(decode_delta_binary_packed_i32(&[], 0, &mut Vec::new()).is_err());
     }
 
     #[test]
     fn delta_rejects_absurd_value_count() {
-        // total = 巨大。ヘッダは 128/4/huge/0。
+        // total is huge. Header is 128/4/huge/0.
         let src = [0x80u8, 0x01, 0x04, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x00];
         assert!(decode_delta_binary_packed_i32(&src, 1, &mut Vec::new()).is_err());
     }
@@ -979,10 +987,10 @@ mod tests {
 
     #[test]
     fn delta_rejects_bit_width_over_type_width() {
-        // block 128 / 4 miniblock / 33 値 / first 0、min_delta 0、幅 33。
+        // block 128 / 4 miniblock / 33 values / first 0, min_delta 0, width 33.
         let src = [0x80u8, 0x01, 0x04, 0x21, 0x00, 0x00, 33, 0, 0, 0];
         assert!(decode_delta_binary_packed_i32(&src, 33, &mut Vec::new()).is_err());
-        // i64 なら 65 が上限超え。
+        // For i64, 65 exceeds the upper bound.
         let src = [0x80u8, 0x01, 0x04, 0x21, 0x00, 0x00, 65, 0, 0, 0];
         assert!(decode_delta_binary_packed_i64(&src, 33, &mut Vec::new()).is_err());
     }
@@ -1009,7 +1017,7 @@ mod tests {
 
     #[test]
     fn delta_byte_array_appends_to_existing_buffer() {
-        // 既存データがあっても直前値の参照範囲がずれないこと。
+        // Confirm the reference range for the previous value doesn't shift even with existing data.
         let mut out = BytesData::new();
         out.push(b"XXXXXXXXXXXX");
         decode_delta_byte_array(DBA, 7, &mut out).unwrap();
@@ -1035,8 +1043,8 @@ mod tests {
 
     #[test]
     fn byte_array_rejects_negative_length() {
-        // 長さ列を手で組む: block 128 / 1 miniblock / 1 値 / first = -1。
-        // zigzag(-1) = 1。
+        // Hand-assemble a length column: block 128 / 1 miniblock / 1 value / first = -1.
+        // zigzag(-1) = 1.
         let src = [0x80u8, 0x01, 0x01, 0x01, 0x01];
         let mut out = BytesData::new();
         assert!(decode_delta_length_byte_array(&src, 1, &mut out).is_err());
@@ -1044,10 +1052,10 @@ mod tests {
 
     #[test]
     fn byte_array_rejects_prefix_longer_than_previous() {
-        // prefix = [0, 5] だが直前の値の長さは 1 しかない、という壊れた入力。
-        // prefix 列: 128/1/2/0 + block(min_delta=5, width=0)
+        // A corrupted input where prefix = [0, 5] but the previous value's length is only 1.
+        // prefix column: 128/1/2/0 + block(min_delta=5, width=0)
         let mut src: Vec<u8> = vec![0x80, 0x01, 0x01, 0x02, 0x00, 0x0a, 0x00];
-        // suffix 列: 128/1/2/1 (first=-1 ではなく 1) + block(min_delta=-1, width=0)
+        // suffix column: 128/1/2/1 (first=-1, not 1) + block(min_delta=-1, width=0)
         src.extend_from_slice(&[0x80, 0x01, 0x01, 0x02, 0x02, 0x01, 0x00]);
         src.extend_from_slice(b"ab");
         let mut out = BytesData::new();
@@ -1056,15 +1064,15 @@ mod tests {
 
     #[test]
     fn byte_array_rejects_absurd_lengths() {
-        // 長さ 1000 を宣言しているのに本体が無い。
+        // Declares length 1000, but the body is missing.
         let src = [0x80u8, 0x01, 0x01, 0x01, 0xd0, 0x0f];
         let mut out = BytesData::new();
         assert!(decode_delta_length_byte_array(&src, 1, &mut out).is_err());
     }
 
-    // --- 総当たりに近い頑健性テスト -------------------------------------------
+    // --- Near-exhaustive robustness tests -------------------------------------
 
-    /// xorshift64。テストを決定的に保つための最小の PRNG。
+    /// xorshift64. A minimal PRNG to keep the tests deterministic.
     fn rng(state: &mut u64) -> u64 {
         let mut x = *state;
         x ^= x << 13;
@@ -1074,8 +1082,8 @@ mod tests {
         x
     }
 
-    /// 壊れた入力を全デコーダに通す。返り値は問わない。
-    /// パニックせず、かつ停止すること自体が検査対象。
+    /// Runs corrupted input through every decoder. The return value doesn't matter.
+    /// What's tested is simply that it doesn't panic and does terminate.
     fn poke(src: &[u8]) {
         for &w in &[0u8, 1, 3, 8, 17, 32, 33, 64, 255] {
             let mut v = Vec::new();
@@ -1107,8 +1115,9 @@ mod tests {
 
     #[test]
     fn mutated_fixtures_never_panic_or_hang() {
-        // 正しいストリームの 1 バイトを壊す。ヘッダの宣言値だけが狂った
-        // 「もっともらしい」破損を作れるので、境界検査の抜けを拾いやすい。
+        // Corrupt a single byte of a valid stream. This produces a "plausible"
+        // corruption where only the header's declared value is off, which is good at
+        // catching gaps in bounds checking.
         let mut state = 0x0123_4567_89ab_cdefu64;
         for fixture in [D32_SMALL, D32_NEG, D32_BIG, D64_SMALL, D64_WRAP, DLBA, DBA] {
             for _ in 0..80 {
@@ -1117,7 +1126,7 @@ mod tests {
                 m[i] ^= rng(&mut state) as u8;
                 poke(&m);
             }
-            // 途中で切れたものも全長にわたって試す。
+            // Also try streams cut short, across the whole length.
             for cut in 0..fixture.len() {
                 poke(&fixture[..cut]);
             }

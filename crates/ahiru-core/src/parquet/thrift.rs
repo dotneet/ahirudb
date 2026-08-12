@@ -1,15 +1,15 @@
-//! Thrift Compact Protocol リーダ（読み取り専用）。
+//! Thrift Compact Protocol reader (read-only).
 //!
-//! Parquet のフッタとページヘッダはこの形式でエンコードされている。
-//! 汎用 Thrift ランタイムは持たず、`meta.rs` の手書きデコーダが必要とする
-//! 操作だけを提供する。
+//! Parquet's footer and page headers are encoded in this format. There is no
+//! general-purpose Thrift runtime here; this only provides the operations
+//! that `meta.rs`'s hand-written decoder needs.
 //!
-//! 入力はネットワーク由来で信用できない。全ての読み取りは境界検査を行い、
-//! 破損に対しては必ず `Err` を返す（パニックしない）。
+//! Input comes from the network and cannot be trusted. Every read is
+//! bounds-checked, and corruption always results in `Err` (never panics).
 
 use crate::prelude::*;
 
-/// Thrift Compact の型タグ。
+/// Thrift Compact type tags.
 pub mod ttype {
     pub const STOP: u8 = 0;
     pub const BOOL_TRUE: u8 = 1;
@@ -26,13 +26,13 @@ pub mod ttype {
     pub const STRUCT: u8 = 12;
 }
 
-/// 構造体のネスト深さ上限。循環・過深な入力でスタックを枯渇させないため。
+/// Upper bound on struct nesting depth. Prevents stack exhaustion from cyclic or excessively deep input.
 pub const MAX_DEPTH: usize = 32;
 
 pub struct Thrift<'a> {
     buf: &'a [u8],
     pos: usize,
-    /// 各ネストレベルの直前フィールド ID（compact protocol の差分符号化用）。
+    /// The previous field ID at each nesting level (for the compact protocol's delta encoding).
     id_stack: [i16; MAX_DEPTH],
     depth: usize,
 }
@@ -42,7 +42,7 @@ impl<'a> Thrift<'a> {
         Thrift { buf, pos: 0, id_stack: [0; MAX_DEPTH], depth: 0 }
     }
 
-    /// 現在の読み取り位置。エラー位置の報告と消費バイト数の算出に使う。
+    /// The current read position. Used for reporting error locations and computing bytes consumed.
     #[inline]
     pub fn pos(&self) -> usize {
         self.pos
@@ -53,7 +53,7 @@ impl<'a> Thrift<'a> {
         self.buf.len() - self.pos
     }
 
-    /// 構造体に入る。フィールド ID の差分符号化コンテキストを 1 段積む。
+    /// Enter a struct. Pushes one level onto the field-ID delta-encoding context.
     pub fn enter(&mut self) -> Result<()> {
         ensure!(self.depth + 1 < MAX_DEPTH, NestingTooDeep, self.pos);
         self.depth += 1;
@@ -61,14 +61,14 @@ impl<'a> Thrift<'a> {
         Ok(())
     }
 
-    /// 構造体から出る。`read_field_begin` が STOP を返した後に呼ぶ。
+    /// Leave a struct. Call this after `read_field_begin` returns STOP.
     pub fn leave(&mut self) {
         if self.depth > 0 {
             self.depth -= 1;
         }
     }
 
-    // --- プリミティブ -------------------------------------------------------
+    // --- Primitives ----------------------------------------------------------
 
     #[inline]
     fn byte(&mut self) -> Result<u8> {
@@ -85,7 +85,7 @@ impl<'a> Thrift<'a> {
         Ok(s)
     }
 
-    /// LEB128 可変長整数。10 バイトを超えたら破損とみなす。
+    /// LEB128 variable-length integer. Exceeding 10 bytes is treated as corruption.
     fn uvarint(&mut self) -> Result<u64> {
         let mut result: u64 = 0;
         let mut shift = 0u32;
@@ -106,10 +106,10 @@ impl<'a> Thrift<'a> {
         Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
     }
 
-    // --- フィールド ---------------------------------------------------------
+    // --- Fields ----------------------------------------------------------------
 
-    /// 次のフィールドヘッダを読む。STOP なら `None`。
-    /// 返り値は `(型タグ, フィールド ID)`。
+    /// Read the next field header. `None` if it's STOP.
+    /// The return value is `(type tag, field ID)`.
     pub fn read_field_begin(&mut self) -> Result<Option<(u8, i16)>> {
         let b = self.byte()?;
         if b == ttype::STOP {
@@ -118,7 +118,7 @@ impl<'a> Thrift<'a> {
         let ftype = b & 0x0f;
         let delta = (b >> 4) as i16;
         let id = if delta == 0 {
-            // 差分ではなく絶対 ID が zigzag varint で続く。
+            // Followed by an absolute ID (not a delta) as a zigzag varint.
             let v = self.zigzag()?;
             ensure!(v >= i16::MIN as i64 && v <= i16::MAX as i64, BadThrift, self.pos);
             v as i16
@@ -129,8 +129,8 @@ impl<'a> Thrift<'a> {
         Ok(Some((ftype, id)))
     }
 
-    /// BOOL。フィールドとして現れる場合は値が型タグに埋め込まれている。
-    /// リスト要素として現れる場合は 1 バイトを読む。
+    /// BOOL. When it appears as a field, the value is embedded in the type
+    /// tag. When it appears as a list element, read 1 byte.
     pub fn read_bool(&mut self, ftype: u8) -> Result<bool> {
         match ftype {
             ttype::BOOL_TRUE => Ok(true),
@@ -143,13 +143,15 @@ impl<'a> Thrift<'a> {
         Ok(self.byte()? as i8)
     }
 
-    /// list/set 要素としての BOOL。構造体フィールドの BOOL と違い、要素の
-    /// 型ヘッダ（`read_list_begin` が返す `etype`）は全要素で共通の
-    /// `BOOL_TRUE` 固定値であり、真偽は運ばない。各要素は独立した 1 バイト
-    /// として書かれ、値が `BOOL_TRUE`（1）かどうかで真偽を判定する
-    /// （Thrift Compact Protocol の仕様、`TCompactProtocol.writeBoolean`
-    /// のフィールド外パス）。`read_bool(ftype)` をリスト要素に使うと
-    /// 「常に true・0 バイト消費」になってしまうので分けてある。
+    /// BOOL as a list/set element. Unlike BOOL as a struct field, the
+    /// element's type header (the `etype` returned by `read_list_begin`) is a
+    /// fixed `BOOL_TRUE` value shared across all elements and carries no
+    /// truth value. Each element is instead written as an independent 1 byte,
+    /// and the truth value is determined by whether it equals `BOOL_TRUE`
+    /// (1) (per the Thrift Compact Protocol spec, the non-field code path of
+    /// `TCompactProtocol.writeBoolean`). This is kept separate from
+    /// `read_bool(ftype)` because using that for list elements would always
+    /// yield "true, consuming 0 bytes".
     pub fn read_bool_elem(&mut self) -> Result<bool> {
         Ok(self.byte()? == ttype::BOOL_TRUE)
     }
@@ -175,15 +177,15 @@ impl<'a> Thrift<'a> {
         Ok(f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
-    /// 可変長バイト列。バッファへの参照をそのまま返す（コピーしない）。
+    /// Variable-length byte string. Returns a reference straight into the buffer (no copy).
     pub fn read_binary(&mut self, _ftype: u8) -> Result<&'a [u8]> {
         let len = self.uvarint()? as usize;
         ensure!(len <= self.buf.len() - self.pos, UnexpectedEof, self.pos);
         self.take(len)
     }
 
-    /// UTF-8 文字列。不正なバイト列は置換文字にせず、そのまま lossy 変換する。
-    /// スキーマ名に不正な UTF-8 が来てもクエリを失敗させないため。
+    /// UTF-8 string. Invalid byte sequences are lossily converted rather than
+    /// replaced outright, so that invalid UTF-8 in a schema name doesn't fail the query.
     pub fn read_string(&mut self, ftype: u8) -> Result<String> {
         let b = self.read_binary(ftype)?;
         Ok(match core::str::from_utf8(b) {
@@ -202,8 +204,8 @@ impl<'a> Thrift<'a> {
         })
     }
 
-    /// リスト/セットのヘッダ。`(要素型, 要素数)` を返す。
-    /// `max` を超える要素数は破損または攻撃とみなして拒否する。
+    /// List/set header. Returns `(element type, element count)`.
+    /// An element count exceeding `max` is treated as corruption or an attack and rejected.
     pub fn read_list_begin(&mut self, max: usize) -> Result<(u8, usize)> {
         let b = self.byte()?;
         let etype = b & 0x0f;
@@ -212,12 +214,12 @@ impl<'a> Thrift<'a> {
             size = self.uvarint()? as usize;
         }
         ensure!(size <= max, LimitExceeded, self.pos);
-        // 要素あたり最低 1 バイトは必要。宣言サイズが残りバッファを超えるなら破損。
+        // Each element needs at least 1 byte. Corruption if the declared size exceeds the remaining buffer.
         ensure!(size <= self.remaining() || etype == ttype::BOOL_TRUE, UnexpectedEof, self.pos);
         Ok((etype, size))
     }
 
-    /// 未知フィールドを読み飛ばす。
+    /// Skip an unknown field.
     pub fn skip(&mut self, ftype: u8) -> Result<()> {
         self.skip_inner(ftype, 0)
     }
@@ -240,12 +242,13 @@ impl<'a> Thrift<'a> {
             }
             ttype::LIST | ttype::SET => {
                 let (et, n) = self.read_list_begin(MAX_SKIP_LIST)?;
-                // list/set の要素としての bool は、struct フィールドと違って
-                // ヘッダのニブルに詰め込まれず 1 要素 1 バイトで並ぶ
-                // （`read_bool_elem` と同じ仕様）。`skip_inner` の BOOL アームは
-                // 「struct フィールドのヘッダに値が埋め込まれているので追加の
-                // バイトは無い」という前提なので、ここで素通しすると読み飛ばす
-                // べきバイト数を静かに間違え、以降のパース全体がずれる。
+                // Unlike a struct field, a bool as a list/set element isn't
+                // packed into the header nibble -- it's laid out as 1 byte per
+                // element (same convention as `read_bool_elem`). The BOOL arm of
+                // `skip_inner` assumes "the value is embedded in the struct
+                // field's header, so there's no extra byte," so passing it
+                // straight through here would silently get the number of bytes
+                // to skip wrong, throwing off the rest of the parse.
                 if et == ttype::BOOL_TRUE || et == ttype::BOOL_FALSE {
                     for _ in 0..n {
                         self.byte()?;
@@ -262,10 +265,11 @@ impl<'a> Thrift<'a> {
                     ensure!(n <= MAX_SKIP_LIST, LimitExceeded, self.pos);
                     let kv = self.byte()?;
                     let (kt, vt) = (kv >> 4, kv & 0x0f);
-                    // list/set と同じ理由: map の要素としての bool（キー・バリュー
-                    // どちらでも）は struct フィールドのようにヘッダへ埋め込まれず
-                    // 1 要素 1 バイトで並ぶ。`skip_inner` の BOOL アームへそのまま
-                    // 渡すと 0 バイト読み飛ばし扱いになり、以降のパース位置がずれる。
+                    // Same reason as list/set: a bool as a map element (key or
+                    // value, either way) isn't embedded into the header like a struct
+                    // field is -- it's laid out as 1 byte per element. Passing it
+                    // straight to `skip_inner`'s BOOL arm would treat it as 0 bytes
+                    // skipped, throwing off the subsequent parse position.
                     let skip_one = |t: &mut Self, ty: u8, depth: usize| -> Result<()> {
                         if ty == ttype::BOOL_TRUE || ty == ttype::BOOL_FALSE {
                             t.byte()?;
@@ -293,7 +297,7 @@ impl<'a> Thrift<'a> {
     }
 }
 
-/// `skip` 中のリスト長上限。
+/// Upper bound on list length while skipping.
 const MAX_SKIP_LIST: usize = 1 << 24;
 
 #[cfg(test)]
@@ -302,7 +306,7 @@ mod tests {
 
     #[test]
     fn read_bool_elem_consumes_one_byte_per_element() {
-        // BOOLEAN_TRUE(1), BOOLEAN_FALSE(2), BOOLEAN_TRUE(1) の 3 要素。
+        // 3 elements: BOOLEAN_TRUE(1), BOOLEAN_FALSE(2), BOOLEAN_TRUE(1).
         let buf = [1u8, 2, 1];
         let mut t = Thrift::new(&buf);
         assert!(t.read_bool_elem().unwrap());
@@ -313,8 +317,8 @@ mod tests {
 
     #[test]
     fn read_bool_elem_treats_any_non_true_tag_as_false() {
-        // 仕様上は 1/2 以外は現れないはずだが、0 のような値でも false 側に
-        // 倒す（== BOOL_TRUE だけを true とみなす）ことをここで固定する。
+        // Per spec, values other than 1/2 shouldn't appear, but this pins down
+        // that a value like 0 falls to false as well (only == BOOL_TRUE counts as true).
         let buf = [0u8];
         let mut t = Thrift::new(&buf);
         assert!(!t.read_bool_elem().unwrap());
@@ -322,19 +326,20 @@ mod tests {
 
     #[test]
     fn skip_inner_treats_bool_list_elements_as_one_byte_each() {
-        // list<bool> の 3 要素を skip し、直後のフィールドが正しく読めることで
-        // 消費バイト数がずれていないことを確認する。struct フィールドの bool は
-        // ヘッダのニブルに値が埋め込まれるが、list/set の要素はそうではなく
-        // 1 要素 1 バイトを占める（`read_bool_elem` と同じ仕様）。ここを
-        // 素通しして 0 バイトとして扱うと、後続のフィールドが全部ずれて読める。
+        // Skip the 3 elements of a list<bool>, and confirm the byte count
+        // hasn't drifted by successfully reading the field right after. A bool
+        // struct field has its value embedded in the header nibble, but a
+        // list/set element does not -- it occupies 1 byte per element (same
+        // convention as `read_bool_elem`). Passing it straight through and
+        // treating it as 0 bytes here would throw off every subsequent field.
         let mut buf = Vec::new();
-        // フィールド 1: list<bool> 3 要素。
-        // フィールドヘッダ: delta=1, type=LIST(9) -> 0x19
+        // Field 1: list<bool>, 3 elements.
+        // Field header: delta=1, type=LIST(9) -> 0x19
         buf.push(0x19);
-        // リストヘッダ: size=3, elem_type=BOOL_TRUE(1) -> (3<<4)|1 = 0x31
+        // List header: size=3, elem_type=BOOL_TRUE(1) -> (3<<4)|1 = 0x31
         buf.push(0x31);
-        buf.extend_from_slice(&[1u8, 2, 1]); // 3 要素ぶんの生バイト
-                                             // フィールド 2: I32 の値 42（delta=1, type=I32(5) -> 0x15、zigzag(42)=84）
+        buf.extend_from_slice(&[1u8, 2, 1]); // raw bytes for the 3 elements
+                                             // Field 2: I32 value 42 (delta=1, type=I32(5) -> 0x15, zigzag(42)=84)
         buf.push(0x15);
         buf.push(84);
         buf.push(0); // STOP
@@ -346,30 +351,27 @@ mod tests {
         t.skip(ft1).unwrap();
         let (ft2, id2) = t.read_field_begin().unwrap().unwrap();
         assert_eq!(id2, 2);
-        assert_eq!(
-            t.read_i32(ft2).unwrap(),
-            42,
-            "list<bool> を skip した後の読み取り位置がずれている"
-        );
+        assert_eq!(t.read_i32(ft2).unwrap(), 42, "read position drifted after skipping list<bool>");
         assert!(t.read_field_begin().unwrap().is_none());
         t.leave();
     }
 
     #[test]
     fn skip_inner_treats_bool_map_key_and_value_elements_as_one_byte_each() {
-        // map<bool, bool> の 2 エントリを skip し、直後のフィールドが正しく
-        // 読めることを確認する回帰テスト。list/set と同じ穴が map のキー・
-        // バリューにも独立して存在していた（キー側だけ、バリュー側だけ、
-        // という壊れ方もありうるので両方を bool にして一度に確認する）。
+        // A regression test that skips 2 entries of a map<bool, bool> and
+        // confirms the field right after can still be read correctly. The same
+        // gap as list/set existed independently for both the map's key and its
+        // value (since it could break for just the key side or just the value
+        // side, both are checked as bool at once here).
         let mut buf = Vec::new();
-        // フィールド 1: map<bool,bool> 2 エントリ。
-        // フィールドヘッダ: delta=1, type=MAP(11) -> 0x1B
+        // Field 1: map<bool,bool>, 2 entries.
+        // Field header: delta=1, type=MAP(11) -> 0x1B
         buf.push(0x1B);
-        buf.push(0x02); // マップサイズ = 2
-                        // kv 型ニブル: kt=vt=BOOL_TRUE(1) -> (1<<4)|1 = 0x11
+        buf.push(0x02); // map size = 2
+                        // kv-type nibble: kt=vt=BOOL_TRUE(1) -> (1<<4)|1 = 0x11
         buf.push(0x11);
-        buf.extend_from_slice(&[1u8, 2, 2, 1]); // key1,val1,key2,val2 の生バイト
-                                                // フィールド 2: I32 の値 42（delta=1, type=I32(5) -> 0x15、zigzag(42)=84）
+        buf.extend_from_slice(&[1u8, 2, 2, 1]); // raw bytes for key1,val1,key2,val2
+                                                // Field 2: I32 value 42 (delta=1, type=I32(5) -> 0x15, zigzag(42)=84)
         buf.push(0x15);
         buf.push(84);
         buf.push(0); // STOP
@@ -384,7 +386,7 @@ mod tests {
         assert_eq!(
             t.read_i32(ft2).unwrap(),
             42,
-            "map<bool,bool> を skip した後の読み取り位置がずれている"
+            "read position drifted after skipping map<bool,bool>"
         );
         assert!(t.read_field_begin().unwrap().is_none());
         t.leave();

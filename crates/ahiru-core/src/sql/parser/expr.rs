@@ -9,13 +9,13 @@ use super::*;
 use crate::expr::funcs;
 
 impl<'a> Parser<'a> {
-    // --- 式 -----------------------------------------------------------------
+    // --- Expressions --------------------------------------------------------
 
     pub(super) fn expr(&mut self) -> Result<ExprId> {
         self.expr_bp(0)
     }
 
-    /// 深さを 1 段消費してから本体へ。エラー経路でも必ず戻すため薄く包む。
+    /// Consumes one level of depth before the body. Kept a thin wrapper so it is always restored even on error paths.
     pub(super) fn expr_bp(&mut self, min_bp: u8) -> Result<ExprId> {
         ensure!(self.depth < MAX_DEPTH, ExpressionTooDeep, self.pos);
         self.depth += 1;
@@ -27,17 +27,17 @@ impl<'a> Parser<'a> {
     fn expr_body(&mut self, min_bp: u8) -> Result<ExprId> {
         let mut lhs = self.prefix()?;
         loop {
-            // `x <op> ANY|ALL|SOME (SELECT ...)`。比較演算子の直後にだけ現れる
-            // 量化比較で、比較と同じ強さの中置演算子として扱う。`ALL` は既存の
-            // 予約語（`UNION ALL` 等）だが、`ANY`/`SOME` は `glob`/`similar` と
-            // 同様に予約語表に入れていない（列名としても使えるように）ので、
-            // ここで 2 トークン先読みして `(` まで確認してから確定させる
-            // （`x > any_col` のような普通の列参照を誤認しないため。
-            // `peek_quantifier` の doc 参照）。
+            // `x <op> ANY|ALL|SOME (SELECT ...)`. A quantified comparison that appears
+            // only right after a comparison operator, treated as an infix operator of the
+            // same binding power as comparison. `ALL` is an existing reserved word (`UNION
+            // ALL` and so on), but `ANY`/`SOME` are kept out of the reserved-word table
+            // like `glob`/`similar` (so they remain usable as column names), so this looks
+            // ahead two tokens and settles only after seeing the `(` (so an ordinary
+            // column reference like `x > any_col` is not misread; see the `peek_quantifier` docs).
             if let Some(op) = comparison_binop(self.cur) {
                 if BP_CMP >= min_bp {
                     if let Some(all) = self.peek_quantifier()? {
-                        self.bump()?; // 比較演算子
+                        self.bump()?; // the comparison operator
                         self.bump()?; // ANY/ALL/SOME
                         self.expect(Tok::LParen)?;
                         let query = self.query_stmt()?;
@@ -52,17 +52,16 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            // `GLOB`/`SIMILAR TO` は ROWS/RANGE/QUALIFY と同じ理由で予約語表
-            // には入れず（ファイル冒頭 `sql/lexer.rs` のコメント参照）、この
-            // 中置演算子の構文位置でだけ綴りを見て判定する。こうすれば
-            // `glob`/`similar` という名前の列も引用符無しでそのまま使える。
+            // `GLOB`/`SIMILAR TO` are kept out of the reserved-word table for the same
+            // reason as ROWS/RANGE/QUALIFY (see the comment at the top of `sql/lexer.rs`)
+            // and are matched by spelling only in this infix-operator position. That way
+            // columns named `glob`/`similar` remain usable unquoted.
             //
-            // DuckDB は `GLOB` に `NOT` を前置できない（`NOT (x GLOB y)` と
-            // 書く必要がある。`duckdb -c "select 'a' NOT GLOB 'b'"` が構文
-            // エラーになることを確認済み）ので、ここでは `LIKE` と違って
-            // `predicate()` を経由させない。`x NOT GLOB y` は `Tok::Kw(Kw::Not)`
-            // 分岐から `predicate()` に入り、そこに `glob` の腕が無いので
-            // 自然に `UnexpectedToken` になる。
+            // DuckDB does not allow `NOT` before `GLOB` (you must write `NOT (x GLOB y)`;
+            // confirmed that `duckdb -c "select 'a' NOT GLOB 'b'"` is a syntax error), so
+            // unlike `LIKE` this does not route through `predicate()`. `x NOT GLOB y`
+            // enters `predicate()` from the `Tok::Kw(Kw::Not)` branch, which has no arm for
+            // `glob`, so it naturally becomes `UnexpectedToken`.
             if self.is_soft_kw(b"glob") {
                 if BP_CMP < min_bp {
                     break;
@@ -72,8 +71,8 @@ impl<'a> Parser<'a> {
                 lhs = self.simple_call("glob", vec![lhs, pattern]);
                 continue;
             }
-            // `SIMILAR TO` は `LIKE` 同様 `[NOT]` を前置できるので、`predicate()`
-            // 側（`Tok::Kw(Kw::Not)` 分岐）にも同じ判定を足してある。
+            // `SIMILAR TO` can take a leading `[NOT]` like `LIKE`, so the same check is
+            // also added on the `predicate()` side (the `Tok::Kw(Kw::Not)` branch).
             if self.is_soft_kw(b"similar") && self.peek_is_to()? {
                 if BP_CMP < min_bp {
                     break;
@@ -135,12 +134,11 @@ impl<'a> Parser<'a> {
                 // ever change, this alias must be revisited.
                 Tok::SlashSlash => (BinaryOp::Div, BP_MUL),
                 Tok::Percent => (BinaryOp::Mod, BP_MUL),
-                // `&`/`|`/`<<`/`>>`/`^`/`**` も `->`/`->>` と同じく新しい
-                // `BinaryOp` を増やさず、既存のスカラ関数呼び出しへの糖衣構文
-                // として展開する（`bit_and`/`bit_or`/`bit_shift_left`/
-                // `bit_shift_right`/`pow` は `expr::funcs` に既存、または
-                // このコミットで新設。カーネルを増やさない、という
-                // DESIGN.md §11 の方針の適用）。
+                // Like `->`/`->>`, `&`/`|`/`<<`/`>>`/`^`/`**` add no new `BinaryOp` and
+                // are expanded as sugar for existing scalar function calls
+                // (`bit_and`/`bit_or`/`bit_shift_left`/`bit_shift_right`/`pow` either
+                // already exist in `expr::funcs` or were added in this commit -- applying
+                // DESIGN.md §11's policy of not adding kernels).
                 Tok::Amp => {
                     if BP_BITWISE < min_bp {
                         break;
@@ -177,9 +175,9 @@ impl<'a> Parser<'a> {
                     lhs = self.simple_call("bit_shift_right", vec![lhs, rhs]);
                     continue;
                 }
-                // 左結合（`duckdb` の `2^3^2` = `(2^3)^2` を確認済み、BP 定数の
-                // doc 参照）なので、通常の演算子と同じく `expr_bp(bp + 1)` で
-                // 右辺を読む。
+                // Left-associative (confirmed `duckdb`'s `2^3^2` = `(2^3)^2`; see the docs
+                // on the BP constants), so the right operand is read with `expr_bp(bp + 1)`
+                // like any ordinary operator.
                 Tok::Pow => {
                     if BP_POW < min_bp {
                         break;
@@ -189,9 +187,9 @@ impl<'a> Parser<'a> {
                     lhs = self.simple_call("pow", vec![lhs, rhs]);
                     continue;
                 }
-                // 中置の `~`/`!~`。前置の `~`（ビット単位 NOT）は `prefix()` が
-                // 別に処理するので、ここに来るのは必ず中置（正規表現一致）。
-                // `SIMILAR TO` と同じ関数に展開する（`similar_to` の doc 参照）。
+                // Infix `~`/`!~`. Prefix `~` (bitwise NOT) is handled separately by
+                // `prefix()`, so anything reaching here is necessarily infix (regex match).
+                // It expands to the same function as `SIMILAR TO` (see the `similar_to` docs).
                 Tok::Tilde | Tok::NotTilde => {
                     if BP_CMP < min_bp {
                         break;
@@ -311,12 +309,12 @@ impl<'a> Parser<'a> {
                     lhs = self.cast_postfix(call)?;
                     continue;
                 }
-                // `->`/`->>` は新しい BinaryOp を増やさず、`json_extract`/
-                // `json_extract_string` 呼び出しへの糖衣構文として展開する
-                // （`expr::funcs` の型解決・実行にそのまま乗る）。
-                // 優先順位は Postgres の「その他の演算子」band に倣い `||` と
-                // 同じ強さにする（比較より強く結合するので `doc->'a' = 1` が
-                // 括弧無しで書ける）。
+                // `->`/`->>` add no new BinaryOp and are expanded as sugar for
+                // `json_extract`/`json_extract_string` calls (which ride the existing type
+                // resolution and execution in `expr::funcs`).
+                // Their precedence follows Postgres's "other operators" band and matches
+                // `||` (binding tighter than comparison, so `doc->'a' = 1` can be written
+                // without parentheses).
                 Tok::Arrow | Tok::LongArrow => {
                     if BP_CONCAT < min_bp {
                         break;
@@ -328,7 +326,7 @@ impl<'a> Parser<'a> {
                     lhs = self.simple_call(name, vec![lhs, rhs]);
                     continue;
                 }
-                // 述語（IS NULL / IN / BETWEEN / LIKE / ILIKE）は比較と同じ強さの後置。
+                // Predicates (IS NULL / IN / BETWEEN / LIKE / ILIKE) are postfix at the same binding power as comparison.
                 Tok::Kw(Kw::Is | Kw::In | Kw::Between | Kw::Like | Kw::Ilike | Kw::Not) => {
                     if BP_CMP < min_bp {
                         break;
@@ -342,7 +340,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump()?;
-            // すべて左結合なので、右辺は 1 段強い下限で読む。
+            // All are left-associative, so the right operand is read one level tighter.
             let rhs = self.expr_bp(bp + 1)?;
             lhs = self.arena.push(Expr::Binary { op, lhs, rhs });
         }
@@ -353,12 +351,12 @@ impl<'a> Parser<'a> {
         match self.cur {
             Tok::Minus => {
                 self.bump()?;
-                // 負の整数はリテラル 1 個に畳む。そうしないと
-                // -9223372036854775808 のように正側へ収まらない値が書けない。
-                // このリテラルは `primary_atom` を経由しないので、後置 `::`
-                // をここでも自分で畳み込む（`primary` の doc 参照。
-                // `-1::VARCHAR` が `(-1)::VARCHAR` になることを
-                // `duckdb -c "select -1::varchar"` で確認済み）。
+                // A negative integer folds into a single literal. Otherwise a value that
+                // does not fit on the positive side, such as -9223372036854775808, could
+                // not be written. This literal does not go through `primary_atom`, so the
+                // postfix `::` is folded here as well (see the `primary` docs; confirmed
+                // with `duckdb -c "select -1::varchar"` that `-1::VARCHAR` means
+                // `(-1)::VARCHAR`).
                 if let Tok::Int(text) = self.cur {
                     let v = int_literal(text, true, self.pos)?;
                     self.bump()?;
@@ -368,23 +366,23 @@ impl<'a> Parser<'a> {
                 let arg = self.expr_bp(BP_UNARY)?;
                 Ok(self.arena.push(Expr::Unary { op: UnaryOp::Neg, arg }))
             }
-            // 単項 + は恒等。ノードを作らない。
+            // Unary + is the identity. No node is created.
             Tok::Plus => {
                 self.bump()?;
                 self.expr_bp(BP_UNARY)
             }
             Tok::Kw(Kw::Not) => {
                 self.bump()?;
-                // `NOT EXISTS` は `Unary::Not` で包まず negated に落とす。
+                // `NOT EXISTS` is folded into negated rather than wrapped in `Unary::Not`.
                 if self.is(Tok::Kw(Kw::Exists)) {
                     return self.exists(true);
                 }
                 let arg = self.expr_bp(BP_NOT)?;
                 Ok(self.arena.push(Expr::Unary { op: UnaryOp::Not, arg }))
             }
-            // 前置の `~`（ビット単位 NOT）。中置の `~`/`!~`（正規表現一致）は
-            // `expr_body` の中置ループ側が処理する（同じトークンだが位置で
-            // 意味が決まる。`-` の前置/中置と同じパターン）。
+            // Prefix `~` (bitwise NOT). Infix `~`/`!~` (regex match) are handled by the
+            // infix loop in `expr_body` (the same token, with meaning fixed by position --
+            // the same pattern as prefix versus infix `-`).
             Tok::Tilde => {
                 self.bump()?;
                 let arg = self.expr_bp(BP_UNARY)?;
@@ -402,12 +400,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `IS [NOT] NULL` / `[NOT] IN` / `[NOT] BETWEEN` / `[NOT] LIKE`。
-    /// 否定は `Unary::Not` で包まず、各ノードの `negated` に落とす。
+    /// `IS [NOT] NULL` / `[NOT] IN` / `[NOT] BETWEEN` / `[NOT] LIKE`.
+    /// Negation is folded into each node's `negated` rather than wrapped in `Unary::Not`.
     fn predicate(&mut self, arg: ExprId) -> Result<ExprId> {
         let negated = self.eat_kw(Kw::Not)?;
-        // `SIMILAR` は予約語ではない（`expr_body` 冒頭のコメント参照）ので、
-        // 通常の `match self.cur` には乗せられない。ここだけ先に判定する。
+        // `SIMILAR` is not a reserved word (see the comment at the top of `expr_body`), so
+        // it cannot ride the ordinary `match self.cur`. Only this case is checked first.
         if self.is_soft_kw(b"similar") && self.peek_is_to()? {
             return self.similar_to(arg, negated);
         }
@@ -416,11 +414,11 @@ impl<'a> Parser<'a> {
                 ensure!(!negated, UnexpectedToken, self.pos);
                 self.bump()?;
                 let neg = self.eat_kw(Kw::Not)?;
-                // `DISTINCT`/`FROM` はどちらも既存の予約語（`Kw::Distinct`/
-                // `Kw::From`）なので、`similar`/`glob` のような文脈依存判定は
-                // 要らない。ただし `IS DISTINCT` だけで終わる文はここには
-                // 存在しない（`FROM` が必ず続く）ので、2 トークン先読みで
-                // 確定させてから消費する。
+                // `DISTINCT`/`FROM` are both existing reserved words
+                // (`Kw::Distinct`/`Kw::From`), so no context-dependent check like
+                // `similar`/`glob` is needed. But no statement ends at just `IS DISTINCT`
+                // (`FROM` always follows), so this settles it with two tokens of lookahead
+                // before consuming.
                 if self.is(Tok::Kw(Kw::Distinct)) && self.peek()? == Tok::Kw(Kw::From) {
                     self.bump()?; // distinct
                     self.bump()?; // from
@@ -467,8 +465,8 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::In) => {
                 self.bump()?;
                 self.expect(Tok::LParen)?;
-                // `IN (SELECT ...)` は副問い合わせ、それ以外は値リスト。
-                // `IN ((SELECT 1))` は値リスト側（要素がスカラサブクエリ）。
+                // `IN (SELECT ...)` is a subquery; anything else is a value list.
+                // `IN ((SELECT 1))` is a value list (whose element is a scalar subquery).
                 if self.starts_query() {
                     let query = self.query_stmt()?;
                     self.expect(Tok::RParen)?;
@@ -491,7 +489,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Between) => {
                 self.bump()?;
-                // 境界は AND より強い下限で読む。区切りの AND を食わないため。
+                // The bounds are read one level tighter than AND, so the separating AND is not swallowed.
                 let low = self.expr_bp(BP_CONCAT)?;
                 self.expect_kw(Kw::And)?;
                 let high = self.expr_bp(BP_CONCAT)?;
@@ -508,7 +506,7 @@ impl<'a> Parser<'a> {
                         _ => err!(UnexpectedToken, pos),
                     };
                     let bytes = unquote(raw, b'\'').into_bytes();
-                    // エスケープ文字は 1 バイトのみ受け付ける。
+                    // Only a single-byte escape character is accepted.
                     ensure!(bytes.len() == 1, SyntaxError, pos);
                     escape = bytes.first().copied();
                     self.bump()?;
@@ -520,19 +518,18 @@ impl<'a> Parser<'a> {
         Ok(self.arena.push(node))
     }
 
-    /// `[NOT] SIMILAR TO pattern`。DuckDB は `SIMILAR TO` を単に
-    /// `regexp_full_match` への糖衣構文として扱う（`duckdb -c "explain select
-    /// 'a' similar to 'a'"` で確認済み）。SQL 標準の `SIMILAR TO` と違い
-    /// `_`/`%` は特別扱いされず、素の POSIX 風正規表現として渡る。
-    /// このエンジンには `regexp_full_match` という名前の関数は無いが、
-    /// `expr::funcs` 側にこの糖衣構文専用として実装してある
-    /// （新しい正規表現エンジンは書かず、既存の `expr::regex` を
-    /// アンカー付きで再利用する。詳細はそちらのモジュール doc）。
+    /// `[NOT] SIMILAR TO pattern`. DuckDB simply treats `SIMILAR TO` as sugar for
+    /// `regexp_full_match` (confirmed with `duckdb -c "explain select 'a' similar to
+    /// 'a'"`). Unlike the SQL standard's `SIMILAR TO`, `_`/`%` are not special and it is
+    /// passed through as a plain POSIX-style regular expression.
+    /// This engine has no function named `regexp_full_match`, but one is implemented in
+    /// `expr::funcs` specifically for this sugar (no new regex engine is written; the
+    /// existing `expr::regex` is reused with anchoring -- see that module's docs).
     ///
-    /// `ESCAPE` 句は DuckDB 自身も「未実装」として拒否する
-    /// （`duckdb -c "select 'a' similar to 'a' escape '\\'"` が
-    /// `Not implemented Error: Custom escape in SIMILAR TO` になることを
-    /// 確認済み）ので、ここでも明示的に拒否する。
+    /// DuckDB itself rejects the `ESCAPE` clause as unimplemented (confirmed that
+    /// `duckdb -c "select 'a' similar to 'a' escape '\\'"` gives
+    /// `Not implemented Error: Custom escape in SIMILAR TO`), so it is explicitly rejected
+    /// here as well.
     fn similar_to(&mut self, arg: ExprId, negated: bool) -> Result<ExprId> {
         self.bump()?; // similar
         self.bump()?; // to
@@ -546,18 +543,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `[NOT] DISTINCT FROM`。NULL 同士は等しいとみなす等価比較（`=` と違い
-    /// 3 値論理の `UNKNOWN` を経由しない、常に `TRUE`/`FALSE` の等価判定）。
-    /// 専用のカーネル・`Expr` バリアントは増やさず、既存の `IS NULL`/`AND`/
-    /// `OR`/`=` の組み合わせへ展開する:
+    /// `[NOT] DISTINCT FROM`. An equality comparison that treats two NULLs as equal
+    /// (unlike `=`, it never goes through three-valued `UNKNOWN`; always TRUE/FALSE).
+    /// Rather than adding a dedicated kernel or `Expr` variant, it expands into a
+    /// combination of the existing `IS NULL`/`AND`/`OR`/`=`:
     ///   `a IS NOT DISTINCT FROM b` ≡
     ///     `(a IS NULL AND b IS NULL) OR (a IS NOT NULL AND b IS NOT NULL AND a = b)`
-    ///   `a IS DISTINCT FROM b` ≡ `NOT (上式)`
-    /// （`(a IS NULL AND b IS NULL) OR a = b` のような一見同等の短い式は、
-    /// 片方だけ NULL のとき `a = b` が `NULL` になり `OR` の結果も `NULL` に
-    /// 引きずられてしまう ―― ここでは常に `TRUE`/`FALSE` だけを返す必要が
-    /// あるので、両辺とも非 NULL であることを明示的に確認してから `=` へ
-    /// 委ねる形にしてある）。
+    ///   `a IS DISTINCT FROM b` == `NOT (the expression above)`
+    /// (A seemingly equivalent shorter form such as `(a IS NULL AND b IS NULL) OR a = b`
+    /// fails when only one side is NULL: `a = b` becomes `NULL` and drags the `OR` result
+    /// to `NULL` too. Since this must always return only TRUE/FALSE, it explicitly
+    /// confirms both sides are non-NULL before delegating to `=`.)
     fn distinct_from(&mut self, l: ExprId, r: ExprId, same: bool) -> ExprId {
         let l_null = self.arena.push(Expr::IsNull { arg: l, negated: false });
         let r_null = self.arena.push(Expr::IsNull { arg: r, negated: false });
@@ -608,20 +604,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `primary_atom()` に続けて、任意個の postfix `::type` / `[i]` /
-    /// `[i:j]` を、現れた順に畳み込む。いずれも前置演算子より強く結合する
-    /// （`duckdb -c "select -1::varchar"` が `-(1::VARCHAR)` と解釈されて
-    /// 型エラーになることで確認済み。添字も同様: `duckdb -c "select
-    /// -[1,2,3][1]"` は `-(list[1])` になる）。`primary_atom` の分岐の
-    /// 大半は結果を `self.arena.push` する前に早期 `return` するので、
-    /// この処理はその外側に置く必要がある（内側に置くと `(expr)::ty` や
-    /// `col::ty`、`(expr)[i]` などほとんどの実用例を取りこぼす）。
+    /// Following `primary_atom()`, folds any number of postfix `::type` / `[i]` / `[i:j]`
+    /// in the order they appear. All bind tighter than prefix operators (confirmed by
+    /// `duckdb -c "select -1::varchar"` being interpreted as `-(1::VARCHAR)` and thus a
+    /// type error; subscripting behaves the same: `duckdb -c "select -[1,2,3][1]"` means
+    /// `-(list[1])`). Most branches of `primary_atom` return early before pushing the
+    /// result via `self.arena.push`, so this handling must sit outside it (inside, it
+    /// would miss almost every practical case, such as `(expr)::ty`, `col::ty`, and `(expr)[i]`).
     ///
-    /// 2 つの後置演算子は好きな順に交互に書ける（DuckDB と同じ、実測済み）:
-    /// `duckdb -c "select [1,2,3][1]::varchar"` は「先に添字、後にキャスト」
-    /// （`CAST(list[1] AS VARCHAR)`）、`duckdb -c "select ([1,2,3]::json)[1]"`
-    /// は「先にキャスト、後に添字」になる。そのため 1 つのループで両方を
-    /// 交互に受け付ける。
+    /// The two postfix operators can be written in any alternating order (the same as
+    /// DuckDB, measured): `duckdb -c "select [1,2,3][1]::varchar"` is "subscript first,
+    /// then cast" (`CAST(list[1] AS VARCHAR)`), while `duckdb -c "select
+    /// ([1,2,3]::json)[1]"` is "cast first, then subscript". Hence a single loop accepts
+    /// both, alternating.
     ///
     /// `!` (factorial) deliberately does *not* join this loop, even though
     /// it's a postfix operator too — it lives in `expr_body`'s infix loop
@@ -644,12 +639,12 @@ impl<'a> Parser<'a> {
         Ok(node)
     }
 
-    /// 任意個の後置 `::type` を `node` へ畳み込む。`prefix` の負数リテラル
-    /// 即畳み込み経路（`primary_atom`/`primary` を経由しないため別途ここを
-    /// 呼ぶ必要がある）専用。`-5[1]` は DuckDB でも構文エラーになる
-    /// （`duckdb -c "select -5[1]"` で確認済み）ので、この経路は `::` だけ
-    /// 畳み込めばよく、`[i]`/`[i:j]` は付けない（`primary` 側のループとは
-    /// 意図的に別実装）。
+    /// Folds any number of postfix `::type` into `node`. Specifically for `prefix`'s
+    /// immediate negative-literal folding path (which bypasses `primary_atom`/`primary`
+    /// and so must call this separately). `-5[1]` is a syntax error in DuckDB too
+    /// (confirmed with `duckdb -c "select -5[1]"`), so this path only needs to fold `::`
+    /// and does not attach `[i]`/`[i:j]` (deliberately implemented separately from the
+    /// loop on the `primary` side).
     ///
     /// `!` (factorial) doesn't belong here either, for the same reason it
     /// doesn't belong in `primary`'s loop: `-4!` folds `-4` to a literal
@@ -696,7 +691,7 @@ impl<'a> Parser<'a> {
                 Expr::Literal(Value::Null)
             }
             Tok::Param => {
-                // 番号は出現順。ホスト側のバインド配列の添字になる。
+                // The number is by order of appearance. It indexes the host's bind array.
                 ensure!(self.num_params < u16::MAX, UnsupportedFeature, pos);
                 let n = self.num_params;
                 self.num_params += 1;
@@ -705,7 +700,7 @@ impl<'a> Parser<'a> {
             }
             Tok::LParen => {
                 self.bump()?;
-                // `(SELECT ...)` はスカラサブクエリ、それ以外は括弧付きの式。
+                // `(SELECT ...)` is a scalar subquery; anything else is a parenthesized expression.
                 if self.starts_query() {
                     let query = self.query_stmt()?;
                     self.expect(Tok::RParen)?;
@@ -715,25 +710,25 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::RParen)?;
                 return Ok(e);
             }
-            // `[expr, ...]` 配列リテラル。ここ（`primary_atom`）に来るのは
-            // `[` が式の**先頭**にあるときだけ。`expr[i]`/`expr[i:j]` の添字
-            // アクセス・スライスは `primary_atom` の結果に**後置**で続く形
-            // なので、`primary`/`postfix_ops`（この関数の外）が別途処理する
-            // （ファイル冒頭 `sql/lexer.rs` の `Tok::LBracket` のコメント参照）。
+            // An `[expr, ...]` array literal. This point (`primary_atom`) is reached only
+            // when `[` is at the **head** of an expression. Subscripting and slicing,
+            // `expr[i]`/`expr[i:j]`, follow the result of `primary_atom` as a **postfix**
+            // and are handled separately by `primary`/`postfix_ops` (outside this
+            // function; see the `Tok::LBracket` comment in `sql/lexer.rs`).
             Tok::LBracket => return self.array_literal(),
             Tok::Kw(Kw::Exists) => return self.exists(false),
             Tok::Kw(Kw::Cast) => return self.cast(),
             Tok::Kw(Kw::Case) => return self.case(),
-            // `INTERVAL` は予約語にしていない（`interval` という列名も書けて
-            // 欲しいため）ので、ここで綴りを見てから中身を先読みして判定する。
+            // `INTERVAL` is not a reserved word (a column named `interval` should be
+            // writable), so the spelling is checked here and the contents looked ahead.
             Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"interval") => {
                 return self.interval_literal_or_ident();
             }
             // `DATE '...'` / `TIME '...'` / `TIMESTAMP '...'` /
-            // `TIMESTAMPTZ '...'`。`INTERVAL` と同じく予約語にはしていない
-            // ので、綴りが合ったうえで次が文字列リテラルのときだけ
-            // 型付きリテラルとして読む（`temporal_literal_or_ident`）。
-            // 引用符付き識別子（`"date"`）は対象外で常に列参照になる。
+            // `TIMESTAMPTZ '...'`. Like `INTERVAL` it is not reserved, so it is read as a
+            // typed literal only when the spelling matches and the next token is a string
+            // literal (`temporal_literal_or_ident`). Quoted identifiers (`"date"`) are
+            // excluded and always become column references.
             Tok::Ident(s) => {
                 if let Some(ty) = temporal_literal_ty(s.as_bytes()) {
                     return self.temporal_literal_or_ident(ty);
@@ -746,14 +741,14 @@ impl<'a> Parser<'a> {
         Ok(self.arena.push(node))
     }
 
-    /// `[expr, expr, ...]`。`list_value(expr, expr, ...)`（`json_array` の
-    /// 別名）へそのまま脱糖する糖衣構文で、意味は完全に同じ。
+    /// `[expr, expr, ...]`. Sugar that desugars directly to `list_value(expr, expr, ...)`
+    /// (an alias of `json_array`), with exactly the same meaning.
     ///
-    /// 空配列 `[]` だけは `list_value()` を経由しない: `list_value`/`json_array`
-    /// の `resolve` は 0 引数を `WrongArgCount` で拒否する設計になっている
-    /// （引数が無いと `call()` が行数を決められないため）ので、代わりに
-    /// JSON の空配列を直接 `TypedLiteral` として埋め込む。`duckdb -c "select
-    /// [], typeof([])"` で `[]` 自体は有効な式であることを確認済み。
+    /// Only the empty array `[]` bypasses `list_value()`: `resolve` for
+    /// `list_value`/`json_array` is designed to reject zero arguments with `WrongArgCount`
+    /// (with no arguments, `call()` cannot determine the row count), so an empty JSON
+    /// array is embedded directly as a `TypedLiteral` instead. Confirmed with `duckdb -c
+    /// "select [], typeof([])"` that `[]` is itself a valid expression.
     fn array_literal(&mut self) -> Result<ExprId> {
         self.bump()?; // '['
         if self.eat(Tok::RBracket)? {
@@ -770,30 +765,29 @@ impl<'a> Parser<'a> {
         Ok(self.simple_call("list_value", args))
     }
 
-    /// `base[i]`（添字アクセス）/ `base[i:j]`（スライス、両端省略可）。
-    /// `primary`（この関数の呼び出し元）の後置ループから、`[` を見た時点で
-    /// 呼ばれる。`self.cur` はまだ `[` を指している。
+    /// `base[i]` (subscripting) / `base[i:j]` (slicing, either bound optional).
+    /// Called from the postfix loop of `primary` (this function's caller) upon seeing `[`.
+    /// `self.cur` still points at `[`.
     ///
-    /// `expr[i]` は `list_extract(expr, i)`（DuckDB と同じく 1 始まり、
-    /// 範囲外は NULL、負数は末尾から: `duckdb -c "select [1,2,3][1],
-    /// [1,2,3][-1], [1,2,3][10]"` で `1`/`3`/`NULL` を確認済み。この
-    /// エンジンの `list_extract` は既にこの規則で実装済み — `crate::json::
-    /// list_index` 参照）、`expr[i:j]` は `list_slice(expr, i, j)`
-    /// （両端含む。境界の詳しい規則は `list_slice` の doc 参照）へ脱糖する。
+    /// `expr[i]` desugars to `list_extract(expr, i)` (1-based like DuckDB, NULL when out
+    /// of range, negatives counting from the end: confirmed `1`/`3`/`NULL` with
+    /// `duckdb -c "select [1,2,3][1], [1,2,3][-1], [1,2,3][10]"`. This engine's
+    /// `list_extract` already implements that rule -- see `crate::json::list_index`), and
+    /// `expr[i:j]` desugars to `list_slice(expr, i, j)` (inclusive on both ends; see the
+    /// `list_slice` docs for the detailed boundary rules).
     ///
-    /// 開始/終了はそれぞれ省略できる（`duckdb -c "select [1,2,3,4,5][:3],
-    /// [1,2,3,4,5][2:]"` で `[1,2,3]`/`[2,3,4,5]` を確認済み、つまり
-    /// `[:3]` == `[1:3]`、`[2:]` == 末尾まで）。省略した境界はそれぞれ
-    /// リテラル `1` / `i64::MAX` に脱糖し、`list_slice` 側でクランプする
-    /// （SQL `NULL` には脱糖しない — `duckdb -c "select list_slice([1,2,3],
-    /// NULL, 3)"` が `NULL` を返すことから、`NULL` 境界は「省略」ではなく
-    /// 「結果も NULL」を意味することが分かる。混同すると `[:3]` が NULL に
-    /// なってしまう）。
+    /// Start and end may each be omitted (confirmed `[1,2,3]`/`[2,3,4,5]` with
+    /// `duckdb -c "select [1,2,3,4,5][:3], [1,2,3,4,5][2:]"`, i.e. `[:3]` == `[1:3]` and
+    /// `[2:]` runs to the end). An omitted bound desugars to the literal `1` /
+    /// `i64::MAX` respectively and is clamped by `list_slice` (it does not desugar to SQL
+    /// `NULL` -- `duckdb -c "select list_slice([1,2,3], NULL, 3)"` returning `NULL` shows
+    /// that a `NULL` bound means "the result is NULL too", not "omitted". Conflating them
+    /// would make `[:3]` NULL).
     fn subscript(&mut self, base: ExprId) -> Result<ExprId> {
         self.bump()?; // '['
-                      // `[:j]`: 開始省略。`[:]`（両方省略）にもここで対応する必要がある
-                      // ——`]` が直後に来る場合、続けて `self.expr()` を呼ぶと `]` を式の
-                      // 先頭として読もうとして構文エラーになる。
+                      // `[:j]`: start omitted. `[:]` (both omitted) must be handled here
+                      // too -- if `]` comes next, calling `self.expr()` would try to read
+                      // `]` as the head of an expression and give a syntax error.
         if self.eat(Tok::Colon)? {
             let end = if self.is(Tok::RBracket) {
                 self.arena.push(Expr::Literal(Value::I64(i64::MAX)))
@@ -806,7 +800,7 @@ impl<'a> Parser<'a> {
         }
         let first = self.expr()?;
         if self.eat(Tok::Colon)? {
-            // `[i:]`: 終了省略。`[i:j]`: 両方指定。
+            // `[i:]`: end omitted. `[i:j]`: both given.
             let end = if self.is(Tok::RBracket) {
                 self.arena.push(Expr::Literal(Value::I64(i64::MAX)))
             } else {
@@ -815,46 +809,46 @@ impl<'a> Parser<'a> {
             self.expect(Tok::RBracket)?;
             return Ok(self.simple_call("list_slice", vec![base, first, end]));
         }
-        // `[i]`: 添字アクセス。
+        // `[i]`: subscripting.
         self.expect(Tok::RBracket)?;
         Ok(self.simple_call("list_extract", vec![base, first]))
     }
 
     /// `INTERVAL '<n> <unit> ...'` / `INTERVAL '<n>' <unit>` /
-    /// `INTERVAL <n> <unit>` リテラル。`INTERVAL` の直後がこれらの形でなければ
-    /// 列参照 (`interval` という名前の列) として `name_ref` に委ねる。
+    /// An `INTERVAL <n> <unit>` literal. If what follows `INTERVAL` is not one of these
+    /// shapes, it is delegated to `name_ref` as a column reference (a column named `interval`).
     ///
-    /// `call()` の `EXTRACT` と同じ流儀: `Lexer` を複製して形を確定させてから
-    /// 本物のトークン列を同じ回数だけ進める。
+    /// The same style as `EXTRACT` in `call()`: clone the `Lexer` to settle the shape,
+    /// then advance the real token stream the same number of times.
     fn interval_literal_or_ident(&mut self) -> Result<ExprId> {
         let mut lx = self.lex.clone();
         let t1 = lx.next_token()?.tok;
         match t1 {
             Tok::Str(raw) => {
                 let text = unquote(raw, b'\'');
-                // 文字列全体が符号付き整数 1 個で、直後に単位語が続くなら
-                // `INTERVAL '3' DAY` 形式。
+                // If the whole string is one signed integer followed by a unit word, this
+                // is the `INTERVAL '3' DAY` form.
                 let t2 = lx.next_token()?.tok;
                 if let (Some(n), Tok::Ident(u)) = (parse_signed_int(&text), t2) {
                     if let Some(unit) = lookup_interval_unit(u.as_bytes()) {
                         let pos = self.pos;
                         self.bump()?; // INTERVAL
-                        self.bump()?; // 文字列
-                        self.bump()?; // 単位語
+                        self.bump()?; // the string
+                        self.bump()?; // the unit word
                         let packed = unit_to_interval(unit, n, pos)?;
                         return Ok(self.arena.push(Expr::IntervalLiteral(packed)));
                     }
                 }
                 let pos = self.pos;
                 self.bump()?; // INTERVAL
-                self.bump()?; // 文字列
+                self.bump()?; // the string
                 let packed = parse_interval_text(&text, pos)?;
                 Ok(self.arena.push(Expr::IntervalLiteral(packed)))
             }
             Tok::Int(text) => {
-                // 引用符無しの `INTERVAL <n> <unit>`。単位語が続かなければ
-                // 列参照（`interval` という名前の列に整数が続く式はどのみち
-                // 構文上ありえないが、安全側に倒して列参照へ逃がす）。
+                // An unquoted `INTERVAL <n> <unit>`. Without a following unit word it is a
+                // column reference (an expression where a column named `interval` is
+                // followed by an integer is syntactically impossible anyway, but this errs on the safe side).
                 let t2 = lx.next_token()?.tok;
                 let Tok::Ident(u) = t2 else {
                     return self.name_ref();
@@ -865,8 +859,8 @@ impl<'a> Parser<'a> {
                 let pos = self.pos;
                 let Some(n) = parse_signed_int(text) else { err!(NumberOverflow, pos) };
                 self.bump()?; // INTERVAL
-                self.bump()?; // 数値
-                self.bump()?; // 単位語
+                self.bump()?; // the number
+                self.bump()?; // the unit word
                 let packed = unit_to_interval(unit, n, pos)?;
                 Ok(self.arena.push(Expr::IntervalLiteral(packed)))
             }
@@ -905,14 +899,14 @@ impl<'a> Parser<'a> {
             return self.name_ref();
         };
         let pos = self.pos;
-        self.bump()?; // 型名
-        self.bump()?; // 文字列
+        self.bump()?; // the type name
+        self.bump()?; // the string
         let text = unquote(raw, b'\'');
         let b = text.as_bytes();
-        // 物理表現は論理型ごとに決まる（DESIGN.md §8）: DATE は日数の I32、
-        // TIME/TIMESTAMP/TIMESTAMPTZ はマイクロ秒の I64。`sql::now` が
-        // `CURRENT_DATE`/`CURRENT_TIMESTAMP` に対して組み立てる
-        // `TypedLiteral` とまったく同じ形。
+        // The physical representation is fixed per logical type (DESIGN.md §8): DATE is
+        // I32 days, TIME/TIMESTAMP/TIMESTAMPTZ are I64 microseconds. Exactly the same
+        // shape as the `TypedLiteral` `sql::now` builds for
+        // `CURRENT_DATE`/`CURRENT_TIMESTAMP`.
         let value = match ty {
             Ty::Date => funcs::parse_date(b).and_then(|d| i32::try_from(d).ok()).map(Value::I32),
             Ty::Time => funcs::parse_time(b).map(Value::I64),
@@ -923,7 +917,7 @@ impl<'a> Parser<'a> {
         Ok(self.arena.push(Expr::TypedLiteral(value, ty)))
     }
 
-    /// 識別子始まりの primary: 関数呼び出し / `q.name` / `q.*` / 列参照。
+    /// A primary beginning with an identifier: function call / `q.name` / `q.*` / column reference.
     fn name_ref(&mut self) -> Result<ExprId> {
         let name = self.ident()?;
         if self.is(Tok::LParen) {
@@ -956,7 +950,7 @@ impl<'a> Parser<'a> {
         Ok(self.arena.push(Expr::ColumnRef { qualifier: None, name }))
     }
 
-    /// `[NOT] EXISTS ( query )`。呼び出し時の `cur` は `EXISTS`。
+    /// `[NOT] EXISTS ( query )`. On entry `cur` is `EXISTS`.
     fn exists(&mut self, negated: bool) -> Result<ExprId> {
         self.bump()?; // EXISTS
         self.expect(Tok::LParen)?;
@@ -966,16 +960,16 @@ impl<'a> Parser<'a> {
     }
 
     fn call(&mut self, name: String) -> Result<ExprId> {
-        // `EXTRACT(part FROM ts)` は `FROM` を挟む特殊構文で、通常のカンマ
-        // 区切り引数列とは形が違う。`date_part(part, ts)` と等価なので、
-        // ここで構文だけ吸収して同じ `Function` ノードに畳む（実行側は
-        // `extract` を知らなくてよい）。
+        // `EXTRACT(part FROM ts)` is a special syntax interposing `FROM`, shaped
+        // differently from an ordinary comma-separated argument list. It is equivalent to
+        // `date_part(part, ts)`, so only the syntax is absorbed here and folded into the
+        // same `Function` node (execution need not know about `extract`).
         //
-        // `Parser` 自体は clone できない（`ExprArena` を持つため）ので、
-        // `Lexer` の clone だけで「`( IDENT FROM` の形か」を確定させてから
-        // `self` を進める。`peek()` と同じ先読みの流儀。
-        // `TRY_CAST(expr AS type)` は CAST と同じ特殊構文（`AS` を挟む）。
-        // 通常のカンマ引数列とは形が違うので、CAST と同じ経路に落とす。
+        // `Parser` itself cannot be cloned (it holds an `ExprArena`), so only the `Lexer`
+        // is cloned to settle "is this the `( IDENT FROM` shape" before advancing `self`.
+        // The same lookahead style as `peek()`.
+        // `TRY_CAST(expr AS type)` is the same special syntax as CAST (interposing `AS`).
+        // Its shape differs from a comma-separated list, so it takes the same path as CAST.
         if eq_ascii_ci(name.as_bytes(), b"try_cast") && self.cur == Tok::LParen {
             return self.cast_body(true);
         }
@@ -995,18 +989,18 @@ impl<'a> Parser<'a> {
         {
             err!(UnsupportedFeature, self.pos)
         }
-        // `UNNEST(expr)`（SELECT リスト用）。DISTINCT/`*`/FILTER/OVER は
-        // 意味を持たないので、通常の関数呼び出しとは別の単純な形で読む
-        // （FROM 句版は `base_rel` 参照）。
+        // `UNNEST(expr)` (for the SELECT list). DISTINCT/`*`/FILTER/OVER are meaningless
+        // here, so it is read in a simple form distinct from an ordinary function call
+        // (for the FROM-clause version see `base_rel`).
         if eq_ascii_ci(name.as_bytes(), b"unnest") && self.cur == Tok::LParen {
             self.bump()?; // '('
             let arg = self.expr()?;
             self.expect(Tok::RParen)?;
             return Ok(self.arena.push(Expr::Unnest(arg)));
         }
-        // `IIF(cond, then, else)` は `CASE WHEN cond THEN then ELSE else END`
-        // の糖衣構文。パーサレベルで CASE 式へ脱糖する（`EXTRACT` → `date_part`
-        // と同じ判断）ので、実行側は `iif` を一切知らなくてよい。
+        // `IIF(cond, then, else)` is sugar for `CASE WHEN cond THEN then ELSE else END`.
+        // It is desugared to a CASE expression at the parser level (the same judgment as
+        // `EXTRACT` -> `date_part`), so execution need not know about `iif` at all.
         if eq_ascii_ci(name.as_bytes(), b"iif") && self.cur == Tok::LParen {
             self.bump()?; // '('
             let cond = self.expr()?;
@@ -1021,16 +1015,16 @@ impl<'a> Parser<'a> {
                 else_: Some(else_),
             }));
         }
-        // --- SQL 標準の関数構文（引数の途中にキーワードを挟む形） -----------
+        // --- Standard SQL function syntax (keywords interposed among arguments) -------
         //
-        // `EXTRACT(part FROM ts)` と同じ扱い: 構文だけここで吸収して、既存の
-        // スカラ関数呼び出しへそのまま脱糖する。実行側もカーネルも
-        // `position`/`substring`/`trim` の「標準構文」を一切知らなくてよい。
+        // Handled like `EXTRACT(part FROM ts)`: only the syntax is absorbed here and
+        // desugared straight into existing scalar function calls. Neither execution nor
+        // the kernels need to know about the "standard syntax" of `position`/`substring`/`trim`.
         //
-        // `EXTRACT` と違ってキーワードの前に任意長の式が来るので、2 トークン
-        // 先読みでは形を確定できない。代わりに `call_has_top_level` で
-        // 「同じ深さに `IN`/`FROM` があるか」を先に見てから分岐する（無ければ
-        // 従来どおりのカンマ区切り引数列としてそのまま読む）。
+        // Unlike `EXTRACT`, an expression of arbitrary length precedes the keyword, so two
+        // tokens of lookahead cannot settle the shape. Instead `call_has_top_level` first
+        // checks "is there an `IN`/`FROM` at the same depth" before branching (without
+        // one, it is read as a conventional comma-separated argument list).
         if eq_ascii_ci(name.as_bytes(), b"position")
             && self.cur == Tok::LParen
             && self.call_has_top_level(Tok::Kw(Kw::In))?
@@ -1054,7 +1048,7 @@ impl<'a> Parser<'a> {
             if let Tok::Ident(part) = t1 {
                 let t2 = lx.next_token()?.tok;
                 if t2 == Tok::Kw(Kw::From) {
-                    // ここまで来たら確定。本物のトークン列を同じ回数だけ進める。
+                    // Settled at this point. Advance the real token stream the same number of times.
                     self.bump()?; // '('
                     self.bump()?; // part
                     self.bump()?; // FROM
@@ -1071,21 +1065,20 @@ impl<'a> Parser<'a> {
         let mut distinct = false;
         let mut star = false;
         if self.is(Tok::Star) {
-            // 引数位置の `*` は COUNT(*) 系だけ。意味付けは binder に任せる。
+            // A `*` in argument position occurs only in the COUNT(*) family. Interpretation is left to the binder.
             star = true;
             self.bump()?;
         } else if !self.is(Tok::RParen) {
             distinct = self.eat_kw(Kw::Distinct)?;
-            // ラムダ（`x -> expr` / `(a, b) -> expr`）は `list_transform` /
-            // `list_filter` / `list_reduce` の引数位置でだけ認識する。
-            // `->` は通常 JSON パス演算子の糖衣構文（`json_extract` への
-            // 展開、`expr_body` 参照）なので、他の関数の引数では
-            // 今までどおりその意味のまま残す（`coalesce(doc -> 'a', 'x')` の
-            // ような既存の使い方を壊さないため。duckdb CLI で実測した
-            // 限りでも、`->` がラムダとして解釈されるのは list_transform 等
-            // 「ラムダを受け取ると分かっている関数」の引数位置だけで、
-            // 例えば `coalesce(x -> 5, 3)` は `x` が列として解決できず
-            // `x -> 5` は JSON 演算子のままエラーになる）。
+            // Lambdas (`x -> expr` / `(a, b) -> expr`) are recognized only in the argument
+            // positions of `list_transform` / `list_filter` / `list_reduce`.
+            // `->` is normally sugar for the JSON path operator (expanding to
+            // `json_extract`; see `expr_body`), so in other functions' arguments it keeps
+            // that meaning as before (so existing usage like `coalesce(doc -> 'a', 'x')` is
+            // not broken. As measured with the duckdb CLI, `->` is interpreted as a lambda
+            // only in the argument positions of functions known to take one, such as
+            // list_transform; `coalesce(x -> 5, 3)`, for instance, fails to resolve `x` as
+            // a column and errors with `x -> 5` still the JSON operator).
             let lambda_fn = is_lambda_func(&name);
             loop {
                 let e = if lambda_fn && self.looks_like_lambda_params()? {
@@ -1100,8 +1093,8 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RParen)?;
-        // `agg(...) FILTER (WHERE cond)`。`FILTER` も予約語ではなく、関数呼び出し
-        // 直後で次が `(` のときだけキーワードとして扱う（`OVER` と同じ判断）。
+        // `agg(...) FILTER (WHERE cond)`. `FILTER` is not reserved either, and is treated
+        // as a keyword only right after a function call when the next token is `(` (the same judgment as `OVER`).
         let mut filter = None;
         if self.is_soft_kw(b"filter") && self.peek()? == Tok::LParen {
             self.bump()?; // filter
@@ -1110,23 +1103,23 @@ impl<'a> Parser<'a> {
             filter = Some(self.expr()?);
             self.expect(Tok::RParen)?;
         }
-        // `OVER` は予約語ではないので、次が `(` か識別子のときだけウィンドウ句
-        // と見なす。`SELECT count(*) over FROM t` の `over` は別名のまま通る
-        // （次が `FROM` などキーワードなら、下の分岐に入らず素通りする）。
+        // `OVER` is not reserved, so it is taken as a window clause only when followed by
+        // `(` or an identifier. The `over` in `SELECT count(*) over FROM t` still passes as
+        // an alias (with a keyword such as `FROM` next, the branch below is not entered).
         if self.is_soft_kw(b"over") {
             match self.peek()? {
                 Tok::LParen => {
-                    // `f(DISTINCT x) OVER (...)` / `f(...) FILTER (...) OVER (...)` は
-                    // 範囲外。無視すると結果が変わるので弾く。
+                    // `f(DISTINCT x) OVER (...)` / `f(...) FILTER (...) OVER (...)` are out
+                    // of scope. Ignoring them would change results, so they are rejected.
                     ensure!(!distinct, UnsupportedFeature, self.pos);
                     ensure!(filter.is_none(), UnsupportedFeature, self.pos);
                     return self.window(name, args, star);
                 }
                 Tok::Ident(_) | Tok::QIdent(_) => {
-                    // `OVER w`（名前付きウィンドウの参照）。定義の実体は
-                    // `WINDOW` 句にしか無く、SELECT リストの方が構文上先に
-                    // 来るのでここでは名前だけ持たせ、束縛時に
-                    // `SelectStmt::windows` から引く（`plan::bind` 参照）。
+                    // `OVER w` (a named window reference). The definition itself lives only
+                    // in the `WINDOW` clause, and the SELECT list comes first syntactically,
+                    // so only the name is kept here and looked up from
+                    // `SelectStmt::windows` at bind time (see `plan::bind`).
                     ensure!(!distinct, UnsupportedFeature, self.pos);
                     ensure!(filter.is_none(), UnsupportedFeature, self.pos);
                     self.bump()?; // OVER
@@ -1147,23 +1140,23 @@ impl<'a> Parser<'a> {
         Ok(self.arena.push(Expr::Function { name, args, distinct, star, filter }))
     }
 
-    /// `position(<search> IN <string>)` — SQL 標準の構文。呼び出し時の `cur`
-    /// は開き括弧で、同じ深さに `IN` があることは確認済み。
+    /// `position(<search> IN <string>)` -- the standard SQL syntax. On entry `cur` is the
+    /// opening parenthesis, and an `IN` at the same depth is already confirmed.
     ///
-    /// **引数の順序が入れ替わる**ことに注意: `strpos(string, search)` に対して
-    /// 標準構文は探す方を先に書く（`duckdb -c "select position('b' in 'abc'),
-    /// strpos('abc','b')"` がどちらも `2` を返すことで確認済み）。既存の
-    /// `strpos`（`position`/`instr` も同じ実体）へそのまま脱糖する。
+    /// Note that **the argument order is swapped**: against `strpos(string, search)`, the
+    /// standard syntax writes the needle first (confirmed by `duckdb -c "select
+    /// position('b' in 'abc'), strpos('abc','b')"` both returning `2`). It desugars
+    /// straight to the existing `strpos` (`position`/`instr` share the same implementation).
     ///
-    /// 見つからなければ `0`、空文字列を探すと `1`、どちらかが NULL なら NULL
-    /// （`duckdb -c "select position('z' in 'abc'), position('' in 'abc'),
-    /// position(NULL in 'abc'), position('b' in NULL)"` -> `0`/`1`/NULL/NULL）
-    /// ——これは既存の `strpos` の挙動そのままなので、ここでは何もしない。
+    /// Not found gives `0`, searching for the empty string gives `1`, and either side
+    /// being NULL gives NULL (`duckdb -c "select position('z' in 'abc'), position('' in
+    /// 'abc'), position(NULL in 'abc'), position('b' in NULL)"` -> `0`/`1`/NULL/NULL)
+    /// -- that is exactly the existing `strpos` behavior, so nothing is done here.
     ///
-    /// 探す側の式は `BP_CMP + 1` で読む。区切りの `IN` を `x IN (...)` の
-    /// 述語として食わせないため（`BETWEEN` の境界を `BP_CONCAT` で読むのと
-    /// 同じ手口）。`||` や算術は `BP_CMP` より強いので普通に結合する
-    /// （`position('a' || 'b' in s)` は意図どおり）。
+    /// The needle expression is read at `BP_CMP + 1`, so the separating `IN` is not
+    /// swallowed as the `x IN (...)` predicate (the same trick as reading `BETWEEN`'s
+    /// bounds at `BP_CONCAT`). `||` and arithmetic bind tighter than `BP_CMP` and so
+    /// combine normally (`position('a' || 'b' in s)` works as intended).
     fn position_in_call(&mut self) -> Result<ExprId> {
         self.bump()?; // '('
         let search = self.expr_bp(BP_CMP + 1)?;
@@ -1173,24 +1166,24 @@ impl<'a> Parser<'a> {
         Ok(self.simple_call("strpos", vec![string, search]))
     }
 
-    /// `trim([BOTH | LEADING | TRAILING] [<chars>] FROM <s>)` — SQL 標準の
-    /// 構文。呼び出し時の `cur` は開き括弧で、同じ深さに `FROM` があることは
-    /// 確認済み。既存の `trim`/`ltrim`/`rtrim`（1 引数版が空白、2 引数版が
-    /// 取り除く文字集合）へ脱糖する。
+    /// `trim([BOTH | LEADING | TRAILING] [<chars>] FROM <s>)` -- the standard SQL syntax.
+    /// On entry `cur` is the opening parenthesis, and a `FROM` at the same depth is
+    /// already confirmed. It desugars to the existing `trim`/`ltrim`/`rtrim` (the
+    /// one-argument form trims whitespace, the two-argument form a set of characters).
     ///
-    /// `duckdb` CLI で受理する形と結果を確認済み:
+    /// The accepted forms and results were confirmed with the `duckdb` CLI:
     ///   trim(both 'x' from 'xxabxx')     -> 'ab'      == trim('xxabxx','x')
     ///   trim(leading 'x' from 'xxabxx')  -> 'abxx'    == ltrim('xxabxx','x')
     ///   trim(trailing 'x' from 'xxabxx') -> 'xxab'    == rtrim('xxabxx','x')
-    ///   trim('x' from 'xxabxx')          -> 'ab'      （方向省略は BOTH）
-    ///   trim(from '  ab  ')              -> 'ab'      （文字集合省略は空白）
+    ///   trim('x' from 'xxabxx')          -> 'ab'      (omitting the direction means BOTH)
+    ///   trim(from '  ab  ')              -> 'ab'      (omitting the character set means whitespace)
     ///   trim(both from '  ab  ')         -> 'ab'
     ///
-    /// `BOTH`/`LEADING`/`TRAILING` は予約語にしない（`ROWS`/`RANGE` を巡る
-    /// 列名破壊の事故と同じ理由）。ここで綴りだけを見て判定できるのは、
-    /// 呼び出し元が「同じ深さに `FROM` がある」と確定させた後だからで、
-    /// 普通の `trim(leading)` / `trim(leading, 'x')`（`leading` という名前の
-    /// 列を渡す形）はこの関数に入らず従来どおり関数呼び出しとして読まれる。
+    /// `BOTH`/`LEADING`/`TRAILING` are not reserved (the same reason as the column-name
+    /// breakage incidents around `ROWS`/`RANGE`). Matching them by spelling alone is safe
+    /// here only because the caller already settled that "there is a `FROM` at the same
+    /// depth"; an ordinary `trim(leading)` / `trim(leading, 'x')` (passing a column named
+    /// `leading`) never enters this function and is read as a function call as before.
     fn trim_from_call(&mut self) -> Result<ExprId> {
         self.bump()?; // '('
         let mut func = "trim";
@@ -1203,7 +1196,7 @@ impl<'a> Parser<'a> {
             func = "rtrim";
             self.bump()?;
         }
-        // 方向語の直後が `FROM` なら文字集合は省略（＝空白を落とす）。
+        // If `FROM` follows the direction word, the character set is omitted (= trim whitespace).
         let chars = if self.eat_kw(Kw::From)? {
             None
         } else {
@@ -1220,24 +1213,24 @@ impl<'a> Parser<'a> {
         Ok(self.simple_call(func, args))
     }
 
-    /// `substring`/`substr` の引数リスト。SQL 標準の
+    /// The argument list of `substring`/`substr`. Reads both the standard SQL form
     /// `substring(<s> FROM <start> [FOR <len>])` / `substring(<s> FOR <len>)`
-    /// と、従来のカンマ区切り `substring(<s>, <start>[, <len>])` の両方を
-    /// 1 か所で読む。呼び出し時の `cur` は開き括弧。
+    /// and the conventional comma-separated `substring(<s>, <start>[, <len>])`
+    /// in one place. On entry `cur` is the opening parenthesis.
     ///
-    /// `duckdb` CLI で確認済み:
+    /// Confirmed with the `duckdb` CLI:
     ///   substring('abcdef' from 2)        -> 'bcdef'  == substring('abcdef',2)
     ///   substring('abcdef' from 2 for 3)  -> 'bcd'    == substring('abcdef',2,3)
     ///   substring('abcdef' for 3)         -> 'abc'    == substring('abcdef',1,3)
-    /// `FOR` だけの形は開始位置 1 と同じなので、リテラル `1` を補って
-    /// 3 引数形へ落とす。
+    /// A `FOR`-only form is the same as start position 1, so a literal `1` is supplied and
+    /// it drops into the three-argument form.
     ///
-    /// `position`/`trim` と違って先読み（`call_has_top_level`）が要らない:
-    /// 区切り語は必ず**第 1 引数の後ろ**にしか現れず、`FROM`（予約語）も
-    /// `FOR`（裸の識別子）も中置演算子ではないので、第 1 引数を普通に
-    /// `expr()` で読めばその手前で必ず止まる。そこで初めて分岐すればよく、
-    /// カンマ形へ戻る道もそのまま残る（`substring(for, 2)` のように `for`
-    /// という名前の列を渡す形を壊さないために、これが重要）。
+    /// Unlike `position`/`trim`, no lookahead (`call_has_top_level`) is needed: the
+    /// separator word can only appear **after the first argument**, and neither `FROM` (a
+    /// reserved word) nor `FOR` (a bare identifier) is an infix operator, so reading the
+    /// first argument with a plain `expr()` always stops just before it. Only then does it
+    /// branch, and the path back to the comma form remains open (which matters so that
+    /// passing a column named `for`, as in `substring(for, 2)`, is not broken).
     fn substring_call(&mut self, name: &str) -> Result<ExprId> {
         self.bump()?; // '('
         let mut args = vec![self.expr()?];
@@ -1260,12 +1253,12 @@ impl<'a> Parser<'a> {
         Ok(self.simple_call(name, args))
     }
 
-    /// 現在位置がラムダの仮引数リストの形（`IDENT ->` または
-    /// `( IDENT [, IDENT]* ) ->`）をしているか。`Lexer` の clone だけで先読みし
-    /// `self` は動かさない（`peek` と同じ流儀）。
+    /// Whether the current position has the shape of a lambda parameter list (`IDENT ->`
+    /// or `( IDENT [, IDENT]* ) ->`). It looks ahead on a clone of the `Lexer` only and
+    /// does not move `self` (the same style as `peek`).
     ///
-    /// 形が違えば `false` を返すだけで構文エラーにはしない（呼び出し側が
-    /// 通常の `expr()` へフォールバックする）。
+    /// A different shape merely returns `false` rather than raising a syntax error (the
+    /// caller falls back to an ordinary `expr()`).
     fn looks_like_lambda_params(&self) -> Result<bool> {
         match self.cur {
             Tok::Ident(_) => Ok(self.peek()? == Tok::Arrow),
@@ -1287,8 +1280,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `x -> expr` / `(a, b) -> expr`。`looks_like_lambda_params` が `true` を
-    /// 返した直後にだけ呼ぶ。
+    /// `x -> expr` / `(a, b) -> expr`. Called only right after `looks_like_lambda_params`
+    /// returns `true`.
     fn lambda_expr(&mut self) -> Result<ExprId> {
         let mut params = Vec::new();
         if self.eat(Tok::LParen)? {
@@ -1303,15 +1296,15 @@ impl<'a> Parser<'a> {
             params.push(self.ident()?);
         }
         self.expect(Tok::Arrow)?;
-        // 本体は通常の式。カンマは引数区切りとして上位ループが見るので
-        // ここでは（`expr_body` に元々カンマの扱いが無いことも合わせて）
-        // 何も特別な下限を与えず読むだけでよい。
+        // The body is an ordinary expression. The comma is seen by the enclosing loop as an
+        // argument separator, so nothing special is needed here (also because `expr_body`
+        // never handled commas in the first place) -- just read with no special lower bound.
         let body = self.expr()?;
         Ok(self.arena.push(Expr::Lambda { params, body }))
     }
 
-    /// `OVER ( [PARTITION BY ...] [ORDER BY ...] )`。呼び出し時の `cur` は
-    /// `OVER` で、次が `(` であることは確認済み。
+    /// `OVER ( [PARTITION BY ...] [ORDER BY ...] )`. On entry `cur` is `OVER`, and the
+    /// next token is already confirmed to be `(`.
     fn window(&mut self, name: String, args: Vec<ExprId>, star: bool) -> Result<ExprId> {
         self.bump()?; // OVER
         self.expect(Tok::LParen)?;
@@ -1327,12 +1320,12 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// `[PARTITION BY ...] [ORDER BY ...] )` の共通本体。呼び出し時に開き
-    /// 括弧は消費済みで、閉じ括弧まで読んで消費する。`OVER (...)` の直書きと
-    /// `WINDOW name AS (...)` の名前付き定義の両方から使う。
+    /// The shared body of `[PARTITION BY ...] [ORDER BY ...] )`. On entry the opening
+    /// parenthesis is already consumed, and this reads and consumes through the closing
+    /// one. Used both by an inline `OVER (...)` and by a named `WINDOW name AS (...)` definition.
     pub(super) fn window_def_body(&mut self) -> Result<WindowDef> {
         let mut partition_by = Vec::new();
-        // `PARTITION` もウィンドウ指定の先頭でだけキーワードとして扱う。
+        // `PARTITION` is likewise treated as a keyword only at the head of a window specification.
         if self.is_soft_kw(b"partition") {
             self.bump()?;
             self.expect_kw(Kw::By)?;
@@ -1355,13 +1348,13 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        // 明示的な枠指定は未対応。黙って既定枠を使うと結果が変わるので弾く。
-        // `ROWS` / `RANGE` も予約語ではないため、ここで綴りを見て判定する。
+        // Explicit frame specifications are unsupported. Silently using the default frame
+        // would change results, so they are rejected. `ROWS` / `RANGE` are not reserved either, so they are matched by spelling here.
         if self.is_soft_kw(b"rows") || self.is_soft_kw(b"range") {
             err!(UnsupportedFeature, self.pos);
         }
         self.expect(Tok::RParen)?;
-        // 既定枠は SQL 標準どおり ORDER BY の有無で決まる。
+        // The default frame is decided by the presence of ORDER BY, per the SQL standard.
         let frame = if order_by.is_empty() {
             WindowFrame::WholePartition
         } else {
@@ -1375,8 +1368,8 @@ impl<'a> Parser<'a> {
         self.cast_body(false)
     }
 
-    /// `( expr AS type )`。`CAST` と `TRY_CAST` の共通部分。呼び出し時の
-    /// `cur` は開き括弧。
+    /// `( expr AS type )`. The shared part of `CAST` and `TRY_CAST`. On entry `cur` is the
+    /// opening parenthesis.
     fn cast_body(&mut self, try_: bool) -> Result<ExprId> {
         self.expect(Tok::LParen)?;
         let arg = self.expr()?;
@@ -1404,10 +1397,10 @@ impl<'a> Parser<'a> {
             ensure!((1..=38).contains(&p) && s <= p, InvalidCast, pos);
             return Ok(Ty::Decimal { precision: p as u8, scale: s as u8 });
         }
-        // SQL 標準の綴り `TIMESTAMP WITH TIME ZONE`。単語 `timestamptz`
-        // （`TYPES` 表）が普段使いの短縮形、こちらは標準準拠のための別綴り。
-        // `WITH` はここでは常に CTE ではなくこの構文の意味しかありえない
-        // 位置（型名の直後）なので、先読み無しでそのまま食ってよい。
+        // The standard SQL spelling `TIMESTAMP WITH TIME ZONE`. The single word
+        // `timestamptz` (the `TYPES` table) is the everyday shorthand; this is the
+        // alternative spelling for standard conformance. `WITH` here is in a position (right
+        // after a type name) where it can only ever mean this construct and never a CTE, so it can be consumed without lookahead.
         if ty == Ty::Timestamp && self.eat_kw(Kw::With)? {
             ensure!(self.is_soft_kw(b"time"), InvalidCast, pos);
             self.bump()?;
@@ -1420,7 +1413,7 @@ impl<'a> Parser<'a> {
 
     fn case(&mut self) -> Result<ExprId> {
         self.bump()?; // CASE
-                      // CASE の直後が WHEN でなければ、比較対象の式が付いている形。
+                      // If WHEN does not immediately follow CASE, the form carries a subject expression to compare against.
         let operand = if self.is(Tok::Kw(Kw::When)) { None } else { Some(self.expr()?) };
         let mut whens = Vec::new();
         while self.eat_kw(Kw::When)? {

@@ -1,42 +1,41 @@
-//! `WITH RECURSIVE`（再帰 CTE）の不動点反復。
+//! The fixed-point iteration of `WITH RECURSIVE` (recursive CTEs).
 //!
-//! ## アルゴリズム
+//! ## The algorithm
 //!
-//! 1. アンカー（`UNION` の左辺）を最後まで読み切り、その全行を最初の
-//!    「作業テーブル」（直前イテレーションの新規行）にする。読みながら
-//!    そのまま呼び出し元へも返す（アンカーの結果も最終結果の一部）。
-//! 2. 作業テーブルが空でない間、それを入力に再帰項（`UNION` の右辺）を
-//!    1 回実行する。再帰項の中の自己参照は `Node::WorkingTable` という
-//!    葉ノードとして現れており、実行のたびに `WorkingTableScan` へ
-//!    「今回の作業テーブル」を差し込んで物理オペレータ木を組み立て直す
-//!    （`super::build_ctx` 参照）。
-//! 3. 再帰項が生んだ行のうち（`UNION` なら）まだ出ていないものだけを
-//!    「新規行」とし、それを次のイテレーションの作業テーブルにしつつ
-//!    呼び出し元へも返す。新規行が 0 件になったら終了。
+//! 1. Read the anchor (the left side of `UNION`) to completion and make all its rows the first
+//!    "working table" (the previous iteration's new rows). They are also returned to the caller
+//!    while being read (the anchor's result is part of the final result too).
+//! 2. While the working table is non-empty, run the recursive term (the right side of `UNION`)
+//!    once with it as input. Self-references inside the recursive term appear as the leaf node
+//!    `Node::WorkingTable`, and each run rebuilds the physical operator tree with "this round's
+//!    working table" plugged into `WorkingTableScan`
+//!    (see `super::build_ctx`).
+//! 3. Of the rows the recursive term produced, only those not yet emitted (under `UNION`) count
+//!    as "new rows"; they become the next iteration's working table and are also returned to the
+//!    caller. It ends once there are 0 new rows.
 //!
-//! ## 重複排除
+//! ## Deduplication
 //!
-//! `UNION ALL` は重複を残すので作業テーブルの構築以外に状態を持たない。
-//! `UNION`（DISTINCT）は `exec::setop`/`exec::agg` と同じ
-//! `rowkey::encode_key` + `HashIndex` を使い、アンカーから最後の
-//! イテレーションまでを通した既出キー集合を 1 つだけ持つ（キー符号化を
-//! オペレータごとに作り直さないという、このエンジン一貫の方針）。
+//! `UNION ALL` keeps duplicates and so holds no state beyond building the working table.
+//! `UNION` (DISTINCT) uses the same `rowkey::encode_key` + `HashIndex` as
+//! `exec::setop`/`exec::agg` and keeps exactly one set of seen keys spanning the anchor through
+//! the final iteration (this engine's consistent policy of not rebuilding key encoding per
+//! operator).
 //!
-//! ## 再開可能性
+//! ## Resumability
 //!
-//! アンカー・各イテレーションの再帰項はどちらも `Step::NeedIo`/`NeedCodec`
-//! を返しうる。中断はそのまま上へ返し、`phase`/`working`/`seen` などの
-//! 途中状態はすべて `self` に持つので、次の `next()` は同じ場所から
-//! 再開する（`exec::setop::SetOp` と同じ流儀）。1 イテレーションの物理
-//! オペレータ木は `self.current` に保持し、イテレーションの境界（作業
-//! テーブルの入れ替え）以外では作り直さない。
+//! The anchor and each iteration's recursive term can both return `Step::NeedIo`/`NeedCodec`.
+//! Interruptions are returned straight up, and all the partial state -- `phase`/`working`/`seen`
+//! and the rest -- lives in `self`, so the next `next()` resumes from the same place (the same
+//! style as `exec::setop::SetOp`). One iteration's physical operator tree is held in
+//! `self.current` and is not rebuilt except at an iteration boundary (swapping the working table).
 //!
-//! ## 安全弁
+//! ## Safety valves
 //!
-//! 終端しない再帰 CTE（例: 減少しない `WHERE` や、そもそも停止条件を
-//! 書き忘れたもの）を有限時間・有限メモリで確実にエラーへ倒すため、
-//! 反復回数とイテレーションあたりの作業テーブルのバイト数の両方に
-//! 上限を設ける（下の定数のコメント参照）。
+//! To reliably turn a non-terminating recursive CTE (a `WHERE` that does not shrink, or a
+//! forgotten stopping condition) into an error in finite time and finite memory, both the
+//! iteration count and the working table's bytes per iteration are capped (see the comments on
+//! the constants below).
 
 use crate::exec::rowkey::{encode_key, HashIndex};
 use crate::exec::sort::vector_bytes;
@@ -45,56 +44,56 @@ use crate::plan::Node;
 use crate::prelude::*;
 use crate::vector::{Batch, Vector};
 
-/// 不動点反復の回数上限。
+/// The cap on fixed-point iterations.
 ///
-/// DuckDB 自身はこの種の入力（例: `SELECT n+1 FROM t` に停止条件が無い
-/// 再帰項）を無制限に回し続け、メモリを食い潰すまで止まらないことを
-/// 実機で確認済み（`duckdb` CLI で 120 秒経っても終了しなかった）。
-/// wasm ホストでこれをやると復帰不能になるため、現実的な階層データ
-/// （数千〜数万段の組織図・カテゴリツリー）やグラフ探索は十分に収まり、
-/// かつ暴走時は数秒で明確なエラーに落ちる値として 100,000 を選んだ。
+/// DuckDB itself was confirmed on real hardware to spin on this kind of input (a recursive term
+/// such as `SELECT n+1 FROM t` with no stopping condition) indefinitely, not stopping until
+/// memory is exhausted (the `duckdb` CLI had not finished after 120 seconds).
+/// Doing that on a wasm host would be unrecoverable, so 100,000 was chosen as a value where
+/// realistic hierarchical data (org charts and category trees thousands to tens of thousands
+/// deep) and graph traversals fit comfortably, while a runaway falls into a clear error in seconds.
 const MAX_RECURSIVE_ITERATIONS: u32 = 100_000;
 
-/// 1 イテレーションぶんの作業テーブル（直前イテレーションの新規行）が
-/// 使ってよいおおよそのバイト数の上限。
+/// The approximate byte cap on what one iteration's working table (the previous iteration's new
+/// rows) may use.
 ///
-/// 反復のたびに行が増え続ける（かつ減らない）ケースを、回数の上限に
-/// 頼らず早期に検出するための第二の安全弁。`exec::sort::Sort`/
-/// `exec::setop::SetOp` と同じ考え方で、厳密なバイト計算はしない。
+/// A second safety valve for detecting, without relying on the iteration cap, the case where
+/// rows keep growing (and never shrink) each round. The same idea as
+/// `exec::sort::Sort`/`exec::setop::SetOp`; no exact byte accounting is done.
 const MAX_WORKING_BYTES: usize = 256 << 20;
 
-/// `UNION`（重複排除）の既出キー集合が使ってよいおおよそのバイト数の上限。
-/// `exec::setop::SetOp`/`exec::mod::DistinctOn` と同じ水準。
+/// The approximate byte cap on what `UNION`'s (deduplicating) seen-key set may use.
+/// The same level as `exec::setop::SetOp`/`exec::mod::DistinctOn`.
 const MAX_SEEN_BYTES: usize = 64 << 20;
 
 enum Phase {
-    /// アンカーを読んでいる。
+    /// Reading the anchor.
     Anchor,
-    /// 現在のイテレーションの再帰項（`current`）を読んでいる。
+    /// Reading the current iteration's recursive term (`current`).
     Iterate,
     Done,
 }
 
 pub struct RecursiveCte {
     anchor: Box<dyn Operator>,
-    /// 再帰項の論理プラン。イテレーションごとに新しい物理オペレータ木を
-    /// 組み立て直すため、実行済みでも所有し続ける（`Node: Clone`）。
+    /// The recursive term's logical plan. A new physical operator tree is rebuilt each iteration,
+    /// so it is kept owned even after execution (`Node: Clone`).
     recursive_term: Node,
     phase: Phase,
-    /// `Iterate` フェーズでのみ `Some`。
+    /// `Some` only in the `Iterate` phase.
     current: Option<Box<dyn Operator>>,
-    /// 直前のイテレーションで新しく増えた行。次のイテレーションの
-    /// `Node::WorkingTable` に差し込む。
+    /// The rows newly added in the previous iteration. Plugged into the next iteration's
+    /// `Node::WorkingTable`.
     working: Vec<Batch>,
-    /// 今のイテレーション（またはアンカー）で新しく見つかった行。
-    /// フェーズが終わったら `working` に差し替える。
+    /// The rows newly found in this iteration (or the anchor).
+    /// Once the phase ends it replaces `working`.
     next_working: Vec<Batch>,
-    /// `next_working` が使っているおおよそのバイト数。
+    /// The approximate bytes `next_working` uses.
     next_working_bytes: usize,
-    /// `UNION`（DISTINCT）のときだけ `Some`。`UNION ALL` では重複を見ない。
+    /// `Some` only under `UNION` (DISTINCT). `UNION ALL` does not look at duplicates.
     seen: Option<HashIndex>,
     keybuf: Vec<u8>,
-    /// 完了した反復回数（安全弁）。
+    /// The number of completed iterations (a safety valve).
     iterations: u32,
 }
 
@@ -114,15 +113,15 @@ impl RecursiveCte {
         }
     }
 
-    /// バッチ 1 つを処理する。`UNION` なら重複行を除き、残った行を
-    /// 「次のイテレーションの作業テーブル」にも積む。戻り値は呼び出し元へ
-    /// 返す出力（重複だけのバッチ、または 0 行なら `None`）。
+    /// Processes one batch. Under `UNION` it removes duplicate rows and also pushes the survivors
+    /// into "the next iteration's working table". The return value is the output for the caller
+    /// (`None` for a batch of nothing but duplicates, or 0 rows).
     fn process(&mut self, mut batch: Batch) -> Result<Option<Batch>> {
         if batch.card() == 0 {
             return Ok(None);
         }
-        // 以降は行番号で引く（重複判定・作業テーブルへの格納とも）ので
-        // selection をここで畳む。
+        // From here on lookups are by row number (both for duplicate checking and for storing into
+        // the working table), so selection is materialized now.
         batch.materialize();
         let cols = match &mut self.seen {
             None => batch.cols,
@@ -159,8 +158,8 @@ impl RecursiveCte {
         Ok(Some(out))
     }
 
-    /// 現在のフェーズの入力を読み切った。次のイテレーションへ進む
-    /// （新規行が無ければ `Done`）。
+    /// The current phase's input is read through. Advances to the next iteration
+    /// (`Done` if there are no new rows).
     fn begin_iteration(&mut self) -> Result<()> {
         self.working = core::mem::take(&mut self.next_working);
         self.next_working_bytes = 0;
@@ -194,8 +193,8 @@ impl Operator for RecursiveCte {
                 Phase::Iterate => {
                     let op = match &mut self.current {
                         Some(op) => op,
-                        // `Iterate` に入るのは `begin_iteration` が `current` を
-                        // 設定した直後だけなので、必ず `Some`。
+                        // `Iterate` is entered only right after `begin_iteration` sets `current`,
+                        // so it is always `Some`.
                         None => err!(Internal),
                     };
                     match op.next(ctx)? {
@@ -215,10 +214,10 @@ impl Operator for RecursiveCte {
     }
 }
 
-/// 再帰 CTE の再帰項内での自己参照（`Node::WorkingTable`）。直前の
-/// イテレーションで新しく増えた行をそのまま返すだけの葉オペレータ。
-/// データは既にメモリ上にあるので、`MemScan` と同じ理由で
-/// `NeedIo`/`NeedCodec` は原理的に返らない。
+/// A self-reference inside a recursive CTE's recursive term (`Node::WorkingTable`). A leaf
+/// operator that simply returns the rows newly added in the previous iteration.
+/// The data is already in memory, so for the same reason as `MemScan` it can never in principle
+/// return `NeedIo`/`NeedCodec`.
 pub struct WorkingTableScan {
     batches: Vec<Batch>,
     pos: usize,
@@ -241,17 +240,15 @@ impl Operator for WorkingTableScan {
     }
 }
 
-/// 作業テーブルを複製する。`Node::WorkingTable` が複数箇所（自己結合）に
-/// 現れても、それぞれが独立に読み進められるよう、参照のたびに新しい
-/// `Vec<Batch>` を作る。
+/// Clones the working table. Even when `Node::WorkingTable` appears in several places (a
+/// self-join), a fresh `Vec<Batch>` is built per reference so each can advance independently.
 pub(crate) fn clone_batches(src: &[Batch]) -> Vec<Batch> {
     src.iter().map(clone_batch).collect()
 }
 
-/// `Batch` は `sel`/`empty_rows` を外から複製する手段を持たないので
-/// （`vector::Batch` の非公開フィールド）、selection を持たない前提で
-/// 列だけを複製する。呼び出し元はすべて `materialize()` 済みのバッチしか
-/// 渡さない。
+/// `Batch` offers no way to clone `sel`/`empty_rows` from outside (they are private fields of
+/// `vector::Batch`), so only the columns are cloned, assuming no selection is present. Every
+/// caller passes only batches that have already been `materialize()`d.
 fn clone_batch(b: &Batch) -> Batch {
     if b.cols.is_empty() {
         Batch::rows_only(b.num_rows())

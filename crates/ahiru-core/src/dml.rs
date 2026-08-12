@@ -1,14 +1,14 @@
-//! DML 実行（`dml` フィーチャ）。
+//! DML execution (the `dml` feature).
 //!
-//! `INSERT` / `UPDATE` / `DELETE`。効くのは `catalog::MemTable`（`ddl` の
-//! `CREATE TABLE` で作ったインメモリ表）だけ。Parquet/CSV/JSONL 由来の
-//! 読み取り専用テーブルに対しては `ReadOnlyTable` で拒否する
-//! （DESIGN.md §16）。
+//! `INSERT` / `UPDATE` / `DELETE`. These apply only to `catalog::MemTable` (in-memory
+//! tables created by `ddl`'s `CREATE TABLE`). Read-only tables backed by
+//! Parquet/CSV/JSONL are rejected with `ReadOnlyTable`
+//! (DESIGN.md §16).
 //!
-//! 式評価はすべて既存のバイトコード VM（`expr::vm::Vm`）を使う。行を
-//! バッチ（最大 `BATCH_SIZE` 行）にまとめてから `Vm::eval`/`eval_filter` に
-//! 通し、専用のスカラ評価器は書かない — 型変換・NULL・3 値論理を
-//! `SELECT` と完全に同じ規則にできるうえ、コードサイズも増えない。
+//! Every expression is evaluated with the existing bytecode VM (`expr::vm::Vm`). Rows
+//! are gathered into batches (up to `BATCH_SIZE` rows) and run through
+//! `Vm::eval`/`eval_filter`; no dedicated scalar evaluator is written -- that keeps type
+//! conversion, NULLs, and three-valued logic exactly the same as in `SELECT`, and adds no code size.
 
 use crate::ddl::{count_result, eval_scalar, run_query_to_rows};
 use crate::plan::compile::{cast_program, compile};
@@ -19,9 +19,9 @@ use crate::session::{Prepared, Session};
 use crate::sql::ast::{ExprArena, ExprId, InsertSource};
 use crate::vector::{Field, Ty, Value, Vector, BATCH_SIZE};
 
-/// 既に確定している `Value` を対象型へキャストする。`Expr::Literal` として
-/// 包んでから `eval_scalar` に通すことで、CAST の意味論（DECIMAL の
-/// スケール調整、DATE/TIMESTAMP など）を `SELECT` の CAST と完全に共有する。
+/// Casts an already-determined `Value` to the target type. Wrapping it as an
+/// `Expr::Literal` and running it through `eval_scalar` shares CAST semantics (DECIMAL
+/// scale adjustment, DATE/TIMESTAMP, and so on) fully with `SELECT`'s CAST.
 fn cast_value(session: &mut Session, v: Value, target_ty: Ty) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
@@ -31,8 +31,8 @@ fn cast_value(session: &mut Session, v: Value, target_ty: Ty) -> Result<Value> {
     eval_scalar(session, &arena, id, &[], target_ty)
 }
 
-/// `columns`（`INSERT INTO t (a, b) ...` の列名リスト）を、対象表のスキーマ
-/// 上の添字に解決する。省略時（空リスト）は全列をスキーマ順で使う。
+/// Resolves `columns` (the column-name list of `INSERT INTO t (a, b) ...`) into indices
+/// in the target table's schema. When omitted (an empty list), all columns are used in schema order.
 fn resolve_insert_columns(schema: &[Field], columns: &[String]) -> Result<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..schema.len()).collect());
@@ -47,7 +47,7 @@ fn resolve_insert_columns(schema: &[Field], columns: &[String]) -> Result<Vec<us
     Ok(out)
 }
 
-/// 組み立て終えた行の全列に対して NOT NULL を検査する。
+/// Checks NOT NULL over every column of a fully assembled row.
 fn check_not_null(schema: &[Field], row: &[Value]) -> Result<()> {
     for (f, v) in schema.iter().zip(row) {
         ensure!(f.nullable || !v.is_null(), TypeMismatch);
@@ -67,9 +67,9 @@ pub(crate) fn insert(
     let schema = session.catalog.mem_get(idx).unwrap().schema.clone();
     let col_idx = resolve_insert_columns(&schema, columns)?;
 
-    // NOT NULL は行を組み立てた後、スキーマ全列に対してまとめて検査する。
-    // `col_idx` だけを見て検査すると、`INSERT INTO t (a) ...` のように
-    // 省略した列（= Value::Null のまま残る）が NOT NULL でもすり抜けてしまう。
+    // NOT NULL is checked over all schema columns at once, after the row is assembled.
+    // Checking only `col_idx` would let an omitted column (left as Value::Null), as in
+    // `INSERT INTO t (a) ...`, slip through even when it is NOT NULL.
     let new_rows: Vec<Vec<Value>> = match source {
         InsertSource::Values(value_rows) => {
             let mut out = Vec::with_capacity(value_rows.len());
@@ -153,9 +153,9 @@ pub(crate) fn update(
             None => mask.iter_mut().for_each(|m| *m = true),
         }
 
-        // 各 SET 式は「元の」バッチ（更新前の値）に対して一括評価する。
-        // SQL の UPDATE は同時代入なので、後続の SET が先行の SET の結果を
-        // 見てはいけない。
+        // Each SET expression is evaluated in bulk against the "original" batch (the
+        // pre-update values). SQL's UPDATE assigns simultaneously, so a later SET must
+        // not see the result of an earlier one.
         let mut new_cols: Vec<Vector> = Vec::with_capacity(set_progs.len());
         for p in &set_progs {
             new_cols.push(session.vm.eval(p, &batch)?);
@@ -197,9 +197,9 @@ pub(crate) fn delete(
 
     let total = session.catalog.mem_get(idx).unwrap().rows.len();
     let mut deleted: u64 = 0;
-    // 削除は行の詰め直しを伴うので、後ろから前へバッチ単位で処理し、
-    // マッチした行だけを `swap_remove` しない安定順序の `retain` 的な方法で
-    // 落とす。前から進めつつ「保持する行」を別のベクタに積み直す。
+    // Deletion involves compacting rows, so this processes batch by batch and drops
+    // matched rows in a stable-order, `retain`-like way rather than `swap_remove`.
+    // It moves forward while re-accumulating "rows to keep" into a separate vector.
     let mut keep: Vec<Vec<Value>> = Vec::with_capacity(total);
     let mut pos = 0;
     while pos < total {
@@ -273,8 +273,8 @@ mod tests {
         assert_eq!(crate::error::code_of(r), Some(Code::ColumnCountMismatch));
     }
 
-    // CSV をフィクスチャに使うので `csv` が要る（`FormatKind::Csv` の
-    // 解決は `csv` 無しだと UnsupportedFeature になる）。
+    // CSV is used as the fixture, so `csv` is required (resolving `FormatKind::Csv`
+    // gives UnsupportedFeature without it).
     #[cfg(feature = "csv")]
     #[test]
     fn insert_into_file_table_is_read_only() {
@@ -284,9 +284,9 @@ mod tests {
         assert_eq!(crate::error::code_of(r), Some(Code::ReadOnlyTable));
     }
 
-    // 列を一部だけ指定した INSERT で、省略した列の NOT NULL がすり抜けない
-    // ことを確認する回帰テスト。`col_idx` だけを見て検査すると、省略列
-    // （Value::Null のまま残る）が NOT NULL でも通ってしまうバグがあった。
+    // A regression test confirming that an INSERT naming only some columns does not let
+    // NOT NULL on the omitted columns slip through. Checking only `col_idx` used to be a
+    // bug that passed omitted columns (left as Value::Null) even when they were NOT NULL.
     #[test]
     fn insert_with_partial_column_list_enforces_not_null_on_omitted_columns() {
         let mut s = Session::new();
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn update_same_batch_sees_pre_update_values_for_all_set_expressions() {
-        // UPDATE は同時代入。後続の SET が先行の SET の更新後の値を見てはいけない。
+        // UPDATE assigns simultaneously. A later SET must not see an earlier SET's updated value.
         let mut s = Session::new();
         s.prepare("CREATE TABLE t (a INTEGER, b INTEGER)", &[]).unwrap();
         s.prepare("INSERT INTO t VALUES (1, 2)", &[]).unwrap();
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn delete_with_null_filter_result_deletes_nothing() {
-        // 3値論理: WHERE が UNKNOWN (NULL) になる行は削除対象に入らない。
+        // Three-valued logic: rows where WHERE is UNKNOWN (NULL) are not deleted.
         let mut s = Session::new();
         s.prepare("CREATE TABLE t (a INTEGER)", &[]).unwrap();
         s.prepare("INSERT INTO t VALUES (1), (NULL)", &[]).unwrap();
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn delete_spanning_multiple_batches_keeps_correct_rows() {
-        // BATCH_SIZE を跨ぐ削除で、保持すべき行の順序と内容が壊れないことを確認。
+        // Confirms that a delete spanning BATCH_SIZE does not corrupt the order or contents of the rows to keep.
         let mut s = Session::new();
         s.prepare("CREATE TABLE t (a INTEGER)", &[]).unwrap();
         let values: Vec<String> = (0..(BATCH_SIZE * 2 + 5)).map(|i| format!("({i})")).collect();

@@ -9,7 +9,7 @@ use super::cte::CteScope;
 use super::refs::{collect_refs, each_child, push_u32};
 use super::*;
 
-/// `EXISTS` / `IN (SELECT ...)` を半結合・反結合に書き換える。
+/// Rewrites `EXISTS` / `IN (SELECT ...)` into semi-joins and anti-joins.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_semijoin(
     catalog: &Catalog,
@@ -24,17 +24,17 @@ pub(super) fn build_semijoin(
     let schema = scope.fields().to_vec();
     match arena.get(pred) {
         Expr::Exists { query, negated } => {
-            // `scope` はこの `EXISTS`/`IN` を含むクエリ自身のスコープなので、
-            // そのまま「1 段外側」として渡す（相関は 1 階層のみ対応。
-            // これより深い相関は内側の `scope` に存在しない列参照になり、
-            // 自然に `ColumnNotFound` で失敗する）。
+            // `scope` is the scope of the query containing this `EXISTS`/`IN`, so it is passed
+            // straight through as "one level out" (only one level of correlation is supported.
+            // Deeper correlation becomes a column reference absent from the inner `scope` and
+            // naturally fails with `ColumnNotFound`).
             let plan = bind_query_in(catalog, arena, query, params, ctes, Some(scope))?;
-            // 相関が無ければ「右が 1 行でもあるか」だけが問題でキーは要らない。
-            // 相関があれば、相関キーが一致する行が 1 つでもあるかを見る。
-            // `EXISTS` は集合ではなく行の存在を問うだけなので、`IN`/`NOT IN`
-            // のような NULL の三値論理の落とし穴が無く、通常の
-            // Semi/Anti（NULL キーは互いに一致しない）でそのまま正しい
-            // （DuckDB で確認済み）。
+            // Without correlation, all that matters is "is there at least one row on the right",
+            // and no key is needed. With correlation, it checks whether at least one row matches
+            // the correlation key. `EXISTS` asks only about row existence rather than about a
+            // set, so it has none of the NULL three-valued-logic pitfalls of `IN`/`NOT IN` and is
+            // correct with an ordinary Semi/Anti (where NULL keys do not match one another)
+            // (confirmed with DuckDB).
             let kind = if *negated { JoinKind::Anti } else { JoinKind::Semi };
             let (left_keys, right_keys) = correlation_keys(arena, scope, params, &plan)?;
             Ok(Node::Join {
@@ -50,10 +50,9 @@ pub(super) fn build_semijoin(
         Expr::InSubquery { arg, query, negated } => build_in_style_semijoin(
             catalog, arena, params, ctes, left, scope, subs, schema, *arg, query, *negated,
         ),
-        // `= ANY (SELECT ...)` / `<> ALL (SELECT ...)` は `IN`/`NOT IN` と
-        // 意味的に全く同じ（`is_semijoin_predicate` の doc 参照）。他の演算子・
-        // `SOME`/`ALL` の組み合わせはここには来ない（`is_semijoin_predicate` が
-        // 弾いている）。
+        // `= ANY (SELECT ...)` / `<> ALL (SELECT ...)` mean exactly the same as `IN`/`NOT IN`
+        // (see the `is_semijoin_predicate` docs). Other operator and `SOME`/`ALL` combinations
+        // never reach here (`is_semijoin_predicate` filters them out).
         Expr::QuantifiedComparison { op, arg, all: _, query } => {
             let negated = matches!(op, BinaryOp::Ne);
             build_in_style_semijoin(
@@ -64,9 +63,9 @@ pub(super) fn build_semijoin(
     }
 }
 
-/// `x [NOT] IN (SELECT ...)` 形の半結合・反結合を組み立てる。`InSubquery` と
-/// `= ANY` / `<> ALL` に書き換わった `QuantifiedComparison` の両方から呼ばれる
-/// 共通実装（`build_semijoin` 参照）。
+/// Builds the semi-join/anti-join for the `x [NOT] IN (SELECT ...)` shape. The shared
+/// implementation called both from `InSubquery` and from a `QuantifiedComparison` rewritten
+/// as `= ANY` / `<> ALL` (see `build_semijoin`).
 #[allow(clippy::too_many_arguments)]
 fn build_in_style_semijoin(
     catalog: &Catalog,
@@ -89,7 +88,7 @@ fn build_in_style_semijoin(
     let lp = compile_with_subs(arena, scope, params, subs, arg)?;
     let rscope = Scope::from_fields(plan.root.schema().to_vec());
     let rp = column_program(&rscope, 0)?;
-    // キーはバイト列に符号化して突き合わせるので、物理型を揃える。
+    // Keys are compared as encoded byte sequences, so the physical types are aligned.
     let want = Ty::unify_or_mismatch(lp.result_ty, rf.ty)?;
     let mut left_keys = vec![cast_program(lp, want)?];
     let mut right_keys = vec![cast_program(rp, want)?];
@@ -97,18 +96,16 @@ fn build_in_style_semijoin(
     left_keys.extend(corr_left);
     right_keys.extend(corr_right);
 
-    // `NOT IN` は右に NULL が 1 つでもあると三値論理で結果が空になる。
-    // 通常の反結合ではこの意味を再現できないので、NULL 対応版
-    // （右に NULL キーが 1 つでもあれば無条件に空を返す）を使う。
-    // `AntiNullAware` は「右全体に NULL があるか」を見る実装
-    // （相関キーごとにスコープされていない）なので、相関がある場合に
-    // そのまま使うと、ある外側行の相関先に NULL があるだけで無関係な
-    // 別の外側行の結果まで空になりかねない。相関キーごとに絞った
-    // null 対応判定を行う実行系のプリミティブが無い以上、相関
-    // `NOT IN` は安全に評価できない（対象列の NULL 可能性を束縛時に
-    // 正確に判定する手段も無い: SELECT リストの出力列は常に
-    // `nullable = true` として扱われるため）。誤った結果を返すより
-    // 明確に拒否する。
+    // With `NOT IN`, a single NULL on the right makes the result empty under three-valued
+    // logic. An ordinary anti-join cannot reproduce that, so the NULL-aware version is used
+    // (if there is even one NULL key on the right, it returns empty unconditionally).
+    // `AntiNullAware` is implemented as "is there a NULL anywhere on the right" (not scoped per
+    // correlation key), so using it as is under correlation could empty the result for an
+    // unrelated outer row merely because some other outer row's correlated side had a NULL.
+    // Without an execution primitive for a NULL-aware check narrowed per correlation key, a
+    // correlated `NOT IN` cannot be evaluated safely (there is also no way to determine the
+    // target column's nullability accurately at bind time: a SELECT list's output columns are
+    // always treated as `nullable = true`). Rejecting clearly beats returning a wrong result.
     ensure!(!(negated && k > 0), UnsupportedFeature);
     let kind = match (negated, rf.nullable) {
         (false, _) => JoinKind::Semi,
@@ -126,10 +123,10 @@ fn build_in_style_semijoin(
     })
 }
 
-/// `plan.correlated` の各項目に対応する結合キー `(left, right)` の組を作る。
-/// `plan.root` の末尾 `plan.correlated.len()` 列が、`bind_select_in` が
-/// 付加した相関キー列（その手前の列数はサブクエリの種類によって違うが、
-/// 常に末尾にまとまっている）。相関が無ければ両方とも空を返す。
+/// Builds the join-key pairs `(left, right)` corresponding to each item of `plan.correlated`.
+/// The trailing `plan.correlated.len()` columns of `plan.root` are the correlation key columns
+/// `bind_select_in` appended (how many columns precede them depends on the kind of subquery,
+/// but they are always grouped at the end). Without correlation, both come back empty.
 fn correlation_keys(
     arena: &ExprArena,
     outer_scope: &Scope,
@@ -155,64 +152,64 @@ fn correlation_keys(
     Ok((left_keys, right_keys))
 }
 
-// --- 量化比較（ANY/ALL/SOME、`>`/`<`/`>=`/`<=` 側） --------------------------
+// --- Quantified comparison (ANY/ALL/SOME, the `>`/`<`/`>=`/`<=` side) --------
 //
-// `= ANY`/`<> ALL` は `IN`/`NOT IN` と同じ半結合に書き換わる
-// （`is_semijoin_predicate`/`build_semijoin` 参照）。残りの 8 通り
-// （`<`/`<=`/`>`/`>=` × `ANY`/`ALL`）は「一致する行があるか」ではなく
-// 「集合全体との比較」なので半結合には落ちない。代わりに `duckdb` の内部
-// 書き換え（`SELECT 5 > ALL(...)` を EXPLAIN すると `NOT (5 <= ANY(...))`
-// になることを実測済み）にならい、`x <op> ALL (q)` を
-// `NOT (x <negate(op)> ANY (q))` として `ANY` 側 1 通りに帰着させる。
+// `= ANY`/`<> ALL` rewrite to the same semi-join as `IN`/`NOT IN` (see
+// `is_semijoin_predicate`/`build_semijoin`). The remaining eight combinations
+// (`<`/`<=`/`>`/`>=` x `ANY`/`ALL`) ask about "a comparison against the whole set" rather than
+// "is there a matching row", so they do not lower to a semi-join. Instead, following
+// `duckdb`'s internal rewrite (measured: EXPLAINing `SELECT 5 > ALL(...)` yields
+// `NOT (5 <= ANY(...))`), `x <op> ALL (q)` is reduced to the single `ANY` form
+// `NOT (x <negate(op)> ANY (q))`.
 //
-// `x <op> ANY (q)` 自体は `MIN`/`MAX` に単純に置き換えるだけでは正しくない
-// （空集合・NULL の三値論理が絡む。`ANY` の空集合は常に `FALSE`、`ALL` の
-// 空集合は常に `TRUE`、という SQL 標準の落とし穴。モジュールを担当した際に
-// `duckdb` CLI の実測で以下の恒真式を確認した）:
+// `x <op> ANY (q)` itself is not correct as a simple substitution of `MIN`/`MAX` (empty sets
+// and NULL three-valued logic are involved -- the SQL standard's pitfall that `ANY` over an
+// empty set is always `FALSE` while `ALL` over an empty set is always `TRUE`. While working on
+// this module the following identity was confirmed by measurement with the `duckdb` CLI):
 //
 //   x <op> ANY (q) ==
 //     CASE
-//       WHEN COUNT(*) = 0        THEN FALSE  -- 空集合
-//       WHEN x IS NULL           THEN NULL   -- x が NULL なら全行 UNKNOWN
-//       WHEN x <op> extreme(q)   THEN TRUE   -- 非 NULL の実測値だけで判定できる
-//       WHEN COUNT(col) < COUNT(*) THEN NULL -- 非 NULL では負けたが NULL 行がある
+//       WHEN COUNT(*) = 0        THEN FALSE  -- the empty set
+//       WHEN x IS NULL           THEN NULL   -- x NULL makes every row UNKNOWN
+//       WHEN x <op> extreme(q)   THEN TRUE   -- decidable from the non-NULL measured values alone
+//       WHEN COUNT(col) < COUNT(*) THEN NULL -- lost against the non-NULLs, but NULL rows exist
 //       ELSE FALSE
 //     END
 //
-// ここで `extreme` は `op` が `>`/`>=` なら `MIN(col)`、`<`/`<=` なら
-// `MAX(col)`（「最も倒しやすい候補」に x を挑ませれば十分、という考え方。
-// `x > ANY(q)` は「q のどれか 1 つより大きい」なので、最小値より大きければ
-// 必ず存在する）。3 番目の分岐は `extreme` が NULL（＝非 NULL 行が無い）なら
-// 比較自体が NULL になり自然に素通りするので、`COUNT(col) > 0` を別途
-// 確認する必要は無い。
+// Here `extreme` is `MIN(col)` when `op` is `>`/`>=` and `MAX(col)` when it is `<`/`<=` (the
+// idea being that pitting x against "the easiest candidate to beat" suffices: `x > ANY(q)`
+// means "greater than at least one element of q", so being greater than the minimum guarantees
+// one exists). In the third branch, if `extreme` is NULL (= there are no non-NULL rows) the
+// comparison itself becomes NULL and falls through naturally, so there is no need to check
+// `COUNT(col) > 0` separately.
 //
-// **対応範囲**: 非相関サブクエリのみ。内側のクエリが外側スコープの列を
-// 参照する場合は `UnsupportedFeature` で明確に拒否する（DESIGN.md 冒頭の
-// 「黙って壊れるより明確に拒否する」方針）。相関対応は決定的に複雑になる
-// （x は外側行ごとに変わるが、`extreme`/`COUNT` は現状 1 度だけ計算する
-// 設計なので、相関キーごとの集約に一般化する追加実装が要る）ため、今回は
-// 対応を見送った。詳細は `tests/any_all_subquery.rs` のテスト・
-// 最終報告を参照。
-// `= ALL (q)`/`<> ANY (q)` も同じ理由で対応を見送っている
-// （`collect_quantified_comparisons` の doc 参照）:
-// この形は「集合の要素がちょうど 1 通りに揃っているか」を問う形で、
-// `MIN`/`MAX` 一発にも半結合にも帰着しない。
+// **Supported scope**: uncorrelated subqueries only. When the inner query references a column
+// of the outer scope it is explicitly rejected with `UnsupportedFeature` (the "reject clearly
+// rather than break silently" policy at the top of DESIGN.md). Supporting correlation gets
+// decisively complex (x varies per outer row, but `extreme`/`COUNT` are currently designed to
+// be computed once, so generalizing to per-correlation-key aggregation would take additional
+// work), so it was deferred this time. See the tests in `tests/any_all_subquery.rs` and the
+// final report for details.
+// `= ALL (q)`/`<> ANY (q)` are deferred for the same reason (see the
+// `collect_quantified_comparisons` docs):
+// that shape asks whether "the set's elements are all exactly one value", which reduces neither
+// to a single `MIN`/`MAX` nor to a semi-join.
 
-/// `x <op> ANY (q)` の書き換えに使う `(MAX を使うか, 比較演算子)` を選ぶ。
-/// `op` は必ず `Lt`/`Le`/`Gt`/`Ge` のいずれか（呼び出し元で保証）。
+/// Picks the `(whether to use MAX, comparison operator)` used to rewrite `x <op> ANY (q)`.
+/// `op` is always one of `Lt`/`Le`/`Gt`/`Ge` (guaranteed by the caller).
 fn quantified_any_extreme(op: BinaryOp) -> (bool, BinaryOp) {
     match op {
-        BinaryOp::Gt => (false, BinaryOp::Gt), // MIN(q) より大きいか
-        BinaryOp::Ge => (false, BinaryOp::Ge), // MIN(q) 以上か
-        BinaryOp::Lt => (true, BinaryOp::Lt),  // MAX(q) より小さいか
-        BinaryOp::Le => (true, BinaryOp::Le),  // MAX(q) 以下か
+        BinaryOp::Gt => (false, BinaryOp::Gt), // greater than MIN(q)?
+        BinaryOp::Ge => (false, BinaryOp::Ge), // at least MIN(q)?
+        BinaryOp::Lt => (true, BinaryOp::Lt),  // less than MAX(q)?
+        BinaryOp::Le => (true, BinaryOp::Le),  // at most MAX(q)?
         _ => unreachable!("caller only passes order comparisons"),
     }
 }
 
-/// 論理否定した比較演算子（`x <op> y` の否定が `x <negate(op)> y` になる方。
-/// 左右を入れ替える `BinaryOp::swapped` とは別物）。
-/// `x <op> ALL (q)` を `NOT (x <negate(op)> ANY (q))` に落とすために使う。
+/// The logically negated comparison operator (the one where negating `x <op> y` gives
+/// `x <negate(op)> y`; distinct from `BinaryOp::swapped`, which swaps the operands).
+/// Used to lower `x <op> ALL (q)` into `NOT (x <negate(op)> ANY (q))`.
 fn negate_comparison(op: BinaryOp) -> BinaryOp {
     match op {
         BinaryOp::Gt => BinaryOp::Le,
@@ -223,10 +220,10 @@ fn negate_comparison(op: BinaryOp) -> BinaryOp {
     }
 }
 
-/// 合成した合成名（`__qc{idx}_{suffix}`）。`Scope::resolve` は無修飾で全列を
-/// 探すので、ユーザーの列名との衝突を避けるため接頭辞を付ける
-/// （既存の `subqN` ラベルと同じ割り切り。完全な衝突回避ではないが、この
-/// 接頭辞を実際の列名に使う SQL はまず無い）。
+/// A synthesized composite name (`__qc{idx}_{suffix}`). `Scope::resolve` searches every column
+/// unqualified, so a prefix is added to avoid colliding with the user's column names
+/// (the same trade-off as the existing `subqN` labels. Not a complete guarantee, but SQL using
+/// this prefix as a real column name is essentially unheard of).
 fn quantified_label(idx: usize, suffix: &str) -> String {
     let mut s = String::from("__qc");
     push_u32(&mut s, idx as u32);
@@ -235,18 +232,19 @@ fn quantified_label(idx: usize, suffix: &str) -> String {
     s
 }
 
-/// `>`/`<`/`>=`/`<=` を伴う量化比較 1 個を、`COUNT(*)`/`COUNT(col)`/
-/// `MIN` か `MAX` の 3 集約 1 行と、それを外側の各行に付ける（キー無しの）
-/// `LEFT JOIN` へ書き換える。集約は `GROUP BY` 無しなので、`q` が空でも
-/// 必ず 1 行返る（`exec::agg` の `empty_input_ungrouped_emits_one_row` と
-/// 同じ前提。COUNT は 0、`MIN`/`MAX` は NULL になる）ので、`q` が空集合の
-/// ときの分岐もこの 1 行の値だけで CASE 式が正しく判定できる。
+/// Rewrites one quantified comparison involving `>`/`<`/`>=`/`<=` into a single row of three
+/// aggregates -- `COUNT(*)`/`COUNT(col)`/`MIN` or `MAX` -- plus a (keyless) `LEFT JOIN`
+/// attaching it to every outer row. The aggregate has no `GROUP BY`, so it always returns one
+/// row even when `q` is empty (the same premise as `empty_input_ungrouped_emits_one_row` in
+/// `exec::agg`; COUNT becomes 0 and `MIN`/`MAX` become NULL), so the empty-set branch is also
+/// decided correctly by the CASE expression from that one row's values alone.
 ///
-/// 結合後、3 集約列と x の値を読む小さな `CASE` 式（モジュール冒頭の式）を
-/// 別の一時 `ExprArena`（このサブクエリの計算専用。外側の `arena` とは無関係）
-/// で組み立て、既存の `compile()` にそのまま通す（比較演算子の型ディスパッチ
-/// や `CASE`/`IS NULL` の意味論を再実装しない）。最後に中間列（x・3 集約列）
-/// を落として、元の列 + 結果の 1 列だけを残す。
+/// After the join, a small `CASE` expression reading the three aggregate columns and x's value
+/// (the expression at the top of the module) is assembled in a separate temporary `ExprArena`
+/// (dedicated to this subquery's computation, unrelated to the outer `arena`) and run through
+/// the existing `compile()` (so comparison-operator type dispatch and `CASE`/`IS NULL`
+/// semantics are not reimplemented). Finally the intermediate columns (x and the three
+/// aggregates) are dropped, leaving the original columns plus one result column.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_quantified_comparison(
     catalog: &Catalog,
@@ -263,12 +261,12 @@ pub(super) fn build_quantified_comparison(
     query: &QueryStmt,
 ) -> Result<Node> {
     let plan = bind_query_in(catalog, arena, query, params, ctes, Some(scope))?;
-    // 相関サブクエリは対応範囲外（モジュール冒頭の doc 参照）。
+    // Correlated subqueries are out of scope (see the module docs at the top).
     ensure!(plan.correlated.is_empty(), UnsupportedFeature);
     ensure!(plan.root.schema().len() == 1, TypeMismatch);
     let col_ty = plan.root.schema()[0].ty;
 
-    // `ALL` は `NOT (x <negate(op)> ANY (q))` として `ANY` 側の書き換えに帰着させる。
+    // `ALL` reduces to the `ANY` rewrite as `NOT (x <negate(op)> ANY (q))`.
     let (want_max, cmp_op, wrap_not) = if all {
         let (wm, co) = quantified_any_extreme(negate_comparison(op));
         (wm, co, true)
@@ -318,7 +316,7 @@ pub(super) fn build_quantified_comparison(
         having: None,
     };
 
-    // x の値を計算し、既存の列すべての後ろに 1 列足す。
+    // Computes x's value and appends one column after all the existing ones.
     let cur_scope = Scope::from_fields(node.schema().to_vec());
     let orig_len = cur_scope.len();
     let x_prog = compile_with_subs(arena, scope, params, subs, arg)?;
@@ -333,7 +331,7 @@ pub(super) fn build_quantified_comparison(
     ext_schema.push(Field::new(x_name, x_ty, true));
     let node = Node::Project { input: Box::new(node), exprs, schema: ext_schema };
 
-    // 集約 1 行をキー無し（＝クロス結合相当）の LEFT JOIN で全行に付ける。
+    // The one aggregate row is attached to every row with a keyless LEFT JOIN (= a cross join).
     let mut full_schema = node.schema().to_vec();
     full_schema.extend_from_slice(agg_node.schema());
     let node = Node::Join {
@@ -346,8 +344,8 @@ pub(super) fn build_quantified_comparison(
         schema: full_schema,
     };
 
-    // 結合後のスキーマ全体を指す一時スコープ上で、CASE 式を組み立てて
-    // コンパイルする。末尾 4 列が [x, cnt, nonnull, extreme]。
+    // The CASE expression is assembled and compiled over a temporary scope covering the whole
+    // post-join schema. The last four columns are [x, cnt, nonnull, extreme].
     let combined_scope = Scope::from_fields(node.schema().to_vec());
     let len = combined_scope.len();
     ensure!(len >= 4, Internal);
@@ -385,7 +383,7 @@ pub(super) fn build_quantified_comparison(
         if wrap_not { fa.push(Expr::Unary { op: UnaryOp::Not, arg: case_id }) } else { case_id };
     let formula = compile(&fa, &combined_scope, params, result_id)?;
 
-    // 中間列（x・cnt・nonnull・extreme）は落とし、元の列 + 結果の 1 列だけ残す。
+    // The intermediate columns (x, cnt, nonnull, extreme) are dropped, leaving the original columns plus one result column.
     let mut exprs2 = Vec::with_capacity(orig_len + 1);
     for i in 0..orig_len {
         exprs2.push(column_program(&combined_scope, i)?);
@@ -396,9 +394,9 @@ pub(super) fn build_quantified_comparison(
     Ok(Node::Project { input: Box::new(node), exprs: exprs2, schema: out_schema })
 }
 
-// --- 述語の分解 --------------------------------------------------------------
+// --- Decomposing predicates --------------------------------------------------
 
-/// AND で連結された述語を要素に分ける。
+/// Splits a predicate joined by AND into its parts.
 pub(super) fn split_conjuncts(
     arena: &ExprArena,
     id: ExprId,
@@ -432,7 +430,7 @@ pub(super) fn and_all(
     Ok(prog)
 }
 
-/// 式がサブクエリを含むか。押し下げの可否判定に使う。
+/// Whether an expression contains a subquery. Used to decide whether pushdown is allowed.
 pub(super) fn contains_subquery(arena: &ExprArena, id: ExprId, depth: u32) -> bool {
     if depth >= MAX_EXPR_DEPTH {
         return true;
@@ -456,13 +454,13 @@ pub(super) fn contains_subquery(arena: &ExprArena, id: ExprId, depth: u32) -> bo
     found
 }
 
-/// 述語そのものが `EXISTS` / `IN (SELECT)` か（半結合に書き換えられる形）。
-/// `= ANY (SELECT ...)` / `<> ALL (SELECT ...)` は意味的に `IN`/`NOT IN` と
-/// 全く同じなので、ここでも同じ半結合として扱う（`build_semijoin` 参照）。
-/// `>`/`<`/`>=`/`<=` を伴う量化比較（それ以外の `QuantifiedComparison`）は
-/// 半結合には書き換えられない（集合全体との比較なので「一致する行が
-/// あるか」だけを見る半結合の形に落ちない）。`bind_select_in` 側の
-/// `collect_quantified_comparisons` が別経路で処理する。
+/// Whether the predicate itself is an `EXISTS` / `IN (SELECT)` (a shape rewritable to a semi-join).
+/// `= ANY (SELECT ...)` / `<> ALL (SELECT ...)` mean exactly the same as `IN`/`NOT IN`, so they
+/// are treated as the same semi-join here (see `build_semijoin`).
+/// Quantified comparisons involving `>`/`<`/`>=`/`<=` (every other `QuantifiedComparison`)
+/// cannot be rewritten as a semi-join (being a comparison against the whole set, they do not
+/// lower to the semi-join shape that only asks "is there a matching row"). They are handled by
+/// `collect_quantified_comparisons` on the `bind_select_in` side, via a separate path.
 pub(super) fn is_semijoin_predicate(arena: &ExprArena, id: ExprId) -> bool {
     match arena.get(id) {
         Expr::Exists { .. } | Expr::InSubquery { .. } => true,
@@ -473,7 +471,7 @@ pub(super) fn is_semijoin_predicate(arena: &ExprArena, id: ExprId) -> bool {
     }
 }
 
-/// 式の中のスカラサブクエリを集める。
+/// Collects the scalar subqueries inside an expression.
 pub(super) fn collect_scalar_subqueries(
     arena: &ExprArena,
     id: ExprId,
@@ -491,15 +489,14 @@ pub(super) fn collect_scalar_subqueries(
     each_child(arena, id, &mut |c| collect_scalar_subqueries(arena, c, out, d))
 }
 
-/// 式の中の「集約経由の量化比較」（`>`/`<`/`>=`/`<=` を伴う `ANY`/`ALL`）を
-/// 集める。`= ANY`/`<> ALL` は `is_semijoin_predicate` 経由で別に処理される
-/// ので、ここでは拾わない（そのまま残ると `build_quantified_comparison` が
-/// `MIN`/`MAX` に頼れない演算子で呼ばれてしまう）。`= ALL`/`<> ANY`
-/// （どちらも半結合にも `MIN`/`MAX` にも書き換えられない、対応範囲外の
-/// 組み合わせ）もここでは拾わない: `bind_select_in` のどの経路にも
-/// 引っかからず素通しし、最終的に `plan::compile` の網
-/// （`Expr::QuantifiedComparison { .. } => err!(UnsupportedFeature)`）に
-/// 落ちて明確なエラーになる。
+/// Collects the "quantified comparisons via aggregation" inside an expression (`ANY`/`ALL` with
+/// `>`/`<`/`>=`/`<=`). `= ANY`/`<> ALL` are handled separately via `is_semijoin_predicate` and
+/// are not picked up here (left in, they would have `build_quantified_comparison` called with
+/// an operator that cannot rely on `MIN`/`MAX`). `= ALL`/`<> ANY` (both out-of-scope
+/// combinations, rewritable to neither a semi-join nor `MIN`/`MAX`) are not picked up here
+/// either: they match none of `bind_select_in`'s paths, pass straight through, and finally land
+/// in `plan::compile`'s net
+/// (`Expr::QuantifiedComparison { .. } => err!(UnsupportedFeature)`), becoming a clear error.
 pub(super) fn collect_quantified_comparisons(
     arena: &ExprArena,
     id: ExprId,
@@ -514,17 +511,17 @@ pub(super) fn collect_quantified_comparisons(
             out.push(id);
         }
     }
-    // `arg` はこの式と同じスコープに属する（`InSubquery` と違って `query` を
-    // 持たない代わりに、`arg` の中にさらに別の量化比較が入れ子になりうる:
-    // 例 `(a > ANY (q1)) = (b < ANY (q2))`）ので、一致した後も必ず子を辿る
-    // （`each_child` は `QuantifiedComparison` については `arg` だけを渡す）。
+    // `arg` belongs to the same scope as this expression (unlike `InSubquery` it carries no
+    // `query`, but another quantified comparison may be nested inside `arg`: for example
+    // `(a > ANY (q1)) = (b < ANY (q2))`), so the children are always walked even after a match
+    // (`each_child` passes only `arg` for a `QuantifiedComparison`).
     let d = depth + 1;
     each_child(arena, id, &mut |c| collect_quantified_comparisons(arena, c, out, d))
 }
 
-/// 修飾子の無い列参照ノードを (ノードの ExprId, 名前) の組で集める。
-/// QUALIFY の出力別名解決に使う（`each_child` で式木全体を辿るので、
-/// どんな深さに書かれていても見つかる）。
+/// Collects unqualified column reference nodes as (the node's ExprId, name) pairs.
+/// Used to resolve QUALIFY's output aliases (`each_child` walks the whole expression tree, so
+/// they are found at any depth).
 pub(super) fn collect_unqualified_colrefs(
     arena: &ExprArena,
     id: ExprId,
@@ -540,7 +537,7 @@ pub(super) fn collect_unqualified_colrefs(
     each_child(arena, id, &mut |c| collect_unqualified_colrefs(arena, c, out, d))
 }
 
-/// この述語が参照する関係が 1 つだけならその添字を返す。
+/// If this predicate references exactly one relation, returns its index.
 pub(super) fn single_rel_of(
     arena: &ExprArena,
     scope: &Scope,
@@ -548,7 +545,7 @@ pub(super) fn single_rel_of(
     id: ExprId,
 ) -> Result<Option<usize>> {
     let mut cols = Vec::new();
-    // 解決できない参照を含む述語は押し下げない。
+    // A predicate containing an unresolvable reference is not pushed down.
     if collect_refs(arena, scope, id, &mut cols).is_err() {
         return Ok(None);
     }
@@ -568,7 +565,7 @@ pub(super) fn single_rel_of(
     Ok(owner)
 }
 
-/// `左の式 = 右の式` の形なら等値結合キーとして取り出す。
+/// If it has the shape `left expression = right expression`, extracts it as an equi-join key.
 pub(super) fn equi_key(
     arena: &ExprArena,
     joined: &Scope,
@@ -586,7 +583,7 @@ pub(super) fn equi_key(
     {
         return Ok(None);
     }
-    // 定数だけの辺は結合キーにならない（WHERE 相当の条件）。
+    // A side made only of constants is not a join key (it is a WHERE-style condition).
     if lc.is_empty() || rc.is_empty() {
         return Ok(None);
     }
@@ -601,15 +598,15 @@ pub(super) fn equi_key(
     }
 }
 
-/// 結合キーの両辺を同じ物理型に揃える。
+/// Aligns both sides of a join key to the same physical type.
 ///
-/// `equi_key` は左右をそれぞれ独立にコンパイルするため（`WHERE a.k = d.k`
-/// の1本のプログラムとしてコンパイルされる相関等価述語や通常の比較式とは
-/// 違い）、`Ty::unify` による暗黙変換が自動では効かない。揃えないと
-/// `BIGINT` 列と `DOUBLE` 列のように論理的には比較可能な型同士でも物理表現
-/// （`I64` の生ビット列 対 `F64` の生ビット列）が食い違い、ハッシュ結合の
-/// キー比較が常に不一致になって行が消える（クラッシュもエラーも起きない
-/// ぶん、誤りに気付きにくい）。
+/// Because `equi_key` compiles the two sides independently (unlike a correlated equality
+/// predicate or an ordinary comparison expression, which compile as a single program such as
+/// `WHERE a.k = d.k`), implicit conversion via `Ty::unify` does not happen automatically.
+/// Without alignment, even logically comparable types such as a `BIGINT` column and a `DOUBLE`
+/// column would have disagreeing physical representations (the raw bits of `I64` versus those
+/// of `F64`), making the hash join's key comparison always mismatch and rows disappear (with
+/// neither a crash nor an error, which makes the mistake hard to notice).
 pub(super) fn unify_key_types(l: Program, r: Program) -> Result<(Program, Program)> {
     if l.result_ty == r.result_ty {
         return Ok((l, r));
@@ -618,31 +615,31 @@ pub(super) fn unify_key_types(l: Program, r: Program) -> Result<(Program, Progra
     Ok((cast_program(l, t)?, cast_program(r, t)?))
 }
 
-// --- 相関サブクエリの WHERE 分類 ---------------------------------------------
+// --- Classifying a correlated subquery's WHERE -------------------------------
 
-/// WHERE の最上位 conjunct（`split_conjuncts` で AND を分解した 1 片）の分類。
+/// The classification of a top-level WHERE conjunct (one piece after `split_conjuncts` splits the ANDs).
 pub(super) enum ConjClass {
-    /// このクエリ自身のスコープだけで解決できる、普通の述語。
+    /// An ordinary predicate resolvable within this query's own scope alone.
     Local,
-    /// `内側の式 = 外側スコープの式` という相関等価述語。
+    /// A correlated equality predicate of the form `inner expression = outer-scope expression`.
     Correlated { inner: ExprId, outer: ExprId },
 }
 
-/// WHERE の 1 つの最上位 conjunct を分類する。
+/// Classifies one top-level WHERE conjunct.
 ///
-/// ローカルスコープだけで解決できるなら `Local`。外側スコープの列を含む
-/// `内側 = 外側` の等価述語（両辺どちらも複合式でよい）なら `Correlated`。
-/// それ以外の形で外側スコープの列を参照している場合（非等価比較、`OR` の
-/// 中、`NOT` で包まれている、など）は結合キーとして取り出せないので
-/// `UnsupportedFeature` を返す。不正確な結果を返すより明確に拒否する方針
-/// （このプロジェクト全体の方針、DESIGN.md 参照）。
+/// `Local` if it resolves within the local scope alone. `Correlated` if it is an equality
+/// predicate `inner = outer` involving an outer-scope column (either side may be a compound
+/// expression). Referencing an outer-scope column in any other shape (a non-equality
+/// comparison, inside an `OR`, wrapped in `NOT`, and so on) cannot be extracted as a join key,
+/// so it returns `UnsupportedFeature`. The policy is to reject clearly rather than return an
+/// inaccurate result (the policy of this project as a whole; see DESIGN.md).
 pub(super) fn classify_conjunct(
     arena: &ExprArena,
     local: &Scope,
     outer: &Scope,
     id: ExprId,
 ) -> Result<ConjClass> {
-    // まずローカルだけで解決できるか（＝相関を含まない普通の述語か）を見る。
+    // First check whether it resolves locally (= an ordinary predicate with no correlation).
     let mut tmp = Vec::new();
     if collect_refs(arena, local, id, &mut tmp).is_ok() {
         return Ok(ConjClass::Local);
@@ -656,24 +653,24 @@ pub(super) fn classify_conjunct(
             return Ok(ConjClass::Correlated { inner: r, outer: l });
         }
     }
-    // 等価の相関キーとしては取り出せなかった。外側スコープへの参照が
-    // どこかに残っているなら、サポート外の相関（非等価・OR の中など）。
+    // It could not be extracted as an equality correlation key. If a reference to the outer
+    // scope remains anywhere, this is unsupported correlation (non-equality, inside an OR, ...).
     if references_outer(arena, local, outer, id, 0)? {
         err!(UnsupportedFeature);
     }
-    // 外側スコープに触れていないなら、相関とは無関係の（別の理由で
-    // ローカル解決に失敗した）述語。通常どおりの経路に委ねる。
+    // If it does not touch the outer scope, it is a predicate unrelated to correlation (which
+    // failed local resolution for some other reason). Left to the ordinary path.
     Ok(ConjClass::Local)
 }
 
-/// 式が丸ごと `scope` だけで解決できるか。
+/// Whether an expression resolves entirely within `scope`.
 fn is_pure_scope(arena: &ExprArena, scope: &Scope, id: ExprId) -> bool {
     let mut tmp = Vec::new();
     collect_refs(arena, scope, id, &mut tmp).is_ok()
 }
 
-/// 式が「ローカルでは解決できないが外側スコープでは解決できる」か
-/// （＝純粋に外側だけを参照している）。
+/// Whether an expression "does not resolve locally but does resolve in the outer scope"
+/// (= it references purely the outer scope).
 fn is_pure_outer_only(arena: &ExprArena, local: &Scope, outer: &Scope, id: ExprId) -> bool {
     if is_pure_scope(arena, local, id) {
         return false;
@@ -681,9 +678,9 @@ fn is_pure_outer_only(arena: &ExprArena, local: &Scope, outer: &Scope, id: ExprI
     is_pure_scope(arena, outer, id)
 }
 
-/// 式のどこかに、外側スコープでのみ解決できる列参照があるか。
-/// ローカルで解決できる同名列はシャドーイングにより除外する
-/// （SQL の名前解決規則: 内側のスコープが外側より優先される）。
+/// Whether the expression contains, anywhere, a column reference resolvable only in the outer
+/// scope. Same-named columns resolvable locally are excluded by shadowing
+/// (SQL's name resolution rule: the inner scope wins over the outer).
 fn references_outer(
     arena: &ExprArena,
     local: &Scope,
@@ -709,10 +706,10 @@ fn references_outer(
     Ok(found)
 }
 
-/// `collect_refs` の相関対応版。ローカルで解決できない列参照が外側スコープで
-/// 解決できるなら（相関参照とみなし）黙って無視する。ローカルにも外側にも
-/// 無い列参照はこれまでどおりエラーにする。`outer_scope` が `None`（相関で
-/// ない通常のクエリ）なら `collect_refs` と完全に同じ挙動。
+/// The correlation-aware version of `collect_refs`. A column reference that does not resolve
+/// locally but does resolve in the outer scope is silently ignored (treated as a correlated
+/// reference). A column reference in neither is still an error as before. With `outer_scope`
+/// as `None` (an ordinary uncorrelated query), the behavior is exactly `collect_refs`.
 pub(super) fn collect_refs_tolerant(
     arena: &ExprArena,
     scope: &Scope,

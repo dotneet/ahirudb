@@ -17,10 +17,10 @@ pub(super) fn json_extract_or_whole<'b>(
 }
 
 // =========================================================================
-// 任意型の関数（kernels の合成）
+// Any-type functions (composed from kernels)
 // =========================================================================
 
-/// `COALESCE` / `IFNULL`。先頭から最初の非 NULL を採る。
+/// `COALESCE` / `IFNULL`. Takes the first non-NULL from the front.
 pub(super) fn fold_null(args: &[&Vector], ty: Ty) -> Result<Vector> {
     ensure!(!args.is_empty(), WrongArgCount);
     let mut acc = args[0].clone();
@@ -30,24 +30,23 @@ pub(super) fn fold_null(args: &[&Vector], ty: Ty) -> Result<Vector> {
     Ok(acc)
 }
 
-/// `NULLIF(a, b)`。`a = b` が **TRUE のときだけ** NULL。
-/// どちらかが NULL で比較結果が NULL の行は `a` をそのまま返す
-/// （`nullif(1, NULL)` は 1）。
+/// `NULLIF(a, b)`. NULL **only when `a = b` is TRUE**.
+/// A row where either is NULL and the comparison is NULL returns `a` unchanged
+/// (`nullif(1, NULL)` is 1).
 pub(super) fn nullif(args: &[&Vector], ty: Ty) -> Result<Vector> {
     ensure!(args.len() == 2, WrongArgCount);
     let eq = kernels::compare(OpCode::Eq, ty.phys(), args[0], args[1])?;
-    // 長さ 1 の NULL は stride 0 で全行に効く。行数ぶん作る必要は無い。
+    // A length-1 NULL applies to every row with stride 0. There is no need to build one per row.
     let mut nul = Vector::new(ty);
     nul.push_null();
     kernels::pick(Some(&eq), &nul, args[0], ty)
 }
 
-/// `GREATEST` / `LEAST`。DuckDB と同じく NULL を読み飛ばし、全部 NULL の
-/// ときだけ NULL を返す。
+/// `GREATEST` / `LEAST`. Like DuckDB it skips NULLs and returns NULL only when everything is NULL.
 ///
-/// 「acc を残す条件」= `acc IS NOT NULL AND (b IS NULL OR acc > b)` を
-/// 三値論理でそのまま組み立てる。物理型ごとの比較は `kernels::compare` が
-/// 既に持っているので、ここに型分岐は現れない。
+/// The condition for keeping acc -- `acc IS NOT NULL AND (b IS NULL OR acc > b)` -- is assembled
+/// directly in three-valued logic. `kernels::compare` already has the per-physical-type
+/// comparison, so no type branching appears here.
 pub(super) fn extremum(want_max: bool, args: &[&Vector], ty: Ty) -> Result<Vector> {
     ensure!(!args.is_empty(), WrongArgCount);
     let op = if want_max { OpCode::Gt } else { OpCode::Lt };
@@ -61,8 +60,7 @@ pub(super) fn extremum(want_max: bool, args: &[&Vector], ty: Ty) -> Result<Vecto
     Ok(acc)
 }
 
-/// `concat`。DuckDB と同じく NULL 引数は空文字列として無視するので、
-/// 結果は決して NULL にならない。
+/// `concat`. Like DuckDB it ignores NULL arguments as the empty string, so the result is never NULL.
 pub(super) fn concat_all(args: &[&Vector], ty: Ty) -> Result<Vector> {
     let (n, s) = strides(args)?;
     let mut out = BytesData::with_capacity(n, n * 8);
@@ -80,16 +78,16 @@ pub(super) fn concat_all(args: &[&Vector], ty: Ty) -> Result<Vector> {
 }
 
 // =========================================================================
-// JSON 構築（`to_json` の値直列化を共有する）
+// JSON construction (sharing `to_json`'s value serialization)
 // =========================================================================
 
-/// スカラ値 1 個を JSON テキストとして `out` に書く。`to_json`・
-/// `json_array`・`json_object` の値部分がこれを共有する。NULL は JSON の
-/// `null` になる（コンテナの要素としての規約。`to_json(NULL)` 自体が
-/// SQL NULL になるのは、この関数を呼ぶ前の既定の NULL 伝播で処理される）。
+/// Writes one scalar value into `out` as JSON text. The value parts of `to_json`, `json_array`,
+/// and `json_object` all share this. NULL becomes JSON `null` (the convention for a container's
+/// element. That `to_json(NULL)` itself becomes SQL NULL is handled by the default NULL
+/// propagation before this function is called).
 ///
-/// 対応する型は `resolve` の `json_encodable` が絞っているので、想定外の
-/// 論理型が来ても（バグでもパニックはしたくないので）安全側に `null` を書く。
+/// The supported types are narrowed by `json_encodable` in `resolve`, so an unexpected logical
+/// type errs safe and writes `null` (a bug should still never panic).
 pub(super) fn write_json_scalar(v: &Vector, row: usize, out: &mut Vec<u8>) {
     if !v.is_valid(row) {
         out.extend_from_slice(b"null");
@@ -99,7 +97,7 @@ pub(super) fn write_json_scalar(v: &Vector, row: usize, out: &mut Vec<u8>) {
         Ty::Boolean => {
             out.extend_from_slice(if v.bools().get(row) { b"true" } else { b"false" });
         }
-        // すでに妥当な JSON テキストのはずなので、そのまま埋め込む。
+        // It should already be valid JSON text, so it is embedded as is.
         Ty::Json => out.extend_from_slice(v.bytes().get(row)),
         Ty::Varchar => crate::json::write_json_string(v.bytes().get(row), out),
         Ty::Date => {
@@ -122,12 +120,12 @@ pub(super) fn write_json_scalar(v: &Vector, row: usize, out: &mut Vec<u8>) {
             if x.is_finite() {
                 kernels::fmt_f64(x, out);
             } else {
-                // NaN/Infinity は JSON に表現が無いので null にする。
+                // NaN/Infinity have no JSON representation, so they become null.
                 out.extend_from_slice(b"null");
             }
         }
         t => {
-            // 整数系・DECIMAL。`fmt_int` は符号なし絶対値 + scale で書く。
+            // The integer family and DECIMAL. `fmt_int` writes an unsigned magnitude plus a scale.
             let scale = match t {
                 Ty::Decimal { scale, .. } => scale,
                 _ => 0,
@@ -146,8 +144,8 @@ pub(super) fn write_json_scalar(v: &Vector, row: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// `json_array`/`list_value`。各引数を要素として直列化する。引数どうしの
-/// 型を揃える必要はない（`json_array(1, 'x', true)` のような混在を許す）。
+/// `json_array`/`list_value`. Serializes each argument as an element. The arguments' types need
+/// not agree (a mixture such as `json_array(1, 'x', true)` is allowed).
 pub(super) fn json_array_build(args: &[&Vector]) -> Result<Vector> {
     let (n, s) = strides(args)?;
     let mut out = BytesData::with_capacity(n, n * 8);
@@ -268,10 +266,9 @@ pub(super) fn list_concat_build(args: &[&Vector], is_operator: bool) -> Result<V
     Ok(v)
 }
 
-/// `json_object(key1, val1, key2, val2, ...)`。キーは `resolve` が
-/// VARCHAR へ変換済み。NULL キーは意味のある既定が無いので空文字列キーに
-/// 落とす（他の値と同じく `null` にはしない: JSON のキーは文字列でなければ
-/// ならないため）。
+/// `json_object(key1, val1, key2, val2, ...)`. The keys are already converted to VARCHAR by
+/// `resolve`. A NULL key has no meaningful default and falls back to the empty-string key (unlike
+/// other values it does not become `null`, since a JSON key must be a string).
 pub(super) fn json_object_build(args: &[&Vector]) -> Result<Vector> {
     let (n, s) = strides(args)?;
     let mut out = BytesData::with_capacity(n, n * 16);
@@ -302,14 +299,13 @@ pub(super) fn json_object_build(args: &[&Vector]) -> Result<Vector> {
 }
 
 // =========================================================================
-// SIMILAR TO（regexp_full_match）
+// SIMILAR TO (regexp_full_match)
 // =========================================================================
 
-/// パターンを `^(?:...)$` で包む。`SIMILAR TO` は部分一致ではなく完全一致を
-/// 要求する（`duckdb -c "select 'abc' similar to 'a.c', 'Xabc' similar to
-/// 'a.c'"` で確認済み: 前者は true、後者は false）ので、`expr::regex` の
-/// 既存アンカー (`^`/`$`) に載せ替えるだけで済む。新しい正規表現エンジンは
-/// 書かない。
+/// Wraps the pattern in `^(?:...)$`. `SIMILAR TO` requires a full match rather than a partial one
+/// (confirmed with `duckdb -c "select 'abc' similar to 'a.c', 'Xabc' similar to 'a.c'"`: the
+/// former is true and the latter false), so it merely rides `expr::regex`'s existing anchors
+/// (`^`/`$`). No new regex engine is written.
 fn wrap_full_match(pattern: &[u8]) -> Vec<u8> {
     let mut w = Vec::with_capacity(pattern.len() + 6);
     w.extend_from_slice(b"^(?:");
@@ -318,11 +314,11 @@ fn wrap_full_match(pattern: &[u8]) -> Vec<u8> {
     w
 }
 
-/// `SIMILAR TO`（`regexp_full_match`）。`regex::eval_matches` とほぼ同じ形
-/// （パターン列が定数ならバッチ内で 1 回だけコンパイルする）だが、包んだ
-/// パターンを渡す点だけが違うので、`expr::regex` 側は一切変更しない。
-/// `regex::compile`/`is_match` が持つステップ数上限（ReDoS 対策）・
-/// パターン長上限は、包んだ後の文字列にもそのままかかる。
+/// `SIMILAR TO` (`regexp_full_match`). Almost the same shape as `regex::eval_matches` (compiling
+/// once per batch when the pattern column is constant), differing only in passing the wrapped
+/// pattern, so `expr::regex` is left entirely unchanged.
+/// The step cap (ReDoS protection) and pattern-length cap in `regex::compile`/`is_match` apply to
+/// the wrapped string just the same.
 pub(super) fn regexp_full_match_build(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 2, WrongArgCount);
     let (n, s) = strides(args)?;

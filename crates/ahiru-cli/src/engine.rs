@@ -183,9 +183,9 @@ impl Engine {
         self.autoregister(sql);
         let start = Instant::now();
 
-        // コアは時計を持たないので、CURRENT_DATE/CURRENT_TIMESTAMP/now() 用に
-        // クエリ開始時刻をここで渡す（DESIGN.md §2、JS ホストの `ahiru_set_now`
-        // 呼び出しと同じ役目）。
+        // The core has no clock, so the query start time is passed in here for
+        // CURRENT_DATE/CURRENT_TIMESTAMP/now() (DESIGN.md §2; the same role as the
+        // JS host's `ahiru_set_now` call).
         let now_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
@@ -194,14 +194,14 @@ impl Engine {
 
         let mut q = match self.s.prepare(sql, &[])? {
             Prepared::Ready(q) => q,
-            // メモリ上にファイル全体があるので、ここには来ない。
+            // The whole file is in memory, so this is unreachable.
             Prepared::NeedIo(_) => return Err("unexpected io request".into()),
         };
-        // `COPY (SELECT ...) TO 'path'`: `ahiru-core` は no_std でファイルシステムに
-        // 触れられないので、実ファイルへの書き込みはここ（ネイティブの CLI）が
-        // 引き受ける。`ahiru-core` 側はバイト列と書き込み先パスを `Query` に
-        // 載せて返すところまでを担う（`ahiru_core::write` モジュール doc、
-        // `ahiru_core::session::Query::copy_result` 参照）。
+        // `COPY (SELECT ...) TO 'path'`: `ahiru-core` is no_std and cannot touch the
+        // filesystem, so writing the real file is handled here (the native CLI).
+        // `ahiru-core`'s job ends at returning the bytes and the destination path on
+        // the `Query` (see the `ahiru_core::write` module docs and
+        // `ahiru_core::session::Query::copy_result`).
         if let Some(c) = q.copy.take() {
             let n = c.data.len();
             std::fs::write(&c.path, &c.data)?;
@@ -228,10 +228,10 @@ impl Engine {
                     }
                 }
                 QueryStep::NeedIo(_) => return Err("unexpected io request".into()),
-                // コーデック委譲。ZSTD は `ahiru-core` の既定フィーチャに含まれる
-                // ようになったので、通常はここまで来ない（コア側で内蔵展開される）。
-                // 残るのは GZIP（コアが意図的に内蔵していない。DESIGN.md §6）と、
-                // `zstd` フィーチャを外してビルドした場合の ZSTD だけ。
+                // Codec delegation. ZSTD is now part of `ahiru-core`'s default
+                // features, so this is normally not reached (the core decompresses
+                // it in-process). What remains is GZIP (deliberately not built into
+                // the core, DESIGN.md §6), plus ZSTD when built without the `zstd` feature.
                 QueryStep::NeedCodec(reqs) => {
                     for r in reqs {
                         let src = source_bytes(&self.sources, r.table, r.part, r.offset, r.len)?;
@@ -313,7 +313,7 @@ fn is_identifier(s: &str) -> bool {
 /// Expands one file spec into the concrete files that make up the table.
 fn resolve_spec(spec: &str) -> R<Vec<PathBuf>> {
     let mut out = Vec::new();
-    // `+` で連結された引数は 1 論理テーブルとして束ねる（usage 参照）。
+    // Arguments joined with `+` are bundled into one logical table (see usage).
     for part in spec.split('+') {
         if part.is_empty() {
             continue;
@@ -430,13 +430,13 @@ fn source_bytes(
     Ok(&b[s..e])
 }
 
-/// ホスト側のコーデック。
+/// Host-side codecs.
 ///
-/// - ZSTD は `ahiru-zstd` を直接リンクする。`ahiru-core` の既定ビルドは
-///   ZSTD を内蔵している（`zstd` フィーチャ）ので、通常はここまで来ない。
-///   `--no-default-features` 相当で `zstd` を外した場合のフォールバック。
-/// - GZIP はシステムの `gzip` に投げる。CLI は開発用なので外部プロセスで十分。
-///   wasm では `DecompressionStream('gzip')` が同じ役目を果たす。
+/// - ZSTD links `ahiru-zstd` directly. `ahiru-core`'s default build has ZSTD built
+///   in (the `zstd` feature), so this is normally not reached. It is the fallback
+///   for builds that drop `zstd`, as with `--no-default-features`.
+/// - GZIP is handed to the system `gzip`. The CLI is for development, so an external process is fine.
+///   On wasm, `DecompressionStream('gzip')` plays the same role.
 fn decompress_host(
     codec: ahiru_core::parquet::Compression,
     src: &[u8],
@@ -445,9 +445,9 @@ fn decompress_host(
     use ahiru_core::parquet::Compression;
     match codec {
         Compression::Zstd => ahiru_zstd::decompress(src, out_len)
-            .map_err(|e| format!("zstd の展開に失敗: {e:?}").into()),
+            .map_err(|e| format!("zstd decompression failed: {e:?}").into()),
         Compression::Gzip => gunzip(src),
-        other => Err(format!("{other:?} はホスト側でも未対応").into()),
+        other => Err(format!("{other:?} is unsupported on the host side too").into()),
     }
 }
 

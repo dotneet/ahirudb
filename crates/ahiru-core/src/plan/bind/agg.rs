@@ -6,7 +6,7 @@
 use super::refs::{const_program, default_name, each_child};
 use super::*;
 
-/// 直近の結合で相関キーとして使った末尾 `k` 列を落とす。
+/// Drops the trailing `k` columns used as correlation keys by the most recent join.
 pub(super) fn drop_trailing_columns(node: Node, k: usize) -> Result<Node> {
     let s = Scope::from_fields(node.schema().to_vec());
     ensure!(s.len() >= k, Internal);
@@ -20,10 +20,9 @@ pub(super) fn drop_trailing_columns(node: Node, k: usize) -> Result<Node> {
     Ok(Node::Project { input: Box::new(node), exprs, schema })
 }
 
-/// 2 つの `Program` のレジスタ・定数・キャスト表を 1 本に併合し、
-/// `Coalesce(a.result, b.result)` を末尾に足す。`and_programs`（`compile.rs`）
-/// と同じ併合規則（`compile::merge_program_bodies` を共有）だが、末尾の
-/// 合成演算子だけが違う。
+/// Merges the registers, constants, and cast tables of two `Program`s into one and appends
+/// `Coalesce(a.result, b.result)`. The same merge rules as `and_programs` (`compile.rs`)
+/// (sharing `compile::merge_program_bodies`); only the final combining operator differs.
 fn coalesce_programs(mut a: Program, b: Program) -> Program {
     let ty = a.result_ty;
     let (ra, rb) = crate::plan::compile::merge_program_bodies(&mut a, b);
@@ -33,10 +32,10 @@ fn coalesce_programs(mut a: Program, b: Program) -> Program {
     a
 }
 
-/// `scope` の `i` 列目が NULL なら 0 に補正する `Program` を作る。
-/// 相関 GROUP BY 分の疑似グループが存在しない（＝一致する内側行が無い）
-/// 場合に `count(*)`/`count(x)` を「0 行を集約 → 0」に補正するために使う
-/// （DuckDB で確認済み: 通常の非相関の `count` と同じ結果になるようにする）。
+/// Builds a `Program` that corrects column `i` of `scope` to 0 when it is NULL.
+/// Used to correct `count(*)`/`count(x)` to "aggregate over 0 rows -> 0" when the pseudo-group
+/// for a correlated GROUP BY does not exist (= there is no matching inner row)
+/// (confirmed with DuckDB: it should match an ordinary uncorrelated `count`).
 fn coalesce_zero(scope: &Scope, i: usize) -> Result<Program> {
     let ty = scope.fields()[i].ty;
     let col = column_program(scope, i)?;
@@ -44,8 +43,8 @@ fn coalesce_zero(scope: &Scope, i: usize) -> Result<Program> {
     Ok(coalesce_programs(col, zero))
 }
 
-/// 集約結果ノードの `target` 列（COUNT 系の集約結果）だけを `coalesce_zero`
-/// で補正し、他の列（相関 GROUP BY のキー列）はそのまま通す `Project` を被せる。
+/// Wraps a `Project` that corrects only the `target` column of the aggregate result node (a
+/// COUNT-family result) with `coalesce_zero`, passing the other columns (the correlated GROUP BY key columns) through.
 pub(super) fn coalesce_count_column(node: Node, target: usize) -> Result<Node> {
     let scope = Scope::from_fields(node.schema().to_vec());
     let mut exprs = Vec::with_capacity(scope.len());
@@ -60,9 +59,9 @@ pub(super) fn coalesce_count_column(node: Node, target: usize) -> Result<Node> {
     Ok(Node::Project { input: Box::new(node), exprs, schema })
 }
 
-// --- 集約の抽出 --------------------------------------------------------------
+// --- Extracting aggregates ---------------------------------------------------
 
-/// 式の中の集約呼び出しを集める。既出のものは構造の一致で重複を除く。
+/// Collects the aggregate calls inside an expression, deduplicating already-seen ones by structural equality.
 pub(super) fn collect_aggregates(
     arena: &ExprArena,
     id: ExprId,
@@ -73,7 +72,7 @@ pub(super) fn collect_aggregates(
     let d = depth + 1;
     if let Expr::Function { name, args, .. } = arena.get(id) {
         if AggKind::from_name(name).is_some() {
-            // 集約の入れ子は SQL として無効。
+            // Nested aggregates are invalid SQL.
             for a in args {
                 let mut nested = Vec::new();
                 collect_aggregates(arena, *a, &mut nested, d)?;
@@ -88,17 +87,17 @@ pub(super) fn collect_aggregates(
     each_child(arena, id, &mut |c| collect_aggregates(arena, c, out, d))
 }
 
-/// `GROUPING(col, ...)` / `GROUPING_ID(col, ...)`。
+/// `GROUPING(col, ...)` / `GROUPING_ID(col, ...)`.
 ///
-/// 集約関数とは違って引数を評価しない（グルーピングセットごとに定まる
-/// ビットマスク定数に置き換わるだけ）ので `collect_aggregates` とは
-/// 別に集める。
+/// Unlike aggregate functions, these do not evaluate their arguments (they are simply
+/// replaced by a bitmask constant fixed per grouping set), so they are collected separately
+/// from `collect_aggregates`.
 fn is_grouping_fn(name: &str) -> bool {
     eq_ascii_ci(name.as_bytes(), b"grouping") || eq_ascii_ci(name.as_bytes(), b"grouping_id")
 }
 
-/// 式の中の `GROUPING`/`GROUPING_ID` 呼び出しを集める。入れ子は不正
-/// （集約と同じ理由: 引数の中で自分自身が現れることは意味を持たない）。
+/// Collects the `GROUPING`/`GROUPING_ID` calls inside an expression. Nesting is invalid
+/// (the same reason as aggregates: a call appearing inside its own arguments is meaningless).
 pub(super) fn collect_grouping_calls(
     arena: &ExprArena,
     id: ExprId,
@@ -119,7 +118,7 @@ pub(super) fn collect_grouping_calls(
     each_child(arena, id, &mut |c| collect_grouping_calls(arena, c, out, d))
 }
 
-/// 式の中のウィンドウ関数呼び出しを集める。入れ子は不正。
+/// Collects the window function calls inside an expression. Nesting is invalid.
 pub(super) fn collect_windows(
     arena: &ExprArena,
     id: ExprId,
@@ -129,7 +128,7 @@ pub(super) fn collect_windows(
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
     let d = depth + 1;
     if let Expr::Window { args, partition_by, order_by, .. } = arena.get(id) {
-        // ウィンドウ関数の入れ子は SQL として無効。
+        // Nested window functions are invalid SQL.
         for a in args.iter().chain(partition_by) {
             let mut nested = Vec::new();
             collect_windows(arena, *a, &mut nested, d)?;
@@ -148,11 +147,11 @@ pub(super) fn collect_windows(
     each_child(arena, id, &mut |c| collect_windows(arena, c, out, d))
 }
 
-/// 式の中の `Expr::Unnest` 呼び出しを集める。集約・ウィンドウと違って
-/// 入れ子（`UNNEST(...)` の引数の中にさらに `UNNEST`）を特別扱いする必要は
-/// 無い ―― `each_child` が引数の中まで辿るので自然に見つかり、複数見つかれば
-/// 呼び出し側が `UnsupportedFeature` で拒否する（`FILTER`/`QUALIFY`
-/// 実装時と同じ「集約でも通常の式でもない特殊な式」としての拾い方）。
+/// Collects the `Expr::Unnest` calls inside an expression. Unlike aggregates and windows,
+/// nesting (a further `UNNEST` inside an `UNNEST(...)` argument) needs no special handling --
+/// `each_child` walks into the arguments so it is found naturally, and if several are found
+/// the caller rejects with `UnsupportedFeature` (the same "neither an aggregate nor an
+/// ordinary expression" collection style as when `FILTER`/`QUALIFY` were implemented).
 pub(super) fn collect_unnests(
     arena: &ExprArena,
     id: ExprId,
@@ -168,25 +167,24 @@ pub(super) fn collect_unnests(
     each_child(arena, id, &mut |c| collect_unnests(arena, c, out, d))
 }
 
-/// UNNEST の要素型を、可能なら `Ty::Json` から実際のスカラ型へ復元する。
+/// Recovers UNNEST's element type from `Ty::Json` to the actual scalar type where possible.
 ///
-/// このエンジンでは配列・オブジェクトはすべて `Ty::Json`（JSON テキスト）
-/// に統一されており、要素の型は実データを見ないと分からない
-/// （`vector::types::Ty::Json` のドキュメント参照）。一方でクエリの出力列の
-/// 型はバインド時（実行前）に確定していなければならないので、実データを
-/// 読まずに「安全に」ネイティブ型だと判定できる場合だけ絞り込む。
+/// In this engine arrays and objects are all unified as `Ty::Json` (JSON text), and the
+/// element type cannot be known without seeing the real data (see the
+/// `vector::types::Ty::Json` docs). But a query's output column types must be settled at
+/// bind time (before execution), so this narrows only when a native type can be determined
+/// "safely" without reading the data.
 ///
-/// 唯一データを見ずに判定できるのは、`UNNEST` の対象がその場で
-/// `json_array(...)`/`list_value(...)`（DuckDB のリストリテラル相当。この
-/// エンジンには `[1,2,3]` のような配列リテラル構文自体が無いので、
-/// `duckdb -c "SELECT UNNEST([1,2,3])"` に対応する書き方はこちらになる）を
-/// 直接呼んでいるケース: 各引数の**コンパイル時の型**が分かっているので、
-/// 全引数が入れ子を持たない同じ非 JSON スカラ型に揃うかどうかを、行データを
-/// 一切読まずに判定できる。
+/// The one case decidable without data is when `UNNEST`'s target is a direct call to
+/// `json_array(...)`/`list_value(...)` (the equivalent of DuckDB's list literal; this engine
+/// has no array literal syntax such as `[1,2,3]`, so this is how you write the equivalent of
+/// `duckdb -c "SELECT UNNEST([1,2,3])"`): each argument's **compile-time type** is known, so
+/// whether every argument settles on the same non-JSON scalar type without nesting can be
+/// decided without reading a single row.
 ///
-/// それ以外（テーブルの JSON 列そのものを UNNEST する、通常のケース）は
-/// 実データを読まないと判定できないので `Ty::Json` のまま返す
-/// （タスクの要求どおり、この場合は絞り込まなくてよい）。
+/// Everything else (the ordinary case of UNNESTing a table's JSON column itself) cannot be
+/// decided without reading real data, so `Ty::Json` is returned unchanged (per the task's
+/// requirement, no narrowing is needed in that case).
 pub(super) fn narrow_unnest_elem_ty(
     arena: &ExprArena,
     scope: &Scope,
@@ -208,8 +206,8 @@ pub(super) fn narrow_unnest_elem_ty(
             Ok(p) => p.result_ty,
             Err(_) => return Ty::Json,
         };
-        // 引数自体が JSON（配列・オブジェクトを含みうる）なら、要素が
-        // 「入れ子を持たないスカラー」という前提が崩れるので諦める。
+        // If the argument is itself JSON (possibly containing arrays or objects), the premise
+        // that elements are "scalars without nesting" collapses, so give up.
         if ty == Ty::Json {
             return Ty::Json;
         }
@@ -226,10 +224,10 @@ pub(super) fn narrow_unnest_elem_ty(
         Some(Ty::Float) | Some(Ty::Double) => Ty::Double,
         Some(Ty::Varchar) => Ty::Varchar,
         Some(Ty::Boolean) => Ty::Boolean,
-        // DECIMAL/DATE/TIME/TIMESTAMP/NULL 等は JSON テキスト経由での復元を
-        // 実装していない（範囲外。精度・書式を保って往復させるにはこの
-        // エンジンの JSON シリアライズ規約を専用に決める必要があり、
-        // スコープを絞った）。
+        // Recovery through JSON text is not implemented for DECIMAL/DATE/TIME/TIMESTAMP/NULL
+        // and the like (out of scope. Round-tripping them while preserving precision and
+        // formatting would require a dedicated JSON serialization convention for this engine,
+        // so the scope was narrowed).
         _ => Ty::Json,
     }
 }
@@ -249,18 +247,18 @@ pub(super) fn build_window(
             }
             _ => err!(Internal),
         };
-    // `OVER w`（名前付き参照）は `WINDOW` 句で定義された実体をここで引く。
-    // `WINDOW` 句は構文上 SELECT リストより後に現れるため、パース時点では
-    // まだ名前を解決できず、束縛時にこの一箇所でだけ解決する。
+    // `OVER w` (a named reference) looks up the definition from the `WINDOW` clause here.
+    // The `WINDOW` clause syntactically follows the SELECT list, so the name cannot be
+    // resolved at parse time; it is resolved at bind time in this one place.
     let (partition_by, order_by, frame): (&[ExprId], &[OrderByItem], WindowFrame) = match window_ref
     {
         Some(wname) => {
             let def = windows.iter().find(|(n, _)| eq_ascii_ci(n.as_bytes(), wname.as_bytes()));
             match def {
                 Some((_, d)) => (&d.partition_by, &d.order_by, d.frame),
-                // 未定義のウィンドウ名を参照した。`duckdb` はパース時に
-                // `window "w" does not exist` として拒否するが、このエンジンは
-                // `WINDOW` 句を先読みしないため束縛時に検出する。
+                // A reference to an undefined window name. `duckdb` rejects it at parse time as
+                // `window "w" does not exist`, but this engine does not look ahead at the
+                // `WINDOW` clause and so detects it at bind time.
                 None => err!(UnsupportedFeature),
             }
         }
@@ -275,7 +273,7 @@ pub(super) fn build_window(
     for a in args {
         arg_progs.push(compile_with_subs(arena, scope, params, subs, *a)?);
     }
-    // `count(*) OVER ()` は引数を取らない集約として扱う。
+    // `count(*) OVER ()` is treated as an aggregate taking no arguments.
     let kind = if star {
         ensure!(kind == WindowKind::Agg(AggKind::Count), WrongArgCount);
         WindowKind::Agg(AggKind::CountStar)
@@ -303,13 +301,13 @@ pub(super) fn build_window(
 
     let arg_ty = arg_progs.first().map_or(Ty::Null, |p| p.result_ty);
     let result_ty = match kind {
-        // 順位付けは 1 始まりの通し番号。
+        // Ranking is a 1-based running number.
         WindowKind::RowNumber | WindowKind::Rank | WindowKind::DenseRank => Ty::BigInt,
-        // 値を運ぶだけの関数は入力型をそのまま返す。
+        // Functions that merely carry a value return the input type unchanged.
         WindowKind::Lag | WindowKind::Lead | WindowKind::FirstValue | WindowKind::LastValue => {
             arg_ty
         }
-        // 集約は通常の集約と同じ規則。両方でずれないよう同じ関数を通す。
+        // Aggregates follow the same rules as ordinary aggregates. The same function is used so the two cannot drift.
         WindowKind::Agg(a) => a.result_ty(arg_ty)?,
     };
 
@@ -326,14 +324,13 @@ pub(super) fn build_window(
     })
 }
 
-/// このクエリが「裸の集約呼び出し 1 つだけを SELECT する」単純な形なら、
-/// その集約の種類を返す。相関スカラサブクエリが（内側の相関 GROUP BY
-/// 決コリレーションを経由する）集約サブクエリだったかどうかを、束縛結果の
-/// `Plan` を介さずに呼び出し側（`bind_select_in` のスカラサブクエリ処理）
-/// から再判定するために使う。相関スカラサブクエリの束縛が成功している
-/// 時点で、集約を伴うなら必ずこの形（`bind_select_in` の早期リターン経路の
-/// `ensure!` 参照）であることが保証されているので、ここでの判定と実際の
-/// 束縛結果は必ず一致する。
+/// If this query is the simple shape "SELECT exactly one bare aggregate call", returns that
+/// aggregate's kind. Used so the caller (the scalar-subquery handling in `bind_select_in`)
+/// can re-decide, without going through the bound `Plan`, whether a correlated scalar
+/// subquery was an aggregate subquery (one going through the inner correlated GROUP BY
+/// decorrelation). Once a correlated scalar subquery has bound successfully, anything with
+/// an aggregate is guaranteed to be in this shape (see the `ensure!` on the early-return
+/// path of `bind_select_in`), so this check and the actual binding result always agree.
 pub(super) fn as_bare_aggregate(arena: &ExprArena, q: &QueryStmt) -> Option<AggKind> {
     let sel = q.as_simple_select()?;
     if sel.items.len() != 1 {
@@ -369,9 +366,9 @@ pub(super) fn build_agg(
         Some(k) => k,
         None => err!(FunctionNotFound),
     };
-    // FILTER の条件は集約前の入力スコープ（args と同じ）で評価する。
-    // 集約自身は書けない（`collect_aggregates` が別扱いにしないので、
-    // FILTER の中身に集約を書くと通常の「集約の入れ子」検出に掛かって弾かれる）。
+    // A FILTER condition is evaluated in the pre-aggregation input scope (the same as args).
+    // An aggregate cannot be written there (`collect_aggregates` does not treat it specially,
+    // so an aggregate inside a FILTER is caught by the ordinary "nested aggregate" detection).
     let filter_prog = match filter {
         Some(f) => Some(compile_predicate(arena, scope, params, f)?),
         None => None,
@@ -389,7 +386,7 @@ pub(super) fn build_agg(
         });
     }
 
-    // `string_agg(x, sep)` だけが 2 引数を許す。sep は定数リテラルのみ。
+    // Only `string_agg(x, sep)` allows two arguments. sep must be a constant literal.
     let max_args = if kind.optional_arg_default().is_some() { 2 } else { 1 };
     ensure!(!args.is_empty() && args.len() <= max_args, WrongArgCount);
     let arg = compile(arena, scope, params, args[0])?;
@@ -418,7 +415,7 @@ fn agg_name(fname: &str, arena: &ExprArena, arg: ExprId) -> String {
     s
 }
 
-/// GROUP BY に無い裸の列参照を検出する。
+/// Detects a bare column reference that is not in GROUP BY.
 pub(super) fn check_grouped(
     arena: &ExprArena,
     scope: &Scope,
@@ -436,13 +433,13 @@ pub(super) fn check_grouped(
     }
     match arena.get(id) {
         Expr::ColumnRef { qualifier, name } => {
-            // 入力に存在する列がここまで来た = GROUP BY にも集約にも入っていない。
+            // A column that exists in the input reaching here = it is in neither GROUP BY nor an aggregate.
             if scope.resolve(qualifier.as_deref(), name).is_ok() {
                 err!(NotGrouped);
             }
         }
-        // スカラサブクエリは集約前の列として横に付けてあるので、集約の上で
-        // 裸で参照されると列番号がずれる。列参照と同じ扱いで弾く。
+        // Scalar subqueries are attached alongside as pre-aggregation columns, so referencing
+        // one bare above the aggregate would shift the column numbers. Rejected like a column reference.
         Expr::ScalarSubquery(_) => err!(NotGrouped),
         _ => {}
     }

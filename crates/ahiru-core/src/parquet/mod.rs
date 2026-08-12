@@ -1,8 +1,8 @@
-//! Parquet 読み取り層。
+//! Parquet read layer.
 //!
-//! このファイルは各サブモジュールが共有する列挙型を持つ。ここを起点に
-//! `thrift` (バイト列 → Thrift) → `meta` (Thrift → メタデータ構造体) →
-//! `reader` (メタデータ + ページ → ベクタ) と流れる。
+//! This file holds the enums shared across the submodules. From here, the
+//! flow is `thrift` (bytes -> Thrift) -> `meta` (Thrift -> metadata structs)
+//! -> `reader` (metadata + pages -> vectors).
 
 pub mod bloom;
 pub mod codec;
@@ -16,7 +16,7 @@ pub mod thrift;
 
 use crate::prelude::*;
 
-/// Parquet の物理型 (parquet.thrift の `Type`)。
+/// Parquet physical type (`Type` in parquet.thrift).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PType {
     Boolean = 0,
@@ -45,7 +45,7 @@ impl PType {
     }
 }
 
-/// 繰り返し種別 (parquet.thrift の `FieldRepetitionType`)。
+/// Repetition kind (`FieldRepetitionType` in parquet.thrift).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Repetition {
     Required = 0,
@@ -64,7 +64,7 @@ impl Repetition {
     }
 }
 
-/// ページのエンコーディング。
+/// Page encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Encoding {
     Plain = 0,
@@ -94,13 +94,13 @@ impl Encoding {
         })
     }
 
-    /// 辞書ページを参照するエンコーディングか。
+    /// Whether this encoding references a dictionary page.
     pub fn is_dictionary(self) -> bool {
         matches!(self, Encoding::PlainDictionary | Encoding::RleDictionary)
     }
 }
 
-/// 圧縮コーデック。
+/// Compression codec.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Compression {
     Uncompressed = 0,
@@ -128,19 +128,19 @@ impl Compression {
         })
     }
 
-    /// wasm コアに内蔵しているコーデックか。
-    /// 内蔵していないものはホスト（JS の DecompressionStream や別 wasm
-    /// モジュール）に展開を委譲する。DESIGN.md §6 を参照。
+    /// Whether this codec is built into the wasm core. Codecs that aren't
+    /// built in delegate decompression to the host (JS's DecompressionStream
+    /// or a separate wasm module). See DESIGN.md §6.
     ///
-    /// ZSTD は `zstd` フィーチャ（既定で有効）が付いているときだけ内蔵扱い。
-    /// 外した場合は旧来どおりホスト委譲（`NeedCodec`）に回る。
+    /// ZSTD only counts as built in when the `zstd` feature (enabled by
+    /// default) is present. Otherwise it falls back to host delegation (`NeedCodec`) as before.
     pub fn is_builtin(self) -> bool {
         matches!(self, Compression::Uncompressed | Compression::Snappy | Compression::Lz4Raw)
             || (self == Compression::Zstd && cfg!(feature = "zstd"))
     }
 }
 
-/// ページ種別。
+/// Page type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PageType {
     DataPage = 0,
@@ -161,7 +161,7 @@ impl PageType {
     }
 }
 
-/// 旧来の `ConvertedType`。`LogicalType` が無いファイル向けの後方互換。
+/// The legacy `ConvertedType`. Backward compatibility for files without `LogicalType`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConvertedType {
     Utf8 = 0,
@@ -219,7 +219,7 @@ impl ConvertedType {
     }
 }
 
-/// 時刻の分解能。
+/// Time resolution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TimeUnit {
     Millis,
@@ -228,8 +228,8 @@ pub enum TimeUnit {
 }
 
 impl TimeUnit {
-    /// この単位の値をマイクロ秒に正規化する。
-    /// ナノ秒は切り捨てる（DESIGN.md §8 の通り内部表現は常にマイクロ秒）。
+    /// Normalize a value in this unit to microseconds.
+    /// Nanoseconds are truncated (per DESIGN.md §8, the internal representation is always microseconds).
     #[inline]
     pub fn to_micros(self, v: i64) -> i64 {
         match self {
@@ -240,7 +240,7 @@ impl TimeUnit {
     }
 }
 
-/// `SchemaElement.logicalType` (Thrift の union)。
+/// `SchemaElement.logicalType` (a Thrift union).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LogicalType {
     String,
@@ -259,7 +259,7 @@ pub enum LogicalType {
     Float16,
 }
 
-/// Parquet ファイル末尾のマジックバイト。
+/// Magic bytes at the end of a Parquet file.
 pub const MAGIC: &[u8; 4] = b"PAR1";
-/// 暗号化ファイルのマジック。検出して明示的に拒否する。
+/// Magic for an encrypted file. Detected and explicitly rejected.
 pub const MAGIC_ENCRYPTED: &[u8; 4] = b"PARE";

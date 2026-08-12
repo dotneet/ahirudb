@@ -1,19 +1,17 @@
 //! `list_transform` / `list_filter` / `list_reduce`.
 //!
-//! ラムダ本体は行ごと・配列要素ごとに評価する必要があり、ベクタ化された
-//! 1 命令には落とせない。`ddl`/`dml` が「1 行だけのバッチを作って `Vm::eval`
-//! に通す」のと同じ発想で、配列の要素数ぶんだけ小さな 1 行バッチを作って
-//! `body`（`plan::compile::Compiler::lambda_call` がコンパイル済み）を
-//! 繰り返し評価する。
+//! A lambda body has to be evaluated per row and per array element and cannot be lowered to one
+//! vectorized instruction. In the same spirit as `ddl`/`dml` "building a one-row batch and running
+//! it through `Vm::eval`", it builds a small one-row batch per array element and repeatedly
+//! evaluates `body` (already compiled by `plan::compile::Compiler::lambda_call`).
 //!
-//! パラメータの型は常に `Ty::Json`（`list_extract` の結果と同じ）。JSON の
-//! `null` はリスト要素の SQL NULL 表現（`json_array`/`list_value` が NULL
-//! 引数をそう埋め込む。モジュール冒頭 doc 参照）なので、そのまま SQL NULL
-//! として束縛する。
+//! A parameter's type is always `Ty::Json` (the same as `list_extract`'s result). JSON `null` is
+//! the SQL NULL representation of a list element (that is how `json_array`/`list_value` embed a
+//! NULL argument; see the module docs at the top), so it is bound directly as SQL NULL.
 use super::json::write_json_scalar;
 use super::*;
 
-/// 配列要素 1 個をラムダのパラメータ用の長さ 1 ベクタにする。
+/// Turns one array element into a length-1 vector for a lambda parameter.
 fn lambda_param_vector(span: &[u8], kind: crate::json::Kind) -> Vector {
     let mut v = Vector::new(Ty::Json);
     if kind == crate::json::Kind::Null {
@@ -24,9 +22,9 @@ fn lambda_param_vector(span: &[u8], kind: crate::json::Kind) -> Vector {
     v
 }
 
-/// `list_transform`/`list_filter`/`list_reduce` の実行本体。`expr::vm::exec`
-/// の `Call` 命令から、`CallSpec::lambda` が `Some` のときだけ呼ばれる
-/// （通常のスカラ関数は `call` のまま）。
+/// The execution body of `list_transform`/`list_filter`/`list_reduce`. Called from the `Call`
+/// instruction in `expr::vm::exec`, and only when `CallSpec::lambda` is `Some`
+/// (ordinary scalar functions still go through `call`).
 pub fn call_lambda(
     func: FuncId,
     result_ty: Ty,
@@ -52,8 +50,8 @@ pub fn call_lambda(
         }
         let elems = match crate::json::array_elements(list.bytes().get(i))? {
             Some(e) => e,
-            // 配列でない値は SQL NULL（`list_extract` 等、他の list_* 関数の
-            // 非配列に対する寛容な扱いに合わせる）。
+            // A non-array value is SQL NULL (matching the lenient treatment of non-arrays in the
+            // other list_* functions such as `list_extract`).
             None => {
                 out.push_empty();
                 set_null(&mut bad, i, n);
@@ -76,9 +74,9 @@ pub fn call_lambda(
                     write_json_scalar(&r, 0, &mut buf);
                 }
                 F_LIST_FILTER => {
-                    // 述語は `plan::compile::Compiler::lambda_call` が
-                    // BOOLEAN/NULL であることを検査済み。NULL/FALSE は除外
-                    // （SQL の 3 値論理どおり、duckdb と同じ）。
+                    // `plan::compile::Compiler::lambda_call` has already checked the predicate is
+                    // BOOLEAN/NULL. NULL/FALSE are excluded (per SQL's three-valued logic, the same
+                    // as duckdb).
                     if r.is_valid(0) && matches!(r.data(), Data::Bool(b) if b.get(0)) {
                         if !first {
                             buf.push(b',');
@@ -100,13 +98,13 @@ pub fn call_lambda(
     Ok(v)
 }
 
-/// `list_reduce(list, (acc, x) -> expr [, initial])`。
+/// `list_reduce(list, (acc, x) -> expr [, initial])`.
 ///
-/// `initial` が無ければ先頭要素を初期アキュムレータにする（duckdb と同じ）。
-/// 空配列かつ `initial` も無い場合、duckdb はエラーにするがこの実装は他の
-/// list_* 関数と同じ「寛容に NULL へ丸める」方針を優先し SQL NULL を返す
-/// （既知の非互換）。累積のどこかで NULL になったら、以降は畳んでも結果が
-/// 変わらないので早期に打ち切る。
+/// Without `initial`, the first element becomes the initial accumulator (the same as duckdb).
+/// For an empty array with no `initial`, duckdb errors while this implementation prefers the same
+/// "leniently round to NULL" policy as the other list_* functions and returns SQL NULL
+/// (a known incompatibility). Once the accumulation becomes NULL anywhere, folding further cannot
+/// change the result, so it breaks off early.
 fn call_list_reduce(args: &[&Vector], result_ty: Ty, body: &Program) -> Result<Vector> {
     ensure!(!args.is_empty() && args.len() <= 2, WrongArgCount);
     let (n, s) = strides(args)?;
@@ -157,7 +155,7 @@ fn call_list_reduce(args: &[&Vector], result_ty: Ty, body: &Program) -> Result<V
         };
         for (span, kind) in iter {
             let Some(acc_text) = acc.as_ref() else {
-                // 既に NULL。これ以降どう畳んでも NULL のままなので打ち切る。
+                // Already NULL. Folding further keeps it NULL, so it breaks off.
                 break;
             };
             let mut acc_v = Vector::new(Ty::Json);

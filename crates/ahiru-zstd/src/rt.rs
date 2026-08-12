@@ -1,30 +1,31 @@
-//! wasm ランタイム基盤: グローバルアロケータとパニックハンドラ。
+//! wasm runtime foundation: the global allocator and the panic handler.
 //!
-//! サイドモジュールの意義はコアを太らせないことなので、`ahiru-core` には
-//! 依存せず自前で持つ（依存させるとエンジン一式がこのモジュールに入ってしまう）。
+//! The point of a side module is not to bloat the core, so these are carried here
+//! rather than depending on `ahiru-core` (which would pull the whole engine into this module).
 //!
-//! アロケータはサイズクラス分離フリーリスト + バンプ。dlmalloc (約 10 KB) の
-//! 代わりに使うことで 1 KB 程度に収まる。wasm は単一スレッド前提なのでロックは
-//! 持たない。解放したページは OS に返さない（wasm の線形メモリは縮まない）。
+//! The allocator is a size-class-segregated free list plus a bump. Using it
+//! instead of dlmalloc (about 10 KB) keeps this to around 1 KB. wasm is assumed
+//! single-threaded, so there is no lock. Freed pages are not returned to the OS
+//! (wasm linear memory never shrinks).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr;
 
-/// wasm + no_std ビルドでのみグローバルアロケータを差し替える。
-/// `standalone`（このクレート単独が wasm モジュールのトップレベルである
-/// とき）でしか定義しない。`ahiru-core` にライブラリとしてリンクされる
-/// ときは `ahiru-core` 側のアロケータと重複してしまうため。
+/// The global allocator is only swapped in for wasm + no_std builds.
+/// It is defined only under `standalone` (when this crate alone is the top level
+/// of a wasm module), because when it is linked into `ahiru-core` as a library it
+/// would collide with `ahiru-core`'s own allocator.
 #[cfg(all(target_arch = "wasm32", not(feature = "std"), feature = "standalone"))]
 #[global_allocator]
 static ALLOC: ZstdAlloc = ZstdAlloc;
 
-/// no_std ビルドのパニックハンドラ。`standalone` 時のみ（理由は上記
-/// アロケータと同じ）。
+/// The panic handler for no_std builds. Only under `standalone` (for the same
+/// reason as the allocator above).
 ///
-/// `panic = "abort"` なので巻き戻しは無い。メッセージを組み立てると
-/// `core::fmt` がリンクされるので、何も見ずに trap する。エラーは全て
-/// `Result` で返す設計なので、ここに来るのはバグかメモリ枯渇のみ。
+/// With `panic = "abort"` there is no unwinding. Assembling a message would link
+/// `core::fmt`, so this traps without looking at anything. Every error is designed
+/// to come back as a `Result`, so reaching here means a bug or memory exhaustion.
 #[cfg(all(target_arch = "wasm32", not(feature = "std"), not(test), feature = "standalone"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -36,7 +37,7 @@ const MIN_SHIFT: usize = 4;
 const NUM_CLASSES: usize = 12;
 /// 16 << 11 = 32768
 const MAX_SMALL: usize = 16 << (NUM_CLASSES - 1);
-/// 一度の `memory.grow` で確保する最小ページ数 (1 MiB)。
+/// The minimum number of pages reserved by one `memory.grow` (1 MiB).
 const GROW_PAGES: usize = 16;
 
 #[repr(C)]
@@ -58,7 +59,7 @@ struct Heap {
 }
 
 struct HeapCell(UnsafeCell<Heap>);
-// wasm32 は単一スレッドで動かす前提。
+// wasm32 is assumed to run single-threaded.
 unsafe impl Sync for HeapCell {}
 
 static HEAP: HeapCell = HeapCell(UnsafeCell::new(Heap {
@@ -83,7 +84,7 @@ fn round16(n: usize) -> usize {
 }
 
 impl Heap {
-    /// バンプ領域から `n` バイト (16 の倍数) を切り出す。
+    /// Carves `n` bytes (a multiple of 16) out of the bump region.
     unsafe fn carve(&mut self, n: usize) -> *mut u8 {
         if self.bump + n > self.end && !unsafe { self.grow(n) } {
             return ptr::null_mut();
@@ -101,11 +102,11 @@ impl Heap {
         }
         let start = prev * PAGE;
         if start == self.end {
-            // 直前の領域と連続しているので末尾を伸ばすだけでよい。
+            // Contiguous with the previous region, so just extend the end.
             self.end = start + pages * PAGE;
         } else {
-            // 連続していない場合は古い残余を捨てる。自分以外が memory.grow を
-            // 呼ばない限りここには来ない。
+            // Otherwise, discard the old remainder. This is unreachable unless
+            // something other than us calls memory.grow.
             self.bump = start;
             self.end = start + pages * PAGE;
         }
@@ -122,7 +123,7 @@ unsafe impl GlobalAlloc for ZstdAlloc {
         let align = layout.align();
 
         if align <= 16 && size <= MAX_SMALL {
-            // クラスは `dealloc` に渡る Layout から復元できるのでヘッダを持たない。
+            // No header is needed: the class can be recovered from the Layout passed to `dealloc`.
             let c = class_of(size);
             let head = h.small[c];
             if !head.is_null() {
@@ -132,8 +133,8 @@ unsafe impl GlobalAlloc for ZstdAlloc {
             return unsafe { h.carve(16 << c) };
         }
         if align > 16 {
-            // 実際には到達しない (このクレートが扱う型は align <= 8)。
-            // 再利用せずバンプから取り、解放時はリークさせる。
+            // Unreachable in practice (every type this crate handles has align <= 8).
+            // Take from the bump without reuse, and leak on free.
             let raw = unsafe { h.carve(round16(size + align)) };
             if raw.is_null() {
                 return raw;
@@ -141,7 +142,7 @@ unsafe impl GlobalAlloc for ZstdAlloc {
             return ((raw as usize + align - 1) & !(align - 1)) as *mut u8;
         }
 
-        // large: フリーリストを first-fit で探す。
+        // large: first-fit search of the free list.
         let need = round16(size);
         let mut prev: *mut *mut LargeNode = &mut h.large;
         let mut cur = h.large;
@@ -172,7 +173,7 @@ unsafe impl GlobalAlloc for ZstdAlloc {
             return;
         }
         if align > 16 {
-            return; // リーク (上記の通り実質到達しない)
+            return; // leak (effectively unreachable, as noted above)
         }
         let node = p as *mut LargeNode;
         unsafe {
@@ -186,7 +187,7 @@ unsafe impl GlobalAlloc for ZstdAlloc {
         let old = layout.size().max(1);
         let align = layout.align();
 
-        // 同じサイズクラスに収まるなら何もしない。Vec の伸長で頻繁に効く。
+        // Nothing to do if it still fits the same size class. This pays off often as a Vec grows.
         if align <= 16
             && old <= MAX_SMALL
             && new_size <= MAX_SMALL
@@ -216,7 +217,7 @@ fn memory_grow(pages: usize) -> usize {
     core::arch::wasm32::memory_grow(0, pages)
 }
 
-/// wasm 以外では成長できない (ネイティブでは std のアロケータを使う)。
+/// Cannot grow off wasm (native builds use std's allocator).
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn memory_grow(_pages: usize) -> usize {

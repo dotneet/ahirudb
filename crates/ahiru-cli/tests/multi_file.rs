@@ -1,8 +1,8 @@
-//! 複数ファイル 1 テーブル機能のエンドツーエンドテスト。
+//! End-to-end tests for the multiple-files-one-table feature.
 //!
-//! CLI の `+` 連結記法（`main.rs` の usage 参照）で複数ファイルを 1 テーブル
-//! として登録し、素の UNION と Hive パーティションの両方を DuckDB と突き合わせる。
-//! `sql_e2e.rs` と同じ「期待値を手で書かずに DuckDB と比較する」方針を踏襲する。
+//! Registers several files as one table using the CLI's `+` concatenation notation
+//! (see the usage text in `main.rs`) and cross-checks both a plain UNION and Hive
+//! partitioning against DuckDB. Follows the same "compare with DuckDB rather than hand-writing expected values" policy as `sql_e2e.rs`.
 
 use std::process::Command;
 
@@ -14,7 +14,7 @@ fn repo_path(rel: &str) -> String {
     format!("{}/../../{}", env!("CARGO_MANIFEST_DIR"), rel)
 }
 
-/// `+` で連結した複数ファイルを 1 テーブル `t` として ahiru CLI で実行する。
+/// Runs the ahiru CLI with several `+`-joined files bound as the single table `t`.
 fn run_ahiru_multi(files: &[&str], sql: &str) -> Vec<Vec<String>> {
     let group = files.iter().map(|f| repo_path(f)).collect::<Vec<_>>().join("+");
     let out = Command::new(env!("CARGO_BIN_EXE_ahiru"))
@@ -78,13 +78,13 @@ const HIVE: [&str; 3] = [
     "tests/data/hive/year=2025/month=01/part.parquet",
 ];
 
-/// 3 ファイルを 1 テーブルとして束ねた `COUNT(*)` が、各ファイルの行数の合計
-/// と一致する。DuckDB の `read_parquet([...])`（複数ファイルの素の UNION）と
-/// 突き合わせる。
+/// `COUNT(*)` over three files bundled as one table equals the sum of the per-file
+/// row counts. Cross-checked against DuckDB's `read_parquet([...])` (a plain
+/// multi-file UNION).
 #[test]
 fn multi_file_union_count_matches_duckdb() {
     if !duckdb_available() {
-        eprintln!("duckdb が無いので飛ばす");
+        eprintln!("duckdb not found, skipping");
         return;
     }
     let ahiru = run_ahiru_multi(&MULTI, "SELECT count(*) FROM t");
@@ -93,11 +93,11 @@ fn multi_file_union_count_matches_duckdb() {
     assert_eq!(body(ahiru), body(duckdb));
 }
 
-/// 各ファイルの行 (id, name) がすべて出てくる（欠落・重複が無い）。
+/// Every (id, name) row of each file shows up (nothing missing, nothing duplicated).
 #[test]
 fn multi_file_union_rows_match_duckdb() {
     if !duckdb_available() {
-        eprintln!("duckdb が無いので飛ばす");
+        eprintln!("duckdb not found, skipping");
         return;
     }
     let ahiru = run_ahiru_multi(&MULTI, "SELECT id, name FROM t ORDER BY id");
@@ -109,8 +109,8 @@ fn multi_file_union_rows_match_duckdb() {
     assert_eq!(body(ahiru), body(duckdb));
 }
 
-/// Hive パーティション列 (`year`, `month`) がスキーマに出て、
-/// `WHERE year = 2024 AND month = 1` が該当ファイル分の行数だけを返す。
+/// The Hive partition columns (`year`, `month`) appear in the schema, and
+/// `WHERE year = 2024 AND month = 1` returns only the rows of the matching files.
 #[test]
 fn hive_partition_columns_are_queryable_and_filterable() {
     let all = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t");
@@ -125,16 +125,16 @@ fn hive_partition_columns_are_queryable_and_filterable() {
     let y25 = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2025");
     assert_eq!(body(y25), vec![vec!["300".to_string()]]);
 
-    // 値そのものも合っている。
+    // The values themselves are right too.
     let rows = run_ahiru_multi(&HIVE, "SELECT year, month FROM t WHERE id = 0");
     assert_eq!(body(rows), vec![vec!["2024".to_string(), "1".to_string()]]);
 }
 
-/// DuckDB の `hive_partitioning=true` と件数を突き合わせる。
+/// Cross-checks the count against DuckDB's `hive_partitioning=true`.
 #[test]
 fn hive_partition_filter_matches_duckdb() {
     if !duckdb_available() {
-        eprintln!("duckdb が無いので飛ばす");
+        eprintln!("duckdb not found, skipping");
         return;
     }
     let glob = repo_path("tests/data/hive/*/*/*.parquet");
@@ -145,7 +145,7 @@ fn hive_partition_filter_matches_duckdb() {
     assert_eq!(body(ahiru), body(duckdb));
 }
 
-/// `+` 連結記法そのものの簡単な動作確認（usage 文言に書いた記法が実際に動く）。
+/// A simple smoke test of the `+` notation itself (the notation documented in the usage text really works).
 #[test]
 fn plus_separator_smoke_test() {
     let out = run_ahiru_multi(&MULTI, "SELECT count(*) FROM t");

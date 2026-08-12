@@ -1,18 +1,18 @@
-//! ランタイム基盤: アロケータ、パニックハンドラ、小さなコンテナ。
+//! Runtime foundation: the allocator, the panic handler, and small containers.
 
 pub mod alloc;
 pub mod hash;
 
-/// wasm + no_std ビルドでのみグローバルアロケータを差し替える。
+/// The global allocator is only swapped in for wasm + no_std builds.
 #[cfg(all(target_arch = "wasm32", not(feature = "std")))]
 #[global_allocator]
 static ALLOC: alloc::AhiruAlloc = alloc::AhiruAlloc;
 
-/// no_std ビルドのパニックハンドラ。
+/// The panic handler for no_std builds.
 ///
-/// `panic = "abort"` としているため巻き戻しは発生しない。メッセージを
-/// 組み立てると `core::fmt` がリンクされてしまうので、何も見ずに trap する。
-/// エラーは `Result` で返す設計なので、ここに来るのはバグかメモリ枯渇のみ。
+/// With `panic = "abort"` there is no unwinding. Assembling a message would link
+/// `core::fmt`, so this traps without looking at anything. Every error is designed
+/// to come back as a `Result`, so reaching here means a bug or memory exhaustion.
 #[cfg(all(target_arch = "wasm32", not(feature = "std"), not(test)))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

@@ -10,13 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 # `export` / `export-parquet`: COPY (SELECT ...) TO 'x.csv'/'x.jsonl'/'x.parquet'
-# を CLI からも使えるようにする。ファイルへの実書き込みは `ahiru-core` では
-# なくここ（`main.rs`）が行う（`ahiru-core` は no_std でファイルシステムに
-# 触れられないため）。Parquet 書き出しは wasm では容量の都合でオプトインだが、
-# ネイティブ CLI にはサイズ制約が無いので既定で入れる（DuckDB との相互運用を
-# `tests/copy.rs` で通しで検証するためにも必要）。
+# is made available from the CLI too. The actual writing to files is done here
+# (`main.rs`), not in `ahiru-core` (which is no_std and cannot touch the
+# filesystem). Parquet output is opt-in on wasm for size reasons, but the
+# native CLI has no size constraint, so it is on by default (also required to
+# verify DuckDB interoperability end to end in `tests/copy.rs`).
 ahiru-core = { path = "../ahiru-core", features = ["std", "export", "export-parquet"] }
-# ZSTD は wasm では別モジュールとして遅延ロードするが、ネイティブ CLI では
-# 直接リンクしてよい（サイズ制約はコアの .wasm にしか掛からない）。
-# こうすることでコーデック委譲プロトコル自体を CLI で通しで検証できる。
+# On wasm, ZSTD is lazily loaded as a separate module, but the native CLI may
+# link it directly (the size constraint applies only to the core .wasm).
+# Doing so also lets the CLI exercise the codec delegation protocol end to end.
 ahiru-zstd = { path = "../ahiru-zstd", features = ["std"] }

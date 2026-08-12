@@ -1,9 +1,9 @@
-//! `format::json`（`read_json`/`read_json_auto` 相当）の統合テスト。
+//! Integration tests for `format::json` (equivalent to `read_json`/`read_json_auto`).
 //!
-//! 単体テストは `format::json` 側で自前のバイト列に対して行っているので、
-//! ここでは「実際に `Session`/`Catalog` 経由の SQL パイプラインとして動くか」
-//! と「同じ内容を持つ他フォーマット（Parquet/JSONL）と同じ結果を返すか」を
-//! 確認する。期待値は `duckdb -c "SELECT ..."` の出力と突き合わせて決めている。
+//! Since the unit tests exercise `format::json` directly against hand-built byte strings,
+//! here we verify "does it actually work as a SQL pipeline through `Session`/`Catalog`"
+//! and "does it return the same result as another format with the same content
+//! (Parquet/JSONL)". Expected values are decided by cross-checking against the output of `duckdb -c "SELECT ..."`.
 
 use ahiru_core::format::FormatKind;
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -14,12 +14,12 @@ fn data(name: &str) -> Vec<u8> {
     std::fs::read(format!("{p}{name}")).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-/// クエリを最後まで実行し、行を集めて返す。全データがメモリ上にあるので
-/// `NeedIo`/`NeedCodec` は起こらない前提。
+/// Runs a query to completion and collects the rows. Assumes `NeedIo`/`NeedCodec` never
+/// happen, since all the data is in memory.
 fn run_all(sql: &str, s: &mut Session) -> Vec<Vec<Value>> {
     let mut q = match s.prepare(sql, &[]).unwrap() {
         Prepared::Ready(q) => q,
-        Prepared::NeedIo(_) => panic!("メモリ上のデータで NeedIo は出ないはず"),
+        Prepared::NeedIo(_) => panic!("NeedIo should not happen for in-memory data"),
     };
     let mut rows = Vec::new();
     loop {
@@ -44,7 +44,7 @@ fn s(v: &str) -> Value {
 #[test]
 fn json_array_file_is_auto_detected_from_extension() {
     let mut sess = Session::new();
-    // register_bytes は拡張子から FormatKind::Auto → Json を選ぶ。
+    // register_bytes picks FormatKind::Auto -> Json based on the extension.
     sess.register_bytes("basic_array.json", data("basic_array.json")).unwrap();
     let rows = run_all("SELECT count(*) AS n FROM \"basic_array.json\"", &mut sess);
     assert_eq!(rows, [[Value::I64(1000)]]);
@@ -65,15 +65,15 @@ fn json_array_file_matches_duckdb_output_through_sql() {
     assert_eq!(rows[0][4], Value::Null); // i % 5 == 0
     assert_eq!(rows[1][2], Value::F64(1.5));
     assert_eq!(rows[1][4], Value::I64(100));
-    // duckdb: epoch_us(d) の先頭行 → 1704067200000000
+    // duckdb: the first row of epoch_us(d) -> 1704067200000000
     assert_eq!(rows[0][5], Value::I64(1_704_067_200_000_000));
 }
 
 #[test]
 fn json_array_and_jsonl_agree_on_aggregates() {
-    // 同じ内容（basic.parquet 由来）を JSON 配列と JSONL の両方で読み、
-    // 集約結果が一致することを確認する。フォーマットが違っても論理的な
-    // 中身は同じであるべき、という不変条件のテスト。
+    // Reads the same content (derived from basic.parquet) via both a JSON array and JSONL,
+    // verifying the aggregate result matches. A test of the invariant that the logical
+    // content should be the same regardless of format.
     let mut sess = Session::new();
     sess.register_bytes_as("arr", data("basic_array.json"), FormatKind::Json).unwrap();
     sess.register_bytes_as("lines", data("basic.jsonl"), FormatKind::Jsonl).unwrap();
@@ -93,8 +93,8 @@ fn where_clause_and_projection_work_over_json_array() {
 
 #[test]
 fn top_level_object_and_scalar_array_round_trip_through_sql() {
-    // register_bytes_as はメモリ上のバイト列をそのまま渡せるので、実ファイルを
-    // 経由せずにトップレベルの規則（モジュール doc 参照）を SQL からも確認する。
+    // Since register_bytes_as can pass an in-memory byte string directly, verify the
+    // top-level rules (see the module doc) from SQL too, without going through a real file.
     let mut sess = Session::new();
     sess.register_bytes_as("obj", br#"{"a":1,"b":"hello"}"#.to_vec(), FormatKind::Json).unwrap();
     let rows = run_all("SELECT a, b FROM obj", &mut sess);
@@ -103,6 +103,6 @@ fn top_level_object_and_scalar_array_round_trip_through_sql() {
     let mut sess = Session::new();
     sess.register_bytes_as("scalars", b"[1,2,3]".to_vec(), FormatKind::Json).unwrap();
     let rows = run_all("SELECT sum(json) AS total FROM scalars", &mut sess);
-    // SUM(INT) はこのエンジンでは常に HUGEINT (I128) に広がる（他の SUM テストと同じ規約）。
+    // SUM(INT) always widens to HUGEINT (I128) in this engine (same convention as the other SUM tests).
     assert_eq!(rows, [[Value::I128(6)]]);
 }

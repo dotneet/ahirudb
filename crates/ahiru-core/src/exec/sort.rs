@@ -1,31 +1,31 @@
-//! ソートと Top-N。
+//! Sorting and Top-N.
 //!
-//! ソートは入力を全部読み切るまで 1 行も返せない**ブロッキング**オペレータ。
-//! リモート（レンジ取得）ソースでは入力の途中で `Step::NeedIo` / `NeedCodec`
-//! が返るので、蓄積の途中状態はすべて `self` に持ち、中断はそのまま素通しして
-//! 次の呼び出しで同じ場所から再開する（DESIGN.md §6）。状態を持たずに
-//! 「全部読む」ループを書くと、そこで入力を捨てるか二重に読むかになる。
+//! Sorting is a **blocking** operator that cannot return a single row until the input is read
+//! through. With a remote (range-fetched) source, `Step::NeedIo` / `NeedCodec` come back midway,
+//! so all the partial buffering state lives in `self`, interruptions are passed straight
+//! through, and the next call resumes from the same place (DESIGN.md §6). Writing a "read
+//! everything" loop without state would either discard input there or read it twice.
 //!
-//! 行は列指向のまま溜める。行ごとに `Value` を作ると 1 セル 1 確保になり、
-//! 比較よりも確保のほうが支配的になるため。
+//! Rows are buffered columnar. Building a `Value` per row would mean one allocation per cell,
+//! making allocation dominate over comparison.
 //!
-//! ## 順序の決め方
+//! ## How the order is decided
 //!
-//! - キーは指定順に比較し、`desc` は**値の比較結果だけ**を反転する。
-//! - NULL の位置は `nulls_first` だけで決まり、`desc` の影響を受けない。
-//!   SQL 既定の ASC→NULLS LAST / DESC→NULLS FIRST はバインダがフラグに
-//!   落とし済みなので、ここで再適用すると二重に反転する。
-//! - F64 は `partial_cmp` が `None` を返しうる。比較器が `None` を「等しい」に
-//!   潰すと推移律が壊れるので、そもそも使わずに全順序を持つ `u64` キーへ写す
-//!   （`f64_key`）。順序は `-inf < … < -0.0 = 0.0 < … < +inf < NaN`。
-//! - 最後にバッファ上の行番号で決着させるので比較は**全順序**になる。
-//!   これで安定性（同値キーは入力順のまま）も同時に得られる。
+//! - Keys are compared in the given order, and `desc` inverts **only the value comparison**.
+//! - NULL placement is decided by `nulls_first` alone and is unaffected by `desc`.
+//!   The SQL defaults ASC->NULLS LAST / DESC->NULLS FIRST are already lowered into flags by the
+//!   binder, so reapplying them here would invert twice.
+//! - F64's `partial_cmp` can return `None`. Collapsing that to "equal" in a comparator would
+//!   break transitivity, so it is not used at all; values are mapped to a totally ordered `u64`
+//!   key instead (`f64_key`). The order is `-inf < ... < -0.0 = 0.0 < ... < +inf < NaN`.
+//! - Ties are finally broken by the row number in the buffer, so the comparison is a **total order**.
+//!   That also yields stability (equal keys keep the input order).
 //!
-//! ## メモリ
+//! ## Memory
 //!
-//! 溢れ処理（spill）は持たない。バッファが `MAX_BUFFER_BYTES` を超えたら
-//! 静かに巨大化させず `Oom` を返す。`limit` があるときはそもそも上位 n 件しか
-//! 抱えないので、50M 行に対する `ORDER BY … LIMIT 10` でも上限に触れない。
+//! There is no spilling. Once the buffer exceeds `MAX_BUFFER_BYTES` it returns `Oom` rather than
+//! quietly ballooning. With a `limit` only the top n are held in the first place, so
+//! `ORDER BY ... LIMIT 10` over 50M rows never touches the cap.
 
 use crate::exec::{ExecContext, Operator, Step};
 use crate::plan::SortKey;
@@ -34,15 +34,15 @@ use crate::vector::{Batch, Bitmap, Data, Vector, BATCH_SIZE};
 
 use core::cmp::Ordering;
 
-/// 溢れ処理を持たないので、これを超えたら `Oom` を返す。
-/// wasm の線形メモリは 4GiB が上限だが、ホスト側のバッファや復号済みページと
-/// 同居するため、ソート単体では 256MiB までに抑える。
+/// With no spilling, exceeding this returns `Oom`.
+/// wasm's linear memory caps at 4 GiB, but the host's buffers and decoded pages share it, so
+/// sorting alone is held to 256 MiB.
 const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
 enum Phase {
-    /// 入力を読んで溜めている。中断を跨いでもこの状態のまま。
+    /// Reading and buffering the input. It stays in this state across interruptions.
     Buffering,
-    /// 順序が確定した。`order` を `BATCH_SIZE` ずつ切って返す。
+    /// The order is settled. `order` is returned in `BATCH_SIZE` slices.
     Emitting,
     Done,
 }
@@ -50,28 +50,28 @@ enum Phase {
 pub struct Sort {
     input: Box<dyn Operator>,
     keys: Vec<SortKey>,
-    /// Top-N で残す行数。`None` は全件。
+    /// How many rows Top-N keeps. `None` means all of them.
     limit: Option<usize>,
     phase: Phase,
 
-    /// 入力列の蓄積。スキーマは入力そのまま（ソートは列を変えない）。
+    /// The buffered input columns. The schema is the input's as is (sorting does not change columns).
     cols: Vec<Vector>,
-    /// ソートキーの蓄積。`keys` と同じ個数・同じ並び。
+    /// The buffered sort keys. The same count and order as `keys`.
     key_cols: Vec<Vector>,
-    /// 蓄積した行数。列を持たない入力（`COUNT(*)` など）でも行数だけは要る。
+    /// The buffered row count. Even an input with no columns (`COUNT(*)` and the like) needs the row count.
     rows: usize,
-    /// 最初のバッチで列型を決めたか。0 列の入力があるので `cols` の空判定では代用できない。
+    /// Whether the column types were decided from the first batch. A zero-column input exists, so emptiness of `cols` cannot stand in for it.
     init: bool,
 
-    /// 確定した出力順。`Emitting` 以降のみ有効。
+    /// The settled output order. Valid only from `Emitting` on.
     order: Vec<u32>,
-    /// 次に返す `order` の位置。
+    /// The next position in `order` to return.
     pos: usize,
 }
 
 impl Sort {
     pub fn new(input: Box<dyn Operator>, keys: Vec<SortKey>, limit: Option<usize>) -> Result<Self> {
-        // LIMIT 0 は 1 行も返さない。入力を引く必要すらない。
+        // LIMIT 0 returns no rows. There is not even a need to pull the input.
         let phase = if limit == Some(0) { Phase::Done } else { Phase::Buffering };
         Ok(Sort {
             input,
@@ -87,10 +87,10 @@ impl Sort {
         })
     }
 
-    /// 1 バッチを蓄積へ取り込む。
+    /// Takes one batch into the buffer.
     fn absorb(&mut self, mut batch: Batch, ctx: &mut ExecContext) -> Result<()> {
-        // selection を先に解消しておく。キー評価と列の追記で 2 回 gather する
-        // のを避けるため。
+        // Selection is resolved first, to avoid gathering twice (once for key evaluation and once
+        // for appending the columns).
         batch.materialize();
         let rows = batch.card();
 
@@ -106,7 +106,7 @@ impl Sort {
         }
         ensure!(batch.cols.len() == self.cols.len(), Internal);
 
-        // 行番号を u32 に載せるので、そこを超えたら諦める。
+        // Row numbers ride in a u32, so beyond that it gives up.
         ensure!(self.rows.saturating_add(rows) <= u32::MAX as usize, LimitExceeded);
 
         for (dst, src) in self.key_cols.iter_mut().zip(kvs.iter()) {
@@ -117,18 +117,18 @@ impl Sort {
         }
         self.rows += rows;
 
-        // 上限判定より先に圧縮する。Top-N は上限に触れずに済む。
+        // Compaction happens before the cap check. Top-N never touches the cap.
         self.compact()?;
         ensure!(self.buffered_bytes() <= MAX_BUFFER_BYTES, Oom);
         Ok(())
     }
 
-    /// Top-N のときだけ、バッファを上位 `n` 件へ切り詰める。
+    /// Only under Top-N, trims the buffer to the top `n` rows.
     ///
-    /// 1 行ごとにヒープを触る代わりに `2n` 行まで溜めてから一括で選別する。
-    /// 列指向のバッファでは 1 行の差し替えが（可変長列のせいで）安くないので、
-    /// まとめて `gather` し直すほうがアロケーションも比較回数も少ない。
-    /// 1 回の圧縮で `n` 行以上を捨てるため、償却では 1 行あたり O(log n)。
+    /// Rather than touching a heap per row, it buffers up to `2n` rows and then selects in bulk.
+    /// In a columnar buffer, replacing one row is not cheap (because of variable-length columns),
+    /// so re-`gather`ing in bulk needs fewer allocations and fewer comparisons.
+    /// One compaction discards at least `n` rows, so amortized it is O(log n) per row.
     fn compact(&mut self) -> Result<()> {
         let n = match self.limit {
             Some(n) => n,
@@ -141,9 +141,9 @@ impl Sort {
         let mut order: Vec<u32> = (0..self.rows as u32).collect();
         order.sort_by(|&a, &b| cmp_row(&self.keys, &self.key_cols, a, b));
         order.truncate(n);
-        // 残す行は**ソート順のまま**書き戻す。こうすると「バッファ添字の昇順は
-        // 同値キーにおける入力順と一致する」という不変条件が保たれ、比較器の
-        // 添字による決着だけで安定性が出る。
+        // The retained rows are written back **in sorted order**. That preserves the invariant
+        // "ascending buffer index matches input order among equal keys", so stability follows from
+        // the comparator's index tiebreak alone.
         for c in self.cols.iter_mut() {
             *c = c.gather(&order);
         }
@@ -154,7 +154,7 @@ impl Sort {
         Ok(())
     }
 
-    /// 蓄積が使っているおおよそのバイト数。
+    /// The approximate bytes the buffer uses.
     fn buffered_bytes(&self) -> usize {
         let mut n = 0usize;
         for v in self.cols.iter().chain(self.key_cols.iter()) {
@@ -163,7 +163,7 @@ impl Sort {
         n
     }
 
-    /// 入力を読み切った。順序を確定して出力フェーズへ移る。
+    /// The input is read through. Settles the order and moves to the output phase.
     fn finish(&mut self) -> Result<()> {
         let mut order: Vec<u32> = (0..self.rows as u32).collect();
         order.sort_by(|&a, &b| cmp_row(&self.keys, &self.key_cols, a, b));
@@ -172,7 +172,7 @@ impl Sort {
         }
         self.order = order;
         self.pos = 0;
-        // キー列はもう使わない。出力中に抱えている理由がない。
+        // The key columns are no longer needed. There is no reason to hold them during output.
         self.key_cols = Vec::new();
         self.phase = Phase::Emitting;
         Ok(())
@@ -203,9 +203,9 @@ impl Operator for Sort {
             match self.phase {
                 Phase::Buffering => match self.input.next(ctx)? {
                     Step::Ready(b) => self.absorb(b, ctx)?,
-                    // 中断はそのまま上へ返す。蓄積した行は `self` に残るので、
-                    // 次回の呼び出しはここから入力を引き直す（取りこぼしも
-                    // 二重取りも起きない）。バイト待ちも展開待ちも扱いは同じ。
+                    // The interruption is returned straight up. The buffered rows stay in `self`,
+                    // so the next call pulls the input again from here (nothing dropped and
+                    // nothing read twice). Waiting on bytes and on decompression are handled alike.
                     Step::NeedIo => return Ok(Step::NeedIo),
                     Step::NeedCodec => return Ok(Step::NeedCodec),
                     Step::Done => self.finish()?,
@@ -217,9 +217,9 @@ impl Operator for Sort {
     }
 }
 
-// --- 比較 -------------------------------------------------------------------
+// --- Comparison ---------------------------------------------------------------
 
-/// 2 行の全順序比較。同値キーは添字で決着させるので、`Equal` は同一行のときだけ。
+/// A total-order comparison of two rows. Equal keys are broken by index, so `Equal` happens only for the same row.
 fn cmp_row(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
     let (ai, bi) = (a as usize, b as usize);
     for (k, c) in keys.iter().zip(cols.iter()) {
@@ -228,8 +228,8 @@ fn cmp_row(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
             if !va && !vb {
                 continue;
             }
-            // NULL の位置は nulls_first だけで決まる。ここで desc を掛けると
-            // バインダが入れた既定（ASC→LAST / DESC→FIRST）を二重に適用する。
+            // NULL placement is decided by nulls_first alone. Applying desc here would apply the
+            // binder's default (ASC->LAST / DESC->FIRST) twice.
             let null_is_first = k.nulls_first;
             return if !va {
                 if null_is_first {
@@ -254,38 +254,38 @@ fn cmp_row(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
     a.cmp(&b)
 }
 
-/// 物理型ごとの値比較。NULL の判定は呼び出し側で済ませてある。
+/// Value comparison per physical type. NULL checks are already done by the caller.
 fn cmp_data(d: &Data, a: usize, b: usize) -> Ordering {
     match d {
-        // false < true。
+        // false < true.
         Data::Bool(v) => v.get(a).cmp(&v.get(b)),
         Data::I32(v) => v[a].cmp(&v[b]),
         Data::I64(v) => v[a].cmp(&v[b]),
         Data::I128(v) => v[a].cmp(&v[b]),
         Data::F64(v) => f64_key(v[a]).cmp(&f64_key(v[b])),
-        // 辞書順。前方一致する場合は短いほうが小さい。
+        // Lexicographic. On a common prefix the shorter one is smaller.
         Data::Bytes(v) => v.get(a).cmp(v.get(b)),
     }
 }
 
-/// f64 を順序を保つ `u64` へ写す。
+/// Maps an f64 to an order-preserving `u64`.
 ///
-/// `partial_cmp` は NaN で `None` を返すため比較器には使えない。ビット表現を
-/// 単調写像に通して全順序にする:
-/// `-inf < … < -0.0 = 0.0 < … < +inf < NaN`。
+/// `partial_cmp` returns `None` for NaN and so cannot be used in a comparator. The bit
+/// representation is passed through a monotone mapping to give a total order:
+/// `-inf < ... < -0.0 = 0.0 < ... < +inf < NaN`.
 ///
-/// - NaN は「全数値より大きい」1 つの値に潰す。NaN 同士は同値なので、
-///   複数の NaN があっても入力順のまま並ぶ（決定的）。
-/// - `-0.0` と `0.0` は `=` で等しく、`rowkey::canonical_f64` も同一視する。
-///   順序だけ別扱いにすると挙動がちぐはぐになるので同値に揃える。
+/// - NaN collapses into a single value "greater than every number". NaNs are equal to one
+///   another, so several NaNs stay in input order (deterministic).
+/// - `-0.0` and `0.0` are equal under `=`, and `rowkey::canonical_f64` identifies them too.
+///   Treating them differently for ordering alone would be incoherent, so they are made equal here as well.
 #[inline]
 fn f64_key(v: f64) -> u64 {
     if v.is_nan() {
         return u64::MAX;
     }
     let b = if v == 0.0 { 0 } else { v.to_bits() };
-    // 負数はビット列が大きいほど値が小さいので反転する。正数は符号ビットを
-    // 立てて負数より上へ持ち上げる。
+    // For negatives, a larger bit pattern means a smaller value, so it is inverted. Positives get
+    // the sign bit set to lift them above the negatives.
     if b >> 63 != 0 {
         !b
     } else {
@@ -293,9 +293,9 @@ fn f64_key(v: f64) -> u64 {
     }
 }
 
-// --- バッファ操作 -----------------------------------------------------------
+// --- Buffer operations --------------------------------------------------------
 
-/// `src` の全行を `dst` の末尾に足す。物理型が同じであることが前提。
+/// Appends every row of `src` to the end of `dst`. Assumes the physical types match.
 fn append(dst: &mut Vector, src: &Vector) -> Result<()> {
     let base = dst.len();
     let n = src.len();
@@ -309,18 +309,18 @@ fn append(dst: &mut Vector, src: &Vector) -> Result<()> {
             let first = s.offsets.first().copied().unwrap_or(0);
             let shift = d.data.len() as u32;
             d.data.extend_from_slice(&s.data);
-            // 先頭 offset は既に dst 側に入っているので飛ばす。
+            // The leading offset is already in `dst`, so it is skipped.
             for &o in s.offsets.iter().skip(1) {
                 d.offsets.push(shift + (o - first));
             }
         }
-        // 同じオペレータから来る列なので、ここに落ちるのは組み立て側のバグ。
+        // The columns come from the same operator, so landing here is an assembly-side bug.
         _ => err!(Internal),
     }
-    // どちらかに NULL があれば validity を揃える。`dst` 側だけが持っている
-    // 場合も伸ばさないと長さが本体とずれ、以降の `is_valid` が範囲外を読む。
+    // If either side has NULLs, validity is aligned. Even when only `dst` has it, without
+    // extending it, its length would desynchronize from the data and later `is_valid` calls would read out of range.
     if n > 0 && (src.has_nulls() || dst.has_nulls()) {
-        // validity_mut は追記済みの長さまで全 1 で実体化・伸長してくれる。
+        // validity_mut materializes and extends with all-ones up to the appended length.
         let bm: &mut Bitmap = dst.validity_mut();
         if let Some(sv) = src.validity() {
             for i in 0..n {
@@ -333,9 +333,9 @@ fn append(dst: &mut Vector, src: &Vector) -> Result<()> {
     Ok(())
 }
 
-/// ベクタ 1 本のおおよそのバイト数。上限判定用なので厳密でなくてよい。
-/// `exec::recursive` も再帰 CTE の作業テーブルのバイト数上限判定に使う
-/// （メモリ見積もりのロジックを 2 か所に増やさないため）。
+/// The approximate byte count of one vector. For the cap check, so it need not be exact.
+/// `exec::recursive` uses it too, for the byte cap on a recursive CTE's working table
+/// (so the memory-estimation logic does not exist in two places).
 pub(crate) fn vector_bytes(v: &Vector) -> usize {
     let n = v.len();
     let body = match v.data() {
@@ -356,9 +356,9 @@ mod tests {
     use crate::expr::{Instr, OpCode, Program};
     use crate::vector::{Ty, Value};
 
-    // --- 組み立てヘルパ -----------------------------------------------------
+    // --- Construction helpers -----------------------------------------------
 
-    /// `col` 番目の列をそのまま返すプログラム。
+    /// A program that returns column `col` unchanged.
     fn col_expr(col: u16, ty: Ty) -> Program {
         let mut p = Program::new();
         let r = p.alloc_reg();
@@ -387,12 +387,12 @@ mod tests {
         vector(Ty::Int, &vals.iter().map(|v| v.map(Value::I32)).collect::<Vec<_>>())
     }
 
-    /// 0..n の連番列。安定性と Top-N の検証用の「行 ID」。
+    /// A running 0..n column. A "row ID" for verifying stability and Top-N.
     fn ids(n: usize) -> Vector {
         ints(&(0..n as i32).map(Some).collect::<Vec<_>>())
     }
 
-    // --- モック入力 ---------------------------------------------------------
+    // --- Mock inputs --------------------------------------------------------
 
     enum Script {
         Rows(Vec<Vector>),
@@ -406,7 +406,7 @@ mod tests {
     }
 
     impl Mock {
-        // テスト用のヘルパなので `Box<dyn Operator>` を返す方が呼び出し側が短い。
+        // A test helper, so returning `Box<dyn Operator>` keeps the call sites shorter.
         #[allow(clippy::new_ret_no_self)]
         fn new(steps: Vec<Script>) -> Box<dyn Operator> {
             Box::new(Mock { steps, pos: 0 })
@@ -420,8 +420,8 @@ mod tests {
             }
             let i = self.pos;
             self.pos += 1;
-            // 中断は「ホストの応答を待った」ことにして消費する。
-            // 実際の Scan も再呼び出しでは同じ分割の続きから返す。
+            // An interruption is consumed as though "the host's response was awaited".
+            // A real Scan likewise resumes the same split on the next call.
             Ok(match &self.steps[i] {
                 Script::NeedIo => Step::NeedIo,
                 Script::NeedCodec => Step::NeedCodec,
@@ -430,12 +430,12 @@ mod tests {
         }
     }
 
-    /// 1 バッチぶんの出力を行ごとの `Value` 列に落とす。
+    /// Flattens one batch's output into per-row `Value` lists.
     fn rows_of(b: &Batch) -> Vec<Vec<Value>> {
         (0..b.card()).map(|i| b.cols.iter().map(|c| c.value_at(i)).collect()).collect()
     }
 
-    /// ソートを最後まで回し、バッチごとの行を返す。
+    /// Runs the sort to completion and returns the rows per batch.
     fn drive(steps: Vec<Script>, keys: Vec<SortKey>, limit: Option<usize>) -> Vec<Vec<Vec<Value>>> {
         let mut op = Sort::new(Mock::new(steps), keys, limit).unwrap();
         let mut cat = Catalog::default();
@@ -446,7 +446,7 @@ mod tests {
         for _ in 0..100_000 {
             match op.next(&mut ctx).unwrap() {
                 Step::Ready(b) => out.push(rows_of(&b)),
-                // ホストが応答したことにして同じオペレータを呼び直す。
+                // Calls the same operator again, as though the host had responded.
                 Step::NeedIo | Step::NeedCodec => continue,
                 Step::Done => return out,
             }
@@ -454,12 +454,12 @@ mod tests {
         panic!("sort did not terminate");
     }
 
-    /// バッチ境界を潰した全行。
+    /// Every row with batch boundaries flattened away.
     fn flat(steps: Vec<Script>, keys: Vec<SortKey>, limit: Option<usize>) -> Vec<Vec<Value>> {
         drive(steps, keys, limit).into_iter().flatten().collect()
     }
 
-    /// 各行の指定列を i32 として取り出す。
+    /// Extracts the given column of each row as i32.
     fn col_i32(rows: &[Vec<Value>], c: usize) -> Vec<Option<i32>> {
         rows.iter()
             .map(|r| match &r[c] {
@@ -469,7 +469,7 @@ mod tests {
             .collect()
     }
 
-    // --- 中断と再開（最重要） -----------------------------------------------
+    // --- Interruption and resumption (the most important) -------------------
 
     #[test]
     fn need_io_mid_input_matches_uninterrupted_run() {
@@ -478,8 +478,8 @@ mod tests {
             let b = Script::Rows(vec![ints(&[Some(3), Some(9)]), ints(&[Some(2), Some(3)])]);
             let c = Script::Rows(vec![ints(&[Some(2)]), ints(&[Some(4)])]);
             if interrupted {
-                // 入力の途中（バッチとバッチの間、かつ先頭でも末尾でもない）で
-                // 中断を挟む。バイト待ちと展開待ちの両方を混ぜる。
+                // Interruptions are interposed mid-input (between batches, and neither at the start nor at
+                // the end). Both waiting on bytes and waiting on decompression are mixed in.
                 vec![a, Script::NeedIo, b, Script::NeedCodec, c, Script::NeedIo]
             } else {
                 vec![a, b, c]
@@ -489,14 +489,14 @@ mod tests {
         let plain = flat(mk(false), ks(), None);
         let broken = flat(mk(true), ks(), None);
         assert_eq!(col_i32(&plain, 0), vec![Some(1), Some(2), Some(3), Some(5), Some(9)]);
-        // 行が消えたり二重に入ったりしていないこと。
+        // No row may have vanished or been doubled.
         assert_eq!(col_i32(&broken, 0), col_i32(&plain, 0));
         assert_eq!(col_i32(&broken, 1), col_i32(&plain, 1));
     }
 
     #[test]
     fn need_io_before_any_input_is_passed_through() {
-        // 最初の呼び出しがいきなり中断でも壊れない。
+        // It does not break even when the very first call is an interruption.
         let steps =
             vec![Script::NeedIo, Script::NeedCodec, Script::Rows(vec![ints(&[Some(2), Some(1)])])];
         let mut op =
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn need_io_during_top_n_compaction() {
-        // 圧縮を跨いで中断しても上位 n 件は変わらない。
+        // Interrupting across a compaction does not change the top n.
         let chunk = |base: i32| {
             let vals: Vec<Option<i32>> = (0..1500).map(|i| Some((base + i * 37) % 5000)).collect();
             Script::Rows(vec![ints(&vals)])
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(plain.len(), 5);
     }
 
-    // --- 基本の順序 ---------------------------------------------------------
+    // --- Basic ordering -----------------------------------------------------
 
     #[test]
     fn single_key_asc_and_desc() {
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn second_key_breaks_ties_with_its_own_direction() {
-        // 第 1 キー ASC、第 2 キー DESC。
+        // First key ASC, second key DESC.
         let cols = vec![
             ints(&[Some(1), Some(1), Some(0), Some(0)]),
             ints(&[Some(10), Some(20), Some(30), Some(40)]),
@@ -565,13 +565,13 @@ mod tests {
 
     #[test]
     fn equal_keys_keep_input_order() {
-        // キーは全部同じ。ID 列が入力順のまま出てくること。
+        // Every key is the same. The ID column must come out in input order.
         let n = 200;
         let cols = vec![ints(&vec![Some(7); n]), ids(n)];
         let rows = flat(vec![Script::Rows(cols)], vec![key(0, Ty::Int, false, false)], None);
         assert_eq!(col_i32(&rows, 1), (0..n as i32).map(Some).collect::<Vec<_>>());
 
-        // バッチを跨いでも同じ。
+        // The same across batches.
         let steps = vec![
             Script::Rows(vec![ints(&[Some(7), Some(7)]), ints(&[Some(0), Some(1)])]),
             Script::Rows(vec![ints(&[Some(7), Some(7)]), ints(&[Some(2), Some(3)])]),
@@ -580,28 +580,28 @@ mod tests {
         assert_eq!(col_i32(&rows, 1), vec![Some(0), Some(1), Some(2), Some(3)]);
     }
 
-    // --- NULL の位置 --------------------------------------------------------
+    // --- NULL placement -----------------------------------------------------
 
     #[test]
     fn null_placement_follows_flag_not_direction() {
-        // 値は 2, NULL, 1（ID は 0, 1, 2）。
+        // The values are 2, NULL, 1 (with IDs 0, 1, 2).
         let cols = || vec![ints(&[Some(2), None, Some(1)]), ids(3)];
         let run = |desc: bool, nulls_first: bool| {
             let rows =
                 flat(vec![Script::Rows(cols())], vec![key(0, Ty::Int, desc, nulls_first)], None);
             col_i32(&rows, 1)
         };
-        // ASC: 1, 2 の順。NULL は旗の側へ。
+        // ASC: 1 then 2. NULL goes to whichever side the flag says.
         assert_eq!(run(false, false), vec![Some(2), Some(0), Some(1)]);
         assert_eq!(run(false, true), vec![Some(1), Some(2), Some(0)]);
-        // DESC: 2, 1 の順。NULL の位置は ASC と同じ旗に従う（desc で反転しない）。
+        // DESC: 2 then 1. NULL placement follows the same flag as ASC (desc does not invert it).
         assert_eq!(run(true, false), vec![Some(0), Some(2), Some(1)]);
         assert_eq!(run(true, true), vec![Some(1), Some(0), Some(2)]);
     }
 
     #[test]
     fn nulls_are_equal_to_each_other_and_fall_through_to_next_key() {
-        // 第 1 キーが両方 NULL なら第 2 キーで決まる。
+        // When the first key is NULL on both sides, the second key decides.
         let cols = vec![ints(&[None, None]), ints(&[Some(9), Some(4)])];
         let rows = flat(
             vec![Script::Rows(cols)],
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(col_i32(&rows, 1), vec![Some(4), Some(9)]);
     }
 
-    // --- 物理型ごとの比較 ---------------------------------------------------
+    // --- Comparison per physical type ---------------------------------------
 
     fn sorted_ids(col: Vector, n: usize, desc: bool) -> Vec<Option<i32>> {
         let ty = col.ty();
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn sorts_bool() {
         let c = vector(Ty::Boolean, &[Some(Value::Bool(true)), Some(Value::Bool(false))]);
-        // false < true。
+        // false < true.
         assert_eq!(sorted_ids(c, 2, false), vec![Some(1), Some(0)]);
     }
 
@@ -647,11 +647,11 @@ mod tests {
     #[test]
     fn sorts_bytes_lexicographically() {
         let b = |s: &str| Some(Value::Bytes(s.as_bytes().to_vec()));
-        // "" < "ab" < "abc" < "b"（前方一致は短いほうが小さい）
+        // "" < "ab" < "abc" < "b" (on a common prefix the shorter is smaller)
         let c = vector(Ty::Varchar, &[b("b"), b("abc"), b(""), b("ab")]);
         assert_eq!(sorted_ids(c, 4, false), vec![Some(2), Some(3), Some(1), Some(0)]);
 
-        // 0x80 以上のバイトも符号なしとして扱う。
+        // Bytes 0x80 and above are treated as unsigned too.
         let raw = |v: &[u8]| Some(Value::Bytes(v.to_vec()));
         let c = vector(Ty::Blob, &[raw(&[0xff]), raw(&[0x01]), raw(&[0x80])]);
         assert_eq!(sorted_ids(c, 3, false), vec![Some(1), Some(2), Some(0)]);
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn f64_total_order_is_documented_and_deterministic() {
         let f = |v: f64| Some(Value::F64(v));
-        // 入力順: NaN, 0.0, -0.0, +inf, -inf, 1.0, NaN(負号)
+        // Input order: NaN, 0.0, -0.0, +inf, -inf, 1.0, NaN (negative sign)
         let c = vector(
             Ty::Double,
             &[
@@ -673,13 +673,13 @@ mod tests {
                 f(-f64::NAN),
             ],
         );
-        // -inf < -0.0 = 0.0 < 1.0 < +inf < NaN。
-        // 0.0 と -0.0 は同値なので入力順（ID 1, 2）のまま。NaN 同士も同様。
+        // -inf < -0.0 = 0.0 < 1.0 < +inf < NaN.
+        // 0.0 and -0.0 are equal, so they stay in input order (IDs 1, 2). The same for the NaNs.
         assert_eq!(
             sorted_ids(c.clone(), 7, false),
             vec![Some(4), Some(1), Some(2), Some(5), Some(3), Some(0), Some(6)]
         );
-        // DESC は完全に逆順（同値の組は入力順のままなので入れ替わらない）。
+        // DESC is the exact reverse (equal pairs stay in input order and do not swap).
         assert_eq!(
             sorted_ids(c, 7, true),
             vec![Some(0), Some(6), Some(3), Some(5), Some(1), Some(2), Some(4)]
@@ -691,7 +691,7 @@ mod tests {
         let f = |v: f64| Some(Value::F64(v));
         let c = vector(Ty::Double, &[f(f64::NAN), None, f(1.0)]);
         let ty = c.ty();
-        // NaN は「最大の数値」、NULL は旗の側。両者は混ざらない。
+        // NaN is "the largest number" and NULL goes to the flag's side. The two do not mix.
         let rows =
             flat(vec![Script::Rows(vec![c.clone(), ids(3)])], vec![key(0, ty, false, true)], None);
         assert_eq!(col_i32(&rows, 1), vec![Some(1), Some(2), Some(0)]);
@@ -718,8 +718,8 @@ mod tests {
 
     #[test]
     fn top_n_over_many_rows_comes_out_in_order() {
-        // 5000 行を 2048 行ずつ流し、圧縮を何度も起こす。
-        // キーは 0..4999 の並べ替え（gcd(37, 5000) = 1）。
+        // 5000 rows are fed 2048 at a time, triggering compaction repeatedly.
+        // The keys are a permutation of 0..4999 (gcd(37, 5000) = 1).
         const N: usize = 5000;
         let mut steps = Vec::new();
         let mut i = 0usize;
@@ -732,15 +732,15 @@ mod tests {
         }
         let rows = flat(steps, vec![key(0, Ty::Int, false, false)], Some(5));
         assert_eq!(col_i32(&rows, 0), vec![Some(0), Some(1), Some(2), Some(3), Some(4)]);
-        // 元の行番号も一致すること（gather がずれていないか）。37 の法 5000 での
-        // 逆元は 2973 なので、キー v を出した行は j = v * 2973 mod 5000。
+        // The original row numbers must match too (checking that gather is not misaligned). 37's
+        // inverse modulo 5000 is 2973, so the row that produced key v is j = v * 2973 mod 5000.
         let expect: Vec<Option<i32>> = (0..5usize).map(|v| Some(((v * 2973) % N) as i32)).collect();
         assert_eq!(col_i32(&rows, 1), expect);
     }
 
     #[test]
     fn top_n_is_stable_across_compaction() {
-        // 全部同じキー。先頭 3 行（入力順）が残ること。
+        // Every key is the same. The first 3 rows (in input order) must survive.
         const N: usize = 5000;
         let mut steps = Vec::new();
         let mut i = 0usize;
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(col_i32(&rows, 1), vec![Some(0), Some(1), Some(2)]);
     }
 
-    // --- 出力バッチ ---------------------------------------------------------
+    // --- Output batches -----------------------------------------------------
 
     #[test]
     fn splits_output_into_batch_size_chunks() {
@@ -763,7 +763,7 @@ mod tests {
         let steps = vec![Script::Rows(vec![ints(&k)])];
         let batches = drive(steps, vec![key(0, Ty::Int, false, false)], None);
         assert_eq!(batches.iter().map(|b| b.len()).collect::<Vec<_>>(), vec![2048, 2048, 904]);
-        // バッチ境界を跨いでも全体として昇順。
+        // Ascending overall, even across batch boundaries.
         let all: Vec<Vec<Value>> = batches.into_iter().flatten().collect();
         assert_eq!(all.len(), N);
         assert_eq!(col_i32(&all, 0), (0..N as i32).map(Some).collect::<Vec<_>>());
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn empty_input_emits_nothing() {
         assert!(drive(Vec::new(), vec![key(0, Ty::Int, false, false)], None).is_empty());
-        // 0 行のバッチだけが来る場合も同じ。
+        // The same when only 0-row batches arrive.
         let steps = vec![Script::Rows(vec![ints(&[])]), Script::NeedIo];
         assert!(drive(steps, vec![key(0, Ty::Int, false, false)], None).is_empty());
     }
@@ -787,7 +787,7 @@ mod tests {
         let batches = drive(vec![Script::Rows(cols)], vec![key(0, Ty::Int, false, false)], None);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 2);
-        assert_eq!(batches[0][0].len(), 3, "列数はそのまま");
+        assert_eq!(batches[0][0].len(), 3, "the column count is unchanged");
         assert_eq!(batches[0][0][0], Value::I32(1));
         assert_eq!(batches[0][0][1], Value::Null);
         assert_eq!(batches[0][0][2], Value::F64(2.5));
@@ -814,11 +814,11 @@ mod tests {
         assert_eq!(col_i32(&rows_of(&b), 1), vec![Some(1), Some(2)]);
     }
 
-    // --- 比較器の性質 -------------------------------------------------------
+    // --- Properties of the comparator ---------------------------------------
 
     #[test]
     fn comparator_is_a_total_order() {
-        // NULL / NaN / 同値を混ぜても反対称性と推移律が破れないこと。
+        // Antisymmetry and transitivity must hold even with NULL / NaN / ties mixed in.
         let f = |v: f64| Some(Value::F64(v));
         let c = vector(
             Ty::Double,
@@ -860,11 +860,11 @@ mod tests {
         assert_eq!(dst.value_at(2), Value::Bytes(Vec::new()));
         assert_eq!(dst.value_at(3), Value::Bytes(b"cde".to_vec()));
 
-        // NULL が後から来る場合（dst に validity がまだ無い）。
+        // When NULLs arrive later (dst has no validity yet).
         let mut dst = Vector::new(Ty::Boolean);
         append(&mut dst, &vector(Ty::Boolean, &[Some(Value::Bool(true))])).unwrap();
         append(&mut dst, &vector(Ty::Boolean, &[None, Some(Value::Bool(false))])).unwrap();
-        // 逆に NULL の無いベクタが後から来ても validity の長さがずれないこと。
+        // Conversely, a vector without NULLs arriving later must not desynchronize validity's length.
         append(&mut dst, &vector(Ty::Boolean, &[Some(Value::Bool(true))])).unwrap();
         assert_eq!(dst.len(), 4);
         assert_eq!(dst.value_at(0), Value::Bool(true));
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn nulls_survive_batches_that_have_none() {
-        // NULL 入りバッチ → NULL 無しバッチ → NULL 入りバッチ、の順。
+        // In the order: a batch with NULLs -> a batch without -> a batch with.
         let steps = vec![
             Script::Rows(vec![ints(&[Some(4), None]), ints(&[Some(0), Some(1)])]),
             Script::Rows(vec![ints(&[Some(2), Some(6)]), ints(&[Some(2), Some(3)])]),
@@ -885,20 +885,20 @@ mod tests {
         assert_eq!(
             col_i32(&rows, 0),
             vec![Some(1), Some(2), Some(4), Some(6), None, None],
-            "NULL は末尾に 2 つだけ"
+            "exactly two NULLs at the end"
         );
         assert_eq!(col_i32(&rows, 1), vec![Some(5), Some(2), Some(0), Some(3), Some(1), Some(4)]);
     }
 
     #[test]
     fn buffer_size_estimate_tracks_appends() {
-        // 上限（256MiB）を実際に超えさせるテストは現実的でないので、
-        // 見積もり関数が行数とともに増えることだけを確認する。
+        // Actually exceeding the cap (256 MiB) in a test is impractical, so this only confirms the
+        // estimation function grows with the row count.
         let empty = vector(Ty::BigInt, &[]);
         assert_eq!(vector_bytes(&empty), 0);
         let mut big = Vector::new(Ty::BigInt);
         append(&mut big, &vector(Ty::BigInt, &[Some(Value::I64(1)), None])).unwrap();
-        // 値 8B × 2 行 + validity。
+        // 8 B per value x 2 rows, plus validity.
         assert!(vector_bytes(&big) >= 16);
         let mut s = Vector::new(Ty::Varchar);
         append(&mut s, &vector(Ty::Varchar, &[Some(Value::Bytes(b"abcdef".to_vec()))])).unwrap();

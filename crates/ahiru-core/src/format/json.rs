@@ -1,108 +1,100 @@
-//! JSON（`read_json`/`read_json_auto` 相当）— ファイル全体が 1 個の JSON 値。
+//! JSON (the equivalent of `read_json`/`read_json_auto`) -- the whole file is a single JSON value.
 //!
-//! `format::jsonl`（NDJSON、1 行 1 オブジェクト）とは違い、こちらはファイル
-//! 全体が **1 つの JSON ドキュメント**（トップレベル配列、またはオブジェクト
-//! 単体）になっている入力を読む。区切りが改行ではなく `[`/`,`/`]` なので、
-//! 分割の途中でレコード境界が確定しない。
+//! Unlike `format::jsonl` (NDJSON, one object per line), this reads input where the whole file is
+//! **one JSON document** (a top-level array, or a single object). The separators are `[`/`,`/`]`
+//! rather than newlines, so record boundaries are not settled partway through a split.
 //!
-//! ## トップレベルの規則（`duckdb` の `read_json_auto` で実測して確認した）
+//! ## Top-level rules (confirmed by measuring `duckdb`'s `read_json_auto`)
 //!
-//! - トップレベルが配列 `[...]` → 各要素を 1 行として読む。
-//! - トップレベルが単一のオブジェクト `{...}` → それ 1 個を 1 行のテーブルと
-//!   して読む（`duckdb -c "SELECT * FROM read_json_auto('single_obj.json')"`
-//!   で確認: 1 行のテーブルになる）。
-//! - 配列の要素がオブジェクトでない（スカラーや配列そのもの）場合、および
-//!   トップレベルがオブジェクトでも配列でもない生のスカラーの場合は、
-//!   `"json"` という名前の列 1 本に生の値をそのまま入れる（`duckdb` の
-//!   `read_json_auto('[1,2,3]')` が `json BIGINT` という 1 列テーブルになる
-//!   のと同じ考え方）。**この判定は行ごとに独立して行う**ので、オブジェクトの
-//!   行とスカラーの行が混在していても（`duckdb` は基本的に想定しない入力だが）
-//!   クラッシュはしない。オブジェクトでない行は `"json"` 列にだけ値が入り、
-//!   他の列は NULL になる。
-//! - 空配列 `[]` は `duckdb` にならい `"json"` という 1 列（型 JSON）・0 行の
-//!   テーブルにする（列が 1 本も無い退化したテーブルより扱いやすいため）。
-//! - 空ファイル（0 バイト）はトップレベル値が存在しないので `UnexpectedEof`
-//!   にする。JSONL の「空ファイルは空テーブル」とは違い、こちらは 1 つの
-//!   JSON ドキュメントを読む前提なので、空はそもそも構文違反になる。
+//! - A top-level array `[...]` -> each element is read as one row.
+//! - A top-level single object `{...}` -> it alone is read as a one-row table (confirmed with
+//!   `duckdb -c "SELECT * FROM read_json_auto('single_obj.json')"`: it becomes a one-row table).
+//! - When an array element is not an object (a scalar, or an array itself), and when the top level
+//!   is a bare scalar rather than an object or array, the raw value goes into a single column
+//!   named `"json"` (the same idea as `duckdb`'s `read_json_auto('[1,2,3]')` becoming a one-column
+//!   table `json BIGINT`). **This decision is made independently per row**, so even a mixture of
+//!   object rows and scalar rows (input `duckdb` does not normally anticipate) does not crash.
+//!   A non-object row has a value only in the `"json"` column, and the other columns are NULL.
+//! - An empty array `[]` becomes, following `duckdb`, a one-column (type JSON), zero-row table
+//!   named `"json"` (easier to handle than a degenerate table with no columns at all).
+//! - An empty file (0 bytes) has no top-level value and gives `UnexpectedEof`. Unlike JSONL's
+//!   "an empty file is an empty table", this premises reading one JSON document, so empty is a
+//!   syntax violation to begin with.
 //!
-//! ## 非ストリーミング設計（v1 の制限）
+//! ## A non-streaming design (a v1 limitation)
 //!
-//! 他のフォーマット（Parquet/CSV/JSONL）は「分割境界でしか I/O を待たない」
-//! 設計（`format` モジュール doc、DESIGN.md §6）に従うが、JSON 配列は途中の
-//! バイトだけでは要素の区切りが構造的に確定しない（配列の深さ・文字列の
-//! エスケープ次第でどこまでが 1 要素か変わる）。そこで `resolve` は
-//! **ファイル全体のバイトが揃うまで `NeedIo` を返し続け、揃った時点で
-//! 一括パースする**という割り切りにしてある。`write::export_all` が
-//! 「クエリ実行中の `NEED_IO` を再開せず失敗させる非再開設計」であることを
-//! 明記しているのと同じ考え方で、ここでは「分割 = ファイル全体 1 個」に
-//! 単純化することで分割境界バリアの形だけは保っている（`num_splits` は常に
-//! 高々 1）。読み取り自体は `read_split` でもう一度ファイル全体を走査する
-//! （`resolve` 側のスキャンとは別実装。自己参照構造体を避けるための単純化）。
+//! The other formats (Parquet/CSV/JSONL) follow the design of "waiting on I/O only at split
+//! boundaries" (the `format` module docs, DESIGN.md §6), but a JSON array's element separators are
+//! not structurally settled from the middle bytes alone (where one element ends depends on the
+//! array depth and string escapes). So `resolve` takes the trade-off of **returning `NeedIo` until
+//! the whole file's bytes are present, then parsing them all at once**. In the same spirit as
+//! `write::export_all` documenting its "non-resumable design that fails rather than resuming a
+//! `NEED_IO` during query execution", the split-boundary barrier's shape is at least preserved
+//! here by simplifying to "a split = the whole file, one of them" (`num_splits` is always at most
+//! 1). Reading itself walks the whole file once more in `read_split` (a separate implementation
+//! from `resolve`'s scan; a simplification to avoid a self-referential struct).
 //!
-//! ## メモリの安全弁
+//! ## The memory safety valve
 //!
-//! ファイル全体を一度にメモリへ載せる都合上、`MAX_JSON_BYTES` を超える
-//! ファイルは `resolve` の時点で `Oom` として拒否する（`exec::join` の
-//! `MAX_BUILD_BYTES` などと同じ「静かに落とさず明示エラーにする」方針。
-//! DESIGN.md の「メモリ上限: 既定 512 MB」と同系統だが、ファイル全体を
-//! 保持する分さらに保守的な値にしてある）。
+//! Since the whole file is loaded into memory at once, a file exceeding `MAX_JSON_BYTES` is
+//! rejected as `Oom` at `resolve` time (the same "fail explicitly rather than quietly" policy as
+//! `exec::join`'s `MAX_BUILD_BYTES` and friends. It is of a piece with DESIGN.md's "memory cap:
+//! 512 MB by default", but set more conservatively still, since the whole file is retained).
 //!
-//! ## スキーマ推論
+//! ## Schema inference
 //!
-//! 列集合はオブジェクトのキーの和集合（初出順）、型は
-//! NULL → BOOLEAN → BIGINT → DOUBLE → VARCHAR/JSON の束で広げる —
-//! ここまでは `format::jsonl` と同じ考え方。ただし `jsonl` には `Ty::Json`
-//! が無かった時代の設計なので、ネストした値や噛み合わない型の混在は
-//! `Ty::Varchar`（生テキストのまま）に倒していた。こちらは `Ty::Json` が
-//! 使えるので、`duckdb` の実測（後述）に合わせてそちらへ倒す:
+//! The column set is the union of the objects' keys (in order of first appearance), and the types
+//! widen along the lattice NULL -> BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR/JSON --
+//! so far the same idea as `format::jsonl`. But `jsonl` was designed when `Ty::Json` did not
+//! exist, so it fell back to `Ty::Varchar` (raw text) for nested values and incompatible type
+//! mixtures. Here `Ty::Json` is available, so it falls that way instead, matching what was
+//! measured with `duckdb` (below):
 //!
-//! - ネストした値（配列・オブジェクト）は常に `Ty::Json`
-//!   （`duckdb -c "SELECT * FROM read_json_auto('nested_mixed.json')"` で
-//!   `[1,2,3]` と `5` が混ざった列が `JSON` 型になることを確認）。
-//! - 文字列とみなせる系統（プレーン文字列 / DATE / TIMESTAMP と判定された
-//!   文字列）同士の混在は、どれも decode 後のテキストとして表現できるので
-//!   `Ty::Varchar` に寄せる（`format::jsonl` の `widen` と同じ判断）。
-//! - それ以外の噛み合わない混在（数値と文字列、真偽値と文字列、
-//!   ネストとスカラーなど）は物理表現が生 JSON テキストしか無いので
-//!   `Ty::Json` に倒す（`duckdb -c "SELECT * FROM read_json_auto('widen.json')"`
-//!   で int/double/bool/string が混ざった列が `JSON` 型になることを確認）。
-//! - サンプル中すべて NULL だった列は `format::jsonl` と同じく安全側の
-//!   `Ty::Varchar` にする（`duckdb` は `JSON` にするが、`jsonl` との一貫性を
-//!   優先した）。
+//! - Nested values (arrays and objects) are always `Ty::Json`
+//!   (confirmed with `duckdb -c "SELECT * FROM read_json_auto('nested_mixed.json')"` that a column
+//!   mixing `[1,2,3]` and `5` becomes type `JSON`).
+//! - A mixture within the string family (plain strings, and strings determined to be DATE or
+//!   TIMESTAMP) settles on `Ty::Varchar`, since all of them can be expressed as decoded text
+//!   (the same judgment as `format::jsonl`'s `widen`).
+//! - Any other incompatible mixture (numbers with strings, booleans with strings, nesting with
+//!   scalars, and so on) has raw JSON text as its only physical representation and falls to
+//!   `Ty::Json` (confirmed with `duckdb -c "SELECT * FROM read_json_auto('widen.json')"` that a
+//!   column mixing int/double/bool/string becomes type `JSON`).
+//! - A column that was all NULL in the sample becomes the safe `Ty::Varchar`, as in
+//!   `format::jsonl` (`duckdb` makes it `JSON`, but consistency with `jsonl` won out).
 //!
-//! 低レベルの JSON スキャナ（文字列・数値の走査、エスケープ復号、
-//! 日付/タイムスタンプの判定）は `format::jsonl` と同じ考え方の実装だが、
-//! `jsonl` 側の型は非公開でこのモジュールから再利用できず、
-//! かつ `jsonl.rs` 自体の変更は本タスクの担当範囲外（分割境界 I/O バリアに
-//! 最適化された既存実装に手を入れない）なので、独立した実装として
-//! 書き起こしてある。構造はできるだけ揃えてあるので、将来どちらかに
-//! 寄せる形で共通化することは可能なはず。
+//! The low-level JSON scanner (scanning strings and numbers, decoding escapes, detecting
+//! dates/timestamps) follows the same idea as `format::jsonl`'s implementation, but `jsonl`'s types
+//! are private and cannot be reused from this module, and changing `jsonl.rs` itself is outside
+//! this task's scope (its existing implementation is optimized for the split-boundary I/O barrier
+//! and is left alone), so this is written up as an independent implementation. The structure is
+//! kept as close as possible, so unifying them into one later should be feasible.
 //!
-//! ## 入力は信用しない
+//! ## The input is untrusted
 //!
-//! `format::jsonl` と同じ方針。壊れた JSON は `Err` になる（NULL セルへの
-//! 読み替えはスキーマ確定後、サンプル外で型が外れた値にのみ適用される）。
-//! 走査は再帰せず、入れ子は `MAX_DEPTH` で打ち切る。
+//! The same policy as `format::jsonl`. Broken JSON gives `Err` (reinterpreting as a NULL cell
+//! applies only after the schema is settled, and only to values whose type falls outside the sample).
+//! Scanning does not recurse, and nesting is cut off at `MAX_DEPTH`.
 
 use crate::catalog::Source;
 use crate::format::{get_or_internal, ResolveStep, TableFormat};
 use crate::prelude::*;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
-/// スキーマ推論（列の型の広がり）に使う先頭からの最大行数。
-/// `format::jsonl::SAMPLE_LINES` と同じ考え方。これを超える要素も構文検査
-/// （`resolve` がファイル全体を読み切る設計のため）と行数カウントはするが、
-/// 型推論の widen 計算には使わない。
+/// The maximum leading rows used for schema inference (how column types widen).
+/// The same idea as `format::jsonl::SAMPLE_LINES`. Elements beyond it are still syntax-checked
+/// (the design has `resolve` read the whole file through) and counted toward the row count, but
+/// they do not enter the widen computation.
 pub const SAMPLE_ELEMENTS: usize = 1000;
 
-/// 値の入れ子の上限。`format::jsonl::MAX_DEPTH` と同じ理由・同じ値。
+/// The nesting limit for values. The same reason and the same value as `format::jsonl::MAX_DEPTH`.
 const MAX_DEPTH: u32 = 32;
 
-/// 推論で作る列数の上限。`format::jsonl::MAX_COLUMNS` と同じ。
+/// The cap on the number of columns inference creates. The same as `format::jsonl::MAX_COLUMNS`.
 const MAX_COLUMNS: usize = 1024;
 
-/// ファイル全体を一度にメモリへ載せる設計上の安全弁。`exec::join` の
-/// `MAX_BUILD_BYTES` (128 MiB) と同じ桁にしてある。
+/// The safety valve for the design of loading the whole file into memory at once. Set to the same
+/// order of magnitude as `exec::join`'s `MAX_BUILD_BYTES` (128 MiB).
 const MAX_JSON_BYTES: u64 = 128 * 1024 * 1024;
 
 pub struct JsonFormat {
@@ -130,13 +122,13 @@ impl TableFormat for JsonFormat {
             return Ok(Ok(()));
         }
         ensure!(src.total_len <= MAX_JSON_BYTES, Oom);
-        // 空ファイルはトップレベル値が無いので、そもそも JSON として不正
-        // （JSONL と違い「1 個の JSON ドキュメント」を読む前提のため）。
+        // An empty file has no top-level value and so is invalid as JSON to begin with
+        // (unlike JSONL, this premises reading "one JSON document").
         ensure!(src.total_len > 0, UnexpectedEof);
         self.total_len = src.total_len;
         let buf = match src.get(0, src.total_len as usize) {
             Some(b) => b,
-            // 分割境界バリアではなく「ファイル全体」を要求する（モジュール doc）。
+            // It requests "the whole file" rather than a split boundary barrier (see the module docs).
             None => return Ok(Err((0, src.total_len))),
         };
         let (schema, row_count) = parse_schema(buf)?;
@@ -155,7 +147,7 @@ impl TableFormat for JsonFormat {
     }
 
     fn num_splits(&self) -> usize {
-        // 非ストリーミング設計: 分割は常にファイル全体 1 個（モジュール doc）。
+        // The non-streaming design: the split is always the whole file, exactly one (see the module docs).
         if self.resolved {
             1
         } else {
@@ -178,7 +170,7 @@ impl TableFormat for JsonFormat {
         out: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
         ensure!(split < self.num_splits(), Internal);
-        // 構造が確定しないので射影があっても常にファイル全体が要る。
+        // The structure is not settled, so the whole file is always needed even with a projection.
         out.push((0, self.total_len));
         Ok(())
     }
@@ -209,7 +201,7 @@ impl TableFormat for JsonFormat {
             while let Some((s, e)) = it.next()? {
                 process_row(&buf[s..e], &names, &mut slots, &mut builders, &mut key, &mut val)?;
             }
-            // 配列の閉じ括弧の後に残るのは空白だけ。
+            // Only whitespace may remain after the array's closing bracket.
             ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
         } else {
             let end = skip_value(buf, i0)?;
@@ -221,11 +213,11 @@ impl TableFormat for JsonFormat {
     }
 }
 
-// --- スキーマ推論 -------------------------------------------------------------
+// --- Schema inference ----------------------------------------------------------
 
-/// `buf` 全体を 1 個の JSON ドキュメントとして解決し、`(スキーマ, 行数)` を返す。
-/// 行数は `SAMPLE_ELEMENTS` を超えても正確に数える（構文検査のためにどのみち
-/// 全要素を走査するので、追加コストは無い）。widen 計算だけがサンプルに限る。
+/// Resolves all of `buf` as one JSON document and returns `(schema, row count)`.
+/// The row count is exact even beyond `SAMPLE_ELEMENTS` (every element is walked for the syntax
+/// check anyway, so there is no extra cost). Only the widen computation is limited to the sample.
 fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64)> {
     let i = skip_ws(buf, skip_bom(buf));
     let c = byte_at(buf, i)?;
@@ -245,14 +237,14 @@ fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64)> {
         }
         ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
         if row_count == 0 {
-            // 空配列。列が 1 本も無い退化したテーブルより duckdb に合わせる
-            // 方が扱いやすいので、`"json"` という JSON 型の列にする。
+            // An empty array. Matching duckdb is easier to handle than a degenerate table with no
+            // columns at all, so it becomes a JSON-typed column named `"json"`.
             names.push(String::from("json"));
             infs.push(Inf::Json);
         }
     } else {
-        // トップレベルが配列でない: オブジェクト単体、または生スカラー。
-        // どちらも「1 行」として扱う（モジュール doc）。
+        // The top level is not an array: a single object, or a bare scalar.
+        // Both are treated as "one row" (see the module docs).
         let end = skip_value(buf, i)?;
         ensure!(skip_ws(buf, end) == buf.len(), SyntaxError, end);
         row_count = 1;
@@ -263,8 +255,8 @@ fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64)> {
     Ok((schema, row_count))
 }
 
-/// 1 行分（配列の 1 要素、またはトップレベル単体の値）を列集合へ畳み込む。
-/// `row` はちょうどその値のバイト列（前後に空白無し）。
+/// Folds one row's worth (one array element, or a single top-level value) into the column set.
+/// `row` is exactly that value's bytes (with no surrounding whitespace).
 fn accumulate_row(
     row: &[u8],
     names: &mut Vec<String>,
@@ -279,15 +271,15 @@ fn accumulate_row(
             merge(names, infs, name, infer(&m))?;
         }
     } else {
-        // オブジェクトでない行は `"json"` 列 1 本に生の値を入れる
-        // （モジュール doc）。
+        // A non-object row puts the raw value into a single `"json"` column
+        // (see the module docs).
         let m = Member { key: b"json", key_escaped: false, val: row, kind: kind_of(c) };
         merge(names, infs, b"json", infer(&m))?;
     }
     Ok(())
 }
 
-/// 列 `name` の推論型を `inf` で束ねる。列が無ければ新設する。
+/// Widens column `name`'s inferred type with `inf`. Creates the column if it does not exist.
 fn merge(names: &mut Vec<String>, infs: &mut Vec<Inf>, name: &[u8], inf: Inf) -> Result<()> {
     let idx = match names.iter().position(|s| s.as_bytes() == name) {
         Some(i) => i,
@@ -302,8 +294,8 @@ fn merge(names: &mut Vec<String>, infs: &mut Vec<Inf>, name: &[u8], inf: Inf) ->
     Ok(())
 }
 
-/// 推論中の列の型。`Ty` を直接使わないのは、DATE/TIMESTAMP/JSON を
-/// 「文字列またはネストから昇格した特別扱い」として束の中で区別したいから。
+/// The column type during inference. `Ty` is not used directly because DATE/TIMESTAMP/JSON need to
+/// be distinguished within the lattice as "specially promoted from a string or from nesting".
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Inf {
     Null,
@@ -312,18 +304,18 @@ enum Inf {
     Double,
     Date,
     Timestamp,
-    /// 日付/タイムスタンプとして解釈できなかったプレーン文字列。
+    /// A plain string that could not be interpreted as a date or timestamp.
     Str,
-    /// ネストした値、または噛み合わない型どうしの混在。生 JSON テキストの
-    /// まま `Ty::Json` 列に持たせる。
+    /// A nested value, or a mixture of incompatible types. It is carried in a `Ty::Json` column as
+    /// raw JSON text.
     Json,
 }
 
 impl Inf {
     fn ty(self) -> Ty {
         match self {
-            // サンプル中すべて NULL。`format::jsonl` と同じく安全側の
-            // VARCHAR にしておく（モジュール doc の duckdb との相違点）。
+            // Everything in the sample was NULL. As in `format::jsonl`, the safe VARCHAR is chosen
+            // (a difference from duckdb noted in the module docs).
             Inf::Null => Ty::Varchar,
             Inf::Bool => Ty::Boolean,
             Inf::Int => Ty::BigInt,
@@ -336,9 +328,9 @@ impl Inf {
     }
 }
 
-/// NULL → BOOLEAN → BIGINT → DOUBLE の束、文字列系（Str/Date/Timestamp）は
-/// 互いに VARCHAR へ、それ以外の噛み合わない組は JSON へ倒す
-/// （モジュール doc の duckdb 実測を参照）。
+/// The lattice NULL -> BOOLEAN -> BIGINT -> DOUBLE; the string family (Str/Date/Timestamp) falls to
+/// VARCHAR among themselves, and any other incompatible pair falls to JSON
+/// (see the duckdb measurements in the module docs).
 fn widen(a: Inf, b: Inf) -> Inf {
     use Inf::*;
     if a == b {
@@ -350,12 +342,12 @@ fn widen(a: Inf, b: Inf) -> Inf {
         (Bool, Double) | (Double, Bool) => Double,
         (Int, Double) | (Double, Int) => Double,
         (Date, Timestamp) | (Timestamp, Date) => Timestamp,
-        // 文字列系（Str/Date/Timestamp）どうしの残りの組は、どれも decode
-        // 後のテキストとして表現できるので VARCHAR 側（Str）に寄せる。
+        // The remaining pairs within the string family (Str/Date/Timestamp) can all be expressed as
+        // decoded text, so they settle on the VARCHAR side (Str).
         (Str, Date) | (Date, Str) => Str,
         (Str, Timestamp) | (Timestamp, Str) => Str,
-        // 数値/真偽値と文字列の混在、ネストが絡む混在は生 JSON テキストでしか
-        // 表現できないので JSON に倒す。
+        // A number or boolean mixed with a string, and any mixture involving nesting, can only be
+        // expressed as raw JSON text, so they fall to JSON.
         _ => Json,
     }
 }
@@ -365,7 +357,7 @@ fn infer(m: &Member<'_>) -> Inf {
         Kind::Null => Inf::Null,
         Kind::Bool => Inf::Bool,
         Kind::Num => {
-            // 小数点・指数があれば無条件に DOUBLE。i64 に入らない整数も DOUBLE。
+            // A decimal point or exponent means DOUBLE unconditionally. An integer not fitting i64 is DOUBLE too.
             if m.val.iter().any(|&c| c == b'.' || c == b'e' || c == b'E') {
                 Inf::Double
             } else if parse_i64(m.val).is_some() {
@@ -375,7 +367,7 @@ fn infer(m: &Member<'_>) -> Inf {
             }
         }
         Kind::Str => {
-            // エスケープを含む文字列が日付になることはまず無いので復号しない。
+            // A string containing escapes is essentially never a date, so it is not decoded.
             if m.value_escaped() {
                 return Inf::Str;
             }
@@ -388,12 +380,12 @@ fn infer(m: &Member<'_>) -> Inf {
                 Inf::Str
             }
         }
-        // ネストは常に JSON（モジュール doc）。
+        // Nesting is always JSON (see the module docs).
         Kind::Nested => Inf::Json,
     }
 }
 
-// --- 列ビルダ ---------------------------------------------------------------
+// --- Column builders ------------------------------------------------------------
 
 enum Cell<'a> {
     Bool(bool),
@@ -403,7 +395,7 @@ enum Cell<'a> {
     Bytes(&'a [u8]),
 }
 
-/// 1 列分の組み立て。データ長と validity 長を必ず 1:1 で進めることだけを守る。
+/// Building one column. The only rule it upholds is advancing the data length and the validity length 1:1.
 struct Builder {
     ty: Ty,
     data: Data,
@@ -421,8 +413,8 @@ impl Builder {
         }
     }
 
-    /// `None` と物理型の不一致はどちらも NULL。型が合わない値を捨てるのは、
-    /// 推論がサンプル由来で後続行が外れうるため（エラーにはしない）。
+    /// Both `None` and a physical type mismatch give NULL. Discarding a value of the wrong type is
+    /// because inference comes from a sample and later rows can fall outside (it is not an error).
     fn push(&mut self, cell: Option<Cell<'_>>) {
         let ok = match (&mut self.data, &cell) {
             (Data::Bool(d), Some(Cell::Bool(v))) => {
@@ -467,7 +459,7 @@ impl Builder {
     }
 }
 
-/// 1 行分の値を、射影された列 (`names`) の中の対応する位置へ振り分ける。
+/// Distributes one row's values to their positions among the projected columns (`names`).
 fn process_row<'a>(
     row: &'a [u8],
     names: &[&[u8]],
@@ -497,7 +489,7 @@ fn process_row<'a>(
     Ok(())
 }
 
-/// メンバ 1 つを列の型に合わせて積む。キー欠落 (`None`) と `null` は NULL。
+/// Pushes one member according to the column's type. A missing key (`None`) and `null` are both NULL.
 fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -> Result<()> {
     let m = match m {
         Some(m) if m.kind != Kind::Null => m,
@@ -527,11 +519,11 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
             Kind::Str => parse_timestamp(m.str_body()).map(Cell::I64),
             _ => None,
         }),
-        // JSON は常に生の JSON テキストのまま（文字列でも引用符ごと保持する。
-        // `Ty::Json` の物理表現は「UTF-8 の JSON テキスト」であって decode 後
-        // の文字列ではないため — `vector::Ty::Json` の doc 参照）。
+        // JSON always stays raw JSON text (even a string keeps its quotes, because `Ty::Json`'s
+        // physical representation is "UTF-8 JSON text" rather than the decoded string -- see the
+        // `vector::Ty::Json` docs).
         Ty::Json => b.push(Some(Cell::Bytes(m.val))),
-        // VARCHAR は何でも受ける。文字列は復号し、それ以外は生の JSON テキスト。
+        // VARCHAR accepts anything. Strings are decoded, and everything else is raw JSON text.
         _ => match m.kind {
             Kind::Str => {
                 scratch.clear();
@@ -544,9 +536,9 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
     Ok(())
 }
 
-// --- JSON 走査 --------------------------------------------------------------
+// --- JSON scanning --------------------------------------------------------------
 //
-// `format::jsonl` の私有スキャナと同じ考え方の独立実装（モジュール doc 参照）。
+// An independent implementation following the same idea as `format::jsonl`'s private scanner (see the module docs).
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -554,23 +546,23 @@ enum Kind {
     Bool,
     Num,
     Str,
-    /// 配列またはオブジェクト。
+    /// An array or an object.
     Nested,
 }
 
 #[derive(Clone, Copy)]
 struct Member<'a> {
-    /// キーの本体（引用符の内側、エスケープ未展開）。オブジェクトでない行を
-    /// `"json"` 列として合成したときは `b"json"`（エスケープ無し）を使う。
+    /// The key's body (inside the quotes, escapes unexpanded). When a non-object row is synthesized
+    /// as the `"json"` column, `b"json"` (unescaped) is used.
     key: &'a [u8],
     key_escaped: bool,
-    /// 値のスパン。文字列なら引用符を含む。
+    /// The value's span. For a string it includes the quotes.
     val: &'a [u8],
     kind: Kind,
 }
 
 impl<'a> Member<'a> {
-    /// 文字列値の本体（引用符を除く）。`kind == Str` のときだけ意味を持つ。
+    /// A string value's body (without the quotes). Meaningful only when `kind == Str`.
     fn str_body(&self) -> &'a [u8] {
         let n = self.val.len();
         if n >= 2 {
@@ -580,18 +572,18 @@ impl<'a> Member<'a> {
         }
     }
 
-    /// 文字列値がエスケープを含むか。
+    /// Whether the string value contains escapes.
     fn value_escaped(&self) -> bool {
         self.str_body().contains(&b'\\')
     }
 }
 
-/// トップレベルオブジェクトのメンバを順に返す。再帰しない。
-/// `obj` はちょうど 1 個のオブジェクト（前後に余分なバイト無し）。
+/// Returns a top-level object's members in order. It does not recurse.
+/// `obj` is exactly one object (with no extra bytes on either side).
 struct Members<'a> {
     b: &'a [u8],
     i: usize,
-    /// 既に 1 つ以上返したか。カンマの要否判定に使う。
+    /// Whether at least one has already been returned. Used to decide whether a comma is required.
     started: bool,
     done: bool,
 }
@@ -612,7 +604,7 @@ impl<'a> Members<'a> {
         let mut c = byte_at(b, i)?;
         if c == b'}' {
             self.done = true;
-            // 閉じた後に残るのは空白だけ。`{}{}` のような入力は弾く。
+            // Only whitespace may remain after the close. Input like `{}{}` is rejected.
             ensure!(skip_ws(b, i + 1) == b.len(), SyntaxError, i + 1);
             return Ok(None);
         }
@@ -635,18 +627,18 @@ impl<'a> Members<'a> {
     }
 }
 
-/// トップレベル配列の要素を順に返す。各要素の `(開始, 終了)` バイト位置
-/// （前後の空白・カンマは含まない、値そのもののスパン）を返す。
+/// Returns a top-level array's elements in order. Each element's `(start, end)` byte positions
+/// (the value's own span, excluding surrounding whitespace and commas).
 struct Elements<'a> {
     b: &'a [u8],
-    /// 次に読む位置。イテレーションが終わった後は `]` の直後を指す。
+    /// The next position to read. After the iteration ends it points just past the `]`.
     i: usize,
     started: bool,
     done: bool,
 }
 
 impl<'a> Elements<'a> {
-    /// `at` は `[` の位置。
+    /// `at` is the position of the `[`.
     fn new(b: &'a [u8], at: usize) -> Result<Self> {
         ensure!(byte_at(b, at)? == b'[', SyntaxError, at);
         Ok(Elements { b, i: at + 1, started: false, done: false })
@@ -688,7 +680,7 @@ fn kind_of(c: u8) -> Kind {
     }
 }
 
-/// メンバのキーをバイト列として得る。エスケープ付きだけ `scratch` に復号する。
+/// Gets a member's key as bytes. Only an escaped one is decoded into `scratch`.
 fn member_key<'k>(m: &Member<'k>, scratch: &'k mut Vec<u8>) -> Result<&'k [u8]> {
     if !m.key_escaped {
         return Ok(m.key);
@@ -698,13 +690,13 @@ fn member_key<'k>(m: &Member<'k>, scratch: &'k mut Vec<u8>) -> Result<&'k [u8]> 
     Ok(scratch)
 }
 
-/// `b[i]` から始まる値 1 つを読み飛ばし、その直後の位置を返す。
+/// Skips one value starting at `b[i]` and returns the position just after it.
 ///
-/// 再帰しない。開いているコンテナの種別は `u32` のビットスタックで持ち、
-/// 深さは `MAX_DEPTH` で頭打ちにする（`u32` のビット数と一致させてある）。
+/// Non-recursive. The kinds of open containers live in a `u32` bit stack, and depth is capped by
+/// `MAX_DEPTH` (kept equal to the bit width of `u32`).
 fn skip_value(b: &[u8], start: usize) -> Result<usize> {
     let mut i = start;
-    // ビット 1 = オブジェクト、0 = 配列。最下位ビットが現在のコンテナ。
+    // Bit 1 = object, 0 = array. The lowest bit is the current container.
     let mut stack: u32 = 0;
     let mut depth: u32 = 0;
 
@@ -719,7 +711,7 @@ fn skip_value(b: &[u8], start: usize) -> Result<usize> {
             i = skip_ws(b, i + 1);
             let n = byte_at(b, i)?;
             if (obj && n == b'}') || (!obj && n == b']') {
-                // 空コンテナ。値を 1 つ消費したものとして下の閉じ処理へ落ちる。
+                // An empty container. Falls through to the closing logic below as though one value had been consumed.
                 i += 1;
                 stack >>= 1;
                 depth -= 1;
@@ -733,7 +725,7 @@ fn skip_value(b: &[u8], start: usize) -> Result<usize> {
             i = skip_scalar(b, i)?;
         }
 
-        // 値を 1 つ消費した。区切り／閉じ括弧を処理する。
+        // One value consumed. Handle the separator or closing bracket.
         loop {
             if depth == 0 {
                 return Ok(i);
@@ -765,7 +757,7 @@ fn skip_value(b: &[u8], start: usize) -> Result<usize> {
     }
 }
 
-/// `"key" :` を読み飛ばし、値の開始位置を返す。
+/// Skips `"key" :` and returns the position where the value starts.
 fn skip_member_key(b: &[u8], i: usize) -> Result<usize> {
     let i = skip_ws(b, i);
     ensure!(byte_at(b, i)? == b'"', SyntaxError, i);
@@ -824,7 +816,7 @@ fn scan_number(b: &[u8], start: usize) -> Result<usize> {
     Ok(i)
 }
 
-/// `b[i]` は `"`。`(本体, エスケープ有無, 閉じ引用符の次)` を返す。
+/// `b[i]` is `"`. Returns `(body, whether escaped, the position after the closing quote)`.
 fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
     let mut j = i + 1;
     let mut esc = false;
@@ -832,7 +824,7 @@ fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
         match byte_at(b, j)? {
             b'"' => return Ok((&b[i + 1..j], esc, j + 1)),
             b'\\' => {
-                // 次の 1 バイトは必ず消費する。`\"` を終端と誤認しないため。
+                // The next byte is always consumed, so `\"` is not mistaken for the terminator.
                 byte_at(b, j + 1)?;
                 esc = true;
                 j += 2;
@@ -842,7 +834,7 @@ fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
     }
 }
 
-/// 文字列本体のエスケープを展開して UTF-8 として `out` に書く。
+/// Expands the escapes in a string body and writes it to `out` as UTF-8.
 fn decode_string(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let mut i = 0;
     while i < body.len() {
@@ -868,21 +860,21 @@ fn decode_string(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
                 let hi = hex4(body, i)?;
                 i += 4;
                 let cp = if (0xD800..0xDC00).contains(&hi) {
-                    // 上位サロゲート。直後が下位サロゲートなら結合する。
+                    // A high surrogate. Combine if a low surrogate follows immediately.
                     match (body.get(i), body.get(i + 1)) {
                         (Some(b'\\'), Some(b'u')) => match hex4(body, i + 2) {
                             Ok(lo) if (0xDC00..0xE000).contains(&lo) => {
                                 i += 6;
                                 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                             }
-                            // 対になっていない上位サロゲートはエラーにせず
-                            // U+FFFD に潰す（壊れた入力で行ごと失いたくない）。
+                            // An unpaired high surrogate is collapsed to U+FFFD rather than made an
+                            // error (losing a whole row to broken input is worse).
                             _ => 0xFFFD,
                         },
                         _ => 0xFFFD,
                     }
                 } else if (0xDC00..0xE000).contains(&hi) {
-                    // 単独の下位サロゲート。
+                    // A lone low surrogate.
                     0xFFFD
                 } else {
                     hi
@@ -912,9 +904,9 @@ fn hex4(b: &[u8], i: usize) -> Result<u32> {
     Ok(v)
 }
 
-// --- 数値・日時 --------------------------------------------------------------
+// --- Numbers and date-times -----------------------------------------------------
 
-/// 整数リテラルを i64 に。小数点・指数付き、または範囲外なら `None`。
+/// An integer literal as i64. `None` when it has a decimal point or exponent, or is out of range.
 fn parse_i64(s: &[u8]) -> Option<i64> {
     let (neg, ds) = match s.first() {
         Some(b'-') => (true, &s[1..]),
@@ -923,7 +915,7 @@ fn parse_i64(s: &[u8]) -> Option<i64> {
     if ds.is_empty() {
         return None;
     }
-    // 負側で累算する。i64::MIN を特別扱いせずに済む。
+    // Accumulated on the negative side. That avoids special-casing i64::MIN.
     let mut acc: i64 = 0;
     for &c in ds {
         if !c.is_ascii_digit() {
@@ -938,13 +930,13 @@ fn parse_i64(s: &[u8]) -> Option<i64> {
     }
 }
 
-/// 浮動小数は core の `str::parse::<f64>`（dec2flt）に任せる。
-/// 自前で書くより小さく、丸めも正しい。
+/// Floating point is left to core's `str::parse::<f64>` (dec2flt).
+/// It is smaller than writing one in-house and rounds correctly.
 fn parse_f64(s: &[u8]) -> Option<f64> {
     core::str::from_utf8(s).ok()?.parse::<f64>().ok()
 }
 
-/// 先頭 `n` バイトを 10 進数として読む。数字以外が混じれば `None`。
+/// Reads the leading `n` bytes as a decimal number. `None` if anything but digits is mixed in.
 fn digits(s: &[u8], n: usize) -> Option<u32> {
     if s.len() < n {
         return None;
@@ -973,18 +965,18 @@ fn days_in_month(y: i32, m: u32) -> u32 {
     }
 }
 
-/// days-from-civil (Howard Hinnant)。エポック 1970-01-01 からの日数。
+/// days-from-civil (Howard Hinnant). Days since the epoch 1970-01-01.
 fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 }; // 3 月始まりに寄せる
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // shift to a March-based year
     let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146097 + doe as i32 - 719468
 }
 
-/// `YYYY-MM-DD` をエポックからの日数に。
+/// `YYYY-MM-DD` as days since the epoch.
 fn parse_date(s: &[u8]) -> Option<i32> {
     if s.len() != 10 || s[4] != b'-' || s[7] != b'-' {
         return None;
@@ -998,8 +990,8 @@ fn parse_date(s: &[u8]) -> Option<i32> {
     Some(days_from_civil(y, m, d))
 }
 
-/// `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]` をエポックからのマイクロ秒に。
-/// 日付だけの文字列は深夜 0 時として受ける（DATE → TIMESTAMP の昇格用）。
+/// `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]` as microseconds since the epoch.
+/// A date-only string is accepted as midnight (for the DATE -> TIMESTAMP promotion).
 fn parse_timestamp(s: &[u8]) -> Option<i64> {
     let days = parse_date(s.get(..10)?)? as i64;
     if s.len() == 10 {
@@ -1023,7 +1015,7 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
         if frac.is_empty() || frac.len() > 9 {
             return None;
         }
-        // 6 桁に切り詰め／ゼロ埋めしてマイクロ秒にする。
+        // Truncated or zero-padded to 6 digits to give microseconds.
         for k in 0..6 {
             let d = match frac.get(k) {
                 Some(&c) if c.is_ascii_digit() => (c - b'0') as u32,
@@ -1042,7 +1034,7 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     Some(secs * 1_000_000 + micros as i64)
 }
 
-// --- バイト列ユーティリティ ---------------------------------------------------
+// --- Byte-sequence utilities ------------------------------------------------------
 
 fn byte_at(b: &[u8], i: usize) -> Result<u8> {
     match b.get(i) {
@@ -1058,7 +1050,7 @@ fn skip_ws(b: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// UTF-8 BOM があれば読み飛ばす。
+/// Skips a UTF-8 BOM if present.
 fn skip_bom(b: &[u8]) -> usize {
     if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
         3
@@ -1083,7 +1075,7 @@ mod tests {
         let mut f = JsonFormat::new();
         match f.resolve(&src).expect("resolve") {
             Ok(()) => {}
-            Err(r) => panic!("メモリ上の Source なのに範囲要求 {r:?} が返った"),
+            Err(r) => panic!("a range request {r:?} came back from an in-memory Source"),
         }
         (f, src)
     }
@@ -1126,7 +1118,7 @@ mod tests {
         schema_of(&text)[0].1
     }
 
-    // --- 実ファイル -----------------------------------------------------
+    // --- Real files -------------------------------------------------------
 
     #[test]
     fn basic_json_array_schema_matches_duckdb() {
@@ -1182,11 +1174,11 @@ mod tests {
         out
     }
 
-    // --- トップレベルの規則 -----------------------------------------------
+    // --- Top-level rules --------------------------------------------------
 
     #[test]
     fn top_level_object_is_a_single_row_table() {
-        // duckdb: SELECT * FROM read_json_auto('single_obj.json') -> 1 行。
+        // duckdb: SELECT * FROM read_json_auto('single_obj.json') -> 1 row.
         let cols = read_all("{\"a\":1,\"b\":\"hello\"}");
         assert_eq!(cols[0], [Value::I64(1)]);
         assert_eq!(cols[1], [s("hello")]);
@@ -1194,7 +1186,7 @@ mod tests {
 
     #[test]
     fn array_of_scalars_becomes_a_single_json_named_column() {
-        // duckdb: SELECT * FROM read_json_auto('[1,2,3]') -> 列名 "json"。
+        // duckdb: SELECT * FROM read_json_auto('[1,2,3]') -> the column name "json".
         let (f, _) = resolve(b"[1,2,3]");
         assert_eq!(f.schema().len(), 1);
         assert_eq!(f.schema()[0].name, "json");
@@ -1205,7 +1197,7 @@ mod tests {
 
     #[test]
     fn empty_array_is_a_single_json_column_with_no_rows() {
-        // duckdb: SELECT * FROM read_json_auto('[]') -> json JSON, 0 行。
+        // duckdb: SELECT * FROM read_json_auto('[]') -> json JSON, 0 rows.
         let (f, _) = resolve(b"[]");
         assert_eq!(f.schema().len(), 1);
         assert_eq!(f.schema()[0].name, "json");
@@ -1216,8 +1208,8 @@ mod tests {
 
     #[test]
     fn mixed_object_and_scalar_rows_do_not_crash() {
-        // duckdb は基本的に想定しない入力だが、壊れずに扱えることを確認する。
-        // オブジェクトでない行は "json" 列にだけ入り、他の列は NULL。
+        // duckdb does not normally anticipate this input, but this confirms it is handled without breaking.
+        // A non-object row goes only into the "json" column, and the other columns are NULL.
         let cols = read_all("[{\"a\":1},5,{\"a\":2}]");
         let names: Vec<_> = {
             let (f, _) = resolve(b"[{\"a\":1},5,{\"a\":2}]");
@@ -1226,12 +1218,12 @@ mod tests {
         let a = names.iter().position(|n| n == "a").unwrap();
         let j = names.iter().position(|n| n == "json").unwrap();
         assert_eq!(cols[a], [Value::I64(1), Value::Null, Value::I64(2)]);
-        // "json" 列は行 1 の `5` しか寄与しないので BIGINT に推論される
-        // （他の行は "json" というキーを持たないオブジェクトなので NULL）。
+        // The "json" column is contributed to only by row 1's `5`, so it is inferred as BIGINT
+        // (the other rows are objects with no "json" key, so they are NULL).
         assert_eq!(cols[j], [Value::Null, Value::I64(5), Value::Null]);
     }
 
-    // --- 列集合の和・NULL -------------------------------------------------
+    // --- The union of column sets, and NULLs ------------------------------
 
     #[test]
     fn schema_is_the_union_of_keys_in_first_seen_order() {
@@ -1247,7 +1239,7 @@ mod tests {
         assert_eq!(cols[1], [Value::I64(2), Value::Null, Value::I64(4)]);
     }
 
-    // --- 型推論 -------------------------------------------------------------
+    // --- Type inference -----------------------------------------------------
 
     #[test]
     fn inference_lattice_covers_every_transition() {
@@ -1258,9 +1250,9 @@ mod tests {
         assert_eq!(infer_ty(&["true", "1"]), Ty::BigInt);
         assert_eq!(infer_ty(&["1", "1.5"]), Ty::Double);
         assert_eq!(infer_ty(&["true", "1.5"]), Ty::Double);
-        // 数値/真偽値と文字列の混在は duckdb と合わせて JSON に倒す
-        // （`format::jsonl` は VARCHAR に倒すが、`Ty::Json` が無かった当時の
-        // 制約による差 — モジュール doc 参照）。
+        // A number or boolean mixed with a string falls to JSON, matching duckdb
+        // (`format::jsonl` falls to VARCHAR, a difference stemming from the constraints of the time
+        // when `Ty::Json` did not exist -- see the module docs).
         assert_eq!(infer_ty(&["1", "\"x\""]), Ty::Json);
         assert_eq!(infer_ty(&["1.5", "\"x\""]), Ty::Json);
         assert_eq!(infer_ty(&["true", "\"x\""]), Ty::Json);
@@ -1273,12 +1265,12 @@ mod tests {
         assert_eq!(infer_ty(&["\"2024-01-01T12:34:56\""]), Ty::Timestamp);
         assert_eq!(infer_ty(&["\"2024-01-01T12:34:56.123456\""]), Ty::Timestamp);
         assert_eq!(infer_ty(&["\"2024-01-01\"", "\"2024-01-01 00:00:00\""]), Ty::Timestamp);
-        // 文字列系どうしの混在は VARCHAR（`format::jsonl` と同じ判断）。
+        // A mixture within the string family is VARCHAR (the same judgment as `format::jsonl`).
         assert_eq!(infer_ty(&["\"2024-01-01\"", "\"hello\""]), Ty::Varchar);
         assert_eq!(infer_ty(&["\"2024-01-01 00:00:00\"", "\"hello\""]), Ty::Varchar);
         assert_eq!(infer_ty(&["\"2024-02-30\""]), Ty::Varchar);
         assert_eq!(infer_ty(&["\"2024-13-01\""]), Ty::Varchar);
-        // 数値と混ざれば JSON（文字列系どうしの混在とは違う扱い）。
+        // Mixed with numbers it is JSON (unlike a mixture within the string family).
         assert_eq!(infer_ty(&["\"2024-01-01\"", "1"]), Ty::Json);
     }
 
@@ -1313,8 +1305,8 @@ mod tests {
         let cols = read_all("[{\"a\":1e3},{\"a\":-1.5E-2},{\"a\":7}]");
         assert_eq!(cols[0], [Value::F64(1000.0), Value::F64(-0.015), Value::F64(7.0)]);
 
-        // 推論はサンプル (SAMPLE_ELEMENTS 個) しか見ない。そこから外れた行に
-        // 型の合わない値が出てきたら、エラーにせずその行だけ NULL にする。
+        // Inference sees only the sample (SAMPLE_ELEMENTS of them). When a row outside it carries a
+        // value of the wrong type, that row alone becomes NULL rather than an error.
         let mut text = String::from("[");
         for i in 0..SAMPLE_ELEMENTS {
             if i > 0 {
@@ -1330,7 +1322,7 @@ mod tests {
         assert_eq!(cols[0][SAMPLE_ELEMENTS + 2], Value::I64(2));
     }
 
-    // --- 文字列 ---------------------------------------------------------
+    // --- Strings ----------------------------------------------------------
 
     #[test]
     fn string_escapes_are_decoded() {
@@ -1341,7 +1333,7 @@ mod tests {
     #[test]
     fn unicode_escapes_and_surrogate_pairs() {
         let cols = read_all("[{\"a\":\"\\u00e9\\u65e5\\uD83D\\uDE00\"}]");
-        assert_eq!(cols[0][0], s("é日😀"));
+        assert_eq!(cols[0][0], s("\u{e9}\u{65e5}\u{1f600}"));
     }
 
     #[test]
@@ -1362,20 +1354,19 @@ mod tests {
         assert_eq!(cols[0], [Value::I64(1), Value::I64(2)]);
     }
 
-    // --- 入れ子 -----------------------------------------------------------
+    // --- Nesting ------------------------------------------------------------
 
     #[test]
     fn nested_values_become_json_typed_columns() {
-        // duckdb は struct/list 型に推論するが、このエンジンは
-        // LIST/STRUCT を持たないので Ty::Json（生 JSON テキスト）に倒す
-        // （モジュール doc、`Ty::Json` の doc 参照）。
+        // duckdb infers struct/list types, but this engine has no LIST/STRUCT and falls to Ty::Json
+        // (raw JSON text) (see the module docs and the `Ty::Json` docs).
         let text = "[{\"a\":[1,2,{\"x\":\"y\"}],\"b\":{\"k\":[true,null]}},\
                      {\"a\":[],\"b\":{}}]";
         let sch = schema_of(text);
         assert_eq!(sch[0].1, Ty::Json);
         assert_eq!(sch[1].1, Ty::Json);
         let cols = read_all(text);
-        // Ty::Json は decode せず、引用符を含む生テキストのまま保持する。
+        // Ty::Json does not decode and keeps the raw text, quotes included.
         assert_eq!(cols[0][0], s("[1,2,{\"x\":\"y\"}]"));
         assert_eq!(cols[1][0], s("{\"k\":[true,null]}"));
         assert_eq!(cols[0][1], s("[]"));
@@ -1384,7 +1375,7 @@ mod tests {
 
     #[test]
     fn nested_mixed_with_scalar_is_json() {
-        // duckdb: read_json_auto('nested_mixed.json') で確認した挙動。
+        // duckdb: the behavior confirmed with read_json_auto('nested_mixed.json').
         assert_eq!(schema_of("[{\"a\":[1,2,3]},{\"a\":5}]")[0].1, Ty::Json);
         let cols = read_all("[{\"a\":[1,2,3]},{\"a\":5}]");
         assert_eq!(cols[0][0], s("[1,2,3]"));
@@ -1393,8 +1384,8 @@ mod tests {
 
     #[test]
     fn json_column_preserves_raw_text_including_quotes_for_strings() {
-        // duckdb: read_json_auto('str_nested.json') で "hello" が引用符付きの
-        // まま JSON 型に入ることを確認した。
+        // duckdb: confirmed with read_json_auto('str_nested.json') that "hello" enters a JSON-typed
+        // column with its quotes intact.
         let cols = read_all("[{\"a\":\"hello\"},{\"a\":[1,2,3]}]");
         assert_eq!(schema_of("[{\"a\":\"hello\"},{\"a\":[1,2,3]}]")[0].1, Ty::Json);
         assert_eq!(cols[0][0], s("\"hello\""));
@@ -1408,7 +1399,7 @@ mod tests {
         assert_eq!(cols[0], [s("2024-01-01"), s("2024-01-01 00:00:00"), s("hello")]);
     }
 
-    // --- 射影 ---------------------------------------------------------------
+    // --- Projection ---------------------------------------------------------
 
     #[test]
     fn projection_returns_requested_columns_in_order() {
@@ -1424,12 +1415,12 @@ mod tests {
         assert_eq!(cols[0].value_at(1), Value::I64(100)); // big
         assert_eq!(cols[1].value_at(1), s("name_1")); // name
         assert_eq!(cols[0].value_at(0), Value::Null);
-        // 空射影でも壊れない。
+        // It does not break with an empty projection either.
         let cols = f.read_split(&src, 0, &[]).unwrap();
         assert!(cols.is_empty());
     }
 
-    // --- 分割 ---------------------------------------------------------------
+    // --- Splits -------------------------------------------------------------
 
     #[test]
     fn split_count_is_always_one_when_resolved() {
@@ -1446,7 +1437,7 @@ mod tests {
         assert_eq!(f.split_rows(1), None);
     }
 
-    // --- resolve の I/O 要求 -------------------------------------------------
+    // --- resolve's I/O requests ---------------------------------------------
 
     #[test]
     fn resolve_requests_the_whole_file_when_bytes_are_missing() {
@@ -1457,7 +1448,7 @@ mod tests {
                 assert_eq!(off, 0);
                 assert_eq!(len, 1_000_000);
             }
-            Ok(()) => panic!("バイトが無いのに解決できるはずがない"),
+            Ok(()) => panic!("it cannot possibly resolve with no bytes"),
         }
         assert!(!f.is_resolved());
         assert_eq!(f.num_splits(), 0);
@@ -1485,7 +1476,7 @@ mod tests {
         assert!(f.schema().is_empty());
     }
 
-    // --- 壊れた入力 ---------------------------------------------------------
+    // --- Corrupt input ------------------------------------------------------
 
     fn resolve_err(text: &str) -> Option<Code> {
         let src = Source::from_bytes(text.as_bytes().to_vec());
@@ -1511,14 +1502,13 @@ mod tests {
 
     #[test]
     fn deeply_nested_input_hits_the_depth_cap() {
-        // 配列要素そのものを深くネストさせる。`Elements::next` が要素の
-        // スパンを求めるのに `skip_value` を要素の先頭（自分自身の
-        // `[`/`{`）から直接呼ぶので、depth の起点はこの要素の最外殻になる
-        // （オブジェクトの 1 メンバとして埋め込んだ場合は、そのメンバの
-        // 行 = 要素自身の `{` が 1 段消費するので、使える深さが 1 少なくなる。
-        // `format::jsonl` の `Members` はメンバの値だけに `skip_value` を
-        // 呼ぶので起点がずれない — この違いはモジュール doc の「独立実装」
-        // 注記のとおり）。
+        // Nests the array elements themselves deeply. `Elements::next` calls `skip_value` directly
+        // from the element's start (its own `[`/`{`) to find the element's span, so depth is counted
+        // from this element's outermost shell (when embedded as an object member, that member's
+        // line -- the element's own `{` -- consumes one level, so one less depth is available.
+        // `format::jsonl`'s `Members` calls `skip_value` only on a member's value, so its origin
+        // does not shift -- this difference is exactly the "independent implementation" note in the
+        // module docs).
         let mut text = String::from("[");
         let deep = MAX_DEPTH as usize + 1;
         for _ in 0..deep {
@@ -1565,7 +1555,7 @@ mod tests {
         assert_eq!(code_of(f.resolve(&src)), Some(Code::LimitExceeded));
     }
 
-    // --- 補助関数 -----------------------------------------------------------
+    // --- Helper functions ---------------------------------------------------
 
     #[test]
     fn days_from_civil_matches_known_dates() {

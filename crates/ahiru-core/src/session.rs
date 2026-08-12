@@ -1,7 +1,7 @@
-//! セッション: カタログを持ち、SQL を受け取ってバッチを返す。
+//! The session: holds the catalog, takes SQL, and returns batches.
 //!
-//! 非同期 I/O は「実行を止めて必要なバイト範囲を返す」形で表現する。
-//! Asyncify を使わずに済むので wasm のコードサイズが増えない（DESIGN.md §6）。
+//! Asynchronous I/O is expressed as "stop execution and return the byte ranges needed".
+//! Avoiding Asyncify keeps the wasm code size down (DESIGN.md §6).
 
 use crate::catalog::{Catalog, Source, TablePart};
 use crate::exec::{build, CodecRequest, ExecContext, IoRequest, Operator, Step, Values};
@@ -15,33 +15,32 @@ use crate::sql::ast::{FromItem, Stmt};
 use crate::sql::parse;
 use crate::vector::{Batch, Field, Ty, Value, Vector};
 
-/// `COPY` が書き出したバイト列と、書き込み先として指定されたパス。
+/// The bytes `COPY` produced, plus the path it was told to write to.
 ///
-/// `ahiru-core` は `no_std` でファイルシステムに触れられないので、実際に
-/// `path` へ `data` を書き込むのは呼び出し側（ネイティブなら `ahiru-cli`）の
-/// 役目（`write` モジュール doc、DESIGN.md §15 参照）。
+/// `ahiru-core` is `no_std` and cannot touch the filesystem, so actually writing
+/// `data` to `path` is the caller's job (`ahiru-cli` on native)
+/// (see the `write` module docs and DESIGN.md §15).
 #[cfg(feature = "export")]
 pub struct CopyResult {
     pub path: String,
     pub data: Vec<u8>,
 }
 
-/// 準備済みクエリ。
+/// A prepared query.
 pub struct Query {
     root: Box<dyn Operator>,
     pub schema: Vec<Field>,
-    /// `COPY` の実行結果（`export` フィーチャ）。`Some` のときは `root`/
-    /// `schema` は意味を持たない空プレースホルダで、`step` を呼ぶ必要は
-    /// ない。実データはここに入っている。
+    /// The result of executing `COPY` (the `export` feature). When it is `Some`,
+    /// `root`/`schema` are meaningless empty placeholders and `step` need not be
+    /// called. The real data is here.
     #[cfg(feature = "export")]
     pub copy: Option<CopyResult>,
 }
 
 impl Query {
-    /// あらかじめ確定している 1 バッチだけの結果を組み立てる。
-    /// `ddl`/`dml` が完了通知（影響行数など）を返すのに使う
-    /// （`SHOW TABLES`/`DESCRIBE` の `one_column`/`describe_result` と同じ
-    /// 手口）。
+    /// Builds a result of exactly one predetermined batch.
+    /// Used by `ddl`/`dml` to return a completion notice (affected row count and the
+    /// like), the same trick as `one_column`/`describe_result` for `SHOW TABLES`/`DESCRIBE`.
     #[cfg(feature = "ddl")]
     pub(crate) fn single_batch(schema: Vec<Field>, batch: Batch) -> Self {
         Query {
@@ -52,8 +51,8 @@ impl Query {
         }
     }
 
-    /// `COPY` の結果を保持するだけの `Query` を組み立てる。
-    /// `write::copy` から呼ばれる。
+    /// Builds a `Query` that merely holds a `COPY` result.
+    /// Called from `write::copy`.
     #[cfg(feature = "export")]
     pub(crate) fn copy_result(path: String, data: Vec<u8>) -> Self {
         Query {
@@ -64,32 +63,32 @@ impl Query {
     }
 }
 
-/// `Session::prepare` の結果。
+/// The result of `Session::prepare`.
 pub enum Prepared {
     Ready(Query),
-    /// フッタを読むためにバイトが足りない。
+    /// Not enough bytes to read the footer.
     NeedIo(Vec<IoRequest>),
 }
 
-/// `Session::step` の結果。
+/// The result of `Session::step`.
 pub enum QueryStep {
     Batch(Batch),
     NeedIo(Vec<IoRequest>),
-    /// 内蔵していないコーデックの展開をホストに依頼する（DESIGN.md §6）。
+    /// Asks the host to decompress a codec that is not built in (DESIGN.md §6).
     NeedCodec(Vec<CodecRequest>),
     Done,
 }
 
 pub struct Session {
     pub catalog: Catalog,
-    /// `pub(crate)`: `ddl`/`dml` モジュールが行単位の式評価（VALUES/SET/WHERE）
-    /// に使う。クレート外には出さない（既存の ABI/JS 面には影響しない）。
+    /// `pub(crate)`: used by the `ddl`/`dml` modules for per-row expression evaluation
+    /// (VALUES/SET/WHERE). Not exposed outside the crate (no effect on the existing ABI/JS surface).
     pub(crate) vm: Vm,
-    /// `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 用のクエリ開始時刻
-    /// （エポックからのマイクロ秒、UTC）。wasm コアは時計を持たないので
-    /// ホストが `set_now` で明示的に渡す。未設定ならエポック（1970-01-01）
-    /// になる — 「時刻を知らないなら黙って嘘をつかず、分かりやすく壊れた
-    /// 値を返す」という他の防御的パース方針と同じ考え方。
+    /// The query start time for `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()`
+    /// (microseconds since the epoch, UTC). The wasm core has no clock, so the host
+    /// passes it explicitly via `set_now`. Unset, it is the epoch (1970-01-01) --
+    /// the same reasoning as the other defensive-parsing choices: if the time is
+    /// unknown, return a conspicuously broken value rather than quietly lying.
     now_micros: i64,
 }
 
@@ -98,16 +97,16 @@ impl Session {
         Session { catalog: Catalog::new(), vm: Vm::new(), now_micros: 0 }
     }
 
-    /// クエリ開始時刻を設定する。次回以降の `prepare` で
+    /// Sets the query start time. Later `prepare` calls use it as the value of
     /// `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`CURRENT_TIME`/`now()`/`today()`
-    /// の値として使われる。ホスト（JS/CLI）がクエリのたびに現在時刻で
-    /// 呼ぶ想定（DESIGN.md §2「ホストでできることはホストでやる」）。
+    /// The host (JS/CLI) is expected to call it with the current time on every query
+    /// (DESIGN.md §2, "do on the host what the host can do").
     pub fn set_now(&mut self, now_micros: i64) {
         self.now_micros = now_micros;
     }
 
-    /// ファイル全体をメモリに持つテーブルを登録する。
-    /// フォーマットは名前（拡張子）から推定する。
+    /// Registers a table whose whole file is held in memory.
+    /// The format is inferred from the name (its extension).
     pub fn register_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<usize> {
         self.register_bytes_as(name, bytes, FormatKind::Auto)
     }
@@ -121,7 +120,7 @@ impl Session {
         self.catalog.register(name, Source::from_bytes(bytes), kind)
     }
 
-    /// ホストがレンジ取得で供給するテーブルを登録する。I/O は発生しない。
+    /// Registers a table the host supplies via range fetching. No I/O happens.
     pub fn register_remote(&mut self, name: &str, total_len: u64) -> Result<usize> {
         self.register_remote_as(name, total_len, FormatKind::Auto)
     }
@@ -135,14 +134,14 @@ impl Session {
         self.catalog.register(name, Source::remote(total_len), kind)
     }
 
-    /// 複数ファイルを 1 論理テーブルとして、バイト列を渡して登録する。
+    /// Registers several files as one logical table by handing over their bytes.
     ///
-    /// `files` は `(パス, バイト列)` の並び。`path` はフォーマット自動判定
-    /// （拡張子）と Hive パーティション列の抽出（`key=value` ディレクトリ）
-    /// の両方に使う。パスに `key=value` セグメントが無いパートはそのまま、
-    /// あるパートだけ `PartitionedFormat` でラップする — 全パートを一律に
-    /// ラップすると、パーティションが無い多数派のケースで無駄な間接層が
-    /// 常に挟まることになる。
+    /// `files` is a sequence of `(path, bytes)`. `path` is used both for automatic
+    /// format detection (the extension) and for extracting Hive partition columns
+    /// (`key=value` directories). Parts whose path has no `key=value` segment are left
+    /// alone, and only those that do are wrapped in `PartitionedFormat` -- wrapping
+    /// every part uniformly would permanently insert a pointless indirection in the
+    /// majority case where there are no partitions.
     pub fn register_multi_bytes(
         &mut self,
         name: &str,
@@ -154,8 +153,8 @@ impl Session {
         self.register_multi(name, files, kind)
     }
 
-    /// 複数ファイルを 1 論理テーブルとして、ホストのレンジ取得で登録する。
-    /// `files` は `(パス, 総バイト長)` の並び。I/O は発生しない。
+    /// Registers several files as one logical table, served by the host's range fetching.
+    /// `files` is a sequence of `(path, total byte length)`. No I/O happens.
     pub fn register_multi_remote(
         &mut self,
         name: &str,
@@ -188,7 +187,7 @@ impl Session {
         self.catalog.register_multi(name, parts)
     }
 
-    /// `NeedIo` で要求したバイト列を渡す。
+    /// Hands over the bytes requested by `NeedIo`.
     pub fn provide(&mut self, table: usize, part: usize, offset: u64, data: Vec<u8>) -> Result<()> {
         let t = match self.catalog.get_mut(table) {
             Some(t) => t,
@@ -203,22 +202,22 @@ impl Session {
         }
     }
 
-    /// SQL をプランに落とす。スキーマ未解決ならバイト範囲を要求して戻る。
+    /// Lowers SQL into a plan. Requests byte ranges and returns if a schema is unresolved.
     pub fn prepare(&mut self, sql: &str, params: &[Value]) -> Result<Prepared> {
         let mut parsed = parse(sql)?;
-        // `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 等は束縛前に定数へ
-        // 置き換える（`sql::now` 参照）。SQL標準の「クエリ内で1回だけ評価
-        // する」契約にも自然に一致する。
+        // `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` and friends are replaced with
+        // constants before binding (see `sql::now`). This also matches the SQL standard's
+        // contract of evaluating them exactly once per query.
         crate::sql::substitute_now(&mut parsed.arena, self.now_micros);
 
-        // `PIVOT`/`UNPIVOT` は構文糖衣なので、通常の `SELECT` へ展開してから
-        // 下の分岐に合流させる（`plan::bind::desugar_pivot`/`desugar_unpivot`
-        // 参照）。展開には（`GROUP BY` 省略時などに）対象表のスキーマが要る
-        // ことがあるので、ここでスキーマ解決 → 展開まで済ませてしまい、
-        // 下の大きな `match &parsed.stmt` には触れずに済ませる
-        // （`Stmt::Pivot`/`Stmt::Unpivot` は `PivotStmt`/`UnpivotStmt` を
-        // 所有権ごと消費するので、`&parsed.stmt` からの借用では作れない —
-        // `mem::replace` で `parsed.stmt` だけを取り出す）。
+        // `PIVOT`/`UNPIVOT` are syntactic sugar, so they are expanded into an ordinary
+        // `SELECT` before joining the branches below (see `plan::bind::desugar_pivot`/
+        // `desugar_unpivot`). Expansion sometimes needs the target table's schema (when
+        // `GROUP BY` is omitted, for instance), so schema resolution and expansion are
+        // both finished here, leaving the large `match &parsed.stmt` below untouched
+        // (`Stmt::Pivot`/`Stmt::Unpivot` consume `PivotStmt`/`UnpivotStmt` by ownership,
+        // so they cannot be built from a borrow of `&parsed.stmt` -- `mem::replace`
+        // extracts just `parsed.stmt`).
         if matches!(parsed.stmt, Stmt::Pivot(_) | Stmt::Unpivot(_)) {
             let stmt = core::mem::replace(&mut parsed.stmt, Stmt::ShowTables);
             let q = match stmt {
@@ -247,7 +246,7 @@ impl Session {
 
         match &parsed.stmt {
             Stmt::Select(q) => self.prepare_query(&parsed.arena, q, params),
-            // EXPLAIN はプランを組んでからテキストに落とす。実行はしない。
+            // EXPLAIN builds the plan and then renders it as text. It does not execute.
             Stmt::Explain(q) => {
                 if let Some(io) = self.resolve_query(&parsed.arena, q)? {
                     return Ok(Prepared::NeedIo(io));
@@ -264,14 +263,14 @@ impl Session {
                 Ok(Prepared::Ready(describe_result(&fields)))
             }
             Stmt::ShowTables => Ok(Prepared::Ready(one_column("name", self.table_names()))),
-            // 上の早期リターンで必ず消費済み（`Stmt::Pivot`/`Stmt::Unpivot` は
-            // 展開してから `prepare_query` に合流するので、ここには来ない）。
+            // Always already consumed by the early return above (`Stmt::Pivot`/`Stmt::Unpivot`
+            // are expanded before joining `prepare_query`, so they never reach here).
             Stmt::Pivot(_) | Stmt::Unpivot(_) => unreachable!(),
-            // DDL/DML は副作用（カタログの変更）を伴う一発実行の文で、
-            // Volcano のストリーミング実行には乗らない。`ddl`/`dml` モジュール
-            // がここで完結させ、結果は 1 行だけの `Query`（影響行数など）で
-            // 返す（`export::export_all` と同じ「既存の公開経路を外側から叩く」
-            // 発想だが、ここは Session の中なので直接呼ぶ）。
+            // DDL/DML are one-shot statements with side effects (catalog changes) and do
+            // not ride the Volcano streaming execution. The `ddl`/`dml` modules finish
+            // them here and return the result as a one-row `Query` (affected row count
+            // and so on) -- the same "drive the existing public path from outside" idea
+            // as `export::export_all`, except this is inside Session, so it calls directly.
             #[cfg(feature = "ddl")]
             Stmt::CreateTable { name, or_replace, if_not_exists, columns, as_select } => {
                 crate::ddl::create_table(
@@ -309,9 +308,9 @@ impl Session {
             Stmt::Delete { table, filter } => {
                 crate::dml::delete(self, &parsed.arena, table, *filter, params)
             }
-            // `COPY` も DDL/DML と同様に一発実行の文だが、副作用はカタログ
-            // ではなくバイト列の組み立て。実際にファイルへ書くのは
-            // `ahiru-core` の外（`write` モジュール doc、DESIGN.md §15）。
+            // `COPY` is a one-shot statement like DDL/DML, but its side effect is
+            // assembling bytes rather than changing the catalog. Actually writing the file
+            // happens outside `ahiru-core` (see the `write` module docs and DESIGN.md §15).
             #[cfg(feature = "export")]
             Stmt::Copy { query, path, format } => {
                 crate::write::copy(self, &parsed.arena, query, path, format.as_deref(), params)
@@ -319,9 +318,9 @@ impl Session {
         }
     }
 
-    /// `SELECT` を束縛してプランに落とす。`Stmt::Select` と、AST を直接持つ
-    /// 呼び出し元（`COPY` の内側クエリなど、SQL 文字列への往復を避けたい
-    /// 場合。`write::export_query` 参照）の両方から使う共通経路。
+    /// Binds a `SELECT` and lowers it into a plan. The shared path used both by
+    /// `Stmt::Select` and by callers holding an AST directly (such as the inner query of
+    /// `COPY`, which wants to avoid a round trip through a SQL string; see `write::export_query`).
     pub(crate) fn prepare_query(
         &mut self,
         arena: &crate::sql::ast::ExprArena,
@@ -341,11 +340,11 @@ impl Session {
         }))
     }
 
-    /// クエリが参照するテーブルのスキーマをすべて解決する。
-    /// 足りない範囲があればまとめて返す（結合や集合演算、複数ファイルテーブル
-    /// があると複数になる）。1 テーブルにつき 1 往復で済むよう、そのテーブルの
-    /// 全パートが必要とする範囲を `Table::resolve` の時点で束ねてから積む
-    /// （`catalog::Table::resolve` のドキュメント参照）。
+    /// Resolves the schemas of every table the query references.
+    /// Any missing ranges are returned together (there can be several with joins, set
+    /// operations, or multi-file tables). To keep it to one round trip per table, the
+    /// ranges every part of that table needs are bundled at `Table::resolve` before being
+    /// collected (see the docs on `catalog::Table::resolve`).
     fn resolve_query(
         &mut self,
         arena: &crate::sql::ast::ExprArena,
@@ -368,7 +367,7 @@ impl Session {
         Ok(if io.is_empty() { None } else { Some(io) })
     }
 
-    /// ホストが展開した圧縮ブロックを渡す。
+    /// Hands over a compressed block the host decompressed.
     pub fn provide_decoded(
         &mut self,
         table: usize,
@@ -390,7 +389,7 @@ impl Session {
         }
     }
 
-    /// 次のバッチを取り出す。
+    /// Pulls the next batch.
     pub fn step(&mut self, q: &mut Query) -> Result<QueryStep> {
         let mut ctx = ExecContext {
             catalog: &mut self.catalog,
@@ -406,8 +405,7 @@ impl Session {
         }
     }
 
-    /// テーブル名を列挙する（`SHOW TABLES`）。インメモリ表・ビューも含める
-    /// （`ddl`）。
+    /// Enumerates table names (`SHOW TABLES`). In-memory tables and views are included (`ddl`).
     pub fn table_names(&self) -> Vec<String> {
         #[allow(unused_mut)]
         let mut names: Vec<String> = self.catalog.names().map(String::from).collect();
@@ -419,8 +417,8 @@ impl Session {
         names
     }
 
-    /// `DESCRIBE` 用。フッタが未解決なら要求を返す
-    /// （複数ファイルテーブルなら複数パート分まとめて）。
+    /// For `DESCRIBE`. Returns requests if the footer is unresolved
+    /// (bundled across parts for a multi-file table).
     pub fn describe(
         &mut self,
         from: &FromItem,
@@ -441,7 +439,7 @@ impl Session {
     }
 }
 
-/// 文字列 1 列だけの結果を作る。`SHOW TABLES` と `EXPLAIN` 用。
+/// Builds a result of a single string column. For `SHOW TABLES` and `EXPLAIN`.
 fn one_column(name: &str, rows: Vec<String>) -> Query {
     let mut v = Vector::with_capacity(Ty::Varchar, rows.len());
     for r in &rows {
@@ -456,7 +454,7 @@ fn one_column(name: &str, rows: Vec<String>) -> Query {
     }
 }
 
-/// `DESCRIBE` の結果。列名・型・NULL 可否の 3 列。
+/// The result of `DESCRIBE`. Three columns: name, type, and nullability.
 fn describe_result(fields: &[Field]) -> Query {
     let mut names = Vector::with_capacity(Ty::Varchar, fields.len());
     let mut types = Vector::with_capacity(Ty::Varchar, fields.len());

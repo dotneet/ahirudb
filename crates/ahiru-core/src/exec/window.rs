@@ -1,37 +1,37 @@
-//! ウィンドウ関数（`OVER (...)`）。
+//! Window functions (`OVER (...)`).
 //!
-//! 出力は**入力の列に続けて `WindowSpec` 1 個につき 1 列**。バインダはこの
-//! 並びでスキーマを組むので、順番は契約として変えない。
+//! The output is **the input's columns followed by one column per `WindowSpec`**. The binder
+//! builds the schema in that order, so the order is a contract and does not change.
 //!
-//! ## ブロッキングと再開
+//! ## Blocking and resumption
 //!
-//! 分割の最後の行を見るまで最初の行の値すら決まらない（`sum(x) OVER ()` を
-//! 考えればよい）ので、入力を全部読み切る**ブロッキング**オペレータになる。
-//! リモート入力は途中で `Step::NeedIo` / `NeedCodec` を返すため、蓄積の途中
-//! 状態はすべて `self` に置き、中断はそのまま素通しして次の `next()` で同じ
-//! 場所から読み直す（DESIGN.md §6）。取り込みの単位は 1 バッチで、`absorb`
-//! は途中で抜けない。これで再開時の取りこぼしと二重取りを構造的に潰す。
-//! フェーズは `Buffering → Emitting → Done`。
+//! Not even the first row's value is settled until the partition's last row is seen (consider
+//! `sum(x) OVER ()`), so this is a **blocking** operator that reads the input through.
+//! A remote input can return `Step::NeedIo` / `NeedCodec` midway, so all the partial
+//! accumulation state lives in `self`, interruptions are passed straight through, and the next
+//! `next()` reads again from the same place (DESIGN.md §6). The unit of ingestion is one batch,
+//! and `absorb` never bails out midway, structurally eliminating drops and double reads on resumption.
+//! The phases are `Buffering -> Emitting -> Done`.
 //!
-//! ## 行順
+//! ## Row order
 //!
-//! 計算は分割ごとに ORDER BY 順で行うが、**出力は入力の行順**でなければ
-//! ならない（ウィンドウは行を並べ替えない）。訪問順に値を積んでから、
-//! 「入力行 → 訪問位置」の逆置換で `gather` して戻す。1 セルずつ `Value` を
-//! 経由して散らすより確保が少ない。
+//! Computation happens per partition in ORDER BY order, but **the output must be in the input's
+//! row order** (a window does not reorder rows). Values are accumulated in visit order and then
+//! `gather`ed back with the inverse permutation "input row -> visit position". That allocates
+//! less than scattering cell by cell through `Value`.
 //!
-//! ## 枠（frame）
+//! ## Frames
 //!
-//! - `WholePartition`（ORDER BY 無しの既定）は分割全体。
-//! - `RangeUnboundedPreceding`（ORDER BY ありの既定）は分割先頭から
-//!   **現在行のピア（ORDER BY キーが等しい行）の末尾まで**。ROWS ではなく
-//!   RANGE なので、同順の行はすべて同じ枠＝同じ値になる。
-//!   `sum(x) OVER (ORDER BY y)` で y が同値の行が同じ累計を返すのはこのため
-//!   （DuckDB で確認済み）。
+//! - `WholePartition` (the default without ORDER BY) is the whole partition.
+//! - `RangeUnboundedPreceding` (the default with ORDER BY) runs from the partition's start
+//!   **to the end of the current row's peers (rows with equal ORDER BY keys)**. It is RANGE
+//!   rather than ROWS, so tied rows all share a frame and thus a value.
+//!   That is why `sum(x) OVER (ORDER BY y)` returns the same running total for rows with equal y
+//!   (confirmed with DuckDB).
 //!
-//! ## メモリ
+//! ## Memory
 //!
-//! 溢れ処理は持たない。蓄積が `MAX_BUFFER_BYTES` を超えたら `Oom` を返す。
+//! There is no overflow handling. Once accumulation exceeds `MAX_BUFFER_BYTES` it returns `Oom`.
 
 use crate::exec::rowkey::{encode_key, ord_f64, pow10, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
@@ -42,15 +42,15 @@ use crate::vector::{Batch, Bitmap, Data, PhysType, Ty, Value, Vector, BATCH_SIZE
 
 use core::cmp::Ordering;
 
-/// 溢れ処理を持たないので、これを超えたら `Oom` を返す。
-/// ソート（256MiB）より低いのは、入力の蓄積に加えてウィンドウ列と分割ごとの
-/// 添字表を同時に抱えるため。
+/// With no overflow handling, exceeding this returns `Oom`.
+/// It is lower than sorting's (256 MiB) because, on top of buffering the input, the window
+/// columns and the per-partition index tables are held at the same time.
 const MAX_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 
 enum Phase {
-    /// 入力を読んで溜めている。中断を跨いでもこの状態のまま。
+    /// Reading and buffering the input. It stays in this state across interruptions.
     Buffering,
-    /// ウィンドウ列が確定した。`BATCH_SIZE` ずつ切って返す。
+    /// The window columns are settled. Returned in `BATCH_SIZE` slices.
     Emitting,
     Done,
 }
@@ -60,17 +60,17 @@ pub struct Window {
     windows: Vec<WindowSpec>,
     phase: Phase,
 
-    /// 入力列の蓄積。出力の前半はこれをそのまま流す。
+    /// The buffered input columns. The first half of the output streams these unchanged.
     cols: Vec<Vector>,
-    /// 蓄積した行数。0 列の入力（`count(*) OVER ()`）でも行数だけは要る。
+    /// The buffered row count. Even a zero-column input (`count(*) OVER ()`) needs the row count.
     rows: usize,
-    /// 最初のバッチで列型を決めたか。0 列の入力があるので `cols` の空判定では
-    /// 代用できない。
+    /// Whether the column types were decided from the first batch. A zero-column input exists, so
+    /// emptiness of `cols` cannot stand in for it.
     init: bool,
 
-    /// ウィンドウ列。`windows` と同じ並び、**入力行順**。`Emitting` 以降のみ有効。
+    /// The window columns. In the same order as `windows`, in **input row order**. Valid only from `Emitting` on.
     out: Vec<Vector>,
-    /// 次に返す行の先頭。
+    /// The start of the next row to return.
     pos: usize,
 }
 
@@ -88,9 +88,9 @@ impl Window {
         })
     }
 
-    /// 1 バッチを丸ごと蓄積へ取り込む。**途中で抜けない**（再開の単位はバッチ）。
+    /// Takes one whole batch into the buffer. **It never bails out midway** (the unit of resumption is a batch).
     fn absorb(&mut self, mut batch: Batch) -> Result<()> {
-        // 以降は行番号で引くので selection をここで畳む。
+        // From here on lookups are by row number, so selection is materialized now.
         batch.materialize();
         let rows = batch.num_rows();
         if rows == 0 {
@@ -101,7 +101,7 @@ impl Window {
             self.init = true;
         }
         ensure!(batch.cols.len() == self.cols.len(), Internal);
-        // 行番号を u32 に載せるので、そこを超えたら諦める。
+        // Row numbers ride in a u32, so beyond that it gives up.
         ensure!(self.rows.saturating_add(rows) <= u32::MAX as usize, LimitExceeded);
 
         for (dst, src) in self.cols.iter_mut().zip(batch.cols.iter()) {
@@ -117,16 +117,16 @@ impl Window {
         Ok(())
     }
 
-    /// 入力を読み切った。全ウィンドウ列を作って出力フェーズへ移る。
+    /// The input is read through. Builds every window column and moves to the output phase.
     fn finish(&mut self, ctx: &mut ExecContext) -> Result<()> {
-        // 1 行も来なかった（全分割が枝刈りされた等）。列型すら分からないので
-        // 式を評価せずに空のまま出力へ移る。`emit` は即 `Done` になる。
+        // Not a single row arrived (every partition was pruned, say). Not even the column types
+        // are known, so it moves to output empty without evaluating expressions. `emit` immediately gives `Done`.
         if self.rows == 0 {
             self.phase = Phase::Emitting;
             return Ok(());
         }
-        // 蓄積列を一度バッチへ預けて式評価に使う。clone すると入力全体の複製に
-        // なるので所有権ごと渡して後で取り返す。
+        // The buffered columns are temporarily lent to a batch for expression evaluation. Cloning
+        // would duplicate the whole input, so ownership is handed over and taken back afterwards.
         let cols = core::mem::take(&mut self.cols);
         let batch = if cols.is_empty() { Batch::rows_only(self.rows) } else { Batch::new(cols) };
         let mut out = Vec::with_capacity(self.windows.len());
@@ -168,9 +168,9 @@ impl Operator for Window {
             match self.phase {
                 Phase::Buffering => match self.input.next(ctx)? {
                     Step::Ready(b) => self.absorb(b)?,
-                    // 中断はそのまま上へ返す。蓄積は `self` に残るので、次回の
-                    // 呼び出しはここから入力を引き直す。バイト待ちも展開待ちも
-                    // 扱いは同じ。
+                    // The interruption is returned straight up. The buffer stays in `self`, so the
+                    // next call pulls the input again from here. Waiting on bytes and waiting on
+                    // decompression are handled identically.
                     other @ (Step::NeedIo | Step::NeedCodec) => return Ok(other),
                     Step::Done => self.finish(ctx)?,
                 },
@@ -181,9 +181,9 @@ impl Operator for Window {
     }
 }
 
-// --- 1 つのウィンドウ関数の計算 ---------------------------------------------
+// --- Computing one window function -------------------------------------------
 
-/// `spec` の結果列を入力行順で作る。
+/// Builds `spec`'s result column in input row order.
 fn compute(spec: &WindowSpec, batch: &Batch, rows: usize, ctx: &mut ExecContext) -> Result<Vector> {
     let mut pcols = Vec::with_capacity(spec.partition_by.len());
     for p in &spec.partition_by {
@@ -198,9 +198,9 @@ fn compute(spec: &WindowSpec, batch: &Batch, rows: usize, ctx: &mut ExecContext)
         acols.push(ctx.vm.eval(a, batch)?);
     }
 
-    // --- 分割 ---------------------------------------------------------------
-    // キーの符号化は `rowkey` に寄せる。GROUP BY と同じく **NULL は NULL と
-    // 同じ分割**に入る（`encode_key` がその意味論）。
+    // --- Partitioning -------------------------------------------------------
+    // Key encoding is delegated to `rowkey`. As with GROUP BY, **NULL joins the same partition
+    // as NULL** (that is `encode_key`'s semantics).
     let mut parts: Vec<Vec<u32>> = Vec::new();
     if spec.partition_by.is_empty() {
         parts.push((0..rows as u32).collect());
@@ -221,22 +221,22 @@ fn compute(spec: &WindowSpec, batch: &Batch, rows: usize, ctx: &mut ExecContext)
         }
     }
 
-    // --- 分割ごとに値を作る（訪問順） ---------------------------------------
+    // --- Building values per partition (in visit order) ---------------------
     let mut vals = Vector::with_capacity(spec.result_ty, rows);
     let mut order: Vec<u32> = Vec::with_capacity(rows);
     for part in parts.iter_mut() {
         if !spec.order_by.is_empty() {
-            // 比較器はソート演算子と同じ規律（NULL は nulls_first、f64 は
-            // 全順序キー、最後は行番号で決着＝安定）。
+            // The comparator follows the same discipline as the sort operator (NULLs by
+            // nulls_first, f64 by a total-order key, ties broken by row number = stable).
             part.sort_by(|&a, &b| cmp_row(&spec.order_by, &kcols, a, b));
         }
         eval_partition(spec, part, &kcols, &acols, &mut vals)?;
         order.extend_from_slice(part);
     }
-    // 各行はちょうど 1 回訪問される。ここが崩れると逆置換が壊れる。
+    // Every row is visited exactly once. If that breaks, the inverse permutation breaks.
     ensure!(vals.len() == rows && order.len() == rows, Internal);
 
-    // --- 入力行順へ戻す -----------------------------------------------------
+    // --- Restoring input row order ------------------------------------------
     let mut inv = vec![0u32; rows];
     for (p, &r) in order.iter().enumerate() {
         inv[r as usize] = p as u32;
@@ -246,7 +246,7 @@ fn compute(spec: &WindowSpec, batch: &Batch, rows: usize, ctx: &mut ExecContext)
     Ok(v)
 }
 
-/// 1 分割ぶんの値を `out` へ**訪問順**（`part` の並び）で積む。
+/// Pushes one partition's values into `out` in **visit order** (the order of `part`).
 fn eval_partition(
     spec: &WindowSpec,
     part: &[u32],
@@ -259,17 +259,17 @@ fn eval_partition(
         return Ok(());
     }
     let ty = spec.result_ty;
-    // ORDER BY が無ければ全行がピアなので、どちらの枠でも分割全体になる。
+    // Without ORDER BY every row is a peer, so either frame covers the whole partition.
     let whole = spec.frame == WindowFrame::WholePartition || spec.order_by.is_empty();
 
-    // ピア群の境界。`groups[g] = (start, end)`（`part` 上の半開区間）。
+    // The peer-group boundaries. `groups[g] = (start, end)` (a half-open interval over `part`).
     let mut groups: Vec<(usize, usize)> = Vec::new();
     if spec.order_by.is_empty() {
         groups.push((0, n));
     } else {
         let mut s = 0usize;
         for i in 1..=n {
-            // `i == n` を先に見て `part[i]` の範囲外参照を避ける。
+            // `i == n` is checked first to avoid indexing `part[i]` out of range.
             if i == n || cmp_keys(&spec.order_by, kcols, part[i - 1], part[i]) != Ordering::Equal {
                 groups.push((s, i));
                 s = i;
@@ -278,13 +278,13 @@ fn eval_partition(
     }
 
     match spec.kind {
-        // ピアを無視して 1 から通し番号。
+        // A running number from 1, ignoring peers.
         WindowKind::RowNumber => {
             for p in 0..n {
                 push_as(out, ty, &Value::I64(p as i64 + 1))?;
             }
         }
-        // 同順は同じ順位、次は飛ぶ。
+        // Ties share a rank, and the next one skips ahead.
         WindowKind::Rank => {
             for &(s, e) in groups.iter() {
                 for _ in s..e {
@@ -292,7 +292,7 @@ fn eval_partition(
                 }
             }
         }
-        // 同順は同じ順位、飛ばない。
+        // Ties share a rank, with no skipping.
         WindowKind::DenseRank => {
             for (gi, &(s, e)) in groups.iter().enumerate() {
                 for _ in s..e {
@@ -300,7 +300,7 @@ fn eval_partition(
                 }
             }
         }
-        // 枠ではなく ORDER BY 順の相対位置で引く。
+        // Looked up by relative position in ORDER BY order rather than by frame.
         WindowKind::Lag | WindowKind::Lead => {
             let src = match acols.first() {
                 Some(c) => c,
@@ -312,14 +312,14 @@ fn eval_partition(
                 let off = match acols.get(1) {
                     Some(c) => match c.value_at(row).as_i64() {
                         Some(x) => x,
-                        // オフセットが NULL なら結果も NULL（DuckDB と同じ）。
+                        // A NULL offset gives a NULL result (the same as DuckDB).
                         None if !c.is_valid(row) => {
                             out.push_null();
                             continue;
                         }
                         None => err!(TypeMismatch),
                     },
-                    // 省略時は 1。負のオフセットは向きが反転する。
+                    // Omitted means 1. A negative offset reverses the direction.
                     None => 1,
                 };
                 let target = if back { p as i64 - off } else { p as i64 + off };
@@ -327,7 +327,7 @@ fn eval_partition(
                     let v = src.value_at(part[target as usize] as usize);
                     push_as(out, ty, &v)?;
                 } else {
-                    // 分割の外は既定値。既定値の指定が無ければ NULL。
+                    // Outside the partition it is the default value, or NULL if none was given.
                     match acols.get(2) {
                         Some(c) => {
                             let v = c.value_at(row);
@@ -338,7 +338,7 @@ fn eval_partition(
                 }
             }
         }
-        // 枠の先頭は常に分割の先頭（どちらの枠でも UNBOUNDED PRECEDING）。
+        // The frame's start is always the partition's start (UNBOUNDED PRECEDING under either frame).
         WindowKind::FirstValue => {
             let src = match acols.first() {
                 Some(c) => c,
@@ -349,7 +349,7 @@ fn eval_partition(
                 push_as(out, ty, &v)?;
             }
         }
-        // 枠の末尾。RANGE ではピアの最後の行になる。
+        // The frame's end. Under RANGE it is the last row of the peer group.
         WindowKind::LastValue => {
             let src = match acols.first() {
                 Some(c) => c,
@@ -369,13 +369,13 @@ fn eval_partition(
                 }
             }
         }
-        // 枠に対する集約。RANGE の枠は前方に伸びる一方なので、削除の要らない
-        // 累積で足りる（ピア群を 1 単位として進める）。
+        // Aggregation over the frame. A RANGE frame only ever extends forward, so an accumulation
+        // with no removal suffices (advancing one peer group at a time).
         WindowKind::Agg(kind) => {
             let src = acols.first();
-            // ウィンドウ版で持つのは枠に対して**足し込むだけ**で済む集約に限る。
-            // 枠は前へ伸びる一方なので削除を考えずに済むのがこの実装の前提で、
-            // 中央値や最頻値は枠ごとに作り直すことになり前提が崩れる。
+            // Only aggregates that need nothing but **adding into** the frame have a window
+            // version. This implementation's premise is that the frame only extends forward, so
+            // removal never has to be considered; median and mode would have to be rebuilt per frame, breaking that premise.
             ensure!(
                 matches!(
                     kind,
@@ -389,7 +389,7 @@ fn eval_partition(
                 UnsupportedFeature
             );
             let div = match spec.args.first().map(|a| a.result_ty) {
-                // DECIMAL の内部表現は整数。AVG では 10^scale で戻す。
+                // DECIMAL's internal representation is an integer. AVG divides back by 10^scale.
                 Some(Ty::Decimal { scale, .. }) => pow10(scale),
                 _ => 1.0,
             };
@@ -418,14 +418,14 @@ fn eval_partition(
     Ok(())
 }
 
-// --- 枠に対する集約の累積 ---------------------------------------------------
+// --- Accumulating an aggregate over a frame ----------------------------------
 
-/// 1 枠ぶんの集約状態。意味論は `exec::agg` と同じに揃える
-/// （SUM(整数) は i128、AVG は f64、MIN/MAX は NaN を最大とする全順序）。
+/// The aggregate state for one frame. The semantics match `exec::agg`
+/// (SUM over integers in i128, AVG in f64, MIN/MAX under a total order with NaN as the maximum).
 struct Acc {
-    /// 非 NULL 入力の個数。`COUNT(*)` では全行数。
+    /// The count of non-NULL inputs. For `COUNT(*)`, every row.
     n: i64,
-    /// 累積値。`Value::Null` は「まだ非 NULL 入力が無い」。
+    /// The accumulated value. `Value::Null` means "no non-NULL input yet".
     acc: Value,
 }
 
@@ -436,16 +436,16 @@ impl Acc {
 
     fn add(&mut self, kind: AggKind, col: Option<&Vector>, row: usize) -> Result<()> {
         if kind == AggKind::CountStar {
-            // COUNT(*) は NULL だけの行も数える。
+            // COUNT(*) counts rows that are all NULL too.
             self.n += 1;
             return Ok(());
         }
         let col = match col {
             Some(c) => c,
-            // COUNT(*) 以外は必ず引数を持つ。
+            // Everything but COUNT(*) always has an argument.
             None => err!(WrongArgCount),
         };
-        // SUM/MIN/MAX/AVG/COUNT(x) は NULL を無視する。
+        // SUM/MIN/MAX/AVG/COUNT(x) ignore NULLs.
         if !col.is_valid(row) {
             return Ok(());
         }
@@ -482,7 +482,7 @@ impl Acc {
                     self.acc = v;
                 }
             }
-            // ウィンドウ版を持たない集約。呼び出し元が先に弾いている。
+            // An aggregate with no window version. The caller rejects it earlier.
             _ => err!(UnsupportedFeature),
         }
         Ok(())
@@ -492,7 +492,7 @@ impl Acc {
         let s = match &self.acc {
             Value::I128(s) => match s.checked_add(x) {
                 Some(v) => v,
-                // i128 でも溢れる合計は黙って巻き戻さずエラーにする。
+                // A sum that overflows even i128 is an error rather than a silent wraparound.
                 None => err!(ValueOutOfRange),
             },
             _ => x,
@@ -504,34 +504,34 @@ impl Acc {
     fn value(&self, kind: AggKind, div: f64) -> Value {
         match kind {
             AggKind::CountStar | AggKind::Count => Value::I64(self.n),
-            // 非 NULL 入力が 1 つも無い枠は NULL。
+            // A frame with not a single non-NULL input is NULL.
             AggKind::Sum | AggKind::Min | AggKind::Max => self.acc.clone(),
             AggKind::Avg => match &self.acc {
-                // 整数は i128 で正確に足してから 1 回だけ割る。
+                // Integers are summed exactly in i128 and divided exactly once.
                 Value::I128(s) if self.n > 0 => Value::F64(*s as f64 / div / self.n as f64),
                 Value::F64(s) if self.n > 0 => Value::F64(s / self.n as f64),
                 _ => Value::Null,
             },
-            // ウィンドウ版を持たない集約はここへ来ない（`add` より前に弾く）。
+            // Aggregates with no window version never reach here (rejected before `add`).
             _ => Value::Null,
         }
     }
 }
 
-/// 同じ物理型の 2 値の比較。NaN は「すべてより大きい」（`exec::agg` と同じ）。
+/// Compares two values of the same physical type. NaN is "greater than everything" (as in `exec::agg`).
 fn cmp_val(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::F64(x), Value::F64(y)) => ord_f64(*x, *y),
-        // 物理型が食い違う組み合わせは上流のバグ。順序を付けずに等しいとみなす。
+        // A physical type mismatch is an upstream bug. No ordering is imposed; they count as equal.
         _ => a.partial_cmp_same(b).unwrap_or(Ordering::Equal),
     }
 }
 
-/// 1 値を `ty` の列へ積む。
+/// Pushes one value into a column of type `ty`.
 ///
-/// `result_ty` は**バインダが決めた出力型が正**なので、値のほうを合わせる。
-/// `Vector::push_value` は物理型が違うと何もせずに落ちる（列の長さがずれる）
-/// ため、ここで必ず変換してから渡す。
+/// **The binder's chosen output type is authoritative** for `result_ty`, so the value is adapted
+/// to it. `Vector::push_value` silently does nothing on a physical type mismatch (which would
+/// desynchronize the column length), so conversion always happens here first.
 fn push_as(out: &mut Vector, ty: Ty, v: &Value) -> Result<()> {
     if v.is_null() {
         out.push_null();
@@ -573,13 +573,13 @@ fn int_of(v: &Value) -> Result<i128> {
     })
 }
 
-// --- 比較 -------------------------------------------------------------------
+// --- Comparison ---------------------------------------------------------------
 //
-// `exec::sort` の比較器と同じ規律。あちらの `cmp_row` / `cmp_data` / `f64_key`
-// は private なので**意図的に複製**している（sort.rs は完成済みで手を入れない
-// 約束のため）。挙動を変えるときは 2 か所を必ず揃えること。
+// The same discipline as `exec::sort`'s comparator. Its `cmp_row` / `cmp_data` / `f64_key` are
+// private, so they are **deliberately duplicated** (sort.rs is finished and, by agreement, not
+// touched). When changing the behavior, always change both places.
 
-/// 2 行の全順序比較。同値キーは行番号で決着させるので安定。
+/// A total-order comparison of two rows. Equal keys are broken by row number, so it is stable.
 fn cmp_row(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
     match cmp_keys(keys, cols, a, b) {
         Ordering::Equal => a.cmp(&b),
@@ -587,18 +587,18 @@ fn cmp_row(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
     }
 }
 
-/// キーだけの比較。`Equal` は「ピア（同順）である」ことを意味する。
+/// Comparison of keys alone. `Equal` means "they are peers (tied)".
 fn cmp_keys(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
     let (ai, bi) = (a as usize, b as usize);
     for (k, c) in keys.iter().zip(cols.iter()) {
         let (va, vb) = (c.is_valid(ai), c.is_valid(bi));
         if !va || !vb {
             if !va && !vb {
-                // NULL 同士は同順。ピアになる。
+                // Two NULLs are tied. They become peers.
                 continue;
             }
-            // NULL の位置は nulls_first だけで決まる。ここで desc を掛けると
-            // バインダが入れた既定（ASC→LAST / DESC→FIRST）を二重に適用する。
+            // NULL placement is decided by nulls_first alone. Applying desc here would apply the
+            // binder's default (ASC->LAST / DESC->FIRST) twice.
             return if !va {
                 if k.nulls_first {
                     Ordering::Less
@@ -633,9 +633,9 @@ fn cmp_data(d: &Data, a: usize, b: usize) -> Ordering {
     }
 }
 
-/// f64 を順序を保つ `u64` へ写す。`partial_cmp` は NaN で `None` を返し、
-/// それを「等しい」に潰すと推移律が壊れるため使わない。
-/// 順序は `-inf < … < -0.0 = 0.0 < … < +inf < NaN`。
+/// Maps an f64 to an order-preserving `u64`. `partial_cmp` returns `None` for NaN, and
+/// collapsing that into "equal" would break transitivity, so it is not used.
+/// The order is `-inf < ... < -0.0 = 0.0 < ... < +inf < NaN`.
 #[inline]
 fn f64_key(v: f64) -> u64 {
     if v.is_nan() {
@@ -649,10 +649,10 @@ fn f64_key(v: f64) -> u64 {
     }
 }
 
-// --- バッファ操作 -----------------------------------------------------------
-// これも `exec::sort` の private ヘルパと同じもの。
+// --- Buffer operations --------------------------------------------------------
+// These are the same as `exec::sort`'s private helpers.
 
-/// `src` の全行を `dst` の末尾に足す。物理型が同じであることが前提。
+/// Appends every row of `src` to the end of `dst`. Assumes the physical types match.
 fn append(dst: &mut Vector, src: &Vector) -> Result<()> {
     let base = dst.len();
     let n = src.len();
@@ -670,11 +670,11 @@ fn append(dst: &mut Vector, src: &Vector) -> Result<()> {
                 d.offsets.push(shift + (o - first));
             }
         }
-        // 同じオペレータから来る列なので、ここに落ちるのは組み立て側のバグ。
+        // The columns come from the same operator, so landing here is an assembly-side bug.
         _ => err!(Internal),
     }
-    // どちらかに NULL があれば validity を揃える。伸ばさないと長さが本体と
-    // ずれ、以降の `is_valid` が範囲外を読む。
+    // If either side has NULLs, validity is aligned. Without extending it, its length would
+    // desynchronize from the data and later `is_valid` calls would read out of range.
     if n > 0 && (src.has_nulls() || dst.has_nulls()) {
         let bm: &mut Bitmap = dst.validity_mut();
         if let Some(sv) = src.validity() {
@@ -688,7 +688,7 @@ fn append(dst: &mut Vector, src: &Vector) -> Result<()> {
     Ok(())
 }
 
-/// ベクタ 1 本のおおよそのバイト数。上限判定用なので厳密でなくてよい。
+/// The approximate byte count of one vector. For the cap check, so it need not be exact.
 fn vector_bytes(v: &Vector) -> usize {
     let n = v.len();
     let body = match v.data() {
@@ -709,7 +709,7 @@ mod tests {
     use crate::expr::vm::Vm;
     use crate::expr::{Instr, OpCode, Program};
 
-    // --- 組み立てヘルパ -----------------------------------------------------
+    // --- Construction helpers -----------------------------------------------
 
     fn col(ty: Ty, vals: &[Option<Value>]) -> Vector {
         let mut v = Vector::new(ty);
@@ -736,7 +736,7 @@ mod tests {
         )
     }
 
-    /// `idx` 列をそのまま返すプログラム。
+    /// A program that returns column `idx` unchanged.
     fn load(ty: Ty, idx: u16) -> Program {
         let mut p = Program::new();
         let r = p.alloc_reg();
@@ -746,7 +746,7 @@ mod tests {
         p
     }
 
-    /// 定数を返すプログラム（lag/lead のオフセットと既定値用）。
+    /// A program returning a constant (for lag/lead's offset and default value).
     fn konst(ty: Ty, v: Value) -> Program {
         let mut p = Program::new();
         let r = p.alloc_reg();
@@ -758,7 +758,7 @@ mod tests {
     }
 
     fn skey(idx: u16, ty: Ty) -> SortKey {
-        // SQL 既定の ASC / NULLS LAST。DuckDB の既定と揃えてある。
+        // The SQL default, ASC / NULLS LAST. Aligned with DuckDB's default.
         SortKey { expr: load(ty, idx), desc: false, nulls_first: false }
     }
 
@@ -794,8 +794,8 @@ mod tests {
             self
         }
         fn build(self) -> WindowSpec {
-            // 枠はバインダの既定と同じ決め方: ORDER BY があれば RANGE、
-            // 無ければ分割全体。
+            // The frame is decided the same way as the binder's default: RANGE with ORDER BY,
+            // the whole partition without.
             let frame = if self.order_by.is_empty() {
                 WindowFrame::WholePartition
             } else {
@@ -811,7 +811,7 @@ mod tests {
                 name: String::from("w"),
             }
         }
-        /// ORDER BY を持つが枠は分割全体、という組み合わせ。
+        /// The combination of having ORDER BY but a whole-partition frame.
         fn build_whole(self) -> WindowSpec {
             let mut s = self.build();
             s.frame = WindowFrame::WholePartition;
@@ -819,7 +819,7 @@ mod tests {
         }
     }
 
-    // --- モック入力 ---------------------------------------------------------
+    // --- Mock inputs --------------------------------------------------------
 
     enum Script {
         Rows(Vec<Vector>),
@@ -846,7 +846,7 @@ mod tests {
             }
             let i = self.pos;
             self.pos += 1;
-            // 中断は「ホストの応答を待った」ことにして消費する。
+            // An interruption is consumed as though "the host's response was awaited".
             Ok(match &self.steps[i] {
                 Script::NeedIo => Step::NeedIo,
                 Script::NeedCodec => Step::NeedCodec,
@@ -855,7 +855,7 @@ mod tests {
         }
     }
 
-    // --- 実行ヘルパ ---------------------------------------------------------
+    // --- Execution helpers --------------------------------------------------
 
     fn drive(steps: Vec<Script>, windows: Vec<WindowSpec>) -> Result<Vec<Vec<Value>>> {
         let mut op = Window::new(Mock::new(steps), windows)?;
@@ -863,7 +863,7 @@ mod tests {
         let mut vm = Vm::new();
         let mut rows = Vec::new();
         for guard in 0..100_000 {
-            assert!(guard < 99_999, "終わらない");
+            assert!(guard < 99_999, "does not terminate");
             let mut ctx =
                 ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
             match op.next(&mut ctx)? {
@@ -888,7 +888,7 @@ mod tests {
         drive(steps, windows).unwrap()
     }
 
-    /// 出力の `c` 列目を i64 で取り出す。
+    /// Extracts column `c` of the output as i64.
     fn ints_at(rows: &[Vec<Value>], c: usize) -> Vec<Option<i64>> {
         rows.iter().map(|r| r[c].as_i64()).collect()
     }
@@ -897,12 +897,12 @@ mod tests {
         rows.iter().map(|r| r[c].as_f64()).collect()
     }
 
-    /// 1 バッチ・2 列（g, x）の入力。
+    /// A one-batch, two-column (g, x) input.
     fn gx(g: &[Option<i32>], x: &[Option<i32>]) -> Vec<Script> {
         vec![Script::Rows(vec![ints(g), ints(x)])]
     }
 
-    // --- 中断と再開（最重要） -----------------------------------------------
+    // --- Interruption and resumption (the most important) -------------------
 
     #[test]
     fn need_io_and_need_codec_mid_input_match_uninterrupted_run() {
@@ -912,7 +912,7 @@ mod tests {
             let b = chunk(&[Some(1), Some(2)], &[Some(30), Some(1)]);
             let c = chunk(&[Some(2), Some(1)], &[Some(2), Some(20)]);
             if interrupted {
-                // 入力の途中（先頭でも末尾でもない位置）で両方の中断を挟む。
+                // Both kinds of interruption are interposed mid-input (neither at the start nor at the end).
                 vec![a, Script::NeedIo, b, Script::NeedCodec, c, Script::NeedIo]
             } else {
                 vec![a, b, c]
@@ -935,7 +935,7 @@ mod tests {
         let broken = run(mk(true), ws());
         assert_eq!(plain.len(), 6);
         for c in 0..4 {
-            assert_eq!(ints_at(&broken, c), ints_at(&plain, c), "列 {c}");
+            assert_eq!(ints_at(&broken, c), ints_at(&plain, c), "column {c}");
         }
     }
 
@@ -959,15 +959,15 @@ mod tests {
         assert!(matches!(op.next(&mut ctx).unwrap(), Step::NeedCodec));
         let b = match op.next(&mut ctx).unwrap() {
             Step::Ready(b) => b,
-            _ => panic!("行が来るはず"),
+            _ => panic!("rows should arrive"),
         };
         assert_eq!(b.card(), 2);
         assert_eq!(b.cols[2].value_at(1), Value::I64(2));
     }
 
-    // --- 順位系（DuckDB で照合済み） ----------------------------------------
+    // --- The ranking family (cross-checked with DuckDB) ---------------------
 
-    /// y = 1,1,2,2,3 に対する row_number / rank / dense_rank。
+    /// row_number / rank / dense_rank against y = 1,1,2,2,3.
     #[test]
     fn row_number_rank_dense_rank_with_ties() {
         let steps = gx(&[Some(1); 5], &[Some(1), Some(1), Some(2), Some(2), Some(3)]);
@@ -982,14 +982,14 @@ mod tests {
         assert_eq!(ints_at(&rows, 4), vec![Some(1), Some(1), Some(2), Some(2), Some(3)]);
     }
 
-    /// 複数列 PARTITION BY・DESC NULLS FIRST の ORDER BY を組み合わせる。
-    /// これまでの row_number/rank テストは単一列の PARTITION BY・既定
-    /// （ASC NULLS LAST）の ORDER BY でしか通っていなかった経路
-    /// （`cmp_keys` の複数キーループ・DESC 反転・NULL 位置反転）を確認する。
-    /// DuckDB で照合済み:
-    ///   PARTITION BY (1,1): x=10,20 → DESC で 20,10 → row_number 2,1
-    ///   PARTITION BY (1,2): x=30,40 → DESC で 40,30 → row_number 2,1
-    ///   PARTITION BY (2,1): x=NULL,5 → DESC NULLS FIRST で NULL,5 → row_number 1,2
+    /// Combines a multi-column PARTITION BY with a DESC NULLS FIRST ORDER BY.
+    /// The row_number/rank tests so far only exercised a single-column PARTITION BY with the
+    /// default (ASC NULLS LAST) ORDER BY; this covers the paths `cmp_keys`'s multi-key loop,
+    /// DESC inversion, and NULL-placement inversion.
+    /// Cross-checked with DuckDB:
+    ///   PARTITION BY (1,1): x=10,20 -> DESC gives 20,10 -> row_number 2,1
+    ///   PARTITION BY (1,2): x=30,40 -> DESC gives 40,30 -> row_number 2,1
+    ///   PARTITION BY (2,1): x=NULL,5 -> DESC NULLS FIRST gives NULL,5 -> row_number 1,2
     #[test]
     fn multi_column_partition_by_with_desc_nulls_first_order_by() {
         let steps = vec![Script::Rows(vec![
@@ -1005,13 +1005,13 @@ mod tests {
         assert_eq!(ints_at(&rows, 3), vec![Some(2), Some(1), Some(2), Some(1), Some(1), Some(2)]);
     }
 
-    // --- RANGE のピア群 -----------------------------------------------------
+    // --- RANGE peer groups --------------------------------------------------
 
-    /// 同順の行は同じ枠を共有する（ROWS ではなく RANGE）。
+    /// Tied rows share a frame (RANGE, not ROWS).
     /// DuckDB:
-    ///   y=1 の 2 行 → sum 30 / count 2 / avg 15
-    ///   y=2 の 2 行 → sum 100 / count 4 / avg 25
-    ///   y=3        → sum 150 / count 5 / avg 30
+    ///   the 2 rows with y=1 -> sum 30 / count 2 / avg 15
+    ///   the 2 rows with y=2 -> sum 100 / count 4 / avg 25
+    ///   y=3               -> sum 150 / count 5 / avg 30
     #[test]
     fn range_frame_shares_the_running_value_across_peers() {
         let steps = vec![Script::Rows(vec![
@@ -1039,19 +1039,22 @@ mod tests {
             dbls_at(&rows, 4),
             vec![Some(15.0), Some(15.0), Some(25.0), Some(25.0), Some(30.0)]
         );
-        assert_eq!(ints_at(&rows, 5), vec![Some(10); 5], "MIN は枠の先頭から");
+        assert_eq!(ints_at(&rows, 5), vec![Some(10); 5], "MIN comes from the frame's start");
         assert_eq!(ints_at(&rows, 6), vec![Some(20), Some(20), Some(40), Some(40), Some(50)]);
-        assert_eq!(ints_at(&rows, 7), vec![Some(10); 5], "FIRST_VALUE は分割の先頭");
+        assert_eq!(
+            ints_at(&rows, 7),
+            vec![Some(10); 5],
+            "FIRST_VALUE is the partition's first row"
+        );
         assert_eq!(
             ints_at(&rows, 8),
             vec![Some(20), Some(20), Some(40), Some(40), Some(50)],
-            "LAST_VALUE はピアの末尾"
+            "LAST_VALUE is the end of the peer group"
         );
     }
 
-    /// FIRST_VALUE/LAST_VALUE を実際に複数パーティションと組み合わせる。
-    /// 既存の RANGE テストは `.part(...)` を使わない単一パーティションでしか
-    /// 確認していなかった。
+    /// Actually combines FIRST_VALUE/LAST_VALUE with several partitions.
+    /// The existing RANGE tests only covered a single partition without using `.part(...)`.
     #[test]
     fn first_value_last_value_are_scoped_per_partition() {
         let steps = vec![Script::Rows(vec![
@@ -1070,16 +1073,16 @@ mod tests {
         assert_eq!(
             ints_at(&rows, 2),
             vec![Some(10), Some(10), Some(10), Some(100), Some(100)],
-            "FIRST_VALUE はパーティションごとに別々でなければならない"
+            "FIRST_VALUE must be separate per partition"
         );
         assert_eq!(
             ints_at(&rows, 3),
             vec![Some(30), Some(30), Some(30), Some(200), Some(200)],
-            "LAST_VALUE もパーティションを跨いで漏れてはいけない"
+            "LAST_VALUE must not leak across partitions either"
         );
     }
 
-    /// ORDER BY 無し（枠は分割全体）。全行が同じ値になる。
+    /// Without ORDER BY (the frame is the whole partition). Every row gets the same value.
     #[test]
     fn whole_partition_frame_without_order_by() {
         let steps = gx(&[Some(1); 3], &[Some(1), Some(2), Some(3)]);
@@ -1093,10 +1096,14 @@ mod tests {
         assert_eq!(ints_at(&rows, 2), vec![Some(6); 3]);
         assert_eq!(ints_at(&rows, 3), vec![Some(3); 3]);
         assert_eq!(ints_at(&rows, 4), vec![Some(1); 3]);
-        assert_eq!(ints_at(&rows, 5), vec![Some(3); 3], "枠が分割全体なら最後の行");
+        assert_eq!(
+            ints_at(&rows, 5),
+            vec![Some(3); 3],
+            "with a whole-partition frame, the last row"
+        );
     }
 
-    /// ORDER BY があっても枠が分割全体なら累計にならない。
+    /// Even with ORDER BY, a whole-partition frame does not produce a running total.
     #[test]
     fn explicit_whole_partition_frame_with_order_by() {
         let steps = gx(&[Some(1); 3], &[Some(3), Some(1), Some(2)]);
@@ -1136,12 +1143,12 @@ mod tests {
                 ])
                 .order(vec![skey(1, Ty::Int)])
                 .build(),
-            // lag(x, -1) は lead(x, 1) と同じ。
+            // lag(x, -1) is the same as lead(x, 1).
             spec(WindowKind::Lag, Ty::Int)
                 .args(vec![load(Ty::Int, 1), konst(Ty::BigInt, Value::I64(-1))])
                 .order(vec![skey(1, Ty::Int)])
                 .build(),
-            // lag(x, 0) は自分自身。
+            // lag(x, 0) is the row itself.
             spec(WindowKind::Lag, Ty::Int)
                 .args(vec![load(Ty::Int, 1), konst(Ty::BigInt, Value::I64(0))])
                 .order(vec![skey(1, Ty::Int)])
@@ -1155,7 +1162,7 @@ mod tests {
         assert_eq!(ints_at(&rows, 6), vec![Some(1), Some(2), Some(3)]);
     }
 
-    /// オフセットが NULL なら結果も NULL（DuckDB と同じ）。
+    /// A NULL offset gives a NULL result (the same as DuckDB).
     #[test]
     fn lag_with_null_offset_yields_null() {
         let steps = gx(&[Some(1); 2], &[Some(1), Some(2)]);
@@ -1166,7 +1173,7 @@ mod tests {
         assert_eq!(ints_at(&run(steps, ws), 2), vec![None, None]);
     }
 
-    /// lag は分割を跨がない。
+    /// lag does not cross partitions.
     #[test]
     fn lag_does_not_cross_partitions() {
         let steps =
@@ -1179,9 +1186,9 @@ mod tests {
         assert_eq!(ints_at(&run(steps, ws), 2), vec![None, Some(1), None, Some(3)]);
     }
 
-    // --- 分割 ---------------------------------------------------------------
+    // --- Partitioning -------------------------------------------------------
 
-    /// 複数分割。DuckDB の出力と同じ（g=2 は y が NULL の 2 行を含む）。
+    /// Several partitions. The same output as DuckDB's (g=2 includes the 2 rows where y is NULL).
     #[test]
     fn multiple_partitions_with_null_order_key() {
         // (g, y, x)
@@ -1202,22 +1209,22 @@ mod tests {
                 .build(),
         ];
         let rows = run(steps, ws);
-        // NULL は ASC/NULLS LAST で末尾、かつ NULL 同士はピア。
+        // With ASC/NULLS LAST, NULLs go last, and NULLs are peers with one another.
         assert_eq!(ints_at(&rows, 3), vec![Some(1), Some(2), Some(1), Some(2), Some(2)]);
         assert_eq!(ints_at(&rows, 4), vec![Some(10), Some(30), Some(1), Some(6), Some(6)]);
     }
 
-    /// PARTITION BY 無し = 分割が 1 つ。
+    /// Without PARTITION BY = one partition.
     #[test]
     fn single_partition_without_partition_by() {
         let steps = gx(&[Some(9); 4], &[Some(4), Some(3), Some(2), Some(1)]);
         let ws =
             vec![spec(WindowKind::RowNumber, Ty::BigInt).order(vec![skey(1, Ty::Int)]).build()];
-        // 入力行順で出るので、値 4,3,2,1 に対して順位は 4,3,2,1。
+        // Emitted in input row order, so values 4,3,2,1 get ranks 4,3,2,1.
         assert_eq!(ints_at(&run(steps, ws), 2), vec![Some(4), Some(3), Some(2), Some(1)]);
     }
 
-    /// NULL の分割キーは独立した 1 分割（GROUP BY と同じ）。
+    /// A NULL partition key forms its own single partition (as with GROUP BY).
     #[test]
     fn null_partition_keys_form_their_own_partition() {
         let steps = gx(&[None, Some(1), None, Some(1)], &[Some(1), Some(2), Some(3), Some(4)]);
@@ -1235,9 +1242,9 @@ mod tests {
         assert_eq!(ints_at(&rows, 3), vec![Some(4), Some(6), Some(4), Some(6)]);
     }
 
-    // --- 行順 ---------------------------------------------------------------
+    // --- Row order ----------------------------------------------------------
 
-    /// 出力は必ず入力の行順。分割内で並べ替えても戻ってくること。
+    /// The output is always in the input's row order. Reordering within a partition must come back.
     #[test]
     fn output_keeps_input_row_order() {
         let g = [Some(1), Some(2), Some(1), Some(2), Some(1)];
@@ -1248,14 +1255,14 @@ mod tests {
             .order(vec![skey(1, Ty::Int)])
             .build()];
         let rows = run(steps, ws);
-        // 入力列がそのまま並んでいること。
+        // The input columns must be laid out unchanged.
         assert_eq!(ints_at(&rows, 0), g.iter().map(|v| v.map(|x| x as i64)).collect::<Vec<_>>());
         assert_eq!(ints_at(&rows, 1), x.iter().map(|v| v.map(|x| x as i64)).collect::<Vec<_>>());
-        // g=1 は 10 < 30 < 50、g=2 は 1 < 5。
+        // g=1 has 10 < 30 < 50; g=2 has 1 < 5.
         assert_eq!(ints_at(&rows, 2), vec![Some(3), Some(2), Some(1), Some(1), Some(2)]);
     }
 
-    /// 同順の行は入力順を保つ（比較器が行番号で決着するため）。
+    /// Tied rows keep the input order (because the comparator breaks ties by row number).
     #[test]
     fn ties_keep_input_order_in_row_number() {
         let steps = gx(&[Some(1); 4], &[Some(7), Some(7), Some(7), Some(7)]);
@@ -1264,7 +1271,7 @@ mod tests {
         assert_eq!(ints_at(&run(steps, ws), 2), vec![Some(1), Some(2), Some(3), Some(4)]);
     }
 
-    // --- 大きさ -------------------------------------------------------------
+    // --- Size ---------------------------------------------------------------
 
     #[test]
     fn more_rows_than_batch_size() {
@@ -1273,7 +1280,7 @@ mod tests {
         let mut i = 0usize;
         while i < N {
             let end = (i + 500).min(N);
-            // g は 0/1 の 2 分割、x は通し番号（降順に見えるよう反転）。
+            // g partitions into 0/1, and x is a running number (reversed so it looks descending).
             let g: Vec<Option<i32>> = (i..end).map(|k| Some((k % 2) as i32)).collect();
             let x: Vec<Option<i32>> = (i..end).map(|k| Some((N - k) as i32)).collect();
             steps.push(Script::Rows(vec![ints(&g), ints(&x)]));
@@ -1290,7 +1297,7 @@ mod tests {
         ];
         let rows = run(steps, ws);
         assert_eq!(rows.len(), N);
-        // x は全体で単調減少なので、分割ごとの順位は末尾ほど小さい。
+        // x decreases monotonically overall, so per-partition ranks get smaller toward the end.
         let n0 = N.div_ceil(2) as i64;
         let n1 = (N / 2) as i64;
         assert_eq!(rows[0][2].as_i64(), Some(n0));
@@ -1325,18 +1332,18 @@ mod tests {
         assert_eq!(sizes, vec![BATCH_SIZE, 10]);
     }
 
-    // --- 端の条件 -----------------------------------------------------------
+    // --- Edge conditions ----------------------------------------------------
 
     #[test]
     fn empty_input_emits_nothing() {
         let ws =
             || vec![spec(WindowKind::RowNumber, Ty::BigInt).order(vec![skey(0, Ty::Int)]).build()];
         assert!(run(Vec::new(), ws()).is_empty());
-        // 0 行のバッチだけが来る場合も同じ。
+        // The same when only 0-row batches arrive.
         assert!(run(vec![Script::Rows(vec![ints(&[])]), Script::NeedIo], ws()).is_empty());
     }
 
-    /// NULL 値は SUM / COUNT(x) から外れるが COUNT(*) には入る。
+    /// NULL values drop out of SUM / COUNT(x) but count toward COUNT(*).
     #[test]
     fn nulls_in_the_value_are_ignored_by_aggregates() {
         let steps = gx(&[Some(1); 3], &[None, Some(2), None]);
@@ -1351,7 +1358,7 @@ mod tests {
         assert_eq!(ints_at(&rows, 4), vec![Some(3); 3]);
     }
 
-    /// 全部 NULL の枠は SUM が NULL、COUNT は 0。
+    /// An all-NULL frame gives NULL for SUM and 0 for COUNT.
     #[test]
     fn all_null_frame_sums_to_null() {
         let steps = gx(&[Some(1); 2], &[None, None]);
@@ -1366,7 +1373,7 @@ mod tests {
         assert!(rows[0][4].is_null());
     }
 
-    /// 文字列列でも first/last/min/max が動く（`Value` 経由の積み込み）。
+    /// first/last/min/max work on string columns too (pushing through `Value`).
     #[test]
     fn string_values() {
         let steps = vec![Script::Rows(vec![
@@ -1386,7 +1393,7 @@ mod tests {
         assert_eq!(rows[0][4], Value::Bytes(b"a".to_vec()));
     }
 
-    /// 0 列の入力（`count(*) OVER ()` だけを選ぶ経路）。
+    /// A zero-column input (the path selecting only `count(*) OVER ()`).
     #[test]
     fn zero_column_input() {
         struct RowsOnly(usize);
@@ -1411,13 +1418,13 @@ mod tests {
             ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
         let b = match op.next(&mut ctx).unwrap() {
             Step::Ready(b) => b,
-            _ => panic!("行が来るはず"),
+            _ => panic!("rows should arrive"),
         };
         assert_eq!(b.card(), 3);
         assert_eq!(b.cols[0].value_at(0), Value::I64(3));
     }
 
-    /// f64 の順序キー。NaN は最大、-0.0 と 0.0 は同順（ピア）。
+    /// The f64 ordering key. NaN is the maximum, and -0.0 and 0.0 are tied (peers).
     #[test]
     fn f64_order_key_is_a_total_order() {
         let steps = vec![Script::Rows(vec![col(
@@ -1434,12 +1441,12 @@ mod tests {
             spec(WindowKind::RowNumber, Ty::BigInt).order(vec![skey(0, Ty::Double)]).build(),
         ];
         let rows = run(steps, ws);
-        // 並びは -1.0 < -0.0 = 0.0 < NaN。
+        // The order is -1.0 < -0.0 = 0.0 < NaN.
         assert_eq!(ints_at(&rows, 1), vec![Some(4), Some(2), Some(2), Some(1)]);
         assert_eq!(ints_at(&rows, 2), vec![Some(4), Some(2), Some(3), Some(1)]);
     }
 
-    /// SUM は i128 で累積する（i64 では溢れる合計）。
+    /// SUM accumulates in i128 (a sum that overflows i64).
     #[test]
     fn sum_accumulates_in_i128() {
         let big = i64::MAX;
@@ -1466,7 +1473,7 @@ mod tests {
         assert_eq!(code_of(drive(steps, ws).map(|_| ())), Some(Code::ValueOutOfRange));
     }
 
-    /// 引数が要るのに無い、は構成側のバグとして弾く。
+    /// An argument required but absent is rejected as a construction-side bug.
     #[test]
     fn missing_argument_is_rejected() {
         let steps = gx(&[Some(1)], &[Some(1)]);
@@ -1474,7 +1481,7 @@ mod tests {
         assert_eq!(code_of(drive(steps, ws).map(|_| ())), Some(Code::WrongArgCount));
     }
 
-    /// 入力の selection vector を尊重する。
+    /// The input's selection vector is honored.
     #[test]
     fn selection_vector_on_input_is_respected() {
         struct Sel;
@@ -1485,7 +1492,7 @@ mod tests {
                 Ok(Step::Ready(b))
             }
         }
-        // 1 回だけ返すよう、2 回目以降は Done になるモックで包む。
+        // Wrapped in a mock that gives Done from the second call on, so it returns exactly once.
         struct Once(Option<Sel>);
         impl Operator for Once {
             fn next(&mut self, ctx: &mut ExecContext) -> Result<Step> {
@@ -1506,7 +1513,7 @@ mod tests {
             ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
         let b = match op.next(&mut ctx).unwrap() {
             Step::Ready(b) => b,
-            _ => panic!("行が来るはず"),
+            _ => panic!("rows should arrive"),
         };
         assert_eq!(b.card(), 2);
         assert_eq!(b.cols[0].value_at(0), Value::I32(1));

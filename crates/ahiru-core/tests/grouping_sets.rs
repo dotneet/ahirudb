@@ -1,9 +1,9 @@
-//! `GROUP BY GROUPING SETS`/`ROLLUP`/`CUBE`/`GROUPING()` の統合テスト。
+//! Integration tests for `GROUP BY GROUPING SETS`/`ROLLUP`/`CUBE`/`GROUPING()`.
 //!
-//! 期待値はすべて `duckdb -c "SELECT ..."` の実際の出力と突き合わせて決めている
-//! （`tests/data/basic.parquet` は DuckDB が書いた実ファイル）。
-//! `ddl`/`dml` フィーチャは要らない（読み取り専用の Parquet だけで足りる）ので、
-//! 既定フィーチャの `cargo test` でも必ず走る。
+//! All expected values are decided by cross-checking against the actual output of
+//! `duckdb -c "SELECT ..."` (`tests/data/basic.parquet` is a real file written by DuckDB).
+//! The `ddl`/`dml` features are not needed (read-only Parquet is enough), so this always
+//! runs even under the default-features `cargo test`.
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::session::{Prepared, QueryStep, Session};
@@ -20,8 +20,8 @@ fn session_with_basic() -> Session {
     s
 }
 
-/// `sql` を実行し、結果を `Vec<Vec<Value>>` として取り出す。
-/// `basic.parquet` はメモリ上にまるごと乗るので `NeedIo`/`NeedCodec` は出ない。
+/// Runs `sql` and extracts the result as `Vec<Vec<Value>>`.
+/// Since `basic.parquet` fits entirely in memory, `NeedIo`/`NeedCodec` never occur.
 fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     let mut q = match session.prepare(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
         Prepared::Ready(q) => q,
@@ -59,8 +59,8 @@ fn b(v: bool) -> Value {
 }
 const NULL: Value = Value::Null;
 
-/// GROUPING SETS/ROLLUP/CUBE を挟まない、素の GROUP BY が今まで通り動くこと
-/// （リグレッション確認）。
+/// A plain GROUP BY without GROUPING SETS/ROLLUP/CUBE still works as before
+/// (regression check).
 #[test]
 fn plain_group_by_is_unaffected() {
     let mut s = session_with_basic();
@@ -69,7 +69,7 @@ fn plain_group_by_is_unaffected() {
     assert_eq!(rows, vec![vec![b(false), i64(666)], vec![b(true), i64(334)],]);
 }
 
-/// `GROUPING SETS ((flag), ())`: 単純な小計 + 総計。セットに無い列は NULL になる。
+/// `GROUPING SETS ((flag), ())`: a simple subtotal + grand total. A column absent from a set becomes NULL.
 #[test]
 fn grouping_sets_basic() {
     let mut s = session_with_basic();
@@ -88,8 +88,8 @@ fn grouping_sets_basic() {
     );
 }
 
-/// `ROLLUP (flag, id % 3)`: 階層的な部分集合
-/// `(flag, id%3), (flag), ()` に展開される。
+/// `ROLLUP (flag, id % 3)`: expands into the hierarchical subsets
+/// `(flag, id%3), (flag), ()`.
 #[test]
 fn rollup_expands_to_hierarchical_subsets() {
     let mut s = session_with_basic();
@@ -111,7 +111,7 @@ fn rollup_expands_to_hierarchical_subsets() {
     );
 }
 
-/// `CUBE (flag, id % 3)`: 全部分集合（2^2 = 4 セット）に展開される。
+/// `CUBE (flag, id % 3)`: expands into all subsets (2^2 = 4 sets).
 #[test]
 fn cube_expands_to_all_subsets() {
     let mut s = session_with_basic();
@@ -136,8 +136,9 @@ fn cube_expands_to_all_subsets() {
     );
 }
 
-/// `GROUPING()`/`GROUPING_ID()`: 列がそのセットで生きていれば 0、集約で潰されて
-/// NULL になっていれば 1。複数引数は先頭を最上位ビットにしたビットマスク。
+/// `GROUPING()`/`GROUPING_ID()`: 0 if the column is alive in that set, 1 if it was collapsed
+/// by aggregation into NULL. With multiple arguments, it's a bitmask with the first argument
+/// as the highest bit.
 #[test]
 fn grouping_function_reports_which_columns_were_rolled_up() {
     let mut s = session_with_basic();
@@ -161,7 +162,7 @@ fn grouping_function_reports_which_columns_were_rolled_up() {
             vec![NULL, NULL, i64(1000), i64(1), i64(1), i64(3)],
         ]
     );
-    // `GROUPING_ID` は DuckDB でも `GROUPING` の別名（同じビットマスク意味論）。
+    // `GROUPING_ID` is also an alias for `GROUPING` in DuckDB (same bitmask semantics).
     let rows2 = run(
         &mut s,
         "SELECT flag, id % 3 AS m, grouping_id(flag, id % 3) gid \
@@ -171,7 +172,7 @@ fn grouping_function_reports_which_columns_were_rolled_up() {
     assert_eq!(last, &vec![NULL, NULL, i64(3)]);
 }
 
-/// `HAVING` はグルーピングセットを UNION ALL で束ねた後の最終結果に対して効く。
+/// `HAVING` applies to the final result after all grouping sets are combined with UNION ALL.
 #[test]
 fn having_filters_after_all_grouping_sets_are_combined() {
     let mut s = session_with_basic();
@@ -184,7 +185,7 @@ fn having_filters_after_all_grouping_sets_are_combined() {
     assert_eq!(rows, vec![vec![b(false), NULL, i64(666)], vec![NULL, NULL, i64(1000)],]);
 }
 
-/// `HAVING` の中で `GROUPING()` も使える。
+/// `GROUPING()` can also be used inside `HAVING`.
 #[test]
 fn having_can_reference_grouping() {
     let mut s = session_with_basic();
@@ -194,7 +195,7 @@ fn having_can_reference_grouping() {
          GROUP BY GROUPING SETS ((flag, id % 3), (flag), ()) \
          HAVING grouping(flag) = 0 ORDER BY 1, 2",
     );
-    // flag が生きている（潰れていない）行だけが残る = 総計行が落ちる。
+    // Only rows where `flag` is alive (not collapsed) remain -- the grand-total row is dropped.
     assert_eq!(
         rows,
         vec![
@@ -207,7 +208,7 @@ fn having_can_reference_grouping() {
     );
 }
 
-/// `GROUPING()` の引数はグルーピング列でなければならない。
+/// `GROUPING()`'s argument must be a grouping column.
 #[test]
 fn grouping_of_a_non_grouped_column_is_rejected() {
     let mut s = session_with_basic();
@@ -218,7 +219,7 @@ fn grouping_of_a_non_grouped_column_is_rejected() {
     assert_eq!(code_of(err), Some(Code::NotGrouped));
 }
 
-/// `GROUPING()` は集約が無いクエリでは使えない。
+/// `GROUPING()` cannot be used in a query with no aggregation.
 #[test]
 fn grouping_without_aggregation_is_rejected() {
     let mut s = session_with_basic();
@@ -226,9 +227,9 @@ fn grouping_without_aggregation_is_rejected() {
     assert_eq!(code_of(err), Some(Code::NotAggregate));
 }
 
-/// `GROUPING SETS` は全セットの和集合を「グルーピング列」として扱う。
-/// あるセットに無い列でも SELECT で裸参照でき、その行では NULL になる
-/// （エラーにはならない）。
+/// `GROUPING SETS` treats the union of all sets as the "grouping columns". A column absent
+/// from a given set can still be referenced bare in SELECT, becoming NULL for that row
+/// (not an error).
 #[test]
 fn columns_missing_from_a_set_are_still_selectable() {
     let mut s = session_with_basic();
@@ -236,7 +237,7 @@ fn columns_missing_from_a_set_are_still_selectable() {
         &mut s,
         "SELECT flag, id % 3 AS m FROM t GROUP BY GROUPING SETS ((flag), (id % 3)) ORDER BY 1, 2",
     );
-    // (flag) だけのセットでは m は必ず NULL、(id % 3) だけのセットでは flag は必ず NULL。
+    // In the (flag)-only set, `m` is always NULL; in the (id % 3)-only set, `flag` is always NULL.
     assert!(rows.iter().any(|r| r[0] != NULL && r[1] == NULL));
     assert!(rows.iter().any(|r| r[0] == NULL && r[1] != NULL));
 }

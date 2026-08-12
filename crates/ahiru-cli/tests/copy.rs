@@ -1,13 +1,13 @@
-//! `COPY (SELECT ...) TO 'path' [(FORMAT csv|jsonl|parquet)]` のエンドツーエンドテスト。
+//! End-to-end tests for `COPY (SELECT ...) TO 'path' [(FORMAT csv|jsonl|parquet)]`.
 //!
-//! `sql_e2e.rs` と同じ「期待値を手で書かずに DuckDB と突き合わせる」方針だが、
-//! ここでは標準出力の行を比べるのではなく、**実際に書き出されたファイルを
-//! バイト単位で** DuckDB の出力と比較する。`ahiru-core` はファイルシステムに
-//! 触れられない（no_std）ので、書き込みを実際に担う `ahiru-cli` の経路を
-//! 通しで確認するのが狙い（`crates/ahiru-core/src/write/mod.rs`、
-//! `crates/ahiru-core/src/session.rs` の `Query::copy_result` 参照）。
+//! Same policy as `sql_e2e.rs` -- cross-check against DuckDB rather than writing
+//! expected values by hand -- but here the comparison is not of stdout lines but of
+//! **the actually written files, byte for byte**, against DuckDB's output.
+//! `ahiru-core` cannot touch the filesystem (no_std), so the aim is to exercise the
+//! `ahiru-cli` path that actually performs the write (see
+//! `crates/ahiru-core/src/write/mod.rs` and `Query::copy_result` in `crates/ahiru-core/src/session.rs`).
 //!
-//! DuckDB が入っていない環境ではテストごと飛ばす（CI では入れる）。
+//! Environments without DuckDB skip these tests entirely (CI installs it).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,15 +20,15 @@ fn repo_path(rel: &str) -> String {
     format!("{}/../../{}", env!("CARGO_MANIFEST_DIR"), rel)
 }
 
-/// テストごとに衝突しないテンポラリファイルパスを作る。
+/// Builds a temporary file path that will not collide across tests.
 fn tmp_path(tag: &str, ext: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("ahiru_copy_test_{tag}_{}.{ext}", std::process::id()));
     p
 }
 
-/// ahiru CLI で `COPY` 文を実行する。標準出力は捨てて成否だけ見る
-/// （書き込み結果はファイルを直接読んで検証する）。
+/// Runs a `COPY` statement through the ahiru CLI. stdout is discarded and only
+/// success is checked (the written result is verified by reading the file directly).
 fn run_ahiru_copy(files: &[&str], sql: &str) {
     let mut args: Vec<String> = vec!["query".into()];
     args.extend(files.iter().map(|f| repo_path(f)));
@@ -44,7 +44,7 @@ fn run_ahiru_copy(files: &[&str], sql: &str) {
     );
 }
 
-/// DuckDB で `COPY` 文を実行する。
+/// Runs a `COPY` statement through DuckDB.
 fn run_duckdb_copy(sql: &str) {
     let out = Command::new("duckdb").args(["-c", sql]).output().expect("failed to run duckdb");
     assert!(
@@ -54,7 +54,7 @@ fn run_duckdb_copy(sql: &str) {
     );
 }
 
-/// DuckDB で 1 行 1 列を返すクエリを実行し、その値を文字列で返す。
+/// Runs a query returning one row and one column through DuckDB and returns that value as a string.
 fn duckdb_scalar(sql: &str) -> String {
     let out = Command::new("duckdb")
         .args(["-noheader", "-list", "-c", sql])
@@ -68,7 +68,7 @@ fn duckdb_scalar(sql: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// CSV ソースファイルを DuckDB から読む式（`sql_e2e.rs::duckdb_source` と同じ）。
+/// The expression for reading the CSV source file from DuckDB (same as `sql_e2e.rs::duckdb_source`).
 fn duckdb_csv_source(file: &str) -> String {
     format!("read_csv_auto('{}')", repo_path(file))
 }
@@ -76,7 +76,7 @@ fn duckdb_csv_source(file: &str) -> String {
 macro_rules! skip_without_duckdb {
     () => {
         if !duckdb_available() {
-            eprintln!("duckdb が無いので飛ばす");
+            eprintln!("duckdb not found, skipping");
             return;
         }
     };
@@ -101,9 +101,9 @@ fn copy_csv_extension_matches_duckdb_byte_for_byte() {
         duckdb_out.display()
     ));
 
-    let a = std::fs::read(&ahiru_out).expect("ahiru の出力が無い");
-    let d = std::fs::read(&duckdb_out).expect("duckdb の出力が無い");
-    assert_eq!(a, d, "CSV 出力がバイト単位で一致しない");
+    let a = std::fs::read(&ahiru_out).expect("no output from ahiru");
+    let d = std::fs::read(&duckdb_out).expect("no output from duckdb");
+    assert_eq!(a, d, "CSV output does not match byte for byte");
     let _ = std::fs::remove_file(&ahiru_out);
     let _ = std::fs::remove_file(&duckdb_out);
 }
@@ -111,8 +111,8 @@ fn copy_csv_extension_matches_duckdb_byte_for_byte() {
 #[test]
 fn copy_jsonl_format_matches_duckdb_byte_for_byte() {
     skip_without_duckdb!();
-    // 拡張子は敢えて CSV っぽくない `.ndjson` にして、明示 FORMAT が
-    // 拡張子より優先されることも一緒に確認する。
+    // The extension is deliberately the un-CSV-like `.ndjson`, so this also confirms
+    // that an explicit FORMAT takes precedence over the extension.
     let ahiru_out = tmp_path("jsonl_fmt", "ndjson");
     let duckdb_out = tmp_path("jsonl_fmt_duckdb", "ndjson");
 
@@ -123,24 +123,24 @@ fn copy_jsonl_format_matches_duckdb_byte_for_byte() {
             ahiru_out.display()
         ),
     );
-    // DuckDB は NDJSON も `FORMAT JSON` として書く（配列ではなく改行区切り。
-    // 手元の duckdb CLI で実測して確認済み）。
+    // DuckDB writes NDJSON under `FORMAT JSON` too (newline-delimited, not an array;
+    // confirmed by measuring the local duckdb CLI).
     run_duckdb_copy(&format!(
         "COPY (SELECT id, name, flag, big FROM {} ORDER BY id LIMIT 5) TO '{}' (FORMAT JSON)",
         duckdb_csv_source("tests/data/basic.csv"),
         duckdb_out.display()
     ));
 
-    let a = std::fs::read(&ahiru_out).expect("ahiru の出力が無い");
-    let d = std::fs::read(&duckdb_out).expect("duckdb の出力が無い");
-    assert_eq!(a, d, "JSONL 出力がバイト単位で一致しない");
+    let a = std::fs::read(&ahiru_out).expect("no output from ahiru");
+    let d = std::fs::read(&duckdb_out).expect("no output from duckdb");
+    assert_eq!(a, d, "JSONL output does not match byte for byte");
     let _ = std::fs::remove_file(&ahiru_out);
     let _ = std::fs::remove_file(&duckdb_out);
 }
 
-/// `COPY <table> TO ...`（サブクエリでなく素のテーブル名）が
-/// `SELECT * FROM <table>` と同じ結果になることを、DuckDB 側は明示
-/// `SELECT *` で組んで突き合わせる。
+/// Confirms that `COPY <table> TO ...` (a plain table name rather than a subquery)
+/// produces the same result as `SELECT * FROM <table>`, cross-checked against a
+/// DuckDB side written with an explicit `SELECT *`.
 #[test]
 fn copy_table_form_matches_select_star_from_table() {
     skip_without_duckdb!();
@@ -154,9 +154,9 @@ fn copy_table_form_matches_select_star_from_table() {
         duckdb_out.display()
     ));
 
-    let a = std::fs::read(&ahiru_out).expect("ahiru の出力が無い");
-    let d = std::fs::read(&duckdb_out).expect("duckdb の出力が無い");
-    assert_eq!(a, d, "COPY <table> TO の出力がバイト単位で一致しない");
+    let a = std::fs::read(&ahiru_out).expect("no output from ahiru");
+    let d = std::fs::read(&duckdb_out).expect("no output from duckdb");
+    assert_eq!(a, d, "the output of COPY <table> TO does not match byte for byte");
     let _ = std::fs::remove_file(&ahiru_out);
     let _ = std::fs::remove_file(&duckdb_out);
 }
@@ -172,19 +172,19 @@ fn copy_unsupported_format_fails_clearly() {
         .args(&args)
         .output()
         .expect("failed to run ahiru");
-    assert!(!out.status.success(), "未対応フォーマットの COPY は失敗するはず");
-    assert!(!out_path.exists(), "失敗したのにファイルが作られている: {}", out_path.display());
+    assert!(!out.status.success(), "COPY with an unsupported format should fail");
+    assert!(!out_path.exists(), "it failed yet a file was created: {}", out_path.display());
 }
 
 // --- Parquet -----------------------------------------------------------------
-// Parquet の出力はバイト単位では DuckDB と一致しない（エンコーディング・
-// 圧縮・統計の選び方が違う。ahirudb 側は非圧縮 PLAIN のみ）。ここで確かめ
-// たいのは「DuckDB が読めるか」なので、比較は書き出したファイルを DuckDB に
-// 読ませた結果と元データの突き合わせで行う。ahirudb 自身の reader との往復は
-// `crates/ahiru-core/src/write/parquet/tests.rs` 側で見ている。
+// Parquet output does not match DuckDB byte for byte (encodings, compression, and
+// statistics choices differ; ahirudb writes uncompressed PLAIN only). What matters
+// here is "can DuckDB read it", so the comparison is made by having DuckDB read the
+// written file and matching that against the source data. The round trip through
+// ahirudb's own reader is covered in `crates/ahiru-core/src/write/parquet/tests.rs`.
 
-/// 書き出した Parquet を DuckDB に読ませ、元の CSV と 1 行も食い違わない
-/// ことを対称差の件数で確かめる。
+/// Has DuckDB read the written Parquet and confirms, via the size of the symmetric
+/// difference, that not one row differs from the source CSV.
 #[test]
 fn copy_parquet_is_readable_by_duckdb_with_identical_rows() {
     skip_without_duckdb!();
@@ -205,14 +205,14 @@ fn copy_parquet_is_readable_by_duckdb_with_identical_rows() {
            (SELECT {cols} FROM {pq} EXCEPT ALL SELECT {cols} FROM {src})
          )"
     ));
-    assert_eq!(diff, "0", "DuckDB から見た行が元の CSV と食い違う");
+    assert_eq!(diff, "0", "the rows DuckDB sees differ from the source CSV");
 
     let _ = std::fs::remove_file(&ahiru_out);
 }
 
-/// DuckDB が推論する列型が、書き出し時の SQL 型と一致すること。
-/// 論理型（`DATE` / `DECIMAL` / `UUID` / `TIMESTAMP(isAdjustedToUTC)` など）
-/// をフッタに正しく書けているかは、値だけを比べても分からない。
+/// The column types DuckDB infers must match the SQL types at write time.
+/// Whether logical types (`DATE` / `DECIMAL` / `UUID` / `TIMESTAMP(isAdjustedToUTC)`
+/// and so on) are written correctly into the footer cannot be told from values alone.
 #[test]
 fn copy_parquet_preserves_column_types_as_duckdb_sees_them() {
     skip_without_duckdb!();
@@ -263,27 +263,27 @@ fn copy_parquet_preserves_column_types_as_duckdb_sees_them() {
     let _ = std::fs::remove_file(&ahiru_out);
 }
 
-/// 1 ファイルに複数の RowGroup が並ぶ場合も DuckDB から通しで読めること。
-/// 行数はテスト内で生成する（リポジトリに 12 万行のデータを置きたくない）。
+/// A file with multiple RowGroups must also be readable end to end from DuckDB.
+/// The rows are generated inside the test (no wish to keep 120k rows of data in the repository).
 #[test]
 fn copy_parquet_spanning_multiple_row_groups_reads_back_intact() {
     skip_without_duckdb!();
     let src = tmp_path("parquet_multi_rg_src", "csv");
     let ahiru_out = tmp_path("parquet_multi_rg", "parquet");
 
-    // `write::parquet::ROW_GROUP_ROWS` は 122880。それを確実に跨ぐ行数。
+    // `write::parquet::ROW_GROUP_ROWS` is 122880. Pick a row count that certainly crosses it.
     let rows = 130_000usize;
     let mut csv = String::from("id,name\n");
     for i in 0..rows {
-        // 5 行に 1 行を NULL にして、definition level が RLE と bit-packed の
-        // 両方を通るようにする。
+        // Make one row in five NULL, so definition levels go through both the RLE
+        // and bit-packed paths.
         if i % 5 == 0 {
             csv.push_str(&format!("{i},\n"));
         } else {
             csv.push_str(&format!("{i},n{i}\n"));
         }
     }
-    std::fs::write(&src, csv).expect("テンポラリ CSV を書けない");
+    std::fs::write(&src, csv).expect("cannot write the temporary CSV");
 
     let out = Command::new(env!("CARGO_BIN_EXE_ahiru"))
         .args([

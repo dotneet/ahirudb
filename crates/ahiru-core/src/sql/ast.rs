@@ -1,14 +1,14 @@
-//! SQL の抽象構文木。
+//! The SQL abstract syntax tree.
 //!
-//! 式は `Box`/`Rc` ではなくアリーナ上の `u32` インデックスで参照する
-//! （DESIGN.md §7）。確保回数が減り、`Drop` の再帰も消えるので、
-//! コードサイズと実行速度の両方に効く。
+//! Expressions are referenced by `u32` indices into an arena rather than `Box`/`Rc`
+//! (DESIGN.md §7). That reduces allocations and removes recursive `Drop`, helping both
+//! code size and execution speed.
 
 use crate::format::FormatKind;
 use crate::prelude::*;
 use crate::vector::{Ty, Value};
 
-/// `ExprArena` 内の式の位置。
+/// The position of an expression within an `ExprArena`.
 pub type ExprId = u32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,7 +46,7 @@ impl BinaryOp {
         matches!(self, BinaryOp::And | BinaryOp::Or)
     }
 
-    /// 左右を入れ替えたときに等価になる演算子。述語プッシュダウンで使う。
+    /// Operators that stay equivalent when their operands are swapped. Used by predicate pushdown.
     pub fn swapped(self) -> BinaryOp {
         use BinaryOp::*;
         match self {
@@ -92,33 +92,32 @@ pub enum ColumnsSpec {
     Names(Vec<String>),
 }
 
-// Clone は導出しない。サブクエリを含むようになったため、式 1 つの複製が
-// クエリ木まるごとの複製になりかねない。必要な場所では子の Vec だけを複製する。
+// Clone is not derived. Now that subqueries are involved, cloning one expression could
+// clone an entire query tree. Where needed, only the children Vec is cloned.
 pub enum Expr {
     Literal(Value),
-    /// `INTERVAL '...'` リテラル。`vector::pack_interval` で詰めた生の値。
-    /// `Literal` と分けているのは、`Value::I128` だけでは既定の論理型が
-    /// `HUGEINT` に決まってしまい `INTERVAL` と区別できないため。
+    /// An `INTERVAL '...'` literal. The raw value packed by `vector::pack_interval`.
+    /// It is separate from `Literal` because `Value::I128` alone would fix the default
+    /// logical type to `HUGEINT`, making it indistinguishable from `INTERVAL`.
     IntervalLiteral(i128),
-    /// `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` 等が束縛前に置き換えられた
-    /// 結果。`Literal` と分けているのは `IntervalLiteral` と同じ理由
-    /// （`Value` の物理表現だけでは論理型を決められない: `Value::I32` は
-    /// 既定で `INTEGER`、`Value::I64` は `BIGINT` になり `DATE`/`TIMESTAMP`
-    /// と区別できない）。クエリ開始時刻はホストから 1 度だけ渡され、
-    /// `Session::prepare` が構文木をこのノードへ置き換えてから束縛する
-    /// （`sql::now::substitute_now` 参照）ので、`plan::compile` 以降は
-    /// 単なる定数として扱うだけでよい。
+    /// The result of substituting `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` and friends
+    /// before binding. Separate from `Literal` for the same reason as `IntervalLiteral`
+    /// (the physical representation of a `Value` alone cannot fix the logical type:
+    /// `Value::I32` defaults to `INTEGER` and `Value::I64` to `BIGINT`, indistinguishable
+    /// from `DATE`/`TIMESTAMP`). The query start time is passed once by the host, and
+    /// `Session::prepare` rewrites the syntax tree into this node before binding (see
+    /// `sql::now::substitute_now`), so from `plan::compile` onward it is just a constant.
     TypedLiteral(Value, Ty),
-    /// `?` プレースホルダ。0 始まり。
+    /// A `?` placeholder. 0-based.
     Param(u16),
     ColumnRef {
         qualifier: Option<String>,
         name: String,
     },
-    /// `*` または `t.*`。SELECT リストでのみ有効。
-    /// `EXCLUDE (col, ...)` / `REPLACE (expr AS col, ...)` は DuckDB 拡張。
-    /// どちらも列名として使われうる一般語なので、パーサは `*`/`t.*` の直後
-    /// という文脈でだけキーワードとして読む（`sql::parser` 参照）。
+    /// `*` or `t.*`. Valid only in a SELECT list.
+    /// `EXCLUDE (col, ...)` / `REPLACE (expr AS col, ...)` are DuckDB extensions.
+    /// Both are common words that could be column names, so the parser reads them as
+    /// keywords only in the context immediately following `*`/`t.*` (see `sql::parser`).
     Star {
         qualifier: Option<String>,
         /// `Some(..)` when this star was written as DuckDB's `COLUMNS(...)`
@@ -129,9 +128,9 @@ pub enum Expr {
         /// qualifier — `t.COLUMNS(*)` is not accepted by DuckDB either
         /// (verified: "Scalar Function with name columns does not exist").
         columns: Option<ColumnsSpec>,
-        /// 展開結果から除く列名（大小無視で比較）。
+        /// Column names excluded from the expansion (compared case-insensitively).
         exclude: Vec<String>,
-        /// 展開結果のうち指定列を式の評価結果に差し替える。列名自体は変わらない。
+        /// Replaces the named columns of the expansion with the result of an expression. The column names themselves are unchanged.
         replace: Vec<(ExprId, String)>,
         /// `RENAME (old AS new, ...)`: relabels columns in the expansion,
         /// as `(old_name, new_name)` pairs. Applied after `exclude`/`replace`
@@ -156,7 +155,7 @@ pub enum Expr {
     Cast {
         arg: ExprId,
         ty: Ty,
-        /// `TRY_CAST`。変換できない行はエラーにせず NULL にする。
+        /// `TRY_CAST`. Rows that cannot be converted become NULL instead of an error.
         try_: bool,
     },
     /// `CASE [operand] WHEN .. THEN .. [ELSE ..] END`
@@ -185,10 +184,10 @@ pub enum Expr {
         pattern: ExprId,
         negated: bool,
         escape: Option<u8>,
-        /// `ILIKE`。大文字小文字を無視して比較する。
+        /// `ILIKE`. Compares case-insensitively.
         ci: bool,
     },
-    /// 集約関数もスカラ関数もここに入る。区別は binder が行う。
+    /// Both aggregate and scalar functions land here. The binder tells them apart.
     Function {
         name: String,
         args: Vec<ExprId>,
@@ -196,26 +195,26 @@ pub enum Expr {
         distinct: bool,
         /// `COUNT(*)`
         star: bool,
-        /// `agg(...) FILTER (WHERE cond)`。集約関数にのみ意味を持つ。
+        /// `agg(...) FILTER (WHERE cond)`. Meaningful only for aggregate functions.
         filter: Option<ExprId>,
     },
-    /// ウィンドウ関数（`f(...) OVER (PARTITION BY .. ORDER BY ..)`、
-    /// または `f(...) OVER w` の名前付き参照）。
+    /// A window function (`f(...) OVER (PARTITION BY .. ORDER BY ..)`, or the named
+    /// reference `f(...) OVER w`).
     Window {
         name: String,
         args: Vec<ExprId>,
         star: bool,
-        /// `OVER w`（識別子 1 つだけ）の場合に `Some(w)`。このとき
-        /// `partition_by`/`order_by`/`frame` は未使用（空/既定値）のままで、
-        /// 実体は束縛時に `SelectStmt::windows` から `w` を引いて使う
-        /// （`WINDOW` 句は構文上 SELECT リストより後に現れるため、パース時点
-        /// ではまだ定義を知りえない。`plan::bind` 参照）。
+        /// `Some(w)` for `OVER w` (a single identifier). In that case
+        /// `partition_by`/`order_by`/`frame` stay unused (empty/default) and the real
+        /// definition is looked up from `SelectStmt::windows` by `w` at bind time (the
+        /// `WINDOW` clause syntactically follows the SELECT list, so the definition
+        /// cannot be known at parse time; see `plan::bind`).
         window_ref: Option<String>,
         partition_by: Vec<ExprId>,
         order_by: Vec<OrderByItem>,
         frame: WindowFrame,
     },
-    /// スカラサブクエリ（`(SELECT ...)`）。1 行 1 列を返さなければならない。
+    /// A scalar subquery (`(SELECT ...)`). It must return one row and one column.
     ScalarSubquery(Box<QueryStmt>),
     /// `EXISTS (SELECT ...)`
     Exists {
@@ -246,28 +245,28 @@ pub enum Expr {
         all: bool,
         query: Box<QueryStmt>,
     },
-    /// `UNNEST(expr)`。SELECT リストにのみ書ける（FROM 句の `UNNEST` は
-    /// `FromItem::Unnest`）。対象は `Ty::Json`（配列）でなければならない。
-    /// 集約でも通常のスカラ式でもない特殊な式として `plan::bind` が拾う
-    /// （`FILTER`/`QUALIFY` と同じ扱い）。
+    /// `UNNEST(expr)`. Writable only in a SELECT list (`UNNEST` in a FROM clause is
+    /// `FromItem::Unnest`). The target must be `Ty::Json` (an array). `plan::bind` picks
+    /// it up as a special expression that is neither an aggregate nor an ordinary scalar
+    /// expression (the same treatment as `FILTER`/`QUALIFY`).
     Unnest(ExprId),
-    /// `x -> expr` / `(a, b) -> expr`。`list_transform`/`list_filter`/
-    /// `list_reduce` の引数としてのみパーサが生成する
-    /// （`sql::parser::Parser::call` 参照。関数呼び出しの引数位置以外では
-    /// `->` は JSON パス演算子 (`json_extract`) の糖衣構文のまま）。
+    /// `x -> expr` / `(a, b) -> expr`. The parser produces this only as an argument to
+    /// `list_transform`/`list_filter`/`list_reduce` (see `sql::parser::Parser::call`;
+    /// anywhere other than an argument position, `->` remains sugar for the JSON path
+    /// operator `json_extract`).
     ///
-    /// `params` は本体の中だけで有効な仮引数名で、外側の SQL スコープの列とは
-    /// 独立している。`plan::compile` はラムダ本体を外側とは別の孤立した
-    /// スコープでコンパイルする（`Compiler::lambda_call` の doc 参照）ので、
-    /// 通常の式の位置（`plan::compile::Compiler::expr_inner` の一般経路）に
-    /// 出現した場合はエラーにする。
+    /// `params` are formal parameter names valid only inside the body, independent of the
+    /// columns of the enclosing SQL scope. `plan::compile` compiles a lambda body in a
+    /// scope isolated from the enclosing one (see the docs on `Compiler::lambda_call`),
+    /// so appearing in an ordinary expression position (the general path of
+    /// `plan::compile::Compiler::expr_inner`) is an error.
     Lambda {
         params: Vec<String>,
         body: ExprId,
     },
 }
 
-/// 式のアリーナ。
+/// The expression arena.
 #[derive(Default)]
 pub struct ExprArena {
     nodes: Vec<Expr>,
@@ -297,7 +296,7 @@ impl ExprArena {
         self.nodes.is_empty()
     }
 
-    /// 全ノードを走査するイテレータ（`sql::now::substitute_now` 用）。
+    /// An iterator over every node (for `sql::now::substitute_now`).
     pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, Expr> {
         self.nodes.iter_mut()
     }
@@ -310,27 +309,27 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
-    /// 左の行を、右に一致があれば 1 回だけ返す。`IN (SELECT)` / `EXISTS` の
-    /// 書き換え先。構文からは作られず、バインダだけが生成する。
+    /// Returns each left row exactly once if the right side has a match. The rewrite
+    /// target of `IN (SELECT)` / `EXISTS`. Never produced by syntax; only the binder generates it.
     Semi,
-    /// 左の行を、右に一致が無ければ返す。`NOT IN` / `NOT EXISTS` 用。
+    /// Returns each left row if the right side has no match. For `NOT IN` / `NOT EXISTS`.
     Anti,
-    /// NULL 対応の ANTI。`NOT IN (SELECT ...)` の書き換え先で、バインダだけが
-    /// 生成する。`Anti` との違いは SQL の 3 値論理をそのまま再現する点:
-    /// 右のキーに NULL が 1 つでもあれば比較が UNKNOWN になり**結果は空**、
-    /// 左のキーが NULL の行も（右が空でない限り）返さない。
+    /// NULL-aware ANTI. The rewrite target of `NOT IN (SELECT ...)`, generated only by the
+    /// binder. Unlike `Anti`, it reproduces SQL's three-valued logic exactly: if any right
+    /// key is NULL the comparison is UNKNOWN and **the result is empty**, and rows whose
+    /// left key is NULL are not returned either (unless the right side is empty).
     AntiNullAware,
 }
 
 impl JoinKind {
-    /// 出力が左のスキーマだけになる結合か（右の列を返さない）。
+    /// Whether the output is just the left schema (the right columns are not returned).
     pub fn is_semi(self) -> bool {
         matches!(self, JoinKind::Semi | JoinKind::Anti | JoinKind::AntiNullAware)
     }
 }
 
 pub enum FromItem {
-    /// 登録済みテーブル名。
+    /// A registered table name.
     Table {
         name: String,
         alias: Option<String>,
@@ -369,41 +368,41 @@ pub enum FromItem {
         kind: JoinKind,
         on: Option<ExprId>,
     },
-    /// `UNNEST(expr) [AS alias[(col)]]`。DuckDB は明示的な `LATERAL` 無しで
-    /// 先行する FROM 項目の列を参照できる（暗黙的に LATERAL）ので、`expr` は
-    /// 左の兄弟が積んだ列だけを参照できるという制約付きで束縛する
-    /// （`plan::bind::flatten_from`/`build_tree` 参照）。単独 (`FROM UNNEST(...)`)
-    /// や JOIN の左側での出現は非対応として明確に拒否する。
+    /// `UNNEST(expr) [AS alias[(col)]]`. DuckDB can reference columns of preceding FROM
+    /// items without an explicit `LATERAL` (implicitly LATERAL), so `expr` is bound with
+    /// the constraint that it may only reference columns contributed by its left siblings
+    /// (see `plan::bind::flatten_from`/`build_tree`). Appearing alone (`FROM UNNEST(...)`)
+    /// or on the left of a JOIN is explicitly rejected as unsupported.
     Unnest {
         expr: ExprId,
         alias: Option<String>,
         column_alias: Option<String>,
     },
     /// `generate_series(start, stop[, step])` / `range([start,] stop[, step])`
-    /// テーブル関数。DuckDB は任意の式を引数に取れるが、束縛時定数畳み込みの
-    /// 仕組みが無い（`plan::bind` は列参照が要る式しかコンパイルできない）ので
-    /// v1 はリテラル整数のみを受け付ける（`sql::parser::Parser::signed_int_lit`）。
-    /// `stop` の扱いが 2 関数で違う: `range` は半開区間、`generate_series` は
-    /// 閉区間（`duckdb` CLI で確認済み）。
+    /// Table functions. DuckDB accepts arbitrary expressions as arguments, but there is
+    /// no bind-time constant-folding machinery here (`plan::bind` can only compile
+    /// expressions that need column references), so v1 accepts literal integers only
+    /// (`sql::parser::Parser::signed_int_lit`). `stop` is treated differently by the two
+    /// functions: `range` is half-open, `generate_series` is closed (confirmed with the `duckdb` CLI).
     GenerateSeries {
         start: i64,
         stop: i64,
         step: i64,
-        /// `true` なら `generate_series`（`stop` を含む）、`false` なら
-        /// `range`（`stop` を含まない）。
+        /// `true` for `generate_series` (which includes `stop`), `false` for `range`
+        /// (which does not).
         inclusive: bool,
         alias: Option<String>,
         column_alias: Option<String>,
     },
 }
 
-/// `USING SAMPLE`/`TABLESAMPLE` のサンプリング手法。
+/// The sampling method of `USING SAMPLE`/`TABLESAMPLE`.
 ///
-/// `duckdb` CLI で確認した限り、手法ごとに実際のアルゴリズムが違う
-/// （`SYSTEM` はベクタ単位、`BERNOULLI` は行単位、`RESERVOIR` は行数指定
-/// 専用）が、このエンジンは構文だけ受理して実装は 1 通りに単純化する
-/// （タスクの優先度: パーセント指定 > 行数指定 > 手法の使い分け）。
-/// `plan::bind::resolve_sample_spec` 参照。
+/// As far as the `duckdb` CLI shows, each method uses a genuinely different algorithm
+/// (`SYSTEM` per vector, `BERNOULLI` per row, `RESERVOIR` only for a row count), but
+/// this engine accepts only the syntax and simplifies the implementation to one
+/// approach (task priority: percentage > row count > distinguishing methods).
+/// See `plan::bind::resolve_sample_spec`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SampleMethod {
     Bernoulli,
@@ -411,15 +410,15 @@ pub enum SampleMethod {
     Reservoir,
 }
 
-/// `USING SAMPLE <spec>` / `TABLESAMPLE <spec>` の構文を保持する。
+/// Holds the syntax of `USING SAMPLE <spec>` / `TABLESAMPLE <spec>`.
 pub struct SampleSpec {
     pub method: SampleMethod,
-    /// `is_rows` が `false` なら 0.0..=100.0 のパーセント、`true` なら
-    /// 残す行数（浮動小数のまま持つ。`duckdb` は端数を丸めて受け付ける）。
+    /// A percentage in 0.0..=100.0 when `is_rows` is `false`, or the number of rows to
+    /// keep when `true` (held as a float; `duckdb` rounds fractions and accepts them).
     pub amount: f64,
     pub is_rows: bool,
-    /// `USING SAMPLE 10% (bernoulli, 42)` のような明示シード。省略時は
-    /// 固定の既定値を使う（決定的でよい、というタスクの指示どおり）。
+    /// An explicit seed, as in `USING SAMPLE 10% (bernoulli, 42)`. When omitted, a fixed
+    /// default is used (determinism is fine, per the task's instruction).
     pub seed: Option<i64>,
 }
 
@@ -451,7 +450,7 @@ pub struct OrderByAll {
     pub nulls_first: bool,
 }
 
-/// 集合演算。
+/// Set operations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SetOp {
     Union,
@@ -459,45 +458,44 @@ pub enum SetOp {
     Except,
 }
 
-/// クエリ本体。集合演算で入れ子になる。
+/// The body of a query. Nests through set operations.
 ///
-/// `EXCEPT` は結合的でない（`(a EXCEPT b) EXCEPT c` と
-/// `a EXCEPT (b EXCEPT c)` は違う）ので、平坦なリストではなく木で持つ。
-/// パーサは左結合で組み立てること。
+/// `EXCEPT` is not associative (`(a EXCEPT b) EXCEPT c` differs from
+/// `a EXCEPT (b EXCEPT c)`), so this is a tree rather than a flat list.
+/// The parser must build it left-associatively.
 pub enum SetExpr {
     Select(Box<SelectStmt>),
     SetOp {
         op: SetOp,
-        /// `UNION ALL` のように重複を残すか。
+        /// Whether duplicates are kept, as with `UNION ALL`.
         all: bool,
         left: Box<SetExpr>,
         right: Box<SetExpr>,
     },
 }
 
-/// 共通表式（`WITH name AS (...)`）。
+/// A common table expression (`WITH name AS (...)`).
 pub struct Cte {
     pub name: String,
-    /// `name(a, b, ...)` の明示列名。空なら本体のスキーマをそのまま使う。
-    /// `WITH RECURSIVE` の下でのみパーサが許す（DESIGN.md 通り、通常の
-    /// `WITH` では列リストは未対応のまま）。
+    /// The explicit column names of `name(a, b, ...)`. When empty, the body's schema is used as is.
+    /// The parser allows this only under `WITH RECURSIVE` (as per DESIGN.md, column lists
+    /// remain unsupported for ordinary `WITH`).
     pub columns: Vec<String>,
-    /// `WITH RECURSIVE` の対象になっている CTE か。
+    /// Whether this CTE is under a `WITH RECURSIVE`.
     ///
-    /// 立っていても実際には自分自身を参照しない CTE（`WITH RECURSIVE base
-    /// AS (...), t AS (... base ... UNION ALL ... t ...)` の `base` 側）が
-    /// 混ざってよいのは標準 SQL 通り。実際に再帰が要るかどうかは束縛時
-    /// （`plan::bind`）に本文を見て判定する。
+    /// Per standard SQL, it is fine for CTEs that are flagged but do not actually
+    /// reference themselves to be mixed in (the `base` side of `WITH RECURSIVE base
+    /// AS (...), t AS (... base ... UNION ALL ... t ...)`). Whether recursion is really
+    /// needed is decided at bind time (`plan::bind`) by looking at the body.
     pub recursive: bool,
     pub query: Box<QueryStmt>,
 }
 
-/// 文としてのクエリ全体。
+/// A whole query as a statement.
 ///
-/// `ORDER BY` / `LIMIT` を `SelectStmt` と両方に持つのは、
-/// `SELECT ... UNION SELECT ... ORDER BY x` の `ORDER BY` が
-/// **集合演算の結果全体**に掛かるため。派生表の中の `SELECT` は自分の
-/// `SelectStmt` 側を使う。
+/// `ORDER BY` / `LIMIT` live both here and on `SelectStmt` because the `ORDER BY` of
+/// `SELECT ... UNION SELECT ... ORDER BY x` applies to **the whole set-operation
+/// result**. A `SELECT` inside a derived table uses its own `SelectStmt` side.
 pub struct QueryStmt {
     pub ctes: Vec<Cte>,
     pub body: SetExpr,
@@ -509,7 +507,7 @@ pub struct QueryStmt {
 }
 
 impl QueryStmt {
-    /// 集合演算も CTE も無い単純な SELECT ならそれを返す。
+    /// Returns the plain SELECT if there is neither a set operation nor a CTE.
     pub fn as_simple_select(&self) -> Option<&SelectStmt> {
         if !self.ctes.is_empty() || !self.order_by.is_empty() || self.limit.is_some() {
             return None;
@@ -521,17 +519,17 @@ impl QueryStmt {
     }
 }
 
-/// ウィンドウ関数の枠。v1 は既定枠のみ扱う。
+/// A window function frame. v1 handles only the default frames.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowFrame {
-    /// `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`（ORDER BY あり時の既定）
+    /// `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (the default when ORDER BY is present)
     RangeUnboundedPreceding,
-    /// `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`（ORDER BY 無し時の既定）
+    /// `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (the default without ORDER BY)
     WholePartition,
 }
 
-/// 名前付きウィンドウ定義（`WINDOW name AS (...)`）の本体。
-/// `Expr::Window` の `partition_by`/`order_by`/`frame` と同じ形。
+/// The body of a named window definition (`WINDOW name AS (...)`).
+/// The same shape as `Expr::Window`'s `partition_by`/`order_by`/`frame`.
 pub struct WindowDef {
     pub partition_by: Vec<ExprId>,
     pub order_by: Vec<OrderByItem>,
@@ -540,8 +538,8 @@ pub struct WindowDef {
 
 pub struct SelectStmt {
     pub distinct: bool,
-    /// `DISTINCT ON (expr, ...)`。空なら未使用。`distinct` とは排他
-    /// （パーサがどちらか一方だけを立てる）。
+    /// `DISTINCT ON (expr, ...)`. Empty when unused. Mutually exclusive with `distinct`
+    /// (the parser sets only one of them).
     pub distinct_on: Vec<ExprId>,
     pub items: Vec<SelectItem>,
     pub from: Option<FromItem>,
@@ -558,29 +556,29 @@ pub struct SelectStmt {
     /// excluded when an aggregate appears anywhere inside it, not only when
     /// the item *is* an aggregate call.
     pub group_by_all: bool,
-    /// `GROUP BY GROUPING SETS (...)` / `ROLLUP (...)` / `CUBE (...)`。
-    /// `Some` のときは `group_by` は使わず、各要素が 1 つのグルーピングセット
-    /// （その回のグルーピングに使う列の組）を表す。`ROLLUP`/`CUBE` はパーサが
-    /// 対応するセット集合へ展開済み（`sql::parser` 参照）。
+    /// `GROUP BY GROUPING SETS (...)` / `ROLLUP (...)` / `CUBE (...)`.
+    /// When `Some`, `group_by` is unused and each element represents one grouping set
+    /// (the set of columns used for that round of grouping). `ROLLUP`/`CUBE` are already
+    /// expanded by the parser into the corresponding set collections (see `sql::parser`).
     pub grouping_sets: Option<Vec<Vec<ExprId>>>,
     pub having: Option<ExprId>,
-    /// `WINDOW name AS (...), ...`。名前は定義順のまま保持し、束縛時に
-    /// `OVER name` からこの名前を大小無視で引く（`plan::bind` 参照）。
+    /// `WINDOW name AS (...), ...`. Names are kept in definition order and looked up
+    /// case-insensitively from `OVER name` at bind time (see `plan::bind`).
     pub windows: Vec<(String, WindowDef)>,
-    /// `QUALIFY`。ウィンドウ関数評価後・ORDER BY 前に効くフィルタ。
+    /// `QUALIFY`. A filter applied after window functions are evaluated and before ORDER BY.
     pub qualify: Option<ExprId>,
     pub order_by: Vec<OrderByItem>,
     /// `ORDER BY ALL`. Mutually exclusive with `order_by` (see `OrderByAll`).
     pub order_by_all: Option<OrderByAll>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
-    /// `USING SAMPLE` / `TABLESAMPLE`。`duckdb` CLI で確認した限り、
-    /// 意味的には常に FROM 句の結合結果（フィルタ前）に効く ―― `a JOIN b
-    /// USING SAMPLE 20 ROWS` は結合後 100 行から 20 行選ぶ。構文上は
-    /// WHERE/GROUP BY/HAVING/QUALIFY のどこの後ろにでも置ける柔軟な文法だが
-    /// （`FROM t WHERE x>1 USING SAMPLE 10%` も通る）、ここでは単純化して
-    /// FROM 句の直後・WHERE の直前という 1 箇所だけで受理する
-    /// （`sql::parser::Parser::select_body` 参照）。
+    /// `USING SAMPLE` / `TABLESAMPLE`. As far as the `duckdb` CLI shows, semantically it
+    /// always applies to the join result of the FROM clause (before filtering) -- `a JOIN
+    /// b USING SAMPLE 20 ROWS` picks 20 rows out of the 100 rows after the join.
+    /// Syntactically the grammar is flexible enough to place it after any of
+    /// WHERE/GROUP BY/HAVING/QUALIFY (`FROM t WHERE x>1 USING SAMPLE 10%` parses too), but
+    /// this simplifies to accepting it in exactly one place: right after the FROM clause
+    /// and right before WHERE (see `sql::parser::Parser::select_body`).
     pub sample: Option<SampleSpec>,
 }
 
@@ -607,59 +605,58 @@ impl SelectStmt {
     }
 }
 
-/// `PIVOT <from> ON <on> [IN (<値> [AS 別名], ...)] USING <agg>[, ...] [GROUP BY <列, ...>]`
-/// の構文糖衣。
+/// Sugar for `PIVOT <from> ON <on> [IN (<value> [AS alias], ...)] USING <agg>[, ...] [GROUP BY <col, ...>]`.
 ///
-/// 意味的には「`on` の各値ごとに `agg(...) FILTER (WHERE on = 値)` を作り、
-/// `GROUP BY` 対象列と束ねる」という通常の集約クエリに等価
-/// （`plan::bind::desugar_pivot` 参照）。展開は束縛の直前
-/// （`session::Session::prepare`）に行い、既存の集約束縛ロジックには一切
-/// 手を入れない。
+/// Semantically it is equivalent to an ordinary aggregate query that "builds
+/// `agg(...) FILTER (WHERE on = value)` for each value of `on` and bundles it with the
+/// `GROUP BY` columns" (see `plan::bind::desugar_pivot`). The expansion happens just
+/// before binding (`session::Session::prepare`) and leaves the existing aggregate
+/// binding logic completely untouched.
 pub struct PivotStmt {
     pub from: FromItem,
-    /// `ON` の対象式。DuckDB は `ON a, b` の複数列指定も許すが、v1 は
-    /// 単一の式のみ対応する。
+    /// The target expression of `ON`. DuckDB also allows several columns as in `ON a, b`,
+    /// but v1 supports only a single expression.
     pub on: ExprId,
-    /// `IN (値 [AS 別名], ...)`。`None` なら値の自動検出が必要になる。
-    /// 束縛時点ではまだ対象表のスキーマしか読めておらず（実データはまだ
-    /// スキャンしていない）、DISTINCT を取るには本来の意味での実行が要る。
-    /// `no_std`/ストリーミング実行の制約下でそれを二段階クエリとして
-    /// 挟むのは大掛かりな変更になるため、v1 では明示 `IN` のみ対応し、
-    /// 省略時は `desugar_pivot` が `UnsupportedFeature` を返す。
+    /// `IN (value [AS alias], ...)`. `None` would require automatic value discovery.
+    /// At bind time only the target table's schema has been read (the real data has not
+    /// been scanned yet), and taking a DISTINCT would require execution in the real sense.
+    /// Interposing that as a two-stage query under the `no_std`/streaming-execution
+    /// constraints would be a large change, so v1 supports only an explicit `IN`, and
+    /// `desugar_pivot` returns `UnsupportedFeature` when it is omitted.
     pub in_list: Option<Vec<(ExprId, Option<String>)>>,
-    /// `USING agg(expr) [AS 別名], ...`。空なら DuckDB と同じく既定で
-    /// `count(*)`。複数集約関数（`USING sum(a), avg(b)`）は列名決定に式の
-    /// 文字列化が要り（`no_std`/`core::fmt` 禁止のコストが見合わない）、
-    /// v1 では単一集約関数のみ対応（`desugar_pivot` が `UnsupportedFeature`）。
+    /// `USING agg(expr) [AS alias], ...`. When empty, the default is `count(*)`, as in
+    /// DuckDB. Several aggregates (`USING sum(a), avg(b)`) would require stringifying
+    /// expressions to determine column names (not worth the cost given `no_std`/no
+    /// `core::fmt`), so v1 supports a single aggregate only (`desugar_pivot` gives `UnsupportedFeature`).
     pub using: Vec<SelectItem>,
-    /// 明示 `GROUP BY`。空なら「`on`/`using` が参照する列以外の全列」
-    /// （DuckDB の既定と同じ）。
+    /// An explicit `GROUP BY`. When empty, "every column other than those referenced by
+    /// `on`/`using`" (the same default as DuckDB).
     pub group_by: Vec<ExprId>,
-    /// 末尾の `ORDER BY`/`LIMIT`/`OFFSET`。展開後の `QueryStmt` にそのまま
-    /// 移す（`plan::bind::desugar_pivot` 参照）。
+    /// The trailing `ORDER BY`/`LIMIT`/`OFFSET`. Carried over unchanged to the expanded
+    /// `QueryStmt` (see `plan::bind::desugar_pivot`).
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
 
-/// `UNPIVOT <from> ON <col, ...> [INTO NAME <name> VALUE <value>]` の構文糖衣。
+/// Sugar for `UNPIVOT <from> ON <col, ...> [INTO NAME <name> VALUE <value>]`.
 ///
-/// 対象列ごとに 1 本の `SELECT`（対象列以外をそのまま通し、対象列名を文字列
-/// リテラルとして・対象列の値をそのまま出す）を作り `UNION ALL` で束ねる
-/// 展開に等価（`plan::bind::desugar_unpivot` 参照。GROUPING SETS が複数の
-/// `Node::Aggregate` を `Node::SetOp` で束ねたのと同じ発想）。
+/// Equivalent to an expansion that builds one `SELECT` per target column (passing
+/// through the non-target columns, emitting the target column's name as a string literal
+/// and its value as is) and bundles them with `UNION ALL` (see
+/// `plan::bind::desugar_unpivot`; the same idea as GROUPING SETS bundling several `Node::Aggregate` with `Node::SetOp`).
 pub struct UnpivotStmt {
     pub from: FromItem,
-    /// `ON` の対象列。DuckDB の `(a, b), (c, d)` のような複数列同時畳み込み
-    /// （1 回の展開で複数の VALUE 列を作る形）は非対応。各要素は修飾子なしの
-    /// 裸の列参照でなければならない。
+    /// The target columns of `ON`. Folding several columns at once, as in DuckDB's
+    /// `(a, b), (c, d)` (producing several VALUE columns in one expansion), is
+    /// unsupported. Each element must be an unqualified bare column reference.
     pub columns: Vec<ExprId>,
-    /// `INTO NAME <name_col>`。省略時は `"name"`（DuckDB の既定と同じ）。
+    /// `INTO NAME <name_col>`. Defaults to `"name"` when omitted (as in DuckDB).
     pub name_col: String,
-    /// `INTO ... VALUE <value_col>`。省略時は `"value"`。
+    /// `INTO ... VALUE <value_col>`. Defaults to `"value"` when omitted.
     pub value_col: String,
-    /// 末尾の `ORDER BY`/`LIMIT`/`OFFSET`。展開後の `QueryStmt` にそのまま
-    /// 移す（`plan::bind::desugar_unpivot` 参照）。
+    /// The trailing `ORDER BY`/`LIMIT`/`OFFSET`. Carried over unchanged to the expanded
+    /// `QueryStmt` (see `plan::bind::desugar_unpivot`).
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -679,14 +676,14 @@ pub enum Stmt {
     ShowTables,
     /// `CREATE TABLE t (col ty, ...)` / `CREATE TABLE t AS SELECT ...`
     ///
-    /// 効くのは `catalog::MemTable`（インメモリ表）のみ。読み取り専用の
-    /// `Source`/`TableFormat` には一切触れない（DESIGN.md §16）。
+    /// Applies only to `catalog::MemTable` (in-memory tables). The read-only
+    /// `Source`/`TableFormat` are never touched (DESIGN.md §16).
     #[cfg(feature = "ddl")]
     CreateTable {
         name: String,
         or_replace: bool,
         if_not_exists: bool,
-        /// 明示列定義。`as_select` があるときは空。
+        /// Explicit column definitions. Empty when `as_select` is present.
         columns: Vec<ColumnDef>,
         as_select: Option<Box<QueryStmt>>,
     },
@@ -696,12 +693,12 @@ pub enum Stmt {
         name: String,
         if_exists: bool,
     },
-    /// `ALTER TABLE t <action>`（`ADD COLUMN` / `DROP COLUMN` /
-    /// `RENAME COLUMN` / `RENAME TO`）。
+    /// `ALTER TABLE t <action>` (`ADD COLUMN` / `DROP COLUMN` /
+    /// `RENAME COLUMN` / `RENAME TO`).
     ///
-    /// 効くのは `catalog::MemTable`（インメモリ表）のみ。読み取り専用の
-    /// `Source`/`TableFormat` には一切触れない（DESIGN.md §16、
-    /// `CreateTable`/`DropTable` と同じ方針）。
+    /// Applies only to `catalog::MemTable` (in-memory tables). The read-only
+    /// `Source`/`TableFormat` are never touched (DESIGN.md §16; the same policy as
+    /// `CreateTable`/`DropTable`).
     #[cfg(feature = "ddl")]
     AlterTable {
         name: String,
@@ -709,10 +706,9 @@ pub enum Stmt {
     },
     /// `CREATE [OR REPLACE] VIEW v AS <query>`
     ///
-    /// ビュー本体は AST ではなく生 SQL テキストで保持する。参照されるたびに
-    /// 束縛時（`plan::bind`）に再パース・再束縛することで、ビュー定義用の
-    /// `ExprArena` を `Catalog` に持たせずに済む（`catalog` を `sql::ast` に
-    /// 依存させたくないため）。
+    /// The view body is held as raw SQL text rather than an AST. Reparsing and rebinding
+    /// it at bind time (`plan::bind`) on every reference avoids giving `Catalog` an
+    /// `ExprArena` for view definitions (since `catalog` should not depend on `sql::ast`).
     #[cfg(feature = "ddl")]
     CreateView {
         name: String,
@@ -748,22 +744,21 @@ pub enum Stmt {
     /// `COPY (<query>) TO '<path>' [(FORMAT csv|jsonl)]` /
     /// `COPY <table> TO '<path>' [...]`
     ///
-    /// `ahiru-core` はファイルへは書かない（`no_std` でファイルシステムに
-    /// 触れられない）。`Session::prepare` はこの文を最後まで実行して
-    /// バイト列を組み立てるところまでを担い、`Query` にその結果（書き込み先
-    /// パスとバイト列）を載せて返す。実際に `path` へ書き込むのは呼び出し側
-    /// （ネイティブなら `ahiru-cli`）の役目（`write` モジュール doc、
-    /// DESIGN.md §15 参照）。
+    /// `ahiru-core` never writes to files (it is `no_std` and cannot touch the
+    /// filesystem). `Session::prepare` runs this statement to completion and assembles
+    /// the bytes, returning the result (destination path and bytes) on the `Query`.
+    /// Actually writing to `path` is the caller's job (`ahiru-cli` on native) -- see the
+    /// `write` module docs and DESIGN.md §15.
     #[cfg(feature = "export")]
     Copy {
         query: Box<QueryStmt>,
         path: String,
-        /// `(FORMAT csv|jsonl|json)`。省略時は `path` の拡張子から推定する。
+        /// `(FORMAT csv|jsonl|json)`. Inferred from `path`'s extension when omitted.
         format: Option<String>,
     },
 }
 
-/// `CREATE TABLE` の列定義 1 個。
+/// One column definition of `CREATE TABLE`.
 #[cfg(feature = "ddl")]
 pub struct ColumnDef {
     pub name: String,
@@ -771,11 +766,11 @@ pub struct ColumnDef {
     pub nullable: bool,
 }
 
-/// `ALTER TABLE t <action>` の具体的な操作。
+/// The concrete operation of `ALTER TABLE t <action>`.
 #[cfg(feature = "ddl")]
 pub enum AlterTableAction {
-    /// `ADD [COLUMN] col ty [NOT NULL] [DEFAULT expr]`。
-    /// `default` が無ければ既存の全行にその列の値として NULL を詰める。
+    /// `ADD [COLUMN] col ty [NOT NULL] [DEFAULT expr]`.
+    /// Without a `default`, every existing row gets NULL as that column's value.
     AddColumn { name: String, ty: Ty, nullable: bool, default: Option<ExprId> },
     /// `DROP [COLUMN] col`
     DropColumn { name: String },
@@ -785,19 +780,19 @@ pub enum AlterTableAction {
     RenameTable { new_name: String },
 }
 
-/// `INSERT` が行を得る方法。
+/// How `INSERT` obtains its rows.
 #[cfg(feature = "dml")]
 pub enum InsertSource {
-    /// `VALUES (a, b), (c, d), ...`。各行は式の並び（列数はチェック時に検証）。
+    /// `VALUES (a, b), (c, d), ...`. Each row is a list of expressions (the column count is validated during checking).
     Values(Vec<Vec<ExprId>>),
-    /// `SELECT ...` からそのまま流し込む。
+    /// Streamed straight in from `SELECT ...`.
     Query(Box<QueryStmt>),
 }
 
-/// パース結果。式アリーナと文をまとめて持つ。
+/// The parse result. Holds the expression arena and the statement together.
 pub struct Parsed {
     pub arena: ExprArena,
     pub stmt: Stmt,
-    /// `?` プレースホルダの個数。
+    /// The number of `?` placeholders.
     pub num_params: u16,
 }

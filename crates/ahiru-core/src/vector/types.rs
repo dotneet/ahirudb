@@ -1,14 +1,14 @@
-//! 型システム。
+//! The type system.
 //!
-//! 論理型と物理型を分離し、**実行カーネルは物理型 6 種に対してのみ**書く。
-//! これがカーネル単相化爆発を抑える最大のレバー（DESIGN.md §8, §11）。
+//! Logical and physical types are separated, and **execution kernels are written
+//! against the six physical types only**. This is the biggest lever against kernel monomorphization blowup (DESIGN.md §8, §11).
 //!
-//! 時刻系は取り込み時にマイクロ秒へ正規化する。TIMESTAMP(ms/us/ns) を型で
-//! 区別しないことで、比較・算術・キャストのカーネルが 1 組で済む。
+//! Time types are normalized to microseconds at ingest. Not distinguishing
+//! TIMESTAMP(ms/us/ns) by type means one set of comparison, arithmetic, and cast kernels suffices.
 
 use crate::prelude::*;
 
-/// 実行カーネルが扱う物理表現。この 6 種以外は存在しない。
+/// The physical representations the execution kernels handle. There are no others.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PhysType {
     Bool,
@@ -27,10 +27,10 @@ impl PhysType {
     pub const COUNT: usize = 6;
 }
 
-/// SQL から見える型。
+/// The types visible from SQL.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ty {
-    /// 型がまだ決まっていない NULL リテラル。
+    /// A NULL literal whose type is not yet decided.
     Null,
     Boolean,
     TinyInt,
@@ -44,59 +44,59 @@ pub enum Ty {
     UBigInt,
     Float,
     Double,
-    /// precision <= 18 は I64、それ以上は I128 で保持する。
+    /// precision <= 18 is held as I64; anything larger as I128.
     Decimal {
         precision: u8,
         scale: u8,
     },
     Varchar,
     Blob,
-    /// エポックからの日数 (I32)。
+    /// Days since the epoch (I32).
     Date,
-    /// 深夜からのマイクロ秒 (I64)。
+    /// Microseconds since midnight (I64).
     Time,
-    /// エポックからのマイクロ秒 (I64)。
+    /// Microseconds since the epoch (I64).
     Timestamp,
-    /// `Timestamp` と物理表現は同一（エポックからの UTC マイクロ秒、I64）。
-    /// 違いは論理的な意味づけだけ: この値は既に UTC の瞬間を表す
-    /// （Parquet の `TIMESTAMP` 論理型の `isAdjustedToUTC = true` に対応）のに対し、
-    /// `Timestamp` は「タイムゾーン無しの素の日時」を表す
-    /// （`isAdjustedToUTC = false`、または注釈自体が無い場合）。
-    /// このエンジンにセッションタイムゾーンの概念は無いので、`VARCHAR` から
-    /// キャストする際にオフセット付き（`+09:00`/`Z` 等）の文字列を UTC マイクロ秒へ
-    /// 正規化する以外は、`Timestamp` と同じ扱いになる。
+    /// Physically identical to `Timestamp` (UTC microseconds since the epoch, I64).
+    /// The difference is purely in logical meaning: this value already denotes a UTC
+    /// instant (matching `isAdjustedToUTC = true` on Parquet's `TIMESTAMP` logical
+    /// type), whereas `Timestamp` denotes a plain date-time with no time zone
+    /// (`isAdjustedToUTC = false`, or no annotation at all).
+    /// This engine has no notion of a session time zone, so apart from normalizing
+    /// offset-bearing strings (`+09:00`/`Z` and the like) to UTC microseconds when
+    /// casting from `VARCHAR`, it behaves the same as `Timestamp`.
     Timestamptz,
-    /// UUID（16 バイトの生値、`Bytes` に収める）。RFC 4122 のバイト順で持ち、
-    /// 表示・パースだけが `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` 形式のハイフン
-    /// 付き 16 進テキストとの相互変換を行う（`VARCHAR`/`BLOB` と違い、テキスト表現
-    /// と物理表現が異なる唯一の `Bytes` 系論理型）。
+    /// UUID (the raw 16 bytes, held in `Bytes`). Stored in RFC 4122 byte order;
+    /// only display and parsing convert to and from the hyphenated hex text form
+    /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. Unlike `VARCHAR`/`BLOB`, it is the
+    /// only `Bytes`-family logical type whose text and physical representations differ.
     Uuid,
-    /// 月 (i32) / 日 (i32) / マイクロ秒 (i64) を 1 個の I128 に詰めて持つ
-    /// （`pack_interval`）。DuckDB / PostgreSQL と同じ 3 成分モデル。
+    /// Months (i32) / days (i32) / microseconds (i64) packed into one I128
+    /// (`pack_interval`). The same three-component model DuckDB / PostgreSQL use.
     Interval,
-    /// 動的型付けの JSON 値。物理表現は UTF-8 の JSON テキスト (Bytes)。
+    /// A dynamically typed JSON value. Physically UTF-8 JSON text (Bytes).
     ///
-    /// LIST / MAP / STRUCT のような入れ子型を物理型ごとに増やすと
-    /// カーネル単相化爆発（DESIGN.md §8, §11 が避けている問題そのもの）
-    /// を起こすので、この 1 種類に統合してある。配列・オブジェクトは
-    /// JSON テキストのまま持ち、`json_extract`/`list_extract`/`unnest`
-    /// 等の関数がその場でパースして取り出す（要素の静的型チェックは
-    /// 諦め、JSON 自身の動的型付けに委ねる設計判断）。
+    /// Adding a physical type per nested type (LIST / MAP / STRUCT) would cause the
+    /// kernel monomorphization blowup that DESIGN.md §8 and §11 exist to avoid, so
+    /// they are unified into this single type. Arrays and objects are kept as JSON
+    /// text, and functions such as `json_extract`/`list_extract`/`unnest` parse them
+    /// on the spot (a design decision that gives up static type checking of elements
+    /// and leans on JSON's own dynamic typing).
     Json,
 }
 
-/// DECIMAL の最大 precision。
+/// The maximum DECIMAL precision.
 pub const MAX_DECIMAL_PRECISION: u8 = 38;
 
 impl Ty {
-    /// precision を上限で丸めた DECIMAL を作る。
+    /// Builds a DECIMAL with the precision clamped to the maximum.
     pub fn decimal(precision: u8, scale: u8) -> Ty {
         let precision = precision.min(MAX_DECIMAL_PRECISION);
         Ty::Decimal { precision, scale: scale.min(precision) }
     }
 
-    /// DECIMAL としての `(precision, scale)`。整数型は scale 0 の DECIMAL と
-    /// みなす（DECIMAL と整数の混在演算で使う）。
+    /// The `(precision, scale)` as a DECIMAL. Integer types count as DECIMALs with
+    /// scale 0 (used when mixing DECIMAL and integers in one operation).
     pub fn as_decimal(self) -> Option<(u8, u8)> {
         use Ty::*;
         Some(match self {
@@ -164,7 +164,7 @@ impl Ty {
         matches!(self, Ty::Interval)
     }
 
-    /// 型の「広さ」。暗黙変換で広い方に寄せるための順序。
+    /// How "wide" a type is. The ordering implicit conversion widens along.
     fn rank(self) -> u8 {
         use Ty::*;
         match self {
@@ -184,22 +184,23 @@ impl Ty {
             Timestamptz => 13,
             Varchar => 14,
             Blob => 15,
-            // 他のどの型とも暗黙変換しない（DATE/TIMESTAMP との加減算は
-            // `plan::compile` が `Ty::unify` を経由しない専用経路で扱う）。
+            // No implicit conversion with any other type (addition and subtraction
+            // against DATE/TIMESTAMP is handled by a dedicated path in `plan::compile`
+            // that does not go through `Ty::unify`).
             Interval => 16,
-            // JSON も同様に他の型と暗黙変換しない。
+            // JSON likewise has no implicit conversion with other types.
             Json => 17,
-            // UUID も同様に他のどの型とも暗黙変換しない
-            // （`Bytes` 物理型を共有する VARCHAR/BLOB とも、下の専用ルールでしか揃えない）。
+            // UUID likewise has no implicit conversion with any other type
+            // (not even with VARCHAR/BLOB, which share the `Bytes` physical type; only the dedicated rule below aligns them).
             Uuid => 18,
         }
     }
 
-    /// `unify` の結果を `Result` にした版。決められない組み合わせは
-    /// `TypeMismatch` エラーにする。`plan::bind`/`plan::compile` の
-    /// 「型が合わなければ即エラー」という大半の呼び出し site が使う形。
-    /// （`Ty::Json` のように「合わなければ既定型に落とす」特殊な呼び出し site
-    /// はこれを使わず `unify` を直接呼ぶ。）
+    /// `unify`'s result as a `Result`. Combinations that cannot be decided become a
+    /// `TypeMismatch` error. This is the form used by the majority of call sites in
+    /// `plan::bind`/`plan::compile`, where "a type mismatch is an immediate error".
+    /// (Special call sites that fall back to a default type on mismatch, as with
+    /// `Ty::Json`, call `unify` directly instead.)
     pub fn unify_or_mismatch(a: Ty, b: Ty) -> Result<Ty> {
         match Ty::unify(a, b) {
             Some(t) => Ok(t),
@@ -207,7 +208,7 @@ impl Ty {
         }
     }
 
-    /// 二項演算の共通型を決める。決められない組み合わせは `None`。
+    /// Determines the common type of a binary operation. `None` when undecidable.
     pub fn unify(a: Ty, b: Ty) -> Option<Ty> {
         use Ty::*;
         if a == b {
@@ -219,13 +220,13 @@ impl Ty {
         if b == Null {
             return Some(a);
         }
-        // DECIMAL 同士は precision/scale を合わせる。
-        // 加減算は桁上がりで 1 桁増えうるので precision に +1 する（DuckDB と同じ）。
+        // Between two DECIMALs, align precision/scale.
+        // Addition and subtraction can carry into one more digit, so precision gets +1 (as in DuckDB).
         if let (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) = (a, b)
         {
             return Some(Ty::decimal((p1 - s1).max(p2 - s2) + s1.max(s2) + 1, s1.max(s2)));
         }
-        // 数値同士は広い方へ。DECIMAL と浮動小数は DOUBLE に落とす。
+        // Between numerics, widen. DECIMAL with floating point drops to DOUBLE.
         if a.is_numeric() && b.is_numeric() {
             let (lo, hi) = if a.rank() < b.rank() { (a, b) } else { (b, a) };
             if matches!(lo, Decimal { .. }) && matches!(hi, Float | Double) {
@@ -236,14 +237,14 @@ impl Ty {
             }
             return Some(if hi == Float { Double } else { hi });
         }
-        // DATE と TIMESTAMP の比較は TIMESTAMP に寄せる。
+        // Comparing DATE with TIMESTAMP settles on TIMESTAMP.
         if matches!((a, b), (Date, Timestamp) | (Timestamp, Date)) {
             return Some(Timestamp);
         }
-        // TIMESTAMPTZ が絡む比較は TIMESTAMPTZ に寄せる（DATE/TIMESTAMP は
-        // 「タイムゾーン無し」なので、より情報量の多い TIMESTAMPTZ 側に揃える。
-        // DuckDB も DATE/TIMESTAMP と TIMESTAMPTZ の比較を許し、TIMESTAMPTZ に
-        // 寄せる）。
+        // Comparisons involving TIMESTAMPTZ settle on TIMESTAMPTZ (DATE/TIMESTAMP are
+        // "without time zone", so they align to the more informative TIMESTAMPTZ side.
+        // DuckDB also permits comparing DATE/TIMESTAMP with TIMESTAMPTZ and settles on
+        // TIMESTAMPTZ).
         if matches!(
             (a, b),
             (Date, Timestamptz)
@@ -259,7 +260,7 @@ impl Ty {
         None
     }
 
-    /// 型名。`DESCRIBE` と結果メタデータで使う。
+    /// The type name. Used by `DESCRIBE` and in result metadata.
     pub fn name(self) -> &'static str {
         use Ty::*;
         match self {
@@ -290,15 +291,15 @@ impl Ty {
     }
 }
 
-/// `months` (i32) を上位 32bit、`days` (i32) を次の 32bit、`micros` (i64) を
-/// 下位 64bit に詰める。フィールドごとに演算する専用カーネル
-/// （`expr::kernels::interval_*`）でしか解かないので、境界を跨ぐ桁上がりは
-/// 起きない。
+/// Packs `months` (i32) into the top 32 bits, `days` (i32) into the next 32, and
+/// `micros` (i64) into the low 64. Only the dedicated per-field kernels
+/// (`expr::kernels::interval_*`) ever take this apart, so no carry can cross a
+/// field boundary.
 pub fn pack_interval(months: i32, days: i32, micros: i64) -> i128 {
     ((months as i128) << 96) | ((days as u32 as i128) << 64) | (micros as u64 as i128)
 }
 
-/// `pack_interval` の逆関数。
+/// The inverse of `pack_interval`.
 pub fn unpack_interval(v: i128) -> (i32, i32, i64) {
     let months = (v >> 96) as i32;
     let days = ((v >> 64) & 0xFFFF_FFFF) as u32 as i32;
@@ -306,10 +307,10 @@ pub fn unpack_interval(v: i128) -> (i32, i32, i64) {
     (months, days, micros)
 }
 
-/// INTERVAL の最小限の文字列化。`core::fmt` は使えないので手組みする
-/// （CSV/JSONL 書き出し・CLI 表示から使う）。DuckDB の表示に寄せて
-/// `<N> years <N> months <N> days HH:MM:SS[.ffffff]` の形にするが、
-/// ゼロの成分は省く。
+/// A minimal stringification of INTERVAL. `core::fmt` is unavailable, so this is
+/// hand-rolled (used by CSV/JSONL writing and CLI display). It follows DuckDB's
+/// rendering, `<N> years <N> months <N> days HH:MM:SS[.ffffff]`, but omits
+/// zero-valued components.
 pub fn fmt_interval(months: i32, days: i32, micros: i64, out: &mut Vec<u8>) {
     fn push_i64(out: &mut Vec<u8>, v: i64) {
         if v < 0 {
@@ -402,7 +403,7 @@ pub fn fmt_interval(months: i32, days: i32, micros: i64, out: &mut Vec<u8>) {
         push_padded(out, ss as i64, 2);
         if frac != 0 {
             out.push(b'.');
-            // 末尾 0 を落とす。
+            // Drop trailing zeros.
             let mut digits = [0u8; 6];
             let mut f = frac;
             for i in (0..6).rev() {
@@ -418,7 +419,7 @@ pub fn fmt_interval(months: i32, days: i32, micros: i64, out: &mut Vec<u8>) {
     }
 }
 
-/// 出力スキーマの 1 列。
+/// One column of the output schema.
 #[derive(Clone)]
 pub struct Field {
     pub name: String,
@@ -442,7 +443,7 @@ mod tests {
         assert_eq!(Ty::Int.phys(), PhysType::I32);
         assert_eq!(Ty::Timestamp.phys(), PhysType::I64);
         assert_eq!(Ty::Time.phys(), PhysType::I64);
-        // 符号なしは 1 段上の符号付きへ昇格させる。
+        // Unsigned types are promoted to the next larger signed type.
         assert_eq!(Ty::UInt.phys(), PhysType::I64);
         assert_eq!(Ty::UBigInt.phys(), PhysType::I128);
         assert_eq!(Ty::Float.phys(), PhysType::F64);
@@ -472,7 +473,7 @@ mod tests {
     #[test]
     fn decimal_precision_is_capped() {
         assert_eq!(Ty::decimal(50, 4), Ty::Decimal { precision: 38, scale: 4 });
-        // scale は precision を超えられない。
+        // scale cannot exceed precision.
         assert_eq!(Ty::decimal(5, 9), Ty::Decimal { precision: 5, scale: 5 });
     }
 
@@ -480,7 +481,7 @@ mod tests {
     fn unify_decimal() {
         let a = Ty::Decimal { precision: 10, scale: 2 };
         let b = Ty::Decimal { precision: 12, scale: 4 };
-        // 加減算は桁上がりぶん precision が 1 増える（DuckDB と同じ）。
+        // Addition and subtraction gain one digit of precision for the carry (as in DuckDB).
         assert_eq!(Ty::unify(a, b), Some(Ty::Decimal { precision: 13, scale: 4 }));
         assert_eq!(Ty::unify(a, Ty::Double), Some(Ty::Double));
     }

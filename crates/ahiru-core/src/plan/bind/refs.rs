@@ -6,9 +6,9 @@
 use super::from::FromTree;
 use super::*;
 
-// --- ORDER BY / GROUP BY の参照解決 -----------------------------------------
+// --- Reference resolution for ORDER BY / GROUP BY ---------------------------
 
-/// `GROUP BY 1` / `GROUP BY alias` を対応する SELECT 式に読み替える。
+/// Reads `GROUP BY 1` / `GROUP BY alias` as the corresponding SELECT expression.
 pub(super) fn resolve_select_ref(
     arena: &ExprArena,
     sel: &SelectStmt,
@@ -31,7 +31,7 @@ pub(super) fn resolve_select_ref(
     Ok(id)
 }
 
-/// ORDER BY の項が出力列を指しているならその番号を返す。
+/// Returns the column number if an ORDER BY item points at an output column.
 pub(super) fn order_output_column(
     arena: &ExprArena,
     sel: &SelectStmt,
@@ -70,10 +70,10 @@ pub(super) fn order_output_column(
             }
         }
     }
-    // 出力式と構造が一致するならその列を使う（再計算を避ける）。
+    // If it structurally matches an output expression, use that column (avoiding recomputation).
     for (col, item) in sel.items.iter().enumerate() {
         if matches!(arena.get(item.expr), Expr::Star { .. }) {
-            // `*` は複数列に展開されるので位置合わせが取れない。諦める。
+            // `*` expands to several columns, so positions cannot be lined up. Give up.
             return Ok(None);
         }
         if expr_eq(arena, item.expr, o.expr) && col < schema.len() {
@@ -83,9 +83,9 @@ pub(super) fn order_output_column(
     Ok(None)
 }
 
-/// `DISTINCT ON` の式が出力列（別名一致 or 構造一致）を指しているなら
-/// その番号を返す。`order_output_column` の序数を除いた版
-/// （DISTINCT ON に `ON (1)` のような序数指定は無い）。
+/// Returns the column number if a `DISTINCT ON` expression points at an output column (by
+/// alias match or structural match). The version of `order_output_column` without ordinals
+/// (DISTINCT ON has no ordinal form such as `ON (1)`).
 pub(super) fn distinct_on_output_column(
     arena: &ExprArena,
     sel: &SelectStmt,
@@ -112,7 +112,7 @@ pub(super) fn distinct_on_output_column(
     None
 }
 
-/// 正の整数リテラルなら値を返す。
+/// Returns the value if it is a positive integer literal.
 pub(super) fn ordinal_of(arena: &ExprArena, id: ExprId) -> Option<u32> {
     match arena.get(id) {
         Expr::Literal(Value::I32(v)) if *v > 0 => Some(*v as u32),
@@ -121,9 +121,9 @@ pub(super) fn ordinal_of(arena: &ExprArena, id: ExprId) -> Option<u32> {
     }
 }
 
-// --- 走査ヘルパ --------------------------------------------------------------
+// --- Traversal helpers -------------------------------------------------------
 
-/// 式の直接の子をすべて訪問する。
+/// Visits every direct child of an expression.
 pub(super) fn each_child(
     arena: &ExprArena,
     id: ExprId,
@@ -184,24 +184,24 @@ pub(super) fn each_child(
                 f(o.expr)?;
             }
         }
-        // サブクエリの中の式は別スコープで解決するので、ここでは辿らない。
+        // Expressions inside a subquery are resolved in a different scope, so they are not walked here.
         Expr::ScalarSubquery(_) | Expr::Exists { .. } => {}
         Expr::InSubquery { arg, .. } => f(*arg)?,
-        // `query` 側は `InSubquery` と同じ理由で辿らない。`arg` だけが
-        // このクエリのスコープに属する式。
+        // The `query` side is not walked, for the same reason as `InSubquery`. Only `arg`
+        // belongs to this query's scope.
         Expr::QuantifiedComparison { arg, .. } => f(*arg)?,
         Expr::Unnest(arg) => f(*arg)?,
-        // ラムダ本体はパラメータだけを参照でき、外側スコープの列は参照
-        // できない（`plan::compile::Compiler::lambda_call` 参照）。ここで
-        // 子として辿ると、パラメータ名がたまたま外側スコープの列名と
-        // 一致したときに誤って外側の列参照とみなされてしまうので、
-        // 意図的に辿らない（GROUP BY 検証・射影プッシュダウンの対象外）。
+        // A lambda body can reference only its parameters, not columns of the enclosing scope
+        // (see `plan::compile::Compiler::lambda_call`). Walking into it as a child would, when
+        // a parameter name happens to match an outer scope column name, mistake it for an
+        // outer column reference, so it is deliberately not walked (excluded from GROUP BY
+        // validation and projection pushdown).
         Expr::Lambda { .. } => {}
     }
     Ok(())
 }
 
-/// 式が参照するスコープ上の列番号を集める。存在しない列はここで検出する。
+/// Collects the scope column numbers an expression references. Nonexistent columns are detected here.
 pub(super) fn collect_refs(
     arena: &ExprArena,
     scope: &Scope,
@@ -243,7 +243,7 @@ pub(super) fn collect_join_refs(
     Ok(())
 }
 
-// --- 名前付け ----------------------------------------------------------------
+// --- Naming ------------------------------------------------------------------
 
 pub(super) fn group_name(arena: &ExprArena, id: ExprId, i: usize) -> String {
     match arena.get(id) {
@@ -256,9 +256,9 @@ pub(super) fn group_name(arena: &ExprArena, id: ExprId, i: usize) -> String {
     }
 }
 
-/// 定数だけを返すプログラムを作る。GROUPING SETS でセットに含まれない
-/// グルーピング列を NULL で埋めるのと、`GROUPING()`/`GROUPING_ID()` の
-/// 結果（ビットマスク）を定数列として載せるのに使う。
+/// Builds a program returning only a constant. Used to fill grouping columns not in the set
+/// with NULL under GROUPING SETS, and to carry the result of `GROUPING()`/`GROUPING_ID()`
+/// (a bitmask) as a constant column.
 pub(super) fn const_program(ty: Ty, v: Value) -> Program {
     let mut p = Program::new();
     let k = p.add_const(ty, v);
@@ -269,13 +269,13 @@ pub(super) fn const_program(ty: Ty, v: Value) -> Program {
     p
 }
 
-/// 別名が無い出力列の名前。列参照はその名前、それ以外は連番。
+/// The name of an output column with no alias. A column reference keeps its name; anything else gets a serial number.
 pub(super) fn default_name(arena: &ExprArena, id: ExprId) -> String {
     match arena.get(id) {
         Expr::ColumnRef { name, .. } => name.clone(),
-        // duckdb の `UNNEST(x)`（別名無し）も出力列名は "unnest"。
+        // duckdb's `UNNEST(x)` (with no alias) also names its output column "unnest".
         Expr::Unnest(_) => String::from("unnest"),
-        // 式の再構成は文字列組み立てが要りサイズを食うので、番号で済ませる。
+        // Reconstructing the expression would need string assembly and cost size, so a number suffices.
         _ => {
             let mut s = String::from("col");
             push_u32(&mut s, id);

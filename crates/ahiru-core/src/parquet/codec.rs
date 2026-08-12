@@ -1,31 +1,31 @@
-//! 圧縮コーデック。
+//! Compression codecs.
 //!
-//! wasm コアが内蔵するのは SNAPPY・LZ4_RAW・ZSTD（`zstd` フィーチャ、既定で
-//! 有効）。ZSTD デコーダは `ahiru-zstd` を素の Rust ライブラリとしてリンク
-//! しているだけで、展開結果自体はここに含めていない（13 KB 程度で 1 MiB
-//! 予算への影響が小さいため、別 wasm モジュールに分ける手間に見合わない
-//! と判断した）。GZIP だけはホストの `DecompressionStream` に委譲する
-//! （ブラウザ/Node に既にあるものをわざわざ内蔵する理由が無いため）。
-//! `zstd` フィーチャを外せば ZSTD もホスト委譲（`NeedCodec`）に戻る
-//! （DESIGN.md §6）。
+//! The wasm core bundles SNAPPY, LZ4_RAW, and ZSTD (the `zstd` feature, enabled
+//! by default). The ZSTD decoder just links `ahiru-zstd` as a plain Rust
+//! library; the decompressed output itself is not vendored here (at roughly
+//! 13 KB it has little impact on the 1 MiB budget, so splitting it into a
+//! separate wasm module wasn't judged worth the trouble). Only GZIP is
+//! delegated to the host's `DecompressionStream` (no reason to bundle
+//! something the browser/Node already provides). Disabling the `zstd` feature
+//! makes ZSTD fall back to host delegation (`NeedCodec`) too (DESIGN.md §6).
 //!
-//! 入力はネットワーク由来で信用できない。宣言された長さ・オフセットは一切
-//! 信用せず、全ての添字を境界検査する。破損に対しては必ず `Err` を返す
-//! （パニックしない・バッファ外を読まない）。
+//! Input comes from the network and cannot be trusted. Declared lengths and
+//! offsets are never trusted; every index is bounds-checked. Corruption always
+//! results in `Err` (never panics, never reads past the buffer).
 //!
-//! エラーコードの使い分け:
-//! - `UnexpectedEof`  … 入力がシーケンスの途中で尽きた
-//! - `BadCompressedData` … 構造の破損（不正なオフセット、長さ不一致など）
-//! - `LimitExceeded`  … 展開結果が呼び出し側の宣言サイズを超える
+//! Error code usage:
+//! - `UnexpectedEof`  ... input ran out in the middle of a sequence
+//! - `BadCompressedData` ... structural corruption (invalid offset, length mismatch, etc.)
+//! - `LimitExceeded`  ... decompressed output exceeds the caller's declared size
 
 use crate::parquet::Compression;
 use crate::prelude::*;
 
-/// 内蔵コーデックで展開する。非内蔵コーデックは `UnsupportedCodec` を返し、
-/// 呼び出し側がホストへの委譲に切り替える。
+/// Decompress with a built-in codec. Unsupported codecs return `UnsupportedCodec`,
+/// and the caller falls back to host delegation.
 ///
-/// `out_len` はページヘッダが宣言する展開後サイズ。デコーダはこれを超えて
-/// 書き込んではならない（信用できない入力に対する上限）。
+/// `out_len` is the decompressed size declared by the page header. The decoder
+/// must never write beyond it (an upper bound against untrusted input).
 pub fn decompress(codec: Compression, src: &[u8], out_len: usize) -> Result<Vec<u8>> {
     match codec {
         Compression::Uncompressed => Ok(src.to_vec()),
@@ -45,11 +45,11 @@ pub fn decompress(codec: Compression, src: &[u8], out_len: usize) -> Result<Vec<
     }
 }
 
-/// `ahiru-zstd` のエラーコードをこのクレートのものへ落とす。位置情報は
-/// 持たない（`ahiru-zstd` はバイト位置を追跡していない）ので `Error::new`
-/// を使う。展開結果が宣言サイズを超える／入力が途中で尽きる、以外は
-/// すべて「構造が壊れている」の一括りにする（このファイル冒頭の
-/// エラーコードの使い分け方針と同じ）。
+/// Map `ahiru-zstd`'s error codes onto this crate's own. It carries no
+/// position information (`ahiru-zstd` doesn't track byte positions), so we
+/// use `Error::new`. Anything other than "decompressed output exceeds the
+/// declared size" or "input ran out early" is lumped together as "corrupted
+/// structure" (same error-code policy as at the top of this file).
 #[cfg(feature = "zstd")]
 fn map_zstd_err(e: ahiru_zstd::Error) -> Error {
     use ahiru_zstd::Error as Z;
@@ -61,16 +61,17 @@ fn map_zstd_err(e: ahiru_zstd::Error) -> Error {
     Error::new(code)
 }
 
-/// `out` の末尾から `offset` バイト戻った位置を `len` バイト複製する。
+/// Duplicate `len` bytes read from `offset` bytes before the end of `out`.
 ///
-/// 複製元と複製先は重なりうる（連続した繰り返しはこの重なりで符号化される）
-/// ので、1 バイトずつ写す。`copy_from_slice` では重なり分を再生成できない。
+/// The source and destination ranges can overlap (consecutive repeats are
+/// encoded exactly via this overlap), so we copy byte by byte; `copy_from_slice`
+/// can't reproduce the overlapping portion.
 #[inline]
 fn copy_within(out: &mut Vec<u8>, offset: usize, len: usize) {
-    // 呼び出し側で 1 <= offset <= 書き込み済みバイト数 を検査済み。
+    // The caller has already checked 1 <= offset <= bytes written so far.
     let mut p = out.len() - offset;
-    // `out` に push しながら同じ `out` を読む（重なりの再生成）。
-    // イテレータでは表現できないので手動カウンタのままにする。
+    // Reads from the same `out` while pushing into it (to reproduce the overlap).
+    // This can't be expressed with an iterator, so we keep the manual counter.
     #[allow(clippy::explicit_counter_loop)]
     for _ in 0..len {
         let b = out[p];
@@ -81,14 +82,14 @@ fn copy_within(out: &mut Vec<u8>, offset: usize, len: usize) {
 
 // --- Snappy -----------------------------------------------------------------
 
-/// Snappy raw format（フレーミング無し）を展開して `out` に追記する。
+/// Decompress Snappy raw format (unframed) and append the result to `out`.
 pub fn snappy_decompress(src: &[u8], max_len: usize, out: &mut Vec<u8>) -> Result<()> {
-    // `out` には既存データが入っていることがある。オフセットの基準は
-    // 「今回の展開で書き始めた位置」であって Vec の先頭ではない。
+    // `out` may already contain data. Offsets are relative to "the position
+    // where this decompression started writing," not the start of the Vec.
     let base = out.len();
     let mut ip = 0usize;
 
-    // 前置きの展開後長（LEB128）。32 bit を超える値は仕様上ありえない。
+    // Decompressed length prefix (LEB128). A value exceeding 32 bits is impossible per spec.
     let mut declared: u64 = 0;
     let mut shift = 0u32;
     loop {
@@ -109,8 +110,8 @@ pub fn snappy_decompress(src: &[u8], max_len: usize, out: &mut Vec<u8>) -> Resul
         let tag = src[ip];
         ip += 1;
         if tag & 0x03 == 0 {
-            // リテラル。n < 60 なら長さは n+1、そうでなければ n-59 バイトの
-            // リトルエンディアン整数が「長さ-1」を表す。
+            // Literal. If n < 60 the length is n+1; otherwise the following n-59
+            // little-endian bytes encode "length-1".
             let n = (tag >> 2) as usize;
             let len = if n < 60 {
                 (n + 1) as u64
@@ -124,7 +125,7 @@ pub fn snappy_decompress(src: &[u8], max_len: usize, out: &mut Vec<u8>) -> Resul
                 ip += w;
                 v + 1
             };
-            // 入力に収まるかを先に見るので、この後 usize へ落として安全。
+            // We check that this fits in the input first, so casting to usize below is safe.
             ensure!(len <= (src.len() - ip) as u64, UnexpectedEof, ip);
             let len = len as usize;
             ensure!(len <= declared - (out.len() - base), LimitExceeded, ip);
@@ -152,8 +153,8 @@ pub fn snappy_decompress(src: &[u8], max_len: usize, out: &mut Vec<u8>) -> Resul
                 }
             };
             let written = out.len() - base;
-            // オフセットが基準位置より前を指すなら、今回の入力とは無関係な
-            // データを覗くことになる。破損として拒否する。
+            // If the offset points before the base position, it would peek at data
+            // unrelated to this input. Reject it as corrupted.
             ensure!(offset > 0 && offset <= written, BadCompressedData, ip);
             ensure!(len <= declared - written, LimitExceeded, ip);
             copy_within(out, offset, len);
@@ -166,8 +167,9 @@ pub fn snappy_decompress(src: &[u8], max_len: usize, out: &mut Vec<u8>) -> Resul
 
 // --- LZ4 block --------------------------------------------------------------
 
-/// LZ4 の長さ拡張。ニブルが 15 のとき、255 が続く限り加算する。
-/// `limit` を超えた時点で打ち切るので、0xff の羅列で桁が溢れることはない。
+/// LZ4 length extension. When the nibble is 15, keep adding 255 for as long as
+/// it continues. This bails out as soon as `limit` is exceeded, so a run of
+/// 0xff bytes can never overflow.
 fn lz4_len_ext(src: &[u8], ip: &mut usize, limit: usize) -> Result<usize> {
     let mut extra: u64 = 0;
     loop {
@@ -182,7 +184,7 @@ fn lz4_len_ext(src: &[u8], ip: &mut usize, limit: usize) -> Result<usize> {
     }
 }
 
-/// LZ4 block format（フレーミング無し）を展開して `out` に追記する。
+/// Decompress LZ4 block format (unframed) and append the result to `out`.
 pub fn lz4_raw_decompress(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Result<()> {
     let base = out.len();
     let mut ip = 0usize;
@@ -191,7 +193,7 @@ pub fn lz4_raw_decompress(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Resu
         let token = src[ip];
         ip += 1;
 
-        // リテラル部。
+        // Literal part.
         let mut lit = (token >> 4) as usize;
         if lit == 15 {
             lit += lz4_len_ext(src, &mut ip, out_len)?;
@@ -201,7 +203,7 @@ pub fn lz4_raw_decompress(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Resu
         out.extend_from_slice(&src[ip..ip + lit]);
         ip += lit;
 
-        // 最終シーケンスはリテラルだけで終わる（マッチ部を持たない）。
+        // The final sequence ends with literals only (no match part).
         if ip == src.len() {
             break;
         }
@@ -212,7 +214,7 @@ pub fn lz4_raw_decompress(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Resu
         let written = out.len() - base;
         ensure!(offset > 0 && offset <= written, BadCompressedData, ip);
 
-        // マッチ部。最小マッチ長 4 がニブルから引かれている。
+        // Match part. The minimum match length of 4 has been subtracted from the nibble.
         let mut mlen = (token & 0x0f) as usize + 4;
         if token & 0x0f == 15 {
             mlen += lz4_len_ext(src, &mut ip, out_len)?;
@@ -230,14 +232,14 @@ mod tests {
     use super::*;
     use crate::error::Code;
 
-    // --- フィクスチャ -------------------------------------------------------
-    // snap / lz4_flex クレートで実際に圧縮したバイト列（16 進）。
-    // 生成物だけを持ち込み、ワークスペースには依存を足さない。
+    // --- Fixtures -----------------------------------------------------------
+    // Byte sequences (hex) actually compressed with the snap / lz4_flex crates.
+    // We bring in only the generated output, without adding a dependency to the workspace.
 
     const SNAPPY_HELLO: &str = "2b1468656c6c6f2046060048776f726c642c2068656c6c6f20776f726c6421";
     const LZ4_HELLO: &str = "6e68656c6c6f20060063776f726c642c190060776f726c6421";
-    // `zstd` CLI で `hello()` と同じ文字列を圧縮したもの
-    // （`printf '...' | zstd -q -c | xxd -p`）。
+    // The same string as `hello()`, compressed with the `zstd` CLI
+    // (`printf '...' | zstd -q -c | xxd -p`).
     #[cfg(feature = "zstd")]
     const ZSTD_HELLO: &str =
         "28b52ffd0458dd00009068656c6c6f20776f726c642c776f726c642102003cb312af140157c1b30b";
@@ -450,7 +452,7 @@ mod tests {
         b.chunks(2).map(|p| nib(p[0]) << 4 | nib(p[1])).collect()
     }
 
-    /// フィクスチャ生成側と同じ線形合同法。非圧縮データの再現に使う。
+    /// Same linear congruential generator as the fixture generator. Used to reproduce the uncompressed data.
     fn lcg(n: usize) -> Vec<u8> {
         let mut s: u32 = 0x1234_5678;
         (0..n)
@@ -491,7 +493,7 @@ mod tests {
         snappy_decompress(&src, expect.len(), &mut out).unwrap();
         assert_eq!(out.len(), expect.len());
         assert!(out == expect);
-        // 宣言サイズに余裕があっても結果は変わらない。
+        // The result doesn't change even with slack in the declared size.
         let mut out2 = Vec::new();
         snappy_decompress(&src, expect.len() + 4096, &mut out2).unwrap();
         assert!(out2 == expect);
@@ -509,7 +511,7 @@ mod tests {
         e.code_u16()
     }
 
-    // --- Snappy: 正常系 -----------------------------------------------------
+    // --- Snappy: happy path -------------------------------------------------
 
     #[test]
     fn snappy_small_literal_and_copy() {
@@ -520,7 +522,7 @@ mod tests {
     #[test]
     fn snappy_empty() {
         snap_ok(SNAPPY_EMPTY, &[]);
-        // 空入力そのものは前置きが読めないので EOF。
+        // An empty input can't even read the length prefix, so it's EOF.
         let mut out = Vec::new();
         assert_eq!(
             code(snappy_decompress(&[], 0, &mut out).unwrap_err()),
@@ -530,7 +532,7 @@ mod tests {
 
     #[test]
     fn snappy_overlapping_single_byte_run() {
-        // offset=1 の自己参照コピー。素朴な実装が壊れる典型。
+        // Self-referential copy with offset=1. A classic case that breaks naive implementations.
         snap_ok(SNAPPY_RUN, &run());
     }
 
@@ -541,7 +543,7 @@ mod tests {
 
     #[test]
     fn snappy_incompressible_all_literal() {
-        // 1000 バイトのリテラル → 長さは 2 バイト拡張で符号化される。
+        // 1000-byte literal -> the length is encoded with a 2-byte extension.
         snap_ok(SNAPPY_RANDOM, &lcg(1000));
     }
 
@@ -552,24 +554,24 @@ mod tests {
 
     #[test]
     fn snappy_over_64k() {
-        // 前置き varint が複数バイトになる領域。
+        // Range where the length-prefix varint spans multiple bytes.
         snap_ok(SNAPPY_BIG, &big());
     }
 
     #[test]
     fn snappy_three_byte_literal_length() {
-        // 64KiB 超のリテラルは長さが 3 バイトになる。実圧縮器は分割するので
-        // ここだけは手で組む。
+        // A literal over 64KiB gets a 3-byte length. Real compressors split such
+        // literals, so this one case is hand-assembled.
         let data = lcg(70_000);
         let mut src = Vec::new();
-        // 前置き: 70000 = 0xf0 0xa2 0x04
+        // Prefix: 70000 = 0xf0 0xa2 0x04
         let mut n = data.len() as u64;
         while n >= 0x80 {
             src.push((n as u8) | 0x80);
             n >>= 7;
         }
         src.push(n as u8);
-        // タグ: n=62 → 3 バイト長（値は 長さ-1）
+        // Tag: n=62 -> 3-byte length (the value is length-1)
         src.push(62 << 2);
         let l = (data.len() - 1) as u32;
         src.extend_from_slice(&l.to_le_bytes()[..3]);
@@ -582,7 +584,7 @@ mod tests {
 
     #[test]
     fn snappy_appends_to_existing_output() {
-        // `out` に既存データがあってもオフセットの基準は今回の開始位置。
+        // Even if `out` already has data, offsets are relative to this run's start.
         let mut out = vec![0xaa; 100];
         snappy_decompress(&hex(SNAPPY_RUN), 5000, &mut out).unwrap();
         assert_eq!(out.len(), 5100);
@@ -592,19 +594,19 @@ mod tests {
 
     #[test]
     fn snappy_cannot_reach_before_base() {
-        // 先頭 1 バイトのリテラルの直後に offset=2 のコピー。基準より前の
-        // 既存データを参照しようとするので拒否されなければならない。
+        // A copy with offset=2 right after a 1-byte literal at the start. This tries
+        // to reference existing data before the base, so it must be rejected.
         let src = [0x08, 0x00, 0xaa, 0x01, 0x02];
         let mut out = vec![0xaa; 64];
         let e = snappy_decompress(&src, 8, &mut out).unwrap_err();
         assert_eq!(code(e), Code::BadCompressedData as u16);
     }
 
-    // --- Snappy: 異常系 -----------------------------------------------------
+    // --- Snappy: error cases ------------------------------------------------
 
     #[test]
     fn snappy_declared_length_over_limit() {
-        // 展開後 5000 バイトの正当なストリームでも上限 100 なら拒否。
+        // Even a valid stream that decompresses to 5000 bytes is rejected when the limit is 100.
         let mut out = Vec::new();
         let e = snappy_decompress(&hex(SNAPPY_RUN), 100, &mut out).unwrap_err();
         assert_eq!(code(e), Code::BadCompressedData as u16);
@@ -614,7 +616,7 @@ mod tests {
     #[test]
     fn snappy_truncated_preamble() {
         let mut out = Vec::new();
-        // 継続ビットが立ったまま終わる。
+        // Ends while the continuation bit is still set.
         assert!(snappy_decompress(&[0x80], 100, &mut out).is_err());
         assert!(snappy_decompress(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80], 100, &mut out).is_err());
     }
@@ -625,19 +627,19 @@ mod tests {
         for cut in 1..full.len() {
             let mut out = Vec::new();
             let r = snappy_decompress(&full[..cut], 4096, &mut out);
-            assert!(r.is_err(), "cut={cut} で成功してしまった");
+            assert!(r.is_err(), "cut={cut} unexpectedly succeeded");
         }
     }
 
     #[test]
     fn snappy_truncated_mid_offset() {
-        // どれも「宣言 8 / リテラル 1 バイト」の後にコピーが中途で切れる形。
+        // Each case is a copy cut off mid-way after "declared 8 / literal 1 byte".
         for src in [
-            // 4 バイトオフセットを 2 バイトで打ち切る。
+            // Truncate a 4-byte offset to 2 bytes.
             &[0x08u8, 0x00, 0xaa, 0x0f, 0x01, 0x00][..],
-            // 2 バイトオフセットを 1 バイトで打ち切る。
+            // Truncate a 2-byte offset to 1 byte.
             &[0x08, 0x00, 0xaa, 0x0e, 0x01][..],
-            // 1 バイトオフセットの続きが無い。
+            // A 1-byte offset with nothing following.
             &[0x08, 0x00, 0xaa, 0x01][..],
         ] {
             let mut out = Vec::new();
@@ -660,14 +662,14 @@ mod tests {
 
     #[test]
     fn snappy_offset_beyond_written() {
-        // 1 バイトしか書いていないのに offset=9999。
+        // Only 1 byte has been written, yet offset=9999.
         let src = [0x08, 0x00, 0xaa, 0x0e, 0x0f, 0x27];
         let mut out = Vec::new();
         assert_eq!(
             code(snappy_decompress(&src, 64, &mut out).unwrap_err()),
             Code::BadCompressedData as u16
         );
-        // 4 バイトオフセットで u32 上限。usize が 32 bit でも溢れないこと。
+        // 4-byte offset at the u32 limit. Must not overflow even if usize is 32-bit.
         let src = [0x08, 0x00, 0xaa, 0x0f, 0xff, 0xff, 0xff, 0xff];
         let mut out = Vec::new();
         assert!(snappy_decompress(&src, 64, &mut out).is_err());
@@ -675,14 +677,14 @@ mod tests {
 
     #[test]
     fn snappy_output_exceeds_declared() {
-        // 宣言 2 バイトなのにリテラル 8 バイトが続く。
+        // Declared 2 bytes, but 8 literal bytes follow.
         let src = [0x02, 0x1c, 1, 2, 3, 4, 5, 6, 7, 8];
         let mut out = Vec::new();
         assert_eq!(
             code(snappy_decompress(&src, 64, &mut out).unwrap_err()),
             Code::LimitExceeded as u16
         );
-        // コピーで超過する場合。
+        // Case where a copy exceeds the limit.
         let src = [0x04, 0x04, 0x08, 0x01, 0x01];
         let mut out = Vec::new();
         assert!(snappy_decompress(&src, 64, &mut out).is_err());
@@ -690,7 +692,7 @@ mod tests {
 
     #[test]
     fn snappy_output_shorter_than_declared() {
-        // 宣言 8 バイトだがリテラルは 2 バイトだけ。
+        // Declared 8 bytes, but only 2 literal bytes are present.
         let src = [0x08, 0x04, 0xaa, 0xbb];
         let mut out = Vec::new();
         assert_eq!(
@@ -701,7 +703,7 @@ mod tests {
 
     #[test]
     fn snappy_arbitrary_bytes_never_panic() {
-        // 実データを 1 バイトずつ壊しても Err で済むこと。
+        // Corrupting real data one byte at a time must still just produce Err.
         let full = hex(SNAPPY_MIXED);
         for i in 0..full.len() {
             for m in [0x00u8, 0x55, 0xff] {
@@ -713,7 +715,7 @@ mod tests {
         }
     }
 
-    // --- LZ4: 正常系 --------------------------------------------------------
+    // --- LZ4: happy path ----------------------------------------------------
 
     #[test]
     fn lz4_small_literal_and_match() {
@@ -724,11 +726,11 @@ mod tests {
     #[test]
     fn lz4_empty() {
         lz4_ok(LZ4_EMPTY, &[]);
-        // 入力が空でも out_len が 0 なら成功（シーケンス無し）。
+        // Succeeds even with empty input if out_len is 0 (no sequences).
         let mut out = Vec::new();
         lz4_raw_decompress(&[], 0, &mut out).unwrap();
         assert!(out.is_empty());
-        // out_len > 0 で入力が空なら足りない。
+        // If out_len > 0 but the input is empty, that's insufficient.
         let mut out = Vec::new();
         assert!(lz4_raw_decompress(&[], 4, &mut out).is_err());
     }
@@ -745,7 +747,7 @@ mod tests {
 
     #[test]
     fn lz4_incompressible_all_literal() {
-        // リテラル長 1000 → 0xff の連続で拡張される。
+        // Literal length 1000 -> extended with a run of 0xff bytes.
         lz4_ok(LZ4_RANDOM, &lcg(1000));
     }
 
@@ -756,7 +758,7 @@ mod tests {
 
     #[test]
     fn lz4_over_64k() {
-        // マッチ長が 64KiB を超え、拡張バイトが大量に続く。
+        // Match length exceeds 64KiB, followed by a large run of extension bytes.
         lz4_ok(LZ4_BIG, &big());
     }
 
@@ -771,7 +773,7 @@ mod tests {
 
     #[test]
     fn lz4_cannot_reach_before_base() {
-        // リテラル 1 バイト → offset=2 は基準より前。
+        // 1-byte literal -> offset=2 points before the base.
         let src = [0x10, 0x00, 0x02, 0x00, 0x00];
         let mut out = vec![0xaa; 64];
         assert_eq!(
@@ -780,7 +782,7 @@ mod tests {
         );
     }
 
-    // --- LZ4: 異常系 --------------------------------------------------------
+    // --- LZ4: error cases ----------------------------------------------------
 
     #[test]
     fn lz4_truncated_mid_literal() {
@@ -789,14 +791,14 @@ mod tests {
             let mut out = Vec::new();
             assert!(
                 lz4_raw_decompress(&full[..cut], 43, &mut out).is_err(),
-                "cut={cut} で成功してしまった"
+                "cut={cut} unexpectedly succeeded"
             );
         }
     }
 
     #[test]
     fn lz4_truncated_mid_offset() {
-        // リテラル 4 バイトの直後にオフセットが 1 バイトしかない。
+        // Only 1 byte of offset follows immediately after a 4-byte literal.
         let src = [0x40, 1, 2, 3, 4, 0x01];
         let mut out = Vec::new();
         assert_eq!(
@@ -807,11 +809,11 @@ mod tests {
 
     #[test]
     fn lz4_truncated_length_extension() {
-        // リテラル長ニブル 15 で 0xff が続いたまま入力が尽きる。
+        // Literal-length nibble is 15 and the input runs out while 0xff bytes continue.
         let src = [0xf0, 0xff, 0xff, 0xff];
         let mut out = Vec::new();
         assert!(lz4_raw_decompress(&src, 1 << 20, &mut out).is_err());
-        // マッチ長側も同様。
+        // Same for the match-length side.
         let src = [0x4f, 1, 2, 3, 4, 0x01, 0x00, 0xff, 0xff];
         let mut out = Vec::new();
         assert!(lz4_raw_decompress(&src, 1 << 20, &mut out).is_err());
@@ -839,14 +841,14 @@ mod tests {
 
     #[test]
     fn lz4_output_exceeds_out_len() {
-        // リテラルだけで上限超過。
+        // Exceeds the limit with literals alone.
         let src = [0x80, 1, 2, 3, 4, 5, 6, 7, 8];
         let mut out = Vec::new();
         assert_eq!(
             code(lz4_raw_decompress(&src, 4, &mut out).unwrap_err()),
             Code::LimitExceeded as u16
         );
-        // マッチで上限超過（リテラル 4 + マッチ 8 > 8）。
+        // Exceeds the limit with a match (literal 4 + match 8 > 8).
         let src = [0x44, 1, 2, 3, 4, 0x04, 0x00, 0x00];
         let mut out = Vec::new();
         assert!(lz4_raw_decompress(&src, 8, &mut out).is_err());
@@ -875,7 +877,7 @@ mod tests {
         }
     }
 
-    // --- ディスパッチ -------------------------------------------------------
+    // --- Dispatch -----------------------------------------------------------
 
     #[test]
     fn decompress_dispatch() {
@@ -888,9 +890,9 @@ mod tests {
         let l = decompress(Compression::Lz4Raw, &hex(LZ4_HELLO), 43).unwrap();
         assert!(l == hello());
 
-        // ZSTD は `zstd` フィーチャが付いていれば内蔵で展開する。
-        // 空バイト列はそもそも妥当な ZSTD フレームではないので、
-        // 「委譲が要る」ではなく「壊れた入力」のエラーになる。
+        // ZSTD decompresses in-process when the `zstd` feature is enabled.
+        // An empty byte slice is not a valid ZSTD frame to begin with, so this
+        // produces a "corrupted input" error rather than "delegation needed".
         #[cfg(feature = "zstd")]
         {
             let z = decompress(Compression::Zstd, &hex(ZSTD_HELLO), 43).unwrap();
@@ -898,16 +900,16 @@ mod tests {
             assert_ne!(
                 code(decompress(Compression::Zstd, b"", 0).unwrap_err()),
                 Code::UnsupportedCodec as u16,
-                "内蔵しているので UnsupportedCodec にはならないはず"
+                "should not be UnsupportedCodec since it is built in"
             );
         }
-        // `zstd` を外した構成では旧来どおりホスト委譲（UnsupportedCodec）に戻る。
+        // With the `zstd` feature disabled, this falls back to host delegation (UnsupportedCodec) as before.
         #[cfg(not(feature = "zstd"))]
         assert_eq!(
             code(decompress(Compression::Zstd, b"", 0).unwrap_err()),
             Code::UnsupportedCodec as u16
         );
-        // GZIP は `zstd` の有無に関わらず常にホスト委譲。
+        // GZIP always delegates to the host, regardless of the `zstd` feature.
         assert_eq!(
             code(decompress(Compression::Gzip, b"", 0).unwrap_err()),
             Code::UnsupportedCodec as u16

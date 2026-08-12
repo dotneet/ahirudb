@@ -204,7 +204,7 @@ try {
 
 `errors.js` mirrors `Code` and `message()` from
 `crates/ahiru-core/src/error.rs`, so **always update both together**. If they
-drift apart, the test (`errors.js は error.rs …`) fails.
+drift apart, the test (`errors.js matches the Code / message in error.rs`) fails.
 
 ## Tests
 

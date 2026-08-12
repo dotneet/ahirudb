@@ -1,8 +1,8 @@
-//! ネイティブ CLI。
+//! The native CLI.
 //!
-//! 開発とテストはここで回す。wasm 越しのデバッグは効率が悪いので、
-//! 「開発とテストはネイティブ、サイズ計測だけ wasm」という分担にしている
-//! （DESIGN.md §12）。
+//! Development and testing happen here. Debugging through wasm is inefficient, so
+//! the split is "develop and test natively, use wasm only for size measurement"
+//! (DESIGN.md §12).
 
 mod args;
 mod engine;
@@ -112,13 +112,13 @@ fn cmd_schema(path: &str) -> R<()> {
     let bytes = std::fs::read(path)?;
     let kind = FormatKind::detect(path);
 
-    // まずフォーマット非依存のスキーマを出す。
+    // Print the format-independent schema first.
     let mut s = Session::new();
     s.register_bytes_as("t", bytes.clone(), kind)?;
     let table = s.catalog.index_of("t").ok_or("table not registered")?;
     match s.catalog.get_mut(table).ok_or("table not registered")?.resolve()? {
         Ok(()) => {}
-        Err(_) => return Err("メモリ上にファイル全体があるのに解決できなかった".into()),
+        Err(_) => return Err("could not resolve even with the whole file in memory".into()),
     }
     let t = s.catalog.get(table).ok_or("table not registered")?;
     println!("format: {kind:?}");
@@ -133,7 +133,7 @@ fn cmd_schema(path: &str) -> R<()> {
     }
     println!("splits: {}", t.num_splits());
 
-    // Parquet だけは物理配置まで見たいので、追加で内訳を出す。
+    // For Parquet only, print an additional breakdown, since the physical layout is worth seeing.
     if kind == FormatKind::Parquet {
         print_parquet_details(&bytes)?;
     }

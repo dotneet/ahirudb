@@ -1,8 +1,8 @@
-//! フレーム / ブロック / シーケンスの復号 (RFC 8878)。
+//! Frame / block / sequence decoding (RFC 8878).
 //!
-//! 入力は信用できない。宣言された長さ・オフセットは一切信用せず、全ての添字を
-//! 境界検査する。破損に対しては必ず `Err` を返す（パニックしない、バッファ外を
-//! 読まない、無限ループしない、上限を超えて確保しない）。
+//! The input is untrusted. Declared lengths and offsets are never taken on faith,
+//! and every index is bounds-checked. Corruption always yields `Err` (no panics,
+//! no out-of-buffer reads, no infinite loops, no allocation beyond the limit).
 
 use crate::fse;
 use crate::huff::Huff;
@@ -11,14 +11,14 @@ use crate::{huff, xxh64, Error};
 
 const MAGIC: u32 = 0xFD2F_B528;
 const SKIP_MAGIC: u32 = 0x184D_2A50;
-/// Block_Maximum_Size。仕様上ブロックはこれを超えない（window がより小さい
-/// 場合は更に小さいが、こちらは全体をバッファに持つので上限だけ効かせる）。
+/// Block_Maximum_Size. Per the spec no block exceeds this (it is smaller still
+/// when the window is smaller, but since this holds everything in a buffer only the cap matters).
 const BLOCK_MAX: usize = 128 * 1024;
 
-// --- 定義済みテーブル -------------------------------------------------------
+// --- Predefined tables ------------------------------------------------------
 
-// RFC 8878 の記載どおり 16 個ずつ並べる（写し間違いを目視で潰せるように）。
-// -1 は「確率 1/N 未満」で、表の末尾から 1 セルずつ埋まる。
+// Laid out 16 per line exactly as in RFC 8878 (so transcription errors can be spotted by eye).
+// -1 means "probability below 1/N", and those fill one cell at a time from the end of the table.
 #[rustfmt::skip]
 const LL_NORM: [i16; 36] = [
      4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
@@ -61,7 +61,7 @@ const ML_BITS: [u8; 53] = [
     12, 13, 14, 15, 16,
 ];
 
-// --- 小物 -------------------------------------------------------------------
+// --- Odds and ends ----------------------------------------------------------
 
 fn u32le(src: &[u8], at: usize) -> Result<u32, Error> {
     let b = src.get(at..at + 4).ok_or(Error::UnexpectedEof)?;
@@ -77,10 +77,10 @@ fn uint_le(src: &[u8], at: usize, n: usize) -> Result<u64, Error> {
     Ok(v)
 }
 
-/// 出力末尾から `offset` 戻った位置を `len` バイト複製する。
+/// Copies `len` bytes from a point `offset` back from the end of the output.
 ///
-/// 複製元と複製先は重なりうる（offset < len が繰り返しの符号化そのもの）ので
-/// 1 バイトずつ写す。`copy_from_slice` では重なり分を再生成できない。
+/// Source and destination may overlap (offset < len is exactly how repetition is
+/// encoded), so this copies one byte at a time. `copy_from_slice` cannot regenerate the overlap.
 fn copy_match(out: &mut Vec<u8>, offset: usize, len: usize, limit: usize) -> Result<(), Error> {
     if out.len() + len > limit {
         return Err(Error::LimitExceeded);
@@ -100,12 +100,12 @@ fn append(out: &mut Vec<u8>, src: &[u8], limit: usize) -> Result<(), Error> {
     Ok(())
 }
 
-// --- フレーム状態 -----------------------------------------------------------
+// --- Frame state ------------------------------------------------------------
 
-/// フレームを跨がずブロック間で持ち越す状態。
+/// State carried across blocks but not across frames.
 ///
-/// ハフマン表は Treeless リテラルブロックが、FSE 表は Repeat モードが
-/// 前ブロックのものを参照する。繰り返しオフセットも同様。
+/// Treeless literal blocks refer to the previous block's Huffman table, and Repeat
+/// mode refers to its FSE tables. The same goes for the repeat offsets.
 struct State {
     huff: Option<Huff>,
     ll: Option<fse::Table>,
@@ -122,16 +122,16 @@ impl State {
             ll: None,
             of: None,
             ml: None,
-            // 繰り返しオフセットの初期値はフレーム毎にこの値へ戻る。
+            // The repeat offsets reset to these initial values at every frame.
             rep: [1, 4, 8],
             lits: Vec::new(),
         }
     }
 }
 
-// --- 入口 -------------------------------------------------------------------
+// --- Entry point ------------------------------------------------------------
 
-/// `src` 全体を（連結された複数フレームとして）展開し `out` に追記する。
+/// Decompresses all of `src` (as concatenated frames) and appends to `out`.
 pub fn decompress_into(src: &[u8], out: &mut Vec<u8>, max_len: usize) -> Result<(), Error> {
     let limit = out.len().checked_add(max_len).ok_or(Error::LimitExceeded)?;
     let mut pos = 0usize;
@@ -141,18 +141,18 @@ pub fn decompress_into(src: &[u8], out: &mut Vec<u8>, max_len: usize) -> Result<
         frames += 1;
     }
     if frames == 0 {
-        // フレームが 1 つも無い＝マジックすら無い。
+        // Not a single frame -- not even a magic number.
         return Err(Error::UnexpectedEof);
     }
     Ok(())
 }
 
-/// 1 フレーム分を処理し、次のフレームの開始位置を返す。
+/// Processes one frame and returns the start position of the next.
 fn one_frame(src: &[u8], mut pos: usize, out: &mut Vec<u8>, limit: usize) -> Result<usize, Error> {
     let magic = u32le(src, pos)?;
     pos += 4;
 
-    // スキッパブルフレームは中身を見ずに読み飛ばす。
+    // Skippable frames are skipped without looking at their contents.
     if magic & 0xFFFF_FFF0 == SKIP_MAGIC {
         let n = u32le(src, pos)? as usize;
         pos += 4;
@@ -169,7 +169,7 @@ fn one_frame(src: &[u8], mut pos: usize, out: &mut Vec<u8>, limit: usize) -> Res
 
     let d = *src.get(pos).ok_or(Error::UnexpectedEof)?;
     pos += 1;
-    // 予約ビットが立っていたら未知の拡張。読み進めない。
+    // A set reserved bit means an unknown extension. Do not read on.
     if d & 0x08 != 0 {
         return Err(Error::BadFrameHeader);
     }
@@ -179,14 +179,14 @@ fn one_frame(src: &[u8], mut pos: usize, out: &mut Vec<u8>, limit: usize) -> Res
     let did_flag = d & 0x03;
 
     if !single {
-        // Window_Descriptor。全体をバッファに持つ実装ではウィンドウ幅を使わず、
-        // オフセットは「フレーム内で生成済みのバイト数」で縛るので読み飛ばす。
+        // Window_Descriptor. An implementation holding everything in a buffer does
+        // not use the window size -- offsets are bounded by "bytes produced so far in this frame" -- so skip it.
         if src.get(pos).is_none() {
             return Err(Error::UnexpectedEof);
         }
         pos += 1;
     }
-    // 辞書は非対応。黙って壊れた出力を返すより明示的に落とす。
+    // Dictionaries are unsupported. Fail explicitly rather than silently returning corrupt output.
     if did_flag != 0 {
         return Err(Error::DictionaryUnsupported);
     }
@@ -201,12 +201,12 @@ fn one_frame(src: &[u8], mut pos: usize, out: &mut Vec<u8>, limit: usize) -> Res
     if fcs_size > 0 {
         let v = uint_le(src, pos, fcs_size)?;
         pos += fcs_size;
-        // 2 バイト形式だけ 256 が下駄として乗る。
+        // Only the 2-byte form carries an added bias of 256.
         fcs = Some(if fcs_size == 2 { v + 256 } else { v });
     }
 
     let frame_base = out.len();
-    // 宣言サイズが上限を超えるなら展開する前に落とす。
+    // If the declared size exceeds the limit, fail before decompressing.
     if let Some(n) = fcs {
         if n > (limit - frame_base) as u64 {
             return Err(Error::LimitExceeded);
@@ -272,7 +272,7 @@ fn one_frame(src: &[u8], mut pos: usize, out: &mut Vec<u8>, limit: usize) -> Res
 }
 
 impl State {
-    /// 圧縮ブロック 1 個。リテラル部 → シーケンス部の順。
+    /// One compressed block. Literals section first, then the sequences section.
     fn block(
         &mut self,
         src: &[u8],
@@ -285,9 +285,9 @@ impl State {
         self.sequences(rest, out, frame_base, limit)
     }
 
-    // --- リテラル部 ---------------------------------------------------------
+    // --- Literals section ---------------------------------------------------
 
-    /// リテラルを `self.lits` に展開し、消費バイト数を返す。
+    /// Expands the literals into `self.lits` and returns the bytes consumed.
     fn literals(&mut self, src: &[u8]) -> Result<usize, Error> {
         let b0 = *src.first().ok_or(Error::UnexpectedEof)?;
         let ltype = b0 & 3;
@@ -295,7 +295,7 @@ impl State {
 
         self.lits.clear();
         if ltype < 2 {
-            // Raw / RLE。ヘッダは 1〜3 バイトで再生サイズだけを持つ。
+            // Raw / RLE. The header is 1-3 bytes and carries only the regenerated size.
             let (hdr, regen) = match sf {
                 1 => (
                     2,
@@ -324,8 +324,8 @@ impl State {
             return Ok(hdr + 1);
         }
 
-        // Compressed / Treeless。ヘッダは 3〜5 バイトのリトルエンディアン語で、
-        // 下位 4 ビットの後ろに再生サイズと圧縮サイズが並ぶ。
+        // Compressed / Treeless. The header is a 3-5 byte little-endian word, with
+        // the regenerated and compressed sizes following the low 4 bits.
         let (hdr, w, streams) = match sf {
             0 => (3, 10u32, 1),
             1 => (3, 10, 4),
@@ -347,7 +347,7 @@ impl State {
             stat!(crate::stats::LIT_COMPRESSED);
             n
         } else {
-            // Treeless は前ブロックの表を再利用する。無ければ破損。
+            // Treeless reuses the previous block's table. Its absence means corruption.
             if self.huff.is_none() {
                 return Err(Error::BadLiterals);
             }
@@ -356,7 +356,7 @@ impl State {
         };
         let streams_buf = body.get(tree_used..).ok_or(Error::UnexpectedEof)?;
 
-        // フィールドを分割借用する（表を読みながらリテラルへ書くため）。
+        // Split-borrow the fields (the table is read while writing into the literals).
         let State { huff, lits, .. } = self;
         let h = huff.as_ref().ok_or(Error::BadLiterals)?;
         lits.reserve(regen);
@@ -365,14 +365,14 @@ impl State {
             h.decode_stream(streams_buf, regen, lits)?;
             stat!(crate::stats::HUF_1STREAM);
         } else {
-            // 4 ストリーム形式。先頭 6 バイトが最初の 3 本のサイズ表。
+            // The 4-stream form. The first 6 bytes are the size table for the first three.
             let jt = streams_buf.get(..6).ok_or(Error::UnexpectedEof)?;
             let s1 = u16::from_le_bytes([jt[0], jt[1]]) as usize;
             let s2 = u16::from_le_bytes([jt[2], jt[3]]) as usize;
             let s3 = u16::from_le_bytes([jt[4], jt[5]]) as usize;
             let body4 = &streams_buf[6..];
             let s4 = body4.len().checked_sub(s1 + s2 + s3).ok_or(Error::BadLiterals)?;
-            // 各ストリームは 1/4 ずつ担当し、最後だけ端数を持つ。
+            // Each stream covers a quarter, and only the last one carries the remainder.
             let seg = regen.div_ceil(4);
             let last = regen.checked_sub(seg * 3).ok_or(Error::BadLiterals)?;
             let mut at = 0usize;
@@ -389,7 +389,7 @@ impl State {
         Ok(hdr + comp)
     }
 
-    // --- シーケンス部 -------------------------------------------------------
+    // --- Sequences section --------------------------------------------------
 
     fn sequences(
         &mut self,
@@ -413,7 +413,7 @@ impl State {
         };
 
         if nb == 0 {
-            // シーケンス無し。リテラルがそのまま出力になる。
+            // No sequences. The literals are the output as is.
             return append(out, &self.lits, limit);
         }
 
@@ -422,7 +422,7 @@ impl State {
         if modes & 3 != 0 {
             return Err(Error::BadSequence);
         }
-        // 表の並びは LL, OF, ML の順（実行順とは違うので注意）。
+        // The tables come in the order LL, OF, ML (note that this differs from execution order).
         p += load_table(&mut self.ll, modes >> 6, src.get(p..).unwrap_or(&[]), Kind::Ll)?;
         p += load_table(&mut self.of, (modes >> 4) & 3, src.get(p..).unwrap_or(&[]), Kind::Of)?;
         p += load_table(&mut self.ml, (modes >> 2) & 3, src.get(p..).unwrap_or(&[]), Kind::Ml)?;
@@ -449,12 +449,12 @@ impl State {
             if of_code > 31 || ll_code >= LL_BASE.len() || ml_code >= ML_BASE.len() {
                 return Err(Error::BadSequence);
             }
-            // 追加ビットは Offset, Match_Length, Literals_Length の順に並ぶ。
+            // The extra bits come in the order Offset, Match_Length, Literals_Length.
             let off_v = (1u64 << of_code) + r.read(of_code);
             let ml_v = ML_BASE[ml_code] as usize + r.read(ML_BITS[ml_code] as u32) as usize;
             let ll_v = LL_BASE[ll_code] as usize + r.read(LL_BITS[ll_code] as u32) as usize;
-            // 状態更新は Literals_Length, Match_Length, Offset の順。
-            // 最後のシーケンスの後には更新用のビットが無い。
+            // State updates go in the order Literals_Length, Match_Length, Offset.
+            // There are no update bits after the last sequence.
             if i + 1 < nb {
                 ll.update(&mut ll_st, &mut r);
                 ml.update(&mut ml_st, &mut r);
@@ -468,8 +468,8 @@ impl State {
             append(out, src_lit, limit)?;
             lit_pos += ll_v;
 
-            // オフセット値 1..3 は繰り返しオフセットの参照。literals_length が
-            // 0 のときだけ 1 つずれる（直前と同じオフセットを再指定できないため）。
+            // Offset values 1..3 refer to the repeat offsets. They shift by one only
+            // when literals_length is 0 (the immediately previous offset cannot be respecified).
             let offset = if off_v > 3 {
                 let o = (off_v - 3) as u32;
                 rep[2] = rep[1];
@@ -492,13 +492,13 @@ impl State {
                 }
             } as usize;
 
-            // 直前フレームや辞書には遡れない。生成済みバイト数で縛る。
+            // There is no reaching back into a previous frame or a dictionary. Bound by bytes produced.
             if offset == 0 || offset > out.len() - frame_base {
                 return Err(Error::BadOffset);
             }
             copy_match(out, offset, ml_v, limit)?;
         }
-        // ビットストリームはちょうど使い切る。
+        // The bitstream is consumed exactly.
         if r.off() != 0 {
             return Err(Error::BadSequence);
         }
@@ -515,7 +515,7 @@ enum Kind {
     Ml,
 }
 
-/// シーケンス用 FSE 表を 1 本読み込む。返り値は消費バイト数。
+/// Reads one FSE table for sequences. The return value is the bytes consumed.
 fn load_table(
     slot: &mut Option<fse::Table>,
     mode: u8,
@@ -553,7 +553,7 @@ fn load_table(
             Ok(used)
         }
         _ => {
-            // Repeat: 直前のブロックの表をそのまま使う。無ければ破損。
+            // Repeat: use the previous block's table as is. Its absence means corruption.
             if slot.is_none() {
                 return Err(Error::BadSequence);
             }
@@ -567,9 +567,9 @@ fn load_table(
 mod predefined_tests {
     use super::*;
 
-    /// 定義済み分布は写し間違えても合計が 2^Accuracy_Log に収まってしまうことが
-    /// あり、`build` の整合検査だけでは検出できない。既知の状態→シンボル対応で
-    /// 固定する（RFC 8878 の表から手計算した値）。
+    /// A mistranscribed predefined distribution can still sum to 2^Accuracy_Log,
+    /// which `build`'s consistency check cannot catch. Pin it down with known
+    /// state-to-symbol mappings (hand-computed from the tables in RFC 8878).
     #[test]
     fn predefined_tables_match_spec() {
         let ll = fse::predefined(&LL_NORM, 6).unwrap();
@@ -585,13 +585,13 @@ mod predefined_tests {
         assert_eq!(ml.peek(57), 52);
         assert_eq!(ml.peek(63), 46);
 
-        // -1 のシンボルは表末尾に自然順で逆向きに並ぶ。
+        // The -1 symbols land at the end of the table in natural order, reversed.
         for (i, s) in [46u8, 47, 48, 49, 50, 51, 52].iter().enumerate() {
             assert_eq!(ml.peek(63 - i as u16), *s);
         }
     }
 
-    /// baseline / 追加ビット表の長さと端の値。
+    /// The lengths and edge values of the baseline / extra-bits tables.
     #[test]
     fn baseline_tables() {
         assert_eq!(LL_BASE.len(), LL_BITS.len());

@@ -1,119 +1,128 @@
-//! Parquet スキーマ → ahirudb の型への解決。
+//! Resolution from Parquet schema to ahirudb types.
 //!
-//! フッタの `schema` は深さ優先順に並んだ `SchemaElement` の平坦な列で、
-//! 各要素は `num_children` で自分の子の数だけを申告する（実際の木構造は
-//! 「次の `num_children` 個ぶんを再帰的に消費する」ことで初めて分かる）。
-//! これは Thrift Compact のフッタが木そのものではなく前順走査の記録だから。
+//! The footer's `schema` is a flat, depth-first-ordered array of `SchemaElement`s.
+//! Each element declares only its own number of children via `num_children` (the
+//! actual tree structure only emerges by recursively consuming the next
+//! `num_children` elements).
+//! This is because the Thrift Compact footer records a preorder traversal, not the
+//! tree itself.
 //!
-//! REPEATED を含まない STRUCT（= 子を持つ REQUIRED/OPTIONAL グループ）は
-//! 物理的にはリーフごとに独立した列チャンクを持つだけなので、
-//! 「木を辿ってドット区切り名のリーフ列を集める」だけで読める。
+//! A STRUCT that contains no REPEATED (i.e. a REQUIRED/OPTIONAL group with
+//! children) physically just has an independent column chunk per leaf, so it can be
+//! read simply by walking the tree and collecting leaf columns with dot-separated
+//! names.
 //!
-//! REPEATED を含む部分木（LIST/MAP、または素の REPEATED フィールド）は
-//! 行と配列要素の対応付けに repetition level の解読が要るので別に扱う。
-//! ここでは「REPEATED を含む部分木をまるごと 1 本の `Ty::Json` 列にする」
-//! という設計を採る： `reader::nested` が repetition/definition level から
-//! Dremel 方式で行ごとの入れ子構造を組み立て、JSON テキストへ直列化する
-//! （物理型は 6 種のまま増やさない。DESIGN.md §8, §11）。
-//! したがって「REPEATED を全く含まない STRUCT」だけが引き続きドット区切り
-//! 列へフラット化される（例: `address.city`）。STRUCT の中に LIST/MAP が
-//! あれば、その STRUCT ごと 1 本の JSON 列になる。
+//! A subtree containing REPEATED (LIST/MAP, or a bare REPEATED field) requires
+//! decoding the repetition level to map rows to array elements, so it is handled
+//! separately. Here we adopt the design of turning a whole subtree that contains
+//! REPEATED into a single `Ty::Json` column: `reader::nested` builds the per-row
+//! nested structure from the repetition/definition levels using the Dremel method,
+//! and serializes it into JSON text (the physical type stays at 6 kinds without
+//! adding more. DESIGN.md §8, §11).
+//! Therefore only a STRUCT that contains no REPEATED at all continues to be
+//! flattened into dot-separated columns (e.g. `address.city`). If a STRUCT contains
+//! a LIST/MAP, the whole STRUCT becomes a single JSON column.
 //!
-//! SQL 側のドットアクセサ（`SELECT s.field`）はここでは扱わない。ここが
-//! 提供するのは `address.city` のようなドット区切り名を持つ、あたかも
-//! フラットであるかのような列の集合だけで、それをどう SQL にバインドする
-//! かは呼び出し側の仕事。
+//! The SQL-side dot accessor (`SELECT s.field`) is not handled here. What this
+//! module provides is only a set of columns with dot-separated names like
+//! `address.city`, as if they were flat; how those get bound to SQL is the
+//! caller's responsibility.
 
 use crate::parquet::meta::{ColumnMetaData, FileMetaData, SchemaElement};
 use crate::parquet::*;
 use crate::prelude::*;
 use crate::vector::Ty;
 
-/// スキーマ木を再帰的に辿る際の深さ上限。壊れた/悪意あるファイルが
-/// スタックを使い切らないための防御（thrift.rs の `MAX_DEPTH` と同じ考え方
-/// だが、対象が Thrift 値ではなくスキーマ木なので別定数として持つ）。
+/// Depth limit when recursively walking the schema tree. A defense against a
+/// corrupted/malicious file exhausting the stack (the same idea as `MAX_DEPTH` in
+/// thrift.rs, but kept as a separate constant since the target here is the schema
+/// tree, not a Thrift value).
 const MAX_SCHEMA_DEPTH: usize = 32;
 
-/// 解決できる物理リーフ列数の上限。`meta.rs::MAX_SCHEMA_ELEMENTS` と揃えて
-/// ある。実ファイル由来ならフッタの Thrift デコード時点でその上限に既に
-/// 収まっているが、`resolve_schema` はそれとは独立に呼べる（テストや将来の
-/// 別入口）ので、ここでも同じ上限を自前で守り、青天井の確保を許さない。
-/// 出力列（論理列）数は物理リーフ数以下に必ず収まるので、この 1 つの上限で
-/// 両方を守れる。
+/// Upper bound on the number of physical leaf columns that can be resolved. Kept
+/// aligned with `meta.rs::MAX_SCHEMA_ELEMENTS`. For a real file, the footer's Thrift
+/// decoding already stays within that limit, but `resolve_schema` can be called
+/// independently of that (from tests, or a future entry point), so we enforce the
+/// same limit here as well and never allow unbounded allocation. The number of
+/// output (logical) columns is always at most the number of physical leaves, so
+/// this single limit protects both.
 const MAX_LEAF_COLUMNS: usize = 16_384;
 
-/// 入れ子列 1 リーフぶんのデコード情報（`reader::nested` が使う）。
-/// `ColumnDesc::leaves` は `ColumnDesc::phys_cols` と同じ順序・長さで並ぶ。
+/// Decoding information for one leaf of a nested column (used by `reader::nested`).
+/// `ColumnDesc::leaves` is arranged in the same order and length as
+/// `ColumnDesc::phys_cols`.
 #[derive(Clone, Copy)]
 pub struct LeafDecodeInfo {
     pub ptype: PType,
     pub type_length: usize,
     pub time_unit: Option<TimeUnit>,
     pub ty: Ty,
-    /// このリーフに至る経路上の OPTIONAL+REPEATED 数（自分含む、入れ子列の
-    /// 根を基準に数える）。値が存在する判定に使う。
+    /// Number of OPTIONAL+REPEATED elements on the path to this leaf (including
+    /// itself, counted from the root of the nested column). Used to determine
+    /// whether a value is present.
     pub max_def_level: u16,
-    /// このリーフに至る経路上の REPEATED 数（自分含む）。ページ内の
-    /// repetition level ストリームのビット幅を決めるのに使う。
+    /// Number of REPEATED elements on the path to this leaf (including itself).
+    /// Used to determine the bit width of the repetition level stream in the page.
     pub max_rep_level: u16,
 }
 
-/// 入れ子スキーマ木（REPEATED を含む部分木）のノード。
+/// A node of the nested schema tree (a subtree that contains REPEATED).
 pub struct NestedNode {
-    /// STRUCT フィールド名としての描画に使う（配列要素そのものには使わない）。
+    /// Used to render as a STRUCT field name (not used for the array element itself).
     pub name: String,
     pub repetition: Repetition,
-    /// このノードに至る経路上の OPTIONAL+REPEATED 数の累計（自分を含む、
-    /// 入れ子列の根を基準に数える）。
+    /// Cumulative count of OPTIONAL+REPEATED elements on the path to this node
+    /// (including itself, counted from the root of the nested column).
     pub def_depth: u16,
-    /// このノードに至る経路上の REPEATED 数の累計（自分を含む）。
+    /// Cumulative count of REPEATED elements on the path to this node (including itself).
     pub rep_depth: u16,
     pub content: NestedContent,
-    /// 存在確認・くり返し境界判定に使う代表リーフの `leaves` 配列中の添字。
-    /// このノード配下の最初のリーフを指す（配下のどのリーフも、このノードの
-    /// 存在・くり返し回数について同じ答えを持つ）。
+    /// Index into the `leaves` array of the representative leaf used for presence
+    /// checks and repetition-boundary determination. Points to the first leaf under
+    /// this node (any leaf under this node gives the same answer for this node's
+    /// presence and repeat count).
     pub rep_leaf: usize,
 }
 
 pub enum NestedContent {
-    /// 物理リーフ列。値は `leaves[index]` から取り出す。
+    /// A physical leaf column. The value is fetched from `leaves[index]`.
     Leaf(usize),
-    /// 子ノード列。非 REPEATED なら名前つきフィールド（STRUCT）、REPEATED
-    /// なら「配列 1 要素ぶんの中身」（3 段/2 段エンコーディングの中間
-    /// group、または MAP の key/value）を表す。
+    /// A child node array. If non-REPEATED, represents named fields (STRUCT); if
+    /// REPEATED, represents "the contents of one array element" (the intermediate
+    /// group of the 3-level/2-level encoding, or a MAP's key/value).
     Group(Vec<NestedNode>),
 }
 
-/// 1 リーフ列の読み取りに必要な情報。
+/// Information needed to read a single leaf column.
 pub struct ColumnDesc {
-    /// STRUCT の下にあるリーフはドット区切り（`address.city`）。
+    /// A leaf under a STRUCT uses a dot-separated name (`address.city`).
     pub name: String,
     pub ty: Ty,
     pub nullable: bool,
-    /// このリーフに至る経路上の OPTIONAL 要素数（リーフ自身を含む）。
-    /// REPEATED が無い STRUCT チェーンでは、これがそのまま
-    /// 「レベル一致 = 値あり」の definition level 上限として使える
-    /// （途中のどのグループが NULL でも、リーフに届く前に打ち切られて
-    /// 同じ 1 ビットの validity に潰れるため）。フラット列なら 0 か 1。
-    /// `nested` が `Some` の列では未使用（常に 0）。
+    /// Number of OPTIONAL elements on the path to this leaf (including the leaf
+    /// itself). In a STRUCT chain with no REPEATED, this can be used directly as
+    /// the definition-level upper bound for "level matches => value present"
+    /// (whichever intermediate group is NULL, it gets cut off before reaching the
+    /// leaf and collapses to the same single validity bit). 0 or 1 for a flat
+    /// column. Unused (always 0) for a column where `nested` is `Some`.
     pub max_def_level: u16,
     pub ptype: PType,
-    /// FIXED_LEN_BYTE_ARRAY のバイト長。それ以外では 0。
-    /// `nested` が `Some` の列では未使用。
+    /// Byte length for FIXED_LEN_BYTE_ARRAY. 0 otherwise.
+    /// Unused for a column where `nested` is `Some`.
     pub type_length: usize,
-    /// TIME / TIMESTAMP のファイル上の分解能。読み取り時にマイクロ秒へ正規化する。
-    /// `nested` が `Some` の列では未使用。
+    /// On-file resolution of TIME / TIMESTAMP. Normalized to microseconds when read.
+    /// Unused for a column where `nested` is `Some`.
     pub time_unit: Option<TimeUnit>,
-    /// 物理列チャンク番号（`row_group.columns` の添字）。フラット列は必ず
-    /// 1 個。入れ子列は部分木の全リーフぶん複数持つ（読み取り順 = `leaves`
-    /// と同じ順序）。
+    /// Physical column chunk number(s) (index into `row_group.columns`). A flat
+    /// column always has exactly one. A nested column has multiple, one for each
+    /// leaf of the subtree (read order matches the order of `leaves`).
     pub phys_cols: Vec<usize>,
-    /// `phys_cols` と同じ順序・長さで並ぶ、入れ子列のリーフごとのデコード
-    /// 情報。フラット列では空。
+    /// Per-leaf decoding information for a nested column, arranged in the same
+    /// order and length as `phys_cols`. Empty for a flat column.
     pub leaves: Vec<LeafDecodeInfo>,
-    /// REPEATED を含む部分木の構造。`Some` なら `ty == Ty::Json` で、
-    /// 読み取りは `reader::nested` の Dremel 組み立て経路を使う。
-    /// `None` なら今までどおりのフラット読み取り。
+    /// Structure of a subtree containing REPEATED. If `Some`, `ty == Ty::Json`,
+    /// and reading uses `reader::nested`'s Dremel-assembly path. If `None`, this is
+    /// a plain flat read as before.
     pub nested: Option<Box<NestedNode>>,
 }
 
@@ -122,20 +131,20 @@ pub struct ParquetSchema {
 }
 
 impl ParquetSchema {
-    /// 名前で列を引く（大文字小文字を区別しない）。STRUCT 配下の列は
-    /// `address.city` のようなドット区切りの完全名で引く。
+    /// Look up a column by name (case-insensitive). A column under a STRUCT is
+    /// looked up by its full dot-separated name, like `address.city`.
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.columns
             .iter()
             .position(|c| crate::rt::hash::eq_ascii_ci(c.name.as_bytes(), name.as_bytes()))
     }
 
-    /// `prefix` が STRUCT 列のドット区切り名の接頭辞として存在するか。
+    /// Whether `prefix` exists as a dot-separated-name prefix of a STRUCT column.
     ///
-    /// `index_of("address")` は（`address` 自体はリーフではないので）
-    /// 見つからずに `None` を返す。DESCRIBE やエラーメッセージ生成側が
-    /// 「その名前は列ではなく STRUCT だ」と言い分けられるよう、この判定
-    /// だけ別に提供する。SQL のドットアクセサ構文自体はここでは扱わない。
+    /// `index_of("address")` returns `None` because `address` itself is not found
+    /// (it is not a leaf). This check is provided separately so that DESCRIBE and
+    /// error-message generation can distinguish "that name is a STRUCT, not a
+    /// column". The SQL dot-accessor syntax itself is not handled here.
     pub fn is_struct_prefix(&self, prefix: &str) -> bool {
         self.columns.iter().any(|c| {
             let name = c.name.as_bytes();
@@ -147,10 +156,11 @@ impl ParquetSchema {
     }
 }
 
-/// フッタのスキーマ要素列（深さ優先順）からリーフ列を解決する。
+/// Resolves leaf columns from the footer's schema element array (depth-first order).
 ///
-/// ルート直下の `nchildren` 個を順に消費する。各要素が STRUCT グループなら
-/// さらにその子を消費する、という再帰で木全体を辿る。
+/// Consumes the `nchildren` elements directly under the root, in order. If an
+/// element is a STRUCT group, its children are consumed too, recursing through the
+/// whole tree.
 pub fn resolve_schema(md: &FileMetaData) -> Result<ParquetSchema> {
     ensure!(!md.schema.is_empty(), BadThrift);
     let root = &md.schema[0];
@@ -163,21 +173,24 @@ pub fn resolve_schema(md: &FileMetaData) -> Result<ParquetSchema> {
     for _ in 0..nchildren {
         pos = resolve_node(md, pos, "", 0, 0, &mut phys, &mut columns)?;
     }
-    // 申告されたトップレベル子数と、実際に消費した要素数（部分木含む）が
-    // 食い違うのは壊れた/意図的に細工されたスキーマ。
+    // A mismatch between the declared top-level child count and the number of
+    // elements actually consumed (including subtrees) indicates a corrupted or
+    // deliberately crafted schema.
     ensure!(pos == md.schema.len(), UnsupportedNested);
     Ok(ParquetSchema { columns })
 }
 
-/// スキーマ木を 1 ノード分（リーフなら自分だけ、グループなら部分木全体）
-/// 消費し、次に消費すべき位置を返す。
+/// Consumes one node's worth of the schema tree (just itself if a leaf, the whole
+/// subtree if a group), and returns the next position to consume.
 ///
-/// - `prefix` はここまでの祖先グループ名を `.` で連結したもの（トップレベル
-///   なら空文字列）。
-/// - `parent_def_level` は祖先（自分を含まない）の OPTIONAL 要素数。
-/// - `phys` はここまでに解決した物理リーフ列数（`row_group.columns` の
-///   次の添字）。フラット列・入れ子列を問わず、リーフを 1 つ消費するたびに
-///   進める。
+/// - `prefix` is the ancestor group names joined with `.` so far (an empty string
+///   at the top level).
+/// - `parent_def_level` is the number of OPTIONAL elements among the ancestors
+///   (not including itself).
+/// - `phys` is the number of physical leaf columns resolved so far (the next
+///   index into `row_group.columns`). It is advanced every time a leaf is
+///   consumed, whether flat or nested.
+///
 fn resolve_node(
     md: &FileMetaData,
     pos: usize,
@@ -188,7 +201,7 @@ fn resolve_node(
     out: &mut Vec<ColumnDesc>,
 ) -> Result<usize> {
     ensure!(depth < MAX_SCHEMA_DEPTH, NestingTooDeep);
-    // 子の数を申告どおりに消費し切る前に列が尽きた = 壊れたスキーマ。
+    // Running out of elements before consuming the declared number of children means the schema is corrupted.
     ensure!(pos < md.schema.len(), UnsupportedNested);
     let e = &md.schema[pos];
 
@@ -199,8 +212,9 @@ fn resolve_node(
     }
     name.push_str(&e.name);
 
-    // REPEATED を部分木のどこかに含む（自分自身が REPEATED な場合も含む）
-    // なら、STRUCT フラット化はせずこの部分木をまるごと 1 本の JSON 列にする。
+    // If REPEATED appears anywhere in the subtree (including the node itself being
+    // REPEATED), don't flatten as a STRUCT -- turn this whole subtree into a single
+    // JSON column instead.
     let (has_repeated, _) = scan_repeated(md, pos, depth)?;
     if has_repeated {
         let mut leaves = Vec::new();
@@ -239,7 +253,7 @@ fn resolve_node(
     ensure!(nchildren >= 0, BadThrift);
 
     if nchildren > 0 {
-        // 子を持つ = STRUCT グループ。子の列名にはこのグループ名を前置する。
+        // Having children means this is a STRUCT group. Prefix child column names with this group's name.
         let mut child_pos = pos + 1;
         for _ in 0..nchildren {
             child_pos = resolve_node(md, child_pos, &name, def_level, depth + 1, phys, out)?;
@@ -251,11 +265,11 @@ fn resolve_node(
     Ok(pos + 1)
 }
 
-/// `pos` の部分木（自分自身を含む）に REPEATED な要素が 1 つでもあるか。
-/// 返り値は `(見つかったか, 消費した次の位置)`。呼び出し側が `has_repeated`
-/// でない場合だけこの関数の返す位置を使い、`has_repeated` の場合は
-/// `build_nested_node` が改めて同じ部分木を辿って本体を組み立てる
-/// （フッタは小さいので二重走査のコストは無視できる）。
+/// Whether the subtree at `pos` (including itself) contains any REPEATED element.
+/// Returns `(found, next position consumed)`. The caller uses this function's
+/// returned position only when `has_repeated` is false; when `has_repeated` is
+/// true, `build_nested_node` walks the same subtree again to build the body
+/// (the footer is small, so the cost of the double traversal is negligible).
 fn scan_repeated(md: &FileMetaData, pos: usize, depth: usize) -> Result<(bool, usize)> {
     ensure!(depth < MAX_SCHEMA_DEPTH, NestingTooDeep);
     ensure!(pos < md.schema.len(), UnsupportedNested);
@@ -272,9 +286,10 @@ fn scan_repeated(md: &FileMetaData, pos: usize, depth: usize) -> Result<(bool, u
     Ok((found, p))
 }
 
-/// REPEATED を含む部分木を `NestedNode` に組み立てる。リーフに出会うたびに
-/// `phys` を進め、`leaves` に `(物理列番号, デコード情報)` を追記する
-/// （追記順 = `NestedContent::Leaf` が指す添字の順）。
+/// Builds a subtree containing REPEATED into a `NestedNode`. Every time a leaf is
+/// encountered, `phys` is advanced and `(physical column number, decode info)` is
+/// appended to `leaves` (append order matches the index order that
+/// `NestedContent::Leaf` points to).
 #[allow(clippy::too_many_arguments)]
 fn build_nested_node(
     md: &FileMetaData,
@@ -317,10 +332,10 @@ fn build_nested_node(
             children.push(child);
             p = next;
         }
-        // 子が 1 つも無いグループ（nchildren == 0 はここに来ない）はあり
-        // 得ないが、`first()` が `None` になる状況（壊れたスキーマで
-        // nchildren > 0 なのに子が消費できていない）は上のループの
-        // `ensure!` で先に弾かれている。
+        // A group with zero children (nchildren == 0 never reaches here) can't
+        // happen, but the situation where `first()` is `None` (a corrupted schema
+        // where nchildren > 0 yet no children were consumed) is already rejected
+        // earlier by the `ensure!` in the loop above.
         let rep_leaf = children.first().map(|c| c.rep_leaf).unwrap_or(0);
         Ok((
             NestedNode {
@@ -365,10 +380,10 @@ fn build_nested_node(
     }
 }
 
-/// リーフ要素 1 つを `ColumnDesc` にする。`max_def_level` は呼び出し側
-/// （`resolve_node` の再帰、またはフラット列単体を扱う `resolve_column`）
-/// が経路全体から計算済みのものを渡す。`phys` はこのリーフの物理列番号を
-/// 割り当てたあと 1 つ進める。
+/// Turns a single leaf element into a `ColumnDesc`. `max_def_level` is passed in
+/// already computed from the whole path by the caller (either `resolve_node`'s
+/// recursion, or `resolve_column`, which handles a standalone flat column). `phys`
+/// is advanced by one after assigning this leaf's physical column number.
 fn resolve_leaf(
     e: &SchemaElement,
     name: String,
@@ -377,9 +392,9 @@ fn resolve_leaf(
 ) -> Result<ColumnDesc> {
     let ptype = match e.ptype {
         Some(p) => p,
-        // 物理型が無い = グループ要素。呼び出し元（`resolve_node`）は
-        // `num_children > 0` のときグループとして先に分岐しているので、
-        // ここに来るのは `num_children == 0` なのに物理型も無い壊れた要素。
+        // No physical type = a group element. The caller (`resolve_node`) already
+        // branches as a group when `num_children > 0`, so reaching here means a
+        // corrupted element with `num_children == 0` and no physical type either.
         None => err!(UnsupportedNested),
     };
     ensure!(*phys < MAX_LEAF_COLUMNS, UnsupportedNested);
@@ -401,22 +416,23 @@ fn resolve_leaf(
     })
 }
 
-/// フラットな単体要素をトップレベル列として解決する。祖先を持たないので
-/// `max_def_level` は自分の OPTIONAL/REQUIRED だけで決まる
-/// （`resolve_node` の `prefix == ""`, `parent_def_level == 0` と同じ計算）。
-/// `resolve_schema` は木を辿る `resolve_node`/`resolve_leaf` を直接使うので、
-/// 現在これを呼ぶのは単体テストだけ（1 要素だけを単独で検証したい場合に、
-/// 木を組み立てずに済む）。
+/// Resolves a standalone flat element as a top-level column. Since it has no
+/// ancestors, `max_def_level` is determined solely by its own OPTIONAL/REQUIRED
+/// (the same computation as `resolve_node` with `prefix == ""`,
+/// `parent_def_level == 0`). `resolve_schema` uses `resolve_node`/`resolve_leaf`
+/// directly to walk the tree, so currently only unit tests call this (useful when
+/// you want to verify a single element in isolation without building a tree).
 #[cfg(test)]
 fn resolve_column(e: &SchemaElement) -> Result<ColumnDesc> {
     let max_def_level = u16::from(e.repetition != Some(Repetition::Required));
     resolve_leaf(e, e.name.clone(), max_def_level, &mut 0)
 }
 
-/// 論理型 → 変換テーブル → 物理型、の優先順で SQL 型を決める。
+/// Decides the SQL type in priority order: logical type -> converted type -> physical type.
 fn map_type(e: &SchemaElement, ptype: PType) -> Result<(Ty, Option<TimeUnit>)> {
-    // 論理型と物理型の整合は検証しない（writer 依存の揺れが大きいため）。
-    // 実際に変換できるかは reader が (ptype, ty) の組で判定する。
+    // We don't validate consistency between logical type and physical type (writer
+    // behavior varies too much). Whether conversion is actually possible is decided
+    // by the reader based on the (ptype, ty) pair.
     if let Some(l) = e.logical {
         return map_logical(l);
     }
@@ -431,9 +447,9 @@ fn map_logical(l: LogicalType) -> Result<(Ty, Option<TimeUnit>)> {
     Ok(match l {
         L::String | L::Enum | L::Json => (Ty::Varchar, None),
         L::Bson => (Ty::Blob, None),
-        // UUID の物理表現は FLBA(16) の生バイト列で、`Ty::Blob` と同じ
-        // `Bytes` 系だが、テキスト表示・パースがハイフン付き 16 進形式に
-        // なる点だけ異なる（`Ty::Uuid` の doc 参照）。
+        // UUID's physical representation is the raw bytes of FLBA(16) -- the same
+        // `Bytes` family as `Ty::Blob` -- but differs only in that text
+        // display/parsing uses the hyphenated hex format (see the `Ty::Uuid` doc).
         L::Uuid => (Ty::Uuid, None),
         L::Decimal { scale, precision } => {
             ensure!((1..=38).contains(&precision), UnsupportedType);
@@ -442,21 +458,21 @@ fn map_logical(l: LogicalType) -> Result<(Ty, Option<TimeUnit>)> {
         }
         L::Date => (Ty::Date, None),
         L::Time { unit, .. } => (Ty::Time, Some(unit)),
-        // `utc` (`isAdjustedToUTC`) が真なら、この列は既に UTC の瞬間を表す
-        // タイムスタンプ（`Ty::Timestamptz`）。偽ならタイムゾーン無しの素の
-        // 日時（`Ty::Timestamp`）。レガシーな `ConvertedType` 経路
-        // （`map_converted`）にはこのビットが無いので、そちらは常に
-        // `Ty::Timestamp` のままにしてある。
+        // If `utc` (`isAdjustedToUTC`) is true, this column already represents a UTC
+        // instant timestamp (`Ty::Timestamptz`). If false, it's a plain date/time
+        // with no timezone (`Ty::Timestamp`). The legacy `ConvertedType` path
+        // (`map_converted`) has no such bit, so that path always stays
+        // `Ty::Timestamp`.
         L::Timestamp { unit, utc } => {
             (if utc { Ty::Timestamptz } else { Ty::Timestamp }, Some(unit))
         }
         L::Integer { bit_width, signed } => (int_ty(bit_width, signed)?, None),
         L::Unknown => (Ty::Null, None),
-        // LIST / MAP は「REPEATED を含む部分木」の入口として build_nested_node
-        // 側で処理されるので、ここに来るのはリーフに直接付いている場合
-        // （スキーマが壊れている）だけ。
+        // LIST / MAP are handled by build_nested_node as the entry point for "a
+        // subtree containing REPEATED", so reaching here means the annotation is
+        // attached directly to a leaf (a corrupted schema).
         L::List | L::Map => err!(UnsupportedNested),
-        // FLOAT16 は FLBA(2) の半精度。v1 では未対応。
+        // FLOAT16 is FLBA(2) half precision. Not supported in v1.
         L::Float16 => err!(UnsupportedType),
     })
 }
@@ -486,9 +502,9 @@ fn map_converted(c: ConvertedType, e: &SchemaElement) -> Result<(Ty, Option<Time
         C::Int16 => (Ty::SmallInt, None),
         C::Int32 => (Ty::Int, None),
         C::Int64 => (Ty::BigInt, None),
-        // LIST/MAP は build_nested_node 側の入口で処理される（上記コメント参照）。
+        // LIST/MAP are handled at the build_nested_node entry point (see the comment above).
         C::List | C::Map | C::MapKeyValue => err!(UnsupportedNested),
-        // INTERVAL は FLBA(12)。SQL 側に対応する型が無いので未対応。
+        // INTERVAL is FLBA(12). Not supported since there is no corresponding SQL type.
         C::Interval => err!(UnsupportedType),
     })
 }
@@ -498,8 +514,8 @@ fn map_physical(ptype: PType) -> Result<Ty> {
         PType::Boolean => Ty::Boolean,
         PType::Int32 => Ty::Int,
         PType::Int64 => Ty::BigInt,
-        // INT96 は非推奨だが Hive/Spark 由来のファイルに今も残っている。
-        // ナノ秒精度のタイムスタンプとして解釈する。
+        // INT96 is deprecated but still shows up in files originating from Hive/Spark.
+        // Interpreted as a nanosecond-precision timestamp.
         PType::Int96 => Ty::Timestamp,
         PType::Float => Ty::Float,
         PType::Double => Ty::Double,
@@ -521,7 +537,7 @@ fn int_ty(bit_width: u8, signed: bool) -> Result<Ty> {
     })
 }
 
-/// 列チャンクが暗号化・外部ファイル参照でないことを確認する。
+/// Confirms that the column chunk is neither encrypted nor an external file reference.
 pub fn check_chunk_supported(meta: &ColumnMetaData) -> Result<()> {
     ensure!(meta.codec != Compression::Lzo, UnsupportedCodec);
     ensure!(meta.codec != Compression::Lz4, UnsupportedCodec);
@@ -651,11 +667,11 @@ mod tests {
         assert_eq!(resolve_column(&e).unwrap().ty, Ty::Decimal { precision: 10, scale: 2 });
     }
 
-    // --- 合成スキーマでの STRUCT / 深さ・幅の上限 ------------------------
+    // --- STRUCT / depth and width limits with synthetic schemas ------------------------
 
-    /// 単一段の OPTIONAL グループの子 1 つと STRUCT でないリーフ 1 つ。
-    /// ドット区切り名になること、`max_def_level` が祖先ぶん積み上がること
-    /// を、実ファイルを介さず最小構成で確かめる。
+    /// A single-level OPTIONAL group with one child, plus one non-STRUCT leaf.
+    /// Confirms, with a minimal setup and no real file involved, that the name
+    /// becomes dot-separated and that `max_def_level` accumulates across ancestors.
     #[test]
     fn single_level_struct_resolves_to_dotted_names() {
         let mut group = elem("address", None, Repetition::Optional);
@@ -676,18 +692,18 @@ mod tests {
         let s = resolve_schema(&md).unwrap();
         let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["id", "address.city", "address.zip"]);
-        assert_eq!(s.columns[0].max_def_level, 0); // id は REQUIRED。
-                                                   // address (OPTIONAL) + city (OPTIONAL) の 2 段ぶん。
+        assert_eq!(s.columns[0].max_def_level, 0); // id is REQUIRED.
+                                                   // 2 levels: address (OPTIONAL) + city (OPTIONAL).
         assert_eq!(s.columns[1].max_def_level, 2);
         assert_eq!(s.columns[2].max_def_level, 2);
         assert_eq!(s.index_of("address.city"), Some(1));
-        assert_eq!(s.index_of("address"), None); // リーフではないので引けない。
+        assert_eq!(s.index_of("address"), None); // Not a leaf, so it can't be looked up.
         assert!(s.is_struct_prefix("address"));
-        assert!(s.is_struct_prefix("ADDRESS")); // 大文字小文字を無視。
+        assert!(s.is_struct_prefix("ADDRESS")); // Case-insensitive.
         assert!(!s.is_struct_prefix("id"));
     }
 
-    /// REQUIRED な祖先は definition level に寄与しない。
+    /// A REQUIRED ancestor does not contribute to the definition level.
     #[test]
     fn required_ancestor_does_not_add_to_def_level() {
         let mut group = elem("g", None, Repetition::Required);
@@ -701,16 +717,16 @@ mod tests {
         };
         let s = resolve_schema(&md).unwrap();
         assert_eq!(s.columns[0].name, "g.leaf");
-        // g は REQUIRED なので寄与せず、leaf 自身の OPTIONAL ぶんの 1 だけ。
+        // g is REQUIRED so it contributes nothing; only the 1 from leaf's own OPTIONAL.
         assert_eq!(s.columns[0].max_def_level, 1);
     }
 
-    /// 32 段を超えて入れ子になったグループはスタックオーバーフローではなく
-    /// `NestingTooDeep` として拒否される。
+    /// A group nested more than 32 levels deep is rejected as `NestingTooDeep`,
+    /// not a stack overflow.
     #[test]
     fn pathologically_deep_schema_is_rejected_not_overflowed() {
         let mut schema = vec![root(1)];
-        // 40 段の OPTIONAL グループ + 末端のリーフ。MAX_SCHEMA_DEPTH (32) 超え。
+        // 40 levels of OPTIONAL groups plus a terminal leaf. Exceeds MAX_SCHEMA_DEPTH (32).
         for _ in 0..40 {
             let mut g = elem("g", None, Repetition::Optional);
             g.num_children = Some(1);
@@ -727,7 +743,7 @@ mod tests {
         assert_eq!(code_of(resolve_schema(&md)), Some(Code::NestingTooDeep));
     }
 
-    /// リーフ数が上限を超える幅広スキーマは、確保が青天井になる前に拒否される。
+    /// A wide schema whose leaf count exceeds the limit is rejected before allocation becomes unbounded.
     #[test]
     fn pathologically_wide_schema_is_rejected_via_leaf_cap() {
         let n = MAX_LEAF_COLUMNS + 10;
@@ -745,8 +761,8 @@ mod tests {
         assert_eq!(code_of(resolve_schema(&md)), Some(Code::UnsupportedNested));
     }
 
-    /// 素の REPEATED リーフ（LIST/MAP 注釈も STRUCT ラッパーも無い、
-    /// 最も古い形の繰り返しフィールド）も 1 本の JSON 列として解決できる。
+    /// A bare REPEATED leaf (no LIST/MAP annotation, no STRUCT wrapper -- the
+    /// oldest form of a repeated field) can also be resolved as a single JSON column.
     #[test]
     fn bare_repeated_leaf_becomes_json_column() {
         let md = FileMetaData {
@@ -760,23 +776,25 @@ mod tests {
         assert_eq!(s.columns.len(), 1);
         assert_eq!(s.columns[0].name, "xs");
         assert_eq!(s.columns[0].ty, Ty::Json);
-        // 素の REPEATED は SQL NULL になり得ない（空配列にしかならない）。
+        // A bare REPEATED can never be SQL NULL (it can only be an empty array).
         assert!(!s.columns[0].nullable);
         assert_eq!(s.columns[0].phys_cols, vec![0]);
         let node = s.columns[0].nested.as_ref().unwrap();
         assert_eq!(node.repetition, Repetition::Repeated);
     }
 
-    // --- 実ファイル（DuckDB 書き出し）を介した end-to-end 検証 ------------
+    // --- End-to-end verification through real files (DuckDB output) ------------
     //
-    // ここから下は tests/data/*.parquet を `file.rs::open_bytes` /
-    // `reader.rs::read_column_chunk` で実際に読み、DuckDB の出力
-    // （`duckdb -c "SELECT ..."` / `duckdb -c "SELECT ... FROM parquet_schema(...)"`）
-    // と突き合わせる。definition level の計算がリーダ側の
-    // `validity = (def_level == max_def_level)` とかみ合っているかは、
-    // 単体テストの合成スキーマだけでは確認できない
-    // （実際のページに書かれた definition level のビット列そのものを
-    // デコードして初めて分かる）ため、ここで実バイト列を読む。
+    // Everything below this point actually reads tests/data/*.parquet via
+    // `file.rs::open_bytes` / `reader.rs::read_column_chunk`, and cross-checks
+    // against DuckDB's output (`duckdb -c "SELECT ..."` /
+    // `duckdb -c "SELECT ... FROM parquet_schema(...)"`). Whether the definition
+    // level computation lines up with the reader side's
+    // `validity = (def_level == max_def_level)` cannot be confirmed from the unit
+    // tests' synthetic schemas alone (it only becomes clear once the actual
+    // definition-level bit stream written into a real page is decoded), so real
+    // byte data is read here.
+    //
 
     use crate::parquet::file::open_bytes;
     use crate::parquet::reader::{read_column_chunk, NoPageCache};
@@ -791,10 +809,11 @@ mod tests {
         std::fs::read(data_path(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
     }
 
-    /// ファイル全体を列ごとに読み、RowGroup をまたいで縦に連結する
-    /// （`crates/ahiru-core/tests/parquet_files.rs` と同じ手順）。
-    /// 入れ子列 (`nested.is_some()`) は含めない（呼び出し側が
-    /// `crate::parquet::reader::nested::read_nested_column` を別途使う）。
+    /// Reads the whole file column by column and concatenates vertically across
+    /// RowGroups (the same procedure as
+    /// `crates/ahiru-core/tests/parquet_files.rs`). Nested columns
+    /// (`nested.is_some()`) are not included (the caller uses
+    /// `crate::parquet::reader::nested::read_nested_column` separately for those).
     fn read_all(bytes: &[u8]) -> (Vec<String>, Vec<Vector>) {
         let f = open_bytes(bytes).expect("open");
         let names: Vec<String> = f.schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -837,7 +856,7 @@ mod tests {
     #[test]
     fn struct_of_scalars_matches_duckdb() {
         // duckdb schema: id INTEGER, address STRUCT(city VARCHAR, zip INTEGER)
-        // 両方 OPTIONAL、city/zip も OPTIONAL（parquet_schema() で確認済み）。
+        // Both OPTIONAL, city/zip also OPTIONAL (confirmed via parquet_schema()).
         let bytes = read_bytes("struct1.parquet");
         let f = open_bytes(&bytes).expect("open struct1.parquet");
         let names: Vec<&str> = f.schema.columns.iter().map(|c| c.name.as_str()).collect();
@@ -863,7 +882,7 @@ mod tests {
     #[test]
     fn deeply_nested_struct_matches_duckdb() {
         // duckdb schema: id INTEGER, nested STRUCT(a STRUCT(b STRUCT(c INTEGER)))
-        // nested/a/b/c すべて OPTIONAL（parquet_schema() で確認済み）。
+        // nested/a/b/c are all OPTIONAL (confirmed via parquet_schema()).
         let bytes = read_bytes("struct_deep.parquet");
         let f = open_bytes(&bytes).expect("open struct_deep.parquet");
         let names: Vec<&str> = f.schema.columns.iter().map(|c| c.name.as_str()).collect();
@@ -882,10 +901,10 @@ mod tests {
     #[test]
     fn null_struct_nulls_every_leaf_for_that_row() {
         // duckdb: CASE WHEN i % 3 = 0 THEN NULL ELSE {...} END AS address
-        // つまり address 列そのものが NULL の行が 10/30 行ある
-        // （`duckdb -c "SELECT count(*) FROM 'struct_null.parquet' WHERE address IS NULL"` = 10）。
-        // definition level の insight が正しければ、city/zip 両方が同じ行で
-        // NULL になり、それ以外の行では両方とも値を持つ。
+        // In other words, there are 10 out of 30 rows where the address column itself
+        // is NULL (`duckdb -c "SELECT count(*) FROM 'struct_null.parquet' WHERE address
+        // IS NULL"` = 10). If the definition-level insight is correct, city/zip should
+        // both be NULL on the same rows, and both should have values on every other row.
         let bytes = read_bytes("struct_null.parquet");
         let (_, cols) = read_all(&bytes);
         assert_eq!(cols[0].len(), 30);
@@ -909,8 +928,8 @@ mod tests {
     #[test]
     fn list_column_resolves_as_one_json_column() {
         // duckdb schema: id INTEGER, xs INTEGER[]
-        // xs は OPTIONAL グループ(LIST) → REPEATED グループ(list) → OPTIONAL
-        // リーフ(element)。これ全体が 1 本の JSON 列になる。
+        // xs is an OPTIONAL group(LIST) -> REPEATED group(list) -> OPTIONAL
+        // leaf(element). This entire thing becomes a single JSON column.
         let bytes = read_bytes("list1.parquet");
         let f = open_bytes(&bytes).expect("open list1.parquet");
         let names: Vec<&str> = f.schema.columns.iter().map(|c| c.name.as_str()).collect();
@@ -918,7 +937,7 @@ mod tests {
         assert_eq!(f.schema.columns[1].ty, Ty::Json);
         assert!(f.schema.columns[1].nullable);
         assert!(f.schema.columns[1].nested.is_some());
-        // xs.list.element の 1 リーフだけを消費する。
+        // Consumes only the single leaf xs.list.element.
         assert_eq!(f.schema.columns[1].phys_cols, vec![1]);
     }
 }

@@ -1,43 +1,43 @@
-//! Parquet メタデータ構造体と、その Thrift デコーダ。
+//! Parquet metadata structs, and their Thrift decoder.
 //!
-//! 汎用 Thrift ランタイムは持たない。構造体ごとに「必要なフィールド ID だけを
-//! 読み、未知フィールドはスキップする」専用デコーダを手書きする。
-//! 汎用実装 + IDL 生成コードは 100 KB 級になるが、この方式なら 45 KB に収まる
-//! （DESIGN.md §5）。
+//! There is no general-purpose Thrift runtime here. For each struct, a dedicated
+//! decoder is handwritten that "reads only the field IDs it needs and skips
+//! unknown fields." A generic implementation plus IDL-generated code would be on
+//! the order of 100 KB, but this approach fits in 45 KB (DESIGN.md §5).
 //!
-//! ここに無いフィールドは意図的に読み捨てている。追加するときは
-//! `docs/DESIGN.md` のサイズ予算も更新すること。
+//! Fields not present here are intentionally dropped. When adding one, also
+//! update the size budget in `docs/DESIGN.md`.
 
 use crate::parquet::thrift::{ttype, Thrift};
 use crate::parquet::*;
 use crate::prelude::*;
 
-// --- 上限値 ---------------------------------------------------------------
-// 敵対的な Parquet ファイルによるメモリ爆撃を防ぐ (DESIGN.md §5)。
+// --- Limits ---------------------------------------------------------------
+// Guards against a memory bombing attack via an adversarial Parquet file (DESIGN.md §5).
 
-/// スキーマ要素数の上限。
+/// Upper bound on the number of schema elements.
 pub const MAX_SCHEMA_ELEMENTS: usize = 16_384;
-/// RowGroup 数の上限。
+/// Upper bound on the number of RowGroups.
 pub const MAX_ROW_GROUPS: usize = 1_000_000;
-/// 1 RowGroup あたりの列数の上限。
+/// Upper bound on the number of columns per RowGroup.
 pub const MAX_COLUMNS: usize = 16_384;
-/// list ヘッダが宣言できる要素数の上限（実バイト数と無関係な巨大値を弾く）。
+/// Upper bound on the element count a list header may declare (rejects huge values unrelated to the actual byte count).
 pub const MAX_LIST_LEN: usize = 1 << 24;
-/// 1 列チャンクあたりのページ数の上限（ColumnIndex/OffsetIndex 用）。
-/// 現実のページは数百バイト以上あるので、これだけあれば十分すぎるほど余裕がある。
+/// Upper bound on the number of pages per column chunk (for ColumnIndex/OffsetIndex).
+/// Real pages are at least a few hundred bytes, so this leaves more than enough headroom.
 pub const MAX_PAGES_PER_COLUMN: usize = 1_000_000;
 
-/// `FileMetaData`。フッタ全体。
+/// `FileMetaData`. The entire footer.
 pub struct FileMetaData {
     pub version: i32,
-    /// 深さ優先順に並んだスキーマ要素。先頭はルート。
+    /// Schema elements in depth-first order. The first element is the root.
     pub schema: Vec<SchemaElement>,
     pub num_rows: i64,
     pub row_groups: Vec<RowGroup>,
     pub created_by: Option<String>,
 }
 
-/// `SchemaElement`。
+/// `SchemaElement`.
 pub struct SchemaElement {
     pub ptype: Option<PType>,
     pub type_length: Option<i32>,
@@ -50,16 +50,16 @@ pub struct SchemaElement {
     pub logical: Option<LogicalType>,
 }
 
-/// `RowGroup`。
+/// `RowGroup`.
 pub struct RowGroup {
     pub columns: Vec<ColumnChunk>,
     pub total_byte_size: i64,
     pub num_rows: i64,
 }
 
-/// `ColumnChunk`。
+/// `ColumnChunk`.
 pub struct ColumnChunk {
-    /// 別ファイル参照。ahirudb では未対応なので `Some` ならエラーにする。
+    /// A reference to a separate file. Not supported by ahirudb, so `Some` is treated as an error.
     pub file_path: Option<String>,
     pub file_offset: i64,
     pub meta: Option<ColumnMetaData>,
@@ -67,11 +67,11 @@ pub struct ColumnChunk {
     pub column_index_length: Option<i32>,
     pub offset_index_offset: Option<i64>,
     pub offset_index_length: Option<i32>,
-    /// 暗号化列。検出したら `EncryptionUnsupported` を返す。
+    /// An encrypted column. Returns `EncryptionUnsupported` when detected.
     pub encrypted: bool,
 }
 
-/// `ColumnMetaData`。
+/// `ColumnMetaData`.
 pub struct ColumnMetaData {
     pub ptype: PType,
     pub encodings: Vec<Encoding>,
@@ -89,8 +89,8 @@ pub struct ColumnMetaData {
 }
 
 impl ColumnMetaData {
-    /// この列チャンクが占めるファイル上のバイト範囲 `[start, end)`。
-    /// 辞書ページがあればそこから始まる。
+    /// The byte range `[start, end)` this column chunk occupies in the file.
+    /// If a dictionary page exists, the range starts there.
     pub fn byte_range(&self) -> (u64, u64) {
         let start = match self.dictionary_page_offset {
             Some(d) if d > 0 && d < self.data_page_offset => d,
@@ -99,8 +99,9 @@ impl ColumnMetaData {
         (start as u64, (start + self.total_compressed_size) as u64)
     }
 
-    /// 辞書ページ（あれば）のバイト範囲 `[dictionary_page_offset, data_page_offset)`。
-    /// ページ選択で辞書エンコード列を読むときに、データページと別に取得する。
+    /// The byte range `[dictionary_page_offset, data_page_offset)` of the dictionary
+    /// page, if any. Fetched separately from the data page when page selection needs
+    /// to read a dictionary-encoded column.
     pub fn dictionary_page_range(&self) -> Option<(u64, u64)> {
         match self.dictionary_page_offset {
             Some(d) if d > 0 && d < self.data_page_offset => {
@@ -110,12 +111,13 @@ impl ColumnMetaData {
         }
     }
 
-    /// Bloom フィルタの投機取得範囲。`bloom_filter_length`（新しめの writer が
-    /// 書く、ヘッダ込みの正確な長さ）が分かっていればそれを使い、無ければ
-    /// 「よくある小さいフィルタなら 1 往復で収まる」サイズを投機取得する。
-    /// 実サイズがそれを超えていた場合は `refine_with_index` 側が黙って
-    /// Bloom フィルタを諦める（`may_match` と同じ「判断できないなら通す」
-    /// 安全側の設計）。
+    /// The speculative fetch range for the Bloom filter. If `bloom_filter_length`
+    /// (an exact length including the header, written by newer writers) is known, it
+    /// is used; otherwise, a size that "a typical small filter should fit within one
+    /// round trip" is speculatively fetched. If the real size exceeds that,
+    /// `refine_with_index` silently gives up on the Bloom filter (the same
+    /// safe-by-default design as `may_match`: "let it through when it can't be
+    /// determined").
     pub fn bloom_filter_probe_range(&self) -> Option<(u64, u64)> {
         let off = self.bloom_filter_offset?;
         if off < 0 {
@@ -129,21 +131,21 @@ impl ColumnMetaData {
     }
 }
 
-/// `bloom_filter_length` が無い場合に投機取得するバイト数。ヘッダ（数十バイト）
-/// + ビットセット本体を 1 往復で取れるよう、実運用のフィルタサイズより
-///   十分大きく取ってある。
+/// Number of bytes to speculatively fetch when `bloom_filter_length` is absent.
+/// Sized generously above typical real-world filter sizes so that the header (a few
+/// dozen bytes) plus the bitset body can be fetched in one round trip.
 pub const BLOOM_FILTER_PROBE: u64 = 128 * 1024;
 
 impl ColumnChunk {
-    /// `ColumnIndex`（ページ単位の min/max/null 統計）のバイト範囲。
-    /// offset/length のどちらか、または両方が無い（古いファイル・非対応
-    /// writer）なら `None`。ページ単位の枝刈りをせず列チャンク全体を読む
-    /// フォールバックの合図として使う。
+    /// The byte range of the `ColumnIndex` (per-page min/max/null statistics).
+    /// `None` if either or both of offset/length are absent (an older file or an
+    /// unsupported writer). Used as a signal to fall back to reading the whole
+    /// column chunk without per-page pruning.
     pub fn column_index_range(&self) -> Option<(u64, u64)> {
         byte_range_from(self.column_index_offset, self.column_index_length)
     }
 
-    /// `OffsetIndex`（ページごとのバイト位置・先頭行番号）のバイト範囲。
+    /// The byte range of the `OffsetIndex` (per-page byte position and first row number).
     pub fn offset_index_range(&self) -> Option<(u64, u64)> {
         byte_range_from(self.offset_index_offset, self.offset_index_length)
     }
@@ -158,11 +160,11 @@ fn byte_range_from(offset: Option<i64>, length: Option<i32>) -> Option<(u64, u64
     Some((off as u64, off as u64 + len as u64))
 }
 
-/// `Statistics`。枝刈りに使う。
+/// `Statistics`. Used for pruning.
 ///
-/// `min`/`max` (フィールド 1,2) は符号の扱いが writer 依存で信用できないため
-/// 読むだけに留め、枝刈りには `min_value`/`max_value` (フィールド 5,6) のみを
-/// 使う。
+/// `min`/`max` (fields 1, 2) are read but never used for pruning, since their sign
+/// handling is writer-dependent and untrustworthy; pruning uses only
+/// `min_value`/`max_value` (fields 5, 6).
 #[derive(Default)]
 pub struct Statistics {
     pub max: Option<Vec<u8>>,
@@ -175,10 +177,11 @@ pub struct Statistics {
     pub is_min_value_exact: Option<bool>,
 }
 
-/// `BoundaryOrder`。ColumnIndex のページ min/max がこの順序で並んでいるかの
-/// ヒント。ページ単位の枝刈りは線形走査で十分（DESIGN.md の 1MB 予算では
-/// 二分探索用の分岐コードを足すだけの価値が薄い）なので、値は保持するだけで
-/// 判定ロジックには使わない。
+/// `BoundaryOrder`. A hint as to whether the per-page min/max values in a
+/// ColumnIndex are sorted in this order. Since a linear scan is good enough for
+/// per-page pruning (in DESIGN.md's 1 MB budget, adding branch code for binary
+/// search has little value), the value is only kept, never used in the pruning
+/// logic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoundaryOrder {
     Unordered = 0,
@@ -187,7 +190,7 @@ pub enum BoundaryOrder {
 }
 
 impl BoundaryOrder {
-    /// 未知の値は `Unordered`（＝順序を仮定しない、安全側）として扱う。
+    /// An unknown value is treated as `Unordered` (i.e. assume no ordering -- the safe default).
     pub fn from_i32(v: i32) -> Self {
         match v {
             1 => BoundaryOrder::Ascending,
@@ -197,14 +200,15 @@ impl BoundaryOrder {
     }
 }
 
-/// `ColumnIndex`。列チャンク内の各ページの min/max/null 統計。
-/// `RowGroup` の `Statistics` と同じ「writer が切り詰めることがある」注意点が
-/// 適用されるため、枝刈りに使う値は `stat_value` を経由して物理型の幅で
-/// 読める数値型に限る（文字列は使わない）。
+/// `ColumnIndex`. Per-page min/max/null statistics within a column chunk.
+/// The same caveat as `RowGroup`'s `Statistics` applies -- "a writer may truncate
+/// it" -- so the values used for pruning are limited, via `stat_value`, to numeric
+/// types that can be read at the physical type's width (strings are not used).
 pub struct ColumnIndex {
-    /// `null_pages[i]` が真なら、そのページは統計が書かれていない
-    /// （全 NULL、または writer が省略した）。`min_values[i]`/`max_values[i]`
-    /// は意味を持たないので枝刈りに使わず、そのページは無条件に残す。
+    /// If `null_pages[i]` is true, that page has no statistics written (either
+    /// entirely NULL, or omitted by the writer). `min_values[i]`/`max_values[i]` are
+    /// meaningless in that case and are not used for pruning; that page is always
+    /// kept unconditionally.
     pub null_pages: Vec<bool>,
     pub min_values: Vec<Vec<u8>>,
     pub max_values: Vec<Vec<u8>>,
@@ -212,35 +216,36 @@ pub struct ColumnIndex {
     pub null_counts: Option<Vec<i64>>,
 }
 
-/// `PageLocation`。1 ページのファイル上の位置と、そのページの先頭が
-/// RowGroup 内の何行目から始まるか。
+/// `PageLocation`. A single page's position in the file, and which row within the
+/// RowGroup its first row starts at.
 #[derive(Clone, Copy)]
 pub struct PageLocation {
-    /// ページヘッダを含む先頭からのファイル上オフセット。
+    /// The file offset from the start, including the page header.
     pub offset: i64,
-    /// ページヘッダ込みの圧縮後バイト数。`[offset, offset+compressed_page_size)`
-    /// が丸ごとこのページ。
+    /// The compressed byte size including the page header. `[offset,
+    /// offset+compressed_page_size)` is this entire page.
     pub compressed_page_size: i32,
-    /// このページの先頭行が RowGroup の先頭から数えて何行目か。
+    /// Which row, counted from the start of the RowGroup, this page's first row is.
     pub first_row_index: i64,
 }
 
-/// `OffsetIndex`。列チャンク内の各ページのバイト位置と先頭行番号。
+/// `OffsetIndex`. Byte position and first row number for each page in a column chunk.
 pub struct OffsetIndex {
     pub page_locations: Vec<PageLocation>,
 }
 
-/// `BloomFilterHeader`。Bloom フィルタ本体（ビットセット）の手前に置かれる。
-/// アルゴリズム/ハッシュ/圧縮のいずれかが対応外なら、デコード時点で
-/// `UnsupportedFeature` にする（誤って別形式のビット列を SBBF として読む
-/// 事故を防ぐため。ここは「分からなければ安全側」を decode の外ではなく
-/// 内側でやるべき数少ない箇所 — 対応外のアルゴリズムを読み進めても
-/// 意味のある値は作れないので、早期に確実なエラーにする）。
+/// `BloomFilterHeader`. Placed just before the Bloom filter body (the bitset).
+/// If the algorithm/hash/compression is anything unsupported, this is treated as
+/// `UnsupportedFeature` at decode time (to prevent the accident of misreading a
+/// bit stream in a different format as an SBBF. This is one of the few places
+/// where "when unsure, be safe" should happen inside `decode` rather than outside
+/// it -- continuing to read past an unsupported algorithm can never produce a
+/// meaningful value, so it's turned into a definite error early).
 pub struct BloomFilterHeader {
     pub num_bytes: i32,
 }
 
-/// `PageHeader`。データページの手前に置かれる。
+/// `PageHeader`. Placed just before a data page.
 pub struct PageHeader {
     pub ptype: PageType,
     pub uncompressed_page_size: i32,
@@ -265,7 +270,7 @@ pub struct DataPageHeaderV2 {
     pub encoding: Encoding,
     pub definition_levels_byte_length: i32,
     pub repetition_levels_byte_length: i32,
-    /// 既定は true（Parquet 仕様）。
+    /// Defaults to true (per the Parquet spec).
     pub is_compressed: bool,
 }
 
@@ -274,10 +279,10 @@ pub struct DictionaryPageHeader {
     pub encoding: Encoding,
 }
 
-// --- デコーダ --------------------------------------------------------------
+// --- Decoders ---------------------------------------------------------------
 
-/// フッタ本体（`FileMetaData` の Thrift バイト列）をデコードする。
-/// `buf` はマジックと長さフィールドを含まない、メタデータ本体のみ。
+/// Decodes the footer body (the Thrift byte stream for `FileMetaData`).
+/// `buf` is just the metadata body, not including the magic bytes or the length field.
 pub fn decode_file_metadata(buf: &[u8]) -> Result<FileMetaData> {
     let mut t = Thrift::new(buf);
     let mut md = FileMetaData {
@@ -347,7 +352,7 @@ fn decode_schema_element(t: &mut Thrift) -> Result<SchemaElement> {
     Ok(e)
 }
 
-/// `LogicalType` union。フィールド ID がそのまま種別を表す。
+/// The `LogicalType` union. The field ID directly indicates the variant.
 fn decode_logical_type(t: &mut Thrift) -> Result<Option<LogicalType>> {
     let mut out = None;
     t.enter()?;
@@ -598,8 +603,8 @@ fn decode_statistics(t: &mut Thrift) -> Result<Statistics> {
     Ok(s)
 }
 
-/// `ColumnIndex` 本体（`ColumnChunk.column_index_offset` が指す先頭バイトから
-/// 始まる、それ単体で完結した Thrift 構造体）をデコードする。
+/// Decodes the `ColumnIndex` body (a self-contained Thrift struct starting at the
+/// byte offset pointed to by `ColumnChunk.column_index_offset`).
 pub fn decode_column_index(buf: &[u8]) -> Result<ColumnIndex> {
     let mut t = Thrift::new(buf);
     let mut ci = ColumnIndex {
@@ -613,8 +618,8 @@ pub fn decode_column_index(buf: &[u8]) -> Result<ColumnIndex> {
     while let Some((ft, id)) = t.read_field_begin()? {
         match id {
             1 => {
-                // list<bool>。要素は等しく BOOL_TRUE 固定の型ヘッダを持つので、
-                // 個々の真偽は `read_bool_elem` で 1 バイトずつ読む。
+                // list<bool>. Every element shares the same fixed BOOL_TRUE type header,
+                // so each individual boolean is read one byte at a time via `read_bool_elem`.
                 let n = t.read_list_begin(MAX_PAGES_PER_COLUMN)?.1;
                 ci.null_pages.reserve(n);
                 for _ in 0..n {
@@ -648,9 +653,9 @@ pub fn decode_column_index(buf: &[u8]) -> Result<ColumnIndex> {
         }
     }
     t.leave();
-    // null_pages が基準。min_values/max_values は null なページでは空バイト列
-    // のことがあるので、要素数の食い違いを許すと後段が out-of-range で
-    // パニックしかねない。ここで揃っていることを確定させておく。
+    // null_pages is the reference. min_values/max_values may be an empty byte string
+    // for a null page, so allowing a mismatched element count risks a later
+    // out-of-range panic. Confirm here that they line up.
     ensure!(ci.min_values.len() == ci.null_pages.len(), BadThrift, t.pos());
     ensure!(ci.max_values.len() == ci.null_pages.len(), BadThrift, t.pos());
     if let Some(nc) = &ci.null_counts {
@@ -674,8 +679,8 @@ fn decode_page_location(t: &mut Thrift) -> Result<PageLocation> {
     Ok(p)
 }
 
-/// `OffsetIndex` 本体（`ColumnChunk.offset_index_offset` が指す先頭バイトから
-/// 始まる、それ単体で完結した Thrift 構造体）をデコードする。
+/// Decodes the `OffsetIndex` body (a self-contained Thrift struct starting at the
+/// byte offset pointed to by `ColumnChunk.offset_index_offset`).
 pub fn decode_offset_index(buf: &[u8]) -> Result<OffsetIndex> {
     let mut t = Thrift::new(buf);
     let mut oi = OffsetIndex { page_locations: Vec::new() };
@@ -721,14 +726,15 @@ fn decode_single_variant_union(t: &mut Thrift) -> Result<bool> {
     Ok(ok)
 }
 
-/// `BloomFilterHeader` をデコードし、`(ヘッダ, 消費バイト数)` を返す。
-/// `buf` はヘッダに続いてビットセット本体も含んでいてよい（余りは無視する）。
-/// `PageHeader` と同様、長さは前置されないので消費量を呼び出し側へ返す。
+/// Decodes a `BloomFilterHeader` and returns `(header, bytes consumed)`.
+/// `buf` may also include the bitset body following the header (any excess is
+/// ignored). As with `PageHeader`, the length isn't prefixed, so the amount
+/// consumed is returned to the caller.
 ///
-/// アルゴリズム/ハッシュ/圧縮のいずれかが `BLOCK`/`XXHASH`/`UNCOMPRESSED` で
-/// ないファイルは `UnsupportedFeature` にする。誤って未知の形式をビット列
-/// として読み、"false" 判定を返してしまう（誤ってページを丸ごと読み飛ばす
-/// = 行が消える）事故を避けるため。
+/// A file whose algorithm/hash/compression isn't `BLOCK`/`XXHASH`/`UNCOMPRESSED`
+/// is treated as `UnsupportedFeature`. This avoids the accident of reading an
+/// unknown format as a bit stream and returning a "false" match (which would
+/// silently skip an entire page = rows disappearing).
 pub fn decode_bloom_filter_header(buf: &[u8]) -> Result<(BloomFilterHeader, usize)> {
     let mut t = Thrift::new(buf);
     let mut num_bytes: Option<i32> = None;
@@ -754,13 +760,13 @@ pub fn decode_bloom_filter_header(buf: &[u8]) -> Result<(BloomFilterHeader, usiz
         None => err!(BadThrift, t.pos()),
     };
     ensure!(algo_ok && hash_ok && comp_ok, UnsupportedFeature, t.pos());
-    // SBBF は 32 バイトブロックの並び。0 または 32 の倍数でなければ壊れている。
+    // An SBBF is a sequence of 32-byte blocks. If it isn't 0 or a multiple of 32, it's corrupted.
     ensure!(num_bytes > 0 && num_bytes % 32 == 0, BadThrift, t.pos());
     Ok((BloomFilterHeader { num_bytes }, t.pos()))
 }
 
-/// ページヘッダをデコードし、`(ヘッダ, 消費バイト数)` を返す。
-/// ページヘッダは長さが前置されないため、消費量を呼び出し側に返す必要がある。
+/// Decodes a page header and returns `(header, bytes consumed)`.
+/// A page header's length is not prefixed, so the amount consumed must be returned to the caller.
 pub fn decode_page_header(buf: &[u8]) -> Result<(PageHeader, usize)> {
     let mut t = Thrift::new(buf);
     let mut h = PageHeader {
@@ -858,9 +864,9 @@ mod tests {
     use super::*;
     use crate::error::code_of;
 
-    // --- 手組みの Thrift Compact エンコーダ（テスト専用） ----------------------
-    // 本番デコーダとは独立にバイト列を組み立てて往復させることで、デコーダの
-    // 実装をそのままなぞるだけのテストにならないようにする。
+    // --- A handwritten Thrift Compact encoder (test-only) ----------------------
+    // Assembles byte streams independently of the production decoder and round-trips
+    // them, so the tests don't just retrace the decoder's own implementation.
 
     fn field_hdr(delta: i16, ttype: u8) -> u8 {
         ((delta as u8) << 4) | ttype
@@ -897,23 +903,23 @@ mod tests {
         }
     }
 
-    /// `BLOCK`/`XXHASH`/`UNCOMPRESSED` を選んだ、対応済みの `BloomFilterHeader`
-    /// を組み立てる。
+    /// Builds a supported `BloomFilterHeader` that selects
+    /// `BLOCK`/`XXHASH`/`UNCOMPRESSED`.
     fn encode_bloom_header(num_bytes: i32) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(field_hdr(1, ttype::I32));
         push_zigzag(&mut out, num_bytes as i64);
-        // algorithm (id=2, struct) { BLOCK(id=1, 空struct) { STOP } STOP }
+        // algorithm (id=2, struct) { BLOCK(id=1, empty struct) { STOP } STOP }
         out.push(field_hdr(1, ttype::STRUCT));
         out.push(field_hdr(1, ttype::STRUCT));
         out.push(ttype::STOP);
         out.push(ttype::STOP);
-        // hash (id=3, struct) { XXHASH(id=1, 空struct) { STOP } STOP }
+        // hash (id=3, struct) { XXHASH(id=1, empty struct) { STOP } STOP }
         out.push(field_hdr(1, ttype::STRUCT));
         out.push(field_hdr(1, ttype::STRUCT));
         out.push(ttype::STOP);
         out.push(ttype::STOP);
-        // compression (id=4, struct) { UNCOMPRESSED(id=1, 空struct) { STOP } STOP }
+        // compression (id=4, struct) { UNCOMPRESSED(id=1, empty struct) { STOP } STOP }
         out.push(field_hdr(1, ttype::STRUCT));
         out.push(field_hdr(1, ttype::STRUCT));
         out.push(ttype::STOP);
@@ -934,7 +940,7 @@ mod tests {
     fn bloom_header_extra_bytes_after_header_are_left_unconsumed() {
         let mut buf = encode_bloom_header(32);
         let header_len = buf.len();
-        buf.extend_from_slice(&[0xAAu8; 32]); // ビットセット本体のつもり
+        buf.extend_from_slice(&[0xAAu8; 32]); // stand-in for the bitset body
         let (h, used) = decode_bloom_filter_header(&buf).unwrap();
         assert_eq!(h.num_bytes, 32);
         assert_eq!(used, header_len);
@@ -948,12 +954,12 @@ mod tests {
 
     #[test]
     fn bloom_header_rejects_unsupported_algorithm() {
-        // algorithm を id=1 ではなく未知の id=9（空 struct）にする → 非対応。
+        // Turn algorithm into an unknown id=9 (empty struct) instead of id=1 -> unsupported.
         let mut out = Vec::new();
         out.push(field_hdr(1, ttype::I32));
         push_zigzag(&mut out, 64);
         out.push(field_hdr(1, ttype::STRUCT)); // algorithm
-        out.push(field_hdr(9, ttype::STRUCT)); // 未知の代替アルゴリズム
+        out.push(field_hdr(9, ttype::STRUCT)); // an unknown alternate algorithm
         out.push(ttype::STOP);
         out.push(ttype::STOP);
         out.push(field_hdr(1, ttype::STRUCT)); // hash: XXHASH
@@ -1026,7 +1032,7 @@ mod tests {
 
     #[test]
     fn column_index_mismatched_list_lengths_are_rejected() {
-        // null_pages は 2 要素だが min_values は 1 要素しかない → 壊れている。
+        // null_pages has 2 elements but min_values has only 1 -> corrupted.
         let mut out = Vec::new();
         out.push(field_hdr(1, ttype::LIST));
         push_list_hdr(&mut out, ttype::BOOL_TRUE, 2);
@@ -1097,7 +1103,7 @@ mod tests {
 
     #[test]
     fn declared_list_length_far_beyond_buffer_is_rejected_not_oom() {
-        // list ヘッダで巨大な要素数を宣言しつつ、実バイトは全く無い。
+        // Declares a huge element count in the list header, with no real bytes at all.
         let mut out = Vec::new();
         out.push(field_hdr(1, ttype::LIST));
         out.push(0xf0 | ttype::BOOL_TRUE);
@@ -1105,14 +1111,14 @@ mod tests {
         assert!(decode_column_index(&out).is_err());
     }
 
-    // --- 実ファイル（pyarrow/parquet-cpp 書き出し）を介した end-to-end 検証 ---
+    // --- End-to-end verification through real files (pyarrow/parquet-cpp output) ---
     //
-    // DuckDB はこの環境で ColumnIndex/OffsetIndex は書くが Bloom フィルタは
-    // 書かない（`scripts/gen-testdata.sh` 参照）。`tests/data/pagetest.parquet`
-    // は pyarrow (`write_page_index=True`, `bloom_filter_options`) で生成した、
-    // 3 つとも揃っているファイル。Bloom フィルタの正しさは Python の
-    // `xxhash` パッケージで独立に実装した SBBF 照合と比較済み（該当する
-    // true/false の具体例をそのままここに書き写している）。
+    // In this environment, DuckDB writes ColumnIndex/OffsetIndex but not Bloom
+    // filters (see `scripts/gen-testdata.sh`). `tests/data/pagetest.parquet` is a
+    // file generated with pyarrow (`write_page_index=True`, `bloom_filter_options`)
+    // that has all three. The Bloom filter's correctness has been cross-checked
+    // against an independently implemented SBBF match using Python's `xxhash`
+    // package (the relevant true/false examples are transcribed verbatim here).
 
     fn pagetest_bytes() -> Vec<u8> {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/pagetest.parquet");
@@ -1124,7 +1130,7 @@ mod tests {
         let bytes = pagetest_bytes();
         let f = crate::parquet::file::open_bytes(&bytes).expect("open pagetest.parquet");
         let rg = &f.meta.row_groups[0];
-        let id_col = &rg.columns[0]; // id: INT32, 先頭列
+        let id_col = &rg.columns[0]; // id: INT32, the first column
         let meta = id_col.meta.as_ref().unwrap();
 
         let (ci_start, ci_end) = id_col.column_index_range().expect("id has a ColumnIndex");
@@ -1135,9 +1141,9 @@ mod tests {
         assert_eq!(ci.null_pages.len(), oi.page_locations.len());
         assert!(oi.page_locations.len() > 1, "test file must have multiple pages to be meaningful");
 
-        // ページはファイル上で連続し、列チャンクの範囲をちょうど覆う
-        // （すきま・重なりが無い）。先頭行番号も単調増加で、最初のページは
-        // 0 行目から始まる。
+        // The pages are contiguous in the file and exactly cover the column chunk's
+        // range (no gaps, no overlaps). The first row number is also strictly
+        // increasing, and the first page starts at row 0.
         let (chunk_start, chunk_end) = meta.byte_range();
         let mut want_offset = chunk_start as i64;
         let mut prev_row = -1i64;
@@ -1157,15 +1163,15 @@ mod tests {
         let bytes = pagetest_bytes();
         let f = crate::parquet::file::open_bytes(&bytes).expect("open pagetest.parquet");
         let rg = &f.meta.row_groups[0];
-        let meta = rg.columns[0].meta.as_ref().unwrap(); // id 列
+        let meta = rg.columns[0].meta.as_ref().unwrap(); // the id column
         let (start, end) = meta.bloom_filter_probe_range().expect("id has a bloom filter");
         let probe = &bytes[start as usize..end.min(bytes.len() as u64) as usize];
         let (hdr, used) = decode_bloom_filter_header(probe).unwrap();
         let bitset = &probe[used..used + hdr.num_bytes as usize];
         let bf = crate::parquet::bloom::BloomFilter::new(bitset).unwrap();
 
-        // Python (`xxhash` パッケージ) で同じビット列に対して独立実装した
-        // SBBF 照合と突き合わせ済みの具体例。
+        // A concrete example cross-checked against an independently implemented SBBF
+        // match, computed against the same bit stream with Python's `xxhash` package.
         for id in [0i32, 1, 12345, 49999] {
             assert!(bf.contains(&id.to_le_bytes()), "id={id} was inserted, must never be absent");
         }

@@ -1,22 +1,22 @@
-//! `generate_series(start, stop, step)` / `range(start, stop, step)` テーブル
-//! 関数。
+//! The `generate_series(start, stop, step)` / `range(start, stop, step)` table
+//! functions.
 //!
-//! カタログ・I/O を一切経由しない「計算だけのソース」。`BATCH_SIZE` 行ずつ
-//! 生成して返す ―― `range(0, 100000000)` のような巨大な範囲でも、全体を
-//! メモリへ展開せず「次に返す値」だけを `self` に持って進む。`NeedIo`/
-//! `NeedCodec` は原理的に返らない（`exec::MemScan` と同じ理由: 実データが
-//! 既にメモリ上、というより計算のみで完結する）。
+//! A "compute-only source" that goes through neither the catalog nor I/O. It generates and
+//! returns `BATCH_SIZE` rows at a time -- even a huge range like `range(0, 100000000)` is never
+//! expanded into memory; only "the next value to return" is kept in `self`. `NeedIo`/`NeedCodec`
+//! can never be returned in principle (the same reason as `exec::MemScan`: the real data is
+//! already in memory -- or rather, it is pure computation).
 
 use crate::exec::{ExecContext, Operator, Step};
 use crate::prelude::*;
 use crate::vector::{Batch, Ty, Value, Vector, BATCH_SIZE};
 
 pub struct GenerateSeries {
-    /// 次に返す値。
+    /// The next value to return.
     cur: i64,
     stop: i64,
     step: i64,
-    /// `stop` を含むか（`generate_series` は含む、`range` は含まない）。
+    /// Whether `stop` is included (`generate_series` includes it; `range` does not).
     inclusive: bool,
     done: bool,
 }
@@ -26,7 +26,7 @@ impl GenerateSeries {
         GenerateSeries { cur: start, stop, step, inclusive, done: false }
     }
 
-    /// `cur` がまだ範囲内か（次の 1 個を出してよいか）。
+    /// Whether `cur` is still in range (whether one more may be emitted).
     fn in_range(&self) -> bool {
         if self.step > 0 {
             if self.inclusive {
@@ -54,8 +54,8 @@ impl Operator for GenerateSeries {
                 break;
             }
             v.push_value(&Value::I64(self.cur));
-            // オーバーフローで折り返すと無限ループになるので、それ自体を
-            // 終了条件にする（`checked_add` が `None` なら打ち切る）。
+            // Wrapping on overflow would loop forever, so that itself is made a termination
+            // condition (stop when `checked_add` gives `None`).
             match self.cur.checked_add(self.step) {
                 Some(next) => self.cur = next,
                 None => {
@@ -82,7 +82,7 @@ mod tests {
         let mut vm = Vm::new();
         let mut out = Vec::new();
         for guard in 0..10_000 {
-            assert!(guard < 9_999, "終わらない");
+            assert!(guard < 9_999, "does not terminate");
             let mut ctx =
                 ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
             match op.next(&mut ctx).unwrap() {
@@ -93,7 +93,7 @@ mod tests {
                         out.push(v);
                     }
                 }
-                Step::NeedIo | Step::NeedCodec => panic!("計算だけのソースなので起きないはず"),
+                Step::NeedIo | Step::NeedCodec => panic!("impossible for a compute-only source"),
                 Step::Done => break,
             }
         }
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn overflow_at_the_boundary_stops_instead_of_looping_forever() {
-        // `step` を足すと `i64::MAX` を超える場合、次の値を作らずに打ち切る。
+        // When adding `step` would exceed `i64::MAX`, it stops without producing the next value.
         let got = drive(GenerateSeries::new(i64::MAX - 2, i64::MAX, 1, true));
         assert_eq!(got, vec![i64::MAX - 2, i64::MAX - 1, i64::MAX]);
     }

@@ -1,9 +1,9 @@
-//! `export` フィーチャの統合テスト。
+//! Integration tests for the `export` feature.
 //!
-//! Parquet から読んだ実データを CSV / JSONL に書き出し、DuckDB の出力と
-//! 突き合わせる。読み取り（Parquet）と書き出し（CSV/JSONL）を跨ぐので、
-//! 型ごとの表示形式（DATE / TIMESTAMP / DECIMAL / NULL）が両方向で
-//! 揃っているかを一度に検証できる。
+//! Writes real data read from Parquet out to CSV / JSONL and cross-checks against DuckDB's
+//! output. Since this spans reading (Parquet) and writing (CSV/JSONL), it lets us verify in
+//! one shot whether each type's display format (DATE / TIMESTAMP / DECIMAL / NULL) lines up
+//! in both directions.
 
 #![cfg(feature = "export")]
 
@@ -56,7 +56,7 @@ fn jsonl_export_matches_duckdb_on_real_parquet() {
 
 #[test]
 fn export_after_aggregation_and_join() {
-    // 単なる SELECT だけでなく、集約・結合を経た結果も正しく書き出せること。
+    // Verify not just a plain SELECT, but that results after aggregation/joins are also written out correctly.
     let mut s = Session::new();
     s.register_bytes("t", data("basic.parquet")).unwrap();
     let mut sink = CsvSink::new();
@@ -69,12 +69,12 @@ fn export_after_aggregation_and_join() {
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(text.starts_with("name,n\n"));
-    assert_eq!(text.lines().count(), 7); // ヘッダ + 6 グループ
+    assert_eq!(text.lines().count(), 7); // header + 6 groups
 }
 
 #[test]
 fn round_trip_csv_export_then_reimport() {
-    // 書き出した CSV を再度読み込んで、元の Parquet と同じ結果になること。
+    // Re-import the exported CSV and verify it matches the original Parquet.
     let mut s = Session::new();
     s.register_bytes("t", data("basic.parquet")).unwrap();
     let mut sink = CsvSink::new();

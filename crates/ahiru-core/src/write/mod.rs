@@ -1,22 +1,23 @@
-//! 書き出し（`export` フィーチャ）。
+//! Writing (`export` feature).
 //!
-//! 読み取り経路（`Source` / `TableFormat`）には一切触れない。`Session` の
-//! 既存の公開 API（`prepare` / `step`）を外側から叩くだけで組み立てている
-//! ので、読み取り側の不変条件（バイト範囲は一度入ったら書き換わらない、
-//! 分割境界でしか I/O を待たない）を壊しようがない。これが「オプトアウト
-//! 可能」の中身: `export` フィーチャを外せばこのモジュールごと消え、
-//! 他のどこにも影響が残らない（DESIGN.md §15）。
+//! Does not touch the read path (`Source` / `TableFormat`) at all. It is built
+//! entirely on top of `Session`'s existing public API (`prepare` / `step`),
+//! driven from the outside, so it cannot break the read side's invariants
+//! (a byte range never changes once loaded; I/O is only awaited at split
+//! boundaries). That is what "opt-out-able" means here: disable the `export`
+//! feature and this whole module disappears, with no effect anywhere else
+//! (DESIGN.md §15).
 //!
-//! ## v1 の制限: 非再開設計
+//! ## v1 limitation: non-resumable design
 //!
-//! 読み取りエンジンの中核は「バイトが足りなければ止めて要求を返す」設計
-//! （DESIGN.md §6）だが、この書き出しドライバはその型を露出していない。
-//! `export_all` はクエリの実行中に `NEED_IO` / `NEED_CODEC` が発生したら
-//! `Err(IoFailed)` で失敗する。全データがメモリ上にある場合（CLI での
-//! 利用、または JS 側が事前にテーブルを完全に取得している場合）にしか
-//! 使えない。ホストの fetch ループと協調する再開可能な書き出しは、
-//! `ahiru_query_step` と同じ形の ABI を書き出し版にも用意する必要がある
-//! ため、v1 では見送っている。
+//! The read engine's core design is to "stop and return a request when bytes
+//! are missing" (DESIGN.md §6), but this write driver does not expose that
+//! type. If `export_all` hits `NEED_IO` / `NEED_CODEC` while executing the
+//! query, it fails with `Err(IoFailed)`. It only works when all data is
+//! already in memory (CLI usage, or when the JS side has already fully
+//! fetched the table). A resumable write path that cooperates with the
+//! host's fetch loop would need an ABI shaped like `ahiru_query_step` for the
+//! write side too; that is deferred past v1.
 
 #[cfg(feature = "csv")]
 pub mod csv;
@@ -31,7 +32,7 @@ use crate::session::{Prepared, Query, QueryStep, Session};
 use crate::sql::ast::{ExprArena, QueryStmt};
 use crate::vector::{Batch, Field, Value};
 
-/// 出力フォーマット。
+/// Output format.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum ExportFormat {
@@ -43,24 +44,24 @@ pub enum ExportFormat {
     Parquet,
 }
 
-/// 書き出し先。`Batch` を受け取ってバイト列に変換するだけの薄い抽象。
+/// Write destination. A thin abstraction that just converts a `Batch` to bytes.
 ///
-/// 読み取り側の `TableFormat` と対称の設計（`Batch` を produce する側と
-/// consume する側）。コア型（`Batch`/`Vector`/`Field`）は共有するが、
-/// 読み取り側の型には一切依存しない。
+/// Symmetric with the read side's `TableFormat` (one produces `Batch`, the
+/// other consumes it). Shares the core types (`Batch`/`Vector`/`Field`) but
+/// does not depend on any read-side type.
 pub trait TableSink {
-    /// ヘッダ相当の情報。実装は必要なら最初のバイト列をここで書いてよい。
+    /// Header-equivalent information. Implementations may write the first bytes here if needed.
     fn begin(&mut self, schema: &[Field]) -> Result<()>;
-    /// 1 バッチぶんの行を書く。selection は解決済み（`materialize` 後）を渡す。
+    /// Writes the rows of one batch. `selection` is passed already resolved (after `materialize`).
     fn write_batch(&mut self, schema: &[Field], batch: &Batch) -> Result<()>;
-    /// 末尾処理（フッタや閉じ括弧）をして完成したバイト列を返す。
+    /// Finalizes (footer, closing brackets, etc.) and returns the completed byte sequence.
     fn finish(&mut self) -> Result<Vec<u8>>;
 }
 
-/// クエリを実行し、結果を丸ごと `sink` に書き出す。
+/// Executes a query and writes the whole result to `sink`.
 ///
-/// **非再開**: 実行中に `NEED_IO` / `NEED_CODEC` が起きたら `IoFailed` で
-/// 失敗する（モジュール doc 参照）。
+/// **Non-resumable**: fails with `IoFailed` if `NEED_IO` / `NEED_CODEC` occurs
+/// during execution (see module doc).
 pub fn export_all(
     session: &mut Session,
     sql: &str,
@@ -75,7 +76,7 @@ pub fn export_all(
     loop {
         match session.step(&mut q)? {
             QueryStep::Batch(mut b) => {
-                // selection を解決してから渡す。sink 側は密な列だけを見ればよい。
+                // Resolve the selection before passing it on, so the sink side only ever sees dense columns.
                 b.materialize();
                 sink.write_batch(&q.schema, &b)?;
             }
@@ -86,16 +87,16 @@ pub fn export_all(
     sink.finish()
 }
 
-/// `export_all` の「既にパース済みの `QueryStmt` から」版。
+/// The "from an already-parsed `QueryStmt`" version of `export_all`.
 ///
-/// `Stmt::Copy` は `Session::prepare` の中で既に `ExprArena`/`QueryStmt` を
-/// 持っている。`export_all` に渡すために木をわざわざ SQL テキストへ戻す
-/// 必要が出ないよう、入力だけ AST 版にした双子の関数を用意する。`Session`
-/// の `prepare`/`step` という公開 API 経由で組み立てる点は `export_all` と
-/// 同じ（モジュール doc の「独立性」参照。`plan::bind`/`exec::build` には
-/// 一切触れない）。
+/// `Stmt::Copy` already has an `ExprArena`/`QueryStmt` from inside
+/// `Session::prepare`. To avoid having to turn the tree back into SQL text
+/// just to pass it to `export_all`, this twin function takes only the input
+/// as an AST instead. It is built the same way as `export_all`, through
+/// `Session`'s public `prepare`/`step` API (see the module doc's
+/// "independence" section; it never touches `plan::bind`/`exec::build`).
 ///
-/// **非再開**: `export_all` と同じ制約（モジュール doc 参照）。
+/// **Non-resumable**: same constraint as `export_all` (see module doc).
 fn export_query(
     session: &mut Session,
     arena: &ExprArena,
@@ -121,7 +122,7 @@ fn export_query(
     sink.finish()
 }
 
-/// `Stmt::Copy` の実行本体。`Session::prepare` から呼ばれる。
+/// Execution body for `Stmt::Copy`. Called from `Session::prepare`.
 ///
 /// The format comes from an explicit `FORMAT csv|jsonl|json|parquet` when
 /// given, and otherwise from the extension of `path` via
@@ -129,9 +130,9 @@ fn export_query(
 /// depends on the enabled features (`csv`, `jsonl`, `export-parquet`);
 /// anything else is `UnsupportedFeature`.
 ///
-/// **ファイルには書かない**: 結果は `Query::copy_result` に包んで返す。
-/// 実際に `path` へ書き込むのは呼び出し側（ネイティブなら `ahiru-cli`）の
-/// 役目（モジュール doc、DESIGN.md §15 参照）。
+/// **Does not write to a file**: the result is wrapped in `Query::copy_result`
+/// and returned. Actually writing to `path` is the caller's responsibility
+/// (`ahiru-cli` on native; see the module doc and DESIGN.md §15).
 pub(crate) fn copy(
     session: &mut Session,
     arena: &ExprArena,
@@ -161,16 +162,16 @@ pub(crate) fn copy(
     Ok(Prepared::Ready(Query::copy_result(path.to_owned(), data)))
 }
 
-/// `format` があればそれを解決し、無ければ `path` の拡張子から推定する。
+/// Resolves `format` if given, otherwise infers it from `path`'s extension.
 fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
     match format {
         Some(f) => format_by_name(f),
-        // `FormatKind::Csv`/`Tsv` は CSV シンクへ、`Jsonl`/`Json` は JSONL
-        // シンクへ寄せる。DuckDB の `COPY ... (FORMAT JSON)` も配列では
-        // なく改行区切りの JSON を書く（実測して確認済み）ので、読み取り側の
-        // 「1 ファイル 1 JSON 値」の `Json` とは書き出し側で意味が分かれる
-        // ことになるが、他に書き出し用の JSON 配列シンクを持たない v1 では
-        // これが妥当な対応先。
+        // `FormatKind::Csv`/`Tsv` map to the CSV sink, and `Jsonl`/`Json` map to the
+        // JSONL sink. DuckDB's `COPY ... (FORMAT JSON)` also writes newline-delimited
+        // JSON rather than an array (confirmed empirically), so the write side's
+        // meaning of `Json` diverges from the read side's "one JSON value per file".
+        // That is acceptable since v1 has no separate JSON-array sink for writing;
+        // this is the appropriate mapping.
         None => match crate::format::FormatKind::detect(path) {
             #[cfg(feature = "csv")]
             crate::format::FormatKind::Csv | crate::format::FormatKind::Tsv => {
@@ -191,7 +192,7 @@ fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
     }
 }
 
-/// `(FORMAT <name>)` の値を `ExportFormat` に対応付ける。
+/// Maps a `(FORMAT <name>)` value to an `ExportFormat`.
 fn format_by_name(name: &str) -> Result<ExportFormat> {
     #[cfg(feature = "csv")]
     if eq_ascii_ci(name.as_bytes(), b"csv") {
@@ -212,7 +213,7 @@ fn format_by_name(name: &str) -> Result<ExportFormat> {
 mod tests {
     use super::*;
 
-    /// テスト用の記録シンク。書き込まれた行を `Value` の行列として溜める。
+    /// Recording sink for tests. Accumulates written rows as a matrix of `Value`.
     struct RecordSink {
         rows: Vec<Vec<Value>>,
         began: bool,
@@ -249,8 +250,8 @@ mod tests {
     #[test]
     #[cfg(feature = "csv")]
     fn drives_begin_write_finish_in_order() {
-        // CSV は手で組み立てられるので、他のフォーマットのテストデータや
-        // 別の実装に依存せずにこのモジュール単体でテストできる。
+        // CSV can be assembled by hand, so this module can be tested in isolation
+        // without depending on other formats' test data or implementations.
         let mut s = Session::new();
         s.register_bytes_as("t", b"id\n1\n2\n3\n".to_vec(), crate::format::FormatKind::Csv)
             .unwrap();
@@ -272,10 +273,11 @@ mod tests {
         assert_eq!(crate::error::code_of(r), Some(crate::error::Code::IoFailed));
     }
 
-    // --- COPY（`Session::prepare` 経由の統合テスト）--------------------------
-    // パーサから `write::copy` まで通しで検証する。`ahiru-core` はファイルへは
-    // 書かないので、ここで見るのは「正しいパスと正しいバイト列が `Query` に
-    // 載って返るか」まで（実ファイルへの書き込み検証は `ahiru-cli` 側）。
+    // --- COPY (integration tests via `Session::prepare`) ---------------------
+    // Verifies the whole path from the parser through to `write::copy`. Since
+    // `ahiru-core` never writes to a file, what we check here is only that the
+    // correct path and correct bytes come back in the `Query` (verifying actual
+    // file writes is `ahiru-cli`'s job).
 
     #[cfg(feature = "csv")]
     fn copy_ready(sql: &str) -> crate::session::CopyResult {
@@ -283,7 +285,7 @@ mod tests {
         s.register_bytes_as("t", b"id,name\n2,b\n1,a\n".to_vec(), crate::format::FormatKind::Csv)
             .unwrap();
         match s.prepare(sql, &[]).unwrap() {
-            Prepared::Ready(q) => q.copy.expect("COPY の結果が無い"),
+            Prepared::Ready(q) => q.copy.expect("no COPY result"),
             Prepared::NeedIo(_) => panic!("unexpected NeedIo"),
         }
     }
@@ -308,10 +310,10 @@ mod tests {
     #[test]
     #[cfg(feature = "jsonl")]
     fn copy_format_json_writes_ndjson_like_duckdb() {
-        // DuckDB の `COPY ... (FORMAT JSON)` は JSON 配列ではなく改行区切り
-        // (NDJSON) を書く（手元の duckdb CLI で実測して確認済み）。書き出し
-        // 側の JSON 配列シンクを別途持たない v1 では、JSONL シンクへ寄せる
-        // のがこの挙動に一致する。
+        // DuckDB's `COPY ... (FORMAT JSON)` writes newline-delimited JSON (NDJSON)
+        // rather than a JSON array (confirmed empirically with the local duckdb
+        // CLI). Since v1 has no separate JSON-array sink for writing, mapping to
+        // the JSONL sink matches this behavior.
         let r = copy_ready("COPY (SELECT id FROM t ORDER BY id) TO 'out.json'");
         assert_eq!(String::from_utf8(r.data).unwrap(), "{\"id\":1}\n{\"id\":2}\n");
     }

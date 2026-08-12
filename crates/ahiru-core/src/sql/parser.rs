@@ -1,10 +1,10 @@
-//! SQL パーサ。
+//! The SQL parser.
 //!
-//! 文は再帰下降、式は Pratt（優先順位登り）で解く（DESIGN.md §7）。
-//! 式は `Box` ではなくアリーナへ積むので、木の破棄で再帰が起きない。
+//! Statements are handled by recursive descent, expressions by Pratt (precedence
+//! climbing) (DESIGN.md §7). Expressions go into an arena rather than `Box`, so dropping the tree does not recurse.
 //!
-//! 再帰は必ず `MAX_DEPTH` で頭打ちにする。wasm ではスタック枯渇が
-//! 回復不能なトラップになるため、深い入力は必ずエラーとして返す。
+//! Recursion is always capped by `MAX_DEPTH`. On wasm, stack exhaustion is an
+//! unrecoverable trap, so deep input is always returned as an error.
 
 use crate::format::FormatKind;
 use crate::prelude::*;
@@ -19,40 +19,40 @@ use crate::vector::{Ty, Value};
 
 use types::{int_literal, unquote};
 
-/// 再帰下降・Pratt の深さ上限。括弧の入れ子・サブクエリ・クエリの入れ子に効く。
+/// The depth limit for recursive descent and Pratt parsing. It bounds nested parentheses, subqueries, and nested queries.
 ///
-/// 式はアリーナに積むので破棄で再帰しないが、`QueryStmt` は `Box` 再帰なので
-/// **パースに成功した木でも破棄時に再帰する**。上限はその破棄も含めて安全な
-/// 値でなければならない。
+/// Expressions go into the arena and do not recurse on drop, but `QueryStmt` recurses
+/// through `Box`, so **even a successfully parsed tree recurses when dropped**. The
+/// limit must be safe including that drop.
 const MAX_DEPTH: u16 = 64;
 
-/// `Box` の左深連鎖（JOIN と集合演算）の総数上限。
+/// The cap on the total number of left-deep `Box` chains (JOINs and set operations).
 ///
-/// どちらも構文上はループで組み立てるので解析時の再帰は無いが、木の破棄では
-/// 連鎖の長さぶんだけ再帰する。深さ上限とは別枠で、文全体を通した通し数として
-/// 数える（入れ子のクエリごとに上限を与えると積で効いてしまうため）。
+/// Both are built with loops syntactically, so parsing does not recurse, but dropping
+/// the tree recurses once per link in the chain. It is counted separately from the
+/// depth limit, as a running total across the whole statement (a per-nested-query limit would multiply).
 const MAX_LINKS: u16 = 64;
 
-/// `Parser::star_modifiers` の戻り値: `(EXCLUDE する列名, REPLACE する
-/// (式, 列名), RENAME する (旧列名, 新列名))`。
+/// The return value of `Parser::star_modifiers`: `(column names to EXCLUDE, the
+/// (expression, column name) pairs to REPLACE, the (old name, new name) pairs to RENAME)`.
 type StarModifiers = (Vec<String>, Vec<(ExprId, String)>, Vec<(String, String)>);
 
-// 結合強度。大きいほど強く結合する。
+// Binding power. Larger binds tighter.
 const BP_OR: u8 = 1;
 const BP_AND: u8 = 2;
 const BP_NOT: u8 = 3;
 const BP_CMP: u8 = 4;
-// `&`/`|`/`<<`/`>>`。比較より強く、`||`/算術より弱い
-// （`duckdb` CLI で `1 + 2 & 3` = `(1 + 2) & 3`、`1 & 2 = 0` = `(1 & 2) = 0`
-// を確認済み）。4 つの演算子間の相対順位までは実測していないので、
-// 単純に 1 段にまとめてある。
+// `&`/`|`/`<<`/`>>`. Tighter than comparison, looser than `||` and arithmetic
+// (confirmed with the `duckdb` CLI: `1 + 2 & 3` = `(1 + 2) & 3`, `1 & 2 = 0` = `(1 & 2) = 0`).
+// The relative precedence among those four operators has not been measured, so they are
+// simply collapsed into one level.
 const BP_BITWISE: u8 = 5;
 const BP_CONCAT: u8 = 6;
 const BP_ADD: u8 = 7;
 const BP_MUL: u8 = 8;
-// `^`/`**`。`duckdb` CLI で `2 + 3^2` = `2 + (3^2)`、`-2^2` = `(-2)^2` を
-// 確認済み（`*`/`/` より強く、単項 `-` より弱い）。左結合
-// （`2^3^2` = `(2^3)^2` = 64、右結合の `512` にはならない）。
+// `^`/`**`. Confirmed with the `duckdb` CLI: `2 + 3^2` = `2 + (3^2)`, `-2^2` = `(-2)^2`
+// (tighter than `*`/`/`, looser than unary `-`). Left-associative
+// (`2^3^2` = `(2^3)^2` = 64, not the right-associative 512).
 const BP_POW: u8 = 9;
 // Postfix `!` (factorial). DuckDB's own precedence for `!` is internally
 // inconsistent Postgres legacy (`3! ^ 2` parses fine but `2 ^ 3!` is a
@@ -81,13 +81,13 @@ pub fn parse(sql: &str) -> Result<Parsed> {
 
 struct Parser<'a> {
     lex: Lexer<'a>,
-    /// 先読み 1 トークン。
+    /// One token of lookahead.
     cur: Tok<'a>,
-    /// `cur` の入力バイト位置。エラーはすべてこれを添えて返す。
+    /// The input byte position of `cur`. Every error carries it.
     pos: usize,
     arena: ExprArena,
     depth: u16,
-    /// JOIN・集合演算で作った `Box` 連鎖の通し数。
+    /// The running count of `Box` chains built by JOINs and set operations.
     links: u16,
     num_params: u16,
 }
@@ -107,14 +107,14 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `Box` 連鎖を 1 本伸ばす前に呼ぶ。上限を超えたらエラー。
+    /// Called before extending a `Box` chain by one. An error once the limit is exceeded.
     fn link(&mut self) -> Result<()> {
         self.links += 1;
         ensure!(self.links <= MAX_LINKS, ExpressionTooDeep, self.pos);
         Ok(())
     }
 
-    // --- トークン操作 -------------------------------------------------------
+    // --- Token operations ---------------------------------------------------
 
     fn bump(&mut self) -> Result<()> {
         let t = self.lex.next_token()?;
@@ -128,23 +128,23 @@ impl<'a> Parser<'a> {
         self.cur == t
     }
 
-    /// 2 トークン目を先読みする。字句器を複製して 1 個進めるだけで、
-    /// `self` の位置は動かさない。`OVER (` の判定にだけ使う。
+    /// Looks ahead at the second token. It merely clones the lexer and advances it once,
+    /// leaving `self`'s position alone. Used only to detect `OVER (`.
     fn peek(&self) -> Result<Tok<'a>> {
         let mut lx = self.lex.clone();
         Ok(lx.next_token()?.tok)
     }
 
-    /// 文脈依存キーワードの照合。引用符付き識別子（`"over"`）は対象外で、
-    /// 明示的に引用すれば常に列名として扱える。
+    /// Matches a context-dependent keyword. Quoted identifiers (`"over"`) are excluded,
+    /// so quoting explicitly always makes it a column name.
     #[inline]
     fn is_soft_kw(&self, word: &[u8]) -> bool {
         matches!(self.cur, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), word))
     }
 
-    /// カレントトークンが単一引用符の文字列リテラルであることを期待して
-    /// 読み進める。`COPY ... TO '<path>'` / `parquet('<path>')` のパス引数
-    /// など、"次は必ず文字列リテラル" という位置で使う。
+    /// Advances expecting the current token to be a single-quoted string literal. Used
+    /// at positions where "the next thing is necessarily a string literal", such as the
+    /// path argument of `COPY ... TO '<path>'` / `parquet('<path>')`.
     fn string_lit(&mut self) -> Result<String> {
         let s = match self.cur {
             Tok::Str(s) => unquote(s, b'\''),
@@ -154,9 +154,9 @@ impl<'a> Parser<'a> {
         Ok(s)
     }
 
-    /// 演算子・糖衣構文をプレーンな関数呼び出しノードに desugar する。
-    /// `GLOB`/`->`/`->>`/`SIMILAR TO`/配列リテラル/`EXTRACT` が使う
-    /// `DISTINCT`/`*`/`FILTER` を持たない単純呼び出しの共通形。
+    /// Desugars operators and syntactic sugar into a plain function-call node.
+    /// The shared form for simple calls without `DISTINCT`/`*`/`FILTER`, used by
+    /// `GLOB`/`->`/`->>`/`SIMILAR TO`/array literals/`EXTRACT`.
     fn simple_call(&mut self, name: &str, args: Vec<ExprId>) -> ExprId {
         self.arena.push(Expr::Function {
             name: name.into(),
@@ -167,8 +167,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `AS name(col)` 形の単一列エイリアスを読む。`generate_series`/`range`/
-    /// `UNNEST` の FROM 項目に共通する「列名リストは 1 個だけ」という形。
+    /// Reads a single-column alias of the form `AS name(col)`. The "column list of
+    /// exactly one" shape shared by the `generate_series`/`range`/`UNNEST` FROM items.
     fn opt_single_col_alias(&mut self) -> Result<Option<String>> {
         if self.is(Tok::LParen) {
             self.bump()?;
@@ -180,19 +180,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// 2 トークン目が文脈依存キーワードに一致するか（`GROUPING SETS` の
-    /// `SETS` 判定用。`is_soft_kw` の 2 トークン先読み版）。
+    /// Whether the second token matches a context-dependent keyword (for detecting `SETS`
+    /// in `GROUPING SETS`; the two-token-lookahead version of `is_soft_kw`).
     #[inline]
     fn peek_is_soft_kw(&self, word: &[u8]) -> Result<bool> {
         Ok(matches!(self.peek()?, Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), word)))
     }
 
-    /// `peek_is_soft_kw(b"to")` の `to`-対応版。`SIMILAR TO` の 2 トークン目
-    /// 先読みに使う。`to` は `ddl` フィーチャが有効なとき `DDL_KEYWORDS`
-    /// （`ALTER TABLE ... RENAME TO` 用）により `Tok::Kw(Kw::To)` として来る
-    /// ため、`peek_is_soft_kw` だけでは（`Tok::Ident` しか見ないので）
-    /// `ddl` 有効ビルドで `SIMILAR TO` を誤って認識し損ねる
-    /// （`expect_to` の doc コメント参照、同じ二重表現の問題）。
+    /// The `to`-aware version of `peek_is_soft_kw(b"to")`. Used for the two-token
+    /// lookahead of `SIMILAR TO`. When the `ddl` feature is on, `to` arrives as
+    /// `Tok::Kw(Kw::To)` via `DDL_KEYWORDS` (for `ALTER TABLE ... RENAME TO`), so
+    /// `peek_is_soft_kw` alone (which only looks at `Tok::Ident`) would fail to recognize
+    /// `SIMILAR TO` in a `ddl`-enabled build (see the doc comment on `expect_to`; the same
+    /// dual-representation problem).
     #[inline]
     fn peek_is_to(&self) -> Result<bool> {
         #[cfg(feature = "ddl")]
@@ -202,12 +202,12 @@ impl<'a> Parser<'a> {
         self.peek_is_soft_kw(b"to")
     }
 
-    /// `is_soft_kw(b"into")` の `into`-対応版。`UNPIVOT ... INTO NAME ...` の
-    /// `INTO` 判定に使う。`into` は `dml` フィーチャが有効なとき
-    /// `INSERT INTO` 用に別途グローバル予約されている（`DML_KEYWORDS`）ので、
-    /// `is_soft_kw` だけでは（`Tok::Ident` しか見ないので）`dml` 有効ビルドで
-    /// `UNPIVOT ... INTO` を誤って認識し損ねる（`expect_to`/`peek_is_to` の
-    /// doc コメント参照、同じ二重表現の問題）。
+    /// The `into`-aware version of `is_soft_kw(b"into")`. Used to detect the `INTO` of
+    /// `UNPIVOT ... INTO NAME ...`. When the `dml` feature is on, `into` is separately
+    /// reserved globally for `INSERT INTO` (`DML_KEYWORDS`), so `is_soft_kw` alone (which
+    /// only looks at `Tok::Ident`) would fail to recognize `UNPIVOT ... INTO` in a
+    /// `dml`-enabled build (see the doc comments on `expect_to`/`peek_is_to`; the same
+    /// dual-representation problem).
     fn is_into(&self) -> bool {
         #[cfg(feature = "dml")]
         if self.is(Tok::Kw(Kw::Into)) {
@@ -216,17 +216,17 @@ impl<'a> Parser<'a> {
         self.is_soft_kw(b"into")
     }
 
-    /// `self.cur` が比較演算子であるという前提で、その直後が
-    /// `ANY|ALL|SOME (` の並びかどうかを、何も消費せずに判定する。
-    /// `Some(true)` = `ALL`、`Some(false)` = `ANY`/`SOME`、`None` = 量化比較
-    /// ではない（呼び出し側は通常の中置演算子として扱う）。
+    /// Assuming `self.cur` is a comparison operator, decides without consuming anything
+    /// whether what follows is `ANY|ALL|SOME (`.
+    /// `Some(true)` = `ALL`, `Some(false)` = `ANY`/`SOME`, `None` = not a quantified
+    /// comparison (the caller treats it as an ordinary infix operator).
     ///
-    /// `(` まで見てから確定させるのは、`ANY`/`SOME` を予約語にしていない
-    /// ため（`is_soft_kw` の doc、ファイル冒頭 `sql/lexer.rs` の
-    /// ROWS/RANGE/QUALIFY 事故のコメント参照）: `x > any` のように `any` が
-    /// ただの列名の場合を、`x > ANY (SELECT ...)` と取り違えないようにする。
-    /// `lex` を複製して 2 トークン先読みするだけで `self` の位置は動かさない
-    /// （`peek`/`peek_is_soft_kw` と同じ流儀）。
+    /// The decision waits until the `(` because `ANY`/`SOME` are not reserved words (see
+    /// the docs on `is_soft_kw` and the ROWS/RANGE/QUALIFY incident comment at the top of
+    /// `sql/lexer.rs`): a case where `any` is just a column name, as in `x > any`, must
+    /// not be mistaken for `x > ANY (SELECT ...)`.
+    /// It only clones `lex` for two tokens of lookahead and leaves `self`'s position
+    /// alone (the same style as `peek`/`peek_is_soft_kw`).
     fn peek_quantifier(&self) -> Result<Option<bool>> {
         let mut lx = self.lex.clone();
         let t1 = lx.next_token()?.tok;
@@ -247,29 +247,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `self.cur` が関数呼び出しの開き括弧であるという前提で、対応する閉じ
-    /// 括弧までの**同じ入れ子深さ**に `want` が現れるかを、何も消費せずに
-    /// 判定する（`peek_quantifier` と同じく `lex` の複製で先読みするだけ）。
+    /// Assuming `self.cur` is the opening parenthesis of a function call, decides without
+    /// consuming anything whether `want` appears at **the same nesting depth** before the
+    /// matching closing parenthesis (like `peek_quantifier`, it only looks ahead on a clone of `lex`).
     ///
-    /// SQL 標準の `position(a IN b)` / `trim(BOTH x FROM s)` のように、
-    /// 引数リストの途中にキーワードを挟む構文かどうかを、引数の式そのものを
-    /// パースする前に確定させるために使う。`EXTRACT` の 2 トークン先読みでは
-    /// 足りない（キーワードの前に任意の長さの式が来る）ケース専用。
+    /// Used to settle, before parsing the argument expressions themselves, whether this is
+    /// a syntax that interposes a keyword in the argument list, as with the standard SQL
+    /// `position(a IN b)` / `trim(BOTH x FROM s)`. Specifically for cases where `EXTRACT`'s
+    /// two-token lookahead is not enough (an expression of arbitrary length precedes the keyword).
     ///
-    /// 内側の呼び出し・部分クエリに現れた同じ語は深さで弾く
-    /// （`trim(f(x FROM y))` のような形を取り違えない）。入力は常に有限で、
-    /// 走査は閉じ括弧か `Eof` で必ず止まる。
+    /// The same word appearing in an inner call or subquery is rejected by depth (so a
+    /// shape like `trim(f(x FROM y))` is not mistaken). The input is always finite, and the
+    /// scan always stops at the closing parenthesis or `Eof`.
     fn call_has_top_level(&self, want: Tok<'a>) -> Result<bool> {
         let mut lx = self.lex.clone();
-        // `self.lex` は既に `self.cur`（開き括弧）の**次**を指しているので、
-        // 深さは 1 から数え始める。
+        // `self.lex` already points **past** `self.cur` (the opening parenthesis), so the
+        // depth starts counting at 1.
         let mut depth = 1u32;
         loop {
             match lx.next_token()?.tok {
                 Tok::Eof => return Ok(false),
                 Tok::LParen | Tok::LBracket => depth += 1,
                 Tok::RParen | Tok::RBracket => {
-                    // 開き括弧（`self.cur`）に対応する閉じ括弧まで来たら終わり。
+                    // Done once we reach the closing parenthesis matching `self.cur`.
                     if depth == 1 {
                         return Ok(false);
                     }
@@ -303,10 +303,10 @@ impl<'a> Parser<'a> {
         self.expect(Tok::Kw(k))
     }
 
-    /// 識別子を 1 個取り出す。
+    /// Takes one identifier.
     ///
-    /// 引用符なし識別子は原文の綴りのまま保持する。比較は束縛時に大小無視で
-    /// 行う（`rt::hash::hash_ascii_ci`）ので、結果の列名は入力の見た目を保てる。
+    /// Unquoted identifiers keep their original spelling. Comparison happens
+    /// case-insensitively at bind time (`rt::hash::hash_ascii_ci`), so result column names keep the input's appearance.
     fn ident(&mut self) -> Result<String> {
         let s = match self.cur {
             Tok::Ident(s) => s.to_owned(),
@@ -317,25 +317,25 @@ impl<'a> Parser<'a> {
         Ok(s)
     }
 
-    /// `[AS] alias`。予約語は `Tok::Kw` なので、句の切れ目を別名と誤認しない。
+    /// `[AS] alias`. Reserved words are `Tok::Kw`, so a clause boundary is never mistaken for an alias.
     fn opt_alias(&mut self) -> Result<Option<String>> {
         if self.eat_kw(Kw::As)? {
             return Ok(Some(self.ident()?));
         }
         match self.cur {
-            // `AS` 無しの裸の別名は、それが実は `USING SAMPLE`/`TABLESAMPLE`
-            // 節の先頭だった場合に食ってしまうと `opt_sample_clause` へ
-            // 二度と辿り着けない（`FROM t USING SAMPLE 10%` のような、ごく
-            // ふつうに書かれる形が壊れる）。`SAMPLE`/`QUALIFY` と同じ「事故に
-            // なりやすい文脈」なので、この 2 語だけはここで先読みして除外する
-            // （引用すれば `AS "using"` 等で常に別名として使える）。
+            // If a bare alias without `AS` swallowed what was actually the head of a
+            // `USING SAMPLE`/`TABLESAMPLE` clause, `opt_sample_clause` could never be
+            // reached (a perfectly ordinary form like `FROM t USING SAMPLE 10%` would
+            // break). This is an accident-prone context like `SAMPLE`/`QUALIFY`, so just
+            // these two words are looked ahead and excluded here (quoting still allows
+            // them as aliases, as in `AS "using"`).
             Tok::Ident(s) if self.is_using_sample_or_tablesample(s.as_bytes())? => Ok(None),
             Tok::Ident(_) | Tok::QIdent(_) => Ok(Some(self.ident()?)),
             _ => Ok(None),
         }
     }
 
-    /// `self.cur` が `USING SAMPLE`/`TABLESAMPLE` 節の先頭かどうか。
+    /// Whether `self.cur` is the head of a `USING SAMPLE`/`TABLESAMPLE` clause.
     fn is_using_sample_or_tablesample(&self, word: &[u8]) -> Result<bool> {
         if eq_ascii_ci(word, b"tablesample") {
             return Ok(true);
@@ -346,7 +346,7 @@ impl<'a> Parser<'a> {
         Ok(false)
     }
 
-    /// 非負整数。LIMIT / OFFSET と DECIMAL の精度指定で使う。
+    /// A non-negative integer. Used by LIMIT / OFFSET and by DECIMAL precision.
     fn uint(&mut self) -> Result<u64> {
         let pos = self.pos;
         let text = match self.cur {
@@ -364,10 +364,10 @@ impl<'a> Parser<'a> {
         Ok(v)
     }
 
-    /// 符号付き整数リテラル 1 個。`generate_series`/`range` の引数と
-    /// `USING SAMPLE ... (method, seed)` のシードで使う。`prefix()` の単項
-    /// マイナス処理と同じく、負号は数値リテラルへ畳んでから範囲を見る
-    /// （`int_literal` は `i32`/`i64`/`i128` の順で収まる型を返す）。
+    /// One signed integer literal. Used by the arguments of `generate_series`/`range` and
+    /// by the seed of `USING SAMPLE ... (method, seed)`. As with the unary-minus handling
+    /// in `prefix()`, the sign is folded into the numeric literal before the range is
+    /// checked (`int_literal` returns the first of `i32`/`i64`/`i128` that fits).
     fn signed_int_lit(&mut self) -> Result<i64> {
         let pos = self.pos;
         let neg = self.eat(Tok::Minus)?;
@@ -384,16 +384,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // --- 文 -----------------------------------------------------------------
+    // --- Statements ---------------------------------------------------------
 
-    /// `sql` は入力全体の原文。`ddl` の `CREATE VIEW` がビュー本体を生テキストの
-    /// まま保持するために使う（`create_view_stmt` 参照）。フィーチャが OFF の
-    /// ときは使わないが、シグネチャを cfg で分けるとこの関数だけ 2 通り持つ
-    /// ことになり複雑なので、常に受け取って未使用警告だけ潰す。
+    /// `sql` is the original text of the whole input. `ddl`'s `CREATE VIEW` uses it to
+    /// keep the view body as raw text (see `create_view_stmt`). It is unused when the
+    /// feature is OFF, but splitting the signature by cfg would mean two versions of just
+    /// this function, so it is always taken and only the unused warning is suppressed.
     fn stmt(&mut self, sql: &'a str) -> Result<Stmt> {
         let _ = sql;
         let s = match self.cur {
-            // クエリは SELECT / WITH / 括弧のいずれかで始まる。
+            // A query starts with SELECT, WITH, or a parenthesis.
             Tok::Kw(Kw::Select | Kw::With) | Tok::LParen => {
                 Stmt::Select(Box::new(self.query_stmt()?))
             }
@@ -424,15 +424,15 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Delete) => self.delete_stmt()?,
             #[cfg(feature = "export")]
             Tok::Kw(Kw::Copy) => self.copy_stmt()?,
-            // `PIVOT`/`UNPIVOT` は予約語にせず、文の先頭というこの文脈でだけ
-            // キーワード扱いする（`ROWS`/`RANGE`/`QUALIFY` を巡る列名破壊
-            // 事故と同じ理由 — 有効な文は必ずここに列挙したキーワードで
-            // 始まるので、先頭が裸の識別子 "pivot"/"unpivot" になるのは
-            // この 2 構文しかなく、`FROM pivot` のような通常の列/表名としての
-            // 利用は一切妨げない）。
+            // `PIVOT`/`UNPIVOT` are not reserved words; they are treated as keywords only
+            // in this statement-head context (the same reason as the column-name-breaking
+            // incidents around `ROWS`/`RANGE`/`QUALIFY` -- a valid statement always starts
+            // with one of the keywords listed here, so a bare identifier "pivot"/"unpivot"
+            // at the head can only be these two constructs, and ordinary uses as a column
+            // or table name such as `FROM pivot` are not hindered at all).
             _ if self.is_soft_kw(b"pivot") => self.pivot_stmt()?,
             _ if self.is_soft_kw(b"unpivot") => self.unpivot_stmt()?,
-            // v1 は上記のみ。その他の未対応の文はここで一括で弾く。
+            // v1 supports only the above. Every other unsupported statement is rejected here.
             _ => err!(UnsupportedFeature, self.pos),
         };
         self.eat(Tok::Semi)?;
@@ -442,22 +442,22 @@ impl<'a> Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    // --- COPY（`export` フィーチャ）-------------------------------------------
+    // --- COPY (the `export` feature) -----------------------------------------
 
     /// `COPY (<query>) TO '<path>' [(FORMAT csv|jsonl|json)]` /
     /// `COPY <table> TO '<path>' [...]`
     ///
-    /// `TO`/`FORMAT` は `export` 単体では文脈依存キーワードとして綴りで
-    /// 照合する（`is_soft_kw`）。`export` のグローバルな予約語表には入れない
-    /// — さもないと `to`/`format` という名前の列（出発/到着の `to`、ファイル
-    /// フォーマットを表す `format` 列など、実データにありふれた名前）が
-    /// 引用符無しでは参照できなくなってしまう。`OVER`/`RECURSIVE` と同じ
-    /// 理由（`sql/lexer.rs` の `KEYWORDS` コメント参照）。`COPY` 自体は
-    /// 文の先頭専用の統語頭語なので `CREATE`/`DROP` と同じく普通に予約する。
+    /// With `export` alone, `TO`/`FORMAT` are matched by spelling as context-dependent
+    /// keywords (`is_soft_kw`). They are not put in `export`'s global reserved-word table
+    /// -- otherwise columns named `to`/`format` (a departure/arrival `to`, a `format`
+    /// column naming a file format, and other names common in real data) would become
+    /// unreferenceable without quotes. The same reason as `OVER`/`RECURSIVE` (see the
+    /// `KEYWORDS` comment in `sql/lexer.rs`). `COPY` itself is a syntactic head used only
+    /// at the start of a statement, so it is reserved normally like `CREATE`/`DROP`.
     ///
-    /// `ddl` フィーチャが同時に有効だと `TO` は `ALTER TABLE ... RENAME TO`
-    /// 用に別途グローバル予約されている（`DDL_KEYWORDS`）ので、その場合は
-    /// `Tok::Kw(Kw::To)` として来る。`expect_to` で両方を受け付ける。
+    /// When the `ddl` feature is on at the same time, `TO` is separately reserved globally
+    /// for `ALTER TABLE ... RENAME TO` (`DDL_KEYWORDS`) and thus arrives as
+    /// `Tok::Kw(Kw::To)`. `expect_to` accepts both.
     #[cfg(feature = "export")]
     fn copy_stmt(&mut self) -> Result<Stmt> {
         self.bump()?; // COPY
@@ -466,9 +466,9 @@ impl<'a> Parser<'a> {
             self.expect(Tok::RParen)?;
             Box::new(q)
         } else {
-            // `COPY <table> TO ...`。`SELECT * FROM <table>` と等価な木を
-            // 組み立てて、以降はサブクエリ形と同じ経路（`write::copy`）に
-            // 流す（`base_rel` の派生表化と同じ発想）。
+            // `COPY <table> TO ...`. Builds a tree equivalent to `SELECT * FROM <table>`
+            // and sends it down the same path as the subquery form (`write::copy`) from
+            // there on (the same idea as turning `base_rel` into a derived table).
             let name = self.ident()?;
             let star = self.arena.push(Expr::Star {
                 qualifier: None,
@@ -508,8 +508,8 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Copy { query, path, format })
     }
 
-    /// `COPY` の `TO`。`ddl` フィーチャの有無で `to` の字句が変わる
-    /// （上の `copy_stmt` ドキュメント参照）ので両方を受け付ける。
+    /// The `TO` of `COPY`. The lexing of `to` changes depending on whether the `ddl`
+    /// feature is on (see the `copy_stmt` docs above), so both forms are accepted.
     #[cfg(feature = "export")]
     fn expect_to(&mut self) -> Result<()> {
         #[cfg(feature = "ddl")]

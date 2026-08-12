@@ -1,10 +1,10 @@
-//! SQL のエンドツーエンド回帰テスト。
+//! End-to-end SQL regression tests.
 //!
-//! **期待値を書かずに DuckDB と突き合わせる。** 手で書いた期待値は書き間違いが
-//! そのまま仕様になってしまうし、クエリを増やすたびに手計算が要る。DuckDB を
-//! 参照実装として使えば、クエリを 1 行足すだけで検証が増える。
+//! **Cross-check against DuckDB instead of writing expected values.** Hand-written
+//! expectations turn typos into the specification, and every new query needs manual
+//! computation. With DuckDB as the reference implementation, one more query line means one more verified case.
 //!
-//! DuckDB が入っていない環境ではテストごと飛ばす（CI では入れる）。
+//! Environments without DuckDB skip these tests entirely (CI installs it).
 
 use std::process::Command;
 
@@ -16,7 +16,7 @@ fn repo_path(rel: &str) -> String {
     format!("{}/../../{}", env!("CARGO_MANIFEST_DIR"), rel)
 }
 
-/// ahirudb の CLI で実行し、行 × 列に分解する（ヘッダ含む）。
+/// Runs through the ahirudb CLI and splits the output into rows x columns (header included).
 fn run_ahiru(files: &[&str], sql: &str) -> Vec<Vec<String>> {
     let mut args: Vec<String> = vec!["query".into()];
     args.extend(files.iter().map(|f| repo_path(f)));
@@ -45,7 +45,7 @@ fn duckdb_source(file: &str) -> String {
     }
 }
 
-/// DuckDB で同じクエリを実行する。テーブル名 `t`, `t2`, ... をファイル参照に置き換える。
+/// Runs the same query through DuckDB, replacing the table names `t`, `t2`, ... with file references.
 fn run_duckdb(files: &[&str], sql: &str) -> Vec<Vec<String>> {
     let sql = replace_tables(sql, files);
     let out =
@@ -58,10 +58,10 @@ fn run_duckdb(files: &[&str], sql: &str) -> Vec<Vec<String>> {
     parse(&String::from_utf8_lossy(&out.stdout), ',')
 }
 
-/// `t`, `t2`, `t3`, ... をそれぞれのファイル参照に差し替える。
+/// Substitutes `t`, `t2`, `t3`, ... with their respective file references.
 ///
-/// 単語境界で切って一致を見る。`text` の中の `t` や、`t` が `t2` の一部で
-/// あるケースを壊さないため。
+/// Matching is done on word boundaries, so the `t` inside `text`, and cases where
+/// `t` is part of `t2`, are not broken.
 fn replace_tables(sql: &str, files: &[&str]) -> String {
     let names: Vec<String> =
         (0..files.len()).map(|i| if i == 0 { "t".into() } else { format!("t{}", i + 1) }).collect();
@@ -96,17 +96,17 @@ fn parse(text: &str, sep: char) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// セルを比較可能な形に揃える。
+/// Normalizes a cell into a comparable form.
 ///
-/// - NULL の表記が違う（ahirudb は `NULL`、DuckDB の CSV は空）
-/// - 浮動小数の桁の出し方が違う（`747` と `747.0`）
+/// - NULL is spelled differently (ahirudb writes `NULL`; DuckDB's CSV writes empty)
+/// - floats are formatted differently (`747` vs `747.0`)
 fn normalize_cell(s: &str) -> String {
     let s = s.trim().trim_matches('"');
     if s.is_empty() || s == "NULL" {
         return "<null>".into();
     }
     if let Ok(f) = s.parse::<f64>() {
-        // 整数として表せる値は整数表記に寄せる。
+        // Values representable as integers are normalized to integer form.
         if f.fract() == 0.0 && f.abs() < 9e15 {
             return format!("{}", f as i64);
         }
@@ -119,15 +119,15 @@ fn check(file: &str, sql: &str) {
     check_multi(&[file], sql)
 }
 
-/// 1 つのクエリを両方で実行して突き合わせる。
+/// Runs one query through both and cross-checks the results.
 fn check_multi(files: &[&str], sql: &str) {
-    // ヘッダは比較しない。別名の付け方までは合わせないし、DuckDB は結果が
-    // 0 行のときヘッダ自体を出さない。データ行だけを突き合わせる。
+    // Headers are not compared. Alias naming is not kept in sync, and DuckDB omits
+    // the header entirely when the result has 0 rows. Only data rows are compared.
     let a = body(run_ahiru(files, sql));
     let d = body(run_duckdb(files, sql));
-    assert_eq!(a.len(), d.len(), "行数が違う\nSQL: {sql}\nahiru: {a:?}\nduckdb: {d:?}");
+    assert_eq!(a.len(), d.len(), "row counts differ\nSQL: {sql}\nahiru: {a:?}\nduckdb: {d:?}");
     for (i, (ra, rd)) in a.iter().zip(&d).enumerate() {
-        assert_eq!(ra, rd, "{} 行目が違う\nSQL: {sql}", i + 1);
+        assert_eq!(ra, rd, "row {} differs\nSQL: {sql}", i + 1);
     }
 }
 
@@ -144,7 +144,7 @@ macro_rules! e2e_multi {
         #[test]
         fn $name() {
             if !duckdb_available() {
-                eprintln!("duckdb が無いので飛ばす");
+                eprintln!("duckdb not found, skipping");
                 return;
             }
             let files = [$($file),*];
@@ -158,7 +158,7 @@ macro_rules! e2e {
         #[test]
         fn $name() {
             if !duckdb_available() {
-                eprintln!("duckdb が無いので飛ばす");
+                eprintln!("duckdb not found, skipping");
                 return;
             }
             $( check($file, $sql); )*
@@ -193,7 +193,7 @@ e2e!(expressions, "tests/data/basic.parquet", [
     "SELECT id, flag FROM t WHERE flag ORDER BY id LIMIT 5",
     "SELECT id FROM t WHERE big > 100 AND id < 20 ORDER BY id",
     "SELECT id FROM t WHERE big IS NULL OR id > 997 ORDER BY id LIMIT 5",
-    // NULL を含む算術は NULL になる。
+    // Arithmetic involving NULL yields NULL.
     "SELECT id, big + 1 FROM t ORDER BY id LIMIT 6",
 ]);
 
@@ -212,7 +212,7 @@ e2e!(
         "SELECT count(DISTINCT name) FROM t",
         "SELECT flag, count(*) FROM t GROUP BY flag ORDER BY flag",
         "SELECT id % 3, count(*) FROM t GROUP BY 1 ORDER BY 1",
-        // 1 行も残らない集約。
+        // An aggregate over zero surviving rows.
         "SELECT count(*) FROM t WHERE id > 100000",
         "SELECT name, count(*) FROM t WHERE id > 100000 GROUP BY name ORDER BY name",
     ]
@@ -230,7 +230,7 @@ e2e!(
         "SELECT big FROM t ORDER BY big DESC NULLS FIRST LIMIT 5",
         "SELECT DISTINCT name FROM t ORDER BY name",
         "SELECT DISTINCT flag FROM t ORDER BY flag",
-        // 出力に無い式で並べ替える（隠しソート列）。
+        // Ordering by an expression absent from the output (a hidden sort column).
         "SELECT name FROM t ORDER BY id DESC LIMIT 5",
     ]
 );
@@ -258,9 +258,9 @@ e2e!(
     ]
 );
 
-// GZIP はホストに展開を委譲する（DESIGN.md §6）。CLI ではシステムの `gzip` が
-// その役目を果たす。ここが通れば、コーデック委譲プロトコルが端から端まで
-// 動いていることになる。
+// GZIP decompression is delegated to the host (DESIGN.md §6). In the CLI the system
+// `gzip` fills that role. If this passes, the codec delegation protocol works end to end.
+//
 e2e!(
     gzip_via_host_codec_delegation,
     "tests/data/gzip.parquet",
@@ -280,21 +280,21 @@ e2e!(
         "SELECT count(*) FROM t",
         "SELECT sum(id), min(id), max(id) FROM t",
         "SELECT k, count(*) FROM t GROUP BY k ORDER BY k LIMIT 10",
-        // 統計による枝刈りが効く範囲でも結果は変わらない。
+        // Results are unchanged even where statistics pruning applies.
         "SELECT count(*) FROM t WHERE id > 40000",
         "SELECT id FROM t WHERE id BETWEEN 8190 AND 8195 ORDER BY id",
     ]
 );
 
-// ページ単位の枝刈り（ColumnIndex/OffsetIndex/Bloom フィルタ）。
-// pagetest.parquet は pyarrow (parquet-cpp) が ColumnIndex/OffsetIndex/Bloom
-// フィルタ付きで書いた、id が 0..50000 の昇順・小さいページのファイル
-// （DuckDB のこの環境の版は Bloom フィルタを書けないので pyarrow を使った。
-// `scripts/gen-testdata.sh` にどちらでどう作ったかを記している）。
-// DuckDB はこのファイルを読めるので、結果の正しさはいつも通り突き合わせる。
-// 「実際にページ単位で絞り込めているか」自体は
-// `crates/ahiru-core/src/format/parquet.rs` の
-// `selective_equality_predicate_reads_a_small_fraction_of_the_column` が見る。
+// Page-level pruning (ColumnIndex/OffsetIndex/Bloom filter).
+// pagetest.parquet was written by pyarrow (parquet-cpp) with ColumnIndex/OffsetIndex/Bloom
+// filters, with id ascending over 0..50000 and small pages (the DuckDB version in
+// this environment cannot write Bloom filters, hence pyarrow; `scripts/gen-testdata.sh`
+// records which tool built what and how).
+// DuckDB can read this file, so result correctness is cross-checked as usual.
+// Whether pruning actually happens at page granularity is covered by
+// `selective_equality_predicate_reads_a_small_fraction_of_the_column` in
+// `crates/ahiru-core/src/format/parquet.rs`.
 e2e!(
     page_level_pruning,
     "tests/data/pagetest.parquet",
@@ -311,19 +311,19 @@ e2e!(
     ]
 );
 
-// 結合。DuckDB 側でもファイル参照に別名を付ける必要があるので、
-// クエリには常に明示的な別名を書く。
-// FROM 句の派生表。集約結果をさらに絞り込む形。
+// Joins. The DuckDB side needs aliases on its file references too, so the queries
+// always spell out explicit aliases.
+// Derived tables in the FROM clause, filtering an aggregate result further.
 e2e!(derived_tables, "tests/data/basic.parquet", [
     "SELECT s.name, s.n FROM (SELECT name, count(*) AS n FROM t GROUP BY name) AS s WHERE s.n > 142 ORDER BY s.name",
     "SELECT count(*) FROM (SELECT id FROM t WHERE id < 10) AS s",
     "SELECT max(s.m) FROM (SELECT name, max(big) AS m FROM t GROUP BY name) AS s",
 ]);
 
-// ZSTD は `ahiru-core` の既定フィーチャ（`zstd`）に含まれ、コアが内蔵で
-// 展開する（DESIGN.md §6）。CLI 側は `ahiru-zstd` を直接リンクしているが、
-// これは `zstd` フィーチャを外した場合のホスト委譲フォールバック用で、
-// 既定ビルドでは経由しない。
+// ZSTD is part of `ahiru-core`'s default features (`zstd`) and the core decompresses
+// it in-process (DESIGN.md §6). The CLI links `ahiru-zstd` directly, but that is the
+// host-delegation fallback for builds without the `zstd` feature, and the default
+// build never goes through it.
 e2e!(
     zstd_is_decompressed_by_the_core,
     "tests/data/zstd2.parquet",
@@ -342,23 +342,23 @@ e2e_multi!(joins, ["tests/data/small_a.parquet", "tests/data/small_b.parquet"], 
     "SELECT a.k, b.w FROM t AS a RIGHT JOIN t2 AS b ON a.k = b.k ORDER BY b.k",
     "SELECT a.k, b.k FROM t AS a FULL JOIN t2 AS b ON a.k = b.k ORDER BY a.k NULLS LAST, b.k NULLS LAST",
     "SELECT a.k, b.k FROM t AS a CROSS JOIN t2 AS b ORDER BY a.k, b.k",
-    // 等値に落ちない条件は残余述語として評価される。
+    // Conditions that do not reduce to equality are evaluated as residual predicates.
     "SELECT a.k, b.k FROM t AS a JOIN t2 AS b ON a.k < b.k ORDER BY a.k, b.k",
-    // 結合キーに加えて片側だけの条件（押し下げの対象）。
+    // A one-sided condition on top of the join key (a pushdown candidate).
     "SELECT a.k, b.w FROM t AS a JOIN t2 AS b ON a.k = b.k WHERE a.v > 4 ORDER BY a.k",
-    // 結合の上での集約。
+    // Aggregation on top of a join.
     "SELECT count(*) FROM t AS a JOIN t2 AS b ON a.k = b.k",
     "SELECT a.k, sum(b.w) FROM t AS a JOIN t2 AS b ON a.k = b.k GROUP BY a.k ORDER BY a.k",
 ]);
 
-// 大きい表と小さい表の結合。射影プッシュダウンと枝刈りが結合下でも効くこと。
+// Joining a large table with a small one. Projection pushdown and pruning must work under a join too.
 e2e_multi!(join_with_dimension, ["tests/data/basic.parquet", "tests/data/dim.parquet"], [
     "SELECT count(*) FROM t AS f JOIN t2 AS d ON f.name = d.label",
     "SELECT d.nid, count(*) FROM t AS f JOIN t2 AS d ON f.name = d.label GROUP BY d.nid ORDER BY d.nid",
     "SELECT f.id, d.w FROM t AS f JOIN t2 AS d ON f.name = d.label WHERE f.id < 5 ORDER BY f.id",
 ]);
 
-// --- SQL 糖衣構文（FILTER / QUALIFY / ILIKE / TRY_CAST / IIF / DISTINCT ON） ---
+// --- SQL sugar (FILTER / QUALIFY / ILIKE / TRY_CAST / IIF / DISTINCT ON) ------
 
 e2e!(
     filter_clause,
@@ -368,9 +368,9 @@ e2e!(
         "SELECT count(*) FILTER (WHERE id > 500), count(*) FROM t",
         "SELECT flag, count(*) FILTER (WHERE big IS NOT NULL) FROM t GROUP BY flag ORDER BY flag",
         "SELECT sum(id) FILTER (WHERE flag), sum(id) FILTER (WHERE NOT flag) FROM t",
-        // 全行が条件に落ちる集約は SUM が NULL、COUNT(*) が 0 になる。
+        // An aggregate whose rows are all filtered out gives NULL for SUM and 0 for COUNT(*).
         "SELECT count(*) FILTER (WHERE id > 100000), sum(id) FILTER (WHERE id > 100000) FROM t",
-        // FILTER 無しの集約と混在しても互いに影響しない。
+        // Mixing with aggregates that have no FILTER leaves both unaffected.
         "SELECT count(*), count(*) FILTER (WHERE flag) FROM t GROUP BY name ORDER BY name LIMIT 5",
     ]
 );
@@ -379,11 +379,11 @@ e2e!(
     qualify_clause,
     "tests/data/basic.parquet",
     [
-        // ウィンドウ関数をそのまま QUALIFY に書く形。
-        // ウィンドウ関数は行を並べ替えないので、出力順を突き合わせるには
-        // 明示的な ORDER BY が要る（QUALIFY 自体は並びに関与しない）。
+        // A window function written directly in QUALIFY.
+        // Window functions do not reorder rows, so cross-checking output order needs an
+        // explicit ORDER BY (QUALIFY itself plays no part in ordering).
         "SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id DESC) <= 3 ORDER BY id DESC",
-        // SELECT の別名を QUALIFY から参照する形。
+        // Referring to a SELECT alias from QUALIFY.
         "SELECT id, flag, row_number() OVER (PARTITION BY flag ORDER BY id) AS rn FROM t QUALIFY rn <= 2 ORDER BY flag, id",
         "SELECT id, flag, rank() OVER (PARTITION BY flag ORDER BY id) AS rk FROM t QUALIFY rk = 1 ORDER BY flag",
     ]
@@ -451,9 +451,9 @@ e2e!(
     try_cast_expr,
     "tests/data/basic.parquet",
     [
-        // 数字でない文字列は CAST ならエラーだが TRY_CAST は NULL。
+        // A non-numeric string is an error under CAST but NULL under TRY_CAST.
         "SELECT TRY_CAST(name AS INTEGER) FROM t ORDER BY id LIMIT 5",
-        // 変換できる場合は普通の CAST と同じ結果になる。
+        // When the conversion succeeds the result matches a plain CAST.
         "SELECT TRY_CAST(CAST(id AS VARCHAR) AS INTEGER) FROM t ORDER BY id LIMIT 5",
         "SELECT TRY_CAST(big AS VARCHAR) FROM t ORDER BY id LIMIT 5",
     ]
@@ -463,9 +463,9 @@ e2e!(
     distinct_on_clause,
     "tests/data/basic.parquet",
     [
-        // 各 flag グループで id が最大の行だけを残す。
+        // Keeps only the row with the largest id in each flag group.
         "SELECT DISTINCT ON (flag) flag, id FROM t ORDER BY flag, id DESC",
-        // ON に無い列（`*` の一部）も普通に出力される。
+        // Columns not in ON (part of `*`) are output normally.
         "SELECT DISTINCT ON (flag) * FROM t ORDER BY flag, id",
     ]
 );
@@ -495,26 +495,30 @@ e2e!(
     ]
 );
 
-/// `ORDER BY` を省略した `DISTINCT ON` は「到着順で最初の行」を残す。
-/// DuckDB も同じ規則だが、どちらを「到着順の先頭」とみなすかはスキャンの
-/// 実装依存（ページ読み出し順など）で、別エンジン同士を突き合わせる意味が
-/// 無い。ここでは行数（= ON キーの種類数）と、返る値が実在するグループの
-/// 値であることだけ確認する。
+/// `DISTINCT ON` without `ORDER BY` keeps "the first row in arrival order".
+/// DuckDB follows the same rule, but which row counts as "first in arrival order"
+/// depends on the scan implementation (page read order and so on), so cross-checking
+/// two engines is meaningless. This only checks the row count (= the number of
+/// distinct ON keys) and that the returned value belongs to a group that exists.
 #[test]
 fn distinct_on_without_order_by_keeps_first_arrival_per_key() {
     let files = ["tests/data/basic.parquet"];
     let rows = body(run_ahiru(&files, "SELECT DISTINCT ON (flag) flag FROM t"));
     let mut vals: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
     vals.sort_unstable();
-    assert_eq!(vals, vec!["false", "true"], "flag は 2 値なので 2 行になるはず: {rows:?}");
+    assert_eq!(
+        vals,
+        vec!["false", "true"],
+        "flag is two-valued, so there should be 2 rows: {rows:?}"
+    );
 }
 
-/// `IIF` は `CASE WHEN` への脱糖なので、この環境の DuckDB に `iif` が
-/// 無くても等価な `CASE WHEN` と突き合わせれば検証できる。
+/// `IIF` desugars to `CASE WHEN`, so it can be verified against an equivalent
+/// `CASE WHEN` even if this environment's DuckDB has no `iif`.
 #[test]
 fn iif_desugars_like_case_when() {
     if !duckdb_available() {
-        eprintln!("duckdb が無いので飛ばす");
+        eprintln!("duckdb not found, skipping");
         return;
     }
     let cases = [
@@ -542,8 +546,8 @@ fn iif_desugars_like_case_when() {
 // --- DuckDB expression sugar (typed literals / `^@` / IS UNKNOWN / SQL
 // --- standard function syntax / GROUP BY ALL / ORDER BY ALL) ---------------
 
-// 型付き時刻リテラル。`d` は TIMESTAMP 列なので、`DATE`/`TIMESTAMP`
-// リテラルとの比較・算術がそのまま突き合わせられる。
+// Typed time literals. `d` is a TIMESTAMP column, so comparisons and arithmetic
+// against `DATE`/`TIMESTAMP` literals can be cross-checked directly.
 e2e!(
     typed_temporal_literals,
     "tests/data/basic.parquet",
@@ -552,7 +556,7 @@ e2e!(
         "SELECT id FROM t WHERE CAST(d AS DATE) = DATE '2024-01-03' ORDER BY id",
         "SELECT count(*) FROM t WHERE d > TIMESTAMP '2024-06-01 00:00:00'",
         "SELECT DATE '2020-02-29' AS a, TIME '01:02:03' AS b FROM t LIMIT 1",
-        // 定数のプルーニングに乗る形（結果は当然変わらない）。
+        // A form that rides on constant pruning (the result is of course unchanged).
         "SELECT id, d FROM t WHERE d = TIMESTAMP '2024-01-10 00:00:00'",
     ]
 );
@@ -564,7 +568,7 @@ e2e!(
         "SELECT id FROM t WHERE name ^@ 'name_1' ORDER BY id LIMIT 10",
         "SELECT count(*) FROM t WHERE NOT name ^@ 'name_'",
         "SELECT id, name ^@ 'name_0' FROM t ORDER BY id LIMIT 5",
-        // NULL はそのまま NULL に伝播する。
+        // NULL propagates through as NULL.
         "SELECT id, big IS UNKNOWN, big IS NOT UNKNOWN FROM t ORDER BY id LIMIT 6",
         "SELECT count(*) FROM t WHERE big IS UNKNOWN",
     ]
@@ -592,35 +596,35 @@ e2e!(
     [
         "SELECT name, count(*) FROM t GROUP BY ALL ORDER BY ALL",
         "SELECT flag, name, count(*) FROM t GROUP BY ALL ORDER BY ALL",
-        // 集約を含む式は GROUP BY ALL の対象から外れる。
+        // Expressions containing an aggregate are excluded from GROUP BY ALL.
         "SELECT id % 3, sum(id) + 1 FROM t GROUP BY ALL ORDER BY ALL",
-        // 集約が 1 つも無ければ DISTINCT と同じ。
+        // With no aggregates at all it behaves like DISTINCT.
         "SELECT name FROM t GROUP BY ALL ORDER BY ALL",
-        // 集約だけならグルーピング列は 0 本。
+        // With only aggregates there are zero grouping columns.
         "SELECT count(*), sum(id) FROM t GROUP BY ALL",
         "SELECT id, name FROM t ORDER BY ALL LIMIT 5",
         "SELECT id, name FROM t ORDER BY ALL DESC LIMIT 5",
-        // NULL を含む列でも並びが一致すること。
+        // Ordering must agree even for columns containing NULL.
         "SELECT big FROM t ORDER BY ALL LIMIT 8",
         "SELECT big FROM t ORDER BY ALL NULLS FIRST LIMIT 8",
-        // `*` の展開結果も ORDER BY ALL の対象になる。
+        // The expansion of `*` is subject to ORDER BY ALL too.
         "SELECT * FROM t ORDER BY ALL LIMIT 5",
-        // 集合演算の結果全体に効く。
+        // It applies to the whole result of a set operation.
         "SELECT id FROM t WHERE id < 3 UNION ALL SELECT id FROM t WHERE id < 2 ORDER BY ALL",
     ]
 );
 
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
-    // `t2` や `text` の中の t を書き換えてしまうと、比較対象の SQL が壊れる。
+    // Rewriting the t inside `t2` or `text` would break the SQL being compared.
     let f = ["a.parquet", "b.parquet"];
     let got = replace_tables("SELECT text, t.a FROM t JOIN t2 ON t.a = t2.a", &f);
-    // `text` の先頭の t を置換していないこと。
-    assert!(got.contains("text,"), "text が壊れている: {got}");
-    // `t` は 3 箇所、`t2` は 2 箇所。数が合っていれば取り違えていない。
+    // The leading t of `text` must not have been replaced.
+    assert!(got.contains("text,"), "text was mangled: {got}");
+    // `t` appears 3 times and `t2` twice. Matching counts means nothing was mixed up.
     assert_eq!(got.matches("a.parquet").count(), 3, "{got}");
     assert_eq!(got.matches("b.parquet").count(), 2, "{got}");
-    // 置換後に裸の `t` / `t2` が残っていないこと。
+    // No bare `t` / `t2` may remain after substitution.
     assert!(!got.split_whitespace().any(|w| w == "t" || w == "t2"), "{got}");
 }
 
@@ -628,7 +632,7 @@ fn table_name_replacement_respects_word_boundaries() {
 fn cell_normalisation() {
     assert_eq!(normalize_cell(""), "<null>");
     assert_eq!(normalize_cell("NULL"), "<null>");
-    // 浮動小数の表記ゆれを吸収する。
+    // Absorbs differences in float formatting.
     assert_eq!(normalize_cell("747.0"), normalize_cell("747"));
     assert_eq!(normalize_cell("1.5"), normalize_cell("1.50"));
     assert_ne!(normalize_cell("1.5"), normalize_cell("1.6"));

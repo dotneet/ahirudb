@@ -1,45 +1,43 @@
-//! スカラ関数。
+//! Scalar functions.
 //!
-//! `resolve` は計画時に 1 度だけ呼ばれ、名前と引数型から「関数 ID・各引数の
-//! 変換先の型・結果型」を決める。暗黙変換は呼び出し側が `Cast` 命令として
-//! 挿入するので、実行時 (`call`) は ID の `match` だけで済み、型検査も
-//! 型ごとの分岐も行わない。
+//! `resolve` is called exactly once at planning time and decides, from the name and argument
+//! types, "the function ID, each argument's conversion target type, and the result type".
+//! Implicit conversion is inserted by the caller as a `Cast` instruction, so at runtime (`call`)
+//! only a `match` on the ID remains -- no type checking and no per-type branching.
 //!
-//! サイズ方針は kernels.rs の 4 つのレバーを引き継ぎ、さらに 3 つ足す:
+//! The size policy inherits kernels.rs's four levers and adds three more:
 //!
-//! 1. **出力物理型ごとに 1 本のループしか書かない。** 行あたりの処理は
-//!    `eval_str` / `eval_int` / `eval_f64` / `eval_bool` の中の `match id` に
-//!    閉じ込める。関数ごとにループを書くと関数の数だけコードが増える。
-//! 2. **型の族ごとに ID を分ける。** `abs` は整数用と浮動小数用で ID が違う。
-//!    実行時に論理型を見ないので、ループ内の判定が 1 段減る。
-//! 3. **任意型の関数は kernels の合成で書く。** `coalesce` / `nullif` /
-//!    `greatest` / `least` は物理型 6 種ぶんのコードを持たず、
-//!    `kernels::pick` / `compare` / `logic` / `is_null` の組み合わせに落とす。
+//! 1. **Only one loop per output physical type.** Per-row work is confined to the `match id`
+//!    inside `eval_str` / `eval_int` / `eval_f64` / `eval_bool`. A loop per function would grow
+//!    the code with the number of functions.
+//! 2. **Separate IDs per type family.** `abs` has different IDs for integers and floating point.
+//!    Logical types are never consulted at runtime, so the loop has one fewer check.
+//! 3. **Any-type functions are written by composing kernels.** `coalesce` / `nullif` /
+//!    `greatest` / `least` carry no code for the six physical types and lower to combinations of
+//!    `kernels::pick` / `compare` / `logic` / `is_null`.
 //!
-//! ## 文字列はコードポイント単位
+//! ## Strings are counted by code point
 //!
-//! `length` / `substr` / `strpos` / `lpad` / `rpad` / `reverse` は
-//! **UTF-8 のコードポイント単位**で数える（DuckDB と同じ）。継続バイト
-//! (`0b10xxxxxx`) を読み飛ばすだけなので、バイト単位実装との差は数十バイト
-//! しかない。一方 `upper` / `lower` は **ASCII のみ**に限る。Unicode の
-//! 大小文字テーブルは数十 KB あり、1MiB 予算に入らないため。
+//! `length` / `substr` / `strpos` / `lpad` / `rpad` / `reverse` count in **UTF-8 code points**
+//! (the same as DuckDB). It only skips continuation bytes (`0b10xxxxxx`), so the difference from
+//! a byte-wise implementation is only a few dozen bytes. `upper` / `lower`, by contrast, are
+//! **ASCII only**: Unicode case tables run to tens of KB and do not fit the 1 MiB budget.
 //!
 //! ## NULL
 //!
-//! 既定は「引数のどれかが NULL ならその行の結果も NULL」。例外は
-//! `coalesce` / `ifnull` / `nullif` / `greatest` / `least`（NULL を読み飛ばす）
-//! と `concat`（NULL を空文字列として扱い、結果は決して NULL にならない）、
-//! `json_array` / `json_object` / `list_value`（NULL 引数はその位置に
-//! JSON `null` を埋め込む。`to_json(NULL)` 自体は既定どおり SQL NULL）。
+//! The default is "if any argument is NULL, that row's result is NULL". The exceptions are
+//! `coalesce` / `ifnull` / `nullif` / `greatest` / `least` (which skip NULLs), `concat` (which
+//! treats NULL as the empty string, so the result is never NULL), and
+//! `json_array` / `json_object` / `list_value` (which embed a JSON `null` at that position for a
+//! NULL argument; `to_json(NULL)` itself is SQL NULL as usual).
 //!
-//! ## 現在時刻が無い
+//! ## There is no current time
 //!
-//! `now()` / `current_timestamp` / `current_date` は **実装しない**
-//! (`FunctionNotFound`)。no_std の wasm には時計が無く、ABI
-//! (`crate::abi`) にもホストから時刻を受け取る入口が無い。値をでっち上げると
-//! 「クエリごとに違う嘘の時刻」を返すことになるので、ホスト側から
-//! エポックマイクロ秒を渡す ABI（例: `ahiru_set_now(i64)`）を足すまでは
-//! 未対応のままにする。
+//! `now()` / `current_timestamp` / `current_date` are **not implemented** (`FunctionNotFound`).
+//! no_std wasm has no clock, and the ABI (`crate::abi`) has no entry point for receiving a time
+//! from the host. Fabricating a value would mean returning "a different fake time per query", so
+//! this stays unsupported until an ABI for passing epoch microseconds from the host (such as
+//! `ahiru_set_now(i64)`) is added.
 
 use crate::expr::vm::Vm;
 use crate::expr::{kernels, regex, OpCode, Program};
@@ -48,10 +46,10 @@ use crate::vector::{Batch, Bitmap, BytesData, Data, PhysType, Ty, Value, Vector}
 
 pub type FuncId = u16;
 
-// --- 関数 ID ---------------------------------------------------------------
-// 出力物理型ごとにまとめてある。`call` のループはこの区分で選ばれる。
+// --- Function IDs -----------------------------------------------------------
+// Grouped by output physical type. `call`'s loop is chosen by this grouping.
 
-// 文字列（Bytes 出力）
+// Strings (Bytes output)
 const F_UPPER: FuncId = 1;
 const F_LOWER: FuncId = 2;
 const F_TRIM: FuncId = 3;
@@ -71,7 +69,7 @@ const F_REGEXP_REPLACE: FuncId = 16;
 const F_PRINTF: FuncId = 17;
 const F_FORMAT: FuncId = 18;
 
-// 整数出力（I32 = DATE、I64 = BIGINT / TIMESTAMP）
+// Integer output (I32 = DATE, I64 = BIGINT / TIMESTAMP)
 const F_LENGTH: FuncId = 20;
 const F_STRPOS: FuncId = 21;
 const F_DATE_PART: FuncId = 22;
@@ -86,18 +84,18 @@ const F_TO_DATE: FuncId = 30;
 const F_TO_TIMESTAMP: FuncId = 31;
 const F_LAST_DAY: FuncId = 32;
 
-// Bool 出力
+// Bool output
 const F_STARTS_WITH: FuncId = 40;
 const F_ENDS_WITH: FuncId = 41;
 const F_CONTAINS: FuncId = 42;
 const F_REGEXP_MATCHES: FuncId = 43;
 const F_GLOB: FuncId = 44;
-/// `SIMILAR TO` の実体。`sql::parser` が `x SIMILAR TO y` をこの名前の
-/// 関数呼び出しへ脱糖する（`Expr::Like` のような専用 AST ノードは増やさず、
-/// 既存の関数呼び出し経路だけで完結させるため）。
+/// The substance of `SIMILAR TO`. `sql::parser` desugars `x SIMILAR TO y` into a call to a
+/// function of this name (rather than adding a dedicated AST node like `Expr::Like`, everything
+/// is done through the existing function-call path).
 const F_REGEXP_FULL_MATCH: FuncId = 45;
 
-// 浮動小数出力
+// Floating-point output
 const F_ABS_F: FuncId = 50;
 const F_SIGN_F: FuncId = 51;
 const F_ROUND_F: FuncId = 52;
@@ -111,20 +109,20 @@ const F_LOG10: FuncId = 59;
 const F_POW: FuncId = 60;
 const F_MOD_F: FuncId = 61;
 
-// 任意型（kernels の合成で処理する）
+// Any type (handled by composing kernels)
 const F_IDENT: FuncId = 70;
 const F_COALESCE: FuncId = 71;
 const F_NULLIF: FuncId = 72;
 const F_GREATEST: FuncId = 73;
 const F_LEAST: FuncId = 74;
 
-// ビット演算（`&`/`|`/`<<`/`>>`/前置 `~` の糖衣構文先。`sql::parser` 参照）。
-// BIGINT 固定（他の数値関数の「HUGEINT/DECIMAL も丸める」簡略化と同じ理由、
-// `num_ty` の doc 参照）。
+// Bitwise operations (the desugaring target of `&`/`|`/`<<`/`>>`/prefix `~`; see `sql::parser`).
+// Fixed to BIGINT (the same reason as the other numeric functions' "HUGEINT/DECIMAL are rounded
+// too" simplification; see the `num_ty` docs).
 //
-// `F_PART_BASE`（100）以上は `eval_int` が `date_part` 用の動的オフセットと
-// して奪ってしまう（`id - F_PART_BASE` を part 番号として読む）ので、
-// その手前の空き番号を使う。
+// Anything at or above `F_PART_BASE` (100) is taken by `eval_int` as a dynamic offset for
+// `date_part` (it reads `id - F_PART_BASE` as the part number), so the free numbers just below
+// that are used.
 const F_BIT_AND: FuncId = 62;
 const F_BIT_OR: FuncId = 63;
 const F_BIT_SHL: FuncId = 64;
@@ -138,9 +136,9 @@ const F_BIT_NOT: FuncId = 66;
 // block below (80-92) and `F_PART_BASE` (100, see the comment above).
 const F_FACTORIAL: FuncId = 93;
 
-// JSON（Bytes 出力）。`json_object`/`json_array` は引数の個数が可変で、
-// かつ NULL 引数を読み飛ばさず JSON `null` として埋め込む必要があるため、
-// `call` の行ループ（`eval_str`）の外、`F_CONCAT` などと同じ場所で処理する。
+// JSON (Bytes output). `json_object`/`json_array` take a variable number of arguments and must
+// embed a JSON `null` for a NULL argument rather than skipping it, so they are handled outside
+// `call`'s row loop (`eval_str`), in the same place as `F_CONCAT` and friends.
 const F_JSON_EXTRACT: FuncId = 80;
 const F_JSON_EXTRACT_STRING: FuncId = 81;
 const F_JSON_TYPE: FuncId = 82;
@@ -149,24 +147,24 @@ const F_LIST_EXTRACT: FuncId = 84;
 const F_MAP_EXTRACT: FuncId = 85;
 const F_JSON_OBJECT: FuncId = 86;
 const F_JSON_ARRAY: FuncId = 87;
-// `list_transform`/`list_filter`/`list_reduce`。通常のスカラ関数と違い
-// `plan::compile::Compiler::lambda_call` が `resolve`/`call` を経由せず直接
-// この ID を使ってコンパイルする（第 2 引数がラムダで通常の `Ty` を持たない
-// ため）。実行は `call` ではなく `call_lambda`（`expr::vm::exec` の `Call`
-// 命令、`CallSpec::lambda` 参照）。`pub(crate)` なのは `plan::compile` から
-// 直接参照するため。
+// `list_transform`/`list_filter`/`list_reduce`. Unlike ordinary scalar functions,
+// `plan::compile::Compiler::lambda_call` compiles them using these IDs directly, without going
+// through `resolve`/`call` (the second argument is a lambda and has no ordinary `Ty`).
+// Execution goes through `call_lambda` rather than `call` (see the `Call` instruction in
+// `expr::vm::exec` and `CallSpec::lambda`). They are `pub(crate)` so `plan::compile` can
+// reference them directly.
 pub(crate) const F_LIST_TRANSFORM: FuncId = 88;
 pub(crate) const F_LIST_FILTER: FuncId = 89;
 pub(crate) const F_LIST_REDUCE: FuncId = 91;
 
-// JSON（整数出力）
+// JSON (integer output)
 const F_JSON_ARRAY_LENGTH: FuncId = 90;
 
-/// `list_slice`/`array_slice`、`expr[i:j]` の脱糖先。92 を選んだのは
-/// 84-91 が既に埋まっていて（上記）、かつ `F_PART_BASE`（下記、100）以上は
-/// 日付部分抽出専用に予約されているため — `eval_int`/`eval_str` などの
-/// 冒頭で `id >= F_PART_BASE` を日付部分抽出とみなす特別扱いがあるので、
-/// 100 以上の番号を汎用関数に使うと衝突する。
+/// The desugaring target of `list_slice`/`array_slice` and `expr[i:j]`. 92 was chosen because
+/// 84-91 are already taken (above) and anything at or above `F_PART_BASE` (below, 100) is
+/// reserved for date-part extraction -- `eval_int`/`eval_str` and friends begin by treating
+/// `id >= F_PART_BASE` as date-part extraction, so using a number at or above 100 for a
+/// general-purpose function would collide.
 const F_LIST_SLICE: FuncId = 92;
 
 // `list_concat` (and its `list_cat`/`array_concat`/`array_cat` aliases), plus
@@ -181,11 +179,11 @@ const F_LIST_SLICE: FuncId = 92;
 const F_LIST_CONCAT: FuncId = 94;
 pub(crate) const F_LIST_CONCAT_OP: FuncId = 95;
 
-/// `year()` などの略記。ID に part 番号を埋め込み、`date_part` と同じ
-/// 抽出関数へ合流させる（関数ごとに ID を分けても中身は 1 本）。
+/// Shorthands such as `year()`. The part number is embedded in the ID, joining the same
+/// extraction function as `date_part` (separate IDs per function, but one body).
 const F_PART_BASE: FuncId = 100;
 
-// --- 日時の part -----------------------------------------------------------
+// --- Date-time parts ---------------------------------------------------------
 
 const P_YEAR: u8 = 0;
 const P_QUARTER: u8 = 1;
@@ -204,8 +202,8 @@ const PART_NAMES: [&[u8]; 11] = [
     b"epoch",
 ];
 
-/// part 名（大文字小文字を問わない）を番号へ。複数形と `dayofweek` /
-/// `dayofyear` も受ける。
+/// Maps a part name (case-insensitive) to a number. Plurals and `dayofweek` / `dayofyear` are
+/// accepted too.
 fn part_id(s: &[u8]) -> Option<u8> {
     let eq = |w: &[u8], t: &[u8]| {
         w.len() == t.len() && w.iter().zip(t.iter()).all(|(a, b)| a.to_ascii_lowercase() == *b)
@@ -216,37 +214,37 @@ fn part_id(s: &[u8]) -> Option<u8> {
     if eq(s, b"dayofyear") {
         return Some(P_DOY);
     }
-    // 末尾の `s` は落とす（`years` = `year`）。
+    // A trailing `s` is dropped (`years` = `year`).
     let t = if s.len() > 1 && (s[s.len() - 1] | 0x20) == b's' { &s[..s.len() - 1] } else { s };
     PART_NAMES.iter().position(|nm| eq(t, nm)).map(|i| i as u8)
 }
 
-// --- 定数 ------------------------------------------------------------------
+// --- Constants ---------------------------------------------------------------
 
 const US_PER_SEC: i64 = 1_000_000;
 const US_PER_MIN: i64 = 60 * US_PER_SEC;
 const US_PER_HOUR: i64 = 60 * US_PER_MIN;
 const US_PER_DAY: i64 = 24 * US_PER_HOUR;
 
-/// 文字列を生成する関数（`repeat` / `lpad` など）の 1 行あたりの上限。
-/// 引数次第でいくらでも確保できてしまうのを防ぐ。
+/// The per-row cap for functions that build strings (`repeat` / `lpad` and so on).
+/// It prevents arbitrarily large allocations depending on the arguments.
 const MAX_STR: i64 = 1 << 24;
 
 // =========================================================================
 // resolve
 // =========================================================================
 
-/// 名前と引数型から関数を解決する。
+/// Resolves a function from its name and argument types.
 ///
-/// 返り値は `(関数 ID, 各引数の変換先の型, 結果型)`。呼び出し側は引数を
-/// 変換先の型へ `Cast` してから `call` に渡す。型検査をコンパイル時に
-/// 済ませることで、実行時の分岐を減らす。
+/// The return value is `(function ID, each argument's conversion target type, result type)`. The
+/// caller `Cast`s the arguments to the target types before passing them to `call`. Finishing type
+/// checking at compile time reduces runtime branching.
 pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
     let lower = name.to_ascii_lowercase();
     let n = args.len();
     use Ty::*;
     match lower.as_str() {
-        // --- 文字列 ---------------------------------------------------------
+        // --- Strings --------------------------------------------------------
         "upper" | "ucase" => fixed(F_UPPER, &[Varchar], n, 1, Varchar),
         "lower" | "lcase" => fixed(F_LOWER, &[Varchar], n, 1, Varchar),
         "trim" => fixed(F_TRIM, &[Varchar, Varchar], n, 1, Varchar),
@@ -270,30 +268,30 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "starts_with" | "prefix" => fixed(F_STARTS_WITH, &[Varchar, Varchar], n, 2, Boolean),
         "ends_with" | "suffix" => fixed(F_ENDS_WITH, &[Varchar, Varchar], n, 2, Boolean),
         "contains" => fixed(F_CONTAINS, &[Varchar, Varchar], n, 2, Boolean),
-        // 正規表現エンジンの実体は expr::regex（対応構文・上限はそちらの
-        // モジュール冒頭コメント参照）。ここは型解決だけ。
+        // The regex engine itself is expr::regex (see the comments at the top of that module for
+        // supported syntax and limits). This is only type resolution.
         "regexp_matches" => fixed(F_REGEXP_MATCHES, &[Varchar, Varchar], n, 2, Boolean),
         "regexp_extract" => fixed(F_REGEXP_EXTRACT, &[Varchar, Varchar, BigInt], n, 2, Varchar),
         "regexp_replace" => {
             fixed(F_REGEXP_REPLACE, &[Varchar, Varchar, Varchar, Varchar], n, 3, Varchar)
         }
-        // `SIMILAR TO` の脱糖先（`sql::parser::Parser::similar_to`）。パターンは
-        // `^(?:...)$` に包んで `expr::regex` の既存エンジンへそのまま渡す
-        // （対応構文・ステップ数上限はそちらのモジュール doc 参照。新しい
-        // 正規表現エンジンは書かない）。DuckDB もパターン構文としては同じ
-        // ものを使う（`_`/`%` は POSIX 正規表現では特別扱いされない）。
+        // The desugaring target of `SIMILAR TO` (`sql::parser::Parser::similar_to`). The pattern is
+        // wrapped in `^(?:...)$` and passed straight to `expr::regex`'s existing engine (see that
+        // module's docs for supported syntax and the step cap; no new regex engine is written).
+        // DuckDB uses the same pattern syntax as well (`_`/`%` are not special in POSIX regular
+        // expressions).
         "regexp_full_match" => fixed(F_REGEXP_FULL_MATCH, &[Varchar, Varchar], n, 2, Boolean),
-        // `GLOB` 演算子（`sql::parser::expr_body` が脱糖する）。シェルの
-        // グロブパターン（`*` `?` `[...]`）で完全一致するかどうか。対応構文は
-        // `glob_match` のコメント参照。
+        // The `GLOB` operator (desugared by `sql::parser::expr_body`). Whether it fully matches a
+        // shell glob pattern (`*` `?` `[...]`). See the comments on `glob_match` for the supported
+        // syntax.
         "glob" => fixed(F_GLOB, &[Varchar, Varchar], n, 2, Boolean),
-        // `printf`/`format` は対応する書式指定子の範囲が違う（printf: `%`
-        // 書式、format: `{}` プレースホルダ）ので ID を分ける。1 個目の
-        // 引数（書式文字列）だけ VARCHAR に固定し、残りは元の型のまま渡す
-        // （`json_array`/`greatest` と同じ「型ごとの分岐は実行時に」方針。
-        // 書式文字列は定数とは限らないので、`resolve` の時点では指定子の
-        // 個数も種類も分からない）。対応範囲は `printf_scan`/`format_scan`
-        // のコメント参照。
+        // `printf`/`format` differ in the range of format specifiers they support (printf: `%`
+        // formats; format: `{}` placeholders), so their IDs are separate. Only the first argument
+        // (the format string) is fixed to VARCHAR and the rest are passed with their original types
+        // (the same "per-type branching happens at runtime" policy as `json_array`/`greatest`.
+        // The format string is not necessarily a constant, so at `resolve` time neither the number
+        // nor the kinds of specifiers are known). See the comments on `printf_scan`/`format_scan`
+        // for the supported range.
         "printf" | "format" => {
             ensure!(n >= 1, WrongArgCount);
             let mut want = vec![Varchar];
@@ -302,11 +300,11 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             Ok((id, want, Varchar))
         }
 
-        // --- 数値 -----------------------------------------------------------
-        // 整数と浮動小数で ID を分ける。実行時に論理型を見ないため。
+        // --- Numbers -------------------------------------------------------
+        // Integers and floating point get separate IDs, since logical types are not consulted at runtime.
         "abs" => num1(args, n, F_ABS_I, F_ABS_F),
         "sign" => num1(args, n, F_SIGN_I, F_SIGN_F),
-        // 整数の ceil / floor / trunc は恒等。専用カーネルを持たない。
+        // ceil / floor / trunc on integers are the identity. There is no dedicated kernel.
         "ceil" | "ceiling" => num1(args, n, F_IDENT, F_CEIL_F),
         "floor" => num1(args, n, F_IDENT, F_FLOOR_F),
         "trunc" => num1(args, n, F_IDENT, F_TRUNC_F),
@@ -328,10 +326,10 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "sqrt" => fixed(F_SQRT, &[Double], n, 1, Double),
         "exp" => fixed(F_EXP, &[Double], n, 1, Double),
         "ln" => fixed(F_LN, &[Double], n, 1, Double),
-        // DuckDB の `log(x)` は常用対数。2 引数の `log(b, x)` は未対応。
+        // DuckDB's `log(x)` is the common logarithm. The two-argument `log(b, x)` is unsupported.
         "log" | "log10" => fixed(F_LOG10, &[Double], n, 1, Double),
         "pow" | "power" => fixed(F_POW, &[Double, Double], n, 2, Double),
-        // `&`/`|`/`<<`/`>>`/前置 `~` の糖衣構文先（`sql::parser` 参照）。
+        // The desugaring target of `&`/`|`/`<<`/`>>`/prefix `~` (see `sql::parser`).
         "bit_and" => fixed(F_BIT_AND, &[BigInt, BigInt], n, 2, BigInt),
         "bit_or" => fixed(F_BIT_OR, &[BigInt, BigInt], n, 2, BigInt),
         "bit_shift_left" => fixed(F_BIT_SHL, &[BigInt, BigInt], n, 2, BigInt),
@@ -353,19 +351,19 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         }
 
         // --- JSON -------------------------------------------------------
-        // パス構文・既知の制限は `crate::json` のモジュール doc を参照。
-        // `->`/`->>` 演算子は `json_extract`/`json_extract_string` への
-        // 糖衣構文として `sql::parser` が展開する。
+        // See `crate::json`'s module docs for the path syntax and known limitations.
+        // The `->`/`->>` operators are expanded by `sql::parser` as sugar for
+        // `json_extract`/`json_extract_string`.
         "json_extract" => fixed(F_JSON_EXTRACT, &[Json, Varchar], n, 2, Json),
         "json_extract_string" => fixed(F_JSON_EXTRACT_STRING, &[Json, Varchar], n, 2, Varchar),
         "json_type" => json_path_opt(F_JSON_TYPE, n, Varchar),
         "json_array_length" => json_path_opt(F_JSON_ARRAY_LENGTH, n, BigInt),
-        // DuckDB の慣習で LIST/MAP 系の名前を持つが、実体は Ty::Json の
-        // 配列/オブジェクト形状を読むだけ（モジュール冒頭 doc の設計判断）。
+        // They carry LIST/MAP-family names by DuckDB convention, but really they just read the
+        // array/object shape of a Ty::Json (the design decision in the module docs at the top).
         "list_extract" | "array_extract" => fixed(F_LIST_EXTRACT, &[Json, BigInt], n, 2, Json),
-        // `expr[i:j]`（`sql::parser::Parser::subscript`）の脱糖先。両端含む、
-        // 1 始まり、負数は末尾から、範囲外は `list_extract` と違い NULL では
-        // なく切り詰める（`crate::json::list_slice` のモジュール doc 参照）。
+        // The desugaring target of `expr[i:j]` (`sql::parser::Parser::subscript`). Inclusive on both
+        // ends, 1-based, with negatives counting from the end; unlike `list_extract`, out of range
+        // clamps rather than giving NULL (see `crate::json::list_slice`'s module docs).
         "list_slice" | "array_slice" => fixed(F_LIST_SLICE, &[Json, BigInt, BigInt], n, 3, Json),
         "map_extract" => fixed(F_MAP_EXTRACT, &[Json, Varchar], n, 2, Json),
         // Variadic, like DuckDB (`duckdb -c "select list_concat([1]),
@@ -396,7 +394,7 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             }
             Ok((F_JSON_OBJECT, want, Json))
         }
-        // `list_value` は DuckDB の慣習で `json_array` の別名。
+        // `list_value` is DuckDB's conventional alias for `json_array`.
         "json_array" | "list_value" => {
             ensure!(n >= 1, WrongArgCount);
             for &a in args {
@@ -405,7 +403,7 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             Ok((F_JSON_ARRAY, args.to_vec(), Json))
         }
 
-        // --- 任意型 ---------------------------------------------------------
+        // --- Any type -------------------------------------------------------
         "greatest" => anyn(F_GREATEST, args, 1),
         "least" => anyn(F_LEAST, args, 1),
         "coalesce" => anyn(F_COALESCE, args, 1),
@@ -418,15 +416,15 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             anyn(F_NULLIF, args, 2)
         }
 
-        // --- 日時 -----------------------------------------------------------
-        // 内部表現は DATE=日数(I32) / TIMESTAMP=マイクロ秒(I64) / TIME=マイクロ秒(I64)。
-        // 引数を TIMESTAMP に寄せるので、DATE 列も VARCHAR リテラルも
-        // 呼び出し側の `Cast` 経由でそのまま渡せる。
+        // --- Date and time ---------------------------------------------------
+        // The internal representations are DATE = days (I32) / TIMESTAMP = microseconds (I64) / TIME = microseconds (I64).
+        // Arguments settle on TIMESTAMP, so both DATE columns and VARCHAR literals can be passed
+        // straight through via the caller's `Cast`.
         //
-        // 注: DuckDB 1.4 の `date_trunc` は part によって DATE / TIMESTAMP を
-        // 返し分けるが、`resolve` は part の**値**を見られない（型しか来ない）
-        // ので常に TIMESTAMP を返す。同じ理由で `date_part('epoch', ..)` も
-        // DOUBLE ではなく BIGINT（秒、切り捨て）を返す。
+        // Note: DuckDB 1.4's `date_trunc` returns DATE or TIMESTAMP depending on the part, but
+        // `resolve` cannot see the part's **value** (only types arrive), so it always returns
+        // TIMESTAMP. For the same reason `date_part('epoch', ..)` returns BIGINT (seconds,
+        // truncated) rather than DOUBLE.
         "date_trunc" | "datetrunc" => fixed(F_DATE_TRUNC, &[Varchar, Timestamp], n, 2, Timestamp),
         "date_part" | "datepart" | "extract" => {
             fixed(F_DATE_PART, &[Varchar, Timestamp], n, 2, BigInt)
@@ -434,13 +432,13 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "date_diff" | "datediff" => {
             fixed(F_DATE_DIFF, &[Varchar, Timestamp, Timestamp], n, 3, BigInt)
         }
-        // DuckDB の `date_add` は INTERVAL を取るが、この実装に INTERVAL 型は
-        // 無い。意図的な非互換として `date_add(part, n, ts)` の 3 引数にする。
+        // DuckDB's `date_add` takes an INTERVAL, but this implementation has no INTERVAL type.
+        // As a deliberate incompatibility it takes three arguments, `date_add(part, n, ts)`.
         "date_add" => fixed(F_DATE_ADD, &[Varchar, BigInt, Timestamp], n, 3, Timestamp),
         "last_day" => fixed(F_LAST_DAY, &[Timestamp], n, 1, Date),
         "strftime" => fixed(F_STRFTIME, &[Timestamp, Varchar], n, 2, Varchar),
-        // DuckDB の `to_timestamp` はエポック秒(DOUBLE)を取るが、ここは
-        // 文字列パーサとして定義する（`strptime` 相当）。意図的な非互換。
+        // DuckDB's `to_timestamp` takes epoch seconds (DOUBLE), but here it is defined as a string
+        // parser (the equivalent of `strptime`). A deliberate incompatibility.
         "to_date" => fixed(F_TO_DATE, &[Varchar], n, 1, Date),
         "to_timestamp" => fixed(F_TO_TIMESTAMP, &[Varchar], n, 1, Timestamp),
         "year" => shorthand(P_YEAR, n),
@@ -455,21 +453,21 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "dayofyear" => shorthand(P_DOY, n),
         "epoch" => shorthand(P_EPOCH, n),
 
-        // 時計が無いので実装しない（モジュール冒頭のコメント参照）。
+        // Not implemented, since there is no clock (see the comments at the top of the module).
         _ => err!(FunctionNotFound),
     }
 }
 
-/// 固定シグネチャ。`pat` は引数型のひな形で、`n < pat.len()` なら前から使う
-/// （省略可能引数）。
+/// A fixed signature. `pat` is the template of argument types; when `n < pat.len()` the leading
+/// ones are used (optional arguments).
 fn fixed(id: FuncId, pat: &[Ty], n: usize, lo: usize, ret: Ty) -> Result<(FuncId, Vec<Ty>, Ty)> {
     ensure!(n >= lo && n <= pat.len(), WrongArgCount);
     Ok((id, pat[..n].to_vec(), ret))
 }
 
-/// `f(json)` / `f(json, path)` の 1-2 引数シグネチャ。`json_type`/
-/// `json_array_length` など「対象が JSON 全体かパス指定か」を第 2 引数の
-/// 有無だけで切り替える JSON 関数の共通形。
+/// The 1-2 argument signature `f(json)` / `f(json, path)`. The common shape for JSON functions
+/// such as `json_type`/`json_array_length` that switch between "the whole JSON" and "a path"
+/// solely by the presence of the second argument.
 fn json_path_opt(id: FuncId, n: usize, ret: Ty) -> Result<(FuncId, Vec<Ty>, Ty)> {
     ensure!((1..=2).contains(&n), WrongArgCount);
     let mut want = vec![Ty::Json];
@@ -479,17 +477,17 @@ fn json_path_opt(id: FuncId, n: usize, ret: Ty) -> Result<(FuncId, Vec<Ty>, Ty)>
     Ok((id, want, ret))
 }
 
-/// 数値 1 引数。整数なら `int_id`、それ以外は `flt_id`。
+/// A one-argument numeric function. `int_id` for integers, `flt_id` otherwise.
 fn num1(args: &[Ty], n: usize, int_id: FuncId, flt_id: FuncId) -> Result<(FuncId, Vec<Ty>, Ty)> {
     ensure!(n == 1, WrongArgCount);
     let t = num_ty(args)?;
     Ok((if t == Ty::Double { flt_id } else { int_id }, vec![t], t))
 }
 
-/// 数値引数の共通型。整数だけなら BIGINT、それ以外は DOUBLE。
+/// The common type of numeric arguments. BIGINT if they are all integers, DOUBLE otherwise.
 ///
-/// HUGEINT / DECIMAL も DOUBLE に寄せる。i128 と 10 進スケール用の分岐を
-/// 全関数に持たせるとコード量がおよそ倍になるため（既知の精度上の制限）。
+/// HUGEINT and DECIMAL settle on DOUBLE too. Giving every function branches for i128 and decimal
+/// scaling would roughly double the amount of code (a known precision limitation).
 fn num_ty(args: &[Ty]) -> Result<Ty> {
     let mut int = true;
     for &t in args {
@@ -504,16 +502,16 @@ fn num_ty(args: &[Ty]) -> Result<Ty> {
     Ok(if int { Ty::BigInt } else { Ty::Double })
 }
 
-/// `to_json`/`json_array`/`json_object` の値として書ける型か。
-/// 対応するのは NULL/BOOLEAN/整数/浮動小数/DECIMAL/VARCHAR/DATE/TIME/
-/// TIMESTAMP/JSON（そのまま埋め込む）。BLOB・INTERVAL は非対応
-/// （JSON に自然な表現が無いため、CAST と同様 `TypeMismatch` で拒否する）。
+/// Whether the type is writable as a value of `to_json`/`json_array`/`json_object`.
+/// Supported are NULL/BOOLEAN/integers/floating point/DECIMAL/VARCHAR/DATE/TIME/TIMESTAMP/JSON
+/// (embedded as is). BLOB and INTERVAL are unsupported (they have no natural JSON representation,
+/// so like CAST they are rejected with `TypeMismatch`).
 fn json_encodable(t: Ty) -> bool {
     use Ty::*;
     t.is_numeric() || matches!(t, Null | Boolean | Varchar | Date | Time | Timestamp | Json)
 }
 
-/// 任意型の可変長関数。全引数を共通型へ寄せる。
+/// A variadic any-type function. Every argument settles on a common type.
 fn anyn(id: FuncId, args: &[Ty], lo: usize) -> Result<(FuncId, Vec<Ty>, Ty)> {
     ensure!(args.len() >= lo, WrongArgCount);
     let mut t = Ty::Null;
@@ -523,14 +521,14 @@ fn anyn(id: FuncId, args: &[Ty], lo: usize) -> Result<(FuncId, Vec<Ty>, Ty)> {
             None => err!(TypeMismatch),
         };
     }
-    // 全部が型未定の NULL なら適当な型に決めておく（DuckDB も INTEGER）。
+    // If all of them are type-undetermined NULLs, some type is picked (DuckDB picks INTEGER too).
     if t == Ty::Null {
         t = Ty::Int;
     }
     Ok((id, vec![t; args.len()], t))
 }
 
-/// `year(ts)` などの略記。part を ID に埋め込む。
+/// Shorthands such as `year(ts)`. The part is embedded in the ID.
 fn shorthand(part: u8, n: usize) -> Result<(FuncId, Vec<Ty>, Ty)> {
     ensure!(n == 1, WrongArgCount);
     Ok((F_PART_BASE + part as FuncId, vec![Ty::Timestamp], Ty::BigInt))
@@ -540,11 +538,11 @@ fn shorthand(part: u8, n: usize) -> Result<(FuncId, Vec<Ty>, Ty)> {
 // call
 // =========================================================================
 
-/// 実行する。`args` は `resolve` が返した型に揃っている。
+/// Executes. `args` are already aligned to the types `resolve` returned.
 ///
-/// 引数はすべて同じ長さか、長さ 1（定数）。定数は stride 0 として扱う。
+/// Every argument is either the same length or length 1 (a constant). Constants are treated as stride 0.
 pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
-    // 任意型の関数は kernels の合成で片づける（物理型ごとのコードを持たない）。
+    // Any-type functions are handled by composing kernels (no per-physical-type code).
     match id {
         F_IDENT => {
             ensure!(args.len() == 1, WrongArgCount);
@@ -554,21 +552,20 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
         F_NULLIF => return nullif(args, result_ty),
         F_GREATEST | F_LEAST => return extremum(id == F_GREATEST, args, result_ty),
         F_CONCAT => return concat_all(args, result_ty),
-        // 正規表現 3 関数は行ごとの eval_* ループに乗せない。パターン列が
-        // 定数（stride 0）ならバッチ内で 1 回だけコンパイルしたいが、その
-        // キャッシュを eval_bool/eval_str の共通シグネチャに持ち込むのは
-        // 不自然なので、F_CONCAT 等と同じく call() 直下で専用関数へ渡す。
+        // The three regex functions do not ride the per-row eval_* loops. When the pattern column
+        // is constant (stride 0) we want to compile once per batch, but carrying that cache into
+        // eval_bool/eval_str's shared signature would be unnatural, so like F_CONCAT they are
+        // passed to a dedicated function directly under call().
         F_REGEXP_MATCHES => return regex::eval_matches(args),
         F_REGEXP_EXTRACT => return regex::eval_extract(args),
         F_REGEXP_REPLACE => return regex::eval_replace(args),
-        // `SIMILAR TO`（`regexp_full_match`）も同じ理由でパターン列のコンパイル
-        // をキャッシュしたいので、専用関数へ渡す（`regexp_full_match_build`
-        // 参照。実体は `regex::eval_matches` とほぼ同じで、パターンをアンカー
-        // で包む点だけが違う）。
+        // `SIMILAR TO` (`regexp_full_match`) wants the same pattern-column compilation cache, so it
+        // too is passed to a dedicated function (see `regexp_full_match_build`. It is almost
+        // identical to `regex::eval_matches`, differing only in wrapping the pattern in anchors).
         F_REGEXP_FULL_MATCH => return regexp_full_match_build(args),
-        // `json_array`/`json_object` も NULL 引数を読み飛ばさず JSON `null`
-        // として埋め込む（`concat` と同じ理由で既定の NULL 伝播から外す）ので
-        // 専用関数へ渡す。
+        // `json_array`/`json_object` also embed a JSON `null` for a NULL argument rather than
+        // skipping it (departing from default NULL propagation for the same reason as `concat`), so
+        // they are passed to a dedicated function.
         F_JSON_ARRAY => return json_array_build(args),
         F_JSON_OBJECT => return json_object_build(args),
         // `list_concat` and `||`-on-JSON also decide NULL row by row rather
@@ -581,8 +578,7 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
         _ => {}
     }
     let (n, s) = strides(args)?;
-    // 入力 validity の AND。NULL 行は評価自体を飛ばす（プレースホルダ値を
-    // 読ませない）。
+    // The AND of the inputs' validity. NULL rows skip evaluation entirely (so no placeholder value is read).
     let valid = combine(args, &s, n);
     let live = |i: usize| valid.as_ref().is_none_or(|b| b.get(i));
     let mut data = Data::with_capacity(result_ty.phys(), n);
@@ -598,7 +594,7 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
                     }
                     buf.clear();
                     if eval_str(id, &A { v: args, s: &s, i }, &mut buf)? {
-                        // offsets は u32。これを超える結果は扱えない。
+                        // offsets are u32. Results beyond that cannot be handled.
                         ensure!(d.data.len() + buf.len() <= u32::MAX as usize, LimitExceeded);
                         d.push(&buf);
                     } else {
@@ -643,7 +639,7 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
         PhysType::I32 | PhysType::I64 => {
             for i in 0..n {
                 let v = if live(i) { eval_int(id, &A { v: args, s: &s, i })? } else { Some(0) };
-                // I32 出力（DATE）は範囲外もその行だけ NULL にする。
+                // For I32 output (DATE), out of range also makes just that row NULL.
                 let ok = match v {
                     Some(x) => push_int(&mut data, x),
                     None => {
@@ -690,10 +686,10 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
     Ok(out)
 }
 
-// --- 行ループの下回り -------------------------------------------------------
+// --- The row loop's underpinnings ---------------------------------------------
 
-/// 行数と各引数の stride。長さ 1 の引数は stride 0（＝定数）。
-/// `expr::regex` からも使う共通ヘルパー（同じ「定数 or 全部同じ長さ」規則）。
+/// The row count and each argument's stride. An argument of length 1 gets stride 0 (= a constant).
+/// A shared helper used by `expr::regex` too (the same "constant or all the same length" rule).
 pub(crate) fn strides(args: &[&Vector]) -> Result<(usize, Vec<usize>)> {
     ensure!(!args.is_empty(), WrongArgCount);
     let mut n = 1usize;
@@ -722,7 +718,7 @@ pub(crate) fn strides(args: &[&Vector]) -> Result<(usize, Vec<usize>)> {
     Ok((n, s))
 }
 
-/// 全引数の validity の AND。NULL 無しなら `None`。`expr::regex` と共有。
+/// The AND of every argument's validity. `None` when there are no NULLs. Shared with `expr::regex`.
 pub(crate) fn combine(args: &[&Vector], s: &[usize], n: usize) -> Option<Bitmap> {
     if !args.iter().any(|a| a.has_nulls()) {
         return None;
@@ -738,8 +734,8 @@ pub(crate) fn combine(args: &[&Vector], s: &[usize], n: usize) -> Option<Bitmap>
     Some(m)
 }
 
-/// 行 `i` を NULL にする（遅延確保）。`expr::kernels`/`expr::regex` にも
-/// 同じ役割の実装がある（それぞれの呼び出しパターンに合わせて独立に持つ）。
+/// Makes row `i` NULL (allocating lazily). `expr::kernels`/`expr::regex` have implementations
+/// serving the same role (each kept independently to suit its own call pattern).
 pub(crate) fn set_null(m: &mut Option<Bitmap>, i: usize, n: usize) {
     if m.is_none() {
         *m = Some(Bitmap::ones(n));
@@ -760,7 +756,7 @@ fn merge(a: Option<Bitmap>, b: Option<Bitmap>) -> Option<Bitmap> {
     }
 }
 
-/// i64 を整数出力へ書く。DATE (I32) の範囲外は `false`（＝ NULL）。
+/// Writes an i64 into an integer output. Out of range for DATE (I32) gives `false` (= NULL).
 fn push_int(d: &mut Data, x: i64) -> bool {
     match d {
         Data::I32(v) => match i32::try_from(x) {
@@ -781,9 +777,9 @@ fn push_int(d: &mut Data, x: i64) -> bool {
     }
 }
 
-/// 行ごとの引数アクセサ。範囲外・物理型不一致では既定値を返す。
-/// 正しい引数は `resolve` が保証するが、`call` を直接呼ばれても
-/// パニックしないようにしておく。
+/// The per-row argument accessors. Out of range or a physical type mismatch returns a default.
+/// `resolve` guarantees the arguments are correct, but this keeps `call` from panicking even if
+/// called directly.
 struct A<'a, 'b> {
     v: &'a [&'b Vector],
     s: &'a [usize],
@@ -869,10 +865,10 @@ pub(crate) use datetime::{
     add_interval_to_ts, days_from_civil, fmt_date, fmt_time, fmt_timestamp, fmt_timestamptz,
     fmt_uuid, parse_date, parse_time, parse_timestamp, parse_timestamptz, parse_uuid,
 };
-// これだけは `write::csv`/`write::jsonl` からしか使われない。`write` 自体が
-// `export` 付きのときだけ存在し、その中の csv/jsonl は更にそれぞれの
-// フィーチャで切られるので、両方を満たすときだけ再エクスポートする
-// （`export` 単体だとどちらのシンクも無く、未使用の警告になる）。
+// This one is used only from `write::csv`/`write::jsonl`. `write` itself exists only with
+// `export`, and the csv/jsonl inside it are gated further by their own features, so it is
+// re-exported only when both hold (with `export` alone neither sink exists and it would warn as
+// unused).
 #[cfg(all(feature = "export", any(feature = "csv", feature = "jsonl")))]
 pub(crate) use datetime::civil_from_days;
 pub use lambda::call_lambda;

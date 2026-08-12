@@ -1,22 +1,22 @@
-//! ハッシュ集約（GROUP BY / HAVING）。
+//! Hash aggregation (GROUP BY / HAVING).
 //!
-//! グループキーの符号化とハッシュ表は `exec::rowkey` を使う。集約と結合で
-//! 等価判定がずれると静かに壊れるうえ、表を 2 つ持つ理由もないため。
+//! Group key encoding and the hash table come from `exec::rowkey`. Divergent equality between
+//! aggregation and joins would break things silently, and there is no reason to keep two tables.
 //!
-//! ## ブロッキングと再開
+//! ## Blocking and resumption
 //!
-//! 集約は入力を最後まで読まないと 1 行も出せない。一方でスキャンは
-//! `Step::NeedIo` / `Step::NeedCodec` を返して中断しうるので、**構築の途中
-//! 状態を保持したまま中断をそのまま上へ返し、次の `next()` で続きから読む**。
-//! 取り込みの単位は 1 バッチで、「丸ごと入れる」か「まだ入れていない」かの
-//! どちらかしかない（`consume` は途中で抜けない）。これで再開時の行の
-//! 取りこぼしと二重計上を構造的に潰す。
+//! Aggregation cannot emit a single row until the input is fully read. Meanwhile a scan can
+//! interrupt by returning `Step::NeedIo` / `Step::NeedCodec`, so **the partially built state is
+//! kept, the interruption is passed straight up, and the next `next()` continues from there**.
+//! The unit of ingestion is one batch, which is either "fully taken in" or "not taken in at
+//! all" (`consume` never bails out midway). That structurally eliminates dropped and
+//! double-counted rows on resumption.
 //!
-//! ## 溢れ
+//! ## Overflow
 //!
-//! スピル（外部集約）は持たない。ハッシュ表が上限を超えたら `Oom` を返す。
-//! 1MiB のバイナリ予算でソート済み実行時のマージまで抱えるのは割に合わない
-//! ため、既知の制限として受け入れる。
+//! There is no spilling (external aggregation). Exceeding the hash table's cap returns `Oom`.
+//! Carrying a sorted-run merge as well within a 1 MiB binary budget does not pay, so this is
+//! accepted as a known limitation.
 
 use crate::exec::rowkey::{encode_key, ord_f64, pow10, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
@@ -25,67 +25,66 @@ use crate::plan::{Agg, AggKind};
 use crate::prelude::*;
 use crate::vector::{Batch, Data, PhysType, Ty, Value, Vector, BATCH_SIZE};
 
-/// ハッシュ表と状態に許すおおよそのバイト数。超えたら `Oom`。
+/// The approximate byte budget allowed for the hash table and states. Exceeding it gives `Oom`.
 ///
-/// ホストが渡す WASM 線形メモリは 32 ビット空間で、実行中はスキャンの
-/// バッファと出力バッチも同居する。集約だけで食い潰さない値として 64MiB。
+/// The WASM linear memory the host provides is a 32-bit space, and during execution the scan
+/// buffers and output batch share it. 64 MiB is a value that keeps aggregation from eating it all.
 const MAX_STATE_BYTES: usize = 64 << 20;
 
-/// 実行時に選ぶ更新規則。`AggKind` と入力の物理型から一度だけ決める。
+/// The update rule chosen at runtime. Decided once from `AggKind` and the input's physical type.
 ///
-/// `ApproxCountDistinct` には専用の variant を用意しない。v1 は厳密カウント
-/// でよく、それは「引数に強制的に DISTINCT の重複除去を掛けた `Count`」と
-/// 完全に同じ演算なので、`Op::Count` にそのまま相乗りする
-/// （`HashAggregate::new` の `distinct` 配列の構築を見よ）。
+/// No dedicated variant exists for `ApproxCountDistinct`. An exact count is fine for v1, and
+/// that is exactly the same operation as "a `Count` with DISTINCT deduplication forced on its
+/// argument", so it rides `Op::Count` directly
+/// (see how the `distinct` array is built in `HashAggregate::new`).
 #[derive(Clone, Copy, PartialEq)]
 enum Op {
     CountStar,
     Count,
-    /// 整数・DECIMAL の SUM。i128 で累積する。
+    /// SUM for integers and DECIMAL. Accumulated in i128.
     SumInt,
     SumF64,
-    /// 整数・DECIMAL の AVG。i128 で累積し、出力時に f64 へ割る。
+    /// AVG for integers and DECIMAL. Accumulated in i128 and divided into f64 on output.
     AvgInt,
     AvgF64,
     Min,
     Max,
-    /// 標本標準偏差・標本分散。Welford のオンライン algorithm（平均と
-    /// 平方偏差和 M2 を 1 パスで更新）で求める。「二乗の総和 − 総和の二乗」
-    /// という素朴な式は桁落ちが激しく実データでは信用できないため使わない。
+    /// Sample standard deviation and sample variance. Computed with Welford's online algorithm
+    /// (updating the mean and the sum of squared deviations M2 in one pass). The naive
+    /// "sum of squares minus square of sum" formula loses too many digits to trust on real data, so it is not used.
     StdDev,
     Variance,
-    /// 連続分布の中央値（`quantile_cont(x, 0.5)` と同じ、線形補間）。
-    /// ストリーミングでは正確な値を求められないので、非 NULL 値を全部
-    /// 保持して出力時に 1 度だけソートする。
+    /// The continuous-distribution median (the same as `quantile_cont(x, 0.5)`, linear
+    /// interpolation). An exact value cannot be computed while streaming, so every non-NULL
+    /// value is retained and sorted exactly once on output.
     Median,
-    /// 最頻値。(グループ, 値) を鍵にした頻度表で数え、同数は先に見つかった
-    /// 方を勝たせる（`>` 判定で更新するため自然にそうなる）。
+    /// The mode. Counted with a frequency table keyed by (group, value); on a tie the one found
+    /// first wins (a `>` test for updating makes that happen naturally).
     Mode,
-    /// 区切り文字で連結する文字列集約。到着順に連結する
-    /// （SQL 標準も DuckDB も `ORDER BY` 無しでは順序を保証しない）。
+    /// String aggregation concatenating with a separator. Concatenated in arrival order
+    /// (neither the SQL standard nor DuckDB guarantees an order without `ORDER BY`).
     StringAgg,
-    /// 値を JSON 風テキストへ集める。LIST 型が無いための代替表現
-    /// （DESIGN.md のネスト型の扱いと同じ判断）。NULL も要素として含める
-    /// 点だけ他の集約と異なる（DuckDB の `array_agg`/`list` と同じ）。
+    /// Collects values into JSON-like text. A substitute representation, since there is no LIST
+    /// type (the same judgment as DESIGN.md's handling of nested types). It differs from the
+    /// other aggregates only in including NULL as an element (the same as DuckDB's `array_agg`/`list`).
     ArrayAgg,
 }
 
-/// 1 グループ × 1 集約の状態。
+/// The state of one group x one aggregate.
 struct State {
-    /// 非 NULL 入力の個数。`COUNT(*)` では全行数。ArrayAgg では NULL も
-    /// 要素として数えるので「積んだ要素数」の意味になる。
+    /// The count of non-NULL inputs. For `COUNT(*)`, all rows. For ArrayAgg, NULLs are counted
+    /// as elements too, so it means "how many elements were pushed".
     n: i64,
-    /// 累積値。`Value::Null` は「まだ非 NULL 入力が無い」。
-    /// StringAgg/ArrayAgg では蓄積中のテキスト（`Value::Bytes`）を兼ねる。
+    /// The accumulated value. `Value::Null` means "no non-NULL input yet".
+    /// For StringAgg/ArrayAgg it doubles as the text being accumulated (`Value::Bytes`).
     acc: Value,
-    /// StdDev/Variance 用の Welford 累積（オンライン平均）。他の演算では
-    /// 未使用のまま 0.0。
+    /// The Welford accumulator for StdDev/Variance (the online mean). Left at 0.0 for other operations.
     mean: f64,
-    /// StdDev/Variance 用の Welford 累積（平方偏差和 M2）。
+    /// The Welford accumulator for StdDev/Variance (the sum of squared deviations, M2).
     m2: f64,
-    /// Median が出力まで抱える非 NULL 値。
+    /// The non-NULL values Median holds until output.
     median_vals: Vec<f64>,
-    /// Mode の現在の最多得票数。
+    /// Mode's current highest vote count.
     mode_best: i64,
 }
 
@@ -107,40 +106,39 @@ pub struct HashAggregate {
     aggs: Vec<Agg>,
     having: Option<Program>,
 
-    /// 集約ごとの更新規則。`aggs` と同じ並び。
+    /// The update rule per aggregate. In the same order as `aggs`.
     ops: Vec<Op>,
-    /// 集約ごとの出力型。**必ず `Agg::result_ty()` 由来**（バインダと同じ関数）。
+    /// The output type per aggregate. **Always derived from `Agg::result_ty()`** (the same function as the binder's).
     out_tys: Vec<Ty>,
-    /// AVG(DECIMAL) の 10^scale。それ以外は 1.0。
+    /// 10^scale for AVG(DECIMAL). 1.0 otherwise.
     avg_div: Vec<f64>,
 
-    /// グループキー → グループ番号。番号は 0 から連番で振られる。
+    /// Group key -> group number. Numbers are assigned consecutively from 0.
     index: HashIndex,
-    /// 出力用に保持するグループキーの実体。`groups` と同じ並び、1 行 1 グループ。
+    /// The group keys themselves, retained for output. In the same order as `groups`, one row per group.
     key_cols: Vec<Vector>,
-    /// 集約ごとの状態列。`states[agg][group]`。
+    /// The state column per aggregate. `states[agg][group]`.
     states: Vec<Vec<State>>,
-    /// DISTINCT 集約の重複除去集合。キーは「グループ番号 ++ 値」。
-    /// `ApproxCountDistinct` は DISTINCT 指定の有無によらず常にここへ
-    /// 重複除去表を持つ（v1 の実装は厳密カウントなので、これがそのまま
-    /// 本体になる）。
+    /// The deduplication set for DISTINCT aggregates. The key is "group number ++ value".
+    /// `ApproxCountDistinct` always keeps a deduplication table here regardless of whether
+    /// DISTINCT was specified (the v1 implementation is an exact count, so this is the substance itself).
     distinct: Vec<Option<HashIndex>>,
-    /// Mode の (グループ, 値) → 頻度表添字。DISTINCT の重複除去表と同じ
-    /// 「グループ番号を前置」方式で、集約ごとに 1 本の表を全グループで
-    /// 共有する（`distinct` と同様、`aggs` と同じ並び）。
+    /// Mode's (group, value) -> frequency table index. The same "prefix the group number" scheme
+    /// as the DISTINCT deduplication table, with one table per aggregate shared across all
+    /// groups (like `distinct`, in the same order as `aggs`).
     mode_freq: Vec<Option<HashIndex>>,
-    /// `mode_freq` の添字ごとの出現数。
+    /// The occurrence count per `mode_freq` index.
     mode_counts: Vec<Vec<i64>>,
 
-    /// MIN/MAX の勝者バイト列・Mode の勝者バイト列・StringAgg/ArrayAgg の
-    /// 蓄積テキスト・Median の一時値など、可変長で伸びる状態のバイト数の
-    /// 合計。メモリ判定に含める。
+    /// The total bytes of variable-length growing state: MIN/MAX's winning byte sequence,
+    /// Mode's winning byte sequence, StringAgg/ArrayAgg's accumulated text, Median's temporary
+    /// values, and so on. Included in the memory check.
     acc_bytes: usize,
-    /// グループキー列の実体のおおよそのバイト数。
+    /// The approximate byte count of the group key columns themselves.
     key_bytes: usize,
 
     phase: Phase,
-    /// 次に出力するグループ番号。
+    /// The next group number to output.
     emit_pos: usize,
 }
 
@@ -160,7 +158,7 @@ impl HashAggregate {
         let mut mode_counts = Vec::with_capacity(aggs.len());
         for a in &aggs {
             let ity = a.input_ty();
-            // 型検査はここで済ませる。出力型は必ずバインダと同じ関数から取る。
+            // Type checking is finished here. The output type always comes from the same function as the binder's.
             out_tys.push(a.result_ty()?);
             let float = ity.phys() == PhysType::F64;
             ops.push(match a.kind {
@@ -186,22 +184,22 @@ impl HashAggregate {
                 AggKind::Variance => Op::Variance,
                 AggKind::Median => Op::Median,
                 AggKind::Mode => Op::Mode,
-                // 下の `distinct` 構築で強制的に重複除去表を持たせるので、
-                // 演算そのものは COUNT(DISTINCT x) と同じ `Op::Count` でよい。
+                // The `distinct` construction below forcibly gives it a deduplication table, so
+                // the operation itself can be the same `Op::Count` as COUNT(DISTINCT x).
                 AggKind::ApproxCountDistinct => Op::Count,
                 AggKind::StringAgg => Op::StringAgg,
                 AggKind::ArrayAgg => Op::ArrayAgg,
             });
-            // DECIMAL は内部が整数なので、AVG/StdDev/Variance/Median では
-            // 10^scale で戻す。
+            // DECIMAL is internally an integer, so AVG/StdDev/Variance/Median divide back by
+            // 10^scale.
             avg_div.push(match ity {
                 Ty::Decimal { scale, .. } => pow10(scale),
                 _ => 1.0,
             });
             states.push(Vec::new());
-            // `COUNT(*)` に DISTINCT は付かない（引数が無い）。
-            // ApproxCountDistinct は書き手が DISTINCT を書いたかどうかに
-            // 関わらず常に重複除去する（それが定義そのものなので）。
+            // `COUNT(*)` never carries DISTINCT (it has no argument).
+            // ApproxCountDistinct always deduplicates whether or not the author wrote DISTINCT
+            // (that is its definition).
             distinct.push(
                 if (a.distinct || a.kind == AggKind::ApproxCountDistinct) && a.arg.is_some() {
                     Some(HashIndex::new())
@@ -238,7 +236,7 @@ impl HashAggregate {
         self.index.len()
     }
 
-    /// おおよそのメモリ使用量。厳密な値は要らない（上限判定にしか使わない）。
+    /// The approximate memory usage. An exact value is unnecessary (it is used only for the cap check).
     fn mem_used(&self) -> usize {
         let mut n = self.index.approx_bytes();
         n += self.key_bytes + self.acc_bytes;
@@ -252,17 +250,17 @@ impl HashAggregate {
         n
     }
 
-    /// 1 バッチを丸ごと取り込む。**途中で抜けない**（再開の単位はバッチ）。
+    /// Takes in one whole batch. **It never bails out midway** (the unit of resumption is a batch).
     fn consume(&mut self, ctx: &mut ExecContext, batch: &Batch) -> Result<()> {
         let rows = batch.card();
         if rows == 0 {
             return Ok(());
         }
-        // VM の結果は selection 解決済みの密ベクタなので、行番号は 0..rows。
+        // The VM's result is a dense vector with selection already resolved, so row numbers are 0..rows.
         let mut gvs = Vec::with_capacity(self.groups.len());
         for (i, p) in self.groups.iter().enumerate() {
             let v = ctx.vm.eval(p, batch)?;
-            // 宣言された型と実データがずれると出力列が壊れる。契約違反を検出する。
+            // A mismatch between the declared type and the real data would corrupt the output column. Detect the contract violation.
             ensure!(v.data().phys() == self.key_cols[i].ty().phys(), Internal);
             gvs.push(v);
         }
@@ -273,8 +271,8 @@ impl HashAggregate {
                 None => None,
             });
         }
-        // `FILTER (WHERE cond)`。集約ごとに独立した BOOLEAN 列を先に評価して
-        // おき、行ループでは真偽を引くだけにする。
+        // `FILTER (WHERE cond)`. An independent BOOLEAN column is evaluated per aggregate up
+        // front, so the row loop only has to look up a truth value.
         let mut fvs = Vec::with_capacity(self.aggs.len());
         for a in &self.aggs {
             fvs.push(match &a.filter {
@@ -302,13 +300,13 @@ impl HashAggregate {
             let g = slot as usize;
 
             for (ai, av) in avs.iter().enumerate() {
-                // FILTER が偽・NULL の行はこの集約からは無かったことにする
-                // （SQL の三値論理: UNKNOWN も除外側）。他の集約は影響しない。
+                // Rows where FILTER is false or NULL are treated as absent for this aggregate
+                // (SQL three-valued logic: UNKNOWN is excluded too). Other aggregates are unaffected.
                 if let Some(fv) = &fvs[ai] {
-                    // `compile_predicate` は結果型が BOOLEAN か NULL であることしか
-                    // 保証しない（`WHERE NULL` 相当）。NULL 型は物理表現が Bool と
-                    // 限らないので、`.bools()` を呼ぶ前に物理型を確かめる
-                    // （`vm::eval_filter` と同じ防御）。
+                    // `compile_predicate` only guarantees the result type is BOOLEAN or NULL
+                    // (the `WHERE NULL` case). A NULL type's physical representation is not
+                    // necessarily Bool, so the physical type is checked before calling `.bools()`
+                    // (the same defense as `vm::eval_filter`).
                     let pass = fv.data().phys() == PhysType::Bool
                         && fv.is_valid(row)
                         && fv.bools().get(row);
@@ -317,27 +315,27 @@ impl HashAggregate {
                     }
                 }
                 if self.ops[ai] == Op::CountStar {
-                    // COUNT(*) は NULL だけの行も数える。
+                    // COUNT(*) counts rows that are all NULL too.
                     self.states[ai][g].n += 1;
                     continue;
                 }
                 let col = match av {
                     Some(c) => c,
-                    // COUNT(*) 以外は必ず引数を持つ（`Agg` の契約）。
+                    // Everything but COUNT(*) always has an argument (the `Agg` contract).
                     None => err!(Internal),
                 };
                 let valid = col.is_valid(row);
-                // SUM/MIN/MAX/AVG/COUNT(x) は NULL を無視する。ArrayAgg だけ
-                // NULL も要素として数える（DuckDB の array_agg/list と同じ）。
+                // SUM/MIN/MAX/AVG/COUNT(x) ignore NULLs. Only ArrayAgg counts NULL as an element
+                // (the same as DuckDB's array_agg/list).
                 if !valid && self.ops[ai] != Op::ArrayAgg {
                     continue;
                 }
                 if let Some(seen) = &mut self.distinct[ai] {
-                    // グループ番号を前置して 1 本の表で全グループを賄う。
-                    // ネストした表を持たずに済むが、(グループ, 値) の組の数
-                    // だけキーが残るのでメモリはその分増える。
-                    // `encode_key` は無効値も flag=0 で符号化するので、
-                    // ArrayAgg(DISTINCT x) の NULL 重複除去もこのまま通せる。
+                    // Prefixing the group number lets one table serve every group. It avoids a
+                    // nested table, at the cost of as many keys as there are (group, value)
+                    // pairs, so memory grows accordingly.
+                    // `encode_key` encodes invalid values with flag=0 as well, so ArrayAgg(DISTINCT x)'s
+                    // NULL deduplication passes through unchanged.
                     encode_key(&[col], row, &mut vkey);
                     dkey.clear();
                     dkey.extend_from_slice(&slot.to_le_bytes());
@@ -349,7 +347,7 @@ impl HashAggregate {
                 if valid {
                     self.update(ai, g, col, row)?;
                 } else {
-                    // ここに来るのは ArrayAgg の NULL 行だけ。
+                    // Only ArrayAgg's NULL rows reach here.
                     self.push_array_null(ai, g);
                 }
             }
@@ -359,7 +357,7 @@ impl HashAggregate {
         Ok(())
     }
 
-    /// 非 NULL・重複除去済みの 1 値を状態へ畳み込む。
+    /// Folds one non-NULL, already-deduplicated value into the state.
     fn update(&mut self, ai: usize, g: usize, col: &Vector, row: usize) -> Result<()> {
         let op = self.ops[ai];
         let st = &mut self.states[ai][g];
@@ -371,7 +369,7 @@ impl HashAggregate {
                 let sum = match &st.acc {
                     Value::I128(s) => match s.checked_add(x) {
                         Some(v) => v,
-                        // i128 でも溢れる合計は黙って巻き戻さずエラーにする。
+                        // A sum that overflows even i128 is an error rather than a silent wraparound.
                         None => err!(ValueOutOfRange),
                     },
                     _ => x,
@@ -410,8 +408,8 @@ impl HashAggregate {
                 }
             }
             Op::StdDev | Op::Variance => {
-                // Welford のオンライン更新。`st.n` はこの関数の先頭で
-                // 既に +1 済みなので、そのまま「今回時点での総数」として使える。
+                // Welford's online update. `st.n` was already incremented at the top of this
+                // function, so it serves directly as "the total so far".
                 let x = as_f64_generic(col, row, self.avg_div[ai])?;
                 let delta = x - st.mean;
                 st.mean += delta / st.n as f64;
@@ -419,15 +417,15 @@ impl HashAggregate {
                 st.m2 += delta * delta2;
             }
             Op::Median => {
-                // 正確な中央値はストリーミングでは求まらないので、出力まで
-                // 非 NULL 値を丸ごと抱える。ソートは push_result で 1 回だけ。
+                // An exact median cannot be found while streaming, so every non-NULL value is
+                // held until output. Sorting happens exactly once, in push_result.
                 let x = as_f64_generic(col, row, self.avg_div[ai])?;
                 st.median_vals.push(x);
                 self.acc_bytes += 8;
             }
             Op::Mode => {
-                // DISTINCT の重複除去表と同じ「グループ番号を前置」方式で、
-                // 1 本の頻度表を全グループで共有する。
+                // The same "prefix the group number" scheme as the DISTINCT deduplication table,
+                // with one frequency table shared across every group.
                 let mut vkey = Vec::new();
                 encode_key(&[col], row, &mut vkey);
                 let mut fkey = Vec::with_capacity(4 + vkey.len());
@@ -435,7 +433,7 @@ impl HashAggregate {
                 fkey.extend_from_slice(&vkey);
                 let freq = match &mut self.mode_freq[ai] {
                     Some(f) => f,
-                    // Mode の Op には必ず対応する頻度表がある（契約違反）。
+                    // Mode's Op always has a matching frequency table (a contract violation otherwise).
                     None => err!(Internal),
                 };
                 let (slot, is_new) = freq.get_or_insert(&fkey);
@@ -446,8 +444,8 @@ impl HashAggregate {
                     self.mode_counts[ai][slot as usize] += 1;
                 }
                 let cnt = self.mode_counts[ai][slot as usize];
-                // `>` なので同数のときは先に見つかった値が勝ったまま残る
-                // （DuckDB で観測した挙動と同じ「先着優先」）。
+                // Being `>`, on a tie the value found first stays the winner
+                // (the "first arrival wins" behavior observed in DuckDB).
                 if cnt > st.mode_best {
                     st.mode_best = cnt;
                     if let Value::Bytes(b) = &st.acc {
@@ -463,7 +461,7 @@ impl HashAggregate {
             Op::StringAgg => {
                 let bytes = match col.data() {
                     Data::Bytes(b) => b.get(row),
-                    // バインダが VARCHAR 以外を渡してきた場合の防御。
+                    // A defense in case the binder hands over something other than VARCHAR.
                     _ => err!(TypeMismatch),
                 };
                 let sep = &self.aggs[ai].separator;
@@ -501,8 +499,8 @@ impl HashAggregate {
         Ok(())
     }
 
-    /// ArrayAgg の NULL 要素を積む。他の集約と違い NULL も読み飛ばさない
-    /// （DuckDB の `array_agg`/`list` は NULL を要素として結果に含める）。
+    /// Pushes a NULL element for ArrayAgg. Unlike other aggregates it does not skip NULLs
+    /// (DuckDB's `array_agg`/`list` include NULL as an element in the result).
     fn push_array_null(&mut self, ai: usize, g: usize) {
         let st = &mut self.states[ai][g];
         st.n += 1;
@@ -519,22 +517,22 @@ impl HashAggregate {
         st.acc = Value::Bytes(new_buf);
     }
 
-    /// 1 グループぶんの集約結果を出力ベクタへ積む。
+    /// Pushes one group's aggregate results into the output vectors.
     ///
-    /// Median だけ `median_vals` を出力直前に 1 度ソートするため `&mut self`
-    /// が要る（他の演算はここで状態を変えない）。
+    /// Only Median needs `&mut self`, because it sorts `median_vals` once just before output
+    /// (the other operations do not change state here).
     fn push_result(&mut self, ai: usize, g: usize, out: &mut Vector) {
         match self.ops[ai] {
             Op::CountStar | Op::Count => out.push_value(&Value::I64(self.states[ai][g].n)),
-            // 非 NULL 入力が 1 つも無いグループは NULL。StringAgg も同じ規則
-            // （非 NULL 値を 1 つも足していなければ acc は Null のまま）。
-            // Mode の勝者も acc に直接入っている。
+            // A group with not a single non-NULL input is NULL. StringAgg follows the same rule
+            // (with no non-NULL value ever added, acc stays Null).
+            // Mode's winner is in acc directly too.
             Op::SumInt | Op::SumF64 | Op::Min | Op::Max | Op::StringAgg | Op::Mode => {
                 out.push_value(&self.states[ai][g].acc)
             }
             Op::AvgInt => {
-                // 整数は i128 で正確に足してから 1 回だけ割る。f64 で足し込むと
-                // 桁落ちが累積するため。
+                // Integers are summed exactly in i128 and divided exactly once. Summing in f64
+                // would accumulate rounding error.
                 let st = &self.states[ai][g];
                 match &st.acc {
                     Value::I128(s) if st.n > 0 => {
@@ -552,13 +550,13 @@ impl HashAggregate {
             }
             Op::StdDev | Op::Variance => {
                 let st = &self.states[ai][g];
-                // 標本分散・標本標準偏差は n < 2 で未定義（DuckDB でも NULL）。
+                // Sample variance and sample standard deviation are undefined for n < 2 (NULL in DuckDB too).
                 if st.n < 2 {
                     out.push_null();
                 } else {
-                    // 浮動小数の丸め誤差で M2 がわずかに負になり得るので 0 で
-                    // 下限を切る（全部同じ値のグループで分散がぴったり 0 に
-                    // ならず NaN の平方根が出るのを防ぐ）。
+                    // Floating-point rounding can make M2 slightly negative, so it is clamped at
+                    // 0 (preventing a group of identical values from producing a variance that is
+                    // not exactly 0 and yielding the square root of NaN).
                     let var = (st.m2 / (st.n as f64 - 1.0)).max(0.0);
                     let v = if self.ops[ai] == Op::StdDev { f_sqrt(var) } else { var };
                     out.push_value(&Value::F64(v));
@@ -569,15 +567,15 @@ impl HashAggregate {
                 if st.median_vals.is_empty() {
                     out.push_null();
                 } else {
-                    // MIN/MAX と同じ「NaN は最大」の全順序で揃える
-                    // （中央値の入力に NaN が混ざること自体まず無いが、
-                    // 順序関数を 2 通り持たずに済ませる）。
+                    // Aligned with the same total order as MIN/MAX, "NaN is the maximum"
+                    // (NaN in the median's input is unlikely in the first place, but this avoids
+                    // carrying two ordering functions).
                     st.median_vals.sort_by(|a, b| ord_f64(*a, *b));
                     let m = st.median_vals.len();
-                    // quantile_cont(0.5) と同じ線形補間: h = (m-1)*0.5。
-                    // `core` に `f64::floor`/`ceil` が無い（libm 側）ので、
-                    // `m-1` が非負整数であることを使って整数演算だけで
-                    // floor(h)/ceil(h) を出す（自動的に切り捨てになる）。
+                    // The same linear interpolation as quantile_cont(0.5): h = (m-1)*0.5.
+                    // `core` has no `f64::floor`/`ceil` (they are in libm), so floor(h)/ceil(h)
+                    // are derived with integer arithmetic alone, using the fact that `m-1` is a
+                    // non-negative integer (truncation happens automatically).
                     let lo = (m - 1) / 2;
                     let hi = m / 2;
                     let v = if lo == hi {
@@ -591,8 +589,8 @@ impl HashAggregate {
                 }
             }
             Op::ArrayAgg => match &self.states[ai][g].acc {
-                // 蓄積中は閉じ括弧を持たない（`append_array_text` 参照）ので
-                // ここで初めて `]` を足す。
+                // While accumulating there is no closing bracket (see `append_array_text`), so
+                // `]` is added here for the first time.
                 Value::Bytes(b) => {
                     let mut v = b.clone();
                     v.push(b']');
@@ -609,7 +607,7 @@ impl HashAggregate {
             let start = self.emit_pos;
             let end = (start + BATCH_SIZE).min(total);
             let idx: Vec<u32> = (start as u32..end as u32).collect();
-            // 出力はグループ列が先、集約列が後（バインダのスキーマと同じ並び）。
+            // The output puts group columns first and aggregate columns after (the same order as the binder's schema).
             let mut cols = Vec::with_capacity(self.key_cols.len() + self.ops.len());
             for c in &self.key_cols {
                 cols.push(c.gather(&idx));
@@ -627,7 +625,7 @@ impl HashAggregate {
             let mut batch =
                 if cols.is_empty() { Batch::rows_only(end - start) } else { Batch::new(cols) };
             if let Some(h) = &self.having {
-                // HAVING は集約後のスキーマで評価する。
+                // HAVING is evaluated against the post-aggregation schema.
                 let mut sel = Vec::new();
                 ctx.vm.eval_filter(h, &batch, &mut sel)?;
                 if sel.is_empty() {
@@ -648,14 +646,14 @@ impl Operator for HashAggregate {
             match self.phase {
                 Phase::Building => match self.input.next(ctx)? {
                     Step::Ready(b) => self.consume(ctx, &b)?,
-                    // 途中状態をそのまま残して素通しする。次回はここから再開。
-                    // 取り込みはバッチ単位なので、中断しても行の取りこぼしも
-                    // 二重計上も起きない。
+                    // The partial state is left as is and passed straight through. Next time it
+                    // resumes from here. Ingestion is per batch, so an interruption drops no rows
+                    // and double-counts none.
                     other @ (Step::NeedIo | Step::NeedCodec) => return Ok(other),
                     Step::Done => {
-                        // GROUP BY が無い集約は入力が空でも 1 行返す
-                        // （COUNT(*) は 0、それ以外は NULL）。GROUP BY がある
-                        // 場合は 0 行。この非対称は SQL の規定どおり。
+                        // An aggregate without GROUP BY returns one row even for empty input
+                        // (COUNT(*) is 0, everything else NULL). With GROUP BY it is 0 rows.
+                        // This asymmetry is exactly as SQL specifies.
                         if self.groups.is_empty() && self.index.is_empty() {
                             self.index.get_or_insert(&[]);
                             for s in self.states.iter_mut() {
@@ -672,7 +670,7 @@ impl Operator for HashAggregate {
     }
 }
 
-/// 整数系の 1 値を i128 で取り出す。SUM の桁溢れを避けるため常に広げる。
+/// Extracts one integer-family value as i128. Always widened, to avoid SUM overflow.
 fn as_i128(col: &Vector, row: usize) -> Result<i128> {
     Ok(match col.data() {
         Data::I32(v) => v[row] as i128,
@@ -689,7 +687,7 @@ fn as_f64(col: &Vector, row: usize) -> Result<f64> {
     })
 }
 
-/// 列の row 行目と累積値の比較。物理型が違う組み合わせは呼び出し側のバグ。
+/// Compares row `row` of a column with the accumulated value. A physical type mismatch is a caller bug.
 fn cmp_at(col: &Vector, row: usize, acc: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (col.data(), acc) {
@@ -703,10 +701,9 @@ fn cmp_at(col: &Vector, row: usize, acc: &Value) -> core::cmp::Ordering {
     }
 }
 
-/// 数値列の 1 値を f64 として取り出す。DECIMAL は `div`（= 10^scale）で
-/// 割って戻す。StdDev/Variance/Median は結果が必ず DOUBLE なので、
-/// SUM/AVG のように整数のまま累積してから割る意味が無く、最初から f64 に
-/// 寄せてしまう。
+/// Extracts one value of a numeric column as f64. DECIMAL is divided back by `div` (= 10^scale).
+/// StdDev/Variance/Median always produce DOUBLE, so unlike SUM/AVG there is no point
+/// accumulating as integers and dividing later; they move to f64 from the start.
 fn as_f64_generic(col: &Vector, row: usize, div: f64) -> Result<f64> {
     Ok(match col.data() {
         Data::I32(v) => v[row] as f64 / div,
@@ -717,10 +714,10 @@ fn as_f64_generic(col: &Vector, row: usize, div: f64) -> Result<f64> {
     })
 }
 
-/// 平方根。`core` に `f64::sqrt` は無い（libm 側）。`expr::funcs::f_sqrt` は
-/// この用途向けに公開されていない（private のまま）ため、同じ考え方
-/// （指数部を半分にした初期値からの Newton 法、5 回反復で倍精度に収束）で
-/// 作り直す。
+/// Square root. `core` has no `f64::sqrt` (it is in libm). `expr::funcs::f_sqrt` is not exposed
+/// for this use (it stays private), so it is rebuilt here on the same idea (Newton's method
+/// from an initial value with a halved exponent, converging to double precision in five
+/// iterations).
 fn f_sqrt(x: f64) -> f64 {
     if x <= 0.0 || !x.is_finite() {
         return if x < 0.0 { f64::NAN } else { x };
@@ -732,9 +729,9 @@ fn f_sqrt(x: f64) -> f64 {
     y
 }
 
-/// ArrayAgg の蓄積バッファへ 1 要素追記する。空なら `[` から書き始め、
-/// 閉じ括弧は付けない（`push_result` が出力直前に 1 回だけ足す）。
-/// NULL 要素も呼び出し側が `b"null"` を渡すだけで同じ経路を通せる。
+/// Appends one element to ArrayAgg's accumulation buffer. When empty it starts writing from
+/// `[`, and the closing bracket is not added (`push_result` adds it exactly once just before
+/// output). A NULL element takes the same path; the caller just passes `b"null"`.
 fn append_array_text(mut buf: Vec<u8>, text: &[u8]) -> Vec<u8> {
     if buf.is_empty() {
         buf.push(b'[');
@@ -745,11 +742,11 @@ fn append_array_text(mut buf: Vec<u8>, text: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// ArrayAgg の 1 要素を JSON 風テキストにして `out` へ足す。この処理系は
-/// LIST 型を持たないため、DESIGN.md のネスト型の扱い（`format::jsonl` が
-/// ネスト値をそのまま VARCHAR のテキストとして持つのと同じ発想）に倣い、
-/// 値を JSON 風の文字列へ寄せる。ここに来る値は必ず非 NULL
-/// （NULL は呼び出し側が `b"null"` を直接 `append_array_text` に渡す）。
+/// Turns one ArrayAgg element into JSON-like text and appends it to `out`. This system has no
+/// LIST type, so following DESIGN.md's handling of nested types (the same idea as
+/// `format::jsonl` keeping a nested value as VARCHAR text), the value is moved to a JSON-like
+/// string. Values reaching here are always non-NULL (for NULL the caller passes `b"null"`
+/// directly to `append_array_text`).
 fn push_json_scalar(col: &Vector, row: usize, out: &mut Vec<u8>) {
     match col.data() {
         Data::Bool(b) => out.extend_from_slice(if b.get(row) { b"true" } else { b"false" }),
@@ -767,9 +764,9 @@ fn push_json_scalar(col: &Vector, row: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// `v` を（DECIMAL なら `scale` 桁の小数点付きで）10 進テキストにする。
-/// `expr::kernels::fmt_int` は private で外から呼べないため、
-/// ArrayAgg で必要な分だけ同じ考え方で書き直す。
+/// Renders `v` as decimal text (with a decimal point at `scale` digits for DECIMAL).
+/// `expr::kernels::fmt_int` is private and cannot be called from outside, so just as much as
+/// ArrayAgg needs is rewritten here on the same idea.
 fn push_int_text(out: &mut Vec<u8>, v: i128, scale: u8) {
     let neg = v < 0;
     let mut u = v.unsigned_abs();
@@ -784,7 +781,7 @@ fn push_int_text(out: &mut Vec<u8>, v: i128, scale: u8) {
         u /= 10;
         k += 1;
     }
-    // 0.05 のように整数部が無い場合の先頭 0 を補う。
+    // Supplies the leading 0 when there is no integer part, as with 0.05.
     while k <= scale as usize {
         buf[k] = b'0';
         k += 1;
@@ -800,9 +797,9 @@ fn push_int_text(out: &mut Vec<u8>, v: i128, scale: u8) {
     }
 }
 
-/// f64 の簡易 10 進表記。有効 15 桁に丸めて末尾 0 を落とす。CAST 相当の
-/// 完全な往復表現は要らない（ArrayAgg の表示用途のみ）ので、
-/// `expr::kernels::fmt_f64`（private で呼べない）ほど厳密には作り込まない。
+/// A simple decimal rendering of f64. Rounded to 15 significant digits with trailing zeros
+/// dropped. A full CAST-grade round-trippable representation is unnecessary (this is only for
+/// ArrayAgg's display), so it is not built as rigorously as `expr::kernels::fmt_f64` (which is private and uncallable).
 fn push_f64_text(out: &mut Vec<u8>, x: f64) {
     if x.is_nan() {
         out.extend_from_slice(b"NaN");
@@ -820,7 +817,7 @@ fn push_f64_text(out: &mut Vec<u8>, x: f64) {
         out.push(b'-');
     }
     let v = if x < 0.0 { -x } else { x };
-    // v = m * 10^e10 を保ったまま m を [1e14, 1e15) に正規化する。
+    // Normalizes m into [1e14, 1e15) while preserving v = m * 10^e10.
     let mut m = v;
     let mut e10: i32 = 0;
     while m >= 1e15 {
@@ -849,7 +846,7 @@ fn push_f64_text(out: &mut Vec<u8>, x: f64) {
     // v = 0.d1..dk × 10^p
     let p = e10 + 15;
     if !(1..=17).contains(&p) {
-        // 指数表記。
+        // Exponential notation.
         out.push(digits[0]);
         if k > 1 {
             out.push(b'.');
@@ -873,9 +870,9 @@ fn push_f64_text(out: &mut Vec<u8>, x: f64) {
     }
 }
 
-/// JSON 風の文字列リテラルを書く。フル JSON の文字コーデックまでは要らない
-/// ので、往復に困る記号（引用符・バックスラッシュ・制御文字）だけ
-/// エスケープする。
+/// Writes a JSON-like string literal. A full JSON character codec is unnecessary, so only the
+/// characters that would break the round trip (quote, backslash, control characters) are
+/// escaped.
 fn push_json_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
     for &b in s {
@@ -912,7 +909,7 @@ mod tests {
     use crate::expr::vm::Vm;
     use crate::expr::{Instr, OpCode};
 
-    // --- 組み立てヘルパ -----------------------------------------------------
+    // --- Construction helpers -----------------------------------------------
 
     fn col(ty: Ty, vals: &[Option<Value>]) -> Vector {
         let mut v = Vector::new(ty);
@@ -947,7 +944,7 @@ mod tests {
         )
     }
 
-    /// 入力バッチの `idx` 列をそのまま返すプログラム。
+    /// A program that returns column `idx` of the input batch unchanged.
     fn load(ty: Ty, idx: u16) -> Program {
         let mut p = Program::new();
         let r = p.alloc_reg();
@@ -957,7 +954,7 @@ mod tests {
         p
     }
 
-    /// `col[idx] <op> const` の述語。HAVING 用。
+    /// The predicate `col[idx] <op> const`. For HAVING.
     fn cmp_const(op: OpCode, ty: Ty, idx: u16, v: Value) -> Program {
         let mut p = Program::new();
         let r0 = p.alloc_reg();
@@ -994,7 +991,7 @@ mod tests {
         }
     }
 
-    /// 区切り文字付きの StringAgg。
+    /// StringAgg with a separator.
     fn agg_sep(kind: AggKind, arg: Program, sep: &[u8]) -> Agg {
         Agg {
             kind,
@@ -1006,7 +1003,7 @@ mod tests {
         }
     }
 
-    /// `FILTER (WHERE cond)` 付きの集約。
+    /// An aggregate with `FILTER (WHERE cond)`.
     fn agg_filter(kind: AggKind, arg: Option<Program>, filter: Program) -> Agg {
         Agg {
             kind,
@@ -1018,25 +1015,25 @@ mod tests {
         }
     }
 
-    /// 浮動小数の許容誤差付き比較。Welford は丸め誤差を多少出すため。
+    /// Floating-point comparison with a tolerance. Welford produces some rounding error.
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
     }
 
-    // --- モックオペレータ ---------------------------------------------------
+    // --- Mock operators -----------------------------------------------------
 
     enum MockStep {
         Rows(Batch),
-        /// 入力の途中で I/O 待ちになる場面を再現する。
+        /// Reproduces waiting on I/O in the middle of the input.
         NeedIo,
-        /// ホストにコーデック展開を頼んで待つ場面。
+        /// Waiting on the host to decompress a codec.
         NeedCodec,
     }
 
     struct Mock {
         steps: Vec<MockStep>,
         pos: usize,
-        /// Done を返したあとに呼ばれた回数。二重消費の検出用。
+        /// How many times it was called after returning Done. For detecting double consumption.
         after_done: usize,
     }
 
@@ -1066,9 +1063,9 @@ mod tests {
         cols.into_iter().map(|c| MockStep::Rows(Batch::new(c))).collect()
     }
 
-    // --- 実行ヘルパ ---------------------------------------------------------
+    // --- Execution helpers --------------------------------------------------
 
-    /// 出力を行の並びに落とす。`NeedIo` はホストが埋めた体で単に再開する。
+    /// Flattens the output into a sequence of rows. `NeedIo` simply resumes, as if the host had filled it.
     fn run(mut op: HashAggregate) -> Result<Vec<Vec<Value>>> {
         let mut catalog = Catalog::new();
         let mut vm = Vm::new();
@@ -1076,7 +1073,7 @@ mod tests {
         let mut guard = 0;
         loop {
             guard += 1;
-            assert!(guard < 100_000, "終わらない");
+            assert!(guard < 100_000, "does not terminate");
             let mut ctx = ExecContext {
                 catalog: &mut catalog,
                 vm: &mut vm,
@@ -1110,7 +1107,7 @@ mod tests {
         HashAggregate::new(Mock::new(steps), groups, aggs, having).unwrap()
     }
 
-    /// 出力行をキー列の文字列表現でソートして比較しやすくする。
+    /// Sorts output rows by the string representation of the key column, for easier comparison.
     fn sorted(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         rows.sort_by_key(|r| fmt_row(r));
         rows
@@ -1124,11 +1121,11 @@ mod tests {
         s
     }
 
-    // --- 型と基本形 ---------------------------------------------------------
+    // --- Types and basic shapes ---------------------------------------------
 
     #[test]
     fn result_types_come_from_agg_result_ty() {
-        // SUM(INT) は HUGEINT、AVG は DOUBLE、COUNT は BIGINT。
+        // SUM(INT) is HUGEINT, AVG is DOUBLE, COUNT is BIGINT.
         let a = HashAggregate::new(
             Mock::new(vec![]),
             vec![],
@@ -1178,8 +1175,8 @@ mod tests {
         );
         let rows = run(op).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::I64(4), "COUNT(*) は NULL 行も数える");
-        assert_eq!(rows[0][1], Value::I64(3), "COUNT(x) は NULL を数えない");
+        assert_eq!(rows[0][0], Value::I64(4), "COUNT(*) counts NULL rows too");
+        assert_eq!(rows[0][1], Value::I64(3), "COUNT(x) does not count NULLs");
         assert_eq!(rows[0][2], Value::I128(7));
         assert_eq!(rows[0][3], Value::I32(1));
         assert_eq!(rows[0][4], Value::I32(4));
@@ -1209,7 +1206,7 @@ mod tests {
         );
         let rows = sorted(run(op).unwrap());
         assert_eq!(rows.len(), 2);
-        // グループ列が先、集約列が後。
+        // Group columns first, aggregate columns after.
         assert_eq!(rows[0][0], Value::Bytes(b"a".to_vec()));
         assert_eq!(rows[0][1], Value::I64(3));
         assert_eq!(rows[0][2], Value::I64(3));
@@ -1227,7 +1224,7 @@ mod tests {
 
     #[test]
     fn filter_restricts_which_rows_feed_the_aggregate() {
-        // col0 = value, col1 = 条件列。FILTER (WHERE col1 > 5) を模す。
+        // col0 = value, col1 = the condition column. Emulates FILTER (WHERE col1 > 5).
         let steps = batches(vec![vec![
             i32s(&[Some(1), Some(2), Some(3), Some(4)]),
             i32s(&[Some(10), Some(1), Some(10), Some(1)]),
@@ -1236,10 +1233,10 @@ mod tests {
             steps,
             vec![],
             vec![
-                // FILTER 無し: 全行を数える／足す。
+                // Without FILTER: counts/sums every row.
                 agg(AggKind::CountStar, None),
                 agg(AggKind::Sum, Some(load(Ty::Int, 0))),
-                // FILTER あり: col1 > 5 の行（1, 3 番目）だけを数える／足す。
+                // With FILTER: counts/sums only the rows where col1 > 5 (the 1st and 3rd).
                 agg_filter(
                     AggKind::CountStar,
                     None,
@@ -1255,10 +1252,14 @@ mod tests {
         );
         let rows = run(op).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::I64(4), "FILTER 無しの COUNT(*) は全行");
-        assert_eq!(rows[0][1], Value::I128(10), "FILTER 無しの SUM は全行 (1+2+3+4)");
-        assert_eq!(rows[0][2], Value::I64(2), "FILTER 付きの COUNT(*) は条件を満たす行だけ");
-        assert_eq!(rows[0][3], Value::I128(4), "FILTER 付きの SUM は 1 番目と 3 番目 (1+3)");
+        assert_eq!(rows[0][0], Value::I64(4), "COUNT(*) without FILTER covers every row");
+        assert_eq!(rows[0][1], Value::I128(10), "SUM without FILTER covers every row (1+2+3+4)");
+        assert_eq!(
+            rows[0][2],
+            Value::I64(2),
+            "COUNT(*) with FILTER covers only the qualifying rows"
+        );
+        assert_eq!(rows[0][3], Value::I128(4), "SUM with FILTER covers the 1st and 3rd (1+3)");
     }
 
     #[test]
@@ -1266,7 +1267,7 @@ mod tests {
         let steps = batches(vec![vec![
             strs(&[Some("a"), Some("a"), Some("b"), Some("b")]),
             i32s(&[Some(1), Some(2), Some(3), Some(4)]),
-            // 条件列: グループ a は 1 行目だけ真、グループ b は 2 行目だけ真。
+            // The condition column: only row 1 is true for group a, only row 2 for group b.
             i32s(&[Some(1), Some(0), Some(0), Some(1)]),
         ]]);
         let cond = cmp_const(OpCode::Eq, Ty::Int, 2, Value::I32(1));
@@ -1279,9 +1280,9 @@ mod tests {
         let rows = sorted(run(op).unwrap());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Bytes(b"a".to_vec()));
-        assert_eq!(rows[0][1], Value::I128(1), "グループ a は 1 行目だけが条件を満たす");
+        assert_eq!(rows[0][1], Value::I128(1), "only row 1 qualifies in group a");
         assert_eq!(rows[1][0], Value::Bytes(b"b".to_vec()));
-        assert_eq!(rows[1][1], Value::I128(4), "グループ b は 2 行目だけが条件を満たす");
+        assert_eq!(rows[1][1], Value::I128(4), "only row 2 qualifies in group b");
     }
 
     #[test]
@@ -1306,19 +1307,19 @@ mod tests {
         );
         let rows = run(op).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::I64(0), "COUNT(*) FILTER は該当 0 件なら 0");
-        assert!(rows[0][1].is_null(), "SUM FILTER は該当 0 件なら NULL");
+        assert_eq!(rows[0][0], Value::I64(0), "COUNT(*) FILTER is 0 when nothing qualifies");
+        assert!(rows[0][1].is_null(), "SUM FILTER is NULL when nothing qualifies");
     }
 
     #[test]
     fn filter_applies_to_statistical_aggregates() {
-        // 全 8 値 (2,4,4,4,5,5,7,9) のうち FILTER (WHERE col1 > 5) が選ぶのは
-        // col1 に 10 を入れた 3 番目・6 番目・8 番目（値 4, 5, 9）。
-        // FILTER 無しの StdDev/Median は全 8 値を、FILTER 付きは絞った 3 値だけを見る。
+        // Of all 8 values (2,4,4,4,5,5,7,9), FILTER (WHERE col1 > 5) selects the 3rd, 6th, and
+        // 8th, where col1 is 10 (values 4, 5, 9).
+        // StdDev/Median without FILTER see all 8 values; with FILTER, only the narrowed 3.
         let steps = batches(vec![vec![
             i32s(&[Some(2), Some(4), Some(4), Some(4), Some(5), Some(5), Some(7), Some(9)]),
             i32s(&[Some(1), Some(1), Some(10), Some(1), Some(1), Some(10), Some(1), Some(10)]),
-            // StringAgg は VARCHAR しか受け付けないので、col0 と同じ値をテキストで並行して持つ。
+            // StringAgg accepts only VARCHAR, so the same values as col0 are carried in parallel as text.
             strs(&[
                 Some("2"),
                 Some("4"),
@@ -1343,20 +1344,28 @@ mod tests {
             None,
         );
         let rows = run(op).unwrap();
-        assert_eq!(rows[0][0], Value::F64(4.5), "FILTER 無しの中央値は全 8 値から");
-        assert_eq!(rows[0][1], Value::F64(5.0), "FILTER 付きの中央値は 4,5,9 の 3 値から（中央）");
-        // 区切り文字は agg() の既定（空文字）。区切り文字自体のテストは別にある。
+        assert_eq!(
+            rows[0][0],
+            Value::F64(4.5),
+            "the median without FILTER comes from all 8 values"
+        );
+        assert_eq!(
+            rows[0][1],
+            Value::F64(5.0),
+            "the median with FILTER comes from the 3 values 4,5,9 (the middle one)"
+        );
+        // The separator is agg()'s default (the empty string). The separator itself is tested separately.
         assert_eq!(rows[0][2], Value::Bytes(b"24445579".to_vec()));
-        assert_eq!(rows[0][3], Value::Bytes(b"459".to_vec()), "FILTER 付きの StringAgg");
+        assert_eq!(rows[0][3], Value::Bytes(b"459".to_vec()), "StringAgg with FILTER");
     }
 
-    // --- 複数グループでの状態分離 -----------------------------------------------
+    // --- State separation across several groups ---------------------------------
 
     #[test]
     fn statistical_aggregates_keep_separate_state_per_group_across_interleaved_batches() {
-        // グループ a / b の行を複数バッチにまたがって交互に流し込み、
-        // Welford の mean/m2、中央値バッファ、Mode の頻度表、StringAgg/ArrayAgg の
-        // 蓄積バッファがグループ間で混線しないことを確認する。
+        // Rows of groups a and b are fed alternately across several batches, confirming that
+        // Welford's mean/m2, the median buffer, Mode's frequency table, and StringAgg/ArrayAgg's
+        // accumulation buffers do not get crossed between groups.
         let steps = batches(vec![
             vec![
                 strs(&[Some("a"), Some("b"), Some("a")]),
@@ -1382,26 +1391,26 @@ mod tests {
         );
         let rows = sorted(run(op).unwrap());
         assert_eq!(rows.len(), 2);
-        // グループ a: 1, 2, 3。
+        // Group a: 1, 2, 3.
         assert_eq!(rows[0][0], Value::Bytes(b"a".to_vec()));
-        assert!(close(rows[0][1].as_f64().unwrap(), 1.0), "a の stddev = {:?}", rows[0][1]);
-        assert_eq!(rows[0][2], Value::F64(2.0), "a の median");
-        assert_eq!(rows[0][3], Value::I32(1), "a の mode（全部 1 回ずつなので先着の 1）");
-        // 区切り文字は agg() の既定（空文字）。区切り文字自体のテストは別にある。
-        assert_eq!(rows[0][4], Value::Bytes(b"123".to_vec()), "a の StringAgg（到着順）");
-        // グループ b: 10, 20, 10。
+        assert!(close(rows[0][1].as_f64().unwrap(), 1.0), "a's stddev = {:?}", rows[0][1]);
+        assert_eq!(rows[0][2], Value::F64(2.0), "a's median");
+        assert_eq!(rows[0][3], Value::I32(1), "a's mode (all appear once, so the first, 1)");
+        // The separator is agg()'s default (the empty string). The separator itself is tested separately.
+        assert_eq!(rows[0][4], Value::Bytes(b"123".to_vec()), "a's StringAgg (arrival order)");
+        // Group b: 10, 20, 10.
         assert_eq!(rows[1][0], Value::Bytes(b"b".to_vec()));
         assert!(
             close(rows[1][1].as_f64().unwrap(), 5.773502691896258),
-            "b の stddev = {:?}",
+            "b's stddev = {:?}",
             rows[1][1]
         );
-        assert_eq!(rows[1][2], Value::F64(10.0), "b の median");
-        assert_eq!(rows[1][3], Value::I32(10), "b の mode（10 が 2 回で最頻）");
-        assert_eq!(rows[1][4], Value::Bytes(b"102010".to_vec()), "b の StringAgg（到着順）");
+        assert_eq!(rows[1][2], Value::F64(10.0), "b's median");
+        assert_eq!(rows[1][3], Value::I32(10), "b's mode (10 appears twice, the most)");
+        assert_eq!(rows[1][4], Value::Bytes(b"102010".to_vec()), "b's StringAgg (arrival order)");
     }
 
-    // --- 再開（これが本命） -------------------------------------------------
+    // --- Resumption (the main event) ----------------------------------------
 
     #[test]
     fn need_io_in_the_middle_resumes_with_identical_result() {
@@ -1414,7 +1423,7 @@ mod tests {
             let mut steps = Vec::new();
             for (i, (k, v)) in keys.iter().zip(data.iter()).enumerate() {
                 if interrupt && i == 1 {
-                    // バッチとバッチの間、かつ入力の途中で I/O 待ちにする。
+                    // Waits on I/O between batches, in the middle of the input.
                     steps.push(MockStep::NeedIo);
                 }
                 steps.push(MockStep::Rows(Batch::new(vec![i32s(k), i32s(v)])));
@@ -1437,11 +1446,11 @@ mod tests {
         let plain = sorted(run(make(false)).unwrap());
         let interrupted = sorted(run(make(true)).unwrap());
         assert_eq!(plain.len(), 2);
-        assert_eq!(plain, interrupted, "NeedIo をまたいでも結果が変わってはいけない");
-        // 中身も直接確認（行が消えても増えても気づけるように）。
-        // key=0 の値は 1, NULL, 1, 9 / key=1 の値は 2, 3, 2。
+        assert_eq!(plain, interrupted, "the result must not change across a NeedIo");
+        // The contents are checked directly too (so a lost or extra row is noticed).
+        // key=0's values are 1, NULL, 1, 9; key=1's are 2, 3, 2.
         assert_eq!(plain[0][1], Value::I64(4)); // COUNT(*)
-        assert_eq!(plain[0][2], Value::I64(3)); // COUNT(x) は NULL を除く
+        assert_eq!(plain[0][2], Value::I64(3)); // COUNT(x) excludes NULL
         assert_eq!(plain[0][3], Value::I128(1 + 1 + 9));
         assert_eq!(plain[0][4], Value::I32(9));
         assert_eq!(plain[1][1], Value::I64(3));
@@ -1451,7 +1460,7 @@ mod tests {
 
     #[test]
     fn need_codec_is_passed_through_and_resumes() {
-        // ホストにコーデック展開を頼む中断も NeedIo と同じ扱い。
+        // An interruption asking the host to decompress a codec is treated like NeedIo.
         let mut steps = vec![MockStep::Rows(Batch::new(vec![i32s(&[Some(1), Some(2)])]))];
         steps.push(MockStep::NeedCodec);
         steps.push(MockStep::Rows(Batch::new(vec![i32s(&[Some(3)])])));
@@ -1493,17 +1502,17 @@ mod tests {
             };
             match op.next(&mut ctx).unwrap() {
                 Step::Ready(b) => {
-                    assert!(first.is_none(), "出力バッチは 1 つだけ");
+                    assert!(first.is_none(), "there should be exactly one output batch");
                     first = Some(b.cols[0].value_at(0));
                 }
-                Step::NeedIo | Step::NeedCodec => panic!("中断は起きないはず"),
+                Step::NeedIo | Step::NeedCodec => panic!("no interruption should occur"),
                 Step::Done => {}
             }
         }
         assert_eq!(first, Some(Value::I64(2)));
     }
 
-    // --- 空入力と全 NULL ----------------------------------------------------
+    // --- Empty input and all-NULL -------------------------------------------
 
     #[test]
     fn empty_input_ungrouped_emits_one_row() {
@@ -1537,7 +1546,7 @@ mod tests {
 
     #[test]
     fn empty_batches_are_ignored() {
-        // card()==0 のバッチが混ざっても 1 行の結果は変わらない。
+        // A batch with card()==0 mixed in does not change the one-row result.
         let steps = vec![
             MockStep::Rows(Batch::new(vec![i32s(&[])])),
             MockStep::Rows(Batch::new(vec![i32s(&[Some(4)])])),
@@ -1566,14 +1575,14 @@ mod tests {
             None,
         );
         let rows = sorted(run(op).unwrap());
-        assert_eq!(rows[0][1], Value::I64(2), "COUNT(*) は 2");
-        assert_eq!(rows[0][2], Value::I64(0), "COUNT(x) は 0");
+        assert_eq!(rows[0][1], Value::I64(2), "COUNT(*) is 2");
+        assert_eq!(rows[0][2], Value::I64(0), "COUNT(x) is 0");
         assert_eq!(rows[0][3], Value::Null);
         assert_eq!(rows[0][4], Value::Null);
         assert_eq!(rows[0][5], Value::Null);
     }
 
-    // --- グループキー -------------------------------------------------------
+    // --- Group keys ---------------------------------------------------------
 
     #[test]
     fn null_keys_form_their_own_group() {
@@ -1589,7 +1598,7 @@ mod tests {
         );
         let rows = sorted(run(op).unwrap());
         assert_eq!(rows.len(), 2);
-        // NULL グループと 1 のグループがそれぞれ 2 行ずつ。
+        // Two rows each for the NULL group and the 1 group.
         let null_row = rows.iter().find(|r| r[0] == Value::Null).unwrap();
         assert_eq!(null_row[1], Value::I64(2));
         assert_eq!(null_row[2], Value::I128(4));
@@ -1622,7 +1631,7 @@ mod tests {
         ]]);
         let op = build(steps, vec![load(Ty::Double, 0)], vec![agg(AggKind::CountStar, None)], None);
         let rows = run(op).unwrap();
-        assert_eq!(rows.len(), 3, "0.0/-0.0 と NaN/-NaN はそれぞれ 1 グループ");
+        assert_eq!(rows.len(), 3, "0.0/-0.0 and NaN/-NaN each form one group");
         for r in &rows {
             let n = r[1].as_i64().unwrap();
             assert!(n == 2 || n == 1);
@@ -1648,8 +1657,8 @@ mod tests {
         );
         let rows = sorted(run(op).unwrap());
         assert_eq!(rows[0][1], Value::F64(-2.0));
-        assert!(rows[0][2].as_f64().unwrap().is_nan(), "MAX は NaN");
-        // 全部 NaN のグループは MIN も NaN。
+        assert!(rows[0][2].as_f64().unwrap().is_nan(), "MAX is NaN");
+        // In an all-NaN group MIN is NaN too.
         assert!(rows[1][1].as_f64().unwrap().is_nan());
     }
 
@@ -1673,7 +1682,7 @@ mod tests {
         assert_eq!(rows[0][1], Value::Bool(true));
     }
 
-    // --- 桁溢れ -------------------------------------------------------------
+    // --- Overflow -----------------------------------------------------------
 
     #[test]
     fn sum_of_i64_accumulates_in_i128() {
@@ -1681,7 +1690,7 @@ mod tests {
         let steps = batches(vec![vec![i64s(&[Some(big), Some(big), Some(big)])]]);
         let op = build(steps, vec![], vec![agg(AggKind::Sum, Some(load(Ty::BigInt, 0)))], None);
         let rows = run(op).unwrap();
-        assert_eq!(rows[0][0], Value::I128(big as i128 * 3), "i64 では溢れる合計");
+        assert_eq!(rows[0][0], Value::I128(big as i128 * 3), "a sum that overflows i64");
     }
 
     #[test]
@@ -1716,13 +1725,13 @@ mod tests {
             None,
         );
         let rows = sorted(run(op).unwrap());
-        // a: 値は 1,1,2,2 → distinct は {1,2}
+        // a: values are 1,1,2,2 -> distinct is {1,2}
         assert_eq!(rows[0][1], Value::I64(2));
         assert_eq!(rows[0][2], Value::I128(3));
-        assert_eq!(rows[0][3], Value::I64(4), "非 DISTINCT は重複を数える");
+        assert_eq!(rows[0][3], Value::I64(4), "non-DISTINCT counts duplicates");
         assert_eq!(rows[0][4], Value::I128(6));
         assert_eq!(rows[0][5], Value::F64(1.5));
-        // b: 値は 5,5 → distinct は {5}
+        // b: values are 5,5 -> distinct is {5}
         assert_eq!(rows[1][1], Value::I64(1));
         assert_eq!(rows[1][2], Value::I128(5));
     }
@@ -1741,7 +1750,7 @@ mod tests {
         );
         let rows = sorted(run(op).unwrap());
         assert_eq!(rows.len(), 2);
-        // 同じ値 7 でもグループが違えば別々に数える。
+        // The same value 7 is counted separately when the groups differ.
         assert_eq!(rows[0][1], Value::I64(1));
         assert_eq!(rows[1][1], Value::I64(1));
     }
@@ -1760,7 +1769,7 @@ mod tests {
     fn having_filters_groups() {
         let steps =
             batches(vec![vec![i32s(&[Some(1), Some(1), Some(2), Some(3), Some(3), Some(3)])]]);
-        // HAVING COUNT(*) > 1。出力スキーマは [key, count]。
+        // HAVING COUNT(*) > 1. The output schema is [key, count].
         let op = build(
             steps,
             vec![load(Ty::Int, 0)],
@@ -1797,11 +1806,11 @@ mod tests {
         assert!(run(op).unwrap().is_empty());
     }
 
-    // --- 大きさ -------------------------------------------------------------
+    // --- Size ---------------------------------------------------------------
 
     #[test]
     fn more_groups_than_batch_size_emits_multiple_batches() {
-        // BATCH_SIZE を超えるグループ数。ハッシュ表の再ハッシュも複数回起きる。
+        // More groups than BATCH_SIZE. The hash table rehashes several times too.
         let n = BATCH_SIZE * 2 + 37;
         let mut steps = Vec::new();
         let mut i = 0usize;
@@ -1810,11 +1819,11 @@ mod tests {
             let keys: Vec<Option<i32>> = (i..end).map(|k| Some(k as i32)).collect();
             let vals: Vec<Option<i32>> = (i..end).map(|_| Some(2)).collect();
             steps.push(MockStep::Rows(Batch::new(vec![i32s(&keys), i32s(&vals)])));
-            // 毎回 I/O 待ちを挟んでも、グループが増減しないこと。
+            // Even with an I/O wait interposed every time, the groups must not change in number.
             steps.push(MockStep::NeedIo);
             i = end;
         }
-        // 同じキーをもう一周入れて、各グループが 2 行ずつになるようにする。
+        // The same keys are fed once more, so each group ends up with two rows.
         let keys: Vec<Option<i32>> = (0..n).map(|k| Some(k as i32)).collect();
         let vals: Vec<Option<i32>> = (0..n).map(|_| Some(3)).collect();
         steps.push(MockStep::Rows(Batch::new(vec![i32s(&keys), i32s(&vals)])));
@@ -1826,11 +1835,11 @@ mod tests {
             None,
         );
         let rows = run(op).unwrap();
-        assert_eq!(rows.len(), n, "グループが増減していない");
+        assert_eq!(rows.len(), n, "the group count is unchanged");
         let mut seen = vec![false; n];
         for r in &rows {
             let k = r[0].as_i64().unwrap() as usize;
-            assert!(!seen[k], "グループ {k} が重複");
+            assert!(!seen[k], "group {k} is duplicated");
             seen[k] = true;
             assert_eq!(r[1], Value::I64(2));
             assert_eq!(r[2], Value::I128(5));
@@ -1866,10 +1875,10 @@ mod tests {
 
     #[test]
     fn memory_limit_is_enforced() {
-        // 長いキーを大量に入れて上限に当てる。スピルは無いので Oom を返す。
+        // Long keys are fed in bulk to hit the cap. There is no spilling, so it returns Oom.
         let mut steps = Vec::new();
         let mut i = 0u32;
-        // 1 グループあたり 1KiB 強のキー → 64MiB 到達には十分な件数を流す。
+        // Just over 1 KiB of key per group -> enough rows to reach 64 MiB.
         let filler = "x".repeat(1024);
         for _ in 0..80 {
             let keys: Vec<Option<String>> = (0..1000)
@@ -1888,7 +1897,7 @@ mod tests {
 
     #[test]
     fn phys_type_mismatch_between_program_and_data_is_detected() {
-        // 宣言 INT なのに実データが VARCHAR。契約違反として Internal。
+        // Declared INT but the real data is VARCHAR. Internal, as a contract violation.
         let steps = vec![MockStep::Rows(Batch::new(vec![strs(&[Some("a")])]))];
         let op = build(steps, vec![load(Ty::Int, 0)], vec![agg(AggKind::CountStar, None)], None);
         assert_eq!(code_of(run(op)), Some(Code::Internal));
@@ -1898,8 +1907,8 @@ mod tests {
 
     #[test]
     fn stddev_and_variance_match_hand_verified_welford_result() {
-        // 2,4,4,4,5,5,7,9 → 分散 32/7 ≈ 4.571428571428571、
-        // 標準偏差 ≈ 2.138089935299395（duckdb の stddev_samp/var_samp と照合済み）。
+        // 2,4,4,4,5,5,7,9 -> variance 32/7 = 4.571428571428571,
+        // standard deviation = 2.138089935299395 (cross-checked with duckdb's stddev_samp/var_samp).
         let steps = batches(vec![vec![i32s(&[
             Some(2),
             Some(4),
@@ -1928,11 +1937,11 @@ mod tests {
 
     #[test]
     fn stddev_variance_below_two_values_is_null() {
-        // n == 0（空入力）。
+        // n == 0 (empty input).
         let op = build(vec![], vec![], vec![agg(AggKind::StdDev, Some(load(Ty::Int, 0)))], None);
         assert_eq!(run(op).unwrap()[0][0], Value::Null);
 
-        // n == 1。標本分散・標本標準偏差は未定義（duckdb でも NULL）。
+        // n == 1. Sample variance and sample standard deviation are undefined (NULL in duckdb too).
         let steps = batches(vec![vec![i32s(&[Some(5)])]]);
         let op = build(steps, vec![], vec![agg(AggKind::Variance, Some(load(Ty::Int, 0)))], None);
         assert_eq!(run(op).unwrap()[0][0], Value::Null);
@@ -1940,7 +1949,7 @@ mod tests {
 
     #[test]
     fn variance_of_constant_values_is_exactly_zero() {
-        // 丸め誤差で M2 がわずかに負になっても 0 にクランプされることを確認。
+        // Confirms that an M2 made slightly negative by rounding is clamped to 0.
         let steps = batches(vec![vec![f64s(&[Some(5.0), Some(5.0), Some(5.0)])]]);
         let op = build(
             steps,
@@ -1962,18 +1971,26 @@ mod tests {
     fn median_even_and_odd_counts() {
         let steps = batches(vec![vec![i32s(&[Some(1), Some(2), Some(3), Some(4)])]]);
         let op = build(steps, vec![], vec![agg(AggKind::Median, Some(load(Ty::Int, 0)))], None);
-        assert_eq!(run(op).unwrap()[0][0], Value::F64(2.5), "偶数個は中央 2 値の線形補間");
+        assert_eq!(
+            run(op).unwrap()[0][0],
+            Value::F64(2.5),
+            "an even count interpolates between the middle two"
+        );
 
         let steps = batches(vec![vec![i32s(&[Some(1), Some(2), Some(3), Some(4), Some(5)])]]);
         let op = build(steps, vec![], vec![agg(AggKind::Median, Some(load(Ty::Int, 0)))], None);
-        assert_eq!(run(op).unwrap()[0][0], Value::F64(3.0), "奇数個はちょうど中央値");
+        assert_eq!(
+            run(op).unwrap()[0][0],
+            Value::F64(3.0),
+            "an odd count gives exactly the middle value"
+        );
     }
 
     #[test]
     fn median_of_decimal_matches_duckdb_quantile_cont() {
-        // DECIMAL(10,2) の 1.00,2.00,3.00,4.00 → duckdb では median = 2.50
-        // (DECIMAL型のまま)。このエンジンは Median の出力型を常に DOUBLE に
-        // 決めている（`AggKind::result_ty`）ので、値は 2.5 (DOUBLE) になる。
+        // DECIMAL(10,2) 1.00,2.00,3.00,4.00 -> duckdb gives median = 2.50 (staying DECIMAL).
+        // This engine always fixes Median's output type to DOUBLE (`AggKind::result_ty`), so the
+        // value is 2.5 (DOUBLE).
         let ty = Ty::Decimal { precision: 10, scale: 2 };
         let steps = batches(vec![vec![col(
             ty,
@@ -2005,11 +2022,11 @@ mod tests {
 
     #[test]
     fn mode_tie_breaks_to_first_encountered_value() {
-        // duckdb で観測した挙動: 同数タイのときは先に現れた値が勝つ。
-        // (SELECT mode(x) FROM (SELECT unnest([3,2,2,1,1]) AS x) → 2)
+        // The behavior observed in duckdb: on a tie the value appearing first wins.
+        // (SELECT mode(x) FROM (SELECT unnest([3,2,2,1,1]) AS x) -> 2)
         let steps = batches(vec![vec![i32s(&[Some(3), Some(2), Some(2), Some(1), Some(1)])]]);
         let op = build(steps, vec![], vec![agg(AggKind::Mode, Some(load(Ty::Int, 0)))], None);
-        assert_eq!(run(op).unwrap()[0][0], Value::I32(2), "2 が 1 より先に現れる");
+        assert_eq!(run(op).unwrap()[0][0], Value::I32(2), "2 appears before 1");
     }
 
     #[test]
@@ -2020,16 +2037,16 @@ mod tests {
 
     #[test]
     fn mode_distinct_dedups_before_counting() {
-        // DISTINCT を付けると重複除去が Mode の頻度表より手前で効くので、
-        // 全ての値が「1 回だけ」に見える。duckdb で観測した挙動と同じく、
-        // 最初に現れた distinct 値が勝つ（SELECT mode(DISTINCT x) FROM
-        // (SELECT unnest([1,1,2,3]) AS x) → 1）。
+        // With DISTINCT, deduplication takes effect before Mode's frequency table, so every value
+        // looks like it appears "exactly once". As in the behavior observed in duckdb, the first
+        // distinct value to appear wins (SELECT mode(DISTINCT x) FROM
+        // (SELECT unnest([1,1,2,3]) AS x) -> 1).
         let steps = batches(vec![vec![i32s(&[Some(1), Some(1), Some(2), Some(3)])]]);
         let op = build(steps, vec![], vec![agg_distinct(AggKind::Mode, load(Ty::Int, 0))], None);
         assert_eq!(run(op).unwrap()[0][0], Value::I32(1));
     }
 
-    // --- Median / Mode の再開 ------------------------------------------------
+    // --- Resumption for Median / Mode ---------------------------------------
 
     #[test]
     fn need_io_mid_input_does_not_change_median_or_mode_result() {
@@ -2061,8 +2078,8 @@ mod tests {
         };
         let plain = run(make(false)).unwrap();
         let interrupted = run(make(true)).unwrap();
-        assert_eq!(plain, interrupted, "NeedIo/NeedCodec をまたいでも結果が変わってはいけない");
-        // 値そのものも確認: 1,1,1,3,5,7,8,9 → median = (3+5)/2 = 4.0, mode = 1。
+        assert_eq!(plain, interrupted, "the result must not change across a NeedIo/NeedCodec");
+        // The values themselves too: 1,1,1,3,5,7,8,9 -> median = (3+5)/2 = 4.0, mode = 1.
         assert_eq!(plain[0][0], Value::F64(4.0));
         assert_eq!(plain[0][1], Value::I32(1));
     }
@@ -2071,7 +2088,7 @@ mod tests {
 
     #[test]
     fn approx_count_distinct_matches_count_distinct_exactly() {
-        // v1 は厳密カウント。COUNT(DISTINCT x) と同じ結果になるはず。
+        // v1 is an exact count. It should give the same result as COUNT(DISTINCT x).
         let steps = batches(vec![vec![i32s(&[Some(1), Some(1), Some(2), Some(3), None, Some(3)])]]);
         let op = build(
             steps,
@@ -2102,10 +2119,10 @@ mod tests {
 
     #[test]
     fn string_agg_default_separator_is_empty_and_explicit_separator_is_used() {
-        // このファイルは `a.separator` をそのまま読むだけ。省略時に何を
-        // 詰めるかはバインダの契約（`AggKind::optional_arg_default`）で、
-        // 現状は空文字。duckdb の既定はカンマなので値は異なるが、
-        // これはバインダ側の判断でありこのファイルの管轄外。
+        // This file merely reads `a.separator` as given. What fills it in when omitted is the
+        // binder's contract (`AggKind::optional_arg_default`), currently the empty string.
+        // duckdb's default is a comma, so the value differs, but that is the binder's decision
+        // and outside this file's remit.
         let steps = batches(vec![vec![strs(&[Some("a"), Some("b"), Some("c")])]]);
         let op =
             build(steps, vec![], vec![agg(AggKind::StringAgg, Some(load(Ty::Varchar, 0)))], None);
@@ -2139,7 +2156,7 @@ mod tests {
             vec![agg_sep(AggKind::StringAgg, load(Ty::Varchar, 0), b",")],
             None,
         );
-        assert_eq!(run(op).unwrap()[0][0], Value::Null, "非 NULL が 1 つも無ければ NULL");
+        assert_eq!(run(op).unwrap()[0][0], Value::Null, "NULL when there is not a single non-NULL");
     }
 
     #[test]
@@ -2161,10 +2178,10 @@ mod tests {
         let rows = run(op).unwrap();
         let s = match &rows[0][0] {
             Value::Bytes(b) => b.clone(),
-            other => panic!("bytes を期待したが {other:?}"),
+            other => panic!("expected bytes but got {other:?}"),
         };
-        // DISTINCT の到着順はハッシュ表の実装依存で厳密には約束しないので、
-        // 集合として {a, b} であることだけ確認する。
+        // DISTINCT's arrival order depends on the hash table's implementation and is not strictly
+        // promised, so only membership of {a, b} is checked.
         let mut parts: Vec<&[u8]> = s.split(|&c| c == b',').collect();
         parts.sort();
         assert_eq!(parts, vec![b"a".as_slice(), b"b".as_slice()]);
@@ -2186,8 +2203,8 @@ mod tests {
 
     #[test]
     fn array_agg_includes_null_elements_as_literal_null() {
-        // ArrayAgg は他の集約と違い NULL も要素として数える
-        // （duckdb の array_agg/list も同じ: [1, NULL, 3]）。
+        // Unlike other aggregates, ArrayAgg counts NULL as an element
+        // (duckdb's array_agg/list do the same: [1, NULL, 3]).
         let steps = batches(vec![vec![i32s(&[Some(1), None, Some(3)])]]);
         let op = build(steps, vec![], vec![agg(AggKind::ArrayAgg, Some(load(Ty::Int, 0)))], None);
         assert_eq!(run(op).unwrap()[0][0], Value::Bytes(b"[1, null, 3]".to_vec()));
@@ -2195,13 +2212,13 @@ mod tests {
 
     #[test]
     fn array_agg_of_f64_uses_shortest_decimal_or_exponential_form() {
-        // push_f64_text は INT/VARCHAR の array_agg テストでは一切通らない。
-        // 通常範囲・指数表記に切り替わる境界（p が 1..=17 の外）・NaN/Infinity
-        // をここでまとめて確認する。duckdb の to_json(x) の書式に合わせてある。
+        // push_f64_text is never exercised by the INT/VARCHAR array_agg tests. The normal range,
+        // the boundary where it switches to exponential notation (p outside 1..=17), and
+        // NaN/Infinity are all checked together here. The format matches duckdb's to_json(x).
         let steps = batches(vec![vec![f64s(&[
             Some(1.5),
-            Some(1e20),  // p = 21 > 17 → 指数表記
-            Some(1e-10), // p = -9 < 1 → 指数表記
+            Some(1e20),  // p = 21 > 17 -> exponential notation
+            Some(1e-10), // p = -9 < 1 -> exponential notation
             Some(f64::NAN),
             Some(f64::INFINITY),
         ])]]);
@@ -2209,16 +2226,16 @@ mod tests {
             build(steps, vec![], vec![agg(AggKind::ArrayAgg, Some(load(Ty::Double, 0)))], None);
         let s = match &run(op).unwrap()[0][0] {
             Value::Bytes(b) => b.clone(),
-            other => panic!("bytes を期待したが {other:?}"),
+            other => panic!("expected bytes but got {other:?}"),
         };
         assert_eq!(s, b"[1.5, 1e20, 1e-10, NaN, Infinity]".to_vec());
     }
 
     #[test]
     fn array_agg_of_zero_rows_is_null_not_empty_array() {
-        // duckdb でも array_agg(x) は「0 行」なら NULL（`[]` ではない）。
-        // NULL だけの行がある場合とは違う（そちらは `[NULL]` になる。
-        // 上の `array_agg_includes_null_elements_as_literal_null` 参照）。
+        // In duckdb too, array_agg(x) over "0 rows" is NULL (not `[]`).
+        // That differs from having rows that are all NULL (which gives `[NULL]`; see
+        // `array_agg_includes_null_elements_as_literal_null` above).
         let op = build(vec![], vec![], vec![agg(AggKind::ArrayAgg, Some(load(Ty::Int, 0)))], None);
         assert_eq!(run(op).unwrap()[0][0], Value::Null);
     }
@@ -2230,22 +2247,22 @@ mod tests {
             build(steps, vec![], vec![agg_distinct(AggKind::ArrayAgg, load(Ty::Int, 0))], None);
         let s = match &run(op).unwrap()[0][0] {
             Value::Bytes(b) => b.clone(),
-            other => panic!("bytes を期待したが {other:?}"),
+            other => panic!("expected bytes but got {other:?}"),
         };
-        // 順序は約束しないので要素の集合だけ確認する。
+        // The order is not promised, so only the set of elements is checked.
         let inner = core::str::from_utf8(&s[1..s.len() - 1]).unwrap();
         let mut parts: Vec<&str> = inner.split(", ").collect();
         parts.sort();
         assert_eq!(parts, vec!["1", "2", "null"]);
     }
 
-    // --- メモリ上限（新しい演算） ---------------------------------------------
+    // --- Memory cap (the new operations) ------------------------------------
 
     #[test]
     fn memory_limit_is_enforced_for_array_agg() {
-        // MIN/MAX と同じ発想: 大きなバイト列を大量に積んで上限に当てる。
-        // ここは単一グループなので、蓄積される JSON 風テキスト自体が
-        // 上限を超えるまで伸び続ける。
+        // The same idea as MIN/MAX: pile up large byte sequences to hit the cap.
+        // This is a single group, so the accumulated JSON-like text itself keeps growing until it
+        // exceeds the cap.
         let filler = "x".repeat(1024);
         let mut steps = Vec::new();
         for _ in 0..80 {
@@ -2260,8 +2277,8 @@ mod tests {
 
     #[test]
     fn memory_limit_is_enforced_for_median() {
-        // median_vals は 1 値あたり 8 バイトとして数える。64MiB を超えるには
-        // 838 万値強が要るので、余裕を見て 900 万行を流し込む。
+        // median_vals counts 8 bytes per value. Exceeding 64 MiB takes just over 8.38 million
+        // values, so 9 million rows are fed in with room to spare.
         let mut steps = Vec::new();
         for _ in 0..90 {
             let vals: Vec<Option<i32>> = (0..100_000).map(Some).collect();

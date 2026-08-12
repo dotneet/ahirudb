@@ -1,23 +1,23 @@
-//! 式のバイトコード VM。
+//! The expression bytecode VM.
 //!
-//! 式ツリーを再帰評価する代わりに、フラットな命令列にコンパイルして
-//! `kernel_table[op][phys_type]` で実行する（DESIGN.md §9）。ジェネリクスに
-//! よる単相化爆発をテーブル 1 枚に置き換えられるので、演算子や型が増えても
-//! コードサイズが線形にしか伸びない。
+//! Instead of recursively evaluating an expression tree, it is compiled into a flat instruction
+//! sequence and executed via `kernel_table[op][phys_type]` (DESIGN.md §9). Replacing generics'
+//! monomorphization blowup with a single table means code size grows only linearly as operators
+//! and types are added.
 //!
-//! ## 設計上の判断: 制御フローを持たない
+//! ## A design decision: no control flow
 //!
-//! DESIGN.md では `AND`/`OR`/`CASE` を分岐命令で短絡評価する想定だったが、
-//! 実装では**分岐を持たず両辺を評価して `Select` で合成する**方式に変えた。
-//! 行ごとに分岐するとベクトル化が壊れるうえ、命令ポインタの巻き戻しが必要に
-//! なり VM が大きくなるため。短絡が必要になる唯一のケースはゼロ除算だが、
-//! これは DuckDB と同じく**エラーではなく NULL を返す**ことで解消している。
+//! DESIGN.md envisioned short-circuiting `AND`/`OR`/`CASE` with branch instructions, but the
+//! implementation instead **has no branches and evaluates both sides, combining them with
+//! `Select`**. Branching per row would break vectorization, and it would need rewinding the
+//! instruction pointer, growing the VM. The one case that would need short-circuiting is division
+//! by zero, and that is resolved, as in DuckDB, by **returning NULL rather than an error**.
 //!
-//! ## NULL の扱い
+//! ## Handling NULLs
 //!
-//! カーネルは「値の計算」と「validity の計算」を分離する。ほとんどの演算では
-//! 結果の validity = 入力の validity の AND だが、`AND`/`OR` だけは三値論理の
-//! ため値と validity を同時に決める必要がある。
+//! Kernels separate "computing the value" from "computing the validity". For most operations the
+//! result's validity is the AND of the inputs' validity, but `AND`/`OR` alone need the value and
+//! the validity decided together, because of three-valued logic.
 
 pub mod funcs;
 pub mod kernels;
@@ -27,21 +27,21 @@ pub mod vm;
 use crate::prelude::*;
 use crate::vector::{PhysType, Ty, Value};
 
-/// レジスタ番号。
+/// A register number.
 pub type Reg = u16;
 
-/// 命令。1 命令 12 バイト。
+/// An instruction. 12 bytes each.
 #[derive(Clone, Copy)]
 pub struct Instr {
     pub op: OpCode,
-    /// 演算対象の物理型。比較では「入力の」型を指す（出力は常に Bool）。
+    /// The physical type operated on. For comparisons it means the **input's** type (the output is always Bool).
     pub ty: PhysType,
     pub dst: Reg,
     pub a: Reg,
     pub b: Reg,
-    /// 命令ごとに意味が異なる補助フィールド。
-    /// `LoadCol` は列番号、`LoadConst` は定数プール添字、`Cast` はキャスト表の
-    /// 添字、`Select` は第 3 オペランドのレジスタ番号。
+    /// An auxiliary field whose meaning depends on the instruction.
+    /// For `LoadCol` it is the column number, for `LoadConst` the constant pool index, for `Cast`
+    /// the cast table index, and for `Select` the third operand's register number.
     pub aux: u16,
 }
 
@@ -59,21 +59,21 @@ impl Instr {
 #[cfg_attr(feature = "std", derive(Debug))]
 #[repr(u8)]
 pub enum OpCode {
-    /// dst = 入力バッチの aux 列
+    /// dst = column aux of the input batch
     LoadCol,
-    /// dst = 定数プール[aux] を長さ 1 のベクタとして
+    /// dst = constant pool[aux] as a length-1 vector
     LoadConst,
 
-    // 算術。ty ∈ {I32, I64, I128, F64}
+    // Arithmetic. ty is one of {I32, I64, I128, F64}
     Add,
     Sub,
     Mul,
-    /// ゼロ除算は NULL を返す（エラーにしない）。
+    /// Division by zero returns NULL (rather than an error).
     Div,
     Mod,
     Neg,
 
-    // 比較。入力は ty、出力は Bool。
+    // Comparison. The input is ty and the output is Bool.
     Eq,
     Ne,
     Lt,
@@ -81,99 +81,99 @@ pub enum OpCode {
     Gt,
     Ge,
 
-    // 三値論理。入力・出力とも Bool。
+    // Three-valued logic. Both input and output are Bool.
     And,
     Or,
     Not,
 
-    /// dst = a が NULL か。結果は決して NULL にならない。
+    /// dst = whether a is NULL. The result is never NULL.
     IsNull,
     IsNotNull,
 
-    /// dst = キャスト表[aux] に従って a を変換。
+    /// dst = a converted according to cast table[aux].
     Cast,
-    /// `TRY_CAST`。`Cast` と同じキャスト表を使うが、変換できない組み合わせ
-    /// （`kernels::cast` がエラーを返す場合）はエラーにせず全行 NULL にする。
-    /// 行単位の変換失敗（範囲外・パース不能）は `Cast` と同じくその行だけ
-    /// NULL になる（`kernels::cast` 自体の契約）。
+    /// `TRY_CAST`. Uses the same cast table as `Cast`, but an unconvertible combination
+    /// (where `kernels::cast` returns an error) becomes all-NULL rather than an error.
+    /// A per-row conversion failure (out of range, unparsable) makes just that row NULL, as with
+    /// `Cast` (the contract of `kernels::cast` itself).
     TryCast,
 
-    /// dst = a LIKE b。ty は Bytes。
+    /// dst = a LIKE b. ty is Bytes.
     Like,
-    /// dst = a || b。ty は Bytes。
+    /// dst = a || b. ty is Bytes.
     Concat,
 
-    /// dst = a(Bool) が真なら b、偽または NULL なら レジスタ aux。
-    /// `CASE` と `COALESCE` はこれに落とす。
+    /// dst = b if a (Bool) is true, or register aux if it is false or NULL.
+    /// `CASE` and `COALESCE` lower to this.
     Select,
 
-    /// dst = a が NULL なら b、そうでなければ a。
+    /// dst = b if a is NULL, otherwise a.
     Coalesce,
 
-    /// スカラ関数呼び出し。`aux` は `Program::calls` の添字。
+    /// A scalar function call. `aux` is an index into `Program::calls`.
     ///
-    /// 引数はレジスタ番号の可変長リストなので、`a`/`b` には収まらない。
-    /// 命令を可変長にすると VM のループが複雑になるため、引数リストだけを
-    /// 別表に逃がしている。
+    /// The arguments are a variable-length list of register numbers and do not fit in `a`/`b`.
+    /// Making instructions variable-length would complicate the VM's loop, so only the argument
+    /// list is moved to a separate table.
     Call,
 
-    // INTERVAL 演算。a・b の物理型が異なる（TIMESTAMP は I64、INTERVAL は
-    // I128）ため、`arith` の物理型 1 種前提のテーブルには乗せられず専用に
-    // 分けてある。カレンダー演算（月末クランプ）が要るのも他の算術と違う点。
-    /// dst(I64) = a(TIMESTAMP, I64) + b(INTERVAL, I128)。DATE は呼び出し側が
-    /// TIMESTAMP へキャストしてから渡す。
+    // INTERVAL operations. `a` and `b` have different physical types (TIMESTAMP is I64 and INTERVAL
+    // is I128), so they cannot ride `arith`'s table, which assumes a single physical type, and are
+    // separated out. Needing calendar arithmetic (month-end clamping) is another difference from the other arithmetic.
+    /// dst(I64) = a(TIMESTAMP, I64) + b(INTERVAL, I128). DATE is cast to TIMESTAMP by the caller
+    /// before being passed in.
     TsAddInterval,
-    /// dst(I128) = a(INTERVAL) + b(INTERVAL)。フィールドごとの加算。
+    /// dst(I128) = a(INTERVAL) + b(INTERVAL). Field-wise addition.
     IntervalAdd,
-    /// dst(I128) = a(INTERVAL) の符号反転。`Sub`/単項 `-` はこれと
-    /// `IntervalAdd`/`TsAddInterval` の組み合わせに展開する。
+    /// dst(I128) = a(INTERVAL) negated. `Sub` and unary `-` expand into a combination of this and
+    /// `IntervalAdd`/`TsAddInterval`.
     IntervalNeg,
-    /// dst(I128) = a(INTERVAL) * b(BIGINT)。フィールドごとの乗算。
+    /// dst(I128) = a(INTERVAL) * b(BIGINT). Field-wise multiplication.
     IntervalMul,
 }
 
-/// スカラ関数呼び出しの引数。
+/// The arguments of a scalar function call.
 #[derive(Clone)]
 pub struct CallSpec {
     pub func: u16,
     pub args: Vec<Reg>,
-    /// 関数が返す論理型。
+    /// The logical type the function returns.
     pub result_ty: Ty,
-    /// `list_transform`/`list_filter`/`list_reduce` のラムダ本体。
-    /// `Program::lambdas` の添字（`None` なら通常のスカラ関数呼び出し）。
-    /// `expr::vm::exec` の `Call` 命令、`expr::funcs::call_lambda` 参照。
+    /// The lambda body of `list_transform`/`list_filter`/`list_reduce`.
+    /// An index into `Program::lambdas` (`None` for an ordinary scalar function call).
+    /// See the `Call` instruction in `expr::vm::exec` and `expr::funcs::call_lambda`.
     pub lambda: Option<u16>,
 }
 
-/// キャストの指定。論理型が要るのは DECIMAL のスケール調整のため。
+/// A cast specification. The logical type is needed for DECIMAL scale adjustment.
 #[derive(Clone, Copy)]
 pub struct CastSpec {
     pub from: Ty,
     pub to: Ty,
 }
 
-/// コンパイル済みの式。
+/// A compiled expression.
 ///
-/// `Clone` は GROUPING SETS 対応で要る: 同じグルーピング列や集約の式を、
-/// グルーピングセットの数だけ作る `Node::Aggregate` それぞれに複製して積む
-/// （入力スコープはどのセットでも同じなのでレジスタ割り当てはそのまま使い回せる）。
+/// `Clone` is needed for GROUPING SETS support: the same grouping-column and aggregate expressions
+/// are duplicated into each of the `Node::Aggregate`s built per grouping set
+/// (the input scope is the same for every set, so the register allocation can be reused as is).
 #[derive(Clone)]
 pub struct Program {
     pub instrs: Vec<Instr>,
-    /// スカラ関数呼び出しの引数表。
+    /// The argument table for scalar function calls.
     pub calls: Vec<CallSpec>,
-    /// 定数プール。`Ty` は `Value` だけでは決まらない論理型（DATE など）を保持する。
+    /// The constant pool. `Ty` retains the logical type (DATE and so on) that `Value` alone does not determine.
     pub consts: Vec<(Ty, Value)>,
     pub casts: Vec<CastSpec>,
-    /// `list_transform`/`list_filter`/`list_reduce` のラムダ本体プログラム。
-    /// `CallSpec::lambda` から添字で参照する。本体は自分のパラメータだけを
-    /// 参照できる孤立したスコープでコンパイルされる（外側スコープの列は
-    /// 参照できない。`plan::compile::Compiler::lambda_call` 参照）。
+    /// The lambda body programs of `list_transform`/`list_filter`/`list_reduce`.
+    /// Referenced by index from `CallSpec::lambda`. A body is compiled in an isolated scope that
+    /// can reference only its own parameters (columns of the enclosing scope are unreachable; see
+    /// `plan::compile::Compiler::lambda_call`).
     pub lambdas: Vec<Program>,
     pub num_regs: u16,
-    /// 結果が入るレジスタ。
+    /// The register the result lands in.
     pub result: Reg,
-    /// 結果の論理型。
+    /// The result's logical type.
     pub result_ty: Ty,
 }
 
@@ -191,7 +191,7 @@ impl Program {
         }
     }
 
-    /// 新しいレジスタを割り当てる。
+    /// Allocates a new register.
     pub fn alloc_reg(&mut self) -> Reg {
         let r = self.num_regs;
         self.num_regs += 1;
@@ -199,7 +199,7 @@ impl Program {
     }
 
     pub fn add_const(&mut self, ty: Ty, v: Value) -> u16 {
-        // 同じ定数は共有する。定数はたいてい少数なので線形探索で足りる。
+        // Identical constants are shared. Constants are usually few, so a linear scan suffices.
         for (i, (t, existing)) in self.consts.iter().enumerate() {
             if *t == ty && *existing == v {
                 return i as u16;
@@ -214,8 +214,7 @@ impl Program {
         (self.calls.len() - 1) as u16
     }
 
-    /// `list_transform`/`list_filter`/`list_reduce` 用。`lambda` は
-    /// `add_lambda` が返した添字。
+    /// For `list_transform`/`list_filter`/`list_reduce`. `lambda` is the index `add_lambda` returned.
     pub fn add_lambda_call(
         &mut self,
         func: u16,
@@ -227,7 +226,7 @@ impl Program {
         (self.calls.len() - 1) as u16
     }
 
-    /// ラムダ本体のプログラムを埋め込み、`CallSpec::lambda` へ渡す添字を返す。
+    /// Embeds a lambda body program and returns the index to pass to `CallSpec::lambda`.
     pub fn add_lambda(&mut self, body: Program) -> u16 {
         self.lambdas.push(body);
         (self.lambdas.len() - 1) as u16
@@ -242,7 +241,7 @@ impl Program {
         self.instrs.push(i);
     }
 
-    /// 定数だけで構成されているか（定数畳み込みの判定用）。
+    /// Whether it consists only of constants (for the constant-folding check).
     pub fn is_constant(&self) -> bool {
         !self.instrs.iter().any(|i| i.op == OpCode::LoadCol)
     }

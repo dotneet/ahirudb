@@ -7,7 +7,7 @@
 
 use ahiru_core::vector::{Ty, Value};
 
-/// `NULL` の既定表記。DuckDB の `.nullvalue` 既定と同じ。
+/// The default rendering of `NULL`. Same as DuckDB's `.nullvalue` default.
 pub const DEFAULT_NULL: &str = "NULL";
 
 pub fn render(v: &Value, ty: Ty, null: &str) -> String {
@@ -58,7 +58,7 @@ fn fmt_interval_value(packed: i128) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// DECIMAL はスケール付きの整数で保持しているので、表示時に小数点を入れる。
+/// DECIMAL is held as a scaled integer, so the decimal point is inserted at display time.
 fn fmt_scaled(v: i128, ty: Ty) -> String {
     let scale = match ty {
         Ty::Decimal { scale, .. } => scale as usize,
@@ -69,7 +69,7 @@ fn fmt_scaled(v: i128, ty: Ty) -> String {
     }
     let neg = v < 0;
     let digits = v.unsigned_abs().to_string();
-    // 整数部が無い場合（0.05 など）は先頭に 0 を補う。
+    // Prepend a 0 when there is no integer part (0.05 and the like).
     let padded = if digits.len() <= scale {
         format!("{}{}", "0".repeat(scale - digits.len() + 1), digits)
     } else {
@@ -79,14 +79,14 @@ fn fmt_scaled(v: i128, ty: Ty) -> String {
     format!("{}{}.{}", if neg { "-" } else { "" }, &padded[..split], &padded[split..])
 }
 
-/// エポックからの日数を `YYYY-MM-DD` にする。civil_from_days アルゴリズム。
+/// Turns days since the epoch into `YYYY-MM-DD`. The civil_from_days algorithm.
 fn fmt_date(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// TIME（深夜からのマイクロ秒）を `HH:MM:SS` で表示する。CLI 表示専用の
-/// 簡略化で、マイクロ秒未満は落とす（`fmt_timestamp` の時刻部分と同じ規約）。
+/// Displays a TIME (microseconds since midnight) as `HH:MM:SS`. A simplification
+/// for CLI display only, dropping sub-microseconds (the same convention as the time part of `fmt_timestamp`).
 fn fmt_time(micros: i64) -> String {
     let rem = micros.rem_euclid(86_400_000_000);
     let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
@@ -101,8 +101,8 @@ fn fmt_timestamp(micros: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
-/// 16 バイトの UUID を `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` にする。
-/// 長さが 16 でない値（本来起き得ない）は 16 進のまま表示する。
+/// Turns a 16-byte UUID into `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+/// A value whose length is not 16 (which should never happen) is shown as raw hex.
 fn fmt_uuid(b: &[u8]) -> String {
     let Ok(b): Result<[u8; 16], _> = b.try_into() else {
         return b.iter().map(|x| format!("{x:02x}")).collect();

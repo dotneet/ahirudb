@@ -1,14 +1,14 @@
-//! ahirudb — WASM 1MB 以内で動く Parquet 用 SQL エンジン。
+//! ahirudb -- a SQL engine for Parquet that runs in under 1 MB of WASM.
 //!
-//! 設計の詳細は `docs/DESIGN.md` を参照。
+//! See `docs/DESIGN.md` for the design in detail.
 //!
-//! ビルド構成:
-//! - ネイティブ (既定): `std` フィーチャ有効。テストとデバッグはこちらで行う。
-//! - wasm 配布: `--no-default-features` で `no_std` になり、`core::fmt` を
-//!   一切リンクしない。
+//! Build configurations:
+//! - native (default): the `std` feature is on. Development and debugging happen here.
+//! - wasm distribution: `--no-default-features` makes it `no_std` and never links
+//!   `core::fmt` at all.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-// no_std でも alloc は常に使う。
+// alloc is always used, even under no_std.
 extern crate alloc;
 
 #[macro_use]
@@ -36,7 +36,7 @@ pub mod exec;
 
 pub mod session;
 
-// 更新系はすべてオプトアウト可能。既定では無効（DESIGN.md §16）。
+// Every mutating feature is opt-out capable. Disabled by default (DESIGN.md §16).
 #[cfg(feature = "export")]
 pub mod write;
 
@@ -48,7 +48,7 @@ pub mod dml;
 #[cfg(target_arch = "wasm32")]
 pub mod abi;
 
-/// クレート内で共通に使う import。
+/// The imports shared across the crate.
 pub(crate) mod prelude {
     #![allow(unused_imports)]
 

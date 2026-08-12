@@ -1,28 +1,27 @@
-//! `USING SAMPLE` / `TABLESAMPLE`。
+//! `USING SAMPLE` / `TABLESAMPLE`.
 //!
-//! パーセント指定はベルヌーイ法で実装する（各行を独立に確率 `p` で残す。
-//! 上流をブロックしない、`exec::Filter` と同じ形のストリーミングオペレータ）。
-//! 行数指定は入力を全部読み切ってから一様ランダムに N 行選ぶブロッキング
-//! 方式（`exec::sort::Sort` と同じ「蓄積 → 確定 → `BATCH_SIZE` ずつ返す」の
-//! 3 相）。`BERNOULLI`/`SYSTEM`/`RESERVOIR` という手法名の構文は受理するが、
-//! 実装上の違いは無い（タスクの優先度: パーセント指定 > 行数指定 > 手法の
-//! 使い分け、という指示どおりの単純化）。
+//! A percentage is implemented with the Bernoulli method (each row is kept independently with
+//! probability `p`; a streaming operator shaped like `exec::Filter` that does not block upstream).
+//! A row count is a blocking scheme that reads the input through and then picks N rows uniformly
+//! at random (the same three phases as `exec::sort::Sort`: buffer -> settle -> return in
+//! `BATCH_SIZE` slices). The method names `BERNOULLI`/`SYSTEM`/`RESERVOIR` are accepted
+//! syntactically but make no difference in the implementation (the simplification the task
+//! prescribed: percentage > row count > distinguishing methods).
 //!
-//! ## 乱数生成器
-//! 依存クレート無しの xorshift64* を自前で実装する（`no_std` なので `rand`
-//! クレートは使えない）。シードは `plan::SampleSpec::seed`
-//! （`USING SAMPLE ... (method, seed)` で明示するか、無ければ
-//! `plan::DEFAULT_SAMPLE_SEED`）から決定的に初期化するので、同じクエリを
-//! 何度実行しても同じ行が選ばれる。
+//! ## The random number generator
+//! xorshift64* is implemented in-house with no dependency (`no_std` rules out the `rand` crate).
+//! The seed is initialized deterministically from `plan::SampleSpec::seed` (given explicitly by
+//! `USING SAMPLE ... (method, seed)`, or `plan::DEFAULT_SAMPLE_SEED` otherwise), so running the
+//! same query any number of times picks the same rows.
 //!
-//! ## `NeedIo`/`NeedCodec` をまたいでも再現性が壊れない理由
-//! - ベルヌーイ法（`Bernoulli`）: 1 行ごとに 1 回だけ乱数を引く。中断は
-//!   入力側で起きてそのまま上へ素通しするだけ（`Filter` と同じ）なので、
-//!   PRNG の呼び出し列は「実際に評価された行の並び」だけで決まり、中断が
-//!   どこで起きたかには依存しない。
-//! - 行数指定（`RowSample`）: `Buffering` フェーズで蓄積を続け、入力が
-//!   `Done` になって初めて乱数で部分集合を選ぶ。中断はその前段（`Sort` と
-//!   同じ）でしか起きないので、選び方自体は中断の有無に影響されない。
+//! ## Why reproducibility survives a `NeedIo`/`NeedCodec`
+//! - Bernoulli (`Bernoulli`): exactly one random draw per row. Interruptions happen on the input
+//!   side and merely pass straight through (as in `Filter`), so the PRNG's call sequence is
+//!   determined solely by "the sequence of rows actually evaluated" and does not depend on where
+//!   an interruption occurred.
+//! - Row count (`RowSample`): buffering continues in the `Buffering` phase, and only once the
+//!   input reaches `Done` is a subset chosen randomly. Interruptions can only happen before that
+//!   stage (as in `Sort`), so the selection itself is unaffected by whether one occurred.
 
 use crate::exec::sort::vector_bytes;
 use crate::exec::{ExecContext, Operator, Step};
@@ -30,13 +29,13 @@ use crate::plan::SampleSpec;
 use crate::prelude::*;
 use crate::vector::{Batch, Ty, Vector, BATCH_SIZE};
 
-/// xorshift64*。`no_std` 環境で依存クレート無しに使える決定的 PRNG。
-/// 暗号強度は要らない（サンプリング用途のみ）。
+/// xorshift64*. A deterministic PRNG usable in a `no_std` environment with no dependencies.
+/// Cryptographic strength is unnecessary (this is only for sampling).
 struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        // 0 は不動点（`0 ^ ... = 0`）になるので下駄を履かせる。
+        // 0 is a fixed point (`0 ^ ... = 0`), so an offset is added.
         Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
     }
 
@@ -49,22 +48,22 @@ impl Rng {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    /// `[0, 1)` の一様乱数。上位 53 bit を仮数部として使う。
+    /// A uniform random number in `[0, 1)`. The top 53 bits are used as the mantissa.
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
     }
 
-    /// `[0, n)` の一様な添字。`n == 0` では呼ばない前提。
+    /// A uniform index in `[0, n)`. Assumes it is never called with `n == 0`.
     fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 }
 
-// --- パーセント指定（ベルヌーイ法） ------------------------------------------
+// --- Percentage (the Bernoulli method) ---------------------------------------
 
 pub struct Bernoulli {
     input: Box<dyn Operator>,
-    /// 残す確率（0.0..=1.0）。
+    /// The probability of keeping a row (0.0..=1.0).
     p: f64,
     rng: Rng,
 }
@@ -95,7 +94,7 @@ impl Operator for Bernoulli {
                 }
             }
             if sel.is_empty() {
-                // 全行落ちたバッチは上流に返さず次を引く（`Filter` と同じ規律）。
+                // A batch whose rows are all dropped is not returned upstream; the next is pulled (the same discipline as `Filter`).
                 continue;
             }
             batch.sel = Some(sel);
@@ -104,37 +103,37 @@ impl Operator for Bernoulli {
     }
 }
 
-// --- 行数指定（一様ランダムに N 行） ------------------------------------------
+// --- Row count (N rows uniformly at random) -----------------------------------
 
-/// 溢れ処理を持たないので、これを超えたら `Oom` を返す（`exec::sort::Sort`
-/// と同じ上限・同じ理由: wasm の線形メモリと他の抱えているバッファとの
-/// 同居を考えて単体では抑える）。
+/// With no overflow handling, exceeding this returns `Oom` (the same cap and the same reason as
+/// `exec::sort::Sort`: it is held down on its own, given wasm's linear memory and the coexistence
+/// of the other buffers held).
 const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
-/// 蓄積した入力 1 バッチぶん。
+/// One buffered input batch.
 struct Buffered {
     cols: Vec<Vector>,
     rows: usize,
 }
 
 enum Phase {
-    /// 入力を読んで溜めている。中断を跨いでもこの状態のまま。
+    /// Reading and buffering the input. It stays in this state across interruptions.
     Buffering,
-    /// 選ばれた行を `BATCH_SIZE` ずつ返す。
+    /// Returning the selected rows in `BATCH_SIZE` slices.
     Emitting,
     Done,
 }
 
 pub struct RowSample {
     input: Box<dyn Operator>,
-    /// 残す行数。
+    /// How many rows to keep.
     target: u64,
     rng: Rng,
     phase: Phase,
     batches: Vec<Buffered>,
     total_rows: u64,
     buffered_bytes: usize,
-    /// `Emitting` 以降のみ有効。選ばれた行を列指向で持つ。
+    /// Valid only from `Emitting` on. Holds the selected rows columnar.
     out: Vec<Vector>,
     out_rows: usize,
     pos: usize,
@@ -142,9 +141,9 @@ pub struct RowSample {
 
 impl RowSample {
     pub fn new(input: Box<dyn Operator>, spec: &SampleSpec) -> Self {
-        // 端数は四捨五入（`duckdb` の `12.5 ROWS` が 12 行になる例もあれば
-        // 四捨五入寄りの例もあり実装依存が伺えるので、ここでは単純な
-        // 四捨五入に決め打つ）。負値は構文上出てこない（`sql::parser` が拒否）。
+        // Fractions are rounded to nearest (`duckdb`'s `12.5 ROWS` gives 12 in some examples and
+        // rounds in others, suggesting it is implementation-defined, so plain round-to-nearest is
+        // fixed here). A negative value cannot occur syntactically (`sql::parser` rejects it).
         let target = (spec.amount.max(0.0) + 0.5) as u64;
         RowSample {
             input,
@@ -161,7 +160,7 @@ impl RowSample {
     }
 
     fn absorb(&mut self, mut batch: Batch) -> Result<()> {
-        // selection を先に解消しておく。`value_at` を後で行番号のまま使うため。
+        // Selection is resolved first, so `value_at` can be used later with plain row numbers.
         batch.materialize();
         let rows = batch.card();
         if rows == 0 {
@@ -175,12 +174,12 @@ impl RowSample {
         Ok(())
     }
 
-    /// 入力を読み切った。`0..total_rows` から一様ランダムに `k` 個選び、
-    /// 選ばれた行を（入力の相対順序を保ったまま）出力ベクタへ移す。
+    /// The input is read through. Picks `k` uniformly at random from `0..total_rows` and moves the
+    /// selected rows into the output vectors (preserving the input's relative order).
     fn finish(&mut self) {
         let n = self.total_rows;
         let k = self.target.min(n);
-        // 部分 Fisher–Yates: 先頭 `k` 個を一様ランダムに選ぶ。
+        // A partial Fisher-Yates: picks the first `k` uniformly at random.
         let mut idx: Vec<u64> = (0..n).collect();
         for i in 0..k {
             let j = i + self.rng.below(n - i);
@@ -238,8 +237,8 @@ impl Operator for RowSample {
             match self.phase {
                 Phase::Buffering => match self.input.next(ctx)? {
                     Step::Ready(b) => self.absorb(b)?,
-                    // 中断はそのまま上へ返す。蓄積した行は `self` に残るので、
-                    // 次回の呼び出しはここから入力を引き直す。
+                    // The interruption is returned straight up. The buffered rows stay in `self`,
+                    // so the next call pulls the input again from here.
                     Step::NeedIo => return Ok(Step::NeedIo),
                     Step::NeedCodec => return Ok(Step::NeedCodec),
                     Step::Done => {
@@ -301,7 +300,7 @@ mod tests {
         let mut vm = Vm::new();
         let mut out = Vec::new();
         for guard in 0..10_000 {
-            assert!(guard < 9_999, "終わらない");
+            assert!(guard < 9_999, "does not terminate");
             let mut ctx =
                 ExecContext { catalog: &mut cat, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
             match op.next(&mut ctx).unwrap() {
@@ -323,7 +322,7 @@ mod tests {
         SampleSpec { is_rows, amount, seed }
     }
 
-    // --- ベルヌーイ法（パーセント指定） --------------------------------------
+    // --- The Bernoulli method (percentage) ----------------------------------
 
     #[test]
     fn zero_percent_keeps_nothing() {
@@ -348,7 +347,7 @@ mod tests {
         let got = drive(op);
         let frac = got.len() as f64 / vals.len() as f64;
         assert!((0.08..0.12).contains(&frac), "got fraction {frac}");
-        // 選ばれた行は入力の相対順序のまま。
+        // The selected rows keep the input's relative order.
         let mut sorted = got.clone();
         sorted.sort_unstable();
         assert_eq!(got, sorted);
@@ -394,14 +393,10 @@ mod tests {
                 &spec(false, 25.0, 99),
             )) as Box<dyn Operator>
         };
-        assert_eq!(
-            drive(mk(false)),
-            drive(mk(true)),
-            "NeedIo をまたいでも結果が変わってはいけない"
-        );
+        assert_eq!(drive(mk(false)), drive(mk(true)), "the result must not change across a NeedIo");
     }
 
-    // --- 行数指定（一様ランダムに N 行） --------------------------------------
+    // --- Row count (N rows uniformly at random) -----------------------------
 
     #[test]
     fn selects_exactly_the_requested_row_count() {
@@ -410,14 +405,14 @@ mod tests {
         let op = Box::new(RowSample::new(Box::new(Mock { steps, pos: 0 }), &spec(true, 100.0, 7)));
         let got = drive(op);
         assert_eq!(got.len(), 100);
-        // 重複なし・入力に実在する値のみ・入力順のまま。
+        // No duplicates, only values present in the input, and in input order.
         let mut sorted = got.clone();
         sorted.dedup();
-        assert_eq!(got, sorted, "重複してはいけない");
+        assert_eq!(got, sorted, "there must be no duplicates");
         assert!(got.iter().all(|v| vals.contains(v)));
         let mut asc = got.clone();
         asc.sort_unstable();
-        assert_eq!(got, asc, "選ばれた行は入力の相対順序のまま");
+        assert_eq!(got, asc, "the selected rows keep the input's relative order");
     }
 
     #[test]
@@ -456,11 +451,7 @@ mod tests {
             Box::new(RowSample::new(Box::new(Mock { steps, pos: 0 }), &spec(true, 50.0, 123)))
                 as Box<dyn Operator>
         };
-        assert_eq!(
-            drive(mk(false)),
-            drive(mk(true)),
-            "NeedIo をまたいでも結果が変わってはいけない"
-        );
+        assert_eq!(drive(mk(false)), drive(mk(true)), "the result must not change across a NeedIo");
     }
 
     #[test]

@@ -13,33 +13,33 @@ use super::refs::each_child;
 use super::subquery::{and_all, equi_key, split_conjuncts, unify_key_types};
 use super::*;
 
-// --- FROM 句の平坦化 ---------------------------------------------------------
+// --- Flattening the FROM clause ----------------------------------------------
 
-/// FROM に現れる 1 つの関係。
+/// One relation appearing in FROM.
 ///
 /// `pub(super)`: `select::bind_select_in` builds/reads `Rel`s directly
 /// (projection pushdown, `UNNEST` column collection), so the type and every
 /// field it touches must be visible to that sibling submodule.
 pub(super) struct Rel {
-    /// カタログ上のテーブル添字。サブクエリなら `None`。
+    /// The table index in the catalog. `None` for a subquery.
     pub(super) table: Option<usize>,
-    /// 修飾子（別名、無ければテーブル名）。
+    /// The qualifier (the alias, or the table name if there is none).
     pub(super) alias: String,
-    /// 関係が持つ全列。
+    /// Every column the relation has.
     pub(super) all: Vec<Field>,
-    /// 参照される列（`all` 上の添字、昇順・重複なし）。
+    /// The referenced columns (indices into `all`, ascending and without duplicates).
     pub(super) needed: Vec<usize>,
-    /// サブクエリの場合のプラン。
+    /// The plan, for a subquery.
     pub(super) subplan: Option<Node>,
-    /// FROM 句の `UNNEST(expr) AS alias(col)` の `expr`（未束縛の AST 式）。
-    /// `Some` のときは他のフィールドは「1 列だけのダミーの関係」の形だけ
-    /// 整えてあり（`table`/`subplan` は使わない）、実プランは `build_tree` が
-    /// 左の兄弟ノードをラップして特別に組み立てる（LATERAL 相当。
-    /// `flatten_from`/`build_tree` の該当コメント参照）。
+    /// The `expr` of a FROM-clause `UNNEST(expr) AS alias(col)` (an unbound AST expression).
+    /// When `Some`, the other fields are only shaped as a "dummy one-column relation"
+    /// (`table`/`subplan` are unused), and the real plan is assembled specially by
+    /// `build_tree` wrapping the left sibling node (the LATERAL equivalent; see the
+    /// corresponding comments in `flatten_from`/`build_tree`).
     pub(super) unnest: Option<ExprId>,
 }
 
-/// FROM の木構造。葉は `rels` の添字。
+/// The tree structure of FROM. Leaves are indices into `rels`.
 ///
 /// `pub(super)`: matched directly by `refs::collect_join_refs`.
 pub(super) enum FromTree {
@@ -48,7 +48,7 @@ pub(super) enum FromTree {
 }
 
 impl FromTree {
-    /// 木に外部結合が 1 つでも含まれるか。述語の押し下げ可否の判定に使う。
+    /// Whether the tree contains at least one outer join. Used to decide whether predicates may be pushed down.
     pub(super) fn has_outer_join(&self) -> bool {
         match self {
             FromTree::Rel(_) => false,
@@ -74,15 +74,15 @@ pub(super) fn flatten_from(
     ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
     match from {
         FromItem::Table { name, alias } => {
-            // CTE を先に見る。同名のテーブルより CTE が優先される（SQL 標準）。
+            // CTEs are checked first. A CTE wins over a table of the same name (per the SQL standard).
             if let Some(k) = ctes.find(name) {
                 let (resolved, all) = ctes.resolve(k)?;
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
                 let subplan = match resolved {
                     ResolvedCte::Plan(node) => *node,
-                    // 再帰 CTE 自身の再帰項からの自己参照。実データは持たず、
-                    // 実行時に `RecursiveCte` オペレータが直前イテレーションの
-                    // 新規行を差し込む（`exec::recursive` 参照）。
+                    // A self-reference from a recursive CTE's own recursive term. It carries
+                    // no real data; at runtime the `RecursiveCte` operator feeds in the
+                    // previous iteration's new rows (see `exec::recursive`).
                     ResolvedCte::WorkingTable => Node::WorkingTable { schema: all.clone() },
                 };
                 rels.push(Rel {
@@ -103,9 +103,8 @@ pub(super) fn flatten_from(
                     rels,
                 );
             }
-            // ファイルテーブルに無ければインメモリ表・ビューを見る
-            // （`ddl` フィーチャのみ）。優先順位: CTE > ファイルテーブル >
-            // インメモリ表 > ビュー。
+            // If not among the file tables, in-memory tables and views are checked
+            // (`ddl` feature only). Priority: CTE > file table > in-memory table > view.
             #[cfg(feature = "ddl")]
             {
                 if let Some(i) = catalog.mem_index_of(name) {
@@ -136,10 +135,10 @@ pub(super) fn flatten_from(
             push_table_rel(catalog, i, alias.clone().unwrap_or_else(|| path.clone()), rels)
         }
         FromItem::Subquery { query, alias } => {
-            // FROM 句の派生表は外側スコープに相関できない（LATERAL 未対応）。
+            // A FROM-clause derived table cannot correlate with the outer scope (LATERAL is unsupported).
             let plan = bind_query_in(catalog, arena, query, params, ctes, None)?;
             let all = plan.root.schema().to_vec();
-            // 別名の無い派生表は修飾して参照できないが、無修飾の参照は通す。
+            // A derived table without an alias cannot be referenced with a qualifier, but unqualified references pass.
             let alias = alias.clone().unwrap_or_default();
             rels.push(Rel {
                 table: None,
@@ -157,12 +156,12 @@ pub(super) fn flatten_from(
             Ok(FromTree::Join { left: Box::new(l), right: Box::new(r), kind: *kind, on: *on })
         }
         FromItem::Unnest { expr, alias, column_alias } => {
-            // 暗黙 LATERAL: `expr` は左の兄弟がここまでに積んだ列だけを
-            // 参照できる。`rels` はここまでの兄弟を左から順に持つので、
-            // その時点の `full_scope` がちょうど「見えてよい範囲」になる
-            // （`build_tree` が実際に組み立てるときも同じスコープを
-            // 再現する。射影プッシュダウンの都合で列の並びは変わりうるが、
-            // 列は名前で解決するので影響しない）。
+            // Implicit LATERAL: `expr` may reference only the columns the left siblings have
+            // contributed so far. `rels` holds the siblings so far in left-to-right order, so
+            // the `full_scope` at that moment is exactly "the range that may be visible"
+            // (`build_tree` reproduces the same scope when it actually assembles things.
+            // Column order may change due to projection pushdown, but columns are resolved by
+            // name, so that does not matter).
             let scope_so_far = full_scope(rels);
             let ty = compile(arena, &scope_so_far, params, *expr)?.result_ty;
             ensure!(ty == Ty::Json, TypeMismatch);
@@ -181,15 +180,15 @@ pub(super) fn flatten_from(
             Ok(FromTree::Rel(rels.len() - 1))
         }
         FromItem::GenerateSeries { start, stop, step, inclusive, alias, column_alias } => {
-            // `step == 0` は `duckdb` も束縛時エラーにする
-            // （"Binder Error: interval cannot be 0!"、`duckdb` CLI で確認済み）。
+            // `step == 0` is a bind-time error in `duckdb` too
+            // ("Binder Error: interval cannot be 0!", confirmed with the `duckdb` CLI).
             ensure!(*step != 0, DivideByZero);
             let name = column_alias.clone().unwrap_or_else(|| {
                 String::from(if *inclusive { "generate_series" } else { "range" })
             });
-            // `duckdb` の `DESCRIBE` は BIGINT 列を NULL 許容として報告する
-            // （実際には NULL を生まないが、宣言上は緩めておく。`Unnest` の
-            // 展開要素と同じ判断）。
+            // `duckdb`'s `DESCRIBE` reports the BIGINT column as nullable (it never actually
+            // produces NULL, but the declaration is left loose -- the same judgment as
+            // `Unnest`'s expanded element).
             let all = vec![Field::new(name, Ty::BigInt, true)];
             let node = Node::GenerateSeries {
                 start: *start,
@@ -222,7 +221,7 @@ fn push_table_rel(
         Some(t) => t,
         None => err!(TableNotFound),
     };
-    // 呼び出し側がスキーマを解決してから来る約束。
+    // By contract the caller resolves the schema before getting here.
     ensure!(t.is_resolved(), Internal);
     rels.push(Rel {
         table: Some(i),
@@ -235,10 +234,10 @@ fn push_table_rel(
     Ok(FromTree::Rel(rels.len() - 1))
 }
 
-/// `catalog::MemTable` を `Rel` として差し込む。ファイルテーブルと違い、
-/// スキャンそのものを `Node::MemScan` という「サブプラン」として持たせる
-/// （`Rel::subplan` は元々 CTE/派生表用の仕組みだが、そのまま流用できる）。
-/// 射影プッシュダウンはしない（全列を出す。`MemScanSpec` のドキュメント参照）。
+/// Inserts a `catalog::MemTable` as a `Rel`. Unlike a file table, the scan itself is carried
+/// as a "subplan", `Node::MemScan` (`Rel::subplan` was originally a mechanism for CTEs and
+/// derived tables, but it can be reused as is).
+/// There is no projection pushdown (every column is emitted; see the `MemScanSpec` docs).
 #[cfg(feature = "ddl")]
 fn push_mem_table_rel(
     catalog: &Catalog,
@@ -263,10 +262,9 @@ fn push_mem_table_rel(
     Ok(FromTree::Rel(rels.len() - 1))
 }
 
-/// `CREATE VIEW` で登録された生 SQL を再パース・再束縛して `Rel` として
-/// 差し込む。ビューは実体を持たないので、参照されるたびに毎回この処理を
-/// 行う（キャッシュしない。テーブルが小さく、ビューの再参照も稀な想定の
-/// ための単純化）。
+/// Reparses and rebinds the raw SQL registered by `CREATE VIEW` and inserts it as a `Rel`.
+/// A view has no substance, so this happens on every reference (no caching -- a
+/// simplification assuming tables are small and re-referencing a view is rare).
 #[cfg(feature = "ddl")]
 fn push_view_rel(
     catalog: &Catalog,
@@ -287,9 +285,9 @@ fn push_view_rel(
         _ => err!(Internal),
     };
     ctes.view_depth += 1;
-    // `ctes` を使い回すのは既存の派生表と同じ流儀（`FromItem::Subquery` 参照）。
-    // ビュー本体から外側の CTE 名がたまたま同名で見えてしまう可能性はあるが、
-    // ビューが CTE 名と衝突する実利用はまず無いので割り切っている。
+    // Reusing `ctes` follows the same style as existing derived tables (see `FromItem::Subquery`).
+    // An outer CTE name could coincidentally become visible from a view body, but a real use
+    // where a view collides with a CTE name is unlikely, so this is accepted.
     let plan = bind_query_in(catalog, &parsed.arena, &q, params, ctes, None);
     ctes.view_depth -= 1;
     let plan = plan?;
@@ -305,7 +303,7 @@ fn push_view_rel(
     Ok(FromTree::Rel(rels.len() - 1))
 }
 
-/// 関係の並びから全列のスコープを作る。
+/// Builds the scope of all columns from a sequence of relations.
 pub(super) fn full_scope(rels: &[Rel]) -> Scope {
     let mut s = Scope::new();
     for r in rels {
@@ -316,7 +314,7 @@ pub(super) fn full_scope(rels: &[Rel]) -> Scope {
     s
 }
 
-/// `needed` を反映した絞り込み後のスコープ。
+/// The narrowed scope reflecting `needed`.
 pub(super) fn narrow_scope(rels: &[Rel]) -> Scope {
     let mut s = Scope::new();
     for r in rels {
@@ -335,7 +333,7 @@ fn qual_of(r: &Rel) -> Option<String> {
     }
 }
 
-/// 絞り込み後スコープでの、各関係の列範囲 `[start, end)`。
+/// Each relation's column range `[start, end)` in the narrowed scope.
 pub(super) fn rel_ranges(rels: &[Rel]) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(rels.len());
     let mut off = 0;
@@ -346,7 +344,7 @@ pub(super) fn rel_ranges(rels: &[Rel]) -> Vec<(usize, usize)> {
     out
 }
 
-// --- 木の構築 ----------------------------------------------------------------
+// --- Building the tree -------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_tree(
@@ -362,17 +360,17 @@ pub(super) fn build_tree(
     ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
     match tree {
         FromTree::Rel(i) => {
-            // FROM 句の `UNNEST` は独立した関係を持たない（`Rel::unnest` の
-            // ドキュメント参照）。ここに来るのは、`FromTree::Join` 側の特別
-            // 分岐（下記）を経ずに `UNNEST` が単独 (`FROM UNNEST(...)`) や
-            // JOIN の左側に置かれた場合 ―― 対応範囲外として明確に拒否する。
+            // A FROM-clause `UNNEST` has no independent relation (see the `Rel::unnest` docs).
+            // Reaching here means `UNNEST` was placed alone (`FROM UNNEST(...)`) or on the
+            // left of a JOIN, without going through the special `FromTree::Join` branch below
+            // -- explicitly rejected as out of scope.
             ensure!(rels[*i].unnest.is_none(), UnsupportedFeature);
             let (start, end) = ranges[*i];
-            // この関係だけを見るスコープ。押し下げた述語はここで評価する。
+            // A scope seeing only this relation. Pushed-down predicates are evaluated here.
             let rel_scope = sub_scope(scope, start, end);
 
             let mut node = match rels[*i].subplan.take() {
-                // 派生表はそのままプランを差し込む。列は既に確定している。
+                // A derived table's plan is inserted as is. Its columns are already settled.
                 Some(p) => p,
                 None => {
                     let table = match rels[*i].table {
@@ -398,10 +396,10 @@ pub(super) fn build_tree(
             Ok(node)
         }
         FromTree::Join { left, right, kind, on } => {
-            // FROM 句の `UNNEST` は独立した関係ではなく、左の兄弟が生む行
-            // ごとに配列を展開する LATERAL 相当の演算。対称な `Node::Join`
-            // には落とせないので、右が `UNNEST` 関係なら特別に組み立てる
-            // （`Rel::unnest`/`FromItem::Unnest` のドキュメント参照）。
+            // A FROM-clause `UNNEST` is not an independent relation but a LATERAL-equivalent
+            // operation expanding an array per row produced by the left sibling. It cannot be
+            // lowered to a symmetric `Node::Join`, so if the right side is an `UNNEST` relation
+            // it is assembled specially (see the `Rel::unnest`/`FromItem::Unnest` docs).
             if let FromTree::Rel(ri) = right.as_ref() {
                 if let Some(arg) = rels[*ri].unnest {
                     ensure!(*kind == JoinKind::Cross && on.is_none(), UnsupportedFeature);
@@ -434,7 +432,7 @@ pub(super) fn build_tree(
             let lw = ln.schema().len();
             let rw = rn.schema().len();
 
-            // 結合の入出力スコープ。左のスキーマ ++ 右のスキーマ。
+            // The join's input/output scope. The left schema ++ the right schema.
             let lspan = leaf_span(ranges, left)?;
             let rspan = leaf_span(ranges, right)?;
             let lscope = sub_scope(scope, lspan.0, lspan.1);
@@ -484,7 +482,7 @@ pub(super) fn build_tree(
     }
 }
 
-/// 部分木が占めるスコープ上の範囲。葉は連続して並んでいる前提。
+/// The scope range a subtree occupies, assuming leaves are laid out contiguously.
 fn leaf_span(ranges: &[(usize, usize)], t: &FromTree) -> Result<(usize, usize)> {
     match t {
         FromTree::Rel(i) => match ranges.get(*i) {
@@ -507,7 +505,7 @@ fn sub_scope(scope: &Scope, start: usize, end: usize) -> Scope {
     s
 }
 
-/// FROM 句からテーブル添字を得る（`DESCRIBE` 用）。
+/// Gets the table index from a FROM clause (for `DESCRIBE`).
 pub fn resolve_from(catalog: &Catalog, from: &FromItem) -> Result<usize> {
     match from {
         FromItem::Table { name, .. } => match catalog.index_of(name) {
@@ -518,8 +516,8 @@ pub fn resolve_from(catalog: &Catalog, from: &FromItem) -> Result<usize> {
             Some(i) => Ok(i),
             None => err!(TableNotFound),
         },
-        // `GenerateSeries` はカタログに実体を持たない計算だけのソースなので、
-        // `DESCRIBE` が期待する「テーブル添字」を返しようがない。
+        // `GenerateSeries` is a compute-only source with no substance in the catalog, so there
+        // is no way to return the "table index" `DESCRIBE` expects.
         FromItem::Join { .. }
         | FromItem::Subquery { .. }
         | FromItem::Unnest { .. }
@@ -529,7 +527,7 @@ pub fn resolve_from(catalog: &Catalog, from: &FromItem) -> Result<usize> {
     }
 }
 
-/// クエリ木の中で参照されるテーブルを集める。
+/// Collects the tables referenced within a query tree.
 ///
 /// This must find *every* table the query will end up binding against,
 /// including ones that only appear inside a subquery in an expression
@@ -569,7 +567,7 @@ fn referenced_in_set_expr(
     match e {
         SetExpr::Select(s) => {
             if let Some(f) = &s.from {
-                // CTE 名はカタログに無いので、見つからなくても後段のバインドに任せる。
+                // CTE names are not in the catalog, so not finding one is left to the later binding.
                 let _ = referenced_tables_at(catalog, arena, f, out, d);
             }
             // Every expression position of the SELECT can host a subquery.
@@ -609,7 +607,7 @@ fn referenced_in_set_expr(
     }
 }
 
-/// 式の中のサブクエリが参照するテーブルを集める。
+/// Collects the tables referenced by subqueries inside an expression.
 ///
 /// Deliberately *not* built on `refs::each_child`, which stops at a
 /// subquery boundary (correct for scope resolution — the inside of a
@@ -645,7 +643,7 @@ fn referenced_in_expr(
     }
 }
 
-/// SQL が参照するテーブルをすべて集める。スキーマ解決の対象を知るために使う。
+/// Collects every table the SQL references. Used to know what schemas to resolve.
 pub fn referenced_tables(
     catalog: &Catalog,
     arena: &ExprArena,
@@ -695,13 +693,13 @@ fn referenced_tables_at(
         FromItem::Subquery { query, .. } => {
             referenced_in_query(catalog, arena, query, out, depth + 1)
         }
-        // `expr` の列参照が指すテーブルは必ず左の兄弟が別の `FromItem` として
-        // 持つ（暗黙 LATERAL の制約、`FromItem::Unnest` のドキュメント参照）
-        // ので、そこからは新たに解決が要るテーブルは出てこない。ただし
-        // `UNNEST((SELECT ...))` のようにサブクエリを含みうるので、式自体は
-        // 走査する。
+        // The tables that `expr`'s column references point at are always held by a left sibling
+        // as a separate `FromItem` (the implicit-LATERAL constraint; see the
+        // `FromItem::Unnest` docs), so no newly resolvable table comes from there. It may
+        // still contain a subquery, as in `UNNEST((SELECT ...))`, so the expression itself is
+        // walked.
         FromItem::Unnest { expr, .. } => referenced_in_expr(catalog, arena, *expr, out, depth + 1),
-        // カタログを経由しない計算だけのソースなので、解決が要るテーブルは無い。
+        // A compute-only source that bypasses the catalog, so there is no table to resolve.
         FromItem::GenerateSeries { .. } => Ok(()),
     }
 }

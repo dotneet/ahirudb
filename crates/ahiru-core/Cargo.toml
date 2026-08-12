@@ -8,45 +8,45 @@ license.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [features]
-# ネイティブ開発・テスト時のみ std を有効化する。
-# wasm ビルドは --no-default-features で no_std + Parquet のみになる。
+# std is enabled only for native development and testing.
+# wasm builds use --no-default-features, leaving no_std + Parquet only.
 default = ["std", "csv", "jsonl", "zstd"]
 std = ["ahiru-zstd?/std"]
-# 追加フォーマットはフィーチャで切る。Parquet だけの配布物を最小に保つため
-# （DESIGN.md §3 のサイズ予算）。
+# Extra formats are feature-gated, to keep a Parquet-only artifact as small
+# as possible (the size budget in DESIGN.md §3).
 csv = []
 jsonl = []
-# ZSTD 展開を `ahiru-zstd` をライブラリとしてリンクして内蔵する。
-# 展開結果が 13 KB 程度（1 MiB 予算の 1.3%）に収まるため、GZIP/ZSTD を
-# 常にホスト委譲していた旧設計から変更し、既定で内蔵にしてある
-# （DESIGN.md §6）。外すと従来どおりホスト（JS の別 wasm モジュール読み込み）
-# に委譲する経路にフォールバックする。
+# Builds ZSTD decompression in by linking `ahiru-zstd` as a library.
+# It costs roughly 13 KB (1.3% of the 1 MiB budget), so this replaces the
+# older design that always delegated GZIP/ZSTD to the host; built in by
+# default now (DESIGN.md §6). Turning it off falls back to the delegation
+# path, where the host (JS) loads a separate wasm module as before.
 zstd = ["dep:ahiru-zstd"]
 
-# --- 更新系（オプトアウト可能） ------------------------------------------
-# 既定で無効。読み取り専用の Source モデル（DESIGN.md §6, §15）には一切
-# 触れない設計にしてある。フィーチャを外せば該当コードごと wasm から
-# 消える（scripts/size.sh が構成ごとの増分を毎回報告する）。
+# --- Mutating features (opt-out capable) ---------------------------------
+# Disabled by default. They are designed to never touch the read-only Source
+# model (DESIGN.md §6, §15). Dropping a feature drops the corresponding code
+# out of the wasm entirely (scripts/size.sh reports the delta per config).
 #
 # - export          : COPY (SELECT ...) TO 'x.csv'/'x.jsonl'
-# - export-parquet  : 同、Parquet 出力（Thrift シリアライザが要るぶん重い）
+# - export-parquet  : same, for Parquet output (heavier: needs the Thrift serializer)
 # - ddl             : CREATE TABLE / CREATE TABLE AS / DROP TABLE / CREATE VIEW
-#                      （読み取り専用の Source モデルとは別系統の、可変な
-#                      インメモリテーブルにのみ効く。メモリ上のみ、非永続）
-# - dml             : INSERT / UPDATE / DELETE。`ddl` が作るインメモリ
-#                      テーブルにしか効かないので `ddl` を暗黙に含む
-#                      （DESIGN.md §16「DDL/DML の設計」参照）。
+#                      (applies only to mutable in-memory tables, a separate
+#                      lineage from the read-only Source model; in-memory, non-persistent)
+# - dml             : INSERT / UPDATE / DELETE. Only applies to the in-memory
+#                      tables `ddl` creates, so it implies `ddl`
+#                      (see "DDL/DML design" in DESIGN.md §16).
 export = []
 export-parquet = ["export"]
 ddl = []
 dml = ["ddl"]
 
 [dependencies]
-# 依存クレートは原則ゼロ。追加時は wasm サイズの実測値を PR に添付すること。
-# ahiru-zstd は唯一の例外（ワークスペース内クレート、`zstd` フィーチャで
-# 切れる）。`standalone` は付けない — `ahiru-core` 側のグローバルアロケータ/
-# パニックハンドラ/wasm ABI と重複するのを避けるため（両クレートの
-# `rt.rs`/`lib.rs` のコメント参照）。
+# Zero dependencies as a rule. When adding one, attach measured wasm sizes to the PR.
+# ahiru-zstd is the sole exception (in-workspace crate, gated by the `zstd`
+# feature). Do not enable `standalone` -- that would duplicate the global
+# allocator / panic handler / wasm ABI that `ahiru-core` already defines
+# (see the comments in both crates' `rt.rs`/`lib.rs`).
 ahiru-zstd = { path = "../ahiru-zstd", default-features = false, optional = true }
 
 [lints.rust]

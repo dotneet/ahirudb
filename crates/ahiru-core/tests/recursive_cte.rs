@@ -1,30 +1,29 @@
-//! `WITH RECURSIVE`（再帰 CTE）の統合テスト。
+//! Integration tests for `WITH RECURSIVE` (recursive CTEs).
 //!
-//! このエンジンは `SELECT 1`（FROM 無し）を v1 の対象外としている
-//! （`plan::bind::bind_select_in` 参照）ので、リテラルだけのアンカーは
-//! `dual`（1 行だけの CSV バイト列で作った、Oracle の `DUAL` 相当のダミー
-//! 表）を経由する。`csv` フィーチャは既定で有効なので、`ddl`/`dml` フィーチャ
-//! を要らず `cargo test --workspace` がそのまま拾う。期待値はすべて
-//! `duckdb -c "..."` の実際の出力と突き合わせて決めている。
+//! This engine excludes `SELECT 1` (with no `FROM`) from v1's scope
+//! (see `plan::bind::bind_select_in`), so a literal-only anchor goes through
+//! `dual` (a dummy table equivalent to Oracle's `DUAL`, built from a single-row CSV byte
+//! string). The `csv` feature is enabled by default, so this is picked up as-is by
+//! `cargo test --workspace` without needing the `ddl`/`dml` features. All expected values
+//! are decided by cross-checking against the actual output of `duckdb -c "..."`.
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::session::{Prepared, QueryStep, Session};
 use ahiru_core::vector::Value;
 use ahiru_core::FormatKind;
 
-/// `dual` テーブル（1 行 1 列、値は使わない）を登録したセッション。
-/// リテラルだけのアンカー（`SELECT 0, 0, 1 FROM dual` のように）を FROM 句
-/// 付きにするためだけに使う。
+/// A session with the `dual` table (1 row, 1 column, value unused) registered. Used only to
+/// give a literal-only anchor (like `SELECT 0, 0, 1 FROM dual`) a FROM clause.
 fn session_with_dual() -> Session {
     let mut s = Session::new();
     s.register_bytes_as("dual", b"x\n1\n".to_vec(), FormatKind::Csv).unwrap();
     s
 }
 
-/// `nodes(id, parent_id, name)` を 4 行のツリー構造（`root` の下に
-/// `child1`/`child2`、`child1` の下に `grandchild`）で登録したセッション。
-/// CSV の型推定で `id`/`parent_id` は `BIGINT` になる（`format::csv` の
-/// 整数推定規則）。
+/// A session with `nodes(id, parent_id, name)` registered as a 4-row tree structure
+/// (`child1`/`child2` under `root`, `grandchild` under `child1`). Under CSV type
+/// inference, `id`/`parent_id` become `BIGINT` (per `format::csv`'s integer-inference
+/// rule).
 fn session_with_nodes() -> Session {
     let mut s = Session::new();
     let csv = b"id,parent_id,name\n1,,root\n2,1,child1\n3,1,child2\n4,2,grandchild\n".to_vec();
@@ -32,9 +31,9 @@ fn session_with_nodes() -> Session {
     s
 }
 
-/// `sql` を実行し、結果を `Vec<Vec<Value>>` として取り出す。
-/// バイト列に丸ごと乗っているデータしか読まないので `NeedIo`/`NeedCodec` は
-/// 絶対に起きない。
+/// Runs `sql` and extracts the result as `Vec<Vec<Value>>`.
+/// Since it only reads data that fits entirely in a byte string, `NeedIo`/`NeedCodec` never
+/// occur.
 fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     let mut q = match session.prepare(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
         Prepared::Ready(q) => q,
@@ -69,7 +68,7 @@ fn s(v: &str) -> Value {
 }
 const NULL: Value = Value::Null;
 
-// --- 数列生成（フィボナッチ） -------------------------------------------------
+// --- Sequence generation (Fibonacci) --------------------------------------------
 
 /// duckdb:
 /// ```sql
@@ -81,7 +80,7 @@ const NULL: Value = Value::Null;
 /// SELECT * FROM fib;
 /// ```
 /// 0,0,1 / 1,1,1 / 2,1,2 / 3,2,3 / 4,3,5 / 5,5,8 / 6,8,13 / 7,13,21 /
-/// 8,21,34 / 9,34,55 / 10,55,89 の 11 行。
+/// 8,21,34 / 9,34,55 / 10,55,89 -- 11 rows total.
 #[test]
 fn fibonacci_union_all() {
     let mut db = session_with_dual();
@@ -112,9 +111,9 @@ fn fibonacci_union_all() {
     );
 }
 
-/// 単純な連番。`n < 5` を渡すたびに 1 行ずつ増える一番素朴な形。
+/// A simple counter. The most basic form, growing by one row each time `n < 5` passes.
 /// duckdb: `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t
-/// WHERE n < 5) SELECT * FROM t` → 1..5。
+/// WHERE n < 5) SELECT * FROM t` -> 1..5.
 #[test]
 fn simple_counter_union_all() {
     let mut db = session_with_dual();
@@ -127,10 +126,10 @@ fn simple_counter_union_all() {
     assert_eq!(rows, vec![vec![i32(1)], vec![i32(2)], vec![i32(3)], vec![i32(4)], vec![i32(5)]]);
 }
 
-// --- 階層データ（自己結合） ---------------------------------------------------
+// --- Hierarchical data (self-join) --------------------------------------------
 
-/// `nodes` は実テーブル（`session_with_nodes` 参照）、`tree` がそれと自分
-/// 自身を JOIN して根から順にたどる。duckdb:
+/// `nodes` is a real table (see `session_with_nodes`), and `tree` JOINs it with itself to
+/// walk from the root downward. duckdb:
 /// ```sql
 /// WITH RECURSIVE tree AS (
 ///     SELECT id, parent_id, name FROM nodes WHERE parent_id IS NULL
@@ -162,13 +161,13 @@ fn hierarchy_self_join() {
     );
 }
 
-// --- UNION（重複排除） ---------------------------------------------------------
+// --- UNION (dedup) --------------------------------------------------------------
 
-/// `UNION`（`ALL` 無し）は全イテレーションを通して重複を除く。`n % 3 + 1` は
-/// 1→2→3→1→2→3… と巡回するので、`UNION ALL` なら無限に続くが `UNION` なら
-/// 3 回目で既出の行しか出さず不動点に達して止まる。
+/// `UNION` (without `ALL`) removes duplicates across all iterations. `n % 3 + 1` cycles
+/// 1->2->3->1->2->3..., so `UNION ALL` would go on forever, but `UNION` only produces
+/// already-seen rows by the 3rd iteration, reaching a fixed point and stopping.
 /// duckdb: `WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT (n % 3) + 1 FROM t)
-/// SELECT * FROM t ORDER BY n` → 1,2,3。
+/// SELECT * FROM t ORDER BY n` -> 1,2,3.
 #[test]
 fn union_distinct_dedups_across_iterations_and_terminates() {
     let mut db = session_with_dual();
@@ -181,9 +180,9 @@ fn union_distinct_dedups_across_iterations_and_terminates() {
     assert_eq!(rows, vec![vec![i32(1)], vec![i32(2)], vec![i32(3)]]);
 }
 
-// --- 列名指定 -----------------------------------------------------------------
+// --- Column naming --------------------------------------------------------------
 
-/// `WITH RECURSIVE` の下では非再帰 CTE にも列名リストを付けられる。
+/// Under `WITH RECURSIVE`, a column-name list can also be attached to a non-recursive CTE.
 #[test]
 fn column_list_applies_to_non_recursive_member_too() {
     let mut db = session_with_dual();
@@ -196,10 +195,10 @@ fn column_list_applies_to_non_recursive_member_too() {
     assert_eq!(rows, vec![vec![i32(1)], vec![i32(2)], vec![i32(3)]]);
 }
 
-// --- 安全弁 --------------------------------------------------------------------
+// --- Safety valve -----------------------------------------------------------------
 
-/// 停止条件を書き忘れた再帰 CTE（`WHERE` が無いので毎回 1 行ずつ無限に
-/// 増える）は、パニックせず `RecursionLimitExceeded` で止まる。
+/// A recursive CTE where forgetting the stop condition (no `WHERE`, so it grows by one row
+/// forever each time) does not panic; instead, it stops with `RecursionLimitExceeded`.
 #[test]
 fn runaway_recursion_is_rejected_not_panicking() {
     let mut db = session_with_dual();
@@ -227,12 +226,13 @@ fn runaway_recursion_is_rejected_not_panicking() {
     assert_eq!(last, Code::RecursionLimitExceeded);
 }
 
-/// 1行あたりの増分が一定ではなく、幾何級数的に膨張する再帰 CTE（毎回 10 倍）
-/// は `MAX_RECURSIVE_ITERATIONS`（10万回）に達するよりずっと早く、作業集合の
-/// バイト数上限（`MAX_WORKING_BYTES`）で `Oom` になるはず。
-/// `RecursiveCte::process` はバッチ単位でこの上限を見ているので、
-/// 最終的に天文学的な行数になる結合を最後まで実体化させずに途中で
-/// 打ち切れることも合わせて確認する（テストが長時間かからないことがその証拠）。
+/// A recursive CTE whose per-row growth is not constant but expands geometrically (10x each
+/// time) should hit `Oom` from the working-set byte limit (`MAX_WORKING_BYTES`) far sooner
+/// than reaching `MAX_RECURSIVE_ITERATIONS` (100,000 iterations).
+/// `RecursiveCte::process` checks this limit on a per-batch basis, so also verify that a
+/// join that would eventually produce an astronomical row count can be cut off partway
+/// through without ever being fully materialized (the test not taking a long time is the
+/// evidence of that).
 #[test]
 fn geometric_growth_hits_the_working_set_byte_limit_not_the_iteration_limit() {
     let mut db = session_with_dual();
@@ -258,19 +258,19 @@ fn geometric_growth_hits_the_working_set_byte_limit_not_the_iteration_limit() {
     let last = loop {
         match db.step(&mut q) {
             Ok(QueryStep::Batch(_)) => {}
-            Ok(QueryStep::Done) => panic!("幾何級数的な膨張はどこかで Oom になるべき"),
+            Ok(QueryStep::Done) => panic!("geometric growth should hit Oom somewhere"),
             Ok(QueryStep::NeedIo(_)) | Ok(QueryStep::NeedCodec(_)) => {
                 panic!("unexpected NeedIo/NeedCodec")
             }
             Err(e) => break e.code,
         }
     };
-    assert_eq!(last, Code::Oom, "反復回数上限より先にバイト数上限で止まるべき");
+    assert_eq!(last, Code::Oom, "must stop at the byte limit before the iteration limit");
 }
 
-/// 2 つの独立した再帰 CTE を同じクエリ内で同時に使う。それぞれの
-/// `WorkingTable` の差し替えが正しい方の CTE に対応しないと、値が
-/// 混線したり無限ループになったりするはず。
+/// Uses two independent recursive CTEs at the same time in the same query. If the
+/// `WorkingTable` swap for each doesn't correspond to the right CTE, values should get
+/// crossed or it should loop forever.
 #[test]
 fn two_independent_recursive_ctes_in_the_same_query_do_not_cross_contaminate() {
     let mut db = session_with_dual();
@@ -284,11 +284,11 @@ fn two_independent_recursive_ctes_in_the_same_query_do_not_cross_contaminate() {
     assert_eq!(rows, vec![vec![i32(1), i32(100)], vec![i32(2), i32(101)], vec![i32(3), i32(102)],]);
 }
 
-// --- 束縛時に明確に拒否するパターン -------------------------------------------
+// --- Patterns explicitly rejected at bind time -----------------------------------
 
-/// `WITH RECURSIVE` でも、自分自身を参照する CTE の本体が
-/// `<anchor> UNION [ALL] <recursive_term>` の形になっていなければ拒否する
-/// （例: 自己参照がアンカー側にある）。
+/// Even under `WITH RECURSIVE`, a CTE body that references itself is rejected unless it has
+/// the form `<anchor> UNION [ALL] <recursive_term>`
+/// (e.g. the self-reference is on the anchor side).
 #[test]
 fn self_reference_in_anchor_is_rejected() {
     let mut db = Session::new();
@@ -299,8 +299,8 @@ fn self_reference_in_anchor_is_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
-/// 列名リストの列数が本体と合わなければ明確に拒否する（アンカーが 1 列しか
-/// 出さないのに `t(a, b)` と 2 列指定している）。
+/// Rejected clearly when the column-name list's column count doesn't match the body (the
+/// anchor produces only 1 column, but `t(a, b)` specifies 2).
 #[test]
 fn column_list_arity_mismatch_is_rejected() {
     let mut db = session_with_dual();

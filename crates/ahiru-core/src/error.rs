@@ -1,17 +1,17 @@
-//! エラーは数値コードで表現する。
+//! Errors are expressed as numeric codes.
 //!
-//! `core::fmt` を一切引かないのが目的。メッセージ文字列は JS ホスト側
-//! (`js/errors.js`) のテーブルで生成する。`std` フィーチャ有効時のみ、
-//! ネイティブデバッグ用の文字列テーブルをリンクする。
+//! The goal is to never pull in `core::fmt`. Message strings are produced by the
+//! table on the JS host side (`js/errors.js`). A string table for native debugging
+//! is linked only when the `std` feature is on.
 
-/// エラーコード。JS 側のテーブルと 1:1 で対応するので、既存の値は変更しない。
-// Debug は std ビルド (ネイティブのテスト) でだけ導出する。
-// wasm ビルドで導出すると core::fmt がリンクされ、数十 KB を失う。
+/// Error codes. These map 1:1 to the table on the JS side, so existing values never change.
+// Debug is derived only in std builds (native tests).
+// Deriving it in wasm builds links core::fmt and costs tens of KB.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 #[repr(u16)]
 pub enum Code {
-    // 1xx: 入力バイト列の破損
+    // 1xx: corrupt input bytes
     UnexpectedEof = 100,
     BadMagic = 101,
     BadThrift = 102,
@@ -21,21 +21,21 @@ pub enum Code {
     BadCompressedData = 106,
     ChecksumMismatch = 107,
 
-    // 2xx: 未対応の Parquet 機能
+    // 2xx: unsupported Parquet features
     UnsupportedEncoding = 200,
     UnsupportedCodec = 201,
     UnsupportedType = 202,
     UnsupportedNested = 203,
     EncryptionUnsupported = 204,
 
-    // 3xx: SQL 構文
+    // 3xx: SQL syntax
     SyntaxError = 300,
     UnexpectedToken = 301,
     UnterminatedString = 302,
     NumberOverflow = 303,
     ExpressionTooDeep = 304,
 
-    // 4xx: 束縛・意味解析
+    // 4xx: binding and semantic analysis
     TableNotFound = 400,
     ColumnNotFound = 401,
     AmbiguousColumn = 402,
@@ -47,36 +47,36 @@ pub enum Code {
     NotGrouped = 408,
     UnsupportedFeature = 409,
     DuplicateTable = 410,
-    /// INSERT の値の個数が列の個数と合わない（`ddl`/`dml`）。
+    /// The number of values in an INSERT does not match the number of columns (`ddl`/`dml`).
     ColumnCountMismatch = 411,
-    /// Parquet/CSV/JSONL 由来の読み取り専用テーブルに DDL/DML を試みた
-    /// （`ddl`/`dml`）。
+    /// DDL/DML was attempted against a read-only table backed by Parquet/CSV/JSONL
+    /// (`ddl`/`dml`).
     ReadOnlyTable = 412,
-    /// `ALTER TABLE ... ADD COLUMN`/`RENAME COLUMN` の結果、列名が同一表内で
-    /// 重複する（`ddl`）。
+    /// `ALTER TABLE ... ADD COLUMN`/`RENAME COLUMN` would leave duplicate column
+    /// names within one table (`ddl`).
     DuplicateColumn = 413,
 
-    // 5xx: 実行時
+    // 5xx: runtime
     Oom = 500,
     LimitExceeded = 501,
     DivideByZero = 502,
     ValueOutOfRange = 503,
     IoFailed = 504,
-    /// `WITH RECURSIVE` の不動点反復が上限回数に達した（`exec::recursive`
-    /// の `MAX_RECURSIVE_ITERATIONS`）。終端しない再帰 CTE を有限時間で
-    /// 確実に止めるための安全弁。
+    /// The fixed-point iteration of `WITH RECURSIVE` hit the iteration cap
+    /// (`MAX_RECURSIVE_ITERATIONS` in `exec::recursive`). A safety valve that
+    /// reliably stops a non-terminating recursive CTE in finite time.
     RecursionLimitExceeded = 505,
 
-    // 9xx: 内部矛盾（バグ）
+    // 9xx: internal inconsistency (bug)
     Internal = 900,
 }
 
-/// エラー本体。16 バイトに収まるようにしておく。
+/// The error itself. Kept within 16 bytes.
 #[derive(Clone, Copy)]
 pub struct Error {
     pub code: Code,
-    /// 意味はコードごと。SQL エラーなら入力文字列上のバイト位置、
-    /// Parquet エラーならファイル/バッファ上のオフセット。
+    /// The meaning depends on the code: a byte position in the input string for SQL
+    /// errors, or an offset into the file/buffer for Parquet errors.
     pub pos: u32,
 }
 
@@ -99,7 +99,7 @@ impl Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// `Err(Error::new(code))` の短縮形。
+/// Shorthand for `Err(Error::new(code))`.
 #[macro_export]
 macro_rules! err {
     ($code:ident) => {
@@ -110,7 +110,7 @@ macro_rules! err {
     };
 }
 
-/// 条件を満たさなければエラーを返す。`assert!` と違いパニックしない。
+/// Returns an error unless the condition holds. Unlike `assert!`, this never panics.
 #[macro_export]
 macro_rules! ensure {
     ($cond:expr, $code:ident) => {
@@ -125,8 +125,8 @@ macro_rules! ensure {
     };
 }
 
-// --- ネイティブ専用: デバッグ表示 -------------------------------------------
-// wasm ビルドではこのブロックごとリンクされない。
+// --- Native only: debug rendering -------------------------------------------
+// This whole block is not linked in wasm builds.
 
 #[cfg(feature = "std")]
 impl Error {
@@ -144,10 +144,11 @@ impl Error {
             UnsupportedEncoding => "unsupported parquet encoding",
             UnsupportedCodec => "unsupported compression codec",
             UnsupportedType => "unsupported parquet type",
-            // LIST/MAP/STRUCT 自体は対応済み（parquet::nested の Dremel 組み立て、
-            // または STRUCT のドット区切りフラット化）。ここに来るのは、壊れた/
-            // 敵対的なスキーマ（子数と実要素数の不一致、物理型を持たないリーフ、
-            // リーフ数の上限超過など）を検出したときだけ。
+            // LIST/MAP/STRUCT themselves are supported (Dremel assembly in
+            // parquet::nested, or dot-separated flattening for STRUCT). This is only
+            // reached when a broken or hostile schema is detected (child count
+            // disagreeing with the actual elements, a leaf with no physical type,
+            // exceeding the leaf-count cap, and so on).
             UnsupportedNested => "malformed or oversized nested parquet schema",
             EncryptionUnsupported => "encrypted parquet files are not supported",
             SyntaxError => "syntax error",
@@ -201,8 +202,8 @@ impl core::fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-/// テスト用: `Result` からエラーコードを取り出す。`unwrap_err()` は
-/// `T: Debug` を要求するため、Debug を導出していない型でも使えるようにする。
+/// For tests: extracts the error code from a `Result`. `unwrap_err()` requires
+/// `T: Debug`, so this works for types that do not derive Debug.
 #[cfg(feature = "std")]
 pub fn code_of<T>(r: Result<T>) -> Option<Code> {
     r.err().map(|e| e.code)

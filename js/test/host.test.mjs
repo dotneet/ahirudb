@@ -1,7 +1,7 @@
-// ホスト層のテスト。`node --test 'js/test/*.test.mjs'` で走る。
+// Host layer tests. Run with `node --test 'js/test/*.test.mjs'`.
 //
-// 事前に `./scripts/size.sh` で target/ahiru-core.wasm を作っておくこと。
-// 値の正解は duckdb CLI から取る（このリポジトリの ground truth）。
+// Build target/ahiru-core.wasm with `./scripts/size.sh` beforehand.
+// Expected values come from the duckdb CLI (this repository's ground truth).
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -32,10 +32,10 @@ const WASM = join(ROOT, 'target/ahiru-core.wasm');
 const BASIC = join(ROOT, 'tests/data/basic.parquet');
 
 if (!existsSync(WASM)) {
-  throw new Error(`${WASM} がありません。先に ./scripts/size.sh を実行してください`);
+  throw new Error(`${WASM} is missing. Run ./scripts/size.sh first`);
 }
 
-/** duckdb CLI を JSON で叩く。値の正解はすべてここから取る。 */
+/** Calls the duckdb CLI with JSON output. Every expected value comes from here. */
 function duck(sql) {
   const out = execFileSync('duckdb', ['-json', '-c', sql], { encoding: 'utf8', maxBuffer: 1 << 28 });
   return out.trim() === '' ? [] : JSON.parse(out);
@@ -46,10 +46,10 @@ async function openDb(options = {}) {
 }
 
 /**
- * CSV / JSONL はフィーチャで切れるので、既定の配布ビルド
- * (`target/ahiru-core.wasm` = parquet のみ) には入っていない。
- * 全フォーマット入りを別に用意する。無ければその場でビルドし、
- * それも駄目ならフォーマット系のテストだけ skip する。
+ * CSV / JSONL are feature-gated, so they are not in the default distribution
+ * build (`target/ahiru-core.wasm` = parquet only). An all-formats build is
+ * prepared separately. If it is missing it is built on the spot, and if that
+ * fails too, only the format tests are skipped.
  */
 const FULL_WASM = process.env.AHIRU_WASM_FULL ?? join(ROOT, 'target/ahiru-core-full.wasm');
 const FORMAT_SKIP = (() => {
@@ -64,20 +64,21 @@ const FORMAT_SKIP = (() => {
     copyFileSync(join(ROOT, 'target/wasm32-unknown-unknown/wasm/ahiru_core.wasm'), FULL_WASM);
     return false;
   } catch {
-    // ビルドできなくても、以前作ったものが残っていれば使う。
+    // Even if the build fails, use a previously built one if it is still around.
     return existsSync(FULL_WASM)
       ? false
-      : `csv,jsonl 入りの wasm がありません。cargo build --profile wasm ` +
+      : `No wasm with csv,jsonl. Run cargo build --profile wasm ` +
           `--target wasm32-unknown-unknown -p ahiru-core --no-default-features ` +
-          `--features csv,jsonl して ${FULL_WASM} に置くか、AHIRU_WASM_FULL を指定してください`;
+          `--features csv,jsonl and place it at ${FULL_WASM}, or set AHIRU_WASM_FULL`;
   }
 })();
 
 /**
- * ZSTD は既定でコアに内蔵する（`zstd` フィーチャ、DESIGN.md §6）ので、
- * `target/ahiru-core.wasm` に対するクエリはコーデック委譲（`NEED_CODEC`）を
- * 経由しない。ホスト側の委譲・キャッシュ溢れ耐性はそれ自体テストしたい
- * 挙動なので、`zstd` を外したコアを別に用意してそちらだけに向ける。
+ * ZSTD is built into the core by default (the `zstd` feature, DESIGN.md §6), so
+ * queries against `target/ahiru-core.wasm` never go through codec delegation
+ * (`NEED_CODEC`). Host-side delegation and resilience to cache eviction are
+ * behaviors we want to test in their own right, so a core built without `zstd`
+ * is prepared separately and only those tests point at it.
  */
 const NOZSTD_WASM = process.env.AHIRU_WASM_NOZSTD ?? join(ROOT, 'target/ahiru-core-nozstd.wasm');
 const NOZSTD_SKIP = (() => {
@@ -94,9 +95,9 @@ const NOZSTD_SKIP = (() => {
   } catch {
     return existsSync(NOZSTD_WASM)
       ? false
-      : `zstd 無しの wasm がありません。cargo build --profile wasm ` +
+      : `No wasm without zstd. Run cargo build --profile wasm ` +
           `--target wasm32-unknown-unknown -p ahiru-core --no-default-features ` +
-          `して ${NOZSTD_WASM} に置くか、AHIRU_WASM_NOZSTD を指定してください`;
+          `and place it at ${NOZSTD_WASM}, or set AHIRU_WASM_NOZSTD`;
   }
 })();
 
@@ -105,10 +106,11 @@ async function openFullDb(options = {}) {
 }
 
 /**
- * 式 VM（crates/ahiru-core/src/expr/vm.rs）はまだスタブで、Project が必ず
- * E900 を返す。値のアサーションはそこが入るまで検証できないので、実際に
- * 動くかを 1 回だけ確かめ、駄目なら該当テストを skip する。
- * VM が入れば自動的に skip が外れる（テスト本体は一切弱めていない）。
+ * The expression VM (crates/ahiru-core/src/expr/vm.rs) is still a stub, and
+ * Project always returns E900. Value assertions cannot be verified until it
+ * lands, so this checks once whether it actually works and skips the affected
+ * tests otherwise. Once the VM lands the skip lifts automatically (the tests
+ * themselves are not weakened at all).
  */
 const VM_STATUS = await (async () => {
   const db = await openDb();
@@ -128,8 +130,8 @@ const VM_STATUS = await (async () => {
 const needsVm = VM_STATUS ?? false;
 
 /**
- * VM が入るまでは、行を取り切る手前で E900 になる。
- * I/O 経路のアサーションはそこまでで十分成立するので、900 だけ飲み込む。
+ * Until the VM lands, E900 occurs before all rows are drained.
+ * The I/O path assertions still hold up to that point, so only 900 is swallowed.
  */
 async function runTolerantly(db, sql) {
   try {
@@ -140,9 +142,9 @@ async function runTolerantly(db, sql) {
   }
 }
 
-// --- ワイヤ形式のデコード（wasm 非依存）--------------------------------------
+// --- Wire format decoding (no wasm needed) -----------------------------------
 
-/** abi.rs の `encode_batch` と同じ並びでバッファを組む。デコーダ単体の検証用。 */
+/** Builds a buffer in the same layout as `encode_batch` in abi.rs. For testing the decoder alone. */
 function encodeBatch(numRows, cols) {
   const parts = [];
   const u32 = (v) => {
@@ -186,11 +188,11 @@ function encodeBatch(numRows, cols) {
   return out;
 }
 
-test('decodeBatch は列指向バッファを型どおりに読む', () => {
-  const bytes = new TextEncoder().encode('あhello');
+test('decodeBatch reads columnar buffers according to their types', () => {
+  const bytes = new TextEncoder().encode('\u20achello');
   const f64 = new Float64Array([1.5, -2.25, 0]);
   const i64 = new BigInt64Array([10n, -20n, 30n]);
-  // I128 は TypedArray が無いので 64 ビット 2 本（下位→上位）で書く。
+  // I128 has no TypedArray, so it is written as two 64-bit halves (low then high).
   const i128 = new Uint8Array(3 * 16);
   const i128dv = new DataView(i128.buffer);
   [0n, 2n ** 100n, -(2n ** 100n) - 1n].forEach((v, i) => {
@@ -200,8 +202,9 @@ test('decodeBatch は列指向バッファを型どおりに読む', () => {
   });
   const buf = encodeBatch(3, [
     { phys: 1, valid: [1, 0, 1], data: new Uint8Array(new Int32Array([7, 999, -3]).buffer) },
-    // 可変長は offsets.len == 行数 + 1。ここの長さが奇数だと後続の列が
-    // 8 バイト境界からずれるので、非整列の経路もこの 1 本で踏む。
+    // For variable-length columns offsets.len == rows + 1. An odd length here
+    // shifts the following columns off the 8-byte boundary, so this single case
+    // also exercises the unaligned path.
     { phys: 5, valid: null, offsets: [0, 3, 3, bytes.length], data: bytes },
     { phys: 3, valid: null, data: new Uint8Array(f64.buffer) },
     { phys: 2, valid: [1, 1, 0], data: new Uint8Array(i64.buffer) },
@@ -220,7 +223,7 @@ test('decodeBatch は列指向バッファを型どおりに読む', () => {
 
   assert.equal(batch.numRows, 3);
   assert.deepEqual(batch.toRows(), [
-    { i: 7, s: 'あ', f: 1.5, b: 10n, z: true, h: 0n },
+    { i: 7, s: '\u20ac', f: 1.5, b: 10n, z: true, h: 0n },
     { i: null, s: '', f: -2.25, b: -20n, z: false, h: 2n ** 100n },
     { i: -3, s: 'hello', f: 0, b: null, z: true, h: -(2n ** 100n) - 1n },
   ]);
@@ -230,20 +233,20 @@ test('decodeBatch は列指向バッファを型どおりに読む', () => {
   assert.equal(batch.get('i', 1), null);
 });
 
-test('decodeBatch はマジックが違えば落とす', () => {
+test('decodeBatch rejects a bad magic number', () => {
   const buf = encodeBatch(0, []);
   buf[0] = 0;
   assert.throws(() => decodeBatch(buf, []), (e) => e instanceof AhiruError && e.code === 900);
 });
 
-// --- レンジ結合 --------------------------------------------------------------
+// --- Range coalescing --------------------------------------------------------
 
-test('coalesceRanges は 1 MB 未満の穴を埋めて 1 本にする', () => {
-  // 隣接（穴なし）
+test('coalesceRanges fills gaps smaller than 1 MB into a single range', () => {
+  // Adjacent (no gap)
   assert.deepEqual(coalesceRanges([{ offset: 100, len: 50 }, { offset: 150, len: 50 }]), [
     { offset: 100, len: 100 },
   ]);
-  // 小さい穴は飲み込む: 400KB + 100KB の穴 + 400KB → 900KB を 1 回
+  // Small gaps are swallowed: 400KB + a 100KB gap + 400KB -> 900KB in one request
   assert.deepEqual(
     coalesceRanges([
       { offset: 0, len: 400 * 1024 },
@@ -251,7 +254,7 @@ test('coalesceRanges は 1 MB 未満の穴を埋めて 1 本にする', () => {
     ]),
     [{ offset: 0, len: 900 * 1024 }],
   );
-  // 1 MB 以上離れていれば分けたまま
+  // Kept separate when at least 1 MB apart
   assert.equal(
     coalesceRanges([
       { offset: 0, len: 10 },
@@ -259,52 +262,52 @@ test('coalesceRanges は 1 MB 未満の穴を埋めて 1 本にする', () => {
     ]).length,
     2,
   );
-  // 順序不同・包含・ファイル末尾のはみ出し
+  // Out of order, contained, and running past the end of the file
   assert.deepEqual(
     coalesceRanges([{ offset: 60, len: 100 }, { offset: 0, len: 10 }, { offset: 70, len: 5 }], 0, 120),
     [{ offset: 0, len: 10 }, { offset: 60, len: 60 }],
   );
 });
 
-// --- キャッシュ --------------------------------------------------------------
+// --- Cache -------------------------------------------------------------------
 
-test('MemoryCache は容量上限で LRU 追い出しする', () => {
+test('MemoryCache evicts LRU entries at the capacity limit', () => {
   const c = new MemoryCache(300);
   c.set('a', new Uint8Array(100));
   c.set('b', new Uint8Array(100));
   c.set('c', new Uint8Array(100));
   assert.ok(c.get('a'));
-  c.set('d', new Uint8Array(100)); // a を触った直後なので b が落ちる
+  c.set('d', new Uint8Array(100)); // a was just touched, so b is the one dropped
   assert.equal(c.get('b'), undefined);
   assert.ok(c.get('a') && c.get('c') && c.get('d'));
   assert.equal(c.size, 300);
-  // 単体で上限を超えるものは載せない（他を全部追い出さないため）
+  // An entry that exceeds the limit on its own is not admitted (it would evict everything else)
   c.set('big', new Uint8Array(1000));
   assert.equal(c.get('big'), undefined);
 });
 
-// --- エラーコード表 ----------------------------------------------------------
+// --- Error code table --------------------------------------------------------
 
-test('errors.js は error.rs の Code / message と一致している', () => {
+test('errors.js matches the Code / message in error.rs', () => {
   const rs = readFileSync(join(ROOT, 'crates/ahiru-core/src/error.rs'), 'utf8');
   const codes = new Map();
   for (const m of rs.matchAll(/^\s{4}(\w+) = (\d+),$/gm)) codes.set(m[1], Number(m[2]));
-  assert.ok(codes.size > 20, 'error.rs から Code を読めていない');
+  assert.ok(codes.size > 20, 'failed to read Code out of error.rs');
 
   const messages = new Map();
   for (const m of rs.matchAll(/^\s{12}(\w+) => "([^"]*)",$/gm)) messages.set(m[1], m[2]);
 
   const known = new Set(Object.values(Code));
   for (const [name, value] of codes) {
-    assert.ok(known.has(value), `errors.js に ${name} = ${value} が無い`);
-    assert.equal(errorMessage(value), messages.get(name), `${name} のメッセージがずれている`);
+    assert.ok(known.has(value), `errors.js is missing ${name} = ${value}`);
+    assert.equal(errorMessage(value), messages.get(name), `the message for ${name} has drifted`);
   }
-  assert.equal(Object.keys(Code).length, codes.size, 'errors.js に余分なコードがある');
+  assert.equal(Object.keys(Code).length, codes.size, 'errors.js has extra codes');
 });
 
-// --- 実データ: メモリ登録 ----------------------------------------------------
+// --- Real data: in-memory registration ---------------------------------------
 
-test('bytes 登録 + SELECT が duckdb と一致する', { skip: needsVm }, async () => {
+test('registering bytes + SELECT agrees with duckdb', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
@@ -317,20 +320,20 @@ test('bytes 登録 + SELECT が duckdb と一致する', { skip: needsVm }, asyn
   }
 });
 
-test('NULL は 0 ではなく null として返る', { skip: needsVm }, async () => {
+test('NULL comes back as null, not 0', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
     const rows = await db.query('SELECT id, big FROM t LIMIT 20');
     const want = duck(`SELECT id, big FROM '${BASIC}' LIMIT 20`);
-    // duckdb の JSON は BIGINT を number で出すので BigInt 側に寄せて比べる。
+    // duckdb's JSON emits BIGINT as a number, so compare on the BigInt side.
     assert.deepEqual(
       rows,
       want.map((r) => ({ id: r.id, big: r.big === null ? null : BigInt(r.big) })),
     );
-    // 5 行ごとに NULL が入っているのが basic.parquet の作り。
+    // basic.parquet is built with a NULL every five rows.
     for (const r of rows) {
-      if (r.id % 5 === 0) assert.equal(r.big, null, `id=${r.id} は NULL のはず`);
+      if (r.id % 5 === 0) assert.equal(r.big, null, `id=${r.id} should be NULL`);
       else assert.notEqual(r.big, null);
     }
   } finally {
@@ -338,9 +341,9 @@ test('NULL は 0 ではなく null として返る', { skip: needsVm }, async ()
   }
 });
 
-test('OFFSET が効く', { skip: needsVm }, async () => {
-  // encode_batch が materialize してから直列化するようになったので、
-  // selection vector が効いた結果がそのまま返る。
+test('OFFSET takes effect', { skip: needsVm }, async () => {
+  // Now that encode_batch materializes before serializing, the result with the
+  // selection vector applied comes back as is.
   const db = await openDb();
   try {
     db.register('t', new Uint8Array(await readFile(BASIC)));
@@ -358,7 +361,7 @@ test('OFFSET が効く', { skip: needsVm }, async () => {
   }
 });
 
-test('stream は列指向バッチを返す', { skip: needsVm }, async () => {
+test('stream returns columnar batches', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
@@ -375,7 +378,7 @@ test('stream は列指向バッチを返す', { skip: needsVm }, async () => {
   }
 });
 
-test('TIMESTAMP はマイクロ秒の BigInt で返り、ヘルパで Date になる', { skip: needsVm }, async () => {
+test('TIMESTAMP comes back as microsecond BigInt and the helper turns it into a Date', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
@@ -387,9 +390,9 @@ test('TIMESTAMP はマイクロ秒の BigInt で返り、ヘルパで Date に�
   }
 });
 
-// --- 実データ: レンジ取得 ----------------------------------------------------
+// --- Real data: range fetching -----------------------------------------------
 
-/** ローカルのバッファを Range で切り出す偽 fetch。要求は全部記録する。 */
+/** A fake fetch that slices a local buffer by Range. Records every request. */
 function fakeFetcher(file, url = 'https://example.invalid/data.parquet') {
   const calls = [];
   const ranges = [];
@@ -401,7 +404,7 @@ function fakeFetcher(file, url = 'https://example.invalid/data.parquet') {
     }
     const raw = new Headers(init.headers ?? {}).get('range') ?? '';
     const m = /bytes=(\d+)-(\d+)/.exec(raw);
-    assert.ok(m, `Range ヘッダが無い: ${raw}`);
+    assert.ok(m, `no Range header: ${raw}`);
     const start = Number(m[1]);
     const end = Math.min(Number(m[2]), file.length - 1);
     ranges.push({ offset: start, len: end - start + 1 });
@@ -413,7 +416,7 @@ function fakeFetcher(file, url = 'https://example.invalid/data.parquet') {
   return { url, calls, ranges, fetchImpl, bytes: () => ranges.reduce((a, r) => a + r.len, 0) };
 }
 
-/** 64 KiB のフッタ投機取得だけでは全体が読めない、多少大きなファイルを用意する。 */
+/** A somewhat large file, so the 64 KiB speculative footer fetch alone cannot read it all. */
 const WIDE = join(tmpdir(), 'ahirudb-test-wide.parquet');
 if (!existsSync(WIDE)) {
   duck(
@@ -425,7 +428,7 @@ if (!existsSync(WIDE)) {
   );
 }
 const WIDE_SIZE = statSync(WIDE).size;
-/** 列チャンクの実バイト範囲。射影と結合のアサーションはこれを基準にする。 */
+/** The actual byte ranges of the column chunks. Projection and coalescing assertions are based on these. */
 const WIDE_CHUNKS = new Map(
   duck(
     `SELECT path_in_schema AS name,
@@ -435,19 +438,19 @@ const WIDE_CHUNKS = new Map(
   ).map((r) => [r.name, { start: Number(r.start), len: Number(r.len) }]),
 );
 
-test('登録だけでは 1 バイトも取りに行かない', async () => {
+test('registration alone fetches not a single byte', async () => {
   const f = fakeFetcher(new Uint8Array(await readFile(WIDE)));
   const db = await openDb({ fetch: f.fetchImpl });
   try {
     db.registerParquet('t', f.url);
-    assert.equal(f.calls.length, 0, '登録時に I/O が発生している');
+    assert.equal(f.calls.length, 0, 'I/O happened at registration time');
     assert.equal(f.ranges.length, 0);
   } finally {
     db.close();
   }
 });
 
-test('射影プッシュダウン: 選んだ列のバイトしか取らない', async () => {
+test('projection pushdown: only the bytes of the selected columns are fetched', async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const f = fakeFetcher(file);
   const db = await openDb({ fetch: f.fetchImpl });
@@ -455,26 +458,26 @@ test('射影プッシュダウン: 選んだ列のバイトしか取らない', 
     db.registerParquet('t', f.url);
     await runTolerantly(db, 'SELECT id, name FROM t LIMIT 5');
 
-    const footer = 64 * 1024; // FOOTER_PROBE（parquet/file.rs）
+    const footer = 64 * 1024; // FOOTER_PROBE (parquet/file.rs)
     const wanted = WIDE_CHUNKS.get('id').len + WIDE_CHUNKS.get('name').len;
-    // 取得量 = フッタ投機 + id/name の列チャンクのみ。score/flag/big は読まない。
+    // Bytes fetched = speculative footer + the id/name column chunks only. score/flag/big are never read.
     assert.equal(f.bytes(), footer + wanted);
-    assert.ok(f.bytes() < WIDE_SIZE * 0.25, `${f.bytes()} bytes は削れていない`);
+    assert.ok(f.bytes() < WIDE_SIZE * 0.25, `${f.bytes()} bytes is not a reduction`);
 
-    // 読まなかった列の領域に触れていないことを直接確かめる。
+    // Directly confirm that the region of the unread columns is never touched.
     const skipped = WIDE_CHUNKS.get('score');
     for (const r of f.ranges) {
       const overlapsSkipped =
         r.offset < skipped.start + skipped.len && skipped.start < r.offset + r.len;
       const isFooterProbe = r.offset >= WIDE_SIZE - footer;
-      assert.ok(!overlapsSkipped || isFooterProbe, `score の領域を読んでいる: ${JSON.stringify(r)}`);
+      assert.ok(!overlapsSkipped || isFooterProbe, `reading score's region: ${JSON.stringify(r)}`);
     }
   } finally {
     db.close();
   }
 });
 
-test('隣接した 2 本の要求は 1 回の fetch にまとまる', async () => {
+test('two adjacent requests coalesce into a single fetch', async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const f = fakeFetcher(file);
   const db = await openDb({ fetch: f.fetchImpl });
@@ -484,20 +487,20 @@ test('隣接した 2 本の要求は 1 回の fetch にまとまる', async () =
 
     const id = WIDE_CHUNKS.get('id');
     const name = WIDE_CHUNKS.get('name');
-    // 前提: この 2 列のチャンクはファイル上で隣接している。
-    assert.equal(id.start + id.len, name.start, 'テストの前提（隣接）が崩れている');
+    // Precondition: these two column chunks are adjacent in the file.
+    assert.equal(id.start + id.len, name.start, "the test's precondition (adjacency) no longer holds");
 
-    // エンジンは列ごとに 1 本ずつ要求する。ホストが結合するので fetch は 1 回。
+    // The engine issues one request per column. The host coalesces them, so there is one fetch.
     const data = f.ranges.filter((r) => r.offset < WIDE_SIZE - 64 * 1024);
-    assert.equal(data.length, 1, `結合されていない: ${JSON.stringify(data)}`);
+    assert.equal(data.length, 1, `not coalesced: ${JSON.stringify(data)}`);
     assert.deepEqual(data[0], { offset: id.start, len: id.len + name.len });
-    assert.equal(f.ranges.length, 2, 'フッタ + データの 2 回だけのはず');
+    assert.equal(f.ranges.length, 2, 'should be exactly two: footer + data');
   } finally {
     db.close();
   }
 });
 
-test('2 回目の同じクエリは新しい fetch を出さない', async () => {
+test('running the same query a second time issues no new fetch', async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const f = fakeFetcher(file);
   const db = await openDb({ fetch: f.fetchImpl });
@@ -507,13 +510,13 @@ test('2 回目の同じクエリは新しい fetch を出さない', async () =>
     const first = f.ranges.length;
     assert.ok(first > 0);
     await runTolerantly(db, 'SELECT id, name FROM t LIMIT 5');
-    assert.equal(f.ranges.length, first, '2 回目に取り直している');
+    assert.equal(f.ranges.length, first, 'refetching on the second run');
   } finally {
     db.close();
   }
 });
 
-test('レンジキャッシュはインスタンスをまたいで効く', async () => {
+test('the range cache works across instances', async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const cache = new MemoryCache(8 * 1024 * 1024);
   const f1 = fakeFetcher(file);
@@ -526,19 +529,19 @@ test('レンジキャッシュはインスタンスをまたいで効く', async
     db1.close();
   }
 
-  // 同じ URL・同じレンジなので、2 つ目のインスタンスは fetch せずに済む。
+  // Same URL and same ranges, so the second instance needs no fetch.
   const f2 = fakeFetcher(file);
   const db2 = await openDb({ fetch: f2.fetchImpl, cache });
   try {
     db2.registerParquet('t', f2.url);
     await runTolerantly(db2, 'SELECT id, name FROM t LIMIT 5');
-    assert.equal(f2.ranges.length, 0, 'キャッシュが使われていない');
+    assert.equal(f2.ranges.length, 0, 'the cache is not being used');
   } finally {
     db2.close();
   }
 });
 
-test('レンジ取得の結果はメモリ登録と一致する', { skip: needsVm }, async () => {
+test('results from range fetching match in-memory registration', { skip: needsVm }, async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const f = fakeFetcher(file);
   const remote = await openDb({ fetch: f.fetchImpl });
@@ -555,7 +558,7 @@ test('レンジ取得の結果はメモリ登録と一致する', { skip: needsV
   }
 });
 
-test('cache: "none" は毎回取りに行く', async () => {
+test('cache: "none" fetches every time', async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const f = fakeFetcher(file);
   const db = await openDb({ fetch: f.fetchImpl, cache: 'none' });
@@ -568,9 +571,9 @@ test('cache: "none" は毎回取りに行く', async () => {
   }
 });
 
-// --- エラー ------------------------------------------------------------------
+// --- Errors ------------------------------------------------------------------
 
-test('構文エラーは AhiruError（3xx）になる', async () => {
+test('a syntax error becomes an AhiruError (3xx)', async () => {
   const db = await openDb();
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
@@ -590,7 +593,7 @@ test('構文エラーは AhiruError（3xx）になる', async () => {
   }
 });
 
-test('未知のテーブルは TABLE_NOT_FOUND', async () => {
+test('an unknown table gives TABLE_NOT_FOUND', async () => {
   const db = await openDb();
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
@@ -603,7 +606,7 @@ test('未知のテーブルは TABLE_NOT_FOUND', async () => {
   }
 });
 
-test('未知の列は COLUMN_NOT_FOUND', async () => {
+test('an unknown column gives COLUMN_NOT_FOUND', async () => {
   const db = await openDb();
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
@@ -616,27 +619,27 @@ test('未知の列は COLUMN_NOT_FOUND', async () => {
   }
 });
 
-// --- パラメータバインド ------------------------------------------------------
+// --- Parameter binding -------------------------------------------------------
 
-test('encodeParams はタグ付きの列を組む', () => {
+test('encodeParams builds a tagged sequence', () => {
   const buf = encodeParams([null, true, 7, 1.5, 'ab']);
   const dv = new DataView(buf.buffer);
   assert.equal(dv.getUint32(0, true), 5);
   assert.equal(buf[4], 0); // NULL
   assert.deepEqual([...buf.subarray(5, 7)], [1, 1]); // BOOL true
-  assert.equal(buf[7], 2); // 安全な整数は I64
+  assert.equal(buf[7], 2); // safe integers are I64
   assert.equal(dv.getBigInt64(8, true), 7n);
-  assert.equal(buf[16], 3); // 小数は F64
+  assert.equal(buf[16], 3); // fractional values are F64
   assert.equal(dv.getFloat64(17, true), 1.5);
-  assert.equal(buf[25], 4); // 文字列は BYTES
+  assert.equal(buf[25], 4); // strings are BYTES
   assert.equal(dv.getUint32(26, true), 2);
   assert.deepEqual([...buf.subarray(30)], [0x61, 0x62]);
   assert.equal(encodeParams([]).length, 0);
   assert.equal(encodeParams(undefined).length, 0);
 });
 
-test('encodeParams は扱えない型を明示的に落とす', () => {
-  // Date を勝手にマイクロ秒へ直すと、桁を間違えても気づけない。
+test('encodeParams rejects unsupported types explicitly', () => {
+  // Silently converting a Date to microseconds would hide an off-by-a-factor mistake.
   assert.throws(
     () => encodeParams([new Date()]),
     (e) => e instanceof AhiruError && e.code === Code.UNSUPPORTED_FEATURE,
@@ -647,7 +650,7 @@ test('encodeParams は扱えない型を明示的に落とす', () => {
   );
 });
 
-test('パラメータが束縛される', { skip: needsVm }, async () => {
+test('parameters are bound', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.register('t', new Uint8Array(await readFile(BASIC)));
@@ -655,28 +658,28 @@ test('パラメータが束縛される', { skip: needsVm }, async () => {
       await db.query('SELECT id, name FROM t WHERE id = ?', [3]),
       duck(`SELECT id, name FROM '${BASIC}' WHERE id = 3`),
     );
-    // 文字列パラメータ。SQL に埋め込まずに済むのがこの API の眼目。
+    // String parameters. Not having to embed them in the SQL is the point of this API.
     assert.deepEqual(
       await db.query('SELECT id FROM t WHERE name = ? LIMIT 3', ['name_5']),
       duck(`SELECT id FROM '${BASIC}' WHERE name = 'name_5' LIMIT 3`),
     );
-    // 複数・BigInt・浮動小数
+    // Several of them, BigInt, and floating point
     assert.deepEqual(
       await db.query('SELECT id FROM t WHERE id > ? AND score < ? ORDER BY id', [10n, 20.0]),
       duck(`SELECT id FROM '${BASIC}' WHERE id > 10 AND score < 20.0 ORDER BY id`),
     );
-    // 引用符入りの文字列がそのまま値として渡ること（連結なら壊れる形）
+    // A string containing a quote is passed through as a value (concatenation would break here)
     assert.deepEqual(await db.query("SELECT id FROM t WHERE name = ?", ["a' OR 1=1 --"]), []);
   } finally {
     db.close();
   }
 });
 
-test('バイトが増えないまま同じ要求が来たらライブロックとして落ちる', async () => {
+test('an identical request with no byte progress is treated as a livelock and fails', async () => {
   const db = await openDb();
   try {
     let reads = 0;
-    // 常に空を返す供給元。放っておくと NEED_IO を無限に回してしまう。
+    // A source that always returns empty. Left alone it would spin on NEED_IO forever.
     db.registerParquet('t', {
       key: 'stuck',
       size: 1024 * 1024,
@@ -689,13 +692,13 @@ test('バイトが増えないまま同じ要求が来たらライブロック�
       () => db.query('SELECT id FROM t'),
       (e) => e instanceof AhiruError && e.code === Code.IO_FAILED,
     );
-    assert.ok(reads <= 4, `空応答で回りすぎ: ${reads}`);
+    assert.ok(reads <= 4, `spun too long on empty responses: ${reads}`);
   } finally {
     db.close();
   }
 });
 
-test('memoryLimit を超えたら E501 で止まる', async () => {
+test('exceeding memoryLimit stops with E501', async () => {
   const db = await openDb({ memoryLimit: 1 });
   try {
     db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
@@ -708,22 +711,22 @@ test('memoryLimit を超えたら E501 で止まる', async () => {
   }
 });
 
-test('close 後の操作はエラー', async () => {
+test('operations after close are errors', async () => {
   const db = await openDb();
   db.close();
-  db.close(); // 二重 close は無害
+  db.close(); // a double close is harmless
   assert.throws(() => db.registerParquet('t', new Uint8Array(8)));
   await assert.rejects(() => db.query('SELECT 1 FROM t'));
 });
 
-// --- WHERE（式 VM 待ち）------------------------------------------------------
+// --- WHERE (waiting on the expression VM) ------------------------------------
 
 test(
-  'WHERE で絞れる',
+  'WHERE narrows rows',
   {
     skip:
       needsVm &&
-      'WHERE は式 VM (expr/vm.rs) が必要。VM が入ったらこの skip は自動で外れる。',
+      'WHERE needs the expression VM (expr/vm.rs). This skip lifts on its own once the VM lands.',
   },
   async () => {
     const db = await openDb();
@@ -738,11 +741,11 @@ test(
 );
 
 test(
-  '統計プルーニング: 述語に当たらない RowGroup は 1 バイトも読まない',
+  'statistics pruning: a RowGroup the predicate cannot match is not read at all',
   {
     skip:
       needsVm &&
-      'WHERE は式 VM (expr/vm.rs) が必要。VM が入ったらこの skip は自動で外れる。',
+      'WHERE needs the expression VM (expr/vm.rs). This skip lifts on its own once the VM lands.',
   },
   async () => {
     const file = new Uint8Array(await readFile(WIDE));
@@ -750,13 +753,13 @@ test(
     const db = await openDb({ fetch: f.fetchImpl });
     try {
       db.registerParquet('t', f.url);
-      // id は昇順なので、2 つ目の RowGroup（id >= 100000）だけが残る。
+      // id is ascending, so only the second RowGroup (id >= 100000) survives.
       const rows = await db.query('SELECT id FROM t WHERE id > 199990');
       assert.deepEqual(rows, duck(`SELECT id FROM '${WIDE}' WHERE id > 199990`));
       const first = WIDE_CHUNKS.get('id');
       for (const r of f.ranges) {
         const hitsFirstGroup = r.offset < first.start + first.len && first.start < r.offset + r.len;
-        assert.ok(!hitsFirstGroup, '枝刈りできる RowGroup を読んでいる');
+        assert.ok(!hitsFirstGroup, 'reading a RowGroup that could have been pruned');
       }
     } finally {
       db.close();
@@ -764,9 +767,9 @@ test(
   },
 );
 
-// --- 集約 / ソート / 結合 ----------------------------------------------------
+// --- Aggregation / sorting / joins -------------------------------------------
 
-/** 未実装の機能は E409 / E900 で返る。値のアサーションは弱めずに skip する。 */
+/** Unimplemented features come back as E409 / E900. Skip rather than weakening the value assertions. */
 async function featureStatus(sql) {
   const db = await openDb();
   try {
@@ -775,7 +778,7 @@ async function featureStatus(sql) {
     return false;
   } catch (e) {
     if (e.code === Code.UNSUPPORTED_FEATURE || e.code === Code.INTERNAL) {
-      return `まだエンジン側が未実装 (E${e.code})。実装されれば自動で skip が外れる。`;
+      return `not implemented on the engine side yet (E${e.code}). The skip lifts on its own once it is.`;
     }
     throw e;
   } finally {
@@ -786,7 +789,7 @@ async function featureStatus(sql) {
 const AGG_SKIP = await featureStatus('SELECT count(*) c FROM t');
 const JOIN_SKIP = await featureStatus('SELECT a.id FROM t a JOIN t b ON a.id = b.id LIMIT 1');
 
-test('GROUP BY と集約が duckdb と一致する', { skip: AGG_SKIP }, async () => {
+test('GROUP BY and aggregates agree with duckdb', { skip: AGG_SKIP }, async () => {
   const db = await openDb();
   try {
     db.register('t', new Uint8Array(await readFile(BASIC)));
@@ -796,7 +799,7 @@ test('GROUP BY と集約が duckdb と一致する', { skip: AGG_SKIP }, async (
       rs.map((r) => ({ flag: r.flag, c: Number(r.c) })).sort((a, b) => Number(a.flag) - Number(b.flag));
     assert.deepEqual(norm(rows), norm(want));
 
-    // NULL を数えないこと（big は 5 行ごとに NULL）
+    // NULLs are not counted (big is NULL every five rows)
     const [agg] = await db.query('SELECT count(big) nb, count(*) n, sum(id) s FROM t');
     const [wantAgg] = duck(`SELECT count(big) nb, count(*) n, sum(id) s FROM '${BASIC}'`);
     assert.equal(Number(agg.nb), Number(wantAgg.nb));
@@ -807,7 +810,7 @@ test('GROUP BY と集約が duckdb と一致する', { skip: AGG_SKIP }, async (
   }
 });
 
-test('HAVING と DISTINCT', { skip: AGG_SKIP }, async () => {
+test('HAVING and DISTINCT', { skip: AGG_SKIP }, async () => {
   const db = await openDb();
   try {
     db.register('t', new Uint8Array(await readFile(BASIC)));
@@ -832,7 +835,7 @@ test('HAVING と DISTINCT', { skip: AGG_SKIP }, async () => {
   }
 });
 
-test('ORDER BY が duckdb と一致する', { skip: AGG_SKIP }, async () => {
+test('ORDER BY agrees with duckdb', { skip: AGG_SKIP }, async () => {
   const db = await openDb();
   try {
     db.register('t', new Uint8Array(await readFile(BASIC)));
@@ -840,7 +843,7 @@ test('ORDER BY が duckdb と一致する', { skip: AGG_SKIP }, async () => {
       await db.query('SELECT id, score FROM t ORDER BY score DESC, id LIMIT 5'),
       duck(`SELECT id, score FROM '${BASIC}' ORDER BY score DESC, id LIMIT 5`),
     );
-    // NULL の並び順も合わせる（big は NULL を含む）
+    // NULL ordering matches too (big contains NULLs)
     assert.deepEqual(
       (await db.query('SELECT big FROM t ORDER BY big NULLS FIRST LIMIT 3')).map((r) => r.big),
       duck(`SELECT big FROM '${BASIC}' ORDER BY big NULLS FIRST LIMIT 3`).map((r) =>
@@ -852,7 +855,7 @@ test('ORDER BY が duckdb と一致する', { skip: AGG_SKIP }, async () => {
   }
 });
 
-test('JOIN が duckdb と一致する', { skip: JOIN_SKIP }, async () => {
+test('JOIN agrees with duckdb', { skip: JOIN_SKIP }, async () => {
   const db = await openDb();
   try {
     db.register('t', new Uint8Array(await readFile(BASIC)));
@@ -872,22 +875,22 @@ test('JOIN が duckdb と一致する', { skip: JOIN_SKIP }, async () => {
 
 // --- CURRENT_DATE / CURRENT_TIMESTAMP / now() ---------------------------------
 
-test('CURRENT_DATE/now() はホストが渡した時刻をクエリごとに反映する', { skip: needsVm }, async () => {
+test('CURRENT_DATE/now() reflect the host-supplied time per query', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.register('t', new Uint8Array(await readFile(BASIC)));
     const before = Date.now();
     const rows = await db.query('SELECT CURRENT_DATE AS d, now() AS n FROM t LIMIT 1');
     const after = Date.now();
-    // DATE/TIMESTAMP の JS 側の正確な型変換より、「呼び出し時刻に近い値が
-    // 返ってきているか」を確認したいのでここでは now() の値だけ厳密に見る。
+    // Rather than the exact JS-side type conversion of DATE/TIMESTAMP, what we want
+    // to confirm is "a value close to the call time came back", so only now() is checked strictly.
     const gotDate = rows[0].d;
     const nowMicros = rows[0].n;
-    assert.ok(typeof nowMicros === 'bigint', `now() は BigInt(micros) のはず: ${typeof nowMicros}`);
+    assert.ok(typeof nowMicros === 'bigint', `now() should be a BigInt(micros): ${typeof nowMicros}`);
     const nowMs = Number(nowMicros / 1000n);
     assert.ok(
       nowMs >= before - 5 && nowMs <= after + 5,
-      `now() が呼び出し時刻の範囲外: ${nowMs} not in [${before}, ${after}]`,
+      `now() is outside the call-time window: ${nowMs} not in [${before}, ${after}]`,
     );
     assert.ok(gotDate !== undefined);
   } finally {
@@ -897,7 +900,7 @@ test('CURRENT_DATE/now() はホストが渡した時刻をクエリごとに反�
 
 // --- DECIMAL -----------------------------------------------------------------
 
-/** DECIMAL(18,4) は I64、DECIMAL(30,6) は I128 に載る。両方通す。 */
+/** DECIMAL(18,4) rides on I64 and DECIMAL(30,6) on I128. Both are exercised. */
 const DEC = join(tmpdir(), 'ahirudb-test-decimal.parquet');
 if (!existsSync(DEC)) {
   duck(
@@ -907,19 +910,19 @@ if (!existsSync(DEC)) {
   );
 }
 
-test('DECIMAL は precision/scale を適用した文字列で返る', { skip: needsVm }, async () => {
+test('DECIMAL comes back as a string with precision/scale applied', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.register('d', new Uint8Array(await readFile(DEC)));
     const rows = await db.query('SELECT id, d18, d30 FROM d LIMIT 4');
-    // 桁を落とさないため文字列で返す。number にすると 18 桁超で丸まる。
+    // Returned as a string so digits are not lost; a number would round past 18 digits.
     assert.deepEqual(rows, [
       { id: 0, d18: '0.0000', d30: '0.000000' },
       { id: 1, d18: '1.0050', d30: '1.005000' },
       { id: 2, d18: '2.0100', d30: '2.010000' },
       { id: 3, d18: '3.0150', d30: '3.015000' },
     ]);
-    // 値として duckdb と一致していること。
+    // And that the values agree with duckdb.
     const want = duck(`SELECT id, d18, d30 FROM '${DEC}' LIMIT 4`);
     assert.deepEqual(
       rows.map((r) => [r.id, Number(r.d18), Number(r.d30)]),
@@ -927,14 +930,14 @@ test('DECIMAL は precision/scale を適用した文字列で返る', { skip: ne
     );
     for await (const b of db.stream('SELECT d18 FROM d LIMIT 1')) {
       assert.equal(b.schema[0].type, 'DECIMAL');
-      assert.equal(b.columns[0].scale, undefined); // scale はスキーマ側が持つ
+      assert.equal(b.columns[0].scale, undefined); // scale is carried by the schema instead
     }
   } finally {
     db.close();
   }
 });
 
-test('JSON 型は生テキストの string で返る（デコード済み文字列にはしない）', { skip: needsVm }, async () => {
+test('the JSON type comes back as the raw text string (not a decoded object)', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     const rows = await db.query(
@@ -943,7 +946,7 @@ test('JSON 型は生テキストの string で返る（デコード済み文字�
     assert.deepEqual(rows, [{ o: '{"a":1,"b":[1,2,3]}', l: '[1,2,3]' }]);
     assert.equal(typeof rows[0].o, 'string');
     assert.equal(typeof rows[0].l, 'string');
-    // 呼び出し側が必要なら自分で JSON.parse する契約であることの確認。
+    // Confirms the contract that the caller runs JSON.parse itself if it needs to.
     assert.deepEqual(JSON.parse(rows[0].o), { a: 1, b: [1, 2, 3] });
     assert.deepEqual(JSON.parse(rows[0].l), [1, 2, 3]);
     for await (const b of db.stream("SELECT json_array(1, 2) AS l FROM range(1)")) {
@@ -954,14 +957,14 @@ test('JSON 型は生テキストの string で返る（デコード済み文字�
   }
 });
 
-test('INTERVAL は 3 成分に開いて返る（詰めたままの i128 にしない）', { skip: needsVm }, async () => {
+test('INTERVAL comes back split into three components (not a packed i128)', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     const rows = await db.query(
       "SELECT INTERVAL '1' MONTH AS mo, INTERVAL '3' DAY AS d," +
         " INTERVAL '90' MINUTE AS t, INTERVAL '1 year 2 months 3 days' AS mix FROM range(1)",
     );
-    // 詰めたままだと month は 2^96 の位に居るので、生の BigInt には意味が無い。
+    // While packed, months sits at the 2^96 place, so the raw BigInt is meaningless.
     assert.deepEqual(rows[0].mo, { months: 1, days: 0, micros: 0n });
     assert.deepEqual(rows[0].d, { months: 0, days: 3, micros: 0n });
     assert.deepEqual(rows[0].t, { months: 0, days: 0, micros: 5400000000n });
@@ -974,8 +977,8 @@ test('INTERVAL は 3 成分に開いて返る（詰めたままの i128 にし�
   }
 });
 
-test('unpackInterval は負の成分も符号付きで取り出す', () => {
-  // pack_interval(months, days, micros) と同じ詰め方を JS 側で組んで往復させる。
+test('unpackInterval extracts negative components with their sign', () => {
+  // Builds the same packing as pack_interval(months, days, micros) on the JS side and round-trips it.
   const pack = (months, days, micros) =>
     (BigInt.asUintN(32, BigInt(months)) << 96n) |
     (BigInt.asUintN(32, BigInt(days)) << 64n) |
@@ -989,10 +992,10 @@ test('unpackInterval は負の成分も符号付きで取り出す', () => {
   });
 });
 
-test('HUGEINT は i128 の端まで正確に返る', { skip: needsVm }, async () => {
+test('HUGEINT is exact all the way to the i128 limits', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
-    // 10 進パーサが 38 桁で打ち切っていた頃は `…105720` に丸まっていた。
+    // Back when the decimal parser truncated at 38 digits, this rounded to `...105720`.
     const rows = await db.query(
       "SELECT CAST('170141183460469231731687303715884105727' AS HUGEINT) AS mx," +
         " CAST('-170141183460469231731687303715884105728' AS HUGEINT) AS mn FROM range(1)",
@@ -1004,9 +1007,9 @@ test('HUGEINT は i128 の端まで正確に返る', { skip: needsVm }, async ()
   }
 });
 
-// --- コーデック委譲 ----------------------------------------------------------
+// --- Codec delegation --------------------------------------------------------
 
-test('decodeCodecRequests は要求列を読む', () => {
+test('decodeCodecRequests reads the request list', () => {
   // encode_codec: [count:u32][{table:u32, part:u32, codec:u32, offset:u64, len:u32, out_len:u32}...]
   const buf = new Uint8Array(4 + 28);
   const dv = new DataView(buf.buffer);
@@ -1024,17 +1027,17 @@ test('decodeCodecRequests は要求列を読む', () => {
 
 const GZIP_PARQUET = join(ROOT, 'tests/data/gzip.parquet');
 
-/** BigInt と number の差だけを均す。duckdb の JSON は整数を number で出す。 */
+/** Smooths over the BigInt vs number difference only. duckdb's JSON emits integers as numbers. */
 const numeric = (rows) =>
   rows.map((r) =>
     Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === 'bigint' ? Number(v) : v])),
   );
 
-test('GZIP はホストの DecompressionStream で展開される', { skip: needsVm }, async () => {
+test('GZIP is decompressed by the host DecompressionStream', { skip: needsVm }, async () => {
   const db = await openDb();
   try {
     db.register('g', new Uint8Array(await readFile(GZIP_PARQUET)));
-    // 列名を決め打ちしない（テストデータは別の agent も差し替える）。
+    // Do not hard-code column names (another agent swaps out the test data too).
     assert.deepEqual(
       numeric(await db.query('SELECT * FROM g LIMIT 5')),
       numeric(duck(`SELECT * FROM '${GZIP_PARQUET}' LIMIT 5`)),
@@ -1048,7 +1051,7 @@ test('GZIP はホストの DecompressionStream で展開される', { skip: need
   }
 });
 
-test('GZIP はレンジ取得経路でも追加 fetch なしで展開できる', { skip: needsVm }, async () => {
+test('GZIP decompresses on the range-fetch path with no extra fetches', { skip: needsVm }, async () => {
   const file = new Uint8Array(await readFile(GZIP_PARQUET));
   const f = fakeFetcher(file);
   const db = await openDb({ fetch: f.fetchImpl });
@@ -1058,8 +1061,8 @@ test('GZIP はレンジ取得経路でも追加 fetch なしで展開できる',
       numeric(await db.query('SELECT * FROM g LIMIT 5')),
       numeric(duck(`SELECT * FROM '${GZIP_PARQUET}' LIMIT 5`)),
     );
-    // 圧縮ブロックは NEED_IO で取った控えから切り出す。取り直しは起きない。
-    assert.ok(f.ranges.length <= 2, `余計な fetch が出ている: ${JSON.stringify(f.ranges)}`);
+    // Compressed blocks are sliced out of the copy retained from NEED_IO. No refetching happens.
+    assert.ok(f.ranges.length <= 2, `extra fetches were issued: ${JSON.stringify(f.ranges)}`);
   } finally {
     db.close();
   }
@@ -1067,8 +1070,8 @@ test('GZIP はレンジ取得経路でも追加 fetch なしで展開できる',
 
 const ZSTD_PARQUET = join(ROOT, 'tests/data/zstd.parquet');
 
-test('ZSTD は既定のコアだけで（サイドモジュール無しで）展開される', { skip: needsVm }, async () => {
-  const db = await openDb(); // 既定の target/ahiru-core.wasm。zstdUrl は渡さない。
+test('ZSTD decompresses with the default core alone (no side module)', { skip: needsVm }, async () => {
+  const db = await openDb(); // the default target/ahiru-core.wasm; zstdUrl is not passed
   try {
     db.register('z', new Uint8Array(await readFile(ZSTD_PARQUET)));
     assert.deepEqual(
@@ -1080,7 +1083,7 @@ test('ZSTD は既定のコアだけで（サイドモジュール無しで）展
   }
 });
 
-test('ZSTD はモジュール未指定なら ZSTD と名指しで落ちる', { skip: NOZSTD_SKIP || needsVm }, async () => {
+test('ZSTD fails naming ZSTD explicitly when no module is given', { skip: NOZSTD_SKIP || needsVm }, async () => {
   const db = await AhiruDB.init({ wasmUrl: NOZSTD_WASM });
   try {
     db.register('z', new Uint8Array(await readFile(ZSTD_PARQUET)));
@@ -1099,12 +1102,12 @@ test('ZSTD はモジュール未指定なら ZSTD と名指しで落ちる', { s
 });
 
 /**
- * ZSTD サイドモジュール（crates/ahiru-zstd）。既定では `ahiru-core` に
- * ライブラリとしてリンクされる（`zstd` フィーチャ）ので、単独の wasm
- * モジュールとしては `standalone` フィーチャを明示し、`crate-type` も
- * `cdylib` に明示的に上書きしてビルドする必要がある
- * （`crates/ahiru-zstd/Cargo.toml` 参照。既定は `rlib` のみ）。
- * `zstd` フィーチャを外したコアでの委譲経路のテスト専用。
+ * The ZSTD side module (crates/ahiru-zstd). By default it is linked into
+ * `ahiru-core` as a library (the `zstd` feature), so building it as a standalone
+ * wasm module requires passing the `standalone` feature explicitly and
+ * overriding `crate-type` to `cdylib` explicitly as well (see
+ * `crates/ahiru-zstd/Cargo.toml`; the default is `rlib` only).
+ * Only used to test the delegation path on a core built without `zstd`.
  */
 const ZSTD_WASM = join(ROOT, 'target/wasm32-unknown-unknown/wasm/ahiru_zstd.wasm');
 const ZSTD_SKIP = await (async () => {
@@ -1118,19 +1121,19 @@ const ZSTD_SKIP = await (async () => {
       { cwd: ROOT, stdio: 'ignore' },
     );
   } catch {
-    /* ビルドできなくても、既にあるものを見る。 */
+    /* Even if the build fails, look at whatever is already there. */
   }
-  if (!existsSync(ZSTD_WASM)) return 'crates/ahiru-zstd がまだビルドできない';
+  if (!existsSync(ZSTD_WASM)) return 'crates/ahiru-zstd does not build yet';
   const mod = await WebAssembly.compile(await readFile(ZSTD_WASM));
   const names = new Set(WebAssembly.Module.exports(mod).map((e) => e.name));
   const missing = ['zstd_alloc', 'zstd_free', 'zstd_decompress'].filter((n) => !names.has(n));
   return missing.length === 0
     ? false
-    : `ahiru-zstd がまだ ${missing.join('/')} を公開していない（実装中）。` +
-        '公開されればこの skip は自動で外れる。';
+    : `ahiru-zstd does not export ${missing.join('/')} yet (work in progress). ` +
+        'This skip lifts on its own once it does.';
 })();
 
-test('ZSTD はサイドモジュールで展開される', { skip: ZSTD_SKIP || NOZSTD_SKIP || needsVm }, async () => {
+test('ZSTD is decompressed by the side module', { skip: ZSTD_SKIP || NOZSTD_SKIP || needsVm }, async () => {
   const db = await AhiruDB.init({ wasmUrl: NOZSTD_WASM, zstdUrl: ZSTD_WASM });
   try {
     db.register('z', new Uint8Array(await readFile(ZSTD_PARQUET)));
@@ -1145,7 +1148,7 @@ test('ZSTD はサイドモジュールで展開される', { skip: ZSTD_SKIP || 
 
 // --- CSV / JSONL -------------------------------------------------------------
 
-test('detectFormat は登録名の拡張子でフォーマットを決める', () => {
+test('detectFormat picks the format from the extension of the registered name', () => {
   assert.equal(detectFormat('a.parquet'), 'parquet');
   assert.equal(detectFormat('a.CSV'), 'csv');
   assert.equal(detectFormat('a.tsv'), 'tsv');
@@ -1156,11 +1159,11 @@ test('detectFormat は登録名の拡張子でフォーマットを決める', (
   assert.equal(detectFormat('https://x/y/data.parquet?name=a.csv'), 'parquet');
 });
 
-test('知らない format 名は登録時に落とす', async () => {
+test('an unknown format name is rejected at registration', async () => {
   const db = await openDb();
   try {
-    // 綴り間違いを Auto に落とすと Parquet として読まれ、BadMagic になって
-    // 原因が分からなくなる。ここで止める。
+    // Falling back to Auto on a typo would read it as Parquet, fail with BadMagic,
+    // and obscure the cause. Stop here instead.
     assert.throws(
       () => db.register('t', new Uint8Array(8), { format: 'json' }),
       (e) => e instanceof AhiruError && e.code === Code.UNSUPPORTED_FEATURE,
@@ -1170,10 +1173,10 @@ test('知らない format 名は登録時に落とす', async () => {
   }
 });
 
-test('format を明示すれば拡張子なしの名前で登録できる', { skip: FORMAT_SKIP }, async () => {
+test('an explicit format allows registering a name without an extension', { skip: FORMAT_SKIP }, async () => {
   const db = await openFullDb();
   try {
-    // ahiru_register_as にフォーマットを渡すので、テーブル名は素の識別子でよい。
+    // The format is passed to ahiru_register_as, so the table name can be a plain identifier.
     db.register('logs', new Uint8Array(await readFile(CSV)), { format: 'csv' });
     db.register('events', new Uint8Array(await readFile(JSONL)), { format: 'jsonl' });
     const want = duck(`SELECT id, name FROM '${BASIC}' LIMIT 5`).map((r) => [r.id, r.name]);
@@ -1190,11 +1193,11 @@ test('format を明示すれば拡張子なしの名前で登録できる', { sk
   }
 });
 
-test('明示した format は拡張子より優先される', async () => {
+test('an explicit format wins over the extension', async () => {
   const db = await openDb();
   try {
-    // 名前が嘘をついていても、明示指定が勝つ（名前と読み方を切り離せることが
-    // このオプションの目的なので、食い違いを検査で塞がない）。
+    // Even when the name lies, the explicit choice wins (decoupling the name from
+    // how it is read is the purpose of this option, so a mismatch is not blocked).
     db.register('p.csv', new Uint8Array(await readFile(BASIC)), { format: 'parquet' });
     assert.deepEqual(
       await db.query('SELECT id, name FROM "p.csv" LIMIT 5'),
@@ -1208,13 +1211,13 @@ test('明示した format は拡張子より優先される', async () => {
 const CSV = join(ROOT, 'tests/data/basic.csv');
 const JSONL = join(ROOT, 'tests/data/basic.jsonl');
 
-test('CSV が Parquet と同じ値を返す', { skip: FORMAT_SKIP }, async () => {
+test('CSV returns the same values as Parquet', { skip: FORMAT_SKIP }, async () => {
   const db = await openFullDb();
   try {
     db.register('basic.csv', new Uint8Array(await readFile(CSV)));
     const rows = await db.query('SELECT id, name FROM "basic.csv" LIMIT 5');
     const want = duck(`SELECT id, name FROM read_csv('${CSV}') LIMIT 5`);
-    // CSV には型が無く、整数は BIGINT として推定される。値として比べる。
+    // CSV has no types, and integers are inferred as BIGINT. Compare by value.
     assert.deepEqual(
       rows.map((r) => [Number(r.id), r.name]),
       want.map((r) => [Number(r.id), r.name]),
@@ -1228,7 +1231,7 @@ test('CSV が Parquet と同じ値を返す', { skip: FORMAT_SKIP }, async () =>
   }
 });
 
-test('JSONL が Parquet と同じ値を返す', { skip: FORMAT_SKIP }, async () => {
+test('JSONL returns the same values as Parquet', { skip: FORMAT_SKIP }, async () => {
   const db = await openFullDb();
   try {
     db.register('basic.jsonl', new Uint8Array(await readFile(JSONL)));
@@ -1249,13 +1252,13 @@ test('JSONL が Parquet と同じ値を返す', { skip: FORMAT_SKIP }, async () 
   }
 });
 
-test('CSV も NULL を null として返す', { skip: FORMAT_SKIP }, async () => {
+test('CSV returns NULL as null too', { skip: FORMAT_SKIP }, async () => {
   const db = await openFullDb();
   try {
     db.register('basic.csv', new Uint8Array(await readFile(CSV)));
     const rows = await db.query('SELECT id, big FROM "basic.csv" LIMIT 12');
     for (const r of rows) {
-      if (Number(r.id) % 5 === 0) assert.equal(r.big, null, `id=${r.id} は NULL のはず`);
+      if (Number(r.id) % 5 === 0) assert.equal(r.big, null, `id=${r.id} should be NULL`);
       else assert.notEqual(r.big, null);
     }
   } finally {
@@ -1263,13 +1266,13 @@ test('CSV も NULL を null として返す', { skip: FORMAT_SKIP }, async () =>
   }
 });
 
-test('CSV もレンジ取得で読める', { skip: FORMAT_SKIP }, async () => {
+test('CSV can be read over range fetching too', { skip: FORMAT_SKIP }, async () => {
   const file = new Uint8Array(await readFile(CSV));
   const f = fakeFetcher(file, 'https://example.invalid/basic.csv');
   const db = await openFullDb({ fetch: f.fetchImpl });
   try {
     db.register('basic.csv', f.url);
-    assert.equal(f.ranges.length, 0, '登録で I/O が出ている');
+    assert.equal(f.ranges.length, 0, 'I/O happened at registration');
     const rows = await db.query('SELECT id, name FROM "basic.csv" LIMIT 5');
     assert.ok(f.ranges.length > 0);
     assert.deepEqual(
@@ -1281,13 +1284,14 @@ test('CSV もレンジ取得で読める', { skip: FORMAT_SKIP }, async () => {
   }
 });
 
-// --- 控えの追い出し ----------------------------------------------------------
+// --- Evicting the retained copy ----------------------------------------------
 
 /**
- * コーデック委譲は「NEED_IO で取った控えから圧縮ブロックを切り出す」前提だが、
- * 控えは `cacheSize` で頭打ちにしてある。溢れて捨てた範囲を後から要求された
- * ときに落ちないこと（＝取り直しに落ちること）を確かめる。メモリ圧のときだけ
- * 出る経路なので、意図的に極小の上限で踏ませる。
+ * Codec delegation assumes compressed blocks are sliced out of the copy retained
+ * from NEED_IO, but that copy is capped by `cacheSize`. This confirms it does not
+ * fail when a range that overflowed and was discarded is requested later (i.e. it
+ * falls back to refetching). The path only shows up under memory pressure, so a
+ * deliberately tiny limit is used to reach it.
  */
 const BIG_GZIP = join(tmpdir(), 'ahirudb-test-big-gzip.parquet');
 const BIG_ZSTD = join(tmpdir(), 'ahirudb-test-big-zstd.parquet');
@@ -1306,7 +1310,7 @@ for (const [path, codec] of [
 async function scanTwiceWithTinyCache(path, options = {}) {
   const file = new Uint8Array(await readFile(path));
   const f = fakeFetcher(file);
-  // 控えもキャッシュも実質ゼロ。毎回どこかが捨てられる状態にする。
+  // Both the retained copy and the cache are effectively zero, so something is always discarded.
   const db = await AhiruDB.init({
     wasmUrl: WASM,
     fetch: f.fetchImpl,
@@ -1316,8 +1320,8 @@ async function scanTwiceWithTinyCache(path, options = {}) {
   try {
     db.register('t', f.url);
     const first = await db.query('SELECT id FROM t');
-    // 2 回目は wasm 側にバイトが残っているので NEED_IO が出ない。
-    // 控えが空でもコーデック要求を満たせること。
+    // The second run raises no NEED_IO because the bytes are still on the wasm side.
+    // Codec requests must still be satisfiable with an empty retained copy.
     const second = await db.query('SELECT id FROM t');
     return { first, second, fetches: f.ranges.length };
   } finally {
@@ -1325,7 +1329,7 @@ async function scanTwiceWithTinyCache(path, options = {}) {
   }
 }
 
-test('控えを溢れさせても GZIP を読み切れる', { skip: needsVm }, async () => {
+test('GZIP can still be read through even when the retained copy overflows', { skip: needsVm }, async () => {
   const { first, second } = await scanTwiceWithTinyCache(BIG_GZIP);
   assert.equal(first.length, 120000);
   assert.deepEqual(first, second);
@@ -1333,7 +1337,7 @@ test('控えを溢れさせても GZIP を読み切れる', { skip: needsVm }, a
   assert.equal(first[first.length - 1].id, 119999);
 });
 
-test('控えを溢れさせても ZSTD を読み切れる', { skip: ZSTD_SKIP || NOZSTD_SKIP || needsVm }, async () => {
+test('ZSTD can still be read through even when the retained copy overflows', { skip: ZSTD_SKIP || NOZSTD_SKIP || needsVm }, async () => {
   const { first, second } = await scanTwiceWithTinyCache(BIG_ZSTD, {
     wasmUrl: NOZSTD_WASM,
     zstdUrl: ZSTD_WASM,

@@ -1,19 +1,19 @@
-//! FSE (Finite State Entropy) デコード表。
+//! The FSE (Finite State Entropy) decoding table.
 //!
-//! 表は「状態 -> (シンボル, 次状態を作るためのビット数とベース)」の 3 本の配列。
-//! 状態数は 2 のべきなので添字はマスクで丸められ、境界検査を省いてもバッファ外に
-//! 出ない（それでも `sym`/`nb`/`base` の長さは常に同じに保つ）。
+//! The table is three arrays: state -> (symbol, and the bit count and base used to form the next state).
+//! The state count is a power of two, so indices are masked and stay in bounds even
+//! without bounds checks (`sym`/`nb`/`base` are nonetheless always kept the same length).
 
 use crate::bits::{Forward, Reverse};
 use crate::prelude::*;
 use crate::Error;
 
-/// 正規化カウントに現れうるシンボルの上限。仕様上 255 まで。
+/// The largest symbol that can appear in the normalized counts. Up to 255 per the spec.
 const MAX_SYMBOLS: usize = 256;
 
 pub struct Table {
     accuracy: u32,
-    /// 状態数 - 1。添字はこれで丸める。
+    /// State count - 1. Indices are masked with this.
     mask: u16,
     sym: Vec<u8>,
     nb: Vec<u8>,
@@ -21,7 +21,7 @@ pub struct Table {
 }
 
 impl Table {
-    /// RLE モード用。状態は常に 0、追加ビットも 0 で同じシンボルを返す。
+    /// For RLE mode. The state is always 0 and the extra bit count is 0, returning the same symbol.
     pub fn rle(s: u8) -> Table {
         Table { accuracy: 0, mask: 0, sym: vec![s], nb: vec![0], base: vec![0] }
     }
@@ -41,15 +41,15 @@ impl Table {
     }
 }
 
-/// 最上位 1 ビットの位置。`v == 0` は呼び出し側で排除済みだが、
-/// デバッグビルドで桁溢れパニックを起こさないよう飽和させておく。
+/// The position of the highest set bit. `v == 0` is ruled out by the caller, but
+/// this saturates so debug builds do not panic on underflow.
 #[inline]
 fn highest_bit(v: u32) -> u32 {
     31u32.saturating_sub(v.leading_zeros())
 }
 
-/// 正規化カウントから復号表を組む。`norm[i] == -1` は「確率 1/N 未満」を表し、
-/// 表の末尾から 1 セルずつ割り当てられる。
+/// Builds the decoding table from normalized counts. `norm[i] == -1` means
+/// "probability below 1/N", and those are assigned one cell at a time from the end of the table.
 fn build(norm: &[i16], n: usize, accuracy: u32) -> Result<Table, Error> {
     let size = 1usize << accuracy;
     let mut sym = vec![0u8; size];
@@ -66,8 +66,8 @@ fn build(norm: &[i16], n: usize, accuracy: u32) -> Result<Table, Error> {
         }
     }
 
-    // セル割り当ては線形ではなく step 幅で散らす。step は size と互いに素
-    // (accuracy >= 5 なので必ず奇数) なので巡回で全セルを踏む。
+    // Cells are assigned scattered by a step rather than linearly. step is coprime
+    // with size (always odd, since accuracy >= 5), so the cycle visits every cell.
     let step = (size >> 1) + (size >> 3) + 3;
     let mask = size - 1;
     let mut pos = 0usize;
@@ -78,8 +78,8 @@ fn build(norm: &[i16], n: usize, accuracy: u32) -> Result<Table, Error> {
         desc[s] = p as u16;
         for _ in 0..p {
             sym[pos] = s as u8;
-            // high == 0 のときはここに来ない（正の確率が無いため）。それでも
-            // 壊れた入力で無限ループしないよう回数を切る。
+            // Unreachable when high == 0 (there would be no positive probability).
+            // Even so, cap the iterations so corrupt input cannot loop forever.
             let mut guard = size + 1;
             loop {
                 pos = (pos + step) & mask;
@@ -93,7 +93,7 @@ fn build(norm: &[i16], n: usize, accuracy: u32) -> Result<Table, Error> {
             }
         }
     }
-    // 全セルを使い切れば一周して 0 に戻る。
+    // Using up every cell wraps around back to 0.
     if pos != 0 {
         return Err(Error::BadFse);
     }
@@ -110,14 +110,14 @@ fn build(norm: &[i16], n: usize, accuracy: u32) -> Result<Table, Error> {
     Ok(Table { accuracy, mask: mask as u16, sym, nb, base })
 }
 
-/// 定義済み分布から表を組む。
+/// Builds a table from a predefined distribution.
 pub fn predefined(norm: &[i16], accuracy: u32) -> Result<Table, Error> {
     build(norm, norm.len(), accuracy)
 }
 
-/// FSE テーブル記述を読む。返り値は表と消費バイト数。
+/// Reads an FSE table description. Returns the table and the bytes consumed.
 ///
-/// 記述は前向き LSB 先行のビット列で、バイト境界に切り上げて終わる。
+/// The description is a forward LSB-first bit sequence that ends rounded up to a byte boundary.
 pub fn read_table(
     src: &[u8],
     max_accuracy: u32,
@@ -133,7 +133,7 @@ pub fn read_table(
     let mut remaining: i32 = 1 << accuracy;
     let mut sym = 0usize;
     while remaining > 0 && sym <= max_symbol {
-        // 残り確率量に応じてビット幅が縮む可変長符号。
+        // A variable-length code whose width shrinks with the remaining probability mass.
         let bits = highest_bit(remaining as u32 + 1) + 1;
         let raw = r.read(bits)?;
         let low_mask = (1u32 << (bits - 1)) - 1;
@@ -147,7 +147,7 @@ pub fn read_table(
             raw
         };
 
-        // 値 0 は「確率 1/N 未満」を意味する -1。
+        // A value of 0 means -1, i.e. "probability below 1/N".
         let proba = val as i32 - 1;
         remaining -= proba.abs();
         if remaining < 0 {
@@ -157,8 +157,8 @@ pub fn read_table(
         sym += 1;
 
         if proba == 0 {
-            // 確率 0 のシンボルの後ろには 2 ビットのスキップ数が続く。
-            // 3 なら更に 2 ビット読む（最大 3 個ずつ連鎖）。
+            // A zero-probability symbol is followed by a 2-bit skip count.
+            // A value of 3 means reading 2 more bits (chaining up to 3 at a time).
             let mut repeat = r.read(2)?;
             loop {
                 let mut i = 0;
@@ -183,10 +183,10 @@ pub fn read_table(
     Ok((t, r.bytes_used()))
 }
 
-/// ハフマン weight 用の 2 状態インターリーブ FSE 展開。
+/// Two-state interleaved FSE expansion for Huffman weights.
 ///
-/// シンボル数は前もって分からず、ビットストリームを踏み越えた時点で終わる
-/// （仕様がそう定めている）。`out` の長さで上限を切る。
+/// The symbol count is not known in advance; it ends the moment the bitstream is
+/// overrun (the spec defines it that way). The length of `out` caps it.
 pub fn decode_interleaved(t: &Table, stream: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     let mut r = Reverse::new(stream)?;
     let mut s1 = t.init(&mut r);

@@ -1,7 +1,7 @@
-//! CSV 書き出し（`export` フィーチャ）。
+//! CSV writing (`export` feature).
 //!
-//! RFC 4180 準拠。カンマ・引用符・改行を含むフィールドだけを引用符で囲む
-//! （毎回引用符を付けるより出力が小さく、読みやすい）。
+//! RFC 4180 compliant. Only quotes fields that contain a comma, quote, or
+//! newline (smaller and more readable output than quoting every field).
 
 use crate::expr::funcs::civil_from_days;
 use crate::prelude::*;
@@ -10,7 +10,7 @@ use crate::write::TableSink;
 
 pub struct CsvSink {
     out: Vec<u8>,
-    /// ヘッダ行を書いたか。
+    /// Whether the header row has been written.
     began: bool,
 }
 
@@ -48,7 +48,7 @@ impl TableSink for CsvSink {
                     self.out.push(b',');
                 }
                 if !c.is_valid(r) {
-                    // 空フィールドが NULL。CSV に NULL の標準表現は無い。
+                    // An empty field means NULL. CSV has no standard representation for NULL.
                     continue;
                 }
                 push_value(&mut self.out, &c.value_at(r), f.ty);
@@ -63,16 +63,16 @@ impl TableSink for CsvSink {
     }
 }
 
-/// カンマ・引用符・改行・CR を含む場合、または値が空文字列の場合だけ
-/// 引用符で囲む。
+/// Quotes a field only if it contains a comma, quote, newline, or CR, or if
+/// the value is the empty string.
 ///
-/// 空文字列も引用符で囲むのは意図的: `write_batch` は NULL を「フィールドを
-/// 一切書かない」ことで表す（`crate::format::csv` の読み取り側で「引用符無し
-/// の空フィールドは NULL」という規約と対になっている）。空文字列を無引用の
-/// まま書くと、出力上は NULL と全く同じバイト列（空）になってしまい、この
-/// クレート自身の CSV リーダーで読み返すと空文字列が NULL に化けてしまう
-/// （実際に発見された往復バグ）。`""` と書けば、読み取り側の
-/// 「引用符付きの空＝空文字列」という規約に乗って区別できる。
+/// Quoting the empty string too is deliberate: `write_batch` represents NULL
+/// by writing no field at all (the counterpart of `crate::format::csv`'s read
+/// side convention that an unquoted empty field is NULL). Writing an empty
+/// string unquoted would produce the exact same output bytes as NULL (empty),
+/// so reading it back with this crate's own CSV reader would turn the empty
+/// string into NULL (a real round-trip bug that was actually found). Writing
+/// `""` lets the read side's "quoted empty = empty string" convention tell them apart.
 fn push_field(out: &mut Vec<u8>, s: &[u8]) {
     let needs_quote = s.is_empty() || s.iter().any(|&b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
     if !needs_quote {
@@ -99,7 +99,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         Value::I64(x) if ty == Ty::Timestamptz => push_timestamptz(out, *x),
         // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
         // `Value::I128` (`vector/types.rs`'s doc on `Decimal`: "precision <=
-        // 18 は I64 で保持する"). This arm used to be missing, so a
+        // 18 is held as I64"). This arm used to be missing, so a
         // DECIMAL(10,2) value of 12.50 (stored as the I64 1250) wrote out as
         // the bare integer `1250` instead of `12.50` — a real round-trip bug
         // found during QA, symmetric with the `Value::I128` arm below.
@@ -118,9 +118,9 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         },
         Value::F64(x) => push_f64(out, *x),
         Value::Bytes(b) if ty == Ty::Uuid => {
-            // UUID の物理表現は生の 16 バイトなので、テキスト化してから
-            // 引用要否を判定する（ハイフンを含むがカンマ/引用符/改行は
-            // 含まないので、実際には常に無引用で書ける）。
+            // UUID's physical representation is 16 raw bytes, so convert to text
+            // first before deciding whether it needs quoting (it contains hyphens
+            // but no comma/quote/newline, so it can always be written unquoted).
             let mut hex = Vec::with_capacity(36);
             if let Ok(raw) = <[u8; 16]>::try_from(b.as_slice()) {
                 crate::expr::funcs::fmt_uuid(&raw, &mut hex);
@@ -190,8 +190,9 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
     }
 }
 
-/// `core` に浮動小数の書式化が無いので手で組む。指数部を持たない範囲では
-/// 単純な整数部+小数部で足りる（DuckDB の CSV 出力も基本この形）。
+/// `core` has no float formatting, so this is hand-rolled. For values without
+/// an exponent, a simple integer-part + fraction-part suffices (this is
+/// basically what DuckDB's CSV output does too).
 fn push_f64(out: &mut Vec<u8>, v: f64) {
     if v.is_nan() {
         out.extend_from_slice(b"NaN");
@@ -210,21 +211,22 @@ fn push_f64(out: &mut Vec<u8>, v: f64) {
     if neg {
         out.push(b'-');
     }
-    // 整数部。`trunc()` は core に無い（libm 依存）ので `as i128` の
-    // 飽和・ゼロ方向丸めキャストで代用する。
+    // Integer part. `trunc()` is not in `core` (it's a libm dependency), so
+    // an `as i128` saturating, round-toward-zero cast is used instead.
     let ip = x as i128;
     push_int(out, ip);
     out.push(b'.');
-    // `ip` が i128 の範囲外で飽和した場合（v の絶対値が i128::MAX 超）、
-    // `x - ip as f64` は [0,1) に収まらない巨大な残差になる。そのまま桁
-    // 抽出すると `x as u8` が 255 に飽和し、`b'0' + d` で u8 加算オーバー
-    // フロー（デバッグ panic、release ビルドでは不正なバイトの書き込み）
-    // になる。飽和したら小数部の抽出自体を諦める。
+    // If `ip` saturates outside the i128 range (v's absolute value exceeds
+    // i128::MAX), `x - ip as f64` becomes a huge residual that does not fit in
+    // [0,1). Extracting digits from it as-is would saturate `x as u8` at 255,
+    // and `b'0' + d` would overflow the u8 addition (a debug panic, or a
+    // corrupted byte write in release builds). So once saturated, give up on
+    // extracting the fraction part entirely.
     if ip == i128::MAX || ip == i128::MIN {
         out.push(b'0');
     } else {
         x -= ip as f64;
-        // 小数部は最大 15 桁まで。末尾 0 は 1 桁残して落とす。
+        // The fraction part goes up to 15 digits max. Trailing zeros are trimmed, keeping at least one digit.
         let mut digits = Vec::with_capacity(15);
         for _ in 0..15 {
             x *= 10.0;
@@ -382,11 +384,12 @@ mod tests {
         assert_eq!(out, "a\n0.1\n100.0\n-0.5\n");
     }
 
-    // `push_f64` は core に指数表記の書式化が無いので整数部+小数部の固定小数点
-    // でしか書けない（ファイル冒頭のコメント参照）。整数部が i128 の範囲を
-    // 超える巨大な有限値では `as i128` が飽和し、`i128::MAX` 相当の整数部を
-    // 出す。DECIMAL/DOUBLE の通常データでここに達することはまず無いが、
-    // 「何が起きるか」を固定して将来の変更で無自覚に壊れないようにする。
+    // `push_f64` has no exponent-notation formatting in `core`, so it can only
+    // write fixed-point integer-part + fraction-part (see the comment at the
+    // top of the file). For huge finite values whose integer part exceeds the
+    // i128 range, `as i128` saturates and produces an integer part equal to
+    // `i128::MAX`. Normal DECIMAL/DOUBLE data should essentially never reach
+    // this, but the behavior is pinned down here so future changes don't break it unknowingly.
     #[test]
     fn float_formatting_saturates_on_extremely_large_finite_values() {
         let out =

@@ -4,12 +4,12 @@ use super::types::{cube_sets, float_literal, int_literal, rollup_sets, sample_me
 use super::*;
 
 impl<'a> Parser<'a> {
-    // --- クエリ（CTE + 集合演算 + 外側の ORDER BY / LIMIT）--------------------
+    // --- Queries (CTEs + set operations + the outer ORDER BY / LIMIT) ---------
 
-    /// 深さを 1 段消費するクエリ。派生表・サブクエリ式経由で再帰しうる。
+    /// A query that consumes one level of depth. It can recurse via derived tables and subquery expressions.
     ///
-    /// クエリの入れ子はすべてここを通るので、深さの計上はこの 1 か所で足りる
-    /// （`select_body` は必ず `query_body` の下から呼ばれる）。
+    /// Every nested query passes through here, so accounting for depth in this one place
+    /// suffices (`select_body` is always called from beneath `query_body`).
     pub(super) fn query_stmt(&mut self) -> Result<QueryStmt> {
         ensure!(self.depth < MAX_DEPTH, ExpressionTooDeep, self.pos);
         self.depth += 1;
@@ -37,10 +37,10 @@ impl<'a> Parser<'a> {
             limit: None,
             offset: None,
         };
-        // 末尾の ORDER BY / LIMIT / OFFSET の置き場所は 1 つの規則で決める:
-        // **本体が括弧無しの単一 SELECT なら `SelectStmt` 側**、それ以外
-        // （集合演算がある、または本体が括弧付きクエリ）なら `QueryStmt` 側。
-        // 括弧付きを除くのは、内側で既に自分の ORDER BY を持ちうるため。
+        // Where the trailing ORDER BY / LIMIT / OFFSET goes is decided by one rule:
+        // **the `SelectStmt` side if the body is a single unparenthesized SELECT**, and the
+        // `QueryStmt` side otherwise (a set operation is present, or the body is a
+        // parenthesized query). Parenthesized bodies are excluded because they may already carry their own ORDER BY inside.
         match (&mut q.body, bare) {
             (SetExpr::Select(s), true) => {
                 s.order_by = order_by;
@@ -58,14 +58,13 @@ impl<'a> Parser<'a> {
         Ok(q)
     }
 
-    /// `WITH` の直後だけで意味を持つ文脈依存キーワード `RECURSIVE`。
+    /// `RECURSIVE`, a context-dependent keyword meaningful only right after `WITH`.
     ///
-    /// `OVER`/`ROWS`/`RANGE` と同じ理由でグローバルには予約しない
-    /// （`recursive` という名前の CTE も書けなければならない）。`RECURSIVE`
-    /// の後には必ず CTE 名（識別子）が続くので、次のトークンが識別子で
-    /// なければ「`recursive` という名前の CTE」の側だと判断して消費しない
-    /// （`WITH recursive AS (...)`／`WITH recursive(a) AS (...)` はどちらも
-    /// 妥当な SQL で、DuckDB の挙動と一致させてある）。
+    /// Not reserved globally, for the same reason as `OVER`/`ROWS`/`RANGE` (a CTE named
+    /// `recursive` must be writable). `RECURSIVE` is always followed by a CTE name (an
+    /// identifier), so if the next token is not an identifier this decides in favor of "a
+    /// CTE named `recursive`" and does not consume it (`WITH recursive AS (...)` and
+    /// `WITH recursive(a) AS (...)` are both valid SQL, matching DuckDB's behavior).
     fn eat_recursive_kw(&mut self) -> Result<bool> {
         if self.is_soft_kw(b"recursive") && matches!(self.peek()?, Tok::Ident(_) | Tok::QIdent(_)) {
             self.bump()?;
@@ -74,17 +73,17 @@ impl<'a> Parser<'a> {
         Ok(false)
     }
 
-    /// `WITH` の本体。`name [(col, ...)] AS ( query )` のカンマ区切り。
+    /// The body of `WITH`. A comma-separated list of `name [(col, ...)] AS ( query )`.
     ///
-    /// `recursive` は `WITH RECURSIVE` かどうか（`eat_recursive_kw` の結果）。
-    /// 標準 SQL 通り、このフラグはリスト中の CTE 全部に等しく効く
-    /// （実際に自分自身を参照するかどうかは束縛時に個別に判定する）。
+    /// `recursive` is whether this is a `WITH RECURSIVE` (the result of `eat_recursive_kw`).
+    /// Per standard SQL the flag applies equally to every CTE in the list (whether one
+    /// actually references itself is decided individually at bind time).
     fn cte_list(&mut self, recursive: bool) -> Result<Vec<Cte>> {
         let mut out = Vec::new();
         loop {
             let name = self.ident()?;
-            // `name (a, b) AS (...)` の列名リストは `WITH RECURSIVE` の下でのみ
-            // 許す（非再帰 CTE の列名リストは引き続き未対応のまま）。
+            // The column list of `name (a, b) AS (...)` is allowed only under
+            // `WITH RECURSIVE` (column lists on non-recursive CTEs remain unsupported).
             let mut columns = Vec::new();
             if self.is(Tok::LParen) {
                 ensure!(recursive, UnsupportedFeature, self.pos);
@@ -109,10 +108,10 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// `UNION` / `EXCEPT` の段。左結合で積む。
+    /// The `UNION` / `EXCEPT` level. Built left-associatively.
     ///
-    /// 戻り値の `bool` は「括弧無しの単一 SELECT だったか」。末尾の
-    /// ORDER BY / LIMIT を `SelectStmt` へ落として良いかの判定に使う。
+    /// The returned `bool` is "was it a single unparenthesized SELECT". It decides whether
+    /// the trailing ORDER BY / LIMIT may be dropped onto `SelectStmt`.
     fn set_expr(&mut self) -> Result<(SetExpr, bool)> {
         let (mut left, mut bare) = self.intersect_expr()?;
         loop {
@@ -131,7 +130,7 @@ impl<'a> Parser<'a> {
         Ok((left, bare))
     }
 
-    /// `INTERSECT` の段。SQL 標準どおり `UNION` / `EXCEPT` より強く結合する。
+    /// The `INTERSECT` level. It binds tighter than `UNION` / `EXCEPT`, per the SQL standard.
     fn intersect_expr(&mut self) -> Result<(SetExpr, bool)> {
         let (mut left, mut bare) = self.select_or_paren()?;
         while self.is(Tok::Kw(Kw::Intersect)) {
@@ -161,11 +160,11 @@ impl<'a> Parser<'a> {
         Ok((SetExpr::Select(Box::new(self.select_body()?)), true))
     }
 
-    /// 括弧付きクエリを集合演算の項に落とす。
+    /// Drops a parenthesized query into a set-operation term.
     ///
-    /// `SetExpr` には CTE も ORDER BY / LIMIT も置けないので、それらを持つ
-    /// 場合だけ `SELECT * FROM (...)` に包む。持たない場合は本体をそのまま使う
-    /// （余計な射影を挟まない）。
+    /// `SetExpr` cannot carry a CTE or an ORDER BY / LIMIT, so it is wrapped in
+    /// `SELECT * FROM (...)` only when it has them. Otherwise the body is used as is (no
+    /// needless projection is interposed).
     fn paren_body(&mut self, q: QueryStmt) -> SetExpr {
         if q.ctes.is_empty()
             && q.order_by.is_empty()
@@ -188,27 +187,26 @@ impl<'a> Parser<'a> {
         SetExpr::Select(Box::new(s))
     }
 
-    /// 先読み: `(` の直後がクエリの始まりか。
+    /// Lookahead: whether what follows `(` is the start of a query.
     ///
-    /// スカラサブクエリ / `IN (SELECT ...)` / 括弧付き式の切り分けはこの 1 語
-    /// だけで行う。`(` が続く場合（`((SELECT 1))`）は式・値リスト側に倒し、
-    /// 内側の `(` が改めてこの判定を受ける。
+    /// Telling apart a scalar subquery / `IN (SELECT ...)` / a parenthesized expression is
+    /// done on this one word alone. A following `(` (`((SELECT 1))`) falls to the
+    /// expression/value-list side, and the inner `(` gets this check afresh.
     #[inline]
     pub(super) fn starts_query(&self) -> bool {
         matches!(self.cur, Tok::Kw(Kw::Select | Kw::With))
     }
 
     fn select_body(&mut self) -> Result<SelectStmt> {
-        // `PIVOT`/`UNPIVOT` はこのエンジンでは文の先頭（`stmt`）でしか認識
-        // しない糖衣構文で、展開（`plan::bind::desugar_pivot`/
-        // `desugar_unpivot`）は `Session::prepare` の入り口で対象表の
-        // スキーマを解決したうえで一度だけ行う設計になっている
-        // （`session.rs` の該当コメント参照）。そのため `FROM (PIVOT ...)`
-        // のような派生表・CTE本体・集合演算の項としては使えない
-        // （`duckdb` はこれを許すが、ここでは対応範囲外）。素通しすると
-        // この先で `SELECT` を期待して素の `UnexpectedToken` になり
-        // 原因が分かりにくいので、ここで先に分かりやすい
-        // `UnsupportedFeature` にしておく。
+        // In this engine `PIVOT`/`UNPIVOT` are sugar recognized only at the head of a
+        // statement (`stmt`), and the expansion
+        // (`plan::bind::desugar_pivot`/`desugar_unpivot`) is by design done exactly once at
+        // the entrance of `Session::prepare`, after resolving the target table's schema
+        // (see the corresponding comment in `session.rs`). They therefore cannot be used as
+        // a derived table, a CTE body, or a set-operation term, as in `FROM (PIVOT ...)`
+        // (`duckdb` allows this; here it is out of scope). Letting it through would lead to
+        // a bare `UnexpectedToken` further on where `SELECT` was expected, obscuring the
+        // cause, so a clearer `UnsupportedFeature` is raised here first.
         ensure!(
             !self.is_soft_kw(b"pivot") && !self.is_soft_kw(b"unpivot"),
             UnsupportedFeature,
@@ -217,8 +215,8 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::Select)?;
         let mut st = SelectStmt::empty();
         st.distinct = self.eat_kw(Kw::Distinct)?;
-        // `DISTINCT ON (expr, ...)`。PostgreSQL/DuckDB 拡張。`ON` は JOIN の
-        // `ON` と同じ予約語なので、列名として使われる心配なく普通に照合できる。
+        // `DISTINCT ON (expr, ...)`. A PostgreSQL/DuckDB extension. `ON` is the same
+        // reserved word as JOIN's `ON`, so it can be matched normally without worrying about column names.
         if st.distinct && self.is(Tok::Kw(Kw::On)) {
             self.bump()?; // ON
             self.expect(Tok::LParen)?;
@@ -230,8 +228,8 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect(Tok::RParen)?;
-            // ON 側が実質の重複除去を行うので、グループキー全体を使う
-            // 通常の DISTINCT フラグは同時には立てない。
+            // The ON side performs the effective deduplication, so the ordinary DISTINCT
+            // flag, which uses the whole group key, is not set at the same time.
             st.distinct = false;
         }
         loop {
@@ -250,16 +248,16 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(Kw::Group)? {
             self.expect_kw(Kw::By)?;
-            // `GROUPING SETS`/`ROLLUP`/`CUBE` は列名としても使える一般語
-            // （`ROWS`/`RANGE`/`QUALIFY` を巡る事故と同種）なので予約語にせず、
-            // `GROUP BY` 直後というこの文脈でだけキーワードとして扱う。
-            // 2 語連続の `GROUPING SETS` は 2 トークン先読みで見分ける。
-            // `GROUP BY ALL`（DuckDB 拡張）。`ALL` は `UNION ALL` 等で既に
-            // 予約語（`Kw::All`）なので、文脈依存キーワードの判定は要らない。
-            // 実際にどの式でグルーピングするかは束縛時に決める
-            // （`SelectStmt::group_by_all` の doc 参照）。`GROUP BY ALL, x`
-            // のような併記は DuckDB も構文エラーにするので、ここでもリストを
-            // 読まない＝続く `,` が `UnexpectedToken` になる形で自然に弾かれる。
+            // `GROUPING SETS`/`ROLLUP`/`CUBE` are common words usable as column names too
+            // (the same class as the incidents around `ROWS`/`RANGE`/`QUALIFY`), so they are
+            // not reserved and are treated as keywords only in this position right after
+            // `GROUP BY`. The two-word `GROUPING SETS` is distinguished with two tokens of lookahead.
+            // `GROUP BY ALL` (a DuckDB extension). `ALL` is already reserved (`Kw::All`) by
+            // `UNION ALL` and friends, so no context-dependent keyword check is needed.
+            // Which expressions are actually grouped on is decided at bind time (see the
+            // docs on `SelectStmt::group_by_all`). Writing both, as in `GROUP BY ALL, x`, is
+            // a syntax error in DuckDB too, and is rejected naturally here as well: no list
+            // is read, so the following `,` becomes an `UnexpectedToken`.
             if self.eat_kw(Kw::All)? {
                 st.group_by_all = true;
             } else if self.is_soft_kw(b"grouping") && self.peek_is_soft_kw(b"sets")? {
@@ -287,9 +285,9 @@ impl<'a> Parser<'a> {
         if self.eat_kw(Kw::Having)? {
             st.having = Some(self.expr()?);
         }
-        // `WINDOW name AS (...), ...`。`GROUP BY`/`ORDER BY` と同格の句
-        // キーワードとして扱う（`Kw::Window` は通常の予約語。`window` を
-        // 一般語として文脈依存にできない理由は `sql::lexer` のコメント参照）。
+        // `WINDOW name AS (...), ...`. Treated as a clause keyword on a par with
+        // `GROUP BY`/`ORDER BY` (`Kw::Window` is an ordinary reserved word; see the comment
+        // in `sql::lexer` for why `window` cannot be made context-dependent).
         if self.eat_kw(Kw::Window)? {
             loop {
                 let wname = self.ident()?;
@@ -311,32 +309,32 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        // `QUALIFY` は `OVER`/`PARTITION`/`ROWS`/`RANGE` と違い、実データの
-        // 列名になり得る一般語ではない（Teradata/SQL:1999 由来の専用語）ので
-        // 通常の予約語にする。文脈依存キーワードにすると、`FROM t QUALIFY ...`
-        // のように `WHERE`/`GROUP BY` を挟まず直後に置いた場合、`opt_alias`
-        // が `QUALIFY` をテーブル別名として食ってしまい構文が壊れる
-        // （ここは `ON` を挟まず `LIKE` を予約語にしているのと同じ判断）。
+        // Unlike `OVER`/`PARTITION`/`ROWS`/`RANGE`, `QUALIFY` is not a common word that
+        // could be a real data column name (it is a dedicated term from Teradata/SQL:1999),
+        // so it is an ordinary reserved word. As a context-dependent keyword, placing it
+        // directly after FROM without an intervening `WHERE`/`GROUP BY`, as in
+        // `FROM t QUALIFY ...`, would have `opt_alias` eat `QUALIFY` as a table alias and
+        // break the syntax (the same judgment as reserving `LIKE` without an intervening `ON`).
         if self.eat_kw(Kw::Qualify)? {
             st.qualify = Some(self.expr()?);
         }
-        // `USING SAMPLE` は文末側の独立した句（`opt_using_sample_clause` の
-        // doc 参照）。`FROM` 項目に直接くっつく `TABLESAMPLE` とは受理位置が
-        // 違うので、両方が同時に書かれた場合は二重指定として拒否する
-        // （`duckdb` は両方を順番に適用できるが、このエンジンの `SampleSpec`
-        // は 1 個しか持てない単純化なので、サポート範囲外として明示的に
-        // 拒否する）。
+        // `USING SAMPLE` is an independent clause on the statement-tail side (see the docs
+        // on `opt_using_sample_clause`). It is accepted at a different position from
+        // `TABLESAMPLE`, which attaches directly to a FROM item, so writing both at once is
+        // rejected as a double specification (`duckdb` can apply both in order, but this
+        // engine's `SampleSpec` is simplified to hold only one, so it is explicitly
+        // rejected as out of scope).
         if let Some(spec) = self.opt_using_sample_clause()? {
             ensure!(st.sample.is_none(), UnsupportedFeature, self.pos);
             st.sample = Some(spec);
         }
-        // ORDER BY / LIMIT / OFFSET はここでは読まない。集合演算の右項が
-        // 外側の ORDER BY を食ってしまうため、`query_body` 側で一括して扱う。
+        // ORDER BY / LIMIT / OFFSET are not read here. The right term of a set operation
+        // would swallow the outer ORDER BY, so `query_body` handles them all together.
         Ok(st)
     }
 
-    /// `GROUPING SETS` の本体 `( (expr, ...), (expr, ...), () )`。
-    /// 空集合 `()` も 1 セットとして許す。
+    /// The body of `GROUPING SETS`, `( (expr, ...), (expr, ...), () )`.
+    /// The empty set `()` is allowed as one set.
     fn grouping_sets_body(&mut self) -> Result<Vec<Vec<ExprId>>> {
         self.expect(Tok::LParen)?;
         let mut sets = Vec::new();
@@ -350,8 +348,8 @@ impl<'a> Parser<'a> {
         Ok(sets)
     }
 
-    /// `( expr, expr, ... )`。空リスト `()` も許す（`ROLLUP ()` 等は書けないが
-    /// `GROUPING SETS` の 1 要素としては現れる）。
+    /// `( expr, expr, ... )`. The empty list `()` is allowed too (`ROLLUP ()` and the like
+    /// cannot be written, but it does appear as one element of `GROUPING SETS`).
     fn paren_expr_list(&mut self) -> Result<Vec<ExprId>> {
         self.expect(Tok::LParen)?;
         let mut list = Vec::new();
@@ -367,10 +365,10 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
-    /// `REPLACE`。`ddl` フィーチャ有効時は `CREATE OR REPLACE` 用にすでに
-    /// グローバル予約語（`Kw::Replace`）になっているため、その形も受け付ける。
-    /// 無効時は `EXCLUDE` と同じく綴りだけで判定する文脈依存キーワード
-    /// （実データに `replace`/`exclude` という列名が現れても壊さないため）。
+    /// `REPLACE`. With the `ddl` feature on it is already a global reserved word
+    /// (`Kw::Replace`) for `CREATE OR REPLACE`, so that form is accepted too.
+    /// With it off, it is matched by spelling as a context-dependent keyword like `EXCLUDE`
+    /// (so real data with columns named `replace`/`exclude` is not broken).
     #[inline]
     fn is_star_replace_kw(&self) -> bool {
         #[cfg(feature = "ddl")]
@@ -394,13 +392,13 @@ impl<'a> Parser<'a> {
         self.is_soft_kw(b"rename")
     }
 
-    /// `*`/`t.*` の直後に続きうる `EXCLUDE (col, ...)` / `REPLACE (expr AS
-    /// col, ...)`（DuckDB 拡張）。この 2 語は `ROWS`/`RANGE`/`QUALIFY` と同種の
-    /// 「実データにありふれた列名」なので、`*` の直後というこの文脈でだけ
-    /// キーワードとして読む。順序は EXCLUDE → REPLACE 固定（`duckdb` で
-    /// `REPLACE (...) EXCLUDE (...)` の逆順を試すと構文エラーになることを
-    /// 確認済み）。カンマ区切りの複数指定は括弧必須だが、1 個だけなら括弧を
-    /// 省略できる（`duckdb` の挙動に合わせた）。
+    /// The `EXCLUDE (col, ...)` / `REPLACE (expr AS col, ...)` (DuckDB extensions) that may
+    /// follow `*`/`t.*`. These two words are of the same class as `ROWS`/`RANGE`/`QUALIFY`
+    /// -- "column names common in real data" -- so they are read as keywords only in this
+    /// position right after `*`. The order is fixed as EXCLUDE then REPLACE (confirmed that
+    /// the reverse `REPLACE (...) EXCLUDE (...)` is a syntax error in `duckdb`).
+    /// A comma-separated list requires parentheses, but a single entry may omit them
+    /// (matching `duckdb`'s behavior).
     ///
     /// A third modifier, `RENAME (old AS new, ...)`, follows the same two
     /// rules and must come last: the fixed order is
@@ -463,8 +461,8 @@ impl<'a> Parser<'a> {
                 replace.push((e, name));
             }
         }
-        // 同じ列を EXCLUDE と REPLACE の両方に置くのは無意味（`duckdb` も
-        // 拒否する）ので、ここで検出する。
+        // Putting the same column in both EXCLUDE and REPLACE is meaningless (`duckdb`
+        // rejects it too), so it is detected here.
         let pos = self.pos;
         for (_, name) in &replace {
             ensure!(
@@ -631,7 +629,7 @@ impl<'a> Parser<'a> {
         if self.is_columns_kw()? {
             return self.columns_item();
         }
-        // 先頭の `*` だけは式ではなく列挙として扱う。`t.*` は primary 側。
+        // Only a leading `*` is treated as an enumeration rather than an expression. `t.*` is handled on the primary side.
         if self.is(Tok::Star) {
             self.bump()?;
             // `*COLUMNS(...)` (DuckDB's unpacking form) and `* LIKE 'pat'` /
@@ -713,7 +711,7 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_from_item(&mut self) -> Result<FromItem> {
         let mut left = self.base_rel()?;
         loop {
-            // ON を要求するのは明示 JOIN のみ。CROSS と暗黙のカンマ結合は無条件。
+            // Only explicit JOINs require ON. CROSS and the implicit comma join are unconditional.
             let (kind, needs_on) = match self.cur {
                 Tok::Comma => {
                     self.bump()?;
@@ -742,7 +740,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => break,
             };
-            // 左深の `Box` 連鎖が伸びすぎると破棄時の再帰でスタックを使い切る。
+            // A left-deep `Box` chain that grows too long exhausts the stack when dropped.
             self.link()?;
             let right = self.base_rel()?;
             let on = if needs_on {
@@ -759,17 +757,17 @@ impl<'a> Parser<'a> {
     fn base_rel(&mut self) -> Result<FromItem> {
         if self.is(Tok::LParen) {
             self.bump()?;
-            // 派生表はクエリ全体を取る。集合演算も CTE も書ける。
+            // A derived table takes a whole query. Set operations and CTEs may be written.
             let query = self.query_stmt()?;
             self.expect(Tok::RParen)?;
             let alias = self.opt_alias()?;
             return Ok(FromItem::Subquery { query: Box::new(query), alias });
         }
-        // `FROM 'path'`: 裸の文字列リテラルによるファイル参照
-        // （`duckdb -c "SELECT * FROM 'x.csv'"` で構文を確認済み）。
-        // フォーマットは拡張子から推定する（`FormatKind::detect`、既存の
-        // Hive/multi-file 登録と同じ規則）。解決経路は下の `parquet(...)`/
-        // `read_csv(...)` 等とまったく同じ（`FromItem::File` の doc 参照）。
+        // `FROM 'path'`: a file reference by a bare string literal
+        // (syntax confirmed with `duckdb -c "SELECT * FROM 'x.csv'"`).
+        // The format is inferred from the extension (`FormatKind::detect`, the same rule as
+        // the existing Hive/multi-file registration). The resolution path is exactly the
+        // same as `parquet(...)`/`read_csv(...)` below (see the `FromItem::File` docs).
         if let Tok::Str(s) = self.cur {
             let path = unquote(s, b'\'');
             self.bump()?;
@@ -780,16 +778,16 @@ impl<'a> Parser<'a> {
         let pos = self.pos;
         let is_parquet = self.is_soft_kw(b"parquet");
         let is_read_parquet = self.is_soft_kw(b"read_parquet");
-        // CSV/JSON テーブル関数。`duckdb` CLI で確認した限り、`read_csv` と
-        // `read_csv_auto`（`read_json`/`read_json_auto` も同様）は 1 引数の
-        // 基本形では同じ結果になるので、この v1 では両方を同じ扱いにする
-        // （named オプション引数は非対応 — `FromItem::File` の doc 参照）。
-        // `csv`/`jsonl` フィーチャが無効なビルドでは該当フォーマットの読み取り
-        // 自体が存在しないので、構文としても認識しない（未対応の soft
-        // keyword は下の `ensure!` に落ちて `UnsupportedFeature` になる —
-        // `ddl`/`dml`/`export` の文が feature 無効時に同じ経路へ落ちるのと
-        // 同じパターン）。Parquet は常に使えるので `parquet`/`read_parquet`
-        // はフィーチャ判定なし。
+        // CSV/JSON table functions. As far as the `duckdb` CLI shows, `read_csv` and
+        // `read_csv_auto` (likewise `read_json`/`read_json_auto`) give the same result in
+        // the basic one-argument form, so v1 treats them identically (named option
+        // arguments are unsupported -- see the `FromItem::File` docs).
+        // In builds where the `csv`/`jsonl` features are off, reading those formats does not
+        // exist at all, so they are not recognized syntactically either (an unsupported soft
+        // keyword falls through to the `ensure!` below and becomes `UnsupportedFeature` --
+        // the same pattern as `ddl`/`dml`/`export` statements falling down the same path
+        // when their features are off). Parquet is always available, so `parquet`/`read_parquet`
+        // have no feature check.
         #[cfg(feature = "csv")]
         let is_read_csv = self.is_soft_kw(b"read_csv") || self.is_soft_kw(b"read_csv_auto");
         #[cfg(not(feature = "csv"))]
@@ -798,15 +796,15 @@ impl<'a> Parser<'a> {
         let is_read_json = self.is_soft_kw(b"read_json") || self.is_soft_kw(b"read_json_auto");
         #[cfg(not(feature = "jsonl"))]
         let is_read_json = false;
-        // `UNNEST` も `parquet(...)` と同じ「非予約語だが `(` が続けば特殊構文」
-        // という扱い。予約語化すると同名の列参照を壊す事故が過去にあった
-        // （`ROWS`/`RANGE`/`QUALIFY`/`RECURSIVE`）ので踏襲する。
+        // `UNNEST` gets the same "not reserved, but special syntax if `(` follows" treatment
+        // as `parquet(...)`. Reserving it has caused incidents breaking same-named column
+        // references in the past (`ROWS`/`RANGE`/`QUALIFY`/`RECURSIVE`), so that is followed here.
         let is_unnest = self.is_soft_kw(b"unnest");
-        // `RANGE` はウィンドウ枠（`OVER (... RANGE BETWEEN ...)`）でも文脈依存
-        // キーワードとして使われるが、そちらは `parse_window` の別の構文位置
-        // （`ORDER BY` の直後）でしか見ないので、ここでテーブル関数として
-        // 扱っても衝突しない（`is_soft_kw` の呼び出し元がそれぞれ独立している
-        // ことを確認済み）。
+        // `RANGE` is also used as a context-dependent keyword in window frames
+        // (`OVER (... RANGE BETWEEN ...)`), but that is only looked at in a different
+        // syntactic position in `parse_window` (right after `ORDER BY`), so treating it as a
+        // table function here does not collide (confirmed that the call sites of
+        // `is_soft_kw` are independent of one another).
         let is_generate_series = self.is_soft_kw(b"generate_series");
         let is_range = self.is_soft_kw(b"range");
         let name = self.ident()?;
@@ -822,8 +820,8 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(Tok::RParen)?;
                 ensure!(!args.is_empty() && args.len() <= 3, WrongArgCount, pos);
-                // `range` は半開区間・単項なら start=0、`generate_series` は
-                // 閉区間・単項なら stop=args[0]（`duckdb` CLI で確認済み）。
+                // `range` is half-open, and unary means start=0; `generate_series` is closed,
+                // and unary means stop=args[0] (confirmed with the `duckdb` CLI).
                 let (start, stop, step) = match args.len() {
                     1 => (0, args[0], 1),
                     2 => (args[0], args[1], 1),
@@ -845,17 +843,16 @@ impl<'a> Parser<'a> {
                 let expr = self.expr()?;
                 self.expect(Tok::RParen)?;
                 let alias = self.opt_alias()?;
-                // `UNNEST` は常に 1 列を生む。複数列を返す DuckDB の
-                // `UNNEST(struct)` 展開は未対応。
+                // `UNNEST` always produces one column. DuckDB's multi-column
+                // `UNNEST(struct)` expansion is unsupported.
                 let column_alias = self.opt_single_col_alias()?;
                 return Ok(FromItem::Unnest { expr, alias, column_alias });
             }
-            // ファイルテーブル関数: parquet/read_parquet/read_csv[_auto]/
-            // read_json[_auto]。すべて 1 引数（パス文字列のみ）で、
-            // 名前付きオプション引数（`delim=`, `header=`, ...）や複数引数・
-            // glob 展開は非対応（`FromItem::File` の doc 参照。フォーマットの
-            // 実体は登録時にホストが決めるため、この読み取り専用の束縛経路では
-            // 再ディスパッチできない）。
+            // File table functions: parquet/read_parquet/read_csv[_auto]/read_json[_auto].
+            // All take one argument (a path string only); named option arguments
+            // (`delim=`, `header=`, ...), multiple arguments, and glob expansion are
+            // unsupported (see the `FromItem::File` docs; the actual format is decided by the
+            // host at registration, so this read-only binding path cannot re-dispatch on it).
             let is_file_fn = is_parquet || is_read_parquet || is_read_csv || is_read_json;
             ensure!(is_file_fn, UnsupportedFeature, pos);
             self.bump()?;
@@ -878,18 +875,18 @@ impl<'a> Parser<'a> {
     // --- SAMPLE ---------------------------------------------------------------
     //
     // `SAMPLE`/`USING`/`TABLESAMPLE`/`BERNOULLI`/`SYSTEM`/`RESERVOIR`/`ROWS`/
-    // `PERCENT` はどれも予約語にしない。`ROWS`/`RANGE`/`QUALIFY` の事故
-    // （ファイル冒頭コメント参照）と同じ理由で、`FROM <item>` の直後という
-    // 決まった位置だけで綴りを見て判定する。`duckdb` CLI で確認したところ
-    // `SAMPLE` 単体（`USING`/`TABLESAMPLE` を伴わない）は文法上どこにも
-    // 現れないので、`SAMPLE` という列名が壊れる心配も無い。
+    // None of `PERCENT` and friends are reserved. For the same reason as the
+    // `ROWS`/`RANGE`/`QUALIFY` incidents (see the comment at the top of the file), they are
+    // matched by spelling only at the fixed position right after `FROM <item>`. As the
+    // `duckdb` CLI shows, `SAMPLE` on its own (without `USING`/`TABLESAMPLE`) appears
+    // nowhere in the grammar, so a column named `SAMPLE` is in no danger either.
 
-    /// `TABLESAMPLE <body>`。`duckdb` CLI で確認した位置の制約: `TABLESAMPLE`
-    /// は FROM 項目に直接くっつく修飾子で、`FROM t TABLESAMPLE 10% WHERE ...`
-    /// のように必ず `WHERE`/`GROUP BY`/... より前（FROM 項目の直後）に置く。
-    /// `WHERE` の後に置くと `duckdb` も構文エラーになる
-    /// (`duckdb -c "... WHERE ... TABLESAMPLE 10%"` → `syntax error at or near
-    /// "TABLESAMPLE"`) ので、呼び出し元（FROM 項目の直後）でだけ呼ぶ。
+    /// `TABLESAMPLE <body>`. The positional constraint confirmed with the `duckdb` CLI:
+    /// `TABLESAMPLE` is a modifier attaching directly to a FROM item and must always come
+    /// before `WHERE`/`GROUP BY`/... (right after the FROM item), as in
+    /// `FROM t TABLESAMPLE 10% WHERE ...`. Placing it after `WHERE` is a syntax error in
+    /// `duckdb` too (`duckdb -c "... WHERE ... TABLESAMPLE 10%"` -> `syntax error at or near`
+    /// `"TABLESAMPLE"`), so it is called only from the caller right after a FROM item.
     fn opt_tablesample_clause(&mut self) -> Result<Option<SampleSpec>> {
         if !self.is_soft_kw(b"tablesample") {
             return Ok(None);
@@ -898,13 +895,13 @@ impl<'a> Parser<'a> {
         Ok(Some(self.sample_body()?))
     }
 
-    /// `USING SAMPLE <body>`。`TABLESAMPLE` と違い、こちらは文全体に対する
-    /// 独立した句で、`WHERE`/`GROUP BY`/`HAVING`/`WINDOW`/`QUALIFY` の後・
-    /// `ORDER BY` の前に置く（`duckdb` CLI で確認済み: `FROM t USING SAMPLE
-    /// 10% WHERE ...` は構文エラーになるが `FROM t WHERE ... USING SAMPLE
-    /// 10%` は通る）。FROM 項目の直後に `WHERE` 等を挟まず直接書いた場合は
-    /// この関数と `opt_tablesample_clause` のどちらでも同じ位置になるが、
-    /// 呼び出しは常にこちら（文末側、`QUALIFY` の直後）だけで行う。
+    /// `USING SAMPLE <body>`. Unlike `TABLESAMPLE`, this is an independent clause over the
+    /// whole statement, placed after `WHERE`/`GROUP BY`/`HAVING`/`WINDOW`/`QUALIFY` and
+    /// before `ORDER BY` (confirmed with the `duckdb` CLI: `FROM t USING SAMPLE 10% WHERE
+    /// ...` is a syntax error while `FROM t WHERE ... USING SAMPLE 10%` parses). Written
+    /// directly after a FROM item with no intervening `WHERE` and the like, it lands at the
+    /// same position as `opt_tablesample_clause`, but the call is always made only from
+    /// here (the statement-tail side, right after `QUALIFY`).
     fn opt_using_sample_clause(&mut self) -> Result<Option<SampleSpec>> {
         if !(self.is_soft_kw(b"using") && self.peek_is_soft_kw(b"sample")?) {
             return Ok(None);
@@ -915,12 +912,12 @@ impl<'a> Parser<'a> {
     }
 
     /// `<method>(<amount>[unit])` / `(<amount>[unit])` / `<amount>[unit]
-    /// [(<method>, <seed>)]` のいずれか（`duckdb` CLI で確認した 3 通りの形）。
+    /// `[(<method>, <seed>)]` -- one of the three forms confirmed with the `duckdb` CLI.
     fn sample_body(&mut self) -> Result<SampleSpec> {
         if let Tok::Ident(s) = self.cur {
             if let Some(method) = sample_method_from_ident(s.as_bytes()) {
                 if self.peek()? == Tok::LParen {
-                    self.bump()?; // method 名
+                    self.bump()?; // the method name
                     self.bump()?; // '('
                     let (amount, is_rows) = self.sample_amount()?;
                     self.expect(Tok::RParen)?;
@@ -935,7 +932,7 @@ impl<'a> Parser<'a> {
             return Ok(SampleSpec { method: SampleMethod::System, amount, is_rows, seed: None });
         }
         let (amount, is_rows) = self.sample_amount()?;
-        // 単位無し（裸の数値）は行数指定として扱う（`duckdb` の実測挙動）。
+        // Without a unit (a bare number) it is treated as a row count (`duckdb`'s measured behavior).
         let mut method = if is_rows { SampleMethod::Reservoir } else { SampleMethod::System };
         let mut seed = None;
         if self.is(Tok::LParen) {
@@ -956,9 +953,9 @@ impl<'a> Parser<'a> {
         Ok(SampleSpec { method, amount, is_rows, seed })
     }
 
-    /// `<数値>['%' | PERCENT | ROWS]`。単位が無ければ行数指定として扱う
-    /// （`duckdb` の実測挙動: `USING SAMPLE 100` は 100 行、`USING SAMPLE
-    /// 0.1` はパーセントではなく行数として解釈される）。
+    /// `<number>['%' | PERCENT | ROWS]`. Without a unit it is treated as a row count
+    /// (`duckdb`'s measured behavior: `USING SAMPLE 100` means 100 rows, and
+    /// `USING SAMPLE 0.1` is interpreted as a row count, not a percentage).
     fn sample_amount(&mut self) -> Result<(f64, bool)> {
         let pos = self.pos;
         let v = match self.cur {
@@ -985,9 +982,9 @@ impl<'a> Parser<'a> {
             true
         };
         if is_rows {
-            // `Tok::Int`/`Tok::Float` は符号を含まない（`-` は独立したトークン
-            // なのでここまで来ない）ので、`amount` は常に 0 以上。負の行数を
-            // 拒否するチェックは不要。
+            // `Tok::Int`/`Tok::Float` carry no sign (`-` is a separate token and never
+            // reaches here), so `amount` is always non-negative. No check rejecting a
+            // negative row count is needed.
         } else {
             // `duckdb`: "Sample sample_size ... out of range, must be between 0 and 100"
             ensure!((0.0..=100.0).contains(&amount), SyntaxError, pos);
@@ -997,23 +994,23 @@ impl<'a> Parser<'a> {
 
     // --- PIVOT/UNPIVOT -------------------------------------------------------
     //
-    // `PIVOT`/`UNPIVOT`/`USING`/`INTO`/`NAME`/`VALUE` はどれも予約語にしない。
-    // 文の先頭（`PIVOT`/`UNPIVOT`）、または各構文の中の決まった位置
-    // （`ON` の直後の `USING`、列リストの直後の `INTO NAME .. VALUE ..`）
-    // でだけ綴りを見て判定する。`ROWS`/`RANGE`/`QUALIFY` を予約語にして
-    // 同名列を壊した過去の事故と同じ理由（`sql::lexer` 冒頭コメント参照）。
+    // None of `PIVOT`/`UNPIVOT`/`USING`/`INTO`/`NAME`/`VALUE` are reserved.
+    // They are matched by spelling only at the head of a statement (`PIVOT`/`UNPIVOT`) or
+    // at fixed positions inside each construct (the `USING` right after `ON`, the
+    // `INTO NAME .. VALUE ..` right after the column list). The same reason as the past
+    // incident where reserving `ROWS`/`RANGE`/`QUALIFY` broke same-named columns (see the comment at the top of `sql::lexer`).
 
-    /// `PIVOT <from> ON <on> [IN (...)] USING <agg>[, ...] [GROUP BY <cols>]`。
-    /// `PIVOT` キーワード自体は呼び出し元（`stmt`）が確認済みで、まだ消費
-    /// していない。
+    /// `PIVOT <from> ON <on> [IN (...)] USING <agg>[, ...] [GROUP BY <cols>]`.
+    /// The `PIVOT` keyword itself has been confirmed by the caller (`stmt`) and is not yet
+    /// consumed.
     pub(super) fn pivot_stmt(&mut self) -> Result<Stmt> {
         self.bump()?; // PIVOT
         let from = self.parse_from_item()?;
         self.expect_kw(Kw::On)?;
-        // `IN (...)` の直前で止めたいので、比較演算子と同じ強さの `IN` 述語を
-        // 飲み込ませない（`BP_CMP + 1` 未満は結合させない）。`ON a, b` の
-        // ような複数列指定は非対応 — カンマが残るので、この後 IN/USING の
-        // どちらにも一致せず自然に構文エラーになる。
+        // We want to stop just before `IN (...)`, so the `IN` predicate (of the same binding
+        // power as comparison) is not swallowed (nothing below `BP_CMP + 1` is combined).
+        // Multiple columns as in `ON a, b` are unsupported -- the comma is left over, so it
+        // matches neither IN nor USING afterwards and naturally becomes a syntax error.
         let on = self.expr_bp(BP_CMP + 1)?;
         let in_list = if self.eat_kw(Kw::In)? {
             self.expect(Tok::LParen)?;
@@ -1044,8 +1041,8 @@ impl<'a> Parser<'a> {
             }
             items
         } else {
-            // DuckDB と同じく、`USING` 省略時は `count(*)` が既定
-            // （`plan::bind::desugar_pivot` が実際に補う）。
+            // As in DuckDB, omitting `USING` defaults to `count(*)`
+            // (`plan::bind::desugar_pivot` actually supplies it).
             Vec::new()
         };
         let mut group_by = Vec::new();
@@ -1060,9 +1057,9 @@ impl<'a> Parser<'a> {
         }
         let (order_by, order_by_all, limit, offset) = self.order_limit_offset_tail()?;
 
-        // `PIVOT`/`UNPIVOT` の展開後クエリ（`plan::bind::desugar_pivot`）は
-        // 出力列を組み立て直すので、`ORDER BY ALL` をそのまま持ち回れない。
-        // 黙って無視すると並びが変わるため、明確に未対応として拒否する。
+        // The post-expansion query of `PIVOT`/`UNPIVOT` (`plan::bind::desugar_pivot`)
+        // reassembles the output columns, so `ORDER BY ALL` cannot be carried through as is.
+        // Silently ignoring it would change the ordering, so it is clearly rejected as unsupported.
         ensure!(order_by_all.is_none(), UnsupportedFeature, self.pos);
         Ok(Stmt::Pivot(Box::new(PivotStmt {
             from,
@@ -1076,15 +1073,15 @@ impl<'a> Parser<'a> {
         })))
     }
 
-    /// `UNPIVOT <from> ON <col, ...> [INTO NAME <name> VALUE <value>]`。
-    /// `UNPIVOT` キーワード自体は呼び出し元が確認済みで、まだ消費していない。
+    /// `UNPIVOT <from> ON <col, ...> [INTO NAME <name> VALUE <value>]`.
+    /// The `UNPIVOT` keyword itself has been confirmed by the caller and is not yet consumed.
     pub(super) fn unpivot_stmt(&mut self) -> Result<Stmt> {
         self.bump()?; // UNPIVOT
         let from = self.parse_from_item()?;
         self.expect_kw(Kw::On)?;
-        // `(a, b), (c, d)` のような複数列同時畳み込みは非対応。裸の列参照の
-        // カンマ区切りのみ受理する（式や `t.col` も構文上は通ってしまうが、
-        // 展開時（`desugar_unpivot`）に裸の列参照でなければ拒否する）。
+        // Folding several columns at once, as in `(a, b), (c, d)`, is unsupported. Only a
+        // comma-separated list of bare column references is accepted (expressions and
+        // `t.col` also parse, but expansion (`desugar_unpivot`) rejects anything that is not a bare column reference).
         let mut columns = Vec::new();
         loop {
             columns.push(self.expr()?);
@@ -1106,9 +1103,9 @@ impl<'a> Parser<'a> {
         };
         let (order_by, order_by_all, limit, offset) = self.order_limit_offset_tail()?;
 
-        // `PIVOT`/`UNPIVOT` の展開後クエリ（`plan::bind::desugar_pivot`）は
-        // 出力列を組み立て直すので、`ORDER BY ALL` をそのまま持ち回れない。
-        // 黙って無視すると並びが変わるため、明確に未対応として拒否する。
+        // The post-expansion query of `PIVOT`/`UNPIVOT` (`plan::bind::desugar_pivot`)
+        // reassembles the output columns, so `ORDER BY ALL` cannot be carried through as is.
+        // Silently ignoring it would change the ordering, so it is clearly rejected as unsupported.
         ensure!(order_by_all.is_none(), UnsupportedFeature, self.pos);
         Ok(Stmt::Unpivot(Box::new(UnpivotStmt {
             from,
@@ -1121,15 +1118,15 @@ impl<'a> Parser<'a> {
         })))
     }
 
-    /// 末尾の `ORDER BY <items> | ORDER BY ALL [ASC|DESC] [NULLS ...]`
-    /// `[LIMIT n] [OFFSET n]`。`PIVOT`/`UNPIVOT` は集合演算も CTE も持たない
-    /// 単純な文なので、`query_body` の同種の処理（こちらは `SetExpr`/`WITH`
-    /// の分岐まで持つ）を簡略化した専用版。
+    /// The trailing `ORDER BY <items> | ORDER BY ALL [ASC|DESC] [NULLS ...]`
+    /// `[LIMIT n] [OFFSET n]`. `PIVOT`/`UNPIVOT` are simple statements with neither set
+    /// operations nor CTEs, so this is a simplified dedicated version of the equivalent
+    /// handling in `query_body` (which also branches on `SetExpr`/`WITH`).
     ///
-    /// `ORDER BY ALL` は `ALL`（既存の予約語 `Kw::All`）1 語だけを取り、
-    /// 通常の項目リストとは併記できない（DuckDB も `ORDER BY ALL, h` を構文
-    /// エラーにする。ここではリストを読まないので、続く `,` が
-    /// `UnexpectedToken` になって同じ結果になる）。
+    /// `ORDER BY ALL` takes only the single word `ALL` (the existing reserved word
+    /// `Kw::All`) and cannot be combined with an ordinary item list (DuckDB makes
+    /// `ORDER BY ALL, h` a syntax error too. No list is read here, so the following `,`
+    /// becomes an `UnexpectedToken`, giving the same result).
     #[allow(clippy::type_complexity)]
     fn order_limit_offset_tail(
         &mut self,
