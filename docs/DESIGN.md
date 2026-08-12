@@ -483,10 +483,10 @@ FROM <table | parquet('url') | read_json[_auto]('url') | generate_series(...) | 
   [, LATERAL? UNNEST(<expr>) ...]
   [TABLESAMPLE|USING SAMPLE <n>% | <n> ROWS | (bernoulli|system|reservoir)(...) ]
 [WHERE <expr>]
-[GROUP BY <expr>, ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
+[GROUP BY <expr>, ... | ALL | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
 [HAVING <expr>] [QUALIFY <expr>]
 [WINDOW name AS (...), ...]
-[ORDER BY <expr> [ASC|DESC] [NULLS FIRST|LAST], ...]
+[ORDER BY <expr> [ASC|DESC] [NULLS FIRST|LAST], ... | ALL [ASC|DESC] [NULLS FIRST|LAST]]
 [LIMIT n] [OFFSET n]
 
 WITH [RECURSIVE] cte_name [(cols...)] AS (<query>), ... <query>
@@ -504,9 +504,14 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
 
 ### Expressions and functions
 
-- Operators: arithmetic, comparison, `AND`/`OR`/`NOT`, `IS [NOT] NULL`,
-  `IN (list | subquery)`, `BETWEEN`, `LIKE`/`ILIKE`, `GLOB`, `SIMILAR TO`,
-  `CASE WHEN`, `CAST`/`TRY_CAST`, `COALESCE`, `IIF`, array/list literals
+- Operators: arithmetic, comparison, `AND`/`OR`/`NOT`,
+  `IS [NOT] NULL`/`IS [NOT] UNKNOWN`, `IN (list | subquery)`, `BETWEEN`,
+  `LIKE`/`ILIKE`, `GLOB`, `SIMILAR TO`, `^@` (prefix/starts-with),
+  `CASE WHEN`, `CAST`/`TRY_CAST`, `COALESCE`, `IIF`, typed temporal
+  literals (`DATE '...'`, `TIME '...'`, `TIMESTAMP '...'`,
+  `TIMESTAMPTZ '...'`), the SQL-standard keyword spellings
+  `position(a IN b)` / `substring(s FROM a FOR n)` /
+  `trim([BOTH|LEADING|TRAILING] [c] FROM s)`, array/list literals
   (`[a, b, c]`), lambda expressions (`x -> expr`, `(a, b) -> expr` — the
   argument position of `list_transform`/`list_filter`/`list_reduce`
   specifically; each lambda body compiles in its own isolated scope and
@@ -863,7 +868,11 @@ what used to be labeled "M8, not started":
 - Regular expression functions
 - `INTERVAL` type and date/time arithmetic
 - SQL sugar: `GROUPING SETS`, `QUALIFY`, `FILTER (WHERE ...)`, `DISTINCT ON`,
-  `ILIKE`, `TRY_CAST`, `IIF`
+  `ILIKE`, `TRY_CAST`, `IIF`, typed temporal literals, `^@`,
+  `IS [NOT] UNKNOWN`, the SQL-standard `position`/`substring`/`trim`
+  keyword spellings, `GROUP BY ALL`/`ORDER BY ALL` — all of them parser- or
+  binder-level desugarings onto machinery that already existed, adding no
+  new execution kernels
 - DDL/DML as an opt-in, in-memory-only layer (§16), plus `COPY (SELECT ...)
   TO` and `ALTER TABLE`
 - glob / multi-file tables, Hive-style partition directories

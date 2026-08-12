@@ -19,9 +19,9 @@ never changes query results.
 | `DECIMAL(precision, scale)` | Fixed-point. `precision` 1–38, `scale` ≤ `precision`. Bare `DECIMAL`/`NUMERIC` (no parens) means `DECIMAL(18, 3)` |
 | `VARCHAR` | UTF-8 text. `TEXT`/`STRING`/`CHAR` are accepted as synonyms in `CAST` |
 | `BLOB` | Byte string. `BYTEA` is accepted as a synonym in `CAST` |
-| `DATE` | Calendar date (days since epoch) |
-| `TIME` | Time of day (microsecond resolution) |
-| `TIMESTAMP` | Date + time (microsecond resolution), no timezone. `DATETIME` is accepted as a synonym in `CAST` |
+| `DATE` | Calendar date (days since epoch). Literal: `DATE '2024-01-01'` — see [Typed date/time literals](#typed-datetime-literals) below |
+| `TIME` | Time of day (microsecond resolution). Literal: `TIME '10:20:30'` |
+| `TIMESTAMP` | Date + time (microsecond resolution), no timezone. `DATETIME` is accepted as a synonym in `CAST`. Literal: `TIMESTAMP '2024-01-01 10:20:30'` |
 | `TIMESTAMPTZ` | Date + time (microsecond resolution), an instant in UTC. `TIMESTAMP WITH TIME ZONE` is accepted as a synonym in `CAST`. See [TIMESTAMPTZ](#timestamptz) below |
 | `INTERVAL` | A span of time — see [Interval literals](#interval-literals) below |
 | `JSON` | Dynamically-typed JSON document. Also how Parquet `LIST`/`MAP` values are exposed — see [data-sources.md](data-sources.md#nested-parquet-types) |
@@ -158,6 +158,43 @@ it needs to be explicit:
   `NaN` values collapse to one representative for grouping purposes.
   Comparison operators still treat `NaN` as not-equal-to-anything (`false`)
   except `<>`, which is `true`.
+
+## Typed date/time literals
+
+```sql
+SELECT DATE '2024-01-01';
+SELECT TIME '10:20:30';
+SELECT TIMESTAMP '2024-01-01 10:20:30';
+SELECT TIMESTAMPTZ '2024-01-01 10:20:30+09';   -- 2024-01-01 01:20:30+00
+
+SELECT * FROM trips WHERE pickup >= TIMESTAMP '2024-01-01 00:00:00';
+```
+
+A type name written directly in front of a single-quoted string is a
+literal of that type. Only the four temporal types above take this form
+here; DuckDB generalizes it to every type name (`INTEGER '5'`), which this
+engine does not — use `CAST('5' AS INTEGER)` for the rest.
+
+The text accepted is the same as the corresponding `CAST` from `VARCHAR`
+(see [CAST and TRY_CAST](#cast-and-try_cast)), including the optional
+timezone offset on `TIMESTAMPTZ`.
+
+Two things worth knowing:
+
+- **These are constants, not casts.** The value is converted once while the
+  query is parsed, so a typed literal in `WHERE` participates in Parquet
+  RowGroup/page/Bloom-filter pruning exactly like a number does. A
+  `CAST('2024-01-01' AS DATE)` in the same position does not.
+- **A literal that can't be parsed is an error, not `NULL`.** This is the
+  one place where the "unreadable text becomes `NULL`" rule used for `CAST`
+  does not apply: `SELECT DATE 'nonsense'` fails at parse time (matching
+  DuckDB), because a literal is fixed query text and a typo there should be
+  reported rather than silently turned into `NULL`.
+
+`DATE`, `TIME`, `TIMESTAMP`, and `TIMESTAMPTZ` are **not** reserved words —
+a column named `date` or `time` still works unquoted (`SELECT date FROM t`,
+`ORDER BY time`, `SELECT 1 AS date`). The literal form is only recognized
+when a string literal immediately follows the type name.
 
 ## Interval literals
 

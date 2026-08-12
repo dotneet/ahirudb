@@ -174,6 +174,37 @@ static TYPES: &[(&[u8], Ty)] = &[
     (b"uuid", Ty::Uuid),
 ];
 
+/// Type names that may prefix a single-quoted string as a **typed literal**
+/// (`DATE '2020-01-01'`, `TIMESTAMP '2020-01-01 10:00:00'`, `TIME
+/// '10:00:00'`, `TIMESTAMPTZ '2020-01-01 00:00:00+09'`).
+///
+/// Deliberately narrower than `lookup_type`. duckdb generalises the form to
+/// every type name (`duckdb -c "select INTEGER '5'"` works, and its EXPLAIN
+/// shows it is literally `CAST('5' AS INTEGER)`), but the four temporal
+/// types are the ones that actually need the syntax: they are the only
+/// types whose values have no other literal spelling. Restricting the table
+/// keeps the "column named `text`/`blob`/... still resolves normally" blast
+/// radius small and costs almost nothing in code size.
+///
+/// These stay out of the reserved-word table (`sql::lexer::KEYWORDS`) —
+/// `date`/`time` are extremely common column names, and duckdb does not
+/// reserve them either (`duckdb -c "select date, time from (select 1 as
+/// date, 2 as time)"` works). The parser only reads them this way when a
+/// string literal follows; see `Parser::temporal_literal_or_ident`.
+pub(super) fn temporal_literal_ty(name: &[u8]) -> Option<Ty> {
+    if eq_ascii_ci(name, b"date") {
+        Some(Ty::Date)
+    } else if eq_ascii_ci(name, b"time") {
+        Some(Ty::Time)
+    } else if eq_ascii_ci(name, b"timestamp") {
+        Some(Ty::Timestamp)
+    } else if eq_ascii_ci(name, b"timestamptz") {
+        Some(Ty::Timestamptz)
+    } else {
+        None
+    }
+}
+
 pub(super) fn lookup_type(name: &[u8]) -> Option<Ty> {
     if name.is_empty() {
         return None;

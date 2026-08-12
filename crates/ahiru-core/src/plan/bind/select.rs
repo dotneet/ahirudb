@@ -118,6 +118,52 @@ pub(super) fn expand_columns(
     Ok(out)
 }
 
+// --- GROUP BY ALL ------------------------------------------------------------
+
+/// `GROUP BY ALL` (DuckDB shorthand) -> the concrete list of grouping
+/// expressions. Returns `sel.group_by` unchanged when the shorthand isn't
+/// used, so every caller downstream stays on the ordinary code path.
+///
+/// The rule, verified against the `duckdb` CLI: group by every select-list
+/// expression that does **not** contain an aggregate anywhere inside it.
+///
+/// ```text
+/// duckdb: select g, h, sum(x) from t group by all      -- groups by g, h
+/// duckdb: select g+1, sum(x)+1 from t group by all     -- groups by g+1 only
+/// duckdb: select sum(x) from t group by all            -- no grouping columns
+/// duckdb: select g from t group by all                 -- groups by g (a DISTINCT)
+/// ```
+///
+/// Note the second line: `sum(x)+1` is excluded even though the item itself
+/// is not an aggregate call — containing one anywhere is what counts.
+///
+/// `SELECT *` combined with `GROUP BY ALL` is rejected rather than expanded.
+/// duckdb supports it (it groups by every column of the star expansion), but
+/// this engine cannot: the binder's arena is immutable, so it has no way to
+/// materialise the per-column expressions the star stands for, and `*` after
+/// an aggregate is already refused by the projection below (`ensure!
+/// (!aggregating, NotGrouped)`). Failing loudly here beats silently
+/// grouping by nothing.
+fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprId>> {
+    if !sel.group_by_all {
+        return Ok(sel.group_by.clone());
+    }
+    // `GROUP BY ALL` と `GROUPING SETS`/`ROLLUP`/`CUBE` は構文上も排他
+    // （パーサがどちらか一方しか立てない）。前提が崩れたら黙って片方を
+    // 無視せずに落とす。
+    ensure!(sel.grouping_sets.is_none(), Internal);
+    let mut out = Vec::new();
+    for item in &sel.items {
+        ensure!(!matches!(arena.get(item.expr), Expr::Star { .. }), UnsupportedFeature);
+        let mut aggs = Vec::new();
+        collect_aggregates(arena, item.expr, &mut aggs, 0)?;
+        if aggs.is_empty() {
+            out.push(item.expr);
+        }
+    }
+    Ok(out)
+}
+
 // --- 本体 --------------------------------------------------------------------
 
 /// `outer_scope` が `Some` のとき、この SELECT は相関サブクエリとして
@@ -138,6 +184,10 @@ pub(super) fn bind_select_in(
         // `SELECT 1` のような FROM 無しは v1 では扱わない。
         None => err!(UnsupportedFeature),
     };
+
+    // `GROUP BY ALL` はここで一度だけ具体的な式リストへ解決し、以降は
+    // 普通の `GROUP BY a, b, ...` とまったく同じ経路を通す。
+    let group_by = resolve_group_by_all(arena, sel)?;
 
     let mut rels: Vec<Rel> = Vec::new();
     let tree = flatten_from(catalog, arena, params, from, &mut rels, ctes, 0)?;
@@ -221,7 +271,7 @@ pub(super) fn bind_select_in(
         // （相関等価述語の抽出自体は後段の WHERE 分解で行う）。
         collect_refs_tolerant(arena, &scope_all, outer_scope, e, &mut refs)?;
     }
-    for e in &sel.group_by {
+    for e in &group_by {
         // 序数指定（`GROUP BY 1`）はここでは列参照を持たない。
         if ordinal_of(arena, *e).is_none() {
             collect_refs(arena, &scope_all, *e, &mut refs)?;
@@ -383,7 +433,7 @@ pub(super) fn bind_select_in(
     for e in [sel.filter, sel.having].into_iter().flatten() {
         collect_scalar_subqueries(arena, e, &mut scalars, 0)?;
     }
-    for e in &sel.group_by {
+    for e in &group_by {
         collect_scalar_subqueries(arena, *e, &mut scalars, 0)?;
     }
     for o in &sel.order_by {
@@ -471,7 +521,7 @@ pub(super) fn bind_select_in(
     for e in [sel.filter, sel.having].into_iter().flatten() {
         collect_quantified_comparisons(arena, e, &mut quantifieds, 0)?;
     }
-    for e in &sel.group_by {
+    for e in &group_by {
         collect_quantified_comparisons(arena, *e, &mut quantifieds, 0)?;
     }
     for o in &sel.order_by {
@@ -522,13 +572,13 @@ pub(super) fn bind_select_in(
             collect_aggregates(arena, h, &mut corr_agg_probe, 0)?;
         }
         let will_aggregate =
-            !corr_agg_probe.is_empty() || !sel.group_by.is_empty() || sel.grouping_sets.is_some();
+            !corr_agg_probe.is_empty() || !group_by.is_empty() || sel.grouping_sets.is_some();
         if will_aggregate {
             ensure!(
                 sel.items.len() == 1
                     && corr_agg_probe.len() == 1
                     && sel.items[0].expr == corr_agg_probe[0]
-                    && sel.group_by.is_empty()
+                    && group_by.is_empty()
                     && sel.grouping_sets.is_none()
                     && sel.having.is_none()
                     && sel.qualify.is_none()
@@ -602,7 +652,7 @@ pub(super) fn bind_select_in(
             ensure!(probe.is_empty(), UnsupportedFeature);
         }
         ensure!(
-            sel.group_by.is_empty() && sel.grouping_sets.is_none() && sel.having.is_none(),
+            group_by.is_empty() && sel.grouping_sets.is_none() && sel.having.is_none(),
             UnsupportedFeature
         );
         let mut agg_probe: Vec<ExprId> = Vec::new();
@@ -659,8 +709,7 @@ pub(super) fn bind_select_in(
         collect_grouping_calls(arena, o.expr, &mut grouping_calls, 0)?;
     }
 
-    let aggregating =
-        !agg_calls.is_empty() || !sel.group_by.is_empty() || sel.grouping_sets.is_some();
+    let aggregating = !agg_calls.is_empty() || !group_by.is_empty() || sel.grouping_sets.is_some();
     // GROUPING() は集約の外では意味を持たない。
     ensure!(aggregating || grouping_calls.is_empty(), NotAggregate);
     let mut item_scope = scope.clone();
@@ -669,7 +718,7 @@ pub(super) fn bind_select_in(
         // 単純な `GROUP BY a, b, ...`（GROUPING SETS 系拡張なし）。
         // 既存の 1 本の Node::Aggregate に havings を直接埋め込む従来経路。
         let mut group_exprs = Vec::new();
-        for g in &sel.group_by {
+        for g in &group_by {
             group_exprs.push(resolve_select_ref(arena, sel, *g)?);
         }
 
@@ -718,7 +767,7 @@ pub(super) fn bind_select_in(
         // 複製する。
         let sets: Vec<Vec<ExprId>> = match &sel.grouping_sets {
             Some(sets) => sets.clone(),
-            None => vec![sel.group_by.clone()],
+            None => vec![group_by.clone()],
         };
         ensure!(!sets.is_empty(), Internal);
 
@@ -1057,6 +1106,9 @@ pub(super) fn bind_select_in(
         }
     }
     ensure!(!exprs.is_empty(), SyntaxError);
+    // `ORDER BY ALL` が並べ替え対象にする列数。相関キー列（下で付け足す
+    // 実装用の隠し列）を含めないよう、ここで確定させておく。
+    let projected = exprs.len();
     // 相関キー列を出力の末尾に付加する（非集約の場合。集約を伴う相関は
     // 上の早期リターン経路で完結しているのでここには来ない）。呼び出し側
     // （相関スカラサブクエリ / `EXISTS` / `IN` の束縛）が結合キーとして
@@ -1074,6 +1126,16 @@ pub(super) fn bind_select_in(
     // --- ORDER BY -----------------------------------------------------------
     // 出力に無い式で並べ替えるときは、隠し列として射影に足してから落とす。
     let mut keys = Vec::new();
+    // `ORDER BY ALL`: 出力列を左から順に、すべて同じ向き・同じ NULL 位置で
+    // 並べ替える。ここまで来れば `*` は既に展開済みなので、`SELECT * ...
+    // ORDER BY ALL` も展開後の全列が対象になる（DuckDB と同じ）。集約の
+    // 結果列も対象に含まれる（`duckdb -c "select h, sum(x) from t group by h
+    // order by all"` が h → sum(x) の順で並ぶことを確認済み）。
+    if let Some(oa) = &sel.order_by_all {
+        for col in 0..projected {
+            keys.push((col, oa.desc, oa.nulls_first));
+        }
+    }
     for o in &sel.order_by {
         let col = match order_output_column(arena, sel, o, &schema)? {
             Some(c) => c,

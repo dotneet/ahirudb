@@ -2,9 +2,11 @@
 //! CAST, CASE, window function calls, lambdas, and literal parsing helpers.
 use super::types::{
     comparison_binop, float_literal, int_literal, is_lambda_func, lookup_interval_unit,
-    lookup_type, parse_interval_text, parse_signed_int, unit_to_interval, unquote,
+    lookup_type, parse_interval_text, parse_signed_int, temporal_literal_ty, unit_to_interval,
+    unquote,
 };
 use super::*;
+use crate::expr::funcs;
 
 impl<'a> Parser<'a> {
     // --- 式 -----------------------------------------------------------------
@@ -243,6 +245,33 @@ impl<'a> Parser<'a> {
                     });
                     continue;
                 }
+                // `^@`: PostgreSQL/DuckDB's prefix ("starts with") operator.
+                // Desugars to the already-existing `starts_with(lhs, rhs)`
+                // scalar function, so nothing downstream learns a new
+                // concept (same treatment as `~~~` -> `glob(...)` below).
+                //
+                // Strength and operand handling are verified against the
+                // `duckdb` CLI, and are deliberately asymmetric in exactly
+                // the same way as the `~~` family:
+                //   duckdb: select 'a' || 'b' ^@ 'a'  -> true    i.e. ('a'||'b') ^@ 'a'
+                //   duckdb: select 'ab' ^@ 'a' || 'b' -> 'trueb' i.e. ('ab' ^@ 'a') || 'b'
+                //   duckdb: select 'ab' ^@ 'a' = true -> true    i.e. ('ab' ^@ 'a') = true
+                // So the operator itself sits at `BP_CMP` (the left side
+                // therefore already absorbed any `||`/arithmetic), while the
+                // right operand is read at `BP_CONCAT + 1` so a following
+                // `||` binds to the *result*, not into the pattern.
+                // NULL on either side yields NULL (`duckdb -c "select NULL
+                // ^@ 'a', 'a' ^@ NULL"` -> both NULL), which is what
+                // `starts_with` already does.
+                Tok::CaretAt => {
+                    if BP_CMP < min_bp {
+                        break;
+                    }
+                    self.bump()?;
+                    let prefix = self.expr_bp(BP_CONCAT + 1)?;
+                    lhs = self.simple_call("starts_with", vec![lhs, prefix]);
+                    continue;
+                }
                 // `~~~`: alias for `GLOB`. Same "bind tighter than `||`"
                 // quirk as the `~~` family above (verified: `duckdb -c
                 // "select 'ab' ~~~ 'a' || '*'"` -> `false*`, i.e. `('ab' ~~~
@@ -405,6 +434,29 @@ impl<'a> Parser<'a> {
                 if let Tok::Kw(want @ (Kw::True | Kw::False)) = self.cur {
                     self.bump()?;
                     return Ok(self.is_true_or_false(arg, want == Kw::True, neg));
+                }
+                // `IS [NOT] UNKNOWN`. Exactly `IS [NOT] NULL`, so it folds
+                // into the same `Expr::IsNull` node — no new AST variant and
+                // nothing for the binder or the kernels to learn.
+                //
+                // The SQL standard only defines `IS UNKNOWN` on a boolean,
+                // but duckdb accepts any operand and answers the plain
+                // null test, without coercing first (`duckdb -c "select
+                // NULL is unknown, 1 is unknown, 'x' is unknown, (1=1) is
+                // unknown, NULL is not unknown"` -> true, false, false,
+                // false, false). That is `IS NULL` on the nose, so no
+                // `CAST(... AS BOOLEAN)` is inserted here (unlike
+                // `is_true_or_false` above, where the cast is load-bearing).
+                //
+                // `UNKNOWN` stays a soft keyword rather than joining
+                // `KEYWORDS`: it is a perfectly ordinary word for a data
+                // column (`SELECT unknown FROM t` works in duckdb too), and
+                // this syntactic position — right after `IS`/`IS NOT` — can
+                // never hold a column reference, so spelling-matching here
+                // is unambiguous.
+                if self.is_soft_kw(b"unknown") {
+                    self.bump()?;
+                    return Ok(self.arena.push(Expr::IsNull { arg, negated: neg }));
                 }
                 if !self.is(Tok::Kw(Kw::Null)) {
                     err!(UnsupportedFeature, self.pos);
@@ -677,7 +729,18 @@ impl<'a> Parser<'a> {
             Tok::Ident(s) if eq_ascii_ci(s.as_bytes(), b"interval") => {
                 return self.interval_literal_or_ident();
             }
-            Tok::Ident(_) | Tok::QIdent(_) => return self.name_ref(),
+            // `DATE '...'` / `TIME '...'` / `TIMESTAMP '...'` /
+            // `TIMESTAMPTZ '...'`。`INTERVAL` と同じく予約語にはしていない
+            // ので、綴りが合ったうえで次が文字列リテラルのときだけ
+            // 型付きリテラルとして読む（`temporal_literal_or_ident`）。
+            // 引用符付き識別子（`"date"`）は対象外で常に列参照になる。
+            Tok::Ident(s) => {
+                if let Some(ty) = temporal_literal_ty(s.as_bytes()) {
+                    return self.temporal_literal_or_ident(ty);
+                }
+                return self.name_ref();
+            }
+            Tok::QIdent(_) => return self.name_ref(),
             _ => err!(UnexpectedToken, pos),
         };
         Ok(self.arena.push(node))
@@ -811,6 +874,55 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `DATE '2020-01-01'` / `TIME '10:00:00'` / `TIMESTAMP '2020-01-01
+    /// 10:00:00'` / `TIMESTAMPTZ '2020-01-01 00:00:00+09'`.
+    ///
+    /// Modeled directly on `interval_literal_or_ident` above, including its
+    /// escape hatch: if the token after the type name is not a string
+    /// literal, this is not a typed literal at all and the word goes back to
+    /// being an ordinary column reference (`SELECT date FROM t`, `SELECT
+    /// date + 1`, `ORDER BY time`). That fallback is the whole reason
+    /// `DATE`/`TIME`/... are not reserved words — column names come from
+    /// data files and users cannot rename them (`sql::lexer` module doc).
+    ///
+    /// The text is converted **here**, at parse time, into a folded
+    /// `Expr::TypedLiteral` rather than being left as `CAST('...' AS DATE)`
+    /// (which is literally what duckdb's EXPLAIN shows for this syntax).
+    /// A constant matters downstream: RowGroup/page/Bloom pruning
+    /// (`plan::bind::pruning`) extracts literal bounds out of `WHERE`, and a
+    /// `Cast` node wrapping a string would not be recognised as one.
+    ///
+    /// A value the parser cannot read is a hard error at parse time,
+    /// matching duckdb (`duckdb -c "select DATE 'nonsense'"` ->
+    /// `Conversion Error: invalid date field format`). This is deliberately
+    /// *not* the `CAST`-of-a-bad-string rule this engine uses elsewhere
+    /// ("that row becomes NULL", see docs/sql/types.md): a literal is a
+    /// fixed piece of query text, so silently turning the whole query's
+    /// constant into NULL would hide a typo instead of reporting it.
+    fn temporal_literal_or_ident(&mut self, ty: Ty) -> Result<ExprId> {
+        let mut lx = self.lex.clone();
+        let Tok::Str(raw) = lx.next_token()?.tok else {
+            return self.name_ref();
+        };
+        let pos = self.pos;
+        self.bump()?; // 型名
+        self.bump()?; // 文字列
+        let text = unquote(raw, b'\'');
+        let b = text.as_bytes();
+        // 物理表現は論理型ごとに決まる（DESIGN.md §8）: DATE は日数の I32、
+        // TIME/TIMESTAMP/TIMESTAMPTZ はマイクロ秒の I64。`sql::now` が
+        // `CURRENT_DATE`/`CURRENT_TIMESTAMP` に対して組み立てる
+        // `TypedLiteral` とまったく同じ形。
+        let value = match ty {
+            Ty::Date => funcs::parse_date(b).and_then(|d| i32::try_from(d).ok()).map(Value::I32),
+            Ty::Time => funcs::parse_time(b).map(Value::I64),
+            Ty::Timestamptz => funcs::parse_timestamptz(b).map(Value::I64),
+            _ => funcs::parse_timestamp(b).map(Value::I64),
+        };
+        let Some(value) = value else { err!(InvalidCast, pos) };
+        Ok(self.arena.push(Expr::TypedLiteral(value, ty)))
+    }
+
     /// 識別子始まりの primary: 関数呼び出し / `q.name` / `q.*` / 列参照。
     fn name_ref(&mut self) -> Result<ExprId> {
         let name = self.ident()?;
@@ -909,6 +1021,33 @@ impl<'a> Parser<'a> {
                 else_: Some(else_),
             }));
         }
+        // --- SQL 標準の関数構文（引数の途中にキーワードを挟む形） -----------
+        //
+        // `EXTRACT(part FROM ts)` と同じ扱い: 構文だけここで吸収して、既存の
+        // スカラ関数呼び出しへそのまま脱糖する。実行側もカーネルも
+        // `position`/`substring`/`trim` の「標準構文」を一切知らなくてよい。
+        //
+        // `EXTRACT` と違ってキーワードの前に任意長の式が来るので、2 トークン
+        // 先読みでは形を確定できない。代わりに `call_has_top_level` で
+        // 「同じ深さに `IN`/`FROM` があるか」を先に見てから分岐する（無ければ
+        // 従来どおりのカンマ区切り引数列としてそのまま読む）。
+        if eq_ascii_ci(name.as_bytes(), b"position")
+            && self.cur == Tok::LParen
+            && self.call_has_top_level(Tok::Kw(Kw::In))?
+        {
+            return self.position_in_call();
+        }
+        if eq_ascii_ci(name.as_bytes(), b"trim")
+            && self.cur == Tok::LParen
+            && self.call_has_top_level(Tok::Kw(Kw::From))?
+        {
+            return self.trim_from_call();
+        }
+        if (eq_ascii_ci(name.as_bytes(), b"substring") || eq_ascii_ci(name.as_bytes(), b"substr"))
+            && self.cur == Tok::LParen
+        {
+            return self.substring_call(&name);
+        }
         if eq_ascii_ci(name.as_bytes(), b"extract") && self.cur == Tok::LParen {
             let mut lx = self.lex.clone();
             let t1 = lx.next_token()?.tok;
@@ -1006,6 +1145,119 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(self.arena.push(Expr::Function { name, args, distinct, star, filter }))
+    }
+
+    /// `position(<search> IN <string>)` — SQL 標準の構文。呼び出し時の `cur`
+    /// は開き括弧で、同じ深さに `IN` があることは確認済み。
+    ///
+    /// **引数の順序が入れ替わる**ことに注意: `strpos(string, search)` に対して
+    /// 標準構文は探す方を先に書く（`duckdb -c "select position('b' in 'abc'),
+    /// strpos('abc','b')"` がどちらも `2` を返すことで確認済み）。既存の
+    /// `strpos`（`position`/`instr` も同じ実体）へそのまま脱糖する。
+    ///
+    /// 見つからなければ `0`、空文字列を探すと `1`、どちらかが NULL なら NULL
+    /// （`duckdb -c "select position('z' in 'abc'), position('' in 'abc'),
+    /// position(NULL in 'abc'), position('b' in NULL)"` -> `0`/`1`/NULL/NULL）
+    /// ——これは既存の `strpos` の挙動そのままなので、ここでは何もしない。
+    ///
+    /// 探す側の式は `BP_CMP + 1` で読む。区切りの `IN` を `x IN (...)` の
+    /// 述語として食わせないため（`BETWEEN` の境界を `BP_CONCAT` で読むのと
+    /// 同じ手口）。`||` や算術は `BP_CMP` より強いので普通に結合する
+    /// （`position('a' || 'b' in s)` は意図どおり）。
+    fn position_in_call(&mut self) -> Result<ExprId> {
+        self.bump()?; // '('
+        let search = self.expr_bp(BP_CMP + 1)?;
+        self.expect_kw(Kw::In)?;
+        let string = self.expr()?;
+        self.expect(Tok::RParen)?;
+        Ok(self.simple_call("strpos", vec![string, search]))
+    }
+
+    /// `trim([BOTH | LEADING | TRAILING] [<chars>] FROM <s>)` — SQL 標準の
+    /// 構文。呼び出し時の `cur` は開き括弧で、同じ深さに `FROM` があることは
+    /// 確認済み。既存の `trim`/`ltrim`/`rtrim`（1 引数版が空白、2 引数版が
+    /// 取り除く文字集合）へ脱糖する。
+    ///
+    /// `duckdb` CLI で受理する形と結果を確認済み:
+    ///   trim(both 'x' from 'xxabxx')     -> 'ab'      == trim('xxabxx','x')
+    ///   trim(leading 'x' from 'xxabxx')  -> 'abxx'    == ltrim('xxabxx','x')
+    ///   trim(trailing 'x' from 'xxabxx') -> 'xxab'    == rtrim('xxabxx','x')
+    ///   trim('x' from 'xxabxx')          -> 'ab'      （方向省略は BOTH）
+    ///   trim(from '  ab  ')              -> 'ab'      （文字集合省略は空白）
+    ///   trim(both from '  ab  ')         -> 'ab'
+    ///
+    /// `BOTH`/`LEADING`/`TRAILING` は予約語にしない（`ROWS`/`RANGE` を巡る
+    /// 列名破壊の事故と同じ理由）。ここで綴りだけを見て判定できるのは、
+    /// 呼び出し元が「同じ深さに `FROM` がある」と確定させた後だからで、
+    /// 普通の `trim(leading)` / `trim(leading, 'x')`（`leading` という名前の
+    /// 列を渡す形）はこの関数に入らず従来どおり関数呼び出しとして読まれる。
+    fn trim_from_call(&mut self) -> Result<ExprId> {
+        self.bump()?; // '('
+        let mut func = "trim";
+        if self.is_soft_kw(b"both") {
+            self.bump()?;
+        } else if self.is_soft_kw(b"leading") {
+            func = "ltrim";
+            self.bump()?;
+        } else if self.is_soft_kw(b"trailing") {
+            func = "rtrim";
+            self.bump()?;
+        }
+        // 方向語の直後が `FROM` なら文字集合は省略（＝空白を落とす）。
+        let chars = if self.eat_kw(Kw::From)? {
+            None
+        } else {
+            let c = self.expr()?;
+            self.expect_kw(Kw::From)?;
+            Some(c)
+        };
+        let s = self.expr()?;
+        self.expect(Tok::RParen)?;
+        let args = match chars {
+            Some(c) => vec![s, c],
+            None => vec![s],
+        };
+        Ok(self.simple_call(func, args))
+    }
+
+    /// `substring`/`substr` の引数リスト。SQL 標準の
+    /// `substring(<s> FROM <start> [FOR <len>])` / `substring(<s> FOR <len>)`
+    /// と、従来のカンマ区切り `substring(<s>, <start>[, <len>])` の両方を
+    /// 1 か所で読む。呼び出し時の `cur` は開き括弧。
+    ///
+    /// `duckdb` CLI で確認済み:
+    ///   substring('abcdef' from 2)        -> 'bcdef'  == substring('abcdef',2)
+    ///   substring('abcdef' from 2 for 3)  -> 'bcd'    == substring('abcdef',2,3)
+    ///   substring('abcdef' for 3)         -> 'abc'    == substring('abcdef',1,3)
+    /// `FOR` だけの形は開始位置 1 と同じなので、リテラル `1` を補って
+    /// 3 引数形へ落とす。
+    ///
+    /// `position`/`trim` と違って先読み（`call_has_top_level`）が要らない:
+    /// 区切り語は必ず**第 1 引数の後ろ**にしか現れず、`FROM`（予約語）も
+    /// `FOR`（裸の識別子）も中置演算子ではないので、第 1 引数を普通に
+    /// `expr()` で読めばその手前で必ず止まる。そこで初めて分岐すればよく、
+    /// カンマ形へ戻る道もそのまま残る（`substring(for, 2)` のように `for`
+    /// という名前の列を渡す形を壊さないために、これが重要）。
+    fn substring_call(&mut self, name: &str) -> Result<ExprId> {
+        self.bump()?; // '('
+        let mut args = vec![self.expr()?];
+        if self.eat_kw(Kw::From)? {
+            args.push(self.expr()?);
+            if self.is_soft_kw(b"for") {
+                self.bump()?;
+                args.push(self.expr()?);
+            }
+        } else if self.is_soft_kw(b"for") {
+            self.bump()?;
+            args.push(self.arena.push(Expr::Literal(Value::I32(1))));
+            args.push(self.expr()?);
+        } else {
+            while self.eat(Tok::Comma)? {
+                args.push(self.expr()?);
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(self.simple_call(name, args))
     }
 
     /// 現在位置がラムダの仮引数リストの形（`IDENT ->` または

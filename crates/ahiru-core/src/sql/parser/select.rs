@@ -27,9 +27,16 @@ impl<'a> Parser<'a> {
         };
         let (body, bare) = self.set_expr()?;
 
-        let (order_by, limit, offset) = self.order_limit_offset_tail()?;
+        let (order_by, order_by_all, limit, offset) = self.order_limit_offset_tail()?;
 
-        let mut q = QueryStmt { ctes, body, order_by: Vec::new(), limit: None, offset: None };
+        let mut q = QueryStmt {
+            ctes,
+            body,
+            order_by: Vec::new(),
+            order_by_all: None,
+            limit: None,
+            offset: None,
+        };
         // 末尾の ORDER BY / LIMIT / OFFSET の置き場所は 1 つの規則で決める:
         // **本体が括弧無しの単一 SELECT なら `SelectStmt` 側**、それ以外
         // （集合演算がある、または本体が括弧付きクエリ）なら `QueryStmt` 側。
@@ -37,11 +44,13 @@ impl<'a> Parser<'a> {
         match (&mut q.body, bare) {
             (SetExpr::Select(s), true) => {
                 s.order_by = order_by;
+                s.order_by_all = order_by_all;
                 s.limit = limit;
                 s.offset = offset;
             }
             _ => {
                 q.order_by = order_by;
+                q.order_by_all = order_by_all;
                 q.limit = limit;
                 q.offset = offset;
             }
@@ -158,7 +167,12 @@ impl<'a> Parser<'a> {
     /// 場合だけ `SELECT * FROM (...)` に包む。持たない場合は本体をそのまま使う
     /// （余計な射影を挟まない）。
     fn paren_body(&mut self, q: QueryStmt) -> SetExpr {
-        if q.ctes.is_empty() && q.order_by.is_empty() && q.limit.is_none() && q.offset.is_none() {
+        if q.ctes.is_empty()
+            && q.order_by.is_empty()
+            && q.order_by_all.is_none()
+            && q.limit.is_none()
+            && q.offset.is_none()
+        {
             return q.body;
         }
         let star = self.arena.push(Expr::Star {
@@ -240,7 +254,15 @@ impl<'a> Parser<'a> {
             // （`ROWS`/`RANGE`/`QUALIFY` を巡る事故と同種）なので予約語にせず、
             // `GROUP BY` 直後というこの文脈でだけキーワードとして扱う。
             // 2 語連続の `GROUPING SETS` は 2 トークン先読みで見分ける。
-            if self.is_soft_kw(b"grouping") && self.peek_is_soft_kw(b"sets")? {
+            // `GROUP BY ALL`（DuckDB 拡張）。`ALL` は `UNION ALL` 等で既に
+            // 予約語（`Kw::All`）なので、文脈依存キーワードの判定は要らない。
+            // 実際にどの式でグルーピングするかは束縛時に決める
+            // （`SelectStmt::group_by_all` の doc 参照）。`GROUP BY ALL, x`
+            // のような併記は DuckDB も構文エラーにするので、ここでもリストを
+            // 読まない＝続く `,` が `UnexpectedToken` になる形で自然に弾かれる。
+            if self.eat_kw(Kw::All)? {
+                st.group_by_all = true;
+            } else if self.is_soft_kw(b"grouping") && self.peek_is_soft_kw(b"sets")? {
                 self.bump()?; // grouping
                 self.bump()?; // sets
                 st.grouping_sets = Some(self.grouping_sets_body()?);
@@ -653,18 +675,27 @@ impl<'a> Parser<'a> {
 
     pub(super) fn order_item(&mut self) -> Result<OrderByItem> {
         let expr = self.expr()?;
+        let (desc, nulls_first) = self.order_direction()?;
+        Ok(OrderByItem { expr, desc, nulls_first })
+    }
+
+    /// `[ASC | DESC] [NULLS FIRST | NULLS LAST]`. Shared by `order_item` and
+    /// by `ORDER BY ALL` (which takes the same modifiers and applies them to
+    /// every output column).
+    ///
+    /// Default matches DuckDB's actual behavior: NULLS LAST regardless of
+    /// ASC/DESC (verified against a real `duckdb` CLI) — not the
+    /// SQL-standard/PostgreSQL convention of "NULL is the largest value"
+    /// (NULLS LAST for ASC, NULLS FIRST for DESC), which this used to
+    /// implement and which silently disagreed with the reference
+    /// implementation this project cross-checks against.
+    fn order_direction(&mut self) -> Result<(bool, bool)> {
         let mut desc = false;
         if self.eat_kw(Kw::Desc)? {
             desc = true;
         } else {
             self.eat_kw(Kw::Asc)?;
         }
-        // Default matches DuckDB's actual behavior: NULLS LAST regardless of
-        // ASC/DESC (verified against a real `duckdb` CLI) — not the
-        // SQL-standard/PostgreSQL convention of "NULL is the largest value"
-        // (NULLS LAST for ASC, NULLS FIRST for DESC), which this used to
-        // implement and which silently disagreed with the reference
-        // implementation this project cross-checks against.
         let mut nulls_first = false;
         if self.eat_kw(Kw::Nulls)? {
             if self.eat_kw(Kw::First)? {
@@ -674,7 +705,7 @@ impl<'a> Parser<'a> {
                 nulls_first = false;
             }
         }
-        Ok(OrderByItem { expr, desc, nulls_first })
+        Ok((desc, nulls_first))
     }
 
     // --- FROM ---------------------------------------------------------------
@@ -1027,7 +1058,12 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        let (order_by, limit, offset) = self.order_limit_offset_tail()?;
+        let (order_by, order_by_all, limit, offset) = self.order_limit_offset_tail()?;
+
+        // `PIVOT`/`UNPIVOT` の展開後クエリ（`plan::bind::desugar_pivot`）は
+        // 出力列を組み立て直すので、`ORDER BY ALL` をそのまま持ち回れない。
+        // 黙って無視すると並びが変わるため、明確に未対応として拒否する。
+        ensure!(order_by_all.is_none(), UnsupportedFeature, self.pos);
         Ok(Stmt::Pivot(Box::new(PivotStmt {
             from,
             on,
@@ -1068,7 +1104,12 @@ impl<'a> Parser<'a> {
         } else {
             (String::from("name"), String::from("value"))
         };
-        let (order_by, limit, offset) = self.order_limit_offset_tail()?;
+        let (order_by, order_by_all, limit, offset) = self.order_limit_offset_tail()?;
+
+        // `PIVOT`/`UNPIVOT` の展開後クエリ（`plan::bind::desugar_pivot`）は
+        // 出力列を組み立て直すので、`ORDER BY ALL` をそのまま持ち回れない。
+        // 黙って無視すると並びが変わるため、明確に未対応として拒否する。
+        ensure!(order_by_all.is_none(), UnsupportedFeature, self.pos);
         Ok(Stmt::Unpivot(Box::new(UnpivotStmt {
             from,
             columns,
@@ -1080,22 +1121,37 @@ impl<'a> Parser<'a> {
         })))
     }
 
-    /// 末尾の `ORDER BY <items> [LIMIT n] [OFFSET n]`。`PIVOT`/`UNPIVOT` は
-    /// 集合演算も CTE も持たない単純な文なので、`query_body` の同種の処理
-    /// （こちらは `SetExpr`/`WITH` の分岐まで持つ）を簡略化した専用版。
-    fn order_limit_offset_tail(&mut self) -> Result<(Vec<OrderByItem>, Option<u64>, Option<u64>)> {
+    /// 末尾の `ORDER BY <items> | ORDER BY ALL [ASC|DESC] [NULLS ...]`
+    /// `[LIMIT n] [OFFSET n]`。`PIVOT`/`UNPIVOT` は集合演算も CTE も持たない
+    /// 単純な文なので、`query_body` の同種の処理（こちらは `SetExpr`/`WITH`
+    /// の分岐まで持つ）を簡略化した専用版。
+    ///
+    /// `ORDER BY ALL` は `ALL`（既存の予約語 `Kw::All`）1 語だけを取り、
+    /// 通常の項目リストとは併記できない（DuckDB も `ORDER BY ALL, h` を構文
+    /// エラーにする。ここではリストを読まないので、続く `,` が
+    /// `UnexpectedToken` になって同じ結果になる）。
+    #[allow(clippy::type_complexity)]
+    fn order_limit_offset_tail(
+        &mut self,
+    ) -> Result<(Vec<OrderByItem>, Option<OrderByAll>, Option<u64>, Option<u64>)> {
         let mut order_by = Vec::new();
+        let mut order_by_all = None;
         if self.eat_kw(Kw::Order)? {
             self.expect_kw(Kw::By)?;
-            loop {
-                order_by.push(self.order_item()?);
-                if !self.eat(Tok::Comma)? {
-                    break;
+            if self.eat_kw(Kw::All)? {
+                let (desc, nulls_first) = self.order_direction()?;
+                order_by_all = Some(OrderByAll { desc, nulls_first });
+            } else {
+                loop {
+                    order_by.push(self.order_item()?);
+                    if !self.eat(Tok::Comma)? {
+                        break;
+                    }
                 }
             }
         }
         let limit = if self.eat_kw(Kw::Limit)? { Some(self.uint()?) } else { None };
         let offset = if self.eat_kw(Kw::Offset)? { Some(self.uint()?) } else { None };
-        Ok((order_by, limit, offset))
+        Ok((order_by, order_by_all, limit, offset))
     }
 }

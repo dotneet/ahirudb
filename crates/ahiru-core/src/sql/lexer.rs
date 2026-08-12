@@ -348,6 +348,12 @@ pub enum Tok<'a> {
     Colon,
     /// `^` または `**`（べき乗）
     Pow,
+    /// `^@`. PostgreSQL/DuckDB's "starts with" operator; sugar for
+    /// `starts_with(lhs, rhs)` (`sql::parser::expr_body`). Matched before
+    /// bare `^` (`Pow`) in `punct`, the same longest-match-first rule the
+    /// `~~~`/`!~~*` families use — without it `'abc' ^@ 'a'` would lex as
+    /// `^` followed by prefix `@` (absolute value) and die as a type error.
+    CaretAt,
     /// `&`（ビット単位 AND、整数のみ）
     Amp,
     /// `|`（ビット単位 OR、整数のみ。`||` は別途 `Concat`）
@@ -614,7 +620,15 @@ impl<'a> Lexer<'a> {
             }
             b'%' => Tok::Percent,
             b'?' => Tok::Param,
-            b'^' => Tok::Pow,
+            // Longest match first: `^@` (prefix/starts-with) before bare `^`
+            // (power). See `Tok::CaretAt`.
+            b'^' => {
+                if eat(b'@') {
+                    Tok::CaretAt
+                } else {
+                    Tok::Pow
+                }
+            }
             b'@' => Tok::At,
             b':' => {
                 if eat(b':') {

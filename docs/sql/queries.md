@@ -17,11 +17,11 @@ FROM <table | parquet('url') | read_json[_auto]('url') | generate_series(...) | 
   [, LATERAL? UNNEST(<expr>) ...]
   [TABLESAMPLE|USING SAMPLE <n>% | <n> ROWS | (bernoulli|system|reservoir)(...)]
 [WHERE <expr>]
-[GROUP BY <expr>, ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
+[GROUP BY <expr>, ... | ALL | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
 [HAVING <expr>]
 [WINDOW name AS (...), ...]
 [QUALIFY <expr>]
-[ORDER BY <expr> [ASC|DESC] [NULLS FIRST|LAST], ...]
+[ORDER BY <expr> [ASC|DESC] [NULLS FIRST|LAST], ... | ALL [ASC|DESC] [NULLS FIRST|LAST]]
 [LIMIT n] [OFFSET n]
 ```
 
@@ -80,6 +80,16 @@ SELECT IIF(flag, 'yes', 'no') FROM t LIMIT 3;
 -- isnull/notnull still works unquoted (SELECT isnull FROM t).
 SELECT * FROM t WHERE name ISNULL;
 SELECT * FROM t WHERE name NOTNULL;
+
+-- IS [NOT] UNKNOWN: exactly IS [NOT] NULL. The SQL standard defines it on
+-- booleans only, but any operand is accepted and simply null-tested
+-- (matching DuckDB): 1 IS UNKNOWN is false. UNKNOWN is a soft keyword, so a
+-- column named `unknown` still works unquoted.
+SELECT NULL IS UNKNOWN, 1 IS UNKNOWN, NULL IS NOT UNKNOWN;  -- true, false, false
+
+-- ^@ (prefix / starts-with): sugar for starts_with(a, b). See
+-- functions-string.md#prefix-operator-starts-with for its precedence.
+SELECT * FROM t WHERE name ^@ 'name_1';
 
 -- IS [NOT] TRUE / IS [NOT] FALSE: unlike `= true`, these coerce a
 -- non-boolean operand (CAST to BOOLEAN) and never return NULL -- NULL IS
@@ -276,6 +286,49 @@ SELECT flag, id % 3 AS m, count(*) c
 FROM t GROUP BY GROUPING SETS ((flag, id % 3), (flag), ())
 HAVING grouping(flag) = 0 ORDER BY 1, 2;
 ```
+
+### GROUP BY ALL
+
+`GROUP BY ALL` (a DuckDB shorthand) groups by **every select-list
+expression that doesn't contain an aggregate**, so you don't have to repeat
+the non-aggregated columns:
+
+```sql
+SELECT flag, name, count(*) c FROM t GROUP BY ALL ORDER BY ALL;
+-- identical to: ... GROUP BY flag, name ORDER BY flag, name, c
+```
+
+- "Contains an aggregate" is about the whole expression, not just its top
+  level: in `SELECT id % 3, sum(id) + 1 FROM t GROUP BY ALL`, the grouping
+  key is `id % 3` alone — `sum(id) + 1` is excluded.
+- With no aggregate anywhere in the select list it behaves like
+  `SELECT DISTINCT`.
+- With nothing *but* aggregates there are no grouping columns, i.e. one
+  row for the whole input.
+- `ALL` can't be mixed with an explicit list (`GROUP BY ALL, x` is a syntax
+  error, as in DuckDB).
+- `SELECT * ... GROUP BY ALL` is **not** supported here (DuckDB expands the
+  star and groups by every column); it fails with `unsupported SQL
+  feature`. Spell the columns out, or use `SELECT DISTINCT *`.
+
+### ORDER BY ALL
+
+`ORDER BY ALL` sorts by every output column, left to right, all in the same
+direction:
+
+```sql
+SELECT id, name FROM t ORDER BY ALL;              -- = ORDER BY id, name
+SELECT id, name FROM t ORDER BY ALL DESC;         -- = ORDER BY id DESC, name DESC
+SELECT big FROM t ORDER BY ALL NULLS FIRST;
+SELECT * FROM t ORDER BY ALL;                     -- covers the whole star expansion
+```
+
+It applies to the final output columns, so aggregate result columns are
+included too (`SELECT name, count(*) FROM t GROUP BY ALL ORDER BY ALL`
+sorts by `name`, then by the count). Like `GROUP BY ALL`, it can't be
+combined with an explicit list. It also works after a set operation
+(`... UNION ALL ... ORDER BY ALL`), but is not accepted on
+`PIVOT`/`UNPIVOT` statements.
 
 See [functions-aggregate.md](functions-aggregate.md) for the full
 aggregate-function list (`sum`, `avg`, `stddev`, `median`, `string_agg`,
