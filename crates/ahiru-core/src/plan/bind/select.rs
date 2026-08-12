@@ -880,31 +880,57 @@ pub(super) fn bind_select_in(
         let base_fields: Vec<Field> = out_fields[..base_cols].to_vec();
         let mut branches: Vec<Node> = Vec::with_capacity(resolved_sets.len());
         for set in &resolved_sets {
-            let mut set_groups = Vec::with_capacity(ngroups);
-            for (i, &g) in group_exprs.iter().enumerate() {
-                if set.iter().any(|&s| expr_eq(arena, s, g)) {
-                    set_groups.push(group_progs[i].clone());
-                } else {
-                    set_groups.push(const_program(group_progs[i].result_ty, Value::Null));
+            // `()` is "group by nothing": one row even on empty input (`count(*) = 0`).
+            // Planning it as `GROUP BY NULL, NULL, …` would make HashAggregate treat it
+            // as a real GROUP BY and emit zero rows for empty input.
+            let empty_set = set.is_empty() && ngroups > 0;
+            let agg_node = if empty_set {
+                Node::Aggregate {
+                    input: Box::new(node.clone()),
+                    groups: Vec::new(),
+                    aggs: aggs.clone(),
+                    schema: base_fields[ngroups..].to_vec(),
+                    having: None,
                 }
-            }
-            let agg_node = Node::Aggregate {
-                input: Box::new(node.clone()),
-                groups: set_groups,
-                aggs: aggs.clone(),
-                schema: base_fields.clone(),
-                having: None,
+            } else {
+                let mut set_groups = Vec::with_capacity(ngroups);
+                for (i, &g) in group_exprs.iter().enumerate() {
+                    if set.iter().any(|&s| expr_eq(arena, s, g)) {
+                        set_groups.push(group_progs[i].clone());
+                    } else {
+                        set_groups.push(const_program(group_progs[i].result_ty, Value::Null));
+                    }
+                }
+                Node::Aggregate {
+                    input: Box::new(node.clone()),
+                    groups: set_groups,
+                    aggs: aggs.clone(),
+                    schema: base_fields.clone(),
+                    having: None,
+                }
             };
-            let branch = if grouping_calls.is_empty() {
+            let need_project = empty_set || !grouping_calls.is_empty();
+            let branch = if !need_project {
                 agg_node
             } else {
                 // GROUPING()'s result is neither a group key nor an aggregate result, so it does
                 // not appear in Node::Aggregate's schema. It is added as a constant column by a
-                // Project.
-                let branch_scope = Scope::from_fields(base_fields.clone());
+                // Project. The empty-set branch also uses a Project to put NULL in every
+                // grouping column in front of the no-key aggregate's output.
                 let mut exprs = Vec::with_capacity(out_fields.len());
-                for i in 0..base_cols {
-                    exprs.push(column_program(&branch_scope, i)?);
+                if empty_set {
+                    for p in group_progs.iter().take(ngroups) {
+                        exprs.push(const_program(p.result_ty, Value::Null));
+                    }
+                    let agg_scope = Scope::from_fields(base_fields[ngroups..].to_vec());
+                    for i in 0..aggs.len() {
+                        exprs.push(column_program(&agg_scope, i)?);
+                    }
+                } else {
+                    let branch_scope = Scope::from_fields(base_fields.clone());
+                    for i in 0..base_cols {
+                        exprs.push(column_program(&branch_scope, i)?);
+                    }
                 }
                 for idxs in &grouping_arg_idx {
                     let bits = idxs.len() as u32;
@@ -1188,13 +1214,20 @@ pub(super) fn bind_select_in(
     node = Node::Project { input: Box::new(node), exprs, schema: project_schema.clone() };
     let project_scope = Scope::from_fields(project_schema);
 
+    // `SELECT DISTINCT a ORDER BY b` adds `b` as a hidden column. Deduplicating
+    // on that hidden key as well would keep one row per (a, b) and then drop
+    // `b`, returning duplicate `a`s. When a sort key sits past `visible`,
+    // DISTINCT is applied *after* the sort as first-row-wins on the visible
+    // columns (the same operator as `DISTINCT ON`).
+    let distinct_after_sort = sel.distinct && keys.iter().any(|(col, _, _)| *col >= visible);
+
     // --- DISTINCT -----------------------------------------------------------
-    if sel.distinct {
-        // Lowered to an aggregate whose group keys are all the output columns. Hidden sort
-        // columns are included as keys too (without them, several rows with the same visible part could survive).
+    if sel.distinct && !distinct_after_sort {
+        // Group only the visible output (plus correlation keys). Hidden sort
+        // columns are not present on this path.
         let mut groups = Vec::new();
         let mut out_fields = Vec::new();
-        for i in 0..project_scope.len() {
+        for i in 0..visible {
             groups.push(column_program(&project_scope, i)?);
             out_fields.push(project_scope.fields()[i].clone());
         }
@@ -1218,10 +1251,10 @@ pub(super) fn bind_select_in(
             });
         }
         // `ORDER BY ... LIMIT n OFFSET k` only needs to hold the top n+k. Lowering to a Top-N
-        // avoids buffering everything. With DISTINCT ON present, though, which row wins is
-        // decided by "deduplication after sorting", so truncating with Top-N first would drop the
-        // correct representative row of another group.
-        let topn = if sel.distinct_on.is_empty() {
+        // avoids buffering everything. With DISTINCT ON (or DISTINCT that must wait until
+        // after the sort) present, which row wins is decided by "deduplication after
+        // sorting", so truncating with Top-N first would drop the correct representative.
+        let topn = if sel.distinct_on.is_empty() && !distinct_after_sort {
             sel.limit
                 .map(|l| l.saturating_add(sel.offset.unwrap_or(0)).min(usize::MAX as u64) as usize)
         } else {
@@ -1236,6 +1269,13 @@ pub(super) fn bind_select_in(
         let mut on_progs = Vec::with_capacity(distinct_on_cols.len());
         for c in distinct_on_cols {
             on_progs.push(column_program(&s, c)?);
+        }
+        node = Node::DistinctOn { input: Box::new(node), keys: on_progs };
+    } else if distinct_after_sort {
+        let s = Scope::from_fields(node.schema().to_vec());
+        let mut on_progs = Vec::with_capacity(visible);
+        for i in 0..visible {
+            on_progs.push(column_program(&s, i)?);
         }
         node = Node::DistinctOn { input: Box::new(node), keys: on_progs };
     }

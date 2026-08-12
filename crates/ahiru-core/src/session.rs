@@ -7,7 +7,7 @@ use crate::catalog::{Catalog, Source, TablePart};
 use crate::exec::{build, CodecRequest, ExecContext, IoRequest, Operator, Step, Values};
 use crate::expr::vm::Vm;
 use crate::format::{partitioned::PartitionedFormat, FormatKind, TableFormat};
-use crate::plan::bind::{bind_query, desugar_pivot, desugar_unpivot, referenced_in_query};
+use crate::plan::bind::{bind_query_at, desugar_pivot, desugar_unpivot, referenced_in_query};
 use crate::prelude::*;
 use crate::sql::ast::{FromItem, Stmt};
 use crate::sql::parse;
@@ -87,7 +87,7 @@ pub struct Session {
     /// passes it explicitly via `set_now`. Unset, it is the epoch (1970-01-01) --
     /// the same reasoning as the other defensive-parsing choices: if the time is
     /// unknown, return a conspicuously broken value rather than quietly lying.
-    now_micros: i64,
+    pub(crate) now_micros: i64,
 }
 
 impl Session {
@@ -249,7 +249,7 @@ impl Session {
                 if let Some(io) = self.resolve_query(&parsed.arena, q)? {
                     return Ok(Prepared::NeedIo(io));
                 }
-                let plan = bind_query(&self.catalog, &parsed.arena, q, params)?;
+                let plan = bind_query_at(&self.catalog, &parsed.arena, q, params, self.now_micros)?;
                 let lines = crate::plan::explain::explain(&plan.root);
                 Ok(Prepared::Ready(one_column("plan", lines)))
             }
@@ -328,7 +328,7 @@ impl Session {
         if let Some(io) = self.resolve_query(arena, q)? {
             return Ok(Prepared::NeedIo(io));
         }
-        let plan = bind_query(&self.catalog, arena, q, params)?;
+        let plan = bind_query_at(&self.catalog, arena, q, params, self.now_micros)?;
         let schema = plan.root.schema().to_vec();
         Ok(Prepared::Ready(Query {
             root: build(plan.root)?,
@@ -482,7 +482,8 @@ impl Session {
             Some(s) => s.to_owned(),
             None => err!(TableNotFound),
         };
-        let parsed = parse(&sql)?;
+        let mut parsed = parse(&sql)?;
+        crate::sql::substitute_now(&mut parsed.arena, self.now_micros);
         let q = match &parsed.stmt {
             Stmt::Select(q) => q,
             _ => err!(Internal),
@@ -490,7 +491,7 @@ impl Session {
         if let Some(io) = self.resolve_query(&parsed.arena, q)? {
             return Ok(Err(io));
         }
-        let plan = bind_query(&self.catalog, &parsed.arena, q, &[])?;
+        let plan = bind_query_at(&self.catalog, &parsed.arena, q, &[], self.now_micros)?;
         Ok(Ok(plan.root.schema().to_vec()))
     }
 }

@@ -26,6 +26,10 @@ pub struct CteScope {
     // not CTE handling proper).
     #[cfg(feature = "ddl")]
     pub(super) view_depth: u32,
+    /// Query start time (UTC microseconds) for `now()` / `CURRENT_DATE` substitution
+    /// when a view body is reparsed. Copied onto nested view scopes.
+    #[cfg(feature = "ddl")]
+    pub(super) now_micros: i64,
 }
 
 /// The maximum view expansion nesting. It is smaller than `MAX_FROM_DEPTH` because expanding

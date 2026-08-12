@@ -1007,31 +1007,43 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
         return None;
     }
     let mut micros = 0u32;
-    if s.len() > 19 {
-        if s[19] != b'.' {
+    let mut rest = if s.len() > 19 { &s[19..] } else { &[][..] };
+    if rest.first() == Some(&b'.') {
+        let frac = &rest[1..];
+        if frac.is_empty() {
             return None;
         }
-        let frac = &s[20..];
-        if frac.is_empty() || frac.len() > 9 {
-            return None;
-        }
-        // Truncated or zero-padded to 6 digits to give microseconds.
-        for k in 0..6 {
-            let d = match frac.get(k) {
-                Some(&c) if c.is_ascii_digit() => (c - b'0') as u32,
-                Some(_) => return None,
-                None => 0,
-            };
-            micros = micros * 10 + d;
-        }
-        for &c in frac.iter().skip(6) {
-            if !c.is_ascii_digit() {
-                return None;
+        let mut k = 0usize;
+        while k < frac.len() && frac[k].is_ascii_digit() {
+            if k < 6 {
+                micros = micros * 10 + (frac[k] - b'0') as u32;
             }
+            k += 1;
         }
+        if k == 0 {
+            return None;
+        }
+        while k < 6 {
+            micros *= 10;
+            k += 1;
+        }
+        let mut n = 1;
+        while n < rest.len() && rest[n].is_ascii_digit() {
+            n += 1;
+        }
+        rest = &rest[n..];
     }
+    let off = if rest.is_empty() {
+        0
+    } else {
+        let (o, n) = crate::format::scan_tz_suffix(rest)?;
+        if n != rest.len() {
+            return None;
+        }
+        o
+    };
     let secs = days * 86_400 + (hh as i64) * 3600 + (mi as i64) * 60 + ss as i64;
-    Some(secs * 1_000_000 + micros as i64)
+    Some(secs * 1_000_000 + micros as i64 - off)
 }
 
 // --- Byte-sequence utilities ------------------------------------------------------

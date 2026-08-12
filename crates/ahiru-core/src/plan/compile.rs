@@ -107,11 +107,12 @@ pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
 /// accepted (the unit -- seconds or microseconds -- cannot be decided).
 fn date_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, bool)> {
     use BinaryOp::*;
+    let intish = |t: Ty| t.is_integer() || t == Ty::Null;
     match (op, lt, rt) {
-        (Add, Ty::Date, r) if r.is_integer() => Some((Ty::Date, false)),
+        (Add, Ty::Date, r) if intish(r) => Some((Ty::Date, false)),
         // `1 + DATE` swaps so DATE comes first.
-        (Add, l, Ty::Date) if l.is_integer() => Some((Ty::Date, true)),
-        (Sub, Ty::Date, r) if r.is_integer() => Some((Ty::Date, false)),
+        (Add, l, Ty::Date) if intish(l) => Some((Ty::Date, true)),
+        (Sub, Ty::Date, r) if intish(r) => Some((Ty::Date, false)),
         (Sub, Ty::Date, Ty::Date) => Some((Ty::BigInt, false)),
         _ => None,
     }
@@ -823,16 +824,21 @@ impl<'a> Compiler<'a> {
         // Arithmetic between DATE and an integer is treated as days (the same as DuckDB).
         // `unify(Date, Int)` is None, so it does not ride the common-type path.
         if let Some((res, swap)) = date_arith(op, lt, rt) {
-            let (l, r) = if swap { (rr, lr) } else { (lr, rr) };
             let code = if op == BinaryOp::Add { OpCode::Add } else { OpCode::Sub };
-            // Both DATE and INTEGER are physically I32, so the operation itself needs no conversion.
-            let dst = self.prog.alloc_reg();
-            self.prog.push(Instr::new(code, crate::vector::PhysType::I32, dst, l, r));
-            // DuckDB returns BIGINT for a day difference, so this matches. The value is the
-            // same, but a different type would throw off type resolution above.
+            // DATE - DATE is I32 minus I32, then widened to BIGINT.
             if res == Ty::BigInt {
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::new(code, crate::vector::PhysType::I32, dst, lr, rr));
                 return Ok((self.coerce(dst, Ty::Int, Ty::BigInt)?, Ty::BigInt));
             }
+            // DATE ± integer. The integer may be BIGINT (CSV inference) or NULL;
+            // both are coerced to I32 days so the kernel sees matching physical types.
+            let (date_r, date_t, int_r, int_t) =
+                if swap { (rr, rt, lr, lt) } else { (lr, lt, rr, rt) };
+            let date_r = self.coerce(date_r, date_t, Ty::Date)?;
+            let int_r = self.coerce(int_r, int_t, Ty::Int)?;
+            let dst = self.prog.alloc_reg();
+            self.prog.push(Instr::new(code, crate::vector::PhysType::I32, dst, date_r, int_r));
             return Ok((dst, res));
         }
 

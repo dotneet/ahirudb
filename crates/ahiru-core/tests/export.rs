@@ -35,6 +35,21 @@ fn csv_export_matches_duckdb_on_real_parquet() {
 }
 
 #[test]
+fn tsv_export_uses_tabs_and_reimports() {
+    let mut s = Session::new();
+    s.register_bytes("t", data("basic.parquet")).unwrap();
+    let mut sink = CsvSink::with_delimiter(b'\t');
+    let out =
+        export_all(&mut s, "SELECT id, name FROM t ORDER BY id LIMIT 2", &[], &mut sink).unwrap();
+    assert_eq!(out, b"id\tname\n0\tname_0\n1\tname_1\n");
+    let mut s2 = Session::new();
+    s2.register_bytes_as("u", out, ahiru_core::FormatKind::Tsv).unwrap();
+    let mut sink2 = CsvSink::with_delimiter(b'\t');
+    let out2 = export_all(&mut s2, "SELECT id, name FROM u ORDER BY id", &[], &mut sink2).unwrap();
+    assert_eq!(out2, b"id\tname\n0\tname_0\n1\tname_1\n");
+}
+
+#[test]
 fn jsonl_export_matches_duckdb_on_real_parquet() {
     let mut s = Session::new();
     s.register_bytes("t", data("basic.parquet")).unwrap();

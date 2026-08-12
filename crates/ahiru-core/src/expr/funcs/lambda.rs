@@ -154,18 +154,20 @@ fn call_list_reduce(args: &[&Vector], result_ty: Ty, body: &Program) -> Result<V
             }
         };
         for (span, kind) in iter {
-            let Some(acc_text) = acc.as_ref() else {
-                // Already NULL. Folding further keeps it NULL, so it breaks off.
-                break;
-            };
             let mut acc_v = Vector::new(Ty::Json);
-            acc_v.push_value(&Value::Bytes(acc_text.clone()));
+            match acc.as_ref() {
+                Some(acc_text) => acc_v.push_value(&Value::Bytes(acc_text.clone())),
+                // A NULL accumulator is still passed in so a non-strict body
+                // (`coalesce(acc, x)`) can recover. Breaking here would make
+                // `list_reduce([NULL, 1], (acc, x) -> coalesce(acc, x))` NULL.
+                None => acc_v.push_null(),
+            }
             let x_v = lambda_param_vector(span, kind);
             let batch = Batch::new(vec![acc_v, x_v]);
             let r = vm.eval(body, &batch)?;
             if !r.is_valid(0) {
                 acc = None;
-                break;
+                continue;
             }
             buf.clear();
             write_json_scalar(&r, 0, &mut buf);

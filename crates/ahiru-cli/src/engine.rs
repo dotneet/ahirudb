@@ -114,8 +114,10 @@ impl Engine {
         if paths.is_empty() {
             return Err(format!("no files matched: {spec}").into());
         }
-        let kind = FormatKind::detect(&paths[0].to_string_lossy());
+        // Detect per file. A directory / glob can mix extensions; applying the
+        // first path's format to every part would read CSV as Parquet (or vice versa).
         if paths.len() == 1 {
+            let kind = FormatKind::detect(&paths[0].to_string_lossy());
             let bytes = std::fs::read(&paths[0])?;
             let a = self.s.register_bytes_as(name, bytes.clone(), kind)?;
             self.sources.insert((a, 0), bytes.clone());
@@ -132,7 +134,7 @@ impl Engine {
             for p in &paths {
                 files.push((p.to_string_lossy().into_owned(), std::fs::read(p)?));
             }
-            let a = self.s.register_multi_bytes(name, files.clone(), kind)?;
+            let a = self.s.register_multi_bytes(name, files.clone(), FormatKind::Auto)?;
             for (p, (_, bytes)) in files.into_iter().enumerate() {
                 self.sources.insert((a, p), bytes);
             }

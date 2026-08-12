@@ -279,20 +279,23 @@ fn push_view_rel(
         Some(s) => s.to_owned(),
         None => err!(TableNotFound),
     };
-    let parsed = crate::sql::parse(&sql)?;
+    let mut parsed = crate::sql::parse(&sql)?;
     // Views are stored queries, not prepared statements. A `?` in the body would be
     // re-numbered from zero on this separate parse and steal the outer query's
     // parameters, so it is rejected rather than silently binding the wrong values.
     ensure!(parsed.num_params == 0, UnsupportedFeature);
+    crate::sql::substitute_now(&mut parsed.arena, ctes.now_micros);
     let q = match parsed.stmt {
         Stmt::Select(q) => q,
         _ => err!(Internal),
     };
     // A view is bound in its own CTE scope so an outer `WITH t AS (...)` cannot
     // shadow the view's base table `t`. `view_depth` is copied so nested view
-    // references still share the expansion-depth cap.
+    // references still share the expansion-depth cap. `now_micros` is copied so
+    // a nested view sees the same query start time.
     let mut view_ctes = CteScope::default();
     view_ctes.view_depth = ctes.view_depth + 1;
+    view_ctes.now_micros = ctes.now_micros;
     let plan = bind_query_in(catalog, &parsed.arena, &q, params, &mut view_ctes, None)?;
     let all = plan.root.schema().to_vec();
     rels.push(Rel {

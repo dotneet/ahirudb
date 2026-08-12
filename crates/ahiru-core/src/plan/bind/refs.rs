@@ -44,40 +44,22 @@ pub(super) fn order_output_column(
         return Ok(Some(i - 1));
     }
     if let Expr::ColumnRef { qualifier: None, name } = arena.get(o.expr) {
-        for (i, item) in sel.items.iter().enumerate() {
-            if let Some(a) = &item.alias {
-                if eq_ascii_ci(a.as_bytes(), name.as_bytes()) && i < schema.len() {
-                    return Ok(Some(i));
-                }
-            }
-        }
-        // A `*` `RENAME (old AS new, ...)` acts like a per-column alias for
-        // `ORDER BY` purposes too (verified against `duckdb`: `ORDER BY new`
-        // resolves to the renamed output column, and so does `ORDER BY old`
-        // via the normal scope-resolution fallback below). Resolved by
-        // matching the final schema name rather than select-item position,
-        // since a `*` can expand into any number of columns and the two
-        // don't line up.
-        let is_rename_target = sel.items.iter().any(|it| {
-            matches!(arena.get(it.expr), Expr::Star { rename, .. }
-                if rename.iter().any(|(_, new)| eq_ascii_ci(new.as_bytes(), name.as_bytes())))
-        });
-        if is_rename_target {
-            if let Some(i) =
-                schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
-            {
-                return Ok(Some(i));
-            }
+        // Resolve aliases against the *expanded* output schema, not the
+        // select-item index. `SELECT *, expr AS extra ORDER BY extra` has
+        // `extra` as item 1 but schema column N after the star expands.
+        if let Some(i) = schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
+        {
+            return Ok(Some(i));
         }
     }
     // If it structurally matches an output expression, use that column (avoiding recomputation).
-    for (col, item) in sel.items.iter().enumerate() {
-        if matches!(arena.get(item.expr), Expr::Star { .. }) {
-            // `*` expands to several columns, so positions cannot be lined up. Give up.
-            return Ok(None);
-        }
-        if expr_eq(arena, item.expr, o.expr) && col < schema.len() {
-            return Ok(Some(col));
+    // A `*` / `COLUMNS(...)` item expands to several columns, so select-item
+    // positions no longer line up with the schema; fall through and recompile.
+    if !sel.items.iter().any(|it| matches!(arena.get(it.expr), Expr::Star { .. })) {
+        for (col, item) in sel.items.iter().enumerate() {
+            if expr_eq(arena, item.expr, o.expr) && col < schema.len() {
+                return Ok(Some(col));
+            }
         }
     }
     Ok(None)
@@ -93,20 +75,16 @@ pub(super) fn distinct_on_output_column(
     schema: &[Field],
 ) -> Option<usize> {
     if let Expr::ColumnRef { qualifier: None, name } = arena.get(on_expr) {
-        for (i, item) in sel.items.iter().enumerate() {
-            if let Some(a) = &item.alias {
-                if eq_ascii_ci(a.as_bytes(), name.as_bytes()) && i < schema.len() {
-                    return Some(i);
-                }
-            }
+        if let Some(i) = schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
+        {
+            return Some(i);
         }
     }
-    for (col, item) in sel.items.iter().enumerate() {
-        if matches!(arena.get(item.expr), Expr::Star { .. }) {
-            return None;
-        }
-        if expr_eq(arena, item.expr, on_expr) && col < schema.len() {
-            return Some(col);
+    if !sel.items.iter().any(|it| matches!(arena.get(it.expr), Expr::Star { .. })) {
+        for (col, item) in sel.items.iter().enumerate() {
+            if expr_eq(arena, item.expr, on_expr) && col < schema.len() {
+                return Some(col);
+            }
         }
     }
     None

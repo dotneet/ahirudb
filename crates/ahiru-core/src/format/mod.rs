@@ -328,6 +328,38 @@ pub const TEXT_SPLIT_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(any(feature = "csv", feature = "jsonl"))]
 pub const TEXT_MAX_RECORD: u64 = 1024 * 1024;
 
+/// Time-zone suffix: `Z` / `z` or `[+-]HH[:]MM` / `[+-]HH`.
+///
+/// Returns `(offset_micros east of UTC, bytes consumed)`. Used by the text
+/// readers so `2020-01-01T00:00:00Z` and a `COPY` TIMESTAMPTZ `+00` suffix
+/// parse as timestamps instead of falling through to VARCHAR / NULL.
+#[cfg(any(feature = "csv", feature = "jsonl"))]
+pub(crate) fn scan_tz_suffix(s: &[u8]) -> Option<(i64, usize)> {
+    match s.first()? {
+        b'Z' | b'z' => Some((0, 1)),
+        &sign @ (b'+' | b'-') => {
+            if s.len() < 3 || !s[1].is_ascii_digit() || !s[2].is_ascii_digit() {
+                return None;
+            }
+            let h = ((s[1] - b'0') as i64) * 10 + (s[2] - b'0') as i64;
+            let (m, n) = if s.get(3) == Some(&b':') {
+                if s.len() < 6 || !s[4].is_ascii_digit() || !s[5].is_ascii_digit() {
+                    return None;
+                }
+                (((s[4] - b'0') as i64) * 10 + (s[5] - b'0') as i64, 6)
+            } else {
+                (0, 3)
+            };
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let micros = (h * 3600 + m * 60) * 1_000_000;
+            Some((if sign == b'-' { -micros } else { micros }, n))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

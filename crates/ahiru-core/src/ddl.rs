@@ -16,7 +16,7 @@
 
 use crate::error::Code;
 use crate::exec::{build, ExecContext, Step};
-use crate::plan::bind::{bind_query, referenced_in_query};
+use crate::plan::bind::{bind_query_at, referenced_in_query};
 use crate::plan::compile::{cast_program, compile};
 use crate::plan::Scope;
 use crate::prelude::*;
@@ -197,7 +197,7 @@ pub(crate) fn run_query_to_rows(
             }
         }
     }
-    let plan = bind_query(&session.catalog, arena, q, params)?;
+    let plan = bind_query_at(&session.catalog, arena, q, params, session.now_micros)?;
     let schema = plan.root.schema().to_vec();
     let mut op = build(plan.root)?;
     let mut rows = Vec::new();

@@ -44,11 +44,14 @@ pub(super) fn nullif(args: &[&Vector], ty: Ty) -> Result<Vector> {
 
 /// `GREATEST` / `LEAST`. Like DuckDB it skips NULLs and returns NULL only when everything is NULL.
 ///
-/// The condition for keeping acc -- `acc IS NOT NULL AND (b IS NULL OR acc > b)` -- is assembled
-/// directly in three-valued logic. `kernels::compare` already has the per-physical-type
-/// comparison, so no type branching appears here.
+/// Floating-point values use a total order (`NaN` greater than every finite value), matching
+/// `MIN`/`MAX`. IEEE `>`/`<` would make `greatest(1, nan)` and `greatest(nan, 1)` disagree.
+/// Other types keep the three-valued `acc IS NOT NULL AND (b IS NULL OR acc > b)` construction.
 pub(super) fn extremum(want_max: bool, args: &[&Vector], ty: Ty) -> Result<Vector> {
     ensure!(!args.is_empty(), WrongArgCount);
+    if ty.phys() == PhysType::F64 {
+        return extremum_f64(want_max, args, ty);
+    }
     let op = if want_max { OpCode::Gt } else { OpCode::Lt };
     let mut acc = args[0].clone();
     for b in &args[1..] {
@@ -58,6 +61,60 @@ pub(super) fn extremum(want_max: bool, args: &[&Vector], ty: Ty) -> Result<Vecto
         acc = kernels::pick(Some(&c), &acc, b, ty)?;
     }
     Ok(acc)
+}
+
+/// Same total order as `exec::rowkey::ord_f64`: `-inf < … < +inf < NaN`.
+fn ord_f64(a: f64, b: f64) -> core::cmp::Ordering {
+    use core::cmp::Ordering::*;
+    if a < b {
+        Less
+    } else if a > b {
+        Greater
+    } else if a == b {
+        Equal
+    } else {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => Equal,
+            (true, false) => Greater,
+            _ => Less,
+        }
+    }
+}
+
+fn extremum_f64(want_max: bool, args: &[&Vector], ty: Ty) -> Result<Vector> {
+    let (n, s) = strides(args)?;
+    let mut out = Vec::with_capacity(n);
+    let mut bad: Option<Bitmap> = None;
+    for i in 0..n {
+        let mut best: Option<f64> = None;
+        for (k, a) in args.iter().enumerate() {
+            let j = i * s[k];
+            if !a.is_valid(j) {
+                continue;
+            }
+            let x = a.f64s()[j];
+            best = Some(match best {
+                None => x,
+                Some(b) => {
+                    let prefer_x =
+                        if want_max { ord_f64(x, b).is_gt() } else { ord_f64(x, b).is_lt() };
+                    if prefer_x {
+                        x
+                    } else {
+                        b
+                    }
+                }
+            });
+        }
+        match best {
+            Some(v) => out.push(v),
+            None => {
+                out.push(0.0);
+                set_null(&mut bad, i, n);
+            }
+        }
+    }
+    Ok(Vector::from_data(ty, Data::F64(out), bad))
 }
 
 /// `concat`. Like DuckDB it ignores NULL arguments as the empty string, so the result is never NULL.

@@ -12,11 +12,16 @@ pub struct CsvSink {
     out: Vec<u8>,
     /// Whether the header row has been written.
     began: bool,
+    delimiter: u8,
 }
 
 impl CsvSink {
     pub fn new() -> Self {
-        CsvSink { out: Vec::new(), began: false }
+        Self::with_delimiter(b',')
+    }
+
+    pub fn with_delimiter(delimiter: u8) -> Self {
+        CsvSink { out: Vec::new(), began: false, delimiter }
     }
 }
 
@@ -30,9 +35,9 @@ impl TableSink for CsvSink {
     fn begin(&mut self, schema: &[Field]) -> Result<()> {
         for (i, f) in schema.iter().enumerate() {
             if i > 0 {
-                self.out.push(b',');
+                self.out.push(self.delimiter);
             }
-            push_field(&mut self.out, f.name.as_bytes());
+            push_field(&mut self.out, f.name.as_bytes(), self.delimiter);
         }
         self.out.push(b'\n');
         self.began = true;
@@ -45,13 +50,13 @@ impl TableSink for CsvSink {
         for r in 0..n {
             for (i, (c, f)) in batch.cols.iter().zip(schema).enumerate() {
                 if i > 0 {
-                    self.out.push(b',');
+                    self.out.push(self.delimiter);
                 }
                 if !c.is_valid(r) {
                     // An empty field means NULL. CSV has no standard representation for NULL.
                     continue;
                 }
-                push_value(&mut self.out, &c.value_at(r), f.ty);
+                push_value(&mut self.out, &c.value_at(r), f.ty, self.delimiter);
             }
             self.out.push(b'\n');
         }
@@ -63,8 +68,8 @@ impl TableSink for CsvSink {
     }
 }
 
-/// Quotes a field only if it contains a comma, quote, newline, or CR, or if
-/// the value is the empty string.
+/// Quotes a field only if it contains the delimiter, a quote, newline, or CR,
+/// or if the value is the empty string.
 ///
 /// Quoting the empty string too is deliberate: `write_batch` represents NULL
 /// by writing no field at all (the counterpart of `crate::format::csv`'s read
@@ -73,8 +78,9 @@ impl TableSink for CsvSink {
 /// so reading it back with this crate's own CSV reader would turn the empty
 /// string into NULL (a real round-trip bug that was actually found). Writing
 /// `""` lets the read side's "quoted empty = empty string" convention tell them apart.
-fn push_field(out: &mut Vec<u8>, s: &[u8]) {
-    let needs_quote = s.is_empty() || s.iter().any(|&b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
+fn push_field(out: &mut Vec<u8>, s: &[u8], delimiter: u8) {
+    let needs_quote =
+        s.is_empty() || s.iter().any(|&b| b == delimiter || matches!(b, b'"' | b'\n' | b'\r'));
     if !needs_quote {
         out.extend_from_slice(s);
         return;
@@ -89,7 +95,7 @@ fn push_field(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
 }
 
-fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
+fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty, delimiter: u8) {
     match v {
         Value::Null => {}
         Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
@@ -125,9 +131,9 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
             if let Ok(raw) = <[u8; 16]>::try_from(b.as_slice()) {
                 crate::expr::funcs::fmt_uuid(&raw, &mut hex);
             }
-            push_field(out, &hex);
+            push_field(out, &hex, delimiter);
         }
-        Value::Bytes(b) => push_field(out, b),
+        Value::Bytes(b) => push_field(out, b, delimiter),
     }
 }
 

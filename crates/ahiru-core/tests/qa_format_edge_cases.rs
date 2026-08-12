@@ -250,3 +250,41 @@ fn empty_csv_file_registers_as_a_zero_row_table_not_an_error() {
     let rows = run_all("SELECT count(*) FROM t", &mut sess);
     assert_eq!(rows, [[Value::I64(0)]]);
 }
+
+#[test]
+fn csv_nan_and_infinity_round_trip_as_double() {
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"v\n1.5\nNaN\nInfinity\n-Infinity\n".to_vec(), FormatKind::Csv)
+        .unwrap();
+    let rows = run_all("SELECT v FROM t", &mut sess);
+    assert_eq!(rows[0][0], Value::F64(1.5));
+    match &rows[1][0] {
+        Value::F64(x) => assert!(x.is_nan()),
+        other => panic!("NaN row: {other:?}"),
+    }
+    match &rows[2][0] {
+        Value::F64(x) => assert!(x.is_infinite() && *x > 0.0),
+        other => panic!("inf row: {other:?}"),
+    }
+    match &rows[3][0] {
+        Value::F64(x) => assert!(x.is_infinite() && *x < 0.0),
+        other => panic!("-inf row: {other:?}"),
+    }
+}
+
+#[test]
+fn jsonl_z_suffix_is_a_timestamp() {
+    let mut sess = Session::new();
+    sess.register_bytes_as(
+        "t",
+        br#"{"t":"2020-01-01T00:00:00"}
+{"t":"2020-01-01T00:00:00Z"}
+"#
+        .to_vec(),
+        FormatKind::Jsonl,
+    )
+    .unwrap();
+    let rows = run_all("SELECT t FROM t", &mut sess);
+    assert_eq!(rows[0][0], Value::I64(1_577_836_800_000_000));
+    assert_eq!(rows[1][0], Value::I64(1_577_836_800_000_000));
+}

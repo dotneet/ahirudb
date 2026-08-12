@@ -40,7 +40,10 @@ fn resolve_insert_columns(schema: &[Field], columns: &[String]) -> Result<Vec<us
     let mut out = Vec::with_capacity(columns.len());
     for c in columns {
         match schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), c.as_bytes())) {
-            Some(i) => out.push(i),
+            Some(i) => {
+                ensure!(!out.contains(&i), DuplicateColumn);
+                out.push(i);
+            }
             None => err!(ColumnNotFound),
         }
     }

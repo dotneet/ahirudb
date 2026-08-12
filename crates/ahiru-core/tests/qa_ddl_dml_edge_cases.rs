@@ -253,3 +253,50 @@ fn delete_where_filter_with_a_scalar_subquery_fails_clearly_not_a_panic_or_wrong
     // partially applied.
     assert_eq!(affected(&mut sess, "SELECT count(*) FROM t"), 4);
 }
+
+#[test]
+fn create_table_rejects_duplicate_column_names() {
+    let mut s = Session::new();
+    assert_eq!(
+        code_of(s.prepare("CREATE TABLE t (id INTEGER, id VARCHAR)", &[])),
+        Some(Code::DuplicateColumn)
+    );
+}
+
+#[test]
+fn insert_rejects_duplicate_target_columns() {
+    let mut s = Session::new();
+    s.prepare("CREATE TABLE t (a INTEGER, b INTEGER)", &[]).unwrap();
+    assert_eq!(
+        code_of(s.prepare("INSERT INTO t (a, a) VALUES (1, 2)", &[])),
+        Some(Code::DuplicateColumn)
+    );
+}
+
+#[test]
+fn register_does_not_shadow_a_mem_table() {
+    let mut s = Session::new();
+    s.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    s.prepare("INSERT INTO t VALUES (1)", &[]).unwrap();
+    assert_eq!(
+        code_of(s.register_bytes_as(
+            "t",
+            b"id\n99\n".to_vec(),
+            ahiru_core::format::FormatKind::Csv
+        )),
+        Some(Code::DuplicateTable)
+    );
+    let rows = run(&mut s, "SELECT id FROM t");
+    assert_eq!(rows, vec![vec![Value::I32(1)]]);
+}
+
+#[test]
+fn grouping_sets_empty_input_emits_the_grand_total() {
+    let mut s = Session::new();
+    s.prepare("CREATE TABLE t (flag BOOLEAN)", &[]).unwrap();
+    let rows = run(
+        &mut s,
+        "SELECT flag, count(*) FROM t GROUP BY GROUPING SETS ((flag), ()) ORDER BY flag",
+    );
+    assert_eq!(rows, vec![vec![Value::Null, Value::I64(0)]]);
+}

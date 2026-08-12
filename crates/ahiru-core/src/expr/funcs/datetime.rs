@@ -353,6 +353,11 @@ fn scan_time(s: &[u8], i: usize) -> Option<(i64, usize)> {
     if h > 24 || m > 59 || sec > 59 {
         return None;
     }
+    // SQL (and DuckDB) accept `24:00:00` only as midnight-at-the-end-of-the-day.
+    // `24:01:00` used to slip through and wrap to `00:01:00` on display.
+    if h == 24 && (m != 0 || sec != 0 || frac != 0) {
+        return None;
+    }
     Some((h * US_PER_HOUR + m * US_PER_MIN + sec * US_PER_SEC + frac, i))
 }
 

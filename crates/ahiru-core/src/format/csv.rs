@@ -715,7 +715,19 @@ fn parse_i64(v: &[u8]) -> Option<i64> {
 }
 
 fn parse_f64(v: &[u8]) -> Option<f64> {
-    // The shape is checked in-house. `inf` / `NaN` / hex are rejected so only CSV numbers pass.
+    // IEEE specials that the CSV writer itself emits (`NaN` / `Infinity` / `-Infinity`).
+    if eq_ascii_ci(v, b"nan") {
+        return Some(f64::NAN);
+    }
+    let signed = match v.first() {
+        Some(b'+') => &v[1..],
+        Some(b'-') => &v[1..],
+        _ => v,
+    };
+    if eq_ascii_ci(signed, b"inf") || eq_ascii_ci(signed, b"infinity") {
+        return Some(if v.first() == Some(&b'-') { f64::NEG_INFINITY } else { f64::INFINITY });
+    }
+    // Hex is still rejected so only decimal CSV numbers pass.
     let mut i = if matches!(v.first(), Some(b'+') | Some(b'-')) { 1 } else { 0 };
     let mut digits = 0usize;
     while let Some(&c) = v.get(i) {
@@ -876,6 +888,12 @@ fn parse_ts(v: &[u8]) -> Option<i64> {
             return None;
         }
     }
+    let mut off = 0i64;
+    if i < v.len() {
+        let (o, n) = crate::format::scan_tz_suffix(&v[i..])?;
+        i += n;
+        off = o;
+    }
     if i != v.len() {
         return None;
     }
@@ -883,7 +901,7 @@ fn parse_ts(v: &[u8]) -> Option<i64> {
         .checked_mul(86_400)?
         .checked_add((h * 3600 + mi * 60 + s) as i64)?;
     // Even for negative times, `seconds * 1e6 + fraction` gets the direction right (-1 s + 999999 us = -1 us).
-    secs.checked_mul(1_000_000)?.checked_add(us)
+    secs.checked_mul(1_000_000)?.checked_add(us)?.checked_sub(off)
 }
 
 // --- Column buffers ------------------------------------------------------------
@@ -1225,8 +1243,9 @@ mod tests {
         assert_eq!(parse_f64(b"1.5"), Some(1.5));
         assert_eq!(parse_f64(b"-.5"), Some(-0.5));
         assert_eq!(parse_f64(b"1e3"), Some(1000.0));
-        assert_eq!(parse_f64(b"inf"), None);
-        assert_eq!(parse_f64(b"NaN"), None);
+        assert!(parse_f64(b"inf").is_some_and(|f| f.is_infinite() && f > 0.0));
+        assert!(parse_f64(b"NaN").is_some_and(|f| f.is_nan()));
+        assert!(parse_f64(b"-Infinity").is_some_and(|f| f.is_infinite() && f < 0.0));
         assert_eq!(parse_f64(b"1e"), None);
         assert_eq!(parse_f64(b"0x10"), None);
         // duckdb: datediff('day', DATE '1970-01-01', DATE '2024-01-01') = 19723
@@ -1242,7 +1261,10 @@ mod tests {
         // The 7th digit onward is truncated.
         assert_eq!(parse_ts(b"1970-01-01 00:00:00.1234567"), Some(123_456));
         assert_eq!(parse_ts(b"2024-01-01 24:00:00"), None);
-        assert_eq!(parse_ts(b"2024-01-01 00:00:00Z"), None);
+        assert_eq!(parse_ts(b"2024-01-01 00:00:00Z"), Some(1_704_067_200_000_000));
+        assert_eq!(parse_ts(b"2024-01-01 00:00:00+00"), Some(1_704_067_200_000_000));
+        // 09:00+09 is 00:00 UTC.
+        assert_eq!(parse_ts(b"2024-01-01 09:00:00+09:00"), Some(1_704_067_200_000_000));
     }
 
     // --- Quotes -------------------------------------------------------------

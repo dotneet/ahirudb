@@ -3,7 +3,7 @@
 A lightweight SQL engine, built to run in under 1 MiB of WASM, that queries
 Parquet directly.
 
-*Last revised against the implementation on 2026-08-12. Where this document
+*Last revised against the implementation on 2026-08-13. Where this document
 describes intent rather than a shipped fact, it says so explicitly.*
 
 ---
@@ -122,11 +122,11 @@ The design rests on three pillars:
 
 | Configuration | raw | gzip -9 | of 1 MiB budget |
 |---|---:|---:|---:|
-| Parquet only, ZSTD off | 465,463 B | 203,945 B | 44.4% |
-| + CSV | 488,981 B | 213,751 B | 46.6% |
-| + JSONL | 499,253 B | 217,521 B | 47.6% |
-| + CSV + JSONL (all read formats) | 507,742 B | 221,470 B | **48.4%** |
-| Parquet only, **default build** (ZSTD on) | 479,371 B | 209,353 B | 45.7% |
+| Parquet only, ZSTD off | 467,319 B | 204,626 B | 44.6% |
+| + CSV | 491,713 B | 214,882 B | 46.9% |
+| + JSONL | 501,478 B | 218,506 B | 47.8% |
+| + CSV + JSONL (all read formats) | 510,581 B | 222,953 B | **48.7%** |
+| Parquet only, **default build** (ZSTD on) | 481,241 B | 210,142 B | 45.9% |
 | `ahiru-zstd.wasm` standalone (opt-out fallback) | 12,668 B | 6,621 B | separate budget |
 
 The CI size gate (`size` job in `.github/workflows/ci.yml`) judges the
@@ -137,7 +137,7 @@ pass wouldn't actually protect anyone shipping the full feature set.
 what a read-only distribution actually ships; turning them on is a separate,
 deliberate size trade a consumer makes.
 
-At 48.4% of budget with the entire current SQL surface (§7) — aggregation,
+At 48.7% of budget with the entire current SQL surface (§7) — aggregation,
 joins, window functions, CTEs including `WITH RECURSIVE`, subqueries, JSON,
 regex, `PIVOT`/`UNPIVOT`, lambda expressions, DDL/DML, and more, all
 included — there is still comfortable headroom. The original per-subsystem
@@ -910,7 +910,7 @@ skeptical reader) — see §14.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Kernel explosion causing size overrun | Was high | §11's five tactics. Current measured size is 48.4% of budget with the full feature set (§3) — the risk materialized far less than originally feared, and this is no longer the primary size concern |
+| Kernel explosion causing size overrun | Was high | §11's five tactics. Current measured size is 48.7% of budget with the full feature set (§3) — the risk materialized far less than originally feared, and this is no longer the primary size concern |
 | ~~ZSTD essentially mandatory and awkward as a side load~~ | ~~Medium~~ | **Resolved (2026-08-11)**: ZSTD measured at ~13 KB (the original 1.1 MB estimate was a large overestimate), so it's now bundled by default via the `zstd` feature instead of shipped as a separate module (§6). Opting out falls back to the standalone `ahiru-zstd` module |
 | ~~Nested types (LIST/STRUCT) unsupported~~ | ~~Medium~~ | **Resolved**: `STRUCT` flattens to dotted columns; `LIST`/`MAP` (and `STRUCT` containing them) expose as `JSON`-typed columns (§5) |
 | Rust `no_std` constraint slows development | Medium | `ahiru-cli` (native) allows `std`, switched via `#[cfg]`; tests are written against the `std` build. In practice this was enough — no nightly toolchain was ever needed either (§4), which removed a second source of development friction this document originally anticipated |
@@ -1206,7 +1206,7 @@ answer themselves during implementation rather than needing an upfront
 decision:
 
 - ~~**Is 1 MiB raw or gzip?**~~ Resolved as raw, and met as raw (§3) — with
-  enough margin (48.4% of budget) that the question stopped being live.
+  enough margin (48.7% of budget) that the question stopped being live.
 - ~~**Is an Arrow JS dependency acceptable?**~~ Resolved by not needing the
   question: the result wire format ended up being a small bespoke format
   instead of Arrow IPC (§10), so Arrow JS was never pulled in at all.

@@ -838,3 +838,34 @@ fn cube_matches_its_explicit_grouping_sets_expansion() {
         ]
     );
 }
+
+#[test]
+fn distinct_does_not_keep_hidden_order_by_keys() {
+    let mut db = Session::new();
+    db.register_bytes_as("t", b"a,b\n1,10\n1,20\n2,5\n".to_vec(), FormatKind::Csv).unwrap();
+    let rows = run(&mut db, "SELECT DISTINCT a FROM t ORDER BY b");
+    assert_eq!(rows.len(), 2, "got {rows:?}");
+    // After sorting by b, first-row-wins DISTINCT keeps a=2 (b=5) then a=1 (b=10).
+    assert_eq!(rows[0][0], Value::I64(2));
+    assert_eq!(rows[1][0], Value::I64(1));
+}
+
+#[test]
+fn order_by_alias_after_star_uses_the_alias_column() {
+    let mut db = Session::new();
+    db.register_bytes_as("t", b"id,name,score\n1,b,10\n2,a,20\n".to_vec(), FormatKind::Csv)
+        .unwrap();
+    let rows = run(&mut db, "SELECT *, score * 2 AS extra FROM t ORDER BY extra");
+    assert_eq!(rows[0][0], Value::I64(1), "sorted by extra, not name: {rows:?}");
+    assert_eq!(rows[1][0], Value::I64(2));
+}
+
+#[test]
+fn date_plus_bigint_adds_days() {
+    let mut db = Session::new();
+    db.register_bytes_as("dual", b"x\n1\n".to_vec(), FormatKind::Csv).unwrap();
+    let rows = run(&mut db, "SELECT DATE '2024-01-01' + CAST(1 AS BIGINT) FROM dual");
+    assert_eq!(rows[0][0], Value::I32(19724));
+    let rows = run(&mut db, "SELECT DATE '2024-01-01' + NULL FROM dual");
+    assert_eq!(rows[0][0], Value::Null);
+}

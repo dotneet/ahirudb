@@ -44,6 +44,8 @@ use crate::vector::{Batch, Field, Value};
 pub enum ExportFormat {
     #[cfg(feature = "csv")]
     Csv,
+    #[cfg(feature = "csv")]
+    Tsv,
     #[cfg(feature = "jsonl")]
     Jsonl,
     #[cfg(feature = "export-parquet")]
@@ -154,6 +156,11 @@ pub(crate) fn copy(
             let mut sink = csv::CsvSink::new();
             export_query(session, arena, query, params, &mut sink)?
         }
+        #[cfg(feature = "csv")]
+        ExportFormat::Tsv => {
+            let mut sink = csv::CsvSink::with_delimiter(b'\t');
+            export_query(session, arena, query, params, &mut sink)?
+        }
         #[cfg(feature = "jsonl")]
         ExportFormat::Jsonl => {
             let mut sink = jsonl::JsonlSink::new();
@@ -180,9 +187,9 @@ fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
         // this is the appropriate mapping.
         None => match crate::format::FormatKind::detect(path) {
             #[cfg(feature = "csv")]
-            crate::format::FormatKind::Csv | crate::format::FormatKind::Tsv => {
-                Ok(ExportFormat::Csv)
-            }
+            crate::format::FormatKind::Csv => Ok(ExportFormat::Csv),
+            #[cfg(feature = "csv")]
+            crate::format::FormatKind::Tsv => Ok(ExportFormat::Tsv),
             #[cfg(feature = "jsonl")]
             crate::format::FormatKind::Jsonl | crate::format::FormatKind::Json => {
                 Ok(ExportFormat::Jsonl)
@@ -203,6 +210,10 @@ fn format_by_name(name: &str) -> Result<ExportFormat> {
     #[cfg(feature = "csv")]
     if eq_ascii_ci(name.as_bytes(), b"csv") {
         return Ok(ExportFormat::Csv);
+    }
+    #[cfg(feature = "csv")]
+    if eq_ascii_ci(name.as_bytes(), b"tsv") || eq_ascii_ci(name.as_bytes(), b"tab") {
+        return Ok(ExportFormat::Tsv);
     }
     #[cfg(feature = "jsonl")]
     if eq_ascii_ci(name.as_bytes(), b"jsonl") || eq_ascii_ci(name.as_bytes(), b"json") {

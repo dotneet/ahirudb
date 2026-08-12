@@ -442,6 +442,17 @@ fn greatest_least_skip_nulls() {
     assert_eq!(int_at(&run("greatest", &[&n(), &n()]).unwrap(), 0), None);
     assert_eq!(int_at(&run("least", &[&k(5), &n()]).unwrap(), 0), Some(5));
     assert_eq!(int_at(&run("greatest", &[&n(), &k(7)]).unwrap(), 0), Some(7));
+    // NaN is greater than every finite value (same total order as MIN/MAX / DuckDB).
+    let nan = vf(&[Some(f64::NAN)]);
+    let one = vf(&[Some(1.0)]);
+    let g1 = run("greatest", &[&one, &nan]).unwrap();
+    let g2 = run("greatest", &[&nan, &one]).unwrap();
+    assert!(g1.f64s()[0].is_nan(), "greatest(1, nan)");
+    assert!(g2.f64s()[0].is_nan(), "greatest(nan, 1)");
+    let l1 = run("least", &[&one, &nan]).unwrap();
+    let l2 = run("least", &[&nan, &one]).unwrap();
+    assert_eq!(l1.f64s()[0], 1.0);
+    assert_eq!(l2.f64s()[0], 1.0);
     // duckdb: greatest('a','b') = 'b'
     let g = run("greatest", &[&vs(&[Some("a")]), &vs(&[Some("b")])]).unwrap();
     assert_eq!(str_at(&g, 0).as_deref(), Some("b"));
@@ -637,6 +648,9 @@ fn parse_rejects_bad_input() {
     assert_eq!(parse_time(b"01:02"), Some(3_720_000_000));
     assert_eq!(parse_time(b"01:02:03.5"), Some(3_723_500_000));
     assert_eq!(parse_time(b"1:2:3"), Some(3_723_000_000));
+    assert_eq!(parse_time(b"24:00:00"), Some(86_400_000_000));
+    assert_eq!(parse_time(b"24:01:00"), None);
+    assert_eq!(parse_time(b"24:00:00.000001"), None);
     assert_eq!(parse_time(b"xx"), None);
     let mut o = Vec::new();
     fmt_time(3_723_500_000, &mut o);

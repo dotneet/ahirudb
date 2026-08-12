@@ -339,7 +339,8 @@ fn read_data_page_v2(
     let page_validity = if desc.max_def_level > 0 {
         ensure!(def_len > 0, BadPageHeader);
         let mut bm = Bitmap::with_capacity(n);
-        let mut d = RleDecoder::new(&raw[..def_len], 1);
+        let bw = encoding::bit_width(desc.max_def_level as u32);
+        let mut d = RleDecoder::new(&raw[..def_len], bw);
         d.read_levels_into(n, desc.max_def_level as u32, &mut bm)?;
         Some(bm)
     } else {

@@ -51,7 +51,24 @@ pub fn bind_query(
     q: &QueryStmt,
     params: &[Value],
 ) -> Result<Plan> {
+    bind_query_at(catalog, arena, q, params, 0)
+}
+
+/// Like [`bind_query`], but substitutes `now()` / `CURRENT_DATE` inside view
+/// bodies using `now_micros` (the same value `Session::set_now` recorded).
+pub(crate) fn bind_query_at(
+    catalog: &Catalog,
+    arena: &ExprArena,
+    q: &QueryStmt,
+    params: &[Value],
+    now_micros: i64,
+) -> Result<Plan> {
     let mut ctes = CteScope::default();
+    #[cfg(feature = "ddl")]
+    {
+        ctes.now_micros = now_micros;
+    }
+    let _ = now_micros;
     for c in &q.ctes {
         // A CTE may reference CTEs too (only ones defined earlier). CTE definitions are
         // always uncorrelated (they have no outer scope).

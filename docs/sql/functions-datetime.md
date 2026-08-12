@@ -27,6 +27,10 @@ query as a constant *before* binding — so `CURRENT_TIMESTAMP` evaluates
 SELECT id, CURRENT_TIMESTAMP FROM t ORDER BY id;   -- same timestamp on every row
 ```
 
+A view that contains `now()` / `CURRENT_DATE` is rewritten at **query** time
+(not at `CREATE VIEW`), so each `SELECT` from the view sees that query's
+start time.
+
 Because of this substitution, `CURRENT_DATE`/`current_time` are recognized
 only in their bare keyword form and take precedence over a same-named
 column (`SELECT current_date FROM t` returns the constant, not a `t.

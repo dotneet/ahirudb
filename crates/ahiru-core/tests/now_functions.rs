@@ -76,6 +76,29 @@ fn typed_literals_can_be_used_in_expressions() {
     assert_eq!(rows[0][0], Value::I32(TODAY_DAYS + 1));
 }
 
+#[cfg(feature = "ddl")]
+#[test]
+fn view_body_sees_now_at_query_time() {
+    let mut s = session_with_dual();
+    s.prepare("CREATE VIEW v AS SELECT now() AS ts, CURRENT_DATE AS d FROM dual", &[]).unwrap();
+    let rows = run(&mut s, "SELECT ts, d FROM v");
+    assert_eq!(rows[0][0], Value::I64(NOW));
+    assert_eq!(rows[0][1], Value::I32(TODAY_DAYS));
+    let mut q = match s.prepare("DESCRIBE v", &[]).unwrap() {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("describe view"),
+    };
+    let mut n = 0usize;
+    loop {
+        match s.step(&mut q).unwrap() {
+            QueryStep::Batch(b) => n += b.num_rows(),
+            QueryStep::Done => break,
+            _ => panic!("suspend"),
+        }
+    }
+    assert_eq!(n, 2);
+}
+
 #[test]
 fn unset_now_defaults_to_the_unix_epoch() {
     // If `set_now` is never called, it defaults to the epoch (1970-01-01)

@@ -279,6 +279,20 @@ fn list_reduce_null_element_poisons_the_result() {
 }
 
 #[test]
+fn list_reduce_coalesce_recovers_from_a_null_accumulator() {
+    let mut sess = session_with_basic();
+    // duckdb: list_reduce([NULL, 1, 2], (acc, x) -> coalesce(acc, x)) -> 1
+    assert_eq!(
+        one(&mut sess, "list_reduce(json_array(NULL, 1, 2), (acc, x) -> coalesce(acc, x))"),
+        s("1")
+    );
+    assert_eq!(
+        one(&mut sess, "list_reduce(json_array(1, 2), (acc, x) -> coalesce(acc, x), NULL)"),
+        s("1")
+    );
+}
+
+#[test]
 fn list_reduce_empty_without_initial_is_null_unlike_duckdb() {
     let mut sess = session_with_basic();
     // duckdb: list_reduce([]::INTEGER[], (acc, x) -> acc + x) is an error

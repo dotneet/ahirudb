@@ -321,6 +321,14 @@ impl Catalog {
     /// as given and needs no knowledge that `format::partitioned` exists.
     pub fn register_multi(&mut self, name: &str, parts: Vec<TablePart>) -> Result<usize> {
         ensure!(!parts.is_empty(), Internal);
+        // A file table must not silently shadow an in-memory table or view of
+        // the same name (`CREATE TABLE t` then `register("t", …)` used to make
+        // `SELECT` read the file and `INSERT` write the mem table).
+        #[cfg(feature = "ddl")]
+        {
+            ensure!(self.mem_index_of(name).is_none(), DuplicateTable);
+            ensure!(self.view_index_of(name).is_none(), DuplicateTable);
+        }
         let t = Table { name: name.into(), parts, schema: None };
         Ok(match self.index_of(name) {
             Some(i) => {
@@ -387,11 +395,20 @@ impl Catalog {
         self.index_of(name).is_some() || self.view_index_of(name).is_some()
     }
 
+    /// Case-insensitive uniqueness of schema column names.
+    #[cfg(feature = "ddl")]
+    fn unique_field_names(schema: &[Field]) -> bool {
+        schema.iter().enumerate().all(|(i, f)| {
+            schema[..i].iter().all(|g| !eq_ascii_ci(g.name.as_bytes(), f.name.as_bytes()))
+        })
+    }
+
     /// `CREATE TABLE t (...)` / `CREATE TABLE t AS SELECT ...`.
     /// With `replace`, an existing in-memory table of the same name is silently replaced.
     #[cfg(feature = "ddl")]
     pub fn mem_create(&mut self, name: &str, schema: Vec<Field>, replace: bool) -> Result<usize> {
         ensure!(!self.name_taken_by_other(name), DuplicateTable);
+        ensure!(Self::unique_field_names(&schema), DuplicateColumn);
         match self.mem_index_of(name) {
             Some(i) => {
                 ensure!(replace, DuplicateTable);
