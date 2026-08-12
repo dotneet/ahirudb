@@ -272,7 +272,7 @@ fn push_view_rel(
     alias: String,
     params: &[Value],
     rels: &mut Vec<Rel>,
-    ctes: &mut CteScope,
+    ctes: &CteScope,
 ) -> Result<FromTree> {
     ensure!(ctes.view_depth < MAX_VIEW_DEPTH, ExpressionTooDeep);
     let sql = match catalog.view_get(i) {
@@ -280,17 +280,20 @@ fn push_view_rel(
         None => err!(TableNotFound),
     };
     let parsed = crate::sql::parse(&sql)?;
+    // Views are stored queries, not prepared statements. A `?` in the body would be
+    // re-numbered from zero on this separate parse and steal the outer query's
+    // parameters, so it is rejected rather than silently binding the wrong values.
+    ensure!(parsed.num_params == 0, UnsupportedFeature);
     let q = match parsed.stmt {
         Stmt::Select(q) => q,
         _ => err!(Internal),
     };
-    ctes.view_depth += 1;
-    // Reusing `ctes` follows the same style as existing derived tables (see `FromItem::Subquery`).
-    // An outer CTE name could coincidentally become visible from a view body, but a real use
-    // where a view collides with a CTE name is unlikely, so this is accepted.
-    let plan = bind_query_in(catalog, &parsed.arena, &q, params, ctes, None);
-    ctes.view_depth -= 1;
-    let plan = plan?;
+    // A view is bound in its own CTE scope so an outer `WITH t AS (...)` cannot
+    // shadow the view's base table `t`. `view_depth` is copied so nested view
+    // references still share the expansion-depth cap.
+    let mut view_ctes = CteScope::default();
+    view_ctes.view_depth = ctes.view_depth + 1;
+    let plan = bind_query_in(catalog, &parsed.arena, &q, params, &mut view_ctes, None)?;
     let all = plan.root.schema().to_vec();
     rels.push(Rel {
         table: None,
@@ -667,13 +670,25 @@ fn referenced_tables_at(
         }
     };
     match from {
-        FromItem::Table { name, .. } => match catalog.index_of(name) {
-            Some(i) => {
+        FromItem::Table { name, .. } => {
+            if let Some(i) = catalog.index_of(name) {
                 push(i);
-                Ok(())
+                return Ok(());
             }
-            None => err!(TableNotFound),
-        },
+            // In-memory tables need no byte-range resolution. Views do: the file
+            // tables they select from must be collected or `push_table_rel` hits
+            // Internal on an unresolved schema.
+            #[cfg(feature = "ddl")]
+            {
+                if catalog.mem_index_of(name).is_some() {
+                    return Ok(());
+                }
+                if let Some(i) = catalog.view_index_of(name) {
+                    return referenced_in_view(catalog, i, out, depth);
+                }
+            }
+            err!(TableNotFound)
+        }
         FromItem::File { path, .. } => match catalog.index_of(path) {
             Some(i) => {
                 push(i);
@@ -702,4 +717,21 @@ fn referenced_tables_at(
         // A compute-only source that bypasses the catalog, so there is no table to resolve.
         FromItem::GenerateSeries { .. } => Ok(()),
     }
+}
+
+/// Walks a `CREATE VIEW` body so schema resolution sees the file tables it
+/// selects from. Without this, `SELECT * FROM v` never calls `Table::resolve`
+/// on those tables and binding fails with `Internal`.
+#[cfg(feature = "ddl")]
+fn referenced_in_view(catalog: &Catalog, i: usize, out: &mut Vec<usize>, depth: u32) -> Result<()> {
+    ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    let parsed = crate::sql::parse(match catalog.view_get(i) {
+        Some(s) => s,
+        None => err!(TableNotFound),
+    })?;
+    let q = match &parsed.stmt {
+        Stmt::Select(q) => q,
+        _ => err!(Internal),
+    };
+    referenced_in_query(catalog, &parsed.arena, q, out, depth + 1)
 }

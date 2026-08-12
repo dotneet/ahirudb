@@ -316,6 +316,61 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "csv")]
+    #[test]
+    fn view_over_unresolved_file_table_is_queryable() {
+        let mut s = Session::new();
+        s.register_bytes_as("src", b"id\n1\n2\n".to_vec(), crate::format::FormatKind::Csv).unwrap();
+        s.prepare("CREATE VIEW v AS SELECT id FROM src", &[]).unwrap();
+        assert_eq!(
+            ready_rows(&mut s, "SELECT id FROM v ORDER BY id"),
+            vec![vec![Value::I64(1)], vec![Value::I64(2)]]
+        );
+    }
+
+    #[test]
+    fn view_does_not_see_an_outer_cte_of_the_same_name_as_its_base_table() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+        #[cfg(feature = "dml")]
+        {
+            s.prepare("INSERT INTO t VALUES (1), (2)", &[]).unwrap();
+        }
+        s.prepare("CREATE VIEW v AS SELECT id FROM t", &[]).unwrap();
+        let rows = ready_rows(&mut s, "WITH t AS (SELECT 99 AS id FROM range(1)) SELECT * FROM v");
+        #[cfg(feature = "dml")]
+        {
+            assert_eq!(rows, vec![vec![Value::I32(1)], vec![Value::I32(2)]]);
+        }
+        #[cfg(not(feature = "dml"))]
+        {
+            assert!(rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn describe_works_on_mem_tables_and_views() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (id INTEGER, name VARCHAR)", &[]).unwrap();
+        let rows = ready_rows(&mut s, "DESCRIBE t");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Bytes(b"id".to_vec()));
+        s.prepare("CREATE VIEW v AS SELECT id FROM t", &[]).unwrap();
+        let rows = ready_rows(&mut s, "DESCRIBE v");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Bytes(b"id".to_vec()));
+    }
+
+    #[test]
+    fn create_view_with_a_placeholder_is_rejected() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+        assert_eq!(
+            crate::error::code_of(s.prepare("CREATE VIEW v AS SELECT * FROM t WHERE id = ?", &[])),
+            Some(Code::UnsupportedFeature)
+        );
+    }
+
     #[test]
     fn duplicate_create_table_is_rejected() {
         let mut s = Session::new();

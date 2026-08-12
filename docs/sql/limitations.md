@@ -251,14 +251,14 @@ that scenario — the session itself doesn't survive it either.
   (the common case for large files) are unaffected and still split normally
   (8 MiB chunks by default).
 
-  This has one narrow, known residual gap: if a file's first 256 KiB
-  contains **no** `"` at all, but a quoted field appears only later, a
-  newline embedded in that later quoted field can still be
-  mis-resynchronized if it happens to land exactly on a later split
-  boundary. In practice this needs a file that is both large enough to
-  split (past 8 MiB) and quote-free for its entire first 256 KiB before
-  quoting begins — files that quote consistently from early on, or don't
-  quote at all, are not affected.
+  This has one remaining remote-only case: if a file's first 256 KiB contains
+  **no** `"` at all, but a quoted field appears only later, and the file is
+  not fully resident at resolve time (HTTP Range / a custom `ByteSource`),
+  a later split that contains a `"` is rejected with `unsupported SQL
+  feature` rather than being parsed as unquoted CSV. In-memory files (the
+  CLI, `register` of a buffer) scan the whole file at resolve time, so a
+  late quote still forces a single split and is read correctly. Files that
+  quote consistently from early on, or don't quote at all, are unaffected.
 - **Low-selectivity `IN`-list pruning**: predicate pushdown for `WHERE x IN
   (...)` skips whole RowGroups/pages when the candidate values cluster
   together. If a list's values are scattered widely enough that nearly

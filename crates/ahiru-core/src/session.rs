@@ -7,9 +7,7 @@ use crate::catalog::{Catalog, Source, TablePart};
 use crate::exec::{build, CodecRequest, ExecContext, IoRequest, Operator, Step, Values};
 use crate::expr::vm::Vm;
 use crate::format::{partitioned::PartitionedFormat, FormatKind, TableFormat};
-use crate::plan::bind::{
-    bind_query, desugar_pivot, desugar_unpivot, referenced_in_query, resolve_from,
-};
+use crate::plan::bind::{bind_query, desugar_pivot, desugar_unpivot, referenced_in_query};
 use crate::prelude::*;
 use crate::sql::ast::{FromItem, Stmt};
 use crate::sql::parse;
@@ -423,7 +421,44 @@ impl Session {
         &mut self,
         from: &FromItem,
     ) -> Result<core::result::Result<Vec<Field>, Vec<IoRequest>>> {
-        let table = resolve_from(&self.catalog, from)?;
+        match from {
+            FromItem::Table { name, .. } => {
+                if let Some(i) = self.catalog.index_of(name) {
+                    return self.describe_file_table(i);
+                }
+                #[cfg(feature = "ddl")]
+                {
+                    if let Some(i) = self.catalog.mem_index_of(name) {
+                        let schema = match self.catalog.mem_get(i) {
+                            Some(t) => t.schema.clone(),
+                            None => err!(TableNotFound),
+                        };
+                        return Ok(Ok(schema));
+                    }
+                    if let Some(i) = self.catalog.view_index_of(name) {
+                        return self.describe_view(i);
+                    }
+                }
+                err!(TableNotFound)
+            }
+            FromItem::File { path, .. } => {
+                let i = match self.catalog.index_of(path) {
+                    Some(i) => i,
+                    None => err!(TableNotFound),
+                };
+                self.describe_file_table(i)
+            }
+            FromItem::Join { .. }
+            | FromItem::Subquery { .. }
+            | FromItem::Unnest { .. }
+            | FromItem::GenerateSeries { .. } => err!(UnsupportedFeature),
+        }
+    }
+
+    fn describe_file_table(
+        &mut self,
+        table: usize,
+    ) -> Result<core::result::Result<Vec<Field>, Vec<IoRequest>>> {
         let t = match self.catalog.get_mut(table) {
             Some(t) => t,
             None => err!(TableNotFound),
@@ -436,6 +471,27 @@ impl Session {
             return Ok(Err(io));
         }
         Ok(Ok(t.schema().to_vec()))
+    }
+
+    #[cfg(feature = "ddl")]
+    fn describe_view(
+        &mut self,
+        i: usize,
+    ) -> Result<core::result::Result<Vec<Field>, Vec<IoRequest>>> {
+        let sql = match self.catalog.view_get(i) {
+            Some(s) => s.to_owned(),
+            None => err!(TableNotFound),
+        };
+        let parsed = parse(&sql)?;
+        let q = match &parsed.stmt {
+            Stmt::Select(q) => q,
+            _ => err!(Internal),
+        };
+        if let Some(io) = self.resolve_query(&parsed.arena, q)? {
+            return Ok(Err(io));
+        }
+        let plan = bind_query(&self.catalog, &parsed.arena, q, &[])?;
+        Ok(Ok(plan.root.schema().to_vec()))
     }
 }
 

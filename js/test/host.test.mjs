@@ -651,6 +651,50 @@ test('a 206 response whose Content-Range does not cover the requested window is 
   }
 });
 
+test('a 206 response with no Content-Range is rejected when the offset is not zero', async () => {
+  const file = new Uint8Array(await readFile(WIDE));
+  const url = 'https://example.invalid/no-cr.parquet';
+  const fetchImpl = async (_target, init = {}) => {
+    const method = init.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, { headers: { 'content-length': String(file.length) } });
+    }
+    const raw = new Headers(init.headers ?? {}).get('range') ?? '';
+    const m = /bytes=(\d+)-(\d+)/.exec(raw);
+    const start = Number(m[1]);
+    const len = Number(m[2]) - start + 1;
+    // Ignores Range: always the first `len` bytes, 206, no Content-Range.
+    return new Response(file.subarray(0, len), { status: 206 });
+  };
+  const db = await openDb({ fetch: fetchImpl });
+  try {
+    db.registerParquet('t', url);
+    await assert.rejects(
+      () => db.query('SELECT id FROM t LIMIT 1'),
+      (e) => e instanceof AhiruError && e.code === Code.IO_FAILED,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('a ByteSource that returns a short read fails instead of spinning', async () => {
+  const db = await openDb();
+  try {
+    db.registerParquet('t', {
+      key: 'short-read',
+      size: 1_000_000,
+      read: (_offset, len) => new Uint8Array(Math.min(len, 100)),
+    });
+    await assert.rejects(
+      withTimeout(db.query('SELECT id FROM t LIMIT 1'), 5000, 'short read hung'),
+      (e) => e instanceof AhiruError && e.code === Code.IO_FAILED,
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test('decodeIoRequests rejects an offset beyond Number.MAX_SAFE_INTEGER instead of truncating it', () => {
   const buf = new Uint8Array(4 + 24);
   const dv = new DataView(buf.buffer);

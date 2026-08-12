@@ -94,7 +94,12 @@ impl<'a> Parser<'a> {
         let name = self.ident()?;
         self.expect_kw(Kw::As)?;
         let start = self.pos;
+        let params_before = self.num_params;
         self.query_stmt()?;
+        // A view is a stored query, not a prepared statement. Placeholders in the
+        // body would be re-parsed from `Param(0)` on every reference and collide
+        // with the outer query's `?` list.
+        ensure!(self.num_params == params_before, UnsupportedFeature, start);
         let end = self.pos;
         let query_sql = sql[start..end].trim().to_owned();
         Ok(Stmt::CreateView { name, or_replace, query_sql })

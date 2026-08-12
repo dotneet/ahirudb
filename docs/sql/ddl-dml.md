@@ -125,7 +125,11 @@ A view's query text is stored as-is and re-parsed/re-bound on every
 reference (rather than a precompiled plan), so it always reflects the
 current definition and current state of whatever it selects from,
 including another view — recursive view references are rejected past a
-fixed depth limit.
+fixed depth limit. The view body is bound in its own scope: an outer
+`WITH` CTE cannot shadow the view's base tables, and `?` placeholders
+are not allowed in a view definition (a view is a stored query, not a
+prepared statement). `DESCRIBE` works on views and on in-memory
+`CREATE TABLE` tables as well as file-backed tables.
 
 ## COPY ... TO (export)
 

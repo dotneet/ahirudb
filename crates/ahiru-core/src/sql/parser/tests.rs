@@ -2020,6 +2020,15 @@ fn create_view_captures_body_as_raw_sql() {
 
 #[cfg(feature = "ddl")]
 #[test]
+fn create_view_rejects_placeholders() {
+    assert_eq!(
+        code("CREATE VIEW v AS SELECT * FROM t WHERE id = ?"),
+        Code::UnsupportedFeature as u16
+    );
+}
+
+#[cfg(feature = "ddl")]
+#[test]
 fn drop_table_and_view_parse() {
     let p = parse("DROP TABLE IF EXISTS t").expect("parse");
     match p.stmt {

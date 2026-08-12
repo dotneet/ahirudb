@@ -142,10 +142,11 @@ impl Shell {
         let sql = rewritten.as_deref().unwrap_or(trimmed);
         // `SELECT 1 + 1` with no `FROM` is the most common thing anyone types
         // at a SQL prompt, and this engine requires a `FROM` on every `SELECT`
-        // (docs/sql/queries.md). Supply the one-row table it wants.
+        // (docs/sql/queries.md). Supply the one-row table it wants. `LIMIT` /
+        // `OFFSET` / `ORDER BY` still need the dummy FROM *before* those clauses.
         let dummied;
-        let sql = if needs_dummy_from(sql) {
-            dummied = format!("{sql} FROM range(1)");
+        let sql = if let Some(rewritten) = dummy_from(sql) {
+            dummied = rewritten;
             dummied.as_str()
         } else {
             sql
@@ -726,25 +727,21 @@ fn split_script(text: &str) -> Vec<Piece> {
     out
 }
 
-/// True for a `SELECT` that needs a `FROM range(1)` appended.
+/// True for a `SELECT` that needs a `FROM range(1)` inserted.
 ///
 /// This engine requires a `FROM` clause on every `SELECT`
 /// (docs/sql/queries.md), which a shell user does not expect when typing
-/// `SELECT 1 + 1`. The rewrite is deliberately conservative: it only fires for
-/// a statement that starts with `SELECT` and whose top level (outside string
-/// literals, quoted identifiers, comments and parentheses) contains no clause
-/// keyword at all — so there is nowhere else the `FROM` could have to go, and
-/// appending it at the end is unambiguous. Anything with a set operation or a
-/// trailing clause is left alone.
+/// `SELECT 1 + 1`. The rewrite fires for a statement that starts with `SELECT`
+/// and whose top level (outside string literals, quoted identifiers, comments
+/// and parentheses) has no `FROM` and no set-operation / grouping / filter
+/// keyword. Trailing `ORDER BY` / `LIMIT` / `OFFSET` are allowed:
+/// `dummy_from` inserts `FROM range(1)` immediately before them.
 fn needs_dummy_from(sql: &str) -> bool {
     const BLOCKERS: &[&str] = &[
         "FROM",
         "UNION",
         "INTERSECT",
         "EXCEPT",
-        "ORDER",
-        "LIMIT",
-        "OFFSET",
         "GROUP",
         "WHERE",
         "HAVING",
@@ -754,39 +751,55 @@ fn needs_dummy_from(sql: &str) -> bool {
     ];
     let words = top_level_words(sql);
     match words.first() {
-        Some(w) if w == "SELECT" => {}
+        Some((_, w)) if w == "SELECT" => {}
         _ => return false,
     }
-    !words.iter().any(|w| BLOCKERS.contains(&w.as_str()))
+    !words.iter().any(|(_, w)| BLOCKERS.contains(&w.as_str()))
+}
+
+/// Rewrites a clauseless `SELECT` so the engine's required `FROM` is present.
+/// `ORDER BY` / `LIMIT` / `OFFSET` stay after the inserted `FROM range(1)`.
+fn dummy_from(sql: &str) -> Option<String> {
+    if !needs_dummy_from(sql) {
+        return None;
+    }
+    const TAIL: &[&str] = &["ORDER", "LIMIT", "OFFSET"];
+    let insert_at = top_level_words(sql)
+        .into_iter()
+        .find_map(|(start, w)| TAIL.contains(&w.as_str()).then_some(start));
+    Some(match insert_at {
+        Some(i) => format!("{} FROM range(1) {}", sql[..i].trim_end(), &sql[i..]),
+        None => format!("{sql} FROM range(1)"),
+    })
 }
 
 /// Upper-cased bare words of `sql` that sit at parenthesis depth 0, outside
 /// string literals, quoted identifiers and comments.
-fn top_level_words(sql: &str) -> Vec<String> {
-    let cs: Vec<char> = sql.chars().collect();
+fn top_level_words(sql: &str) -> Vec<(usize, String)> {
+    let cs: Vec<(usize, char)> = sql.char_indices().collect();
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut i = 0;
     while i < cs.len() {
-        match cs[i] {
-            '-' if cs.get(i + 1) == Some(&'-') => {
-                while i < cs.len() && cs[i] != '\n' {
+        match cs[i].1 {
+            '-' if cs.get(i + 1).map(|c| c.1) == Some('-') => {
+                while i < cs.len() && cs[i].1 != '\n' {
                     i += 1;
                 }
             }
-            '/' if cs.get(i + 1) == Some(&'*') => {
+            '/' if cs.get(i + 1).map(|c| c.1) == Some('*') => {
                 i += 2;
-                while i < cs.len() && !(cs[i] == '*' && cs.get(i + 1) == Some(&'/')) {
+                while i < cs.len() && !(cs[i].1 == '*' && cs.get(i + 1).map(|c| c.1) == Some('/')) {
                     i += 1;
                 }
                 i += 2;
             }
             '\'' | '"' => {
-                let q = cs[i];
+                let q = cs[i].1;
                 i += 1;
                 while i < cs.len() {
-                    if cs[i] == q {
-                        if cs.get(i + 1) == Some(&q) {
+                    if cs[i].1 == q {
+                        if cs.get(i + 1).map(|c| c.1) == Some(q) {
                             i += 2;
                             continue;
                         }
@@ -805,12 +818,14 @@ fn top_level_words(sql: &str) -> Vec<String> {
                 i += 1;
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
-                let start = i;
-                while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                let start_byte = cs[i].0;
+                i += 1;
+                while i < cs.len() && (cs[i].1.is_ascii_alphanumeric() || cs[i].1 == '_') {
                     i += 1;
                 }
                 if depth == 0 {
-                    out.push(cs[start..i].iter().collect::<String>().to_ascii_uppercase());
+                    let end_byte = if i < cs.len() { cs[i].0 } else { sql.len() };
+                    out.push((start_byte, sql[start_byte..end_byte].to_ascii_uppercase()));
                 }
             }
             _ => i += 1,
@@ -1003,10 +1018,21 @@ mod tests {
         assert!(needs_dummy_from("SELECT (SELECT max(x) FROM t)"));
         assert!(!needs_dummy_from("SELECT * FROM t"));
         assert!(!needs_dummy_from("SELECT 1 UNION SELECT 2"));
-        assert!(!needs_dummy_from("SELECT 1 AS x ORDER BY x"));
         assert!(!needs_dummy_from("DESCRIBE t"));
         // A `from` inside a literal is not a clause keyword.
         assert!(needs_dummy_from("SELECT 'from'"));
+        // Trailing LIMIT/ORDER still need the dummy FROM, inserted before them.
+        assert!(needs_dummy_from("SELECT 1 LIMIT 5"));
+        assert!(needs_dummy_from("SELECT 1 AS x ORDER BY x"));
+        assert_eq!(
+            dummy_from("SELECT 1 LIMIT 5").as_deref(),
+            Some("SELECT 1 FROM range(1) LIMIT 5")
+        );
+        assert_eq!(
+            dummy_from("SELECT 1 AS x ORDER BY x").as_deref(),
+            Some("SELECT 1 AS x FROM range(1) ORDER BY x")
+        );
+        assert_eq!(dummy_from("SELECT 1 + 1").as_deref(), Some("SELECT 1 + 1 FROM range(1)"));
     }
 
     #[test]

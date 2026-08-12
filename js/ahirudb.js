@@ -364,14 +364,17 @@ function urlSource(url, fetchImpl) {
         const cr = r.headers?.get('content-range');
         const m = cr && /^bytes\s+(\d+)-(\d+)\/(?:\d+|\*)\s*$/i.exec(cr);
         if (!m) {
-          // No Content-Range to check the body against. A body of exactly the
-          // requested length is presumably correct; anything else cannot be
-          // trusted, so fail loudly rather than risk misaligned bytes.
-          if (buf.byteLength === len) return buf;
+          // No Content-Range. A body of the requested length starting at offset 0
+          // is the only case we can trust without a range header (the request was
+          // for the prefix). Anything else — including a prefix-sized body for a
+          // non-zero offset — would silently feed the wrong bytes to wasm.
+          if (offset === 0 && buf.byteLength === len) return buf;
           throw new AhiruError(Code.IO_FAILED, {
             detail:
-              `${redactUrl(url)}: 206 response has no Content-Range and an unexpected ` +
-              `body length (${buf.byteLength} vs the ${len} requested)`,
+              `${redactUrl(url)}: 206 response has no Content-Range` +
+              (offset === 0
+                ? ` and an unexpected body length (${buf.byteLength} vs the ${len} requested)`
+                : ` (cannot verify that the body is offset ${offset})`),
           });
         }
         const start = Number(m[1]);
@@ -390,8 +393,17 @@ function urlSource(url, fetchImpl) {
         });
       }
       // Some servers ignore Range and return 200 with the whole thing. Slice out the requested window.
-      if (buf.byteLength > len) return buf.subarray(offset, offset + len);
-      return buf;
+      if (buf.byteLength >= offset + len) return buf.subarray(offset, offset + len);
+      if (buf.byteLength === len && offset === 0) return buf;
+      // 200 with a body of exactly the requested length at a non-zero offset: treat
+      // it as a range body (the server honoured Range but answered 200). A short
+      // body cannot be the requested window.
+      if (buf.byteLength === len) return buf;
+      throw new AhiruError(Code.IO_FAILED, {
+        detail:
+          `${redactUrl(url)}: 200 response length ${buf.byteLength} does not cover ` +
+          `the requested [${offset}, ${offset + len})`,
+      });
     },
   };
 }
@@ -1238,7 +1250,7 @@ export class AhiruDB {
     const everFetched = rec.fetched.some(
       (r) => r.offset <= offset && offset + len <= r.offset + r.len,
     );
-    if (everFetched) return this.#read(rec, offset, len);
+    if (everFetched) return this.#read(rec, offset, len, sql);
     throw new AhiruError(Code.INTERNAL, {
       sql,
       detail:
@@ -1280,7 +1292,7 @@ export class AhiruDB {
     }
 
     // Coalesced ranges are fetched in parallel, to avoid stacking round trips.
-    const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.offset, j.len)));
+    const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.offset, j.len, sql)));
 
     let provided = 0;
     for (let i = 0; i < jobs.length; i++) {
@@ -1317,7 +1329,7 @@ export class AhiruDB {
   }
 
   /** Reads a byte range through the cache. */
-  async #read(rec, offset, len) {
+  async #read(rec, offset, len, sql) {
     const key = `${rec.source.key}:${offset}:${len}`;
     const cacheable = rec.source.cacheable !== false;
     if (cacheable) {
@@ -1330,10 +1342,18 @@ export class AhiruDB {
     // owns; copy it before this host retains it anywhere. Bytes this host produced
     // itself (fetch / Blob) are already privately owned, so they are not copied again.
     if (rec.source.untrusted) u8 = u8.slice();
-    // A short/partial read must never be cached under the full requested-length
-    // key: a later request for the same [offset, len) would then keep replaying
-    // the truncated body forever instead of refetching.
-    if (cacheable && u8.byteLength === len) this.#cache.set(key, u8);
+    // A short or over-long read must never be handed to wasm: Source::insert keeps
+    // the first prefix of overlapping ranges, so a truncated body at `offset` would
+    // poison a later full read of the same window, and a non-empty short read also
+    // defeats livelock detection (which only trips on zero bytes provided).
+    // A zero-length body is left to that livelock path.
+    if (u8.byteLength !== 0 && u8.byteLength !== len) {
+      throw new AhiruError(Code.IO_FAILED, {
+        sql,
+        detail: `short read at ${offset}: got ${u8.byteLength} bytes, wanted ${len}`,
+      });
+    }
+    if (cacheable) this.#cache.set(key, u8);
     return u8;
   }
 

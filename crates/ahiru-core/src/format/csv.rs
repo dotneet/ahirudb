@@ -13,10 +13,12 @@
 //! Splitting a file that uses RFC 4180 quoting is unsafe in general: an embedded `\n` inside a
 //! quoted field is not a record boundary, but a fixed-size split cut has no way to know, from its
 //! own bytes alone, whether the byte right at its boundary sits inside an open quote (the field
-//! carrying it can start arbitrarily far back). So `resolve` checks the leading sample for a `"`
-//! byte and, if found, forces the whole file to be read as a single split (`quoted_sample` on
-//! `CsvFormat`) rather than risk mis-resynchronizing and emitting a phantom row. See
-//! `docs/sql/limitations.md` for the resulting (narrow) residual gap.
+//! carrying it can start arbitrarily far back). So `resolve` checks for a `"` byte — in the
+//! leading sample, and in the rest of the file when it is already resident — and, if found,
+//! forces the whole file to be read as a single split (`quoted_sample` on `CsvFormat`) rather
+//! than risk mis-resynchronizing and emitting a phantom row. A remote file whose first sample
+//! has no `"` but a later split does is rejected with `UnsupportedFeature` rather than
+//! returning a wrong row count.
 
 use crate::catalog::Source;
 use crate::format::{get_or_internal, ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
@@ -53,7 +55,8 @@ pub struct CsvFormat {
     /// It also doubles as the "overread amount" for finishing a record that straddles a split
     /// boundary, so a file with a record exceeding it cannot be read split (`LimitExceeded`).
     pub max_record: u64,
-    /// Set once, in `resolve`, when the leading sample contains a `"` byte.
+    /// Set once, in `resolve`, when a `"` byte is found in the leading sample, or in the
+    /// rest of a fully-resident file.
     ///
     /// A split boundary can only ever be mis-resynchronized (§ the module doc's quoting caveat)
     /// when the file uses RFC 4180 quoting: an unquoted CSV/TSV field can never contain the
@@ -156,11 +159,16 @@ impl TableFormat for CsvFormat {
         let bom = if sample.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
         let body = &sample[bom..];
 
-        // See `quoted_sample`'s doc comment: any `"` in the leading sample is treated as evidence
-        // the file may use RFC 4180 quoting, which forces reading it as a single split. A quote
-        // that first appears only after this sample is a known, documented residual gap
-        // (`docs/sql/limitations.md`), not something this check can see.
+        // See `quoted_sample`'s doc comment: any `"` is treated as evidence the file may
+        // use RFC 4180 quoting, which forces reading it as a single split. The leading
+        // sample is checked first; when the whole file is already resident, the rest is
+        // scanned too so a quote that first appears after `SAMPLE_BYTES` is not missed.
         self.quoted_sample = body.contains(&b'"');
+        if !self.quoted_sample && src.is_complete() && src.total_len > n {
+            if let Some(all) = src.get(0, src.total_len as usize) {
+                self.quoted_sample = all[n as usize..].contains(&b'"');
+            }
+        }
 
         // --- The header row -------------------------------------------------
         let mut sc = Scanner::new(body, self.delimiter);
@@ -295,6 +303,11 @@ impl TableFormat for CsvFormat {
                 *s = Some(slot);
             }
         }
+
+        // A quote past the leading sample on a remote (incomplete-at-resolve) file
+        // cannot be turned into a single-split plan after the fact. Refusing beats
+        // mis-resynchronizing a quoted newline at a later split boundary.
+        ensure!(self.quoted_sample || split == 0 || !buf.contains(&b'"'), UnsupportedFeature);
 
         let lead = (own_start - fetch_start) as usize;
         let mut sc = Scanner::new(buf, self.delimiter);
@@ -1445,6 +1458,58 @@ mod tests {
         assert_eq!(text(&got[1][1]), "plain");
         assert_eq!(text(&got[1][2]), "another\nembedded\nnewline");
         assert_eq!(text(&got[1][3]), "end");
+    }
+
+    #[test]
+    fn quote_after_the_sample_on_a_complete_source_still_forces_a_single_split() {
+        // Residual gap that used to drop rows: the leading SAMPLE_BYTES had no `"`,
+        // so the file was split, and a quoted embedded newline on a later boundary
+        // was treated as a record terminator. A fully-resident source now scans
+        // past the sample, so quoting still collapses to one split.
+        let mut s = String::from("a,b\n");
+        let mut pad_rows = 0usize;
+        while s.len() < SAMPLE_BYTES as usize + 64 {
+            // Keep column `b` VARCHAR so the late quoted value is not
+            // coerced to NULL by integer inference on the leading sample.
+            s.push_str("0,a\n");
+            pad_rows += 1;
+        }
+        s.push_str("1,\"x\ny\"\n2,z\n");
+        let (f, src) = open_split(s.as_bytes(), b',', 8192);
+        assert!(f.quoted_sample);
+        assert_eq!(f.num_splits(), 1);
+        let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(got[0].len(), pad_rows + 2);
+        assert_eq!(got[0][pad_rows], Value::I64(1));
+        assert_eq!(text(&got[1][pad_rows]), "x\ny");
+        assert_eq!(got[0][pad_rows + 1], Value::I64(2));
+        assert_eq!(text(&got[1][pad_rows + 1]), "z");
+    }
+
+    #[test]
+    fn quote_in_a_later_split_of_an_unquoted_sample_is_rejected() {
+        // Remote resolve only sees the sample. A `"` in a later split must not be
+        // parsed as unquoted CSV (wrong row count); it is UnsupportedFeature.
+        let mut bytes = b"a,b\n".to_vec();
+        while bytes.len() < SAMPLE_BYTES as usize + 64 {
+            bytes.extend_from_slice(b"0,0\n");
+        }
+        bytes.extend_from_slice(b"1,\"x\ny\"\n");
+        let mut src = Source::remote(bytes.len() as u64);
+        let sample_n = SAMPLE_BYTES.min(bytes.len() as u64) as usize;
+        src.insert(0, bytes[..sample_n].to_vec());
+        let mut f = CsvFormat::new(b',');
+        f.split_bytes = 8192;
+        match f.resolve(&src).expect("resolve") {
+            Ok(()) => {}
+            Err(_) => panic!("sample is present"),
+        }
+        assert!(!f.quoted_sample);
+        assert!(f.num_splits() > 1);
+        src.insert(sample_n as u64, bytes[sample_n..].to_vec());
+        let saw = (1..f.num_splits())
+            .any(|i| code_of(f.read_split(&src, i, &[0, 1])) == Some(Code::UnsupportedFeature));
+        assert!(saw, "a later split containing a quote must be rejected");
     }
 
     #[test]

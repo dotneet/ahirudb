@@ -446,7 +446,17 @@ fn decompress_host(
     match codec {
         Compression::Zstd => ahiru_zstd::decompress(src, out_len)
             .map_err(|e| format!("zstd decompression failed: {e:?}").into()),
-        Compression::Gzip => gunzip(src),
+        Compression::Gzip => {
+            let out = gunzip(src)?;
+            if out.len() != out_len {
+                return Err(format!(
+                    "gzip decompressed to {} bytes, expected {out_len}",
+                    out.len()
+                )
+                .into());
+            }
+            Ok(out)
+        }
         other => Err(format!("{other:?} is unsupported on the host side too").into()),
     }
 }
@@ -491,5 +501,26 @@ mod tests {
     fn identifier_check_keeps_hive_paths_intact() {
         assert!(is_identifier("sales"));
         assert!(!is_identifier("data/year=2024"));
+    }
+
+    #[test]
+    fn gzip_rejects_a_length_mismatch() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new("gzip")
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("gzip");
+        c.stdin.take().expect("stdin").write_all(b"hello").unwrap();
+        let out = c.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert!(decompress_host(ahiru_core::parquet::Compression::Gzip, &out.stdout, 1).is_err());
+        assert_eq!(
+            decompress_host(ahiru_core::parquet::Compression::Gzip, &out.stdout, 5).unwrap(),
+            b"hello"
+        );
     }
 }
