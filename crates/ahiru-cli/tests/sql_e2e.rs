@@ -513,6 +513,30 @@ e2e!(
     ]
 );
 
+e2e!(
+    group_by_all_and_order_by_all,
+    "tests/data/basic.parquet",
+    [
+        "SELECT name, count(*) FROM t GROUP BY ALL ORDER BY ALL",
+        "SELECT flag, name, count(*) FROM t GROUP BY ALL ORDER BY ALL",
+        // 集約を含む式は GROUP BY ALL の対象から外れる。
+        "SELECT id % 3, sum(id) + 1 FROM t GROUP BY ALL ORDER BY ALL",
+        // 集約が 1 つも無ければ DISTINCT と同じ。
+        "SELECT name FROM t GROUP BY ALL ORDER BY ALL",
+        // 集約だけならグルーピング列は 0 本。
+        "SELECT count(*), sum(id) FROM t GROUP BY ALL",
+        "SELECT id, name FROM t ORDER BY ALL LIMIT 5",
+        "SELECT id, name FROM t ORDER BY ALL DESC LIMIT 5",
+        // NULL を含む列でも並びが一致すること。
+        "SELECT big FROM t ORDER BY ALL LIMIT 8",
+        "SELECT big FROM t ORDER BY ALL NULLS FIRST LIMIT 8",
+        // `*` の展開結果も ORDER BY ALL の対象になる。
+        "SELECT * FROM t ORDER BY ALL LIMIT 5",
+        // 集合演算の結果全体に効く。
+        "SELECT id FROM t WHERE id < 3 UNION ALL SELECT id FROM t WHERE id < 2 ORDER BY ALL",
+    ]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // `t2` や `text` の中の t を書き換えてしまうと、比較対象の SQL が壊れる。

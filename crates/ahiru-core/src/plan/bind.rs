@@ -79,14 +79,32 @@ fn bind_query_in(
     // ここでも同じ理由で明確に拒否する（相関キーごとではなく全体に効いて
     // しまうため）。
     ensure!(
-        correlated.is_empty() || (q.order_by.is_empty() && q.limit.is_none() && q.offset.is_none()),
+        correlated.is_empty()
+            || (q.order_by.is_empty()
+                && q.order_by_all.is_none()
+                && q.limit.is_none()
+                && q.offset.is_none()),
         UnsupportedFeature
     );
 
     // 外側の ORDER BY / LIMIT は集合演算の結果全体に掛かる。
-    if !q.order_by.is_empty() {
+    if !q.order_by.is_empty() || q.order_by_all.is_some() {
         let scope = Scope::from_fields(node.schema()[..visible_len].to_vec());
-        let mut keys = Vec::with_capacity(q.order_by.len());
+        let mut keys = Vec::with_capacity(q.order_by.len().max(visible_len));
+        // `ORDER BY ALL`: 出力列を左から順に、すべて同じ向き・同じ NULL 位置
+        // で並べ替える（`duckdb -c "select g,h from t union all select g,h
+        // from t order by all"` が集合演算の結果全体に効くことを確認済み）。
+        // ここでの「出力列」は集合演算の結果スキーマそのものなので、
+        // `bind_select_in` 側と違って射影を組み直す必要は無い。
+        if let Some(oa) = &q.order_by_all {
+            for col in 0..visible_len {
+                keys.push(SortKey {
+                    expr: column_program(&scope, col)?,
+                    desc: oa.desc,
+                    nulls_first: oa.nulls_first,
+                });
+            }
+        }
         for o in &q.order_by {
             // 集合演算の結果には元の式が残っていないので、序数か出力列名だけ。
             let col = match ordinal_of(arena, o.expr) {

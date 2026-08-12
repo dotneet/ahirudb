@@ -206,6 +206,9 @@ pub fn desugar_pivot(
         // に置いても意味は変わらない（`UNPIVOT` 側は `SetOp` になるので
         // 同じ置き場所で揃えてある）。
         order_by,
+        // `ORDER BY ALL` は `PIVOT`/`UNPIVOT` ではパーサが拒否済み
+        // （`sql::parser::Parser::pivot_stmt` 参照）。
+        order_by_all: None,
         limit,
         offset,
     })
@@ -312,5 +315,5 @@ pub fn desugar_unpivot(
         };
     }
 
-    Ok(QueryStmt { ctes: Vec::new(), body, order_by, limit, offset })
+    Ok(QueryStmt { ctes: Vec::new(), body, order_by, order_by_all: None, limit, offset })
 }

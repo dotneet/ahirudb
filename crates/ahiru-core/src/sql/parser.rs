@@ -10,9 +10,9 @@ use crate::format::FormatKind;
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{
-    BinaryOp, Cte, Expr, ExprArena, ExprId, FromItem, JoinKind, OrderByItem, Parsed, PivotStmt,
-    QueryStmt, SampleMethod, SampleSpec, SelectItem, SelectStmt, SetExpr, SetOp, Stmt, UnaryOp,
-    UnpivotStmt, WindowDef, WindowFrame,
+    BinaryOp, Cte, Expr, ExprArena, ExprId, FromItem, JoinKind, OrderByAll, OrderByItem, Parsed,
+    PivotStmt, QueryStmt, SampleMethod, SampleSpec, SelectItem, SelectStmt, SetExpr, SetOp, Stmt,
+    UnaryOp, UnpivotStmt, WindowDef, WindowFrame,
 };
 use crate::sql::lexer::{Kw, Lexer, Tok};
 use crate::vector::{Ty, Value};
@@ -483,6 +483,7 @@ impl<'a> Parser<'a> {
                 ctes: Vec::new(),
                 body: SetExpr::Select(Box::new(s)),
                 order_by: Vec::new(),
+                order_by_all: None,
                 limit: None,
                 offset: None,
             })

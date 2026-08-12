@@ -393,6 +393,23 @@ pub struct OrderByItem {
     pub nulls_first: bool,
 }
 
+/// `ORDER BY ALL [ASC|DESC] [NULLS FIRST|LAST]` (DuckDB shorthand): sort by
+/// every output column, left to right, all with this one direction and null
+/// placement.
+///
+/// Kept as its own field rather than as items inside `order_by` for two
+/// reasons. It is resolved at bind time, not parse time — the output column
+/// list isn't known until `SELECT *` has been expanded, and `ORDER BY ALL`
+/// must cover the expanded columns (verified: `duckdb -c "... select * from
+/// t order by all"` sorts by every column). And it is mutually exclusive
+/// with an ordinary list: DuckDB's parser rejects `ORDER BY ALL, h` outright,
+/// so there is never a mix to represent.
+#[derive(Clone, Copy)]
+pub struct OrderByAll {
+    pub desc: bool,
+    pub nulls_first: bool,
+}
+
 /// 集合演算。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SetOp {
@@ -444,6 +461,8 @@ pub struct QueryStmt {
     pub ctes: Vec<Cte>,
     pub body: SetExpr,
     pub order_by: Vec<OrderByItem>,
+    /// `ORDER BY ALL`. Mutually exclusive with `order_by` (see `OrderByAll`).
+    pub order_by_all: Option<OrderByAll>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -487,6 +506,17 @@ pub struct SelectStmt {
     pub from: Option<FromItem>,
     pub filter: Option<ExprId>,
     pub group_by: Vec<ExprId>,
+    /// `GROUP BY ALL` (DuckDB shorthand): group by every select-list
+    /// expression that does **not** contain an aggregate.
+    ///
+    /// Resolved at bind time rather than by the parser, because "contains an
+    /// aggregate" is a question about function *names* that only the binder
+    /// (`plan::bind::agg::collect_aggregates`) can answer. When set,
+    /// `group_by` is empty and unused. Verified against duckdb: `SELECT g+1,
+    /// sum(x)+1 ... GROUP BY ALL` groups by `g+1` only — an expression is
+    /// excluded when an aggregate appears anywhere inside it, not only when
+    /// the item *is* an aggregate call.
+    pub group_by_all: bool,
     /// `GROUP BY GROUPING SETS (...)` / `ROLLUP (...)` / `CUBE (...)`。
     /// `Some` のときは `group_by` は使わず、各要素が 1 つのグルーピングセット
     /// （その回のグルーピングに使う列の組）を表す。`ROLLUP`/`CUBE` はパーサが
@@ -499,6 +529,8 @@ pub struct SelectStmt {
     /// `QUALIFY`。ウィンドウ関数評価後・ORDER BY 前に効くフィルタ。
     pub qualify: Option<ExprId>,
     pub order_by: Vec<OrderByItem>,
+    /// `ORDER BY ALL`. Mutually exclusive with `order_by` (see `OrderByAll`).
+    pub order_by_all: Option<OrderByAll>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     /// `USING SAMPLE` / `TABLESAMPLE`。`duckdb` CLI で確認した限り、
@@ -520,11 +552,13 @@ impl SelectStmt {
             from: None,
             filter: None,
             group_by: Vec::new(),
+            group_by_all: false,
             grouping_sets: None,
             having: None,
             windows: Vec::new(),
             qualify: None,
             order_by: Vec::new(),
+            order_by_all: None,
             limit: None,
             offset: None,
             sample: None,

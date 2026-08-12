@@ -291,6 +291,9 @@ fn select_str(a: &ExprArena, s: &SelectStmt) -> String {
     if let Some(w) = s.filter {
         out.push_str(&format!(" WHERE {}", r(a, w)));
     }
+    if s.group_by_all {
+        out.push_str(" GROUP BY ALL");
+    }
     if !s.group_by.is_empty() {
         let g: Vec<String> = s.group_by.iter().map(|e| r(a, *e)).collect();
         out.push_str(&format!(" GROUP BY {}", g.join(", ")));
@@ -329,6 +332,9 @@ fn select_str(a: &ExprArena, s: &SelectStmt) -> String {
     if let Some(q) = s.qualify {
         out.push_str(&format!(" QUALIFY {}", r(a, q)));
     }
+    if let Some(oa) = &s.order_by_all {
+        out.push_str(&format!(" ORDER BY ALL {}", order_all_str(oa)));
+    }
     if !s.order_by.is_empty() {
         out.push_str(&format!(" ORDER BY {}", order_list(a, &s.order_by)));
     }
@@ -339,6 +345,14 @@ fn select_str(a: &ExprArena, s: &SelectStmt) -> String {
         out.push_str(&format!(" OFFSET {}", o));
     }
     out
+}
+
+fn order_all_str(oa: &OrderByAll) -> String {
+    format!(
+        "{} NULLS {}",
+        if oa.desc { "DESC" } else { "ASC" },
+        if oa.nulls_first { "FIRST" } else { "LAST" }
+    )
 }
 
 fn order_list(a: &ExprArena, items: &[OrderByItem]) -> String {
@@ -398,6 +412,9 @@ fn query_str(a: &ExprArena, q: &QueryStmt) -> String {
         out.push_str(&format!("{}{} ", kw, cs.join(", ")));
     }
     out.push_str(&setexpr_str(a, &q.body));
+    if let Some(oa) = &q.order_by_all {
+        out.push_str(&format!(" ORDER BY ALL {}", order_all_str(oa)));
+    }
     if !q.order_by.is_empty() {
         out.push_str(&format!(" ORDER BY {}", order_list(a, &q.order_by)));
     }
@@ -2699,4 +2716,53 @@ fn top_level_keyword_lookahead_ignores_nested_occurrences() {
     assert_eq!(ex("trim((SELECT x FROM t))"), "trim((SELECT x FROM t))");
     // Likewise a nested `IN` inside parentheses.
     assert_eq!(ex("position((a IN (1, 2)), b)"), "position((a IN [1i32, 2i32]), b)");
+}
+
+// --- `GROUP BY ALL` / `ORDER BY ALL` ----------------------------------------
+
+#[test]
+fn group_by_all_and_order_by_all_parse_as_flags() {
+    assert_eq!(sel("SELECT a, sum(b) FROM t GROUP BY ALL"), "SELECT a, sum(b) FROM t GROUP BY ALL");
+    assert_eq!(sel("SELECT a FROM t ORDER BY ALL"), "SELECT a FROM t ORDER BY ALL ASC NULLS LAST");
+    assert_eq!(
+        sel("SELECT a FROM t ORDER BY ALL DESC"),
+        "SELECT a FROM t ORDER BY ALL DESC NULLS LAST"
+    );
+    assert_eq!(
+        sel("SELECT a FROM t ORDER BY ALL NULLS FIRST"),
+        "SELECT a FROM t ORDER BY ALL ASC NULLS FIRST"
+    );
+    assert_eq!(
+        sel("SELECT a FROM t ORDER BY ALL DESC NULLS LAST LIMIT 3"),
+        "SELECT a FROM t ORDER BY ALL DESC NULLS LAST LIMIT 3"
+    );
+}
+
+#[test]
+fn order_by_all_after_a_set_operation_lands_on_the_query() {
+    assert_eq!(
+        qs("SELECT a FROM t UNION ALL SELECT a FROM t2 ORDER BY ALL"),
+        "(SELECT a FROM t UNION ALL SELECT a FROM t2) ORDER BY ALL ASC NULLS LAST"
+    );
+}
+
+#[test]
+fn all_cannot_be_mixed_with_an_explicit_list() {
+    // duckdb rejects both of these with a parser error at the comma.
+    assert_eq!(code("SELECT a FROM t GROUP BY ALL, a"), Code::UnexpectedToken as u16);
+    assert_eq!(code("SELECT a FROM t ORDER BY ALL, a"), Code::UnexpectedToken as u16);
+}
+
+#[test]
+fn order_by_all_is_rejected_for_pivot_and_unpivot() {
+    // The desugaring rebuilds the output column list, so the shorthand
+    // cannot be carried through; refuse it rather than silently dropping it.
+    assert_eq!(
+        code("PIVOT t ON a IN (1) USING count(*) ORDER BY ALL"),
+        Code::UnsupportedFeature as u16
+    );
+    assert_eq!(
+        code("UNPIVOT t ON a, b INTO NAME n VALUE v ORDER BY ALL"),
+        Code::UnsupportedFeature as u16
+    );
 }
