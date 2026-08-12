@@ -29,6 +29,10 @@
 //! sign, and the fixed-vs-exponential notation threshold), is byte-identical
 //! between the two formats and lives here as `write_f64_finite`.
 
+// `Vec` and `vec!` come from here, not from a prelude: this crate is `no_std`
+// on the wasm target, where neither is in scope by default.
+use crate::prelude::*;
+
 /// The number of significant decimal digits the first-pass conversion
 /// (`normalize_and_correct`) computes.
 ///
