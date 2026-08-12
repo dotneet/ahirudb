@@ -823,12 +823,22 @@ impl<'a> Parser<'a> {
                 let (exclude, replace, rename) = self.star_modifiers()?;
                 return Ok(self.arena.push(Expr::Star {
                     qualifier: Some(name),
+                    columns: None,
                     exclude,
                     replace,
                     rename,
                 }));
             }
             let col = self.ident()?;
+            // `t.COLUMNS(*)` is not a thing: DuckDB rejects a qualified
+            // `COLUMNS` too ("Scalar Function with name columns does not
+            // exist"). Reported as `UnsupportedFeature` rather than as a
+            // stray-token error on the `(`, which would read as a typo.
+            ensure!(
+                !(self.is(Tok::LParen) && eq_ascii_ci(col.as_bytes(), b"columns")),
+                UnsupportedFeature,
+                self.pos
+            );
             return Ok(self.arena.push(Expr::ColumnRef { qualifier: Some(name), name: col }));
         }
         Ok(self.arena.push(Expr::ColumnRef { qualifier: None, name }))
@@ -856,6 +866,22 @@ impl<'a> Parser<'a> {
         // 通常のカンマ引数列とは形が違うので、CAST と同じ経路に落とす。
         if eq_ascii_ci(name.as_bytes(), b"try_cast") && self.cur == Tok::LParen {
             return self.cast_body(true);
+        }
+        // `COLUMNS(...)` is only a star expression at the start of a
+        // select-list item (`sql::parser::Parser::columns_item`); reaching it
+        // here means it was written somewhere a star cannot expand — most
+        // often `min(COLUMNS(*))`, DuckDB's "distribute the enclosing function
+        // over the expansion" form. That would need the binder to synthesize
+        // one function call per expanded column, which it cannot do: the
+        // expression arena is immutable by the time the input schema is known,
+        // and aggregates are collected from the raw AST in an earlier pass.
+        // `UNPACK(...)` (the other unpacking form) is rejected alongside it.
+        // Both are reported as `UnsupportedFeature` rather than left to
+        // surface later as "function not found", which would suggest a typo.
+        if (eq_ascii_ci(name.as_bytes(), b"columns") || eq_ascii_ci(name.as_bytes(), b"unpack"))
+            && self.cur == Tok::LParen
+        {
+            err!(UnsupportedFeature, self.pos)
         }
         // `UNNEST(expr)`（SELECT リスト用）。DISTINCT/`*`/FILTER/OVER は
         // 意味を持たないので、通常の関数呼び出しとは別の単純な形で読む

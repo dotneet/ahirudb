@@ -52,6 +52,18 @@ user-visible effect.
 - **`UNPIVOT`** supports only single-column-at-a-time unpivoting; DuckDB's
   `UNPIVOT ... ON (a, b), (c, d)` (unpivoting several columns into several
   value columns at once) isn't supported.
+- **Star expressions**: `COLUMNS(*)`, `COLUMNS('regex')`,
+  `COLUMNS(['a','b'])` and the `AS '\1'` capture-group renaming form all
+  work (see [queries.md](queries.md#columns)), but four DuckDB star-expression
+  features are rejected with `UnsupportedFeature` rather than
+  half-implemented: distributing an enclosing expression over the expansion
+  (`min(COLUMNS(*))`, `COLUMNS(*) + 1`), `UNPACK(...)` / `*COLUMNS(...)`
+  unpacking, the `COLUMNS(c -> ...)` lambda predicate form, and the
+  `* LIKE 'col%'` / `* GLOB` / `* SIMILAR TO` star-filtering operators.
+  A `COLUMNS(...)` item also can't be table-qualified (`t.COLUMNS(*)`) —
+  neither can DuckDB's. Note the `COLUMNS('regex')` match is
+  **case-sensitive**, unlike every other column-name comparison here; that
+  matches DuckDB.
 - **Regular expressions**: the engine (a hand-written Thompson NFA, chosen
   to avoid backtracking blowups on adversarial input) does not support
   lookaround, backreferences *inside a pattern*, named capture groups,

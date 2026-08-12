@@ -65,10 +65,16 @@ fn r(a: &ExprArena, id: ExprId) -> String {
             Some(q) => format!("{}.{}", q, name),
             None => name.clone(),
         },
-        Expr::Star { qualifier, exclude, replace, rename } => {
-            let mut s = match qualifier {
-                Some(q) => format!("{}.*", q),
-                None => "*".to_string(),
+        Expr::Star { qualifier, columns, exclude, replace, rename } => {
+            let mut s = match (qualifier, columns) {
+                (_, Some(ColumnsSpec::All)) => "COLUMNS(*)".to_string(),
+                (_, Some(ColumnsSpec::Regex(p))) => format!("COLUMNS('{}')", p),
+                (_, Some(ColumnsSpec::Names(ns))) => {
+                    let items: Vec<String> = ns.iter().map(|n| format!("'{}'", n)).collect();
+                    format!("COLUMNS([{}])", items.join(", "))
+                }
+                (Some(q), None) => format!("{}.*", q),
+                (None, None) => "*".to_string(),
             };
             if !exclude.is_empty() {
                 s.push_str(&format!(" EXCLUDE ({})", exclude.join(", ")));
@@ -1097,6 +1103,71 @@ fn star_rename() {
         assert_eq!(sel("SELECT rename FROM t"), "SELECT rename FROM t");
         assert_eq!(sel("SELECT a AS rename FROM t"), "SELECT a AS rename FROM t");
     }
+}
+
+/// DuckDB's `COLUMNS(...)` star expression. Every accepted and rejected form
+/// below is cross-checked against a real `duckdb` v1.4.4 CLI.
+///
+/// Note the round-trip strings put the star modifiers *after* the closing
+/// paren (`COLUMNS(*) EXCLUDE (b)`) while the real syntax puts them inside
+/// it. `select_str` is a structural dump, not valid SQL (see its doc), and
+/// `COLUMNS(...)` shares the `Expr::Star` node with a plain `*`.
+#[test]
+fn columns_star_expression() {
+    // The three supported argument forms.
+    assert_eq!(sel("SELECT COLUMNS(*) FROM t"), "SELECT COLUMNS(*) FROM t");
+    assert_eq!(sel("SELECT COLUMNS('n.*') FROM t"), "SELECT COLUMNS('n.*') FROM t");
+    assert_eq!(sel("SELECT COLUMNS(['id', 'num']) FROM t"), "SELECT COLUMNS(['id', 'num']) FROM t");
+    // A single-element list is still a list, not the regex form.
+    assert_eq!(sel("SELECT COLUMNS(['id']) FROM t"), "SELECT COLUMNS(['id']) FROM t");
+    // The star modifiers go *inside* the parens (`duckdb` rejects
+    // `COLUMNS(*) EXCLUDE (b)` as a parser error), and all three still apply
+    // in their usual fixed order.
+    assert_eq!(sel("SELECT COLUMNS(* EXCLUDE (b)) FROM t"), "SELECT COLUMNS(*) EXCLUDE (b) FROM t");
+    assert_eq!(
+        sel("SELECT COLUMNS(* EXCLUDE (c) REPLACE (b + 1 AS b) RENAME (a AS z)) FROM t"),
+        "SELECT COLUMNS(*) EXCLUDE (c) REPLACE ((b + 1i32) AS b) RENAME (a AS z) FROM t"
+    );
+    assert_eq!(code("SELECT COLUMNS(*) EXCLUDE (b) FROM t"), Code::UnexpectedToken as u16);
+    // `AS '<template>'` is the capture-group renaming form, so the alias may
+    // be a string literal here — `opt_alias` alone would reject that.
+    assert_eq!(
+        sel("SELECT COLUMNS('(a)b') AS '\\1' FROM t"),
+        "SELECT COLUMNS('(a)b') AS \\1 FROM t"
+    );
+    assert_eq!(sel("SELECT COLUMNS(*) AS x FROM t"), "SELECT COLUMNS(*) AS x FROM t");
+
+    // --- forms that must fail loudly ---------------------------------------
+    // Distributing an enclosing function over the expansion.
+    assert_eq!(code("SELECT min(COLUMNS(*)) FROM t"), Code::UnsupportedFeature as u16);
+    // ... including over a plain operator, which `duckdb` also distributes
+    // (`COLUMNS(*) + 1` yields one `+ 1` column per input column there).
+    assert_eq!(code("SELECT COLUMNS(*) + 1 FROM t"), Code::UnsupportedFeature as u16);
+    // `UNPACK(...)` / `*COLUMNS(...)` unpacking into a parent expression.
+    assert_eq!(code("SELECT UNPACK(COLUMNS(*)) FROM t"), Code::UnsupportedFeature as u16);
+    assert_eq!(code("SELECT *COLUMNS(*) FROM t"), Code::UnsupportedFeature as u16);
+    // The lambda predicate form.
+    assert_eq!(code("SELECT COLUMNS(c -> c LIKE 'n%') FROM t"), Code::UnsupportedFeature as u16);
+    // `* LIKE`/`GLOB`/`SIMILAR TO` star filtering.
+    assert_eq!(code("SELECT * LIKE 'n%' FROM t"), Code::UnsupportedFeature as u16);
+    assert_eq!(code("SELECT * ILIKE 'n%' FROM t"), Code::UnsupportedFeature as u16);
+    assert_eq!(code("SELECT * NOT LIKE 'n%' FROM t"), Code::UnsupportedFeature as u16);
+    assert_eq!(code("SELECT * GLOB 'n*' FROM t"), Code::UnsupportedFeature as u16);
+    assert_eq!(code("SELECT * SIMILAR TO 'n.*' FROM t"), Code::UnsupportedFeature as u16);
+    // A qualified `t.COLUMNS(*)` — `duckdb` rejects this too.
+    assert_eq!(code("SELECT t.COLUMNS(*) FROM t"), Code::UnsupportedFeature as u16);
+    // `COLUMNS` outside the select list.
+    assert_eq!(code("SELECT a FROM t WHERE COLUMNS('a') > 1"), Code::UnsupportedFeature as u16);
+
+    // `COLUMNS` is not a reserved word: a column (or alias, or table) that
+    // happens to be named `columns` still works unquoted, the same guarantee
+    // EXCLUDE/REPLACE/RENAME carry. `duckdb` behaves the same way.
+    assert_eq!(sel("SELECT columns FROM t"), "SELECT columns FROM t");
+    assert_eq!(sel("SELECT a AS columns FROM t"), "SELECT a AS columns FROM t");
+    assert_eq!(sel("SELECT columns.a FROM columns"), "SELECT columns.a FROM columns");
+    assert_eq!(sel("SELECT columns.* FROM columns"), "SELECT columns.* FROM columns");
+    assert_eq!(sel("SELECT a FROM t WHERE columns > 1"), "SELECT a FROM t WHERE (columns > 1i32)");
+    assert_eq!(sel("SELECT unpack FROM t"), "SELECT unpack FROM t");
 }
 
 #[test]

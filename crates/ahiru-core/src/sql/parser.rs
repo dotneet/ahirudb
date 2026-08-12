@@ -10,9 +10,9 @@ use crate::format::FormatKind;
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{
-    BinaryOp, Cte, Expr, ExprArena, ExprId, FromItem, JoinKind, OrderByItem, Parsed, PivotStmt,
-    QueryStmt, SampleMethod, SampleSpec, SelectItem, SelectStmt, SetExpr, SetOp, Stmt, UnaryOp,
-    UnpivotStmt, WindowDef, WindowFrame,
+    BinaryOp, ColumnsSpec, Cte, Expr, ExprArena, ExprId, FromItem, JoinKind, OrderByItem, Parsed,
+    PivotStmt, QueryStmt, SampleMethod, SampleSpec, SelectItem, SelectStmt, SetExpr, SetOp, Stmt,
+    UnaryOp, UnpivotStmt, WindowDef, WindowFrame,
 };
 use crate::sql::lexer::{Kw, Lexer, Tok};
 use crate::vector::{Ty, Value};
@@ -438,6 +438,7 @@ impl<'a> Parser<'a> {
             let name = self.ident()?;
             let star = self.arena.push(Expr::Star {
                 qualifier: None,
+                columns: None,
                 exclude: Vec::new(),
                 replace: Vec::new(),
                 rename: Vec::new(),

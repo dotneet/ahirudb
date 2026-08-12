@@ -1,9 +1,11 @@
 use super::agg::{check_grouped, collect_aggregates};
 use super::pruning::extract_pruners;
 use super::refs::{collect_refs, ordinal_of};
+use super::select::expand_columns;
 use super::subquery::{equi_key, single_rel_of, split_conjuncts};
 use super::*;
 use crate::error::code_of;
+use crate::sql::ast::ColumnsSpec;
 use crate::vector::Ty;
 
 fn scope() -> Scope {
@@ -339,4 +341,105 @@ fn refs_are_collected_and_unknown_columns_rejected() {
     let bad = col(&mut a, "nope");
     let mut out2 = Vec::new();
     assert_eq!(code_of(collect_refs(&a, &scope(), bad, &mut out2)), Some(Code::ColumnNotFound));
+}
+
+// --- COLUMNS(...) expansion ---------------------------------------------------
+//
+// `expand_columns` is the whole of `COLUMNS(...)`'s semantics; the cases below
+// pin the parts that were resolved by running them against a real `duckdb`
+// v1.4.4 CLI rather than guessed. The scope here is `id, score, name`.
+
+/// Column names only (no template), for the common assertions below.
+fn expanded_names(spec: &ColumnsSpec) -> Vec<String> {
+    let s = scope();
+    expand_columns(spec, &s, None)
+        .unwrap()
+        .into_iter()
+        .map(|(i, _)| s.fields()[i].name.clone())
+        .collect()
+}
+
+#[test]
+fn columns_all_expands_like_a_plain_star() {
+    assert_eq!(expanded_names(&ColumnsSpec::All), vec!["id", "score", "name"]);
+}
+
+/// The regex is an unanchored search, not a full match: `COLUMNS('am')`
+/// matches `name` (`duckdb`: `COLUMNS('um')` matches a `num` column).
+#[test]
+fn columns_regex_is_an_unanchored_search() {
+    assert_eq!(expanded_names(&ColumnsSpec::Regex("am".into())), vec!["name"]);
+    assert_eq!(expanded_names(&ColumnsSpec::Regex("^n".into())), vec!["name"]);
+    assert_eq!(expanded_names(&ColumnsSpec::Regex("e$".into())), vec!["score", "name"]);
+}
+
+/// Unlike every other column-name comparison in this engine, the regex match
+/// is case-sensitive (`duckdb`: `COLUMNS('N.*')` matches nothing on a `name`
+/// column).
+#[test]
+fn columns_regex_is_case_sensitive() {
+    assert_eq!(
+        code_of(expand_columns(&ColumnsSpec::Regex("N.*".into()), &scope(), None)),
+        Some(Code::ColumnNotFound)
+    );
+}
+
+/// A regex matching no column is an error, not an empty expansion
+/// (`duckdb`: "No matching columns found that match regex").
+#[test]
+fn columns_regex_matching_nothing_is_an_error() {
+    assert_eq!(
+        code_of(expand_columns(&ColumnsSpec::Regex("zzz".into()), &scope(), None)),
+        Some(Code::ColumnNotFound)
+    );
+}
+
+/// The explicit list expands in *schema* order, matches names
+/// case-insensitively, and emits each column once even if listed twice
+/// (all three verified against `duckdb`).
+#[test]
+fn columns_list_follows_schema_order_and_dedups() {
+    assert_eq!(
+        expanded_names(&ColumnsSpec::Names(vec!["name".into(), "id".into()])),
+        vec!["id", "name"]
+    );
+    assert_eq!(expanded_names(&ColumnsSpec::Names(vec!["ID".into()])), vec!["id"]);
+    assert_eq!(expanded_names(&ColumnsSpec::Names(vec!["id".into(), "id".into()])), vec!["id"]);
+}
+
+/// A listed name that no column has is an error — `COLUMNS` sides with
+/// `EXCLUDE`, not with `RENAME`, on the asymmetry documented on
+/// `Expr::Star::rename` (`duckdb`: "Column "nope" was selected but was not
+/// found in the FROM clause").
+#[test]
+fn columns_list_with_an_unknown_name_is_an_error() {
+    assert_eq!(
+        code_of(expand_columns(
+            &ColumnsSpec::Names(vec!["id".into(), "nope".into()]),
+            &scope(),
+            None
+        )),
+        Some(Code::ColumnNotFound)
+    );
+}
+
+/// `AS '<template>'`: `\0` is the whole column name and `\1`.. are the
+/// pattern's capture groups. An expansion that comes out empty leaves the
+/// original name alone.
+#[test]
+fn columns_alias_template_substitutes_capture_groups() {
+    let s = scope();
+    let names = |spec: &ColumnsSpec, t: &str| -> Vec<String> {
+        expand_columns(spec, &s, Some(t))
+            .unwrap()
+            .into_iter()
+            .map(|(i, n)| n.unwrap_or_else(|| s.fields()[i].name.clone()))
+            .collect()
+    };
+    assert_eq!(names(&ColumnsSpec::All, "x_\\0"), vec!["x_id", "x_score", "x_name"]);
+    assert_eq!(names(&ColumnsSpec::Regex("(..).*".into()), "\\1"), vec!["id", "sc", "na"]);
+    // A group the pattern doesn't have expands to the empty string, and a
+    // fully empty result falls back to the original name.
+    assert_eq!(names(&ColumnsSpec::Regex("^n".into()), "q\\1"), vec!["q"]);
+    assert_eq!(names(&ColumnsSpec::Regex("^n".into()), "\\1"), vec!["name"]);
 }
