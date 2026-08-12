@@ -4,7 +4,7 @@
 //! 明示的な `Cast` 命令を挿入する。実行カーネルが型変換を意識しなくて済むので
 //! カーネル数を増やさずに済む（DESIGN.md §11）。
 
-use crate::expr::{funcs, Instr, OpCode, Program, Reg};
+use crate::expr::{funcs, CallSpec, Instr, OpCode, Program, Reg};
 use crate::plan::{AggKind, Scope};
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
@@ -207,13 +207,37 @@ fn interval_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<IntervalOp> {
 ///
 /// `lhs.num_regs` はここで `rhs` ぶん増やしてあるので、呼び出し側は
 /// そのまま `lhs.alloc_reg()` を呼んでよい。
+///
+/// Every side table a `Program` carries has to be rebased here, not just
+/// `consts`/`casts`: `OpCode::Call`'s `aux` indexes `Program::calls`, a
+/// `CallSpec`'s `args` are register numbers, and `CallSpec::lambda` indexes
+/// `Program::lambdas`. Missing any of them makes the merged program reference
+/// the wrong side table entry — e.g. `WHERE a = 1 AND upper(s) = 'FOO'` used
+/// to merge a call-free `lhs` with a `rhs` holding one `CallSpec`, leaving the
+/// `Call` instruction pointing into an empty `calls` table (`Internal` at
+/// runtime), while the same conjuncts in the opposite order happened to work.
 pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg) {
     let base = lhs.num_regs;
     let kbase = lhs.consts.len() as u16;
     let cbase = lhs.casts.len() as u16;
+    let fbase = lhs.calls.len() as u16;
+    let lbase = lhs.lambdas.len() as u16;
 
     lhs.consts.extend(rhs.consts.iter().cloned());
     lhs.casts.extend(rhs.casts.iter().copied());
+    // Lambda bodies are self-contained programs with their own register and
+    // constant space (`Compiler::lambda_call` compiles them in an isolated
+    // scope), so they move over as-is; only the index that points at them
+    // shifts.
+    lhs.lambdas.extend(rhs.lambdas);
+    for c in rhs.calls {
+        lhs.calls.push(CallSpec {
+            func: c.func,
+            args: c.args.iter().map(|r| r + base).collect(),
+            result_ty: c.result_ty,
+            lambda: c.lambda.map(|l| l + lbase),
+        });
+    }
     for i in &rhs.instrs {
         let mut i2 = *i;
         i2.dst += base;
@@ -231,6 +255,9 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
                 i2.b += base;
                 i2.aux += base;
             }
+            // `Call` takes no register operands (`a`/`b` are unused); its
+            // arguments live in `calls[aux].args`, already rebased above.
+            OpCode::Call => i2.aux += fbase,
             _ => {
                 i2.a += base;
                 i2.b += base;
@@ -1388,5 +1415,98 @@ mod tests {
         let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
         let id = a.push(Expr::Lambda { params: vec!["x".into()], body: x });
         assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::UnsupportedFeature));
+    }
+
+    /// `upper(name) = '<lit>'`.
+    fn upper_eq(a: &mut ExprArena, lit: &str) -> ExprId {
+        let col = a.push(Expr::ColumnRef { qualifier: None, name: "name".into() });
+        let up = func_call(a, "upper", vec![col]);
+        let s = a.push(Expr::Literal(Value::Bytes(lit.as_bytes().to_vec())));
+        a.push(Expr::Binary { op: BinaryOp::Eq, lhs: up, rhs: s })
+    }
+
+    /// Merging a call-free `lhs` with a `rhs` that has one must not leave the
+    /// `Call` instruction pointing into `lhs`'s (empty) call table. This is the
+    /// shape predicate pushdown produces for `WHERE id = 1 AND upper(name) =
+    /// 'X'`: the equality is compiled first (and separately consumed into a
+    /// scan pruner), then merged with the residual conjunct.
+    #[test]
+    fn and_programs_rebases_the_call_table_of_the_right_hand_side() {
+        let mut a = ExprArena::new();
+        let lhs_id = bin(&mut a, BinaryOp::Eq, "id", Value::I32(1));
+        let rhs_id = upper_eq(&mut a, "NAME_1");
+        let lhs = compile(&a, &cols(), &[], lhs_id).unwrap();
+        let rhs = compile(&a, &cols(), &[], rhs_id).unwrap();
+        assert!(lhs.calls.is_empty());
+        assert_eq!(rhs.calls.len(), 1);
+        let upper = rhs.calls[0].func;
+
+        let p = and_programs(lhs, rhs).unwrap();
+        assert_eq!(p.calls.len(), 1);
+        for i in p.instrs.iter().filter(|i| i.op == OpCode::Call) {
+            let spec = p.calls.get(i.aux as usize).expect("call index out of range");
+            assert_eq!(spec.func, upper);
+            for &r in &spec.args {
+                assert!(r < p.num_regs, "argument register {r} out of range");
+            }
+        }
+    }
+
+    /// With calls on both sides the indices must not collide either — before
+    /// the rebase existed this silently ran the left-hand function twice
+    /// (`WHERE lower(name) = 'a' AND upper(name) = 'A'` returned no rows at
+    /// all rather than erroring).
+    #[test]
+    fn and_programs_keeps_both_sides_call_tables_distinct() {
+        let mut a = ExprArena::new();
+        let col = a.push(Expr::ColumnRef { qualifier: None, name: "name".into() });
+        let low = func_call(&mut a, "lower", vec![col]);
+        let lit = a.push(Expr::Literal(Value::Bytes(b"name_1".to_vec())));
+        let lhs_id = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: low, rhs: lit });
+        let rhs_id = upper_eq(&mut a, "NAME_1");
+        let lhs = compile(&a, &cols(), &[], lhs_id).unwrap();
+        let rhs = compile(&a, &cols(), &[], rhs_id).unwrap();
+        let (lower, upper) = (lhs.calls[0].func, rhs.calls[0].func);
+        assert_ne!(lower, upper);
+
+        let p = and_programs(lhs, rhs).unwrap();
+        assert_eq!(p.calls.len(), 2);
+        let called: Vec<u16> = p
+            .instrs
+            .iter()
+            .filter(|i| i.op == OpCode::Call)
+            .map(|i| p.calls[i.aux as usize].func)
+            .collect();
+        assert_eq!(called, vec![lower, upper]);
+    }
+
+    /// `CallSpec::lambda` indexes `Program::lambdas`, so that table has to be
+    /// merged and the index rebased too.
+    #[test]
+    fn and_programs_rebases_the_lambda_table() {
+        let mut a = ExprArena::new();
+        let lhs_id = bin(&mut a, BinaryOp::Eq, "id", Value::I32(1));
+        let list = json_lit(&mut a, "[1,2,3]");
+        let x = a.push(Expr::ColumnRef { qualifier: None, name: "x".into() });
+        let one = json_lit(&mut a, "1");
+        let pred = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: x, rhs: one });
+        let lambda = a.push(Expr::Lambda { params: vec!["x".into()], body: pred });
+        let filtered = func_call(&mut a, "list_filter", vec![list, lambda]);
+        let len = func_call(&mut a, "json_array_length", vec![filtered]);
+        let n = a.push(Expr::Literal(Value::I64(1)));
+        let rhs_id = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: len, rhs: n });
+
+        let lhs = compile(&a, &cols(), &[], lhs_id).unwrap();
+        let rhs = compile(&a, &cols(), &[], rhs_id).unwrap();
+        assert!(lhs.lambdas.is_empty());
+        assert_eq!(rhs.lambdas.len(), 1);
+
+        let p = and_programs(lhs, rhs).unwrap();
+        assert_eq!(p.lambdas.len(), 1);
+        for spec in &p.calls {
+            if let Some(l) = spec.lambda {
+                assert!((l as usize) < p.lambdas.len(), "lambda index out of range");
+            }
+        }
     }
 }

@@ -377,3 +377,34 @@ fn lambda_body_cannot_reference_outer_scope_columns() {
         Some(Code::ColumnNotFound)
     );
 }
+
+// --- 押し下げた述語との併合 ----------------------------------------------------
+
+/// A lambda call sitting in a `WHERE` conjunct next to a pushdown-able
+/// equality. The equality is consumed into the scan's pruner and compiled as
+/// its own program, then merged with the residual conjunct by
+/// `plan::compile::and_programs`. That merge has to carry the residual side's
+/// lambda table over — it used to be dropped, so the query failed with
+/// `Internal` while the same conjuncts in the opposite order worked, which is
+/// why both orders are checked here.
+#[test]
+fn lambda_in_a_conjunct_next_to_a_pushed_down_equality() {
+    let mut sess = session_with_basic();
+    let gt = |n: &str| {
+        format!(
+            "json_array_length(list_filter(json_array(1, 2, 3), x -> {} > {n})) ",
+            int_cast("x")
+        )
+    };
+    let pred = format!("{}= 2", gt("1"));
+    let expect = vec![vec![Value::I32(1)]];
+    assert_eq!(run(&mut sess, &format!("SELECT id FROM t WHERE id = 1 AND {pred}")), expect);
+    assert_eq!(run(&mut sess, &format!("SELECT id FROM t WHERE {pred} AND id = 1")), expect);
+    // Lambdas on both sides of a merge: the two lambda tables must stay
+    // distinct rather than the second aliasing the first.
+    let other = format!("{}= 1", gt("2"));
+    assert_eq!(
+        run(&mut sess, &format!("SELECT id FROM t WHERE id = 1 AND {pred} AND {other}")),
+        expect
+    );
+}
