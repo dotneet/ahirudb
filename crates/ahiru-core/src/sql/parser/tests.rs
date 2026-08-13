@@ -913,6 +913,9 @@ fn filter_clause() {
 fn column_refs_and_params() {
     assert_eq!(ex("a"), "a");
     assert_eq!(ex("t.a"), "t.a");
+    // Flattened STRUCT leaves: dots after the first become the column name.
+    assert_eq!(ex("address.city"), "address.city");
+    assert_eq!(ex("nested.a.b.c"), "nested.a.b.c");
     assert_eq!(ex("\"Mixed Case\".\"x\"\"y\""), "Mixed Case.x\"y");
     let p = parse("SELECT ? WHERE a = ? AND b = ?").expect("parse");
     assert_eq!(p.num_params, 3);

@@ -21,6 +21,7 @@
 //! a different code path in this engine). Expected values are
 //! cross-checked against a real `duckdb` CLI.
 
+use ahiru_core::error::{code_of, Code};
 use ahiru_core::format::FormatKind;
 use ahiru_core::session::{Prepared, QueryStep, Session};
 use ahiru_core::vector::Value;
@@ -109,6 +110,30 @@ fn cast_shorthand_matches_cast() {
     let b = run(&mut db, "SELECT CAST('42' AS INTEGER) FROM dual");
     assert_eq!(a, b);
     assert_eq!(a, vec![vec![Value::I32(42)]]);
+}
+
+#[test]
+fn cast_string_fraction_rounds_like_numeric_cast() {
+    let mut db = session_with_dual();
+    let from_str = run(&mut db, "SELECT CAST('1.5' AS INTEGER) FROM dual");
+    let from_num = run(&mut db, "SELECT CAST(1.5 AS INTEGER) FROM dual");
+    assert_eq!(from_str, from_num);
+    assert_eq!(from_str, vec![vec![Value::I32(2)]]);
+    let dec = run(&mut db, "SELECT CAST('1.25' AS DECIMAL(10,1)) FROM dual");
+    assert_eq!(dec, vec![vec![Value::I64(13)]]);
+}
+
+#[test]
+fn between_on_interval_or_json_is_type_mismatch() {
+    let mut db = session_with_dual();
+    assert_eq!(
+        code_of(db.prepare("SELECT 1 FROM dual WHERE INTERVAL '1' DAY BETWEEN INTERVAL '0' DAY AND INTERVAL '2' DAY", &[])),
+        Some(Code::TypeMismatch)
+    );
+    assert_eq!(
+        code_of(db.prepare("SELECT 1 FROM dual WHERE CAST('[1]' AS JSON) BETWEEN CAST('[0]' AS JSON) AND CAST('[2]' AS JSON)", &[])),
+        Some(Code::TypeMismatch)
+    );
 }
 
 #[test]

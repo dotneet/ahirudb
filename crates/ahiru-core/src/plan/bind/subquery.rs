@@ -519,22 +519,23 @@ pub(super) fn collect_quantified_comparisons(
     each_child(arena, id, &mut |c| collect_quantified_comparisons(arena, c, out, d))
 }
 
-/// Collects unqualified column reference nodes as (the node's ExprId, name) pairs.
-/// Used to resolve QUALIFY's output aliases (`each_child` walks the whole expression tree, so
-/// they are found at any depth).
-pub(super) fn collect_unqualified_colrefs(
+/// Collects every column reference, qualified or not, as
+/// `(ExprId, qualifier, name)`. Used when compiling QUALIFY after projection:
+/// unqualified names that match an output column stay on the projected
+/// schema; everything else is added as a hidden input column.
+pub(super) fn collect_colrefs(
     arena: &ExprArena,
     id: ExprId,
-    out: &mut Vec<(ExprId, String)>,
+    out: &mut Vec<(ExprId, Option<String>, String)>,
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
-    if let Expr::ColumnRef { qualifier: None, name } = arena.get(id) {
-        out.push((id, name.clone()));
+    if let Expr::ColumnRef { qualifier, name } = arena.get(id) {
+        out.push((id, qualifier.clone(), name.clone()));
         return Ok(());
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| collect_unqualified_colrefs(arena, c, out, d))
+    each_child(arena, id, &mut |c| collect_colrefs(arena, c, out, d))
 }
 
 /// If this predicate references exactly one relation, returns its index.

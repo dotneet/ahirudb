@@ -935,7 +935,7 @@ impl<'a> Parser<'a> {
                     rename,
                 }));
             }
-            let col = self.ident()?;
+            let mut col = self.ident()?;
             // `t.COLUMNS(*)` is not a thing: DuckDB rejects a qualified
             // `COLUMNS` too ("Scalar Function with name columns does not
             // exist"). Reported as `UnsupportedFeature` rather than as a
@@ -945,6 +945,16 @@ impl<'a> Parser<'a> {
                 UnsupportedFeature,
                 self.pos
             );
+            // Further dots are part of a flattened STRUCT field name
+            // (`nested.a.b.c` → qualifier `nested`, name `a.b.c`). `t.*` is
+            // handled above; `a.b.*` is rejected rather than silently
+            // becoming a column named `b.*`.
+            while self.eat(Tok::Dot)? {
+                ensure!(!self.is(Tok::Star), SyntaxError, self.pos);
+                let more = self.ident()?;
+                col.push('.');
+                col.push_str(&more);
+            }
             return Ok(self.arena.push(Expr::ColumnRef { qualifier: Some(name), name: col }));
         }
         Ok(self.arena.push(Expr::ColumnRef { qualifier: None, name }))

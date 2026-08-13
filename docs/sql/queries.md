@@ -379,7 +379,11 @@ result. If you need a specific frame, restructure the query with a subquery
 or `LIMIT`/aggregation instead of relying on `OVER (... ROWS BETWEEN ...)`.
 
 `QUALIFY` filters on the *result* of a window function without needing to
-wrap the query in a subquery:
+wrap the query in a subquery. It is evaluated **after** the select list, so
+it sees output names: `* REPLACE`, `* RENAME`, and a trailing alias that
+shadows a star column (the last column of that name wins). A window
+function written only in `QUALIFY` is computed and then dropped from the
+output.
 
 ```sql
 SELECT id, row_number() OVER (ORDER BY id) AS rn

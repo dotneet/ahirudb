@@ -73,6 +73,11 @@ SELECT list_extract('[10,20,30]', 0);    -- NULL  (index 0 is invalid)
 
 SELECT map_extract('{"a":1,"b":2}', 'a'); -- '1'
 SELECT map_extract('{"a":1}', 'z');       -- NULL  (missing key -> NULL, not an error)
+
+-- Parquet MAP columns are stored as a JSON array of {key,value} pairs;
+-- map_extract looks those up the same way:
+--   m = '[{"key":"a","value":1},{"key":"b","value":2}]'
+SELECT map_extract(m, 'a');               -- '1'
 ```
 
 `array_extract` is an alias for `list_extract`.

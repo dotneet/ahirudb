@@ -97,9 +97,30 @@ impl Scope {
         match found {
             Some(i) => Ok(i),
             None => {
-                // If a qualifier is present but the qualifier itself does not exist,
-                // "no such table" is closer to the cause.
+                // Flattened STRUCT leaves are stored as a single field named
+                // `qual.name` (e.g. `address.city`). `address.city` parses as
+                // qualifier `address` + name `city`, which misses both the
+                // table-column lookup above and an unqualified lookup of the
+                // dotted field. Fall back to that dotted name before deciding
+                // the qualifier is a missing table.
                 if let Some(q) = qual {
+                    let mut dotted = String::with_capacity(q.len() + 1 + name.len());
+                    dotted.push_str(q);
+                    dotted.push('.');
+                    dotted.push_str(name);
+                    let mut flat = None;
+                    for i in 0..self.fields.len() {
+                        if !eq_ascii_ci(self.fields[i].name.as_bytes(), dotted.as_bytes()) {
+                            continue;
+                        }
+                        if flat.is_some() {
+                            err!(AmbiguousColumn);
+                        }
+                        flat = Some(i);
+                    }
+                    if let Some(i) = flat {
+                        return Ok(i);
+                    }
                     if !self.has_qualifier(q) {
                         err!(TableNotFound);
                     }
@@ -148,6 +169,21 @@ mod tests {
         assert_eq!(code_of(s.resolve(Some("z"), "id")), Some(Code::TableNotFound));
         // With a qualifier present but no such column, the column is the problem.
         assert_eq!(code_of(s.resolve(Some("a"), "score")), Some(Code::ColumnNotFound));
+    }
+
+    #[test]
+    fn dotted_struct_field_resolves_without_a_qualifier_table() {
+        let mut s = Scope::new();
+        s.push(Some("t".into()), Field::new("id", Ty::Int, false));
+        s.push(Some("t".into()), Field::new("address.city", Ty::Varchar, true));
+        // `address.city` parsed as qualifier + name.
+        assert_eq!(s.resolve(Some("address"), "city").unwrap(), 1);
+        // Quoted `"address.city"` is a single identifier.
+        assert_eq!(s.resolve(None, "address.city").unwrap(), 1);
+        // `t.address.city` after the parser joins the tail into the name.
+        assert_eq!(s.resolve(Some("t"), "address.city").unwrap(), 1);
+        // A qualifier that is neither a table nor a struct prefix stays missing.
+        assert_eq!(code_of(s.resolve(Some("z"), "city")), Some(Code::TableNotFound));
     }
 
     #[test]

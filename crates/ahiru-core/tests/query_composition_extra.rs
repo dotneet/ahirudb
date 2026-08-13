@@ -869,3 +869,38 @@ fn date_plus_bigint_adds_days() {
     let rows = run(&mut db, "SELECT DATE '2024-01-01' + NULL FROM dual");
     assert_eq!(rows[0][0], Value::Null);
 }
+
+/// `GROUP BY` may name a select-list alias. Projection pushdown has to
+/// resolve that alias to the underlying expression (otherwise `k` is
+/// looked up in the input and `ColumnNotFound`).
+/// duckdb: `SELECT id+1 AS k, count(*) c FROM t GROUP BY k ORDER BY k`
+#[test]
+fn group_by_select_list_alias_is_resolved() {
+    let mut db = Session::new();
+    db.register_bytes_as("t", b"id,v\n1,10\n2,10\n3,20\n".to_vec(), FormatKind::Csv).unwrap();
+    let rows = run(&mut db, "SELECT v + 1 AS k, count(*) c FROM t GROUP BY k ORDER BY k");
+    assert_eq!(rows, vec![vec![i64v(11), i64v(2)], vec![i64v(21), i64v(1)]]);
+}
+
+/// QUALIFY sees the SELECT output, including `* REPLACE`, a trailing alias
+/// that shadows a star column, and `RENAME`.
+#[test]
+fn qualify_uses_post_projection_names() {
+    let mut db = Session::new();
+    db.register_bytes_as("t", b"id,score\n1,10\n2,20\n".to_vec(), FormatKind::Csv).unwrap();
+
+    // REPLACE: filter on the replaced `score` (20, 40), not the input (10, 20).
+    let rows =
+        run(&mut db, "SELECT * REPLACE (score * 2 AS score) FROM t QUALIFY score > 15 ORDER BY id");
+    assert_eq!(rows, vec![vec![i64v(1), i64v(20)], vec![i64v(2), i64v(40)]]);
+
+    // Shadowed alias: last `id` wins (`id+10` → 11, 12).
+    let rows = run(&mut db, "SELECT *, id + 10 AS id FROM t QUALIFY id > 5 ORDER BY id");
+    assert_eq!(rows.len(), 2, "got {rows:?}");
+    assert_eq!(rows[0][0], i64v(1));
+    assert_eq!(rows[0][2], i64v(11));
+
+    // RENAME: QUALIFY can use the new name.
+    let rows = run(&mut db, "SELECT * RENAME (id AS pk) FROM t QUALIFY pk > 1 ORDER BY pk");
+    assert_eq!(rows, vec![vec![i64v(2), i64v(20)]]);
+}

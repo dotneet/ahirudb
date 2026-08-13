@@ -334,9 +334,19 @@ impl Operator for Scan {
                 return Ok(Step::NeedCodec);
             }
 
-            let cols = fmt.read_split(&part.source, self.split, &self.spec.columns)?;
+            let mut cols = fmt.read_split(&part.source, self.split, &self.spec.columns)?;
             // The format implementation's contract: return as many columns, of the same length, as the projection.
             ensure!(cols.len() == self.spec.columns.len(), Internal);
+            ensure!(cols.len() == self.spec.schema.len(), Internal);
+            // Multi-file / Hive tables unify per-part types (`INT` + `BIGINT`
+            // → `BIGINT`) in the catalog schema, but each part still emits
+            // its native physical type. Recast here so operators above the
+            // scan never see a mixed-type column.
+            for (c, f) in cols.iter_mut().zip(self.spec.schema.iter()) {
+                if c.ty() != f.ty {
+                    *c = crate::expr::kernels::cast(c.ty(), f.ty, c)?;
+                }
+            }
             let rows = cols.first().map_or(0, |c| c.len());
             ensure!(cols.iter().all(|c| c.len() == rows), Internal);
 

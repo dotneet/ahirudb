@@ -15,10 +15,9 @@ use super::refs::{
     group_name, order_output_column, push_u32, resolve_select_ref,
 };
 use super::subquery::{
-    and_all, build_quantified_comparison, build_semijoin, classify_conjunct,
+    and_all, build_quantified_comparison, build_semijoin, classify_conjunct, collect_colrefs,
     collect_quantified_comparisons, collect_refs_tolerant, collect_scalar_subqueries,
-    collect_unqualified_colrefs, contains_subquery, is_semijoin_predicate, single_rel_of,
-    split_conjuncts, ConjClass,
+    contains_subquery, is_semijoin_predicate, single_rel_of, split_conjuncts, ConjClass,
 };
 use super::*;
 use crate::expr::regex;
@@ -271,15 +270,20 @@ pub(super) fn bind_select_in(
         collect_refs_tolerant(arena, &scope_all, outer_scope, e, &mut refs)?;
     }
     for e in &group_by {
-        // An ordinal (`GROUP BY 1`) carries no column reference here.
-        if ordinal_of(arena, *e).is_none() {
-            collect_refs(arena, &scope_all, *e, &mut refs)?;
+        // Resolve `GROUP BY 1` / `GROUP BY alias` to the select-list expression
+        // first so pushdown reads the columns that expression actually uses.
+        // Collecting the bare alias (`GROUP BY k` for `SELECT v+1 AS k`) would
+        // look `k` up in the input scope and fail with `ColumnNotFound`.
+        let e = resolve_select_ref(arena, sel, *e)?;
+        if ordinal_of(arena, e).is_none() {
+            collect_refs(arena, &scope_all, e, &mut refs)?;
         }
     }
     // `GROUPING SETS`/`ROLLUP`/`CUBE` are likewise included in projection pushdown.
     if let Some(sets) = &sel.grouping_sets {
         for set in sets {
             for &e in set {
+                let e = resolve_select_ref(arena, sel, e)?;
                 if ordinal_of(arena, e).is_none() {
                     collect_refs(arena, &scope_all, e, &mut refs)?;
                 }
@@ -705,6 +709,9 @@ pub(super) fn bind_select_in(
     if let Some(h) = sel.having {
         collect_aggregates(arena, h, &mut agg_calls, 0)?;
     }
+    if let Some(q) = sel.qualify {
+        collect_aggregates(arena, q, &mut agg_calls, 0)?;
+    }
     for o in &sel.order_by {
         collect_aggregates(arena, o.expr, &mut agg_calls, 0)?;
     }
@@ -1006,48 +1013,6 @@ pub(super) fn bind_select_in(
         item_scope = Scope::from_fields(fields);
     }
 
-    // --- QUALIFY --------------------------------------------------------------
-    // A filter that applies after GROUP BY/HAVING and before ORDER BY, against window function
-    // results. Evaluated against `item_scope` (the aggregate and window output).
-    //
-    // QUALIFY can also point at a SELECT output alias (`... AS rn ... QUALIFY rn = 1`).
-    // The alias's substance (a GROUP BY expression, an aggregate call, a window call) is already
-    // registered in `subs` as a column number, so it suffices to register an additional
-    // `Substitution` pointing at the same column number for the same-named bare column reference
-    // nodes found on the QUALIFY side (the expression tree is not duplicated; it rides the existing replacement mechanism).
-    if let Some(q) = sel.qualify {
-        let mut alias_refs = Vec::new();
-        collect_unqualified_colrefs(arena, q, &mut alias_refs, 0)?;
-        for (rid, rname) in alias_refs {
-            let hit = sel.items.iter().find(|it| {
-                it.alias.as_deref().is_some_and(|a| eq_ascii_ci(a.as_bytes(), rname.as_bytes()))
-            });
-            let Some(item) = hit else { continue };
-            let col = subs
-                .iter()
-                .rev()
-                .find(|s| {
-                    if s.structural {
-                        expr_eq(arena, s.expr, item.expr)
-                    } else {
-                        s.expr == item.expr
-                    }
-                })
-                .map(|s| s.column)
-                .or_else(|| match arena.get(item.expr) {
-                    Expr::ColumnRef { qualifier, name } => {
-                        item_scope.resolve(qualifier.as_deref(), name).ok()
-                    }
-                    _ => None,
-                });
-            if let Some(col) = col {
-                subs.push(Substitution { expr: rid, column: col, structural: false });
-            }
-        }
-        let pred = compile_predicate_with_subs(arena, &item_scope, params, &subs, q)?;
-        node = Node::Filter { input: Box::new(node), pred };
-    }
-
     // --- Projection ---------------------------------------------------------
     let mut exprs = Vec::new();
     let mut schema = Vec::new();
@@ -1165,6 +1130,55 @@ pub(super) fn bind_select_in(
     }
     let visible = exprs.len();
 
+    // --- QUALIFY hidden columns ---------------------------------------------
+    // QUALIFY is evaluated against the SELECT output (after `*` REPLACE/RENAME
+    // and last-wins aliases), so it is compiled after this Project. Window
+    // functions, aggregates, and input columns that are not themselves output
+    // columns are added here as hidden columns and dropped by the trailing
+    // trim — the same mechanism ORDER BY uses for sort keys absent from SELECT.
+    let mut qualify_subs: Vec<Substitution> = Vec::new();
+    if let Some(q) = sel.qualify {
+        let mut q_wins = Vec::new();
+        collect_windows(arena, q, &mut q_wins, 0)?;
+        for &w in &q_wins {
+            let p = compile_with_subs(arena, &item_scope, params, &subs, w)?;
+            schema.push(Field::new(String::new(), p.result_ty, true));
+            exprs.push(p);
+            qualify_subs.push(Substitution { expr: w, column: exprs.len() - 1, structural: true });
+        }
+        let mut q_aggs = Vec::new();
+        collect_aggregates(arena, q, &mut q_aggs, 0)?;
+        for &a in &q_aggs {
+            let p = compile_with_subs(arena, &item_scope, params, &subs, a)?;
+            schema.push(Field::new(String::new(), p.result_ty, true));
+            exprs.push(p);
+            qualify_subs.push(Substitution { expr: a, column: exprs.len() - 1, structural: true });
+        }
+        let mut q_refs = Vec::new();
+        collect_colrefs(arena, q, &mut q_refs, 0)?;
+        for (rid, qual, rname) in q_refs {
+            let out_hit = if qual.is_none() {
+                schema.iter().rposition(|f| {
+                    !f.name.is_empty() && eq_ascii_ci(f.name.as_bytes(), rname.as_bytes())
+                })
+            } else {
+                None
+            };
+            if let Some(col) = out_hit {
+                qualify_subs.push(Substitution { expr: rid, column: col, structural: false });
+                continue;
+            }
+            let p = compile_with_subs(arena, &item_scope, params, &subs, rid)?;
+            schema.push(Field::new(String::new(), p.result_ty, true));
+            exprs.push(p);
+            qualify_subs.push(Substitution {
+                expr: rid,
+                column: exprs.len() - 1,
+                structural: false,
+            });
+        }
+    }
+
     // --- ORDER BY -----------------------------------------------------------
     // When sorting by an expression absent from the output, it is added to the projection as a hidden column and dropped afterwards.
     let mut keys = Vec::new();
@@ -1213,6 +1227,14 @@ pub(super) fn bind_select_in(
     let project_schema: Vec<Field> = schema.clone();
     node = Node::Project { input: Box::new(node), exprs, schema: project_schema.clone() };
     let project_scope = Scope::from_fields(project_schema);
+
+    // QUALIFY filters the projected rows. Unqualified names resolve to the
+    // last output column of that name (`* REPLACE`, a trailing `AS` that
+    // shadows a star column, `RENAME`), matching DuckDB.
+    if let Some(q) = sel.qualify {
+        let pred = compile_predicate_with_subs(arena, &project_scope, params, &qualify_subs, q)?;
+        node = Node::Filter { input: Box::new(node), pred };
+    }
 
     // `SELECT DISTINCT a ORDER BY b` adds `b` as a hidden column. Deduplicating
     // on that hidden key as well would keep one row per (a, b) and then drop

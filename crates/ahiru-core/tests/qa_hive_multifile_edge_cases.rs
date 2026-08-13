@@ -156,3 +156,27 @@ fn large_numeric_partition_value_that_overflows_i32_is_bigint_and_comparable() {
     let rows = run_all("SELECT id FROM t WHERE ts = 99999999999", &mut sess);
     assert_eq!(rows, vec![vec![Value::I64(1)]]);
 }
+
+#[test]
+fn mixed_int_and_bigint_partition_values_unify_and_compare() {
+    // One part infers `ts` as INT (`1`), the other as BIGINT (`99999999999`).
+    // Catalog unify widens to BIGINT; the scan must recast the INT part so
+    // ORDER BY / comparisons do not hit a mixed physical type.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![
+            ("data/ts=1/f.csv".into(), b"id\n1\n".to_vec()),
+            ("data/ts=99999999999/f.csv".into(), b"id\n2\n".to_vec()),
+        ],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT id, ts FROM t ORDER BY ts", &mut sess);
+    assert_eq!(
+        rows,
+        vec![vec![Value::I64(1), Value::I64(1)], vec![Value::I64(2), Value::I64(99999999999)],]
+    );
+    let rows = run_all("SELECT id FROM t WHERE ts > 10 ORDER BY id", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(2)]]);
+}

@@ -11,7 +11,8 @@
 
 use ahiru_core::catalog::Source;
 use ahiru_core::format::parquet::ParquetFormat;
-use ahiru_core::format::{PruneOp, Pruner, TableFormat};
+use ahiru_core::format::{FormatKind, PruneOp, Pruner, TableFormat};
+use ahiru_core::session::{Prepared, QueryStep, Session};
 use ahiru_core::vector::{Ty, Value, Vector};
 
 fn data(name: &str) -> Vec<u8> {
@@ -244,4 +245,42 @@ fn list_column_survives_page_pruning_on_a_sibling_column() {
             assert_eq!(got.unwrap(), format!("[{id},{}]", id + 1), "id={id}");
         }
     }
+}
+
+fn run_sql(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    let mut q = match session.prepare(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("{sql}: unexpected NeedIo"),
+    };
+    let mut rows = Vec::new();
+    loop {
+        match session.step(&mut q).unwrap() {
+            QueryStep::Batch(mut b) => {
+                b.materialize();
+                for r in 0..b.num_rows() {
+                    rows.push(b.cols.iter().map(|c| c.value_at(r)).collect());
+                }
+            }
+            QueryStep::Done => break,
+            QueryStep::NeedIo(_) | QueryStep::NeedCodec(_) => {
+                panic!("{sql}: unexpected NeedIo/NeedCodec")
+            }
+        }
+    }
+    rows
+}
+
+/// Flattened STRUCT leaves are stored as dotted field names. Unquoted
+/// `address.city` / `nested.a.b.c` must bind to those fields.
+#[test]
+fn struct_dotted_names_are_bindable_in_sql() {
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", data("struct1.parquet"), FormatKind::Parquet).unwrap();
+    let rows = run_sql(&mut sess, "SELECT address.city, address.zip FROM t WHERE id = 0");
+    assert_eq!(rows, vec![vec![Value::Bytes(b"Tokyo".to_vec()), Value::I32(10000)]]);
+
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", data("struct_deep.parquet"), FormatKind::Parquet).unwrap();
+    let rows = run_sql(&mut sess, "SELECT nested.a.b.c FROM t WHERE id = 3");
+    assert_eq!(rows, vec![vec![Value::I32(3)]]);
 }

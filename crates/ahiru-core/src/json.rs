@@ -591,18 +591,68 @@ pub(crate) fn list_slice(doc: &[u8], start: i64, end: i64) -> Result<Option<(usi
 }
 
 /// The body of `map_extract`. A direct member-name lookup (no path syntax).
-/// A non-object, or a missing key, gives `None`.
+///
+/// Accepts a JSON object (`{"a":1}`) and the Parquet MAP encoding — a JSON
+/// array of `{"key":...,"value":...}` pairs. A missing key, or a root that
+/// is neither an object nor such an array, gives `None`.
 pub(crate) fn map_get<'a>(doc: &'a [u8], key: &[u8]) -> Result<Option<&'a [u8]>> {
     let start = skip_ws(doc, 0);
-    if byte_at(doc, start)? != b'{' {
-        return Ok(None);
+    match byte_at(doc, start)? {
+        b'{' => match find_member(doc, start, key)? {
+            Some(vs) => {
+                let ve = skip_value(doc, vs)?;
+                Ok(Some(&doc[vs..ve]))
+            }
+            None => Ok(None),
+        },
+        b'[' => map_get_pairs(doc, key),
+        _ => Ok(None),
     }
-    match find_member(doc, start, key)? {
-        Some(vs) => {
-            let ve = skip_value(doc, vs)?;
-            Ok(Some(&doc[vs..ve]))
+}
+
+/// Looks up `key` in a Parquet-style MAP: `[{"key":...,"value":...}, ...]`.
+fn map_get_pairs<'a>(doc: &'a [u8], key: &[u8]) -> Result<Option<&'a [u8]>> {
+    let Some(elems) = array_elements(doc)? else {
+        return Ok(None);
+    };
+    for (span, kind) in elems {
+        if kind != Kind::Object {
+            continue;
         }
-        None => Ok(None),
+        let obj = skip_ws(span, 0);
+        let Some(ks) = find_member(span, obj, b"key")? else {
+            continue;
+        };
+        let ke = skip_value(span, ks)?;
+        if !json_key_matches(&span[ks..ke], key)? {
+            continue;
+        }
+        let Some(vs) = find_member(span, obj, b"value")? else {
+            return Ok(None);
+        };
+        let ve = skip_value(span, vs)?;
+        return Ok(Some(&span[vs..ve]));
+    }
+    Ok(None)
+}
+
+/// Whether a JSON key token equals the VARCHAR lookup key.
+/// String keys are unquoted (and unescaped); numbers/bools/null compare as
+/// their raw JSON text so `map_extract(m, '1')` hits a numeric MAP key `1`.
+fn json_key_matches(span: &[u8], want: &[u8]) -> Result<bool> {
+    let s = skip_ws(span, 0);
+    if byte_at(span, s)? == b'"' {
+        let (raw, esc, _) = scan_string(span, s)?;
+        if esc {
+            let mut scratch = Vec::new();
+            decode_string(raw, &mut scratch)?;
+            Ok(scratch == want)
+        } else {
+            Ok(raw == want)
+        }
+    } else {
+        let e = skip_value(span, s)?;
+        Ok(&span[s..e] == want)
     }
 }
 
@@ -860,6 +910,19 @@ mod tests {
         assert_eq!(map_get(br#"{"a":1,"b":2}"#, b"a").unwrap(), Some(&b"1"[..]));
         assert_eq!(map_get(br#"{"a":1}"#, b"z").unwrap(), None);
         assert_eq!(map_get(b"[1,2]", b"a").unwrap(), None);
+    }
+
+    #[test]
+    fn map_get_looks_up_parquet_map_pairs() {
+        let doc = br#"[{"key":"a","value":0},{"key":"b","value":2},{"key":"c","value":null}]"#;
+        assert_eq!(map_get(doc, b"a").unwrap(), Some(&b"0"[..]));
+        assert_eq!(map_get(doc, b"b").unwrap(), Some(&b"2"[..]));
+        assert_eq!(map_get(doc, b"c").unwrap(), Some(&b"null"[..]));
+        assert_eq!(map_get(doc, b"z").unwrap(), None);
+        // Numeric MAP keys compare as their JSON text.
+        let nums = br#"[{"key":1,"value":"v1"},{"key":2,"value":"v2"}]"#;
+        assert_eq!(map_get(nums, b"1").unwrap(), Some(&br#""v1""#[..]));
+        assert_eq!(map_get(nums, b"2").unwrap(), Some(&br#""v2""#[..]));
     }
 
     #[test]

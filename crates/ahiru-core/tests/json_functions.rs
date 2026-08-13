@@ -168,6 +168,30 @@ fn map_extract_looks_up_object_keys() {
     assert_eq!(one(&mut sess, r#"map_extract('{"a":1}', 'z')"#), Value::Null);
 }
 
+#[test]
+fn map_extract_reads_parquet_map_pair_arrays() {
+    // Parquet MAP is stored as `[{"key":...,"value":...}, ...]`.
+    // map_basic row id=1: a=1, b=2, c=null.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", data("map_basic.parquet"), ahiru_core::format::FormatKind::Parquet)
+        .unwrap();
+    let rows = run(
+        &mut sess,
+        "SELECT map_extract(m, 'a'), map_extract(m, 'b'), map_extract(m, 'z') FROM t WHERE id = 1",
+    );
+    assert_eq!(rows, vec![vec![s("1"), s("2"), Value::Null]]);
+
+    let mut sess = Session::new();
+    sess.register_bytes_as(
+        "t",
+        data("map_int_key.parquet"),
+        ahiru_core::format::FormatKind::Parquet,
+    )
+    .unwrap();
+    let rows = run(&mut sess, "SELECT map_extract(m, '1') FROM t WHERE id = 1");
+    assert_eq!(rows, vec![vec![s("\"v1\"")]]);
+}
+
 // --- list_concat / `||` on lists ---------------------------------------------
 
 #[test]

@@ -908,10 +908,14 @@ impl<'a> Compiler<'a> {
         let (hr, ht) = self.expr(high)?;
 
         let (a1, l, t1) = self.unify_operands(ar, at, lr, lt)?;
+        // INTERVAL/JSON have no ordering (`<`/`>` are TypeMismatch); BETWEEN
+        // must not silently fall through to a physical byte compare.
+        ensure!(t1 != Ty::Interval && t1 != Ty::Json, TypeMismatch);
         let ge = self.prog.alloc_reg();
         self.prog.push(Instr::new(OpCode::Ge, t1.phys(), ge, a1, l));
 
         let (a2, h, t2) = self.unify_operands(ar, at, hr, ht)?;
+        ensure!(t2 != Ty::Interval && t2 != Ty::Json, TypeMismatch);
         let le = self.prog.alloc_reg();
         self.prog.push(Instr::new(OpCode::Le, t2.phys(), le, a2, h));
 
@@ -1075,6 +1079,27 @@ mod tests {
         assert!(p.instrs.iter().any(|i| i.op == OpCode::Ge));
         assert!(p.instrs.iter().any(|i| i.op == OpCode::Le));
         assert!(p.instrs.iter().any(|i| i.op == OpCode::And));
+    }
+
+    #[test]
+    fn between_rejects_interval_and_json() {
+        let mut a = ExprArena::new();
+        let col = a.push(Expr::ColumnRef { qualifier: None, name: "iv".into() });
+        let lo = a.push(Expr::IntervalLiteral(0));
+        let hi = a.push(Expr::IntervalLiteral(1));
+        let id = a.push(Expr::Between { arg: col, low: lo, high: hi, negated: false });
+        let scope = Scope::from_fields(vec![Field::new("iv", Ty::Interval, true)]);
+        assert_eq!(code_of(compile(&a, &scope, &[], id)), Some(crate::error::Code::TypeMismatch));
+
+        let mut a = ExprArena::new();
+        let col = a.push(Expr::ColumnRef { qualifier: None, name: "j".into() });
+        let lo_s = a.push(Expr::Literal(Value::Bytes(b"1".to_vec())));
+        let lo = a.push(Expr::Cast { arg: lo_s, ty: Ty::Json, try_: false });
+        let hi_s = a.push(Expr::Literal(Value::Bytes(b"9".to_vec())));
+        let hi = a.push(Expr::Cast { arg: hi_s, ty: Ty::Json, try_: false });
+        let id = a.push(Expr::Between { arg: col, low: lo, high: hi, negated: false });
+        let scope = Scope::from_fields(vec![Field::new("j", Ty::Json, true)]);
+        assert_eq!(code_of(compile(&a, &scope, &[], id)), Some(crate::error::Code::TypeMismatch));
     }
 
     #[test]

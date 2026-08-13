@@ -1248,7 +1248,11 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                             } else if -k > 38 {
                                 Some(0)
                             } else {
-                                pow10_i128((-k) as u32).map(|p| m / p)
+                                // Same away-from-zero rounding as DECIMAL
+                                // scale-down (`CAST(1.5 AS INTEGER)` is 2;
+                                // `CAST('1.5' AS INTEGER)` must not truncate
+                                // to 1).
+                                pow10_i128((-k) as u32).and_then(|p| rescale_i128(m, 1, p, false))
                             };
                             match y {
                                 Some(y) => store_i128(&mut data, y),

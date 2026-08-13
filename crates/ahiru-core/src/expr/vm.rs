@@ -787,12 +787,16 @@ mod tests {
         assert_eq!(r.bytes().get(1), b"-0.25");
 
         // VARCHAR -> numeric. Only unreadable rows become NULL.
-        let src = bytes(&[b"42", b" -7 ", b"abc", b"1.9"]);
+        // Fractional strings round away from zero (same as DECIMAL scale-down),
+        // so they agree with `CAST(1.5 AS INTEGER)` rather than truncating.
+        let src = bytes(&[b"42", b" -7 ", b"abc", b"1.9", b"1.5", b"-1.5"]);
         let r = cast_of(Ty::Varchar, Ty::Int, src).unwrap();
         assert_eq!(r.i32s()[0], 42);
         assert_eq!(r.i32s()[1], -7);
         assert!(!r.is_valid(2));
-        assert_eq!(r.i32s()[3], 1);
+        assert_eq!(r.i32s()[3], 2);
+        assert_eq!(r.i32s()[4], 2);
+        assert_eq!(r.i32s()[5], -2);
 
         let src = bytes(&[b"1.25e2", b"nope"]);
         let r = cast_of(Ty::Varchar, Ty::Double, src).unwrap();
@@ -800,7 +804,10 @@ mod tests {
         assert!(!r.is_valid(1));
 
         let src = bytes(&[b"12.345"]);
-        assert_eq!(cast_of(Ty::Varchar, d2, src).unwrap().i64s(), &[1234]);
+        assert_eq!(cast_of(Ty::Varchar, d2, src).unwrap().i64s(), &[1235]);
+        let src = bytes(&[b"1.25"]);
+        let d1 = Ty::Decimal { precision: 10, scale: 1 };
+        assert_eq!(cast_of(Ty::Varchar, d1, src).unwrap().i64s(), &[13]);
     }
 
     #[test]
