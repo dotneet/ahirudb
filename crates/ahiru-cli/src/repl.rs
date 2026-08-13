@@ -732,23 +732,10 @@ fn split_script(text: &str) -> Vec<Piece> {
 /// This engine requires a `FROM` clause on every `SELECT`
 /// (docs/sql/queries.md), which a shell user does not expect when typing
 /// `SELECT 1 + 1`. The rewrite fires for a statement that starts with `SELECT`
-/// and whose top level (outside string literals, quoted identifiers, comments
-/// and parentheses) has no `FROM` and no set-operation / grouping / filter
-/// keyword. Trailing `ORDER BY` / `LIMIT` / `OFFSET` are allowed:
-/// `dummy_from` inserts `FROM range(1)` immediately before them.
+/// and whose top level has no `FROM` and no set operation. Trailing clauses
+/// (`WHERE`, `ORDER BY`, `LIMIT`, …) stay after the inserted `FROM range(1)`.
 fn needs_dummy_from(sql: &str) -> bool {
-    const BLOCKERS: &[&str] = &[
-        "FROM",
-        "UNION",
-        "INTERSECT",
-        "EXCEPT",
-        "GROUP",
-        "WHERE",
-        "HAVING",
-        "QUALIFY",
-        "WINDOW",
-        "USING",
-    ];
+    const BLOCKERS: &[&str] = &["FROM", "UNION", "INTERSECT", "EXCEPT"];
     let words = top_level_words(sql);
     match words.first() {
         Some((_, w)) if w == "SELECT" => {}
@@ -758,19 +745,44 @@ fn needs_dummy_from(sql: &str) -> bool {
 }
 
 /// Rewrites a clauseless `SELECT` so the engine's required `FROM` is present.
-/// `ORDER BY` / `LIMIT` / `OFFSET` stay after the inserted `FROM range(1)`.
+/// Trailing clauses (`WHERE` / `GROUP BY` / `ORDER BY` / `LIMIT` / …) stay
+/// after the inserted `FROM range(1)`. `AS order` / `AS limit` are aliases,
+/// not clauses, and must not be treated as insert points.
 fn dummy_from(sql: &str) -> Option<String> {
     if !needs_dummy_from(sql) {
         return None;
     }
-    const TAIL: &[&str] = &["ORDER", "LIMIT", "OFFSET"];
-    let insert_at = top_level_words(sql)
-        .into_iter()
-        .find_map(|(start, w)| TAIL.contains(&w.as_str()).then_some(start));
+    let words = top_level_words(sql);
+    let insert_at =
+        words.iter().find_map(|&(start, ref w)| clause_starts_at(sql, start, w).then_some(start));
     Some(match insert_at {
         Some(i) => format!("{} FROM range(1) {}", sql[..i].trim_end(), &sql[i..]),
         None => format!("{sql} FROM range(1)"),
     })
+}
+
+/// Whether the top-level word at `start` begins a SELECT tail clause.
+fn clause_starts_at(sql: &str, start: usize, word: &str) -> bool {
+    match word {
+        "WHERE" | "GROUP" | "HAVING" | "WINDOW" | "QUALIFY" | "USING" => true,
+        "ORDER" => next_word_is(sql, start + word.len(), "BY"),
+        "LIMIT" | "OFFSET" => looks_like_limit_arg(sql, start + word.len()),
+        _ => false,
+    }
+}
+
+fn next_word_is(sql: &str, from: usize, want: &str) -> bool {
+    let rest = sql[from.min(sql.len())..].trim_start();
+    rest.len() >= want.len()
+        && rest[..want.len()].eq_ignore_ascii_case(want)
+        && rest[want.len()..].starts_with(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+fn looks_like_limit_arg(sql: &str, from: usize) -> bool {
+    let rest = sql[from.min(sql.len())..].trim_start();
+    rest.starts_with(|c: char| c.is_ascii_digit())
+        || rest.starts_with('?')
+        || next_word_is(sql, from, "ALL")
 }
 
 /// Upper-cased bare words of `sql` that sit at parenthesis depth 0, outside
@@ -1033,6 +1045,19 @@ mod tests {
             Some("SELECT 1 AS x FROM range(1) ORDER BY x")
         );
         assert_eq!(dummy_from("SELECT 1 + 1").as_deref(), Some("SELECT 1 + 1 FROM range(1)"));
+        // `AS order` / `AS limit` are aliases, not ORDER BY / LIMIT clauses.
+        assert_eq!(
+            dummy_from("SELECT 1 AS order").as_deref(),
+            Some("SELECT 1 AS order FROM range(1)")
+        );
+        assert_eq!(
+            dummy_from("SELECT 1 AS limit").as_deref(),
+            Some("SELECT 1 AS limit FROM range(1)")
+        );
+        assert_eq!(
+            dummy_from("SELECT 1 WHERE false").as_deref(),
+            Some("SELECT 1 FROM range(1) WHERE false")
+        );
     }
 
     #[test]

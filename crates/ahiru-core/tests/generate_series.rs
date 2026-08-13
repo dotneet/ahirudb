@@ -133,7 +133,31 @@ fn table_alias_qualifies_the_column_reference() {
     assert_eq!(rows, i64s(1..3));
 }
 
+#[test]
+fn default_table_alias_is_the_function_name() {
+    let mut db = session_with_dual();
+    let (schema, rows) = run(&mut db, "SELECT range.* FROM range(3)");
+    assert_eq!(schema[0].name, "range");
+    assert_eq!(rows, i64s(0..3));
+    let (_, rows) = run(&mut db, "SELECT range.range FROM range(3) WHERE range.range > 0");
+    assert_eq!(rows, i64s(1..3));
+    let (schema, rows) = run(&mut db, "SELECT generate_series.* FROM generate_series(1, 3)");
+    assert_eq!(schema[0].name, "generate_series");
+    assert_eq!(rows, i64s(1..=3));
+}
+
 // --- Combinations --------------------------------------------------------------
+
+#[test]
+fn bare_null_where_is_unknown_not_a_type_error() {
+    let mut db = session_with_dual();
+    let (_, rows) = run(&mut db, "SELECT 1 FROM range(3) WHERE NULL");
+    assert!(rows.is_empty());
+    let (_, rows) = run(&mut db, "SELECT 1 FROM range(3) WHERE TRUE AND NULL");
+    assert!(rows.is_empty());
+    let (_, rows) = run(&mut db, "SELECT NOT NULL FROM range(1)");
+    assert_eq!(rows, vec![vec![Value::Null]]);
+}
 
 #[test]
 fn works_with_where_and_order_by() {

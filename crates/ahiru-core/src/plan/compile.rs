@@ -79,8 +79,25 @@ pub fn compile_predicate_with_subs(
     id: ExprId,
 ) -> Result<Program> {
     let p = compile_with_subs(arena, scope, params, subs, id)?;
-    ensure!(matches!(p.result_ty, Ty::Boolean | Ty::Null), TypeMismatch);
+    if p.result_ty == Ty::Null {
+        // A bare `NULL` (or `?` bound to null) is UNKNOWN, not a type error.
+        // `eval_filter` requires a BOOLEAN physical type, so materialize a
+        // BOOLEAN NULL constant rather than leaving `Ty::Null` (I32).
+        return Ok(boolean_null_program());
+    }
+    ensure!(p.result_ty == Ty::Boolean, TypeMismatch);
     Ok(p)
+}
+
+/// `WHERE NULL` / a leftover `AND NULL` conjunct: one BOOLEAN NULL row.
+fn boolean_null_program() -> Program {
+    let mut p = Program::new();
+    let k = p.add_const(Ty::Boolean, Value::Null);
+    let dst = p.alloc_reg();
+    p.push(Instr::with_aux(OpCode::LoadConst, Ty::Boolean.phys(), dst, 0, 0, k));
+    p.result = dst;
+    p.result_ty = Ty::Boolean;
+    p
 }
 
 /// A program that just returns the input columns unchanged. Used by `SELECT *` and join keys.
@@ -772,6 +789,7 @@ impl<'a> Compiler<'a> {
             }
             UnaryOp::Not => {
                 ensure!(matches!(t, Ty::Boolean | Ty::Null), TypeMismatch);
+                let r = self.coerce(r, t, Ty::Boolean)?;
                 Ok((self.emit(OpCode::Not, Ty::Boolean, r, 0), Ty::Boolean))
             }
         }
@@ -1020,7 +1038,7 @@ impl<'a> Compiler<'a> {
 mod tests {
     use super::*;
     use crate::error::code_of;
-    use crate::sql::ast::Expr;
+    use crate::sql::ast::{Expr, UnaryOp};
     use crate::vector::Field;
 
     fn cols() -> Scope {
@@ -1161,6 +1179,23 @@ mod tests {
         let mut a = ExprArena::new();
         let id = a.push(Expr::ColumnRef { qualifier: None, name: "id".into() });
         assert_eq!(code_of(compile_predicate(&a, &cols(), &[], id)), Some(Code::TypeMismatch));
+    }
+
+    #[test]
+    fn bare_null_predicate_is_boolean_unknown() {
+        let mut a = ExprArena::new();
+        let id = a.push(Expr::Literal(Value::Null));
+        let p = compile_predicate(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Boolean);
+    }
+
+    #[test]
+    fn not_null_is_boolean_unknown() {
+        let mut a = ExprArena::new();
+        let n = a.push(Expr::Literal(Value::Null));
+        let id = a.push(Expr::Unary { op: UnaryOp::Not, arg: n });
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.result_ty, Ty::Boolean);
     }
 
     #[test]

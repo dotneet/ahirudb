@@ -149,6 +149,14 @@ fn select_list_unnest_default_column_name_is_unnest() {
     assert_eq!(schema[0].name, "unnest");
 }
 
+#[test]
+fn from_unnest_default_table_alias_is_unnest() {
+    let mut db = session_with_dual();
+    let (schema, rows) = run(&mut db, "SELECT unnest.* FROM dual, UNNEST(list_value(1, 2))");
+    assert_eq!(schema[0].name, "unnest");
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)]]);
+}
+
 // --- FROM clause (implicit LATERAL) --------------------------------------------
 
 /// duckdb: `SELECT t.id, y.x FROM 'list_varied.parquet' t, UNNEST(t.xs) AS

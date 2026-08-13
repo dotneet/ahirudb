@@ -86,12 +86,9 @@ impl Engine {
     /// `FROM 'data/x.parquet'` / `read_parquet('data/x.parquet')` resolve.
     /// Returns the alias the table got.
     pub fn register_arg(&mut self, arg: &str) -> R<String> {
-        let (alias, spec) = match arg.split_once('=') {
-            // Only treat `x=y` as an alias when `x` looks like an identifier;
-            // otherwise it is a path that happens to contain `=` (Hive layouts
-            // are full of them: `year=2024/part.parquet`).
-            Some((name, rest)) if is_identifier(name) => (Some(name.to_string()), rest),
-            _ => (None, arg),
+        let (alias, spec) = match split_alias_spec(arg) {
+            (Some(name), rest) => (Some(name.to_string()), rest),
+            (None, rest) => (None, rest),
         };
         let alias = match alias {
             Some(a) => a,
@@ -304,6 +301,27 @@ impl Engine {
     }
 }
 
+/// Splits a CLI file argument into `(optional alias, spec)`.
+///
+/// `name=path` is only used when `name` is a bare identifier *and* the
+/// whole argument is not itself an existing file, directory, or matching
+/// glob. Otherwise `year=2024/part.parquet` (a Hive-style relative path)
+/// would be read as alias `year` and file `2024/part.parquet`.
+fn split_alias_spec(arg: &str) -> (Option<&str>, &str) {
+    match arg.split_once('=') {
+        Some((name, rest)) if is_identifier(name) && !spec_exists(arg) => (Some(name), rest),
+        _ => (None, arg),
+    }
+}
+
+fn spec_exists(spec: &str) -> bool {
+    if glob::is_pattern(spec) {
+        !glob::expand(spec).is_empty()
+    } else {
+        Path::new(spec).exists()
+    }
+}
+
 /// True for a bare SQL identifier, used to tell `name=path` from a path that
 /// merely contains `=`.
 fn is_identifier(s: &str) -> bool {
@@ -503,6 +521,26 @@ mod tests {
     fn identifier_check_keeps_hive_paths_intact() {
         assert!(is_identifier("sales"));
         assert!(!is_identifier("data/year=2024"));
+    }
+
+    #[test]
+    fn split_alias_does_not_eat_an_existing_hive_relative_path() {
+        let dir = std::env::temp_dir().join(format!("ahiru-hive-{}", std::process::id()));
+        let hive = dir.join("year=2024");
+        std::fs::create_dir_all(&hive).unwrap();
+        let file = hive.join("part.csv");
+        std::fs::write(&file, b"id\n1\n").unwrap();
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("chdir");
+        let got = split_alias_spec("year=2024/part.csv");
+        std::env::set_current_dir(&cwd).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, (None, "year=2024/part.csv"));
+    }
+
+    #[test]
+    fn split_alias_still_accepts_name_eq_path() {
+        assert_eq!(split_alias_spec("sales=data.parquet"), (Some("sales"), "data.parquet"));
     }
 
     #[test]

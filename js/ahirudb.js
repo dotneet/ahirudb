@@ -379,10 +379,9 @@ function urlSource(url, fetchImpl) {
         }
         const start = Number(m[1]);
         const end = Number(m[2]);
-        if (start === offset && end - start + 1 === buf.byteLength) return buf; // exactly what was asked for
-        // The server answered a different range than requested (most commonly:
-        // the whole file, ignoring Range, while still claiming 206). Slice out the
-        // requested window only when Content-Range proves it is actually in there.
+        // Slice whenever Content-Range proves the requested window is inside
+        // the body. A wider 206 (start matches, body longer than `len`) used
+        // to be returned unsliced and then rejected as an over-long read.
         if (start <= offset && offset + len <= start + buf.byteLength) {
           return buf.subarray(offset - start, offset - start + len);
         }
@@ -394,11 +393,11 @@ function urlSource(url, fetchImpl) {
       }
       // Some servers ignore Range and return 200 with the whole thing. Slice out the requested window.
       if (buf.byteLength >= offset + len) return buf.subarray(offset, offset + len);
+      // A body of the requested length at offset 0 is the prefix we asked for.
+      // The same length at a non-zero offset is *not* trustworthy: a Range-unaware
+      // server often returns the first `len` bytes of the file (or an error page)
+      // and would silently poison the engine with the wrong window.
       if (buf.byteLength === len && offset === 0) return buf;
-      // 200 with a body of exactly the requested length at a non-zero offset: treat
-      // it as a range body (the server honoured Range but answered 200). A short
-      // body cannot be the requested window.
-      if (buf.byteLength === len) return buf;
       throw new AhiruError(Code.IO_FAILED, {
         detail:
           `${redactUrl(url)}: 200 response length ${buf.byteLength} does not cover ` +

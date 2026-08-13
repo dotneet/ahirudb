@@ -86,29 +86,42 @@ fn round16(n: usize) -> usize {
 impl Heap {
     /// Carves `n` bytes (a multiple of 16) out of the bump region.
     unsafe fn carve(&mut self, n: usize) -> *mut u8 {
-        if self.bump + n > self.end && !unsafe { self.grow(n) } {
-            return ptr::null_mut();
+        loop {
+            match self.bump.checked_add(n) {
+                Some(end) if end <= self.end => {
+                    let p = self.bump;
+                    self.bump = end;
+                    return p as *mut u8;
+                }
+                _ => {
+                    if !unsafe { self.grow(n) } {
+                        return ptr::null_mut();
+                    }
+                }
+            }
         }
-        let p = self.bump;
-        self.bump += n;
-        p as *mut u8
     }
 
     unsafe fn grow(&mut self, need: usize) -> bool {
         let pages = need.div_ceil(PAGE).max(GROW_PAGES);
+        let Some(bytes) = pages.checked_mul(PAGE) else {
+            return false;
+        };
         let prev = memory_grow(pages);
         if prev == usize::MAX {
             return false;
         }
-        let start = prev * PAGE;
+        let Some(start) = prev.checked_mul(PAGE) else {
+            return false;
+        };
+        let Some(new_end) = start.checked_add(bytes) else {
+            return false;
+        };
         if start == self.end {
-            // Contiguous with the previous region, so just extend the end.
-            self.end = start + pages * PAGE;
+            self.end = new_end;
         } else {
-            // Otherwise, discard the old remainder. This is unreachable unless
-            // something other than us calls memory.grow.
             self.bump = start;
-            self.end = start + pages * PAGE;
+            self.end = new_end;
         }
         true
     }
@@ -149,6 +162,15 @@ unsafe impl GlobalAlloc for ZstdAlloc {
         while !cur.is_null() {
             if unsafe { (*cur).size } >= need {
                 unsafe { *prev = (*cur).next };
+                let rem = unsafe { (*cur).size } - need;
+                if rem > 0 {
+                    let rest = unsafe { (cur as *mut u8).add(need) as *mut LargeNode };
+                    unsafe {
+                        (*rest).next = h.large;
+                        (*rest).size = rem;
+                    }
+                    h.large = rest;
+                }
                 return cur as *mut u8;
             }
             prev = unsafe { &mut (*cur).next };

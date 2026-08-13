@@ -404,7 +404,12 @@ pub(super) fn bind_select_in(
             sel.limit.is_none()
                 && sel.offset.is_none()
                 && sel.order_by.is_empty()
-                && sel.qualify.is_none(),
+                && sel.qualify.is_none()
+                // `DISTINCT ON` keys only the user columns, not the correlation
+                // keys appended during decorrelation, so it can drop the wrong
+                // outer rows. Plain `DISTINCT` is safe: it keys `0..visible`,
+                // which already includes those columns.
+                && sel.distinct_on.is_empty(),
             UnsupportedFeature
         );
         let mut win_probe = Vec::new();

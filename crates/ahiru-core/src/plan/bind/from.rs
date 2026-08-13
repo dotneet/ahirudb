@@ -168,7 +168,9 @@ pub(super) fn flatten_from(
             let elem_ty = narrow_unnest_elem_ty(arena, &scope_so_far, params, *expr);
             let name = column_alias.clone().unwrap_or_else(|| String::from("unnest"));
             let all = vec![Field::new(name, elem_ty, true)];
-            let alias = alias.clone().unwrap_or_default();
+            // DuckDB uses the function name as the default table alias, so
+            // `unnest.*` / `unnest.unnest` resolve. An explicit `AS` wins.
+            let alias = alias.clone().unwrap_or_else(|| String::from("unnest"));
             rels.push(Rel {
                 table: None,
                 alias,
@@ -197,7 +199,11 @@ pub(super) fn flatten_from(
                 inclusive: *inclusive,
                 schema: all.clone(),
             };
-            let alias = alias.clone().unwrap_or_default();
+            // Same as DuckDB: `FROM range(3)` is addressable as `range` /
+            // `range.range` / `range.*`, not only as the bare column name.
+            let alias = alias.clone().unwrap_or_else(|| {
+                String::from(if *inclusive { "generate_series" } else { "range" })
+            });
             rels.push(Rel {
                 table: None,
                 alias,

@@ -651,6 +651,62 @@ test('a 206 response whose Content-Range does not cover the requested window is 
   }
 });
 
+test('a 200 response of exactly the requested length is rejected at a non-zero offset', async () => {
+  const file = new Uint8Array(await readFile(WIDE));
+  const url = 'https://example.invalid/prefix200.parquet';
+  const fetchImpl = async (_target, init = {}) => {
+    const method = init.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, { headers: { 'content-length': String(file.length) } });
+    }
+    const raw = new Headers(init.headers ?? {}).get('range') ?? '';
+    const m = /bytes=(\d+)-(\d+)/.exec(raw);
+    const start = Number(m[1]);
+    const len = Number(m[2]) - start + 1;
+    // Range-unaware: always the first `len` bytes, 200.
+    return new Response(file.subarray(0, len), { status: 200 });
+  };
+  const db = await openDb({ fetch: fetchImpl });
+  try {
+    db.registerParquet('t', url);
+    await assert.rejects(
+      () => db.query('SELECT id FROM t LIMIT 1'),
+      (e) => e instanceof AhiruError && e.code === Code.IO_FAILED,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('a 206 response wider than requested is sliced to the requested window', async () => {
+  const file = new Uint8Array(await readFile(WIDE));
+  const url = 'https://example.invalid/wide206.parquet';
+  const fetchImpl = async (_target, init = {}) => {
+    const method = init.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, { headers: { 'content-length': String(file.length) } });
+    }
+    const raw = new Headers(init.headers ?? {}).get('range') ?? '';
+    const m = /bytes=(\d+)-(\d+)/.exec(raw);
+    const start = Number(m[1]);
+    const end = Number(m[2]);
+    // Honour the start but send 64 extra bytes past the requested end.
+    const sendEnd = Math.min(file.length - 1, end + 64);
+    return new Response(file.subarray(start, sendEnd + 1), {
+      status: 206,
+      headers: { 'content-range': `bytes ${start}-${sendEnd}/${file.length}` },
+    });
+  };
+  const db = await openDb({ fetch: fetchImpl });
+  try {
+    db.registerParquet('t', url);
+    const rows = await db.query('SELECT id FROM t LIMIT 1');
+    assert.equal(rows.length, 1);
+  } finally {
+    db.close();
+  }
+});
+
 test('a 206 response with no Content-Range is rejected when the offset is not zero', async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const url = 'https://example.invalid/no-cr.parquet';

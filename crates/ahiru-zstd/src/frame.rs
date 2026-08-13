@@ -271,6 +271,17 @@ fn one_frame(src: &[u8], mut pos: usize, out: &mut Vec<u8>, limit: usize) -> Res
     Ok(pos)
 }
 
+/// Regenerated sizes of the four Huffman streams.
+///
+/// RFC 8878's prose lists `(n+3)/4 … n/4`, but libzstd (`HUF_decompress4X`)
+/// lays the output out as four segments of `segmentSize = (n+3)/4`, with the
+/// last stream taking whatever remains. Real Parquet pages follow libzstd.
+fn huf_4stream_sizes(regen: usize) -> Option<[usize; 4]> {
+    let seg = regen.div_ceil(4);
+    let last = regen.checked_sub(seg.checked_mul(3)?)?;
+    Some([seg, seg, seg, last])
+}
+
 impl State {
     /// One compressed block. Literals section first, then the sequences section.
     fn block(
@@ -372,11 +383,9 @@ impl State {
             let s3 = u16::from_le_bytes([jt[4], jt[5]]) as usize;
             let body4 = &streams_buf[6..];
             let s4 = body4.len().checked_sub(s1 + s2 + s3).ok_or(Error::BadLiterals)?;
-            // Each stream covers a quarter, and only the last one carries the remainder.
-            let seg = regen.div_ceil(4);
-            let last = regen.checked_sub(seg * 3).ok_or(Error::BadLiterals)?;
+            let [n1, n2, n3, n4] = huf_4stream_sizes(regen).ok_or(Error::BadLiterals)?;
             let mut at = 0usize;
-            for (sz, n) in [(s1, seg), (s2, seg), (s3, seg), (s4, last)] {
+            for (sz, n) in [(s1, n1), (s2, n2), (s3, n3), (s4, n4)] {
                 let part = body4.get(at..at + sz).ok_or(Error::UnexpectedEof)?;
                 h.decode_stream(part, n, lits)?;
                 at += sz;
@@ -599,5 +608,21 @@ mod predefined_tests {
         assert_eq!((LL_BASE[35], LL_BITS[35]), (65536, 16));
         assert_eq!((ML_BASE[52], ML_BITS[52]), (65539, 16));
         assert_eq!((ML_BASE[0], ML_BITS[0]), (3, 0));
+    }
+
+    #[test]
+    fn four_stream_sizes_match_libzstd() {
+        assert_eq!(huf_4stream_sizes(4), Some([1, 1, 1, 1]));
+        assert_eq!(huf_4stream_sizes(6), Some([2, 2, 2, 0]));
+        assert_eq!(huf_4stream_sizes(7), Some([2, 2, 2, 1]));
+        assert_eq!(huf_4stream_sizes(8), Some([2, 2, 2, 2]));
+        // Differs from the RFC prose ((n+3)/4 … n/4 = 26,25,25,25).
+        assert_eq!(huf_4stream_sizes(101), Some([26, 26, 26, 23]));
+        assert_eq!(huf_4stream_sizes(102), Some([26, 26, 26, 24]));
+        for n in 6..128 {
+            if let Some(sizes) = huf_4stream_sizes(n) {
+                assert_eq!(sizes.iter().sum::<usize>(), n, "n={n}");
+            }
+        }
     }
 }

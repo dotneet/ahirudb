@@ -258,6 +258,17 @@ fn correlation_inside_or_is_rejected() {
 /// no way to merge the correlation key into that grouping (silently ignoring the correlation
 /// would let the aggregate mix across outer rows, producing a wrong result).
 #[test]
+fn correlated_distinct_on_is_rejected() {
+    let mut db = session_with_customers_orders();
+    let err = db.prepare(
+        "SELECT c.id FROM customers c WHERE EXISTS \
+         (SELECT DISTINCT ON (o.region) o.region FROM orders o WHERE o.customer_id = c.id)",
+        &[],
+    );
+    assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
+}
+
+#[test]
 fn correlated_aggregate_with_own_group_by_is_rejected() {
     let mut db = session_with_customers_orders();
     let err = db.prepare(
