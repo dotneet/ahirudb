@@ -284,6 +284,8 @@ pub(super) fn build_quantified_comparison(
             distinct: false,
             name: "cnt".into(),
             separator: Vec::new(),
+            quantile: 0.5,
+            arg2: None,
             filter: None,
         },
         Agg {
@@ -292,6 +294,8 @@ pub(super) fn build_quantified_comparison(
             distinct: false,
             name: "nonnull".into(),
             separator: Vec::new(),
+            quantile: 0.5,
+            arg2: None,
             filter: None,
         },
         Agg {
@@ -300,6 +304,8 @@ pub(super) fn build_quantified_comparison(
             distinct: false,
             name: "extreme".into(),
             separator: Vec::new(),
+            quantile: 0.5,
+            arg2: None,
             filter: None,
         },
     ];

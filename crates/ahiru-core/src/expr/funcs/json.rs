@@ -134,6 +134,121 @@ pub(super) fn concat_all(args: &[&Vector], ty: Ty) -> Result<Vector> {
     Ok(Vector::from_data(ty, Data::Bytes(out), None))
 }
 
+/// `concat_ws(sep, x, ...)`. A NULL value argument is dropped along with the separator that
+/// would have preceded it, so `concat_ws('-', 'a', NULL, 'b')` is `a-b` rather than `a--b`.
+/// A NULL **separator** makes the whole row NULL (both verified against duckdb).
+pub(super) fn concat_ws_build(args: &[&Vector], ty: Ty) -> Result<Vector> {
+    let (n, s) = strides(args)?;
+    let mut out = BytesData::with_capacity(n, n * 8);
+    let mut bad: Option<Bitmap> = None;
+    for i in 0..n {
+        if !args[0].is_valid(i * s[0]) {
+            out.offsets.push(out.data.len() as u32);
+            set_null(&mut bad, i, n);
+            continue;
+        }
+        let sep = args[0].bytes().get(i * s[0]);
+        let mut first = true;
+        for (k, a) in args.iter().enumerate().skip(1) {
+            let j = i * s[k];
+            if !a.is_valid(j) {
+                continue;
+            }
+            if !first {
+                out.data.extend_from_slice(sep);
+            }
+            out.data.extend_from_slice(a.bytes().get(j));
+            first = false;
+        }
+        ensure!(out.data.len() <= u32::MAX as usize, LimitExceeded);
+        out.offsets.push(out.data.len() as u32);
+    }
+    Ok(Vector::from_data(ty, Data::Bytes(out), bad))
+}
+
+// =========================================================================
+// LIST functions over the JSON representation
+// =========================================================================
+
+/// Serializes one row of a `list_contains`/`list_position` search value into JSON text, so it
+/// can be compared byte-wise against the array's element spans.
+fn search_text(a: &A, out: &mut Vec<u8>) {
+    if let Some((v, j)) = a.at(1) {
+        write_json_scalar(v, j, out);
+    }
+}
+
+/// The 1-based index of `needle` in the array, or 0 when absent. `None` when the argument is
+/// not an array at all (the caller turns that into SQL NULL, matching duckdb's behavior for
+/// `list_position` on a non-list).
+pub(super) fn list_find(a: &A) -> Result<Option<i64>> {
+    let mut needle = Vec::new();
+    search_text(a, &mut needle);
+    let doc = a.bytes(0);
+    let elems = match crate::json::array_elements(doc)? {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    for (k, (span, _)) in elems.iter().enumerate() {
+        if *span == needle.as_slice() {
+            return Ok(Some(k as i64 + 1));
+        }
+    }
+    Ok(Some(0))
+}
+
+/// `list_sort` / `list_distinct` / `list_reverse`. All three only reorder or drop whole element
+/// spans, so one body covers them: parse once, permute the spans, re-emit.
+pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Result<bool> {
+    let elems = match crate::json::array_elements(doc)? {
+        Some(e) => e,
+        // Not an array -> NULL, the same judgment as `list_find`.
+        None => return Ok(false),
+    };
+    let mut order: Vec<usize> = (0..elems.len()).collect();
+    match id {
+        F_LIST_REVERSE => order.reverse(),
+        F_LIST_SORT => order.sort_by(|&x, &y| cmp_elem(elems[x], elems[y])),
+        // Keeps first-occurrence order (duckdb's `list_distinct` does not promise an order, and
+        // this way the function needs no comparator).
+        _ => order.retain(|&k| !elems[..k].iter().any(|e| e.0 == elems[k].0)),
+    }
+    out.push(b'[');
+    for (i, &k) in order.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(elems[k].0);
+    }
+    out.push(b']');
+    Ok(true)
+}
+
+/// The ordering `list_sort` uses. JSON is untyped, so elements are ranked by kind first
+/// (numbers < strings < booleans < arrays < objects, with `null` last like duckdb's default
+/// `NULLS LAST`), then within a kind: numbers numerically, everything else by raw span bytes.
+fn cmp_elem(a: crate::json::Elem, b: crate::json::Elem) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let rank = |k: crate::json::Kind| match k {
+        crate::json::Kind::Num => 0u8,
+        crate::json::Kind::Str => 1,
+        crate::json::Kind::Bool => 2,
+        crate::json::Kind::Array => 3,
+        crate::json::Kind::Object => 4,
+        crate::json::Kind::Null => 5,
+    };
+    match rank(a.1).cmp(&rank(b.1)) {
+        Ordering::Equal => {}
+        o => return o,
+    }
+    if a.1 == crate::json::Kind::Num {
+        if let (Some(x), Some(y)) = (crate::json::parse_f64(a.0), crate::json::parse_f64(b.0)) {
+            return ord_f64(x, y);
+        }
+    }
+    a.0.cmp(b.0)
+}
+
 // =========================================================================
 // JSON construction (sharing `to_json`'s value serialization)
 // =========================================================================

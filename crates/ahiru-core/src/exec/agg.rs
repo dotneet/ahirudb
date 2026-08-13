@@ -68,6 +68,28 @@ enum Op {
     /// type (the same judgment as DESIGN.md's handling of nested types). It differs from the
     /// other aggregates only in including NULL as an element (the same as DuckDB's `array_agg`/`list`).
     ArrayAgg,
+    /// `any_value`/`first` keeps the first non-NULL, `last` keeps the most recent one.
+    AnyValue,
+    Last,
+    /// `bool_and`/`bool_or`, accumulated in `State::acc` as a `Value::Bool`.
+    BoolAnd,
+    BoolOr,
+    /// `count_if`. Counts only the rows whose argument is true, so it cannot ride `Count`
+    /// (which counts every non-NULL row).
+    CountIf,
+    /// `product`, accumulated in f64.
+    Product,
+    /// Population standard deviation and variance. The same Welford accumulator as
+    /// `StdDev`/`Variance`, divided by `n` rather than `n-1` on output.
+    StdDevPop,
+    VarPop,
+    /// `quantile_cont`. Retains every value and sorts once on output, exactly like `Median`
+    /// (which is this with a fraction of 0.5).
+    Quantile,
+    /// `arg_min`/`arg_max`. `State::acc` holds the value to return and `State::key` the
+    /// ordering key it won with.
+    ArgMin,
+    ArgMax,
 }
 
 /// The state of one group x one aggregate.
@@ -82,15 +104,26 @@ struct State {
     mean: f64,
     /// The Welford accumulator for StdDev/Variance (the sum of squared deviations, M2).
     m2: f64,
-    /// The non-NULL values Median holds until output.
+    /// The non-NULL values Median/Quantile hold until output.
     median_vals: Vec<f64>,
     /// Mode's current highest vote count.
     mode_best: i64,
+    /// ArgMin/ArgMax's current best ordering key (`acc` holds the value that goes with it).
+    /// `Value::Null` means "no row has qualified yet".
+    key: Value,
 }
 
 impl State {
     fn empty() -> Self {
-        State { n: 0, acc: Value::Null, mean: 0.0, m2: 0.0, median_vals: Vec::new(), mode_best: 0 }
+        State {
+            n: 0,
+            acc: Value::Null,
+            mean: 0.0,
+            m2: 0.0,
+            median_vals: Vec::new(),
+            mode_best: 0,
+            key: Value::Null,
+        }
     }
 }
 
@@ -189,6 +222,17 @@ impl HashAggregate {
                 AggKind::ApproxCountDistinct => Op::Count,
                 AggKind::StringAgg => Op::StringAgg,
                 AggKind::ArrayAgg => Op::ArrayAgg,
+                AggKind::AnyValue => Op::AnyValue,
+                AggKind::Last => Op::Last,
+                AggKind::BoolAnd => Op::BoolAnd,
+                AggKind::BoolOr => Op::BoolOr,
+                AggKind::CountIf => Op::CountIf,
+                AggKind::Product => Op::Product,
+                AggKind::StdDevPop => Op::StdDevPop,
+                AggKind::VarPop => Op::VarPop,
+                AggKind::Quantile => Op::Quantile,
+                AggKind::ArgMin => Op::ArgMin,
+                AggKind::ArgMax => Op::ArgMax,
             });
             // DECIMAL is internally an integer, so AVG/StdDev/Variance/Median divide back by
             // 10^scale.
@@ -271,6 +315,14 @@ impl HashAggregate {
                 None => None,
             });
         }
+        // ARG_MIN/ARG_MAX's ordering key. `None` for every other aggregate.
+        let mut a2vs = Vec::with_capacity(self.aggs.len());
+        for a in &self.aggs {
+            a2vs.push(match &a.arg2 {
+                Some(p) => Some(ctx.vm.eval(p, batch)?),
+                None => None,
+            });
+        }
         // `FILTER (WHERE cond)`. An independent BOOLEAN column is evaluated per aggregate up
         // front, so the row loop only has to look up a truth value.
         let mut fvs = Vec::with_capacity(self.aggs.len());
@@ -330,6 +382,13 @@ impl HashAggregate {
                 if !valid && self.ops[ai] != Op::ArrayAgg {
                     continue;
                 }
+                // ARG_MIN/ARG_MAX additionally need a non-NULL ordering key (DuckDB skips a row
+                // where either argument is NULL).
+                if let Some(k) = &a2vs[ai] {
+                    if !k.is_valid(row) {
+                        continue;
+                    }
+                }
                 if let Some(seen) = &mut self.distinct[ai] {
                     // Prefixing the group number lets one table serve every group. It avoids a
                     // nested table, at the cost of as many keys as there are (group, value)
@@ -345,7 +404,7 @@ impl HashAggregate {
                     }
                 }
                 if valid {
-                    self.update(ai, g, col, row)?;
+                    self.update(ai, g, col, a2vs[ai].as_ref(), row)?;
                 } else {
                     // Only ArrayAgg's NULL rows reach here.
                     self.push_array_null(ai, g);
@@ -358,12 +417,105 @@ impl HashAggregate {
     }
 
     /// Folds one non-NULL, already-deduplicated value into the state.
-    fn update(&mut self, ai: usize, g: usize, col: &Vector, row: usize) -> Result<()> {
+    ///
+    /// `key` is ARG_MIN/ARG_MAX's ordering column (already checked non-NULL at this row by the
+    /// caller); `None` for every other aggregate.
+    fn update(
+        &mut self,
+        ai: usize,
+        g: usize,
+        col: &Vector,
+        key: Option<&Vector>,
+        row: usize,
+    ) -> Result<()> {
         let op = self.ops[ai];
         let st = &mut self.states[ai][g];
         st.n += 1;
         match op {
             Op::CountStar | Op::Count => {}
+            // Only true rows count, so `n` (bumped above for every non-NULL row) cannot serve
+            // as the result; the tally lives in `acc` instead.
+            Op::CountIf => {
+                let hit = matches!(col.data(), Data::Bool(b) if b.get(row));
+                let c = match &st.acc {
+                    Value::I64(c) => *c,
+                    _ => 0,
+                };
+                st.acc = Value::I64(c + i64::from(hit));
+            }
+            Op::BoolAnd | Op::BoolOr => {
+                let x = match col.data() {
+                    Data::Bool(b) => b.get(row),
+                    // A defense in case the binder hands over something other than BOOLEAN.
+                    _ => err!(TypeMismatch),
+                };
+                let v = match &st.acc {
+                    Value::Bool(a) => {
+                        if op == Op::BoolAnd {
+                            *a && x
+                        } else {
+                            *a || x
+                        }
+                    }
+                    _ => x,
+                };
+                st.acc = Value::Bool(v);
+            }
+            Op::Product => {
+                let x = as_f64_generic(col, row, self.avg_div[ai])?;
+                let p = match &st.acc {
+                    Value::F64(p) => p * x,
+                    _ => x,
+                };
+                st.acc = Value::F64(p);
+            }
+            // `AnyValue` keeps the first arrival, `Last` the most recent one.
+            Op::AnyValue | Op::Last => {
+                if op == Op::Last || matches!(st.acc, Value::Null) {
+                    if let Value::Bytes(b) = &st.acc {
+                        self.acc_bytes = self.acc_bytes.saturating_sub(b.len());
+                    }
+                    let v = col.value_at(row);
+                    if let Value::Bytes(b) = &v {
+                        self.acc_bytes += b.len();
+                    }
+                    self.states[ai][g].acc = v;
+                }
+            }
+            Op::ArgMin | Op::ArgMax => {
+                let key = match key {
+                    Some(k) => k,
+                    // The binder always attaches `arg2` to these (the `Agg` contract).
+                    None => err!(Internal),
+                };
+                let take = match &st.key {
+                    Value::Null => true,
+                    best => {
+                        let c = cmp_at(key, row, best);
+                        if op == Op::ArgMin {
+                            c.is_lt()
+                        } else {
+                            c.is_gt()
+                        }
+                    }
+                };
+                if take {
+                    for old in [&st.acc, &st.key] {
+                        if let Value::Bytes(b) = old {
+                            self.acc_bytes = self.acc_bytes.saturating_sub(b.len());
+                        }
+                    }
+                    let (v, k) = (col.value_at(row), key.value_at(row));
+                    for new in [&v, &k] {
+                        if let Value::Bytes(b) = new {
+                            self.acc_bytes += b.len();
+                        }
+                    }
+                    let st = &mut self.states[ai][g];
+                    st.acc = v;
+                    st.key = k;
+                }
+            }
             Op::SumInt | Op::AvgInt => {
                 let x = as_i128(col, row)?;
                 let sum = match &st.acc {
@@ -407,7 +559,7 @@ impl HashAggregate {
                     self.states[ai][g].acc = v;
                 }
             }
-            Op::StdDev | Op::Variance => {
+            Op::StdDev | Op::Variance | Op::StdDevPop | Op::VarPop => {
                 // Welford's online update. `st.n` was already incremented at the top of this
                 // function, so it serves directly as "the total so far".
                 let x = as_f64_generic(col, row, self.avg_div[ai])?;
@@ -416,7 +568,7 @@ impl HashAggregate {
                 let delta2 = x - st.mean;
                 st.m2 += delta * delta2;
             }
-            Op::Median => {
+            Op::Median | Op::Quantile => {
                 // An exact median cannot be found while streaming, so every non-NULL value is
                 // held until output. Sorting happens exactly once, in push_result.
                 let x = as_f64_generic(col, row, self.avg_div[ai])?;
@@ -527,9 +679,25 @@ impl HashAggregate {
             // A group with not a single non-NULL input is NULL. StringAgg follows the same rule
             // (with no non-NULL value ever added, acc stays Null).
             // Mode's winner is in acc directly too.
-            Op::SumInt | Op::SumF64 | Op::Min | Op::Max | Op::StringAgg | Op::Mode => {
-                out.push_value(&self.states[ai][g].acc)
-            }
+            // CountIf's tally also lives in acc, but a group with no true row must be 0 rather
+            // than NULL, so it takes the zero-default branch instead.
+            Op::CountIf => match &self.states[ai][g].acc {
+                Value::I64(c) => out.push_value(&Value::I64(*c)),
+                _ => out.push_value(&Value::I64(0)),
+            },
+            Op::SumInt
+            | Op::SumF64
+            | Op::Min
+            | Op::Max
+            | Op::StringAgg
+            | Op::Mode
+            | Op::AnyValue
+            | Op::Last
+            | Op::BoolAnd
+            | Op::BoolOr
+            | Op::Product
+            | Op::ArgMin
+            | Op::ArgMax => out.push_value(&self.states[ai][g].acc),
             Op::AvgInt => {
                 // Integers are summed exactly in i128 and divided exactly once. Summing in f64
                 // would accumulate rounding error.
@@ -548,21 +716,30 @@ impl HashAggregate {
                     _ => out.push_null(),
                 }
             }
-            Op::StdDev | Op::Variance => {
+            Op::StdDev | Op::Variance | Op::StdDevPop | Op::VarPop => {
                 let st = &self.states[ai][g];
-                // Sample variance and sample standard deviation are undefined for n < 2 (NULL in DuckDB too).
-                if st.n < 2 {
+                let pop = matches!(self.ops[ai], Op::StdDevPop | Op::VarPop);
+                // Sample variance and sample standard deviation are undefined for n < 2 (NULL in
+                // DuckDB too). The population versions are defined from n = 1 and only need a
+                // single value.
+                if st.n < if pop { 1 } else { 2 } {
                     out.push_null();
                 } else {
                     // Floating-point rounding can make M2 slightly negative, so it is clamped at
                     // 0 (preventing a group of identical values from producing a variance that is
                     // not exactly 0 and yielding the square root of NaN).
-                    let var = (st.m2 / (st.n as f64 - 1.0)).max(0.0);
-                    let v = if self.ops[ai] == Op::StdDev { f_sqrt(var) } else { var };
+                    let denom = if pop { st.n as f64 } else { st.n as f64 - 1.0 };
+                    let var = (st.m2 / denom).max(0.0);
+                    let v = if matches!(self.ops[ai], Op::StdDev | Op::StdDevPop) {
+                        f_sqrt(var)
+                    } else {
+                        var
+                    };
                     out.push_value(&Value::F64(v));
                 }
             }
-            Op::Median => {
+            Op::Median | Op::Quantile => {
+                let frac = if self.ops[ai] == Op::Median { 0.5 } else { self.aggs[ai].quantile };
                 let st = &mut self.states[ai][g];
                 if st.median_vals.is_empty() {
                     out.push_null();
@@ -572,19 +749,14 @@ impl HashAggregate {
                     // carrying two ordering functions).
                     st.median_vals.sort_by(|a, b| ord_f64(*a, *b));
                     let m = st.median_vals.len();
-                    // The same linear interpolation as quantile_cont(0.5): h = (m-1)*0.5.
-                    // `core` has no `f64::floor`/`ceil` (they are in libm), so floor(h)/ceil(h)
-                    // are derived with integer arithmetic alone, using the fact that `m-1` is a
-                    // non-negative integer (truncation happens automatically).
-                    let lo = (m - 1) / 2;
-                    let hi = m / 2;
-                    let v = if lo == hi {
-                        st.median_vals[lo]
-                    } else {
-                        let h = (m - 1) as f64 * 0.5;
-                        let frac = h - lo as f64;
-                        st.median_vals[lo] + (st.median_vals[hi] - st.median_vals[lo]) * frac
-                    };
+                    // Linear interpolation at h = (m-1)*frac. `core` has no `f64::floor`/`ceil`
+                    // (they are in libm), so the two bracketing indices are derived by
+                    // truncating toward zero -- `h` is non-negative here, so that is floor.
+                    let h = (m - 1) as f64 * frac;
+                    let lo = (h as usize).min(m - 1);
+                    let hi = (lo + 1).min(m - 1);
+                    let w = h - lo as f64;
+                    let v = st.median_vals[lo] + (st.median_vals[hi] - st.median_vals[lo]) * w;
                     out.push_value(&Value::F64(v));
                 }
             }
@@ -976,6 +1148,8 @@ mod tests {
             distinct: false,
             name: String::from("a"),
             separator: Vec::new(),
+            quantile: 0.5,
+            arg2: None,
             filter: None,
         }
     }
@@ -987,6 +1161,8 @@ mod tests {
             distinct: true,
             name: String::from("a"),
             separator: Vec::new(),
+            quantile: 0.5,
+            arg2: None,
             filter: None,
         }
     }
@@ -999,6 +1175,8 @@ mod tests {
             distinct: false,
             name: String::from("a"),
             separator: sep.to_vec(),
+            quantile: 0.5,
+            arg2: None,
             filter: None,
         }
     }
@@ -1011,6 +1189,8 @@ mod tests {
             distinct: false,
             name: String::from("a"),
             separator: Vec::new(),
+            quantile: 0.5,
+            arg2: None,
             filter: Some(filter),
         }
     }
@@ -2171,6 +2351,8 @@ mod tests {
                 distinct: true,
                 name: String::from("a"),
                 separator: b",".to_vec(),
+                quantile: 0.5,
+                arg2: None,
                 filter: None,
             }],
             None,

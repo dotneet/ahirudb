@@ -736,6 +736,22 @@ impl<'a> Parser<'a> {
                 return self.name_ref();
             }
             Tok::QIdent(_) => return self.name_ref(),
+            // A handful of reserved words are also DuckDB function names: `LEFT`/`RIGHT`
+            // (join kinds) and `FIRST`/`LAST` (`NULLS FIRST`/`NULLS LAST`). None of those
+            // clause positions can be followed by `(`, so one token of lookahead separates
+            // the function call from the keyword unambiguously.
+            Tok::Kw(k @ (Kw::Left | Kw::Right | Kw::First | Kw::Last))
+                if self.peek()? == Tok::LParen =>
+            {
+                self.bump()?;
+                let name = match k {
+                    Kw::Left => "left",
+                    Kw::Right => "right",
+                    Kw::First => "first",
+                    _ => "last",
+                };
+                return self.call(String::from(name));
+            }
             _ => err!(UnexpectedToken, pos),
         };
         Ok(self.arena.push(node))

@@ -369,6 +369,88 @@ fn eval_partition(
                 }
             }
         }
+        // `nth_value(x, n)`: the n-th row of the frame, 1-based. The frame always starts at the
+        // partition's start (like FirstValue), so the n-th row of the frame is the n-th row of
+        // the partition -- but only once the frame has actually reached it, which under a RANGE
+        // frame happens at the end of the peer group containing that row.
+        WindowKind::NthValue => {
+            let src = match acols.first() {
+                Some(c) => c,
+                None => err!(WrongArgCount),
+            };
+            for p in 0..n {
+                let row = part[p] as usize;
+                let k = match acols.get(1) {
+                    Some(c) => match c.value_at(row).as_i64() {
+                        Some(x) => x,
+                        None => {
+                            out.push_null();
+                            continue;
+                        }
+                    },
+                    None => err!(WrongArgCount),
+                };
+                // The frame's end: the whole partition, or this row's peer group's last row.
+                let end = if whole {
+                    n
+                } else {
+                    match groups.iter().find(|&&(s, e)| p >= s && p < e) {
+                        Some(&(_, e)) => e,
+                        None => n,
+                    }
+                };
+                if k >= 1 && (k as usize) <= end {
+                    let v = src.value_at(part[k as usize - 1] as usize);
+                    push_as(out, ty, &v)?;
+                } else {
+                    out.push_null();
+                }
+            }
+        }
+        // `ntile(n)`: buckets 1..=n, with the first `rows % n` buckets one row larger.
+        WindowKind::NTile => {
+            for (p, &r) in part.iter().enumerate() {
+                let row = r as usize;
+                let buckets = match acols.first().map(|c| c.value_at(row).as_i64()) {
+                    Some(Some(b)) => b,
+                    // A NULL or missing bucket count gives NULL (DuckDB errors on n < 1; NULL
+                    // is this engine's convention for an undefined argument).
+                    _ => {
+                        out.push_null();
+                        continue;
+                    }
+                };
+                if buckets < 1 {
+                    out.push_null();
+                    continue;
+                }
+                let b = (buckets as usize).min(n.max(1));
+                let (base, rem) = (n / b, n % b);
+                // Rows 0..rem*(base+1) fall in the larger buckets; the rest in the smaller ones.
+                let big = rem * (base + 1);
+                let idx = if p < big { p / (base + 1) } else { rem + (p - big) / base.max(1) };
+                push_as(out, ty, &Value::I64(idx as i64 + 1))?;
+            }
+        }
+        // `(rank - 1) / (rows - 1)`. A single-row partition is 0 by definition (SQL standard).
+        WindowKind::PercentRank => {
+            let denom = if n > 1 { (n - 1) as f64 } else { 1.0 };
+            for &(s, e) in groups.iter() {
+                let v = if n > 1 { s as f64 / denom } else { 0.0 };
+                for _ in s..e {
+                    push_as(out, ty, &Value::F64(v))?;
+                }
+            }
+        }
+        // The fraction of the partition at or before this row's peer group.
+        WindowKind::CumeDist => {
+            for &(s, e) in groups.iter() {
+                let v = e as f64 / n as f64;
+                for _ in s..e {
+                    push_as(out, ty, &Value::F64(v))?;
+                }
+            }
+        }
         // Aggregation over the frame. A RANGE frame only ever extends forward, so an accumulation
         // with no removal suffices (advancing one peer group at a time).
         WindowKind::Agg(kind) => {
@@ -385,6 +467,12 @@ fn eval_partition(
                         | AggKind::Min
                         | AggKind::Max
                         | AggKind::Avg
+                        | AggKind::AnyValue
+                        | AggKind::Last
+                        | AggKind::BoolAnd
+                        | AggKind::BoolOr
+                        | AggKind::CountIf
+                        | AggKind::Product
                 ),
                 UnsupportedFeature
             );
@@ -482,6 +570,53 @@ impl Acc {
                     self.acc = v;
                 }
             }
+            // First arrival wins; `Last` keeps overwriting. Both only ever *add* to the frame,
+            // so they satisfy the same forward-only premise as SUM/MIN/MAX.
+            AggKind::AnyValue => {
+                if matches!(self.acc, Value::Null) {
+                    self.acc = col.value_at(row);
+                }
+            }
+            AggKind::Last => self.acc = col.value_at(row),
+            AggKind::BoolAnd | AggKind::BoolOr => {
+                let x = match col.data() {
+                    Data::Bool(b) => b.get(row),
+                    _ => err!(TypeMismatch),
+                };
+                let v = match &self.acc {
+                    Value::Bool(a) => {
+                        if kind == AggKind::BoolAnd {
+                            *a && x
+                        } else {
+                            *a || x
+                        }
+                    }
+                    _ => x,
+                };
+                self.acc = Value::Bool(v);
+            }
+            AggKind::CountIf => {
+                let hit = matches!(col.data(), Data::Bool(b) if b.get(row));
+                let c = match &self.acc {
+                    Value::I64(c) => *c,
+                    _ => 0,
+                };
+                self.acc = Value::I64(c + i64::from(hit));
+            }
+            AggKind::Product => {
+                let x = match col.data() {
+                    Data::I32(v) => v[row] as f64,
+                    Data::I64(v) => v[row] as f64,
+                    Data::I128(v) => v[row] as f64,
+                    Data::F64(v) => v[row],
+                    _ => err!(TypeMismatch),
+                };
+                let p = match &self.acc {
+                    Value::F64(p) => p * x,
+                    _ => x,
+                };
+                self.acc = Value::F64(p);
+            }
             // An aggregate with no window version. The caller rejects it earlier.
             _ => err!(UnsupportedFeature),
         }
@@ -505,7 +640,19 @@ impl Acc {
         match kind {
             AggKind::CountStar | AggKind::Count => Value::I64(self.n),
             // A frame with not a single non-NULL input is NULL.
-            AggKind::Sum | AggKind::Min | AggKind::Max => self.acc.clone(),
+            AggKind::Sum
+            | AggKind::Min
+            | AggKind::Max
+            | AggKind::AnyValue
+            | AggKind::Last
+            | AggKind::BoolAnd
+            | AggKind::BoolOr
+            | AggKind::Product => self.acc.clone(),
+            // A frame with no true row is 0, not NULL (the same rule as the grouped version).
+            AggKind::CountIf => match &self.acc {
+                Value::I64(c) => Value::I64(*c),
+                _ => Value::I64(0),
+            },
             AggKind::Avg => match &self.acc {
                 // Integers are summed exactly in i128 and divided exactly once.
                 Value::I128(s) if self.n > 0 => Value::F64(*s as f64 / div / self.n as f64),

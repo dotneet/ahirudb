@@ -93,6 +93,18 @@ pub(super) fn date_part(p: u8, us: i64) -> Option<i64> {
         P_SECOND => c.tod / US_PER_SEC % 60,
         P_DOW => weekday(c.days),
         P_DOY => c.days - days_from_civil(c.y, 1, 1) + 1,
+        // Both include the whole seconds field, matching DuckDB
+        // (`date_part('millisecond', TIMESTAMP '2021-08-03 11:59:44.123456')` -> 44123).
+        P_MILLISECOND => c.tod.rem_euclid(US_PER_MIN) / 1_000,
+        P_MICROSECOND => c.tod.rem_euclid(US_PER_MIN),
+        // Monday = 1 .. Sunday = 7.
+        P_ISODOW => match weekday(c.days) {
+            0 => 7,
+            w => w,
+        },
+        // Year 1-100 is century 1, 2021 is century 21 (DuckDB's definition).
+        P_CENTURY => (c.y - 1).div_euclid(100) + 1,
+        P_DECADE => c.y.div_euclid(10),
         // DuckDB returns a DOUBLE including fractional seconds; here it is BIGINT seconds (floored).
         _ => us.div_euclid(US_PER_SEC),
     })
@@ -114,6 +126,10 @@ pub(super) fn date_trunc(p: u8, us: i64) -> Result<Option<i64>> {
         P_HOUR => unit(US_PER_HOUR),
         P_MINUTE => unit(US_PER_MIN),
         P_SECOND => unit(US_PER_SEC),
+        P_MILLISECOND => unit(1_000),
+        P_MICROSECOND => Some(us),
+        P_DECADE => day(days_from_civil(c.y.div_euclid(10) * 10, 1, 1)),
+        P_CENTURY => day(days_from_civil((c.y - 1).div_euclid(100) * 100 + 1, 1, 1)),
         _ => err!(TypeMismatch),
     })
 }
@@ -134,6 +150,10 @@ pub(super) fn date_diff(p: u8, a: i64, b: i64) -> Result<Option<i64>> {
         P_MINUTE => unit(US_PER_MIN),
         P_SECOND => unit(US_PER_SEC),
         P_EPOCH => unit(US_PER_SEC),
+        P_MILLISECOND => unit(1_000),
+        P_MICROSECOND => b - a,
+        P_DECADE => cb.y.div_euclid(10) - ca.y.div_euclid(10),
+        P_CENTURY => (cb.y - 1).div_euclid(100) - (ca.y - 1).div_euclid(100),
         _ => err!(TypeMismatch),
     }))
 }
@@ -161,6 +181,10 @@ pub(super) fn date_add(p: u8, k: i64, us: i64) -> Result<Option<i64>> {
         P_HOUR => unit(US_PER_HOUR),
         P_MINUTE => unit(US_PER_MIN),
         P_SECOND => unit(US_PER_SEC),
+        P_MILLISECOND => unit(1_000),
+        P_MICROSECOND => unit(1),
+        P_DECADE => k.checked_mul(120).and_then(months),
+        P_CENTURY => k.checked_mul(1_200).and_then(months),
         _ => err!(TypeMismatch),
     })
 }

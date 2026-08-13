@@ -302,11 +302,17 @@ pub(super) fn build_window(
     let arg_ty = arg_progs.first().map_or(Ty::Null, |p| p.result_ty);
     let result_ty = match kind {
         // Ranking is a 1-based running number.
-        WindowKind::RowNumber | WindowKind::Rank | WindowKind::DenseRank => Ty::BigInt,
-        // Functions that merely carry a value return the input type unchanged.
-        WindowKind::Lag | WindowKind::Lead | WindowKind::FirstValue | WindowKind::LastValue => {
-            arg_ty
+        WindowKind::RowNumber | WindowKind::Rank | WindowKind::DenseRank | WindowKind::NTile => {
+            Ty::BigInt
         }
+        // Relative ranking is a fraction in 0..1.
+        WindowKind::PercentRank | WindowKind::CumeDist => Ty::Double,
+        // Functions that merely carry a value return the input type unchanged.
+        WindowKind::Lag
+        | WindowKind::Lead
+        | WindowKind::FirstValue
+        | WindowKind::LastValue
+        | WindowKind::NthValue => arg_ty,
         // Aggregates follow the same rules as ordinary aggregates. The same function is used so the two cannot drift.
         WindowKind::Agg(a) => a.result_ty(arg_ty)?,
     };
@@ -382,27 +388,67 @@ pub(super) fn build_agg(
             distinct: false,
             name: String::from("count_star()"),
             separator: Vec::new(),
+            quantile: 0.5,
+            arg2: None,
             filter: filter_prog,
         });
     }
 
-    // Only `string_agg(x, sep)` allows two arguments. sep must be a constant literal.
-    let max_args = if kind.optional_arg_default().is_some() { 2 } else { 1 };
+    // What the second argument means -- and whether one is accepted at all -- is decided by
+    // the aggregate (see `AggKind::second_arg`).
+    let second = kind.second_arg();
+    let max_args = if second == SecondArg::None { 1 } else { 2 };
     ensure!(!args.is_empty() && args.len() <= max_args, WrongArgCount);
+    // `Separator` is the only optional one; the rest are required when accepted.
+    ensure!(
+        args.len() == 2 || matches!(second, SecondArg::None | SecondArg::Separator(_)),
+        WrongArgCount
+    );
     let arg = compile(arena, scope, params, args[0])?;
-    let separator = match args.get(1) {
-        Some(&sep_id) => match arena.get(sep_id) {
-            Expr::Literal(Value::Bytes(b)) => b.clone(),
-            _ => err!(UnsupportedFeature),
-        },
-        None => kind.optional_arg_default().map(|d| d.to_vec()).unwrap_or_default(),
-    };
+    let mut separator = Vec::new();
+    let mut quantile = 0.5f64;
+    let mut arg2 = None;
+    match second {
+        SecondArg::None => {}
+        SecondArg::Separator(default) => {
+            separator = match args.get(1) {
+                Some(&sep_id) => match arena.get(sep_id) {
+                    Expr::Literal(Value::Bytes(b)) => b.clone(),
+                    _ => err!(UnsupportedFeature),
+                },
+                None => default.to_vec(),
+            };
+        }
+        SecondArg::Fraction => {
+            let f = match args.get(1).map(|&id| arena.get(id)) {
+                Some(Expr::Literal(Value::F64(f))) => *f,
+                Some(Expr::Literal(Value::I64(i))) => *i as f64,
+                _ => err!(UnsupportedFeature),
+            };
+            // DuckDB rejects a fraction outside [0, 1] outright; so does this.
+            ensure!((0.0..=1.0).contains(&f), ValueOutOfRange);
+            quantile = f;
+        }
+        SecondArg::Expr => {
+            let id2 = match args.get(1) {
+                Some(&id) => id,
+                None => err!(WrongArgCount),
+            };
+            arg2 = Some(compile(arena, scope, params, id2)?);
+        }
+    }
+    // DISTINCT would have to deduplicate on the *pair* for ARG_MIN/ARG_MAX, which the
+    // single-column deduplication table cannot express, so it is rejected rather than
+    // silently deduplicating on the wrong column.
+    ensure!(!(distinct && arg2.is_some()), UnsupportedFeature);
     Ok(Agg {
         kind,
         arg: Some(arg),
         distinct,
         name: agg_name(name, arena, args[0]),
         separator,
+        quantile,
+        arg2,
         filter: filter_prog,
     })
 }

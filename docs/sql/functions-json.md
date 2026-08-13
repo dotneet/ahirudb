@@ -82,6 +82,42 @@ SELECT map_extract(m, 'a');               -- '1'
 
 `array_extract` is an alias for `list_extract`.
 
+## Searching and reordering lists
+
+```sql
+SELECT array_length([1, 2, 3]);              -- 3   (alias: list_length, json_array_length)
+SELECT list_contains([1, 2, 3], 2);          -- true
+SELECT list_position(['a', 'b'], 'b');       -- 2   (1-based; NULL when absent, like DuckDB)
+SELECT list_sort([3, 1, 2]);                 -- '[1,2,3]'
+SELECT list_distinct([1, 2, 1, 3]);          -- '[1,2,3]'  (keeps first-occurrence order)
+SELECT list_reverse([1, 2, 3]);              -- '[3,2,1]'
+```
+
+| Function | Aliases |
+|---|---|
+| `array_length(l)` | `list_length`, `json_array_length` |
+| `list_contains(l, x)` | `array_contains`, `list_has`, `array_has` |
+| `list_position(l, x)` | `list_indexof`, `array_position`, `array_indexof` |
+| `list_sort(l)` | `array_sort` |
+| `list_distinct(l)` | `array_distinct` |
+| `list_reverse(l)` | `array_reverse` |
+
+`list_contains`/`list_position` serialize the search value to JSON text and
+compare it byte-wise against each element — the same equality `JSON` values
+already use here (see
+[limitations.md](limitations.md#json-equality-is-byte-comparison)). Both
+return `NULL` when the first argument is not an array at all.
+
+`list_sort` has to impose an order on an untyped representation, so it
+ranks elements by kind first — numbers < strings < booleans < arrays <
+objects < `null` — then numerically within numbers and by raw bytes
+otherwise. On a homogeneous list (the usual case) that is the ordinary
+sort; on a mixed list it is defined but engine-specific.
+
+Note `list_unique` is deliberately **not** an alias for `list_distinct`: in
+DuckDB it returns the *count* of distinct elements, and it is not
+implemented here.
+
 ## Concatenating lists
 
 ```sql

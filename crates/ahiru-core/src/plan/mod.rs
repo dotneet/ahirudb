@@ -46,6 +46,46 @@ pub enum AggKind {
     /// Collects values into JSON-like text. A substitute representation, since there is no
     /// LIST type (the same judgment as DESIGN.md's handling of nested types).
     ArrayAgg,
+    /// `any_value` / `first` / `arbitrary`. The first non-NULL input seen.
+    AnyValue,
+    /// `last`. The last non-NULL input seen.
+    Last,
+    /// `bool_and` / `bool_or`. NULL inputs are skipped, so a group with only NULLs is NULL.
+    BoolAnd,
+    BoolOr,
+    /// `count_if`. Counts the rows whose BOOLEAN argument is true.
+    CountIf,
+    /// `product`. Accumulated in f64 (an exact integer product would overflow immediately).
+    Product,
+    /// Population standard deviation and population variance (`stddev_pop` / `var_pop`).
+    /// The same Welford accumulator as the sample versions, divided by `n` instead of `n-1`.
+    StdDevPop,
+    VarPop,
+    /// `quantile_cont` / `percentile_cont` (and `quantile`, which DuckDB defines as the
+    /// discrete version but is served here by the continuous one -- see
+    /// `docs/sql/functions-aggregate.md`). Linear interpolation, exactly like `Median`; the
+    /// fraction is `Agg::quantile`.
+    Quantile,
+    /// `arg_min` / `arg_max` (aliases `min_by` / `max_by`). Returns the first argument's value
+    /// at the row where the second argument is smallest/largest. Both arguments have to be
+    /// non-NULL for a row to take part.
+    ArgMin,
+    ArgMax,
+}
+
+/// What an aggregate's second argument means. Every aggregate here takes at most one, and it
+/// is either a compile-time constant (folded into `Agg` at bind time) or a second per-row
+/// expression (`Agg::arg2`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SecondArg {
+    /// No second argument is accepted.
+    None,
+    /// An optional constant separator, with the default used when omitted (`string_agg`).
+    Separator(&'static [u8]),
+    /// A required constant fraction in `[0, 1]` (`quantile_cont`).
+    Fraction,
+    /// A required second expression, evaluated per row (`arg_min`/`arg_max`).
+    Expr,
 }
 
 impl AggKind {
@@ -75,7 +115,37 @@ impl AggKind {
             AggKind::Min | AggKind::Max | AggKind::Mode => input,
             AggKind::StringAgg => Ty::Varchar,
             AggKind::ArrayAgg => Ty::Varchar,
+            // These carry a value through rather than computing one, so the type is the
+            // argument's (for ARG_MIN/ARG_MAX that is the *first* argument's).
+            AggKind::AnyValue | AggKind::Last | AggKind::ArgMin | AggKind::ArgMax => input,
+            AggKind::BoolAnd | AggKind::BoolOr => match input {
+                Ty::Boolean | Ty::Null => Ty::Boolean,
+                _ => err!(TypeMismatch),
+            },
+            AggKind::CountIf => match input {
+                Ty::Boolean | Ty::Null => Ty::BigInt,
+                _ => err!(TypeMismatch),
+            },
+            AggKind::Product | AggKind::StdDevPop | AggKind::VarPop | AggKind::Quantile => {
+                match input {
+                    t if t.is_numeric() || t == Ty::Null => Ty::Double,
+                    _ => err!(TypeMismatch),
+                }
+            }
         })
+    }
+
+    /// What this aggregate's second argument is, if it takes one.
+    pub fn second_arg(self) -> SecondArg {
+        match self {
+            // In DuckDB, `string_agg(x)` (separator omitted) defaults to `','` (measured:
+            // `duckdb -c "select string_agg(x) from (values ('p'),('q'),('r')) t(x)"` gives
+            // `p,q,r`; the `group_concat` alias behaves the same). It is not the empty string.
+            AggKind::StringAgg => SecondArg::Separator(b","),
+            AggKind::Quantile => SecondArg::Fraction,
+            AggKind::ArgMin | AggKind::ArgMax => SecondArg::Expr,
+            _ => SecondArg::None,
+        }
     }
 
     /// Whether the aggregate takes no arguments.
@@ -83,51 +153,51 @@ impl AggKind {
         self == AggKind::CountStar
     }
 
-    /// Whether it may take a second argument (a separator and the like), as `StringAgg` does.
-    /// If so, returns the default argument used when it is omitted.
-    ///
-    /// In DuckDB, `string_agg(x)` (separator omitted) defaults to `','` (measured:
-    /// `duckdb -c "select string_agg(x) from (values ('p'),('q'),('r')) t(x)"` gives
-    /// `p,q,r`; the `group_concat` alias behaves the same).
-    /// It is not the empty string.
-    pub fn optional_arg_default(self) -> Option<&'static [u8]> {
-        match self {
-            AggKind::StringAgg => Some(b","),
-            _ => None,
-        }
-    }
-
     /// Looks up by name. Case-insensitive.
     pub fn from_name(name: &str) -> Option<AggKind> {
         use crate::rt::hash::eq_ascii_ci;
         let n = name.as_bytes();
-        if eq_ascii_ci(n, b"count") {
-            Some(AggKind::Count)
-        } else if eq_ascii_ci(n, b"sum") {
-            Some(AggKind::Sum)
-        } else if eq_ascii_ci(n, b"min") {
-            Some(AggKind::Min)
-        } else if eq_ascii_ci(n, b"max") {
-            Some(AggKind::Max)
-        } else if eq_ascii_ci(n, b"avg") || eq_ascii_ci(n, b"mean") {
-            Some(AggKind::Avg)
-        } else if eq_ascii_ci(n, b"stddev") || eq_ascii_ci(n, b"stddev_samp") {
-            Some(AggKind::StdDev)
-        } else if eq_ascii_ci(n, b"variance") || eq_ascii_ci(n, b"var_samp") {
-            Some(AggKind::Variance)
-        } else if eq_ascii_ci(n, b"median") {
-            Some(AggKind::Median)
-        } else if eq_ascii_ci(n, b"mode") {
-            Some(AggKind::Mode)
-        } else if eq_ascii_ci(n, b"approx_count_distinct") {
-            Some(AggKind::ApproxCountDistinct)
-        } else if eq_ascii_ci(n, b"string_agg") || eq_ascii_ci(n, b"group_concat") {
-            Some(AggKind::StringAgg)
-        } else if eq_ascii_ci(n, b"array_agg") || eq_ascii_ci(n, b"list") {
-            Some(AggKind::ArrayAgg)
-        } else {
-            None
-        }
+        // A flat table rather than a chain of `if`s: the list is long enough now that one
+        // linear scan over `&'static [u8]` is both smaller and easier to extend.
+        const NAMES: &[(&[u8], AggKind)] = &[
+            (b"count", AggKind::Count),
+            (b"sum", AggKind::Sum),
+            (b"min", AggKind::Min),
+            (b"max", AggKind::Max),
+            (b"avg", AggKind::Avg),
+            (b"mean", AggKind::Avg),
+            (b"stddev", AggKind::StdDev),
+            (b"stddev_samp", AggKind::StdDev),
+            (b"variance", AggKind::Variance),
+            (b"var_samp", AggKind::Variance),
+            (b"stddev_pop", AggKind::StdDevPop),
+            (b"var_pop", AggKind::VarPop),
+            (b"median", AggKind::Median),
+            (b"mode", AggKind::Mode),
+            (b"approx_count_distinct", AggKind::ApproxCountDistinct),
+            (b"string_agg", AggKind::StringAgg),
+            (b"group_concat", AggKind::StringAgg),
+            (b"listagg", AggKind::StringAgg),
+            (b"array_agg", AggKind::ArrayAgg),
+            (b"list", AggKind::ArrayAgg),
+            (b"any_value", AggKind::AnyValue),
+            (b"first", AggKind::AnyValue),
+            (b"arbitrary", AggKind::AnyValue),
+            (b"last", AggKind::Last),
+            (b"bool_and", AggKind::BoolAnd),
+            (b"bool_or", AggKind::BoolOr),
+            (b"count_if", AggKind::CountIf),
+            (b"countif", AggKind::CountIf),
+            (b"product", AggKind::Product),
+            (b"quantile", AggKind::Quantile),
+            (b"quantile_cont", AggKind::Quantile),
+            (b"percentile_cont", AggKind::Quantile),
+            (b"arg_min", AggKind::ArgMin),
+            (b"min_by", AggKind::ArgMin),
+            (b"arg_max", AggKind::ArgMax),
+            (b"max_by", AggKind::ArgMax),
+        ];
+        NAMES.iter().find(|(nm, _)| eq_ascii_ci(n, nm)).map(|&(_, k)| k)
     }
 }
 
@@ -141,6 +211,12 @@ pub struct Agg {
     /// The separator of `string_agg(x, sep)`. Only a constant literal is allowed
     /// (a per-row separator has almost no practical use, and this keeps execution simple).
     pub separator: Vec<u8>,
+    /// The fraction of `quantile_cont(x, frac)`. Only a constant literal is allowed, for the
+    /// same reason as `separator`. Ignored (and left at 0.5) by every other aggregate.
+    pub quantile: f64,
+    /// The second per-row expression of `arg_min`/`arg_max` (the ordering key). `None` for
+    /// every other aggregate.
+    pub arg2: Option<Program>,
     /// `agg(...) FILTER (WHERE cond)`. A BOOLEAN expression evaluated in the pre-aggregation
     /// input scope. Rows that are false or NULL are excluded from updating this aggregate.
     pub filter: Option<Program>,
@@ -168,6 +244,14 @@ pub enum WindowKind {
     Lead,
     FirstValue,
     LastValue,
+    /// `nth_value(x, n)`. The n-th row of the frame, 1-based.
+    NthValue,
+    /// `ntile(n)`. Splits the partition into `n` buckets as evenly as possible.
+    NTile,
+    /// `percent_rank()`. `(rank - 1) / (rows - 1)`, so it spans 0..1.
+    PercentRank,
+    /// `cume_dist()`. The fraction of rows at or before this row's peer group.
+    CumeDist,
     /// The window version of an aggregate (`sum(x) OVER (...)`).
     Agg(AggKind),
 }
@@ -190,6 +274,14 @@ impl WindowKind {
             Some(WindowKind::FirstValue)
         } else if eq_ascii_ci(n, b"last_value") {
             Some(WindowKind::LastValue)
+        } else if eq_ascii_ci(n, b"nth_value") {
+            Some(WindowKind::NthValue)
+        } else if eq_ascii_ci(n, b"ntile") {
+            Some(WindowKind::NTile)
+        } else if eq_ascii_ci(n, b"percent_rank") {
+            Some(WindowKind::PercentRank)
+        } else if eq_ascii_ci(n, b"cume_dist") {
+            Some(WindowKind::CumeDist)
         } else {
             AggKind::from_name(name).map(WindowKind::Agg)
         }
@@ -197,7 +289,14 @@ impl WindowKind {
 
     /// Whether the function takes no arguments.
     pub fn is_nullary(self) -> bool {
-        matches!(self, WindowKind::RowNumber | WindowKind::Rank | WindowKind::DenseRank)
+        matches!(
+            self,
+            WindowKind::RowNumber
+                | WindowKind::Rank
+                | WindowKind::DenseRank
+                | WindowKind::PercentRank
+                | WindowKind::CumeDist
+        )
     }
 }
 

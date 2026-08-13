@@ -32,6 +32,10 @@ SELECT strpos('hello world', 'wor'); -- 7      (aliases: position, instr; 0 if n
 SELECT starts_with('hello', 'he');   -- true   (alias: prefix)
 SELECT ends_with('hello', 'lo');     -- true   (alias: suffix)
 SELECT contains('hello', 'ell');     -- true
+SELECT left('abcde', 2);             -- 'ab'
+SELECT right('abcde', 2);            -- 'de'
+SELECT left('abcde', -2);            -- 'abc'  (negative = all but the last 2)
+SELECT string_split('a,b,c', ',');   -- ["a","b","c"]  (a LIST, i.e. JSON text)
 ```
 
 | Function | Aliases | Notes |
@@ -43,6 +47,13 @@ SELECT contains('hello', 'ell');     -- true
 | `ends_with(s, suffix)` | `suffix(s, s2)` | boolean |
 | `contains(s, sub)` | — | boolean |
 | `length(s)` | `len`, `char_length`, `character_length` | counts codepoints |
+| `left(s, n)` | — | First `n` codepoints; negative `n` drops the last `\|n\|` instead |
+| `right(s, n)` | — | Last `n` codepoints; negative `n` drops the first `\|n\|` instead |
+| `string_split(s, sep)` | `str_split`, `string_to_array`, `split` | Returns a LIST (JSON text — see [functions-json.md](functions-json.md)). An empty `sep` gives a one-element list holding the whole string, matching DuckDB (it does **not** split into characters) |
+
+`left` and `right` are reserved words (they introduce a join kind), but a
+`(` immediately after the keyword is unambiguous, so writing them as
+function calls needs no quoting.
 
 ## SQL-standard spellings
 
@@ -95,6 +106,12 @@ SELECT replace('a-b-c', '-', '_');   -- 'a_b_c'  (literal, not regex; empty `fro
 SELECT repeat('ab', 3);              -- 'ababab' (capped at 16 MiB output)
 SELECT reverse('abc');               -- 'cba'    (codepoint-aware)
 SELECT concat('a', NULL, 'b');       -- 'ab'     (NULL args treated as empty string; result is never NULL)
+SELECT concat_ws('-', 'a', NULL, 'b'); -- 'a-b'  (a NULL value drops its separator too)
+SELECT concat_ws(NULL, 'a', 'b');    -- NULL     (a NULL *separator* does propagate)
+SELECT ascii('A');                   -- 65       (codepoint; aliases: unicode, ord)
+SELECT chr(9731);                    -- '☃'
+SELECT hex('AB');                    -- '4142'   (byte dump; an integer argument uses to_hex)
+SELECT to_hex(255);                  -- 'FF'     (negatives use the two's-complement pattern)
 ```
 
 `concat` is special-cased: unlike most functions, it never returns `NULL`

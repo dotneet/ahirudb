@@ -46,12 +46,31 @@ SELECT year(d), month(d), day(d) FROM t LIMIT 1;
 SELECT date_part('year', d) FROM t LIMIT 1;    -- alias: datepart, extract
 SELECT extract(year FROM d) FROM t LIMIT 1;
 SELECT date_part('epoch', d) FROM t LIMIT 1;   -- BIGINT seconds, floored (not fractional)
+SELECT dayname(d), monthname(d) FROM t LIMIT 1;  -- 'Wednesday', 'August' (English only)
+SELECT epoch_ms(ts), epoch_us(ts), epoch_ns(ts) FROM t LIMIT 1;
 ```
 
 `year`/`quarter`/`month`/`week`/`day`/`dayofmonth`/`hour`/`minute`/
-`second`/`dayofweek`/`dayofyear`/`epoch` are all shorthand for the
-equivalent `date_part(...)` call. `week` uses ISO 8601 week numbering
+`second`/`millisecond`/`microsecond`/`dayofweek`/`isodow`/`dayofyear`/
+`century`/`decade`/`epoch` are all shorthand for the equivalent
+`date_part(...)` call. `week` uses ISO 8601 week numbering
 (`date_trunc('week', ...)` treats Monday as the start of the week).
+
+| Part | Notes |
+|---|---|
+| `millisecond` (`ms`), `microsecond` (`us`) | Include the whole seconds field, matching DuckDB: `millisecond` of `11:59:44.123456` is `44123`, not `123` |
+| `dayofweek` (`dow`) | Sunday = 0 … Saturday = 6 |
+| `isodow` (`isoweekday`) | Monday = 1 … Sunday = 7 |
+| `century` | Years 1–100 are century 1, so 2021 → 21 and 2000 → 20 |
+| `decade` | `year / 10`, so 2021 → 202 |
+
+The same part names work with `date_trunc`/`date_diff`/`date_add`
+(`isodow` excepted — there is nothing to truncate or add there).
+
+`epoch_ms`/`epoch_us`/`epoch_ns` are the sub-second counterparts of the
+`epoch` part: the same instant rescaled to milliseconds, microseconds, or
+nanoseconds since 1970-01-01. `dayname`/`monthname` return English names
+only — the engine carries no locale data.
 
 ## Truncating, formatting, parsing
 
@@ -60,7 +79,17 @@ SELECT date_trunc('month', d) FROM t LIMIT 1;   -- always returns TIMESTAMP, eve
 SELECT strftime(d, '%Y-%m-%d') FROM t LIMIT 1;  -- only %Y %m %d %H %M %S %% are interpreted
 SELECT to_date('2024-05-01');                   -- strict YYYY-MM-DD
 SELECT to_timestamp('2024-05-01 10:00:00');     -- YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]]
+SELECT make_date(2024, 2, 29);                  -- 2024-02-29 (a DATE)
+SELECT make_timestamp(2024, 8, 14, 13, 45, 30); -- 2024-08-14 13:45:30
 ```
+
+`make_date(y, m, d)` and `make_timestamp(y, m, d, h, mi, s)` return `NULL`
+for an out-of-range component — `make_date(2023, 2, 29)` is `NULL` because
+2023 is not a leap year — where DuckDB raises. That follows this engine's
+general "prefer `NULL` over erroring mid-scan" policy. DuckDB's
+single-argument `make_timestamp(microseconds)` overload and its `DOUBLE`
+seconds argument (fractional seconds) are not provided; use a `CAST` or add
+an `INTERVAL` for those.
 
 `strftime` only understands `%Y`/`%m`/`%d`/`%H`/`%M`/`%S`/`%%` — it is not
 a full strftime implementation; unrecognized specifiers pass through as

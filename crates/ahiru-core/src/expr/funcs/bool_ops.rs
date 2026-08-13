@@ -3,6 +3,17 @@ use super::string::find;
 use super::*;
 
 pub(super) fn eval_bool(id: FuncId, a: &A) -> Result<Option<bool>> {
+    // The float and list predicates read their arguments differently, so they are taken before
+    // the byte-slice pair the string predicates share.
+    match id {
+        F_ISNAN => return Ok(Some(a.flt(0).is_nan())),
+        F_ISINF => return Ok(Some(a.flt(0).is_infinite())),
+        F_ISFINITE => return Ok(Some(a.flt(0).is_finite())),
+        // A non-array argument gives NULL rather than false (the same judgment as
+        // `list_position`; see `super::json::list_find`).
+        F_LIST_CONTAINS => return Ok(super::json::list_find(a)?.map(|k| k > 0)),
+        _ => {}
+    }
     let (s, p) = (a.bytes(0), a.bytes(1));
     Ok(Some(match id {
         F_STARTS_WITH => s.len() >= p.len() && &s[..p.len()] == p,

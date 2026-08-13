@@ -643,12 +643,28 @@ impl<'a> Compiler<'a> {
     /// A scalar function call. Type checking and argument conversion are finished here, so
     /// only already-converted vectors are passed at runtime.
     fn scalar_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
+        // `pi()` takes no arguments, and the runtime's row loop derives its row count from the
+        // arguments (`expr::funcs::strides`), so a nullary function has nowhere to get one.
+        // It is folded to a literal here instead.
+        if eq_ascii_ci(name.as_bytes(), b"pi") {
+            ensure!(args.is_empty(), WrongArgCount);
+            return Ok((self.konst(Ty::Double, Value::F64(core::f64::consts::PI)), Ty::Double));
+        }
         let mut regs = Vec::with_capacity(args.len());
         let mut tys = Vec::with_capacity(args.len());
         for a in args {
             let (r, t) = self.expr(*a)?;
             regs.push(r);
             tys.push(t);
+        }
+        // `typeof` is decided entirely by the argument's static type, which is known right here,
+        // so it folds to a literal too. Going through `resolve`/`call` would additionally make
+        // `typeof(NULL_column)` come out NULL instead of `'NULL'`, because the row loop
+        // propagates a NULL argument to the result.
+        if eq_ascii_ci(name.as_bytes(), b"typeof") {
+            ensure!(tys.len() == 1, WrongArgCount);
+            let v = Value::Bytes(tys[0].name().as_bytes().to_vec());
+            return Ok((self.konst(Ty::Varchar, v), Ty::Varchar));
         }
         let (id, want, res) = crate::expr::funcs::resolve(name, &tys)?;
         ensure!(want.len() == regs.len(), WrongArgCount);

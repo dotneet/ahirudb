@@ -31,13 +31,18 @@
 //! `json_array` / `json_object` / `list_value` (which embed a JSON `null` at that position for a
 //! NULL argument; `to_json(NULL)` itself is SQL NULL as usual).
 //!
-//! ## There is no current time
+//! ## Functions that never reach `resolve`
 //!
-//! `now()` / `current_timestamp` / `current_date` are **not implemented** (`FunctionNotFound`).
-//! no_std wasm has no clock, and the ABI (`crate::abi`) has no entry point for receiving a time
-//! from the host. Fabricating a value would mean returning "a different fake time per query", so
-//! this stays unsupported until an ABI for passing epoch microseconds from the host (such as
-//! `ahiru_set_now(i64)`) is added.
+//! `now()` / `current_timestamp` / `current_date` do not resolve here (`FunctionNotFound`).
+//! no_std wasm has no clock of its own, so the host supplies the query's start time
+//! (`Session::set_now`) and `sql::now::substitute_now` folds these forms into literals before
+//! binding. There is no general-purpose "read the clock" function beyond those fixed spellings.
+//!
+//! `pi()` and `typeof(x)` are folded to literals too, in
+//! `plan::compile::Compiler::scalar_call`: `call`'s row loop takes its row count from the
+//! arguments (`strides`), so a zero-argument function has nowhere to get one, and `typeof`'s
+//! answer is fully determined by the argument's static type (folding it also keeps
+//! `typeof(null_column)` at `'NULL'` instead of letting NULL propagation swallow it).
 
 use crate::expr::vm::Vm;
 use crate::expr::{kernels, regex, OpCode, Program};
@@ -179,9 +184,57 @@ const F_LIST_SLICE: FuncId = 92;
 const F_LIST_CONCAT: FuncId = 94;
 pub(crate) const F_LIST_CONCAT_OP: FuncId = 95;
 
+// --- DuckDB-compatibility additions -----------------------------------------
+// 96-199 is one flat block of free IDs (`F_PART_BASE` used to sit at 100 and
+// cap this range at four spare numbers; it was moved to 200 so the block could
+// grow). Grouped by output physical type, like the blocks above.
+
+// Strings / JSON (Bytes output)
+const F_CONCAT_WS: FuncId = 96;
+const F_LEFT: FuncId = 97;
+const F_RIGHT: FuncId = 98;
+const F_CHR: FuncId = 99;
+const F_DAYNAME: FuncId = 110;
+const F_MONTHNAME: FuncId = 111;
+const F_HEX: FuncId = 112;
+const F_TO_HEX: FuncId = 113;
+const F_STRING_SPLIT: FuncId = 114;
+const F_LIST_SORT: FuncId = 115;
+const F_LIST_DISTINCT: FuncId = 116;
+const F_LIST_REVERSE: FuncId = 117;
+
+// Integer output
+const F_ASCII: FuncId = 120;
+const F_GCD: FuncId = 121;
+const F_LCM: FuncId = 122;
+const F_BIT_COUNT: FuncId = 123;
+const F_BIT_XOR: FuncId = 124;
+const F_MAKE_DATE: FuncId = 125;
+const F_MAKE_TIMESTAMP: FuncId = 126;
+const F_EPOCH_MS: FuncId = 127;
+const F_EPOCH_US: FuncId = 128;
+const F_EPOCH_NS: FuncId = 129;
+const F_LIST_POSITION: FuncId = 130;
+
+// Bool output
+const F_ISNAN: FuncId = 140;
+const F_ISINF: FuncId = 141;
+const F_ISFINITE: FuncId = 142;
+const F_LIST_CONTAINS: FuncId = 143;
+
+// Floating-point output
+const F_LOG2: FuncId = 150;
+const F_LOG_BASE: FuncId = 151;
+const F_CBRT: FuncId = 152;
+const F_RADIANS: FuncId = 153;
+const F_DEGREES: FuncId = 154;
+
 /// Shorthands such as `year()`. The part number is embedded in the ID, joining the same
 /// extraction function as `date_part` (separate IDs per function, but one body).
-const F_PART_BASE: FuncId = 100;
+///
+/// Everything at or above this number is a date part, so it has to stay above every
+/// ordinary function ID (see the free-ID block above).
+const F_PART_BASE: FuncId = 200;
 
 // --- Date-time parts ---------------------------------------------------------
 
@@ -196,10 +249,29 @@ const P_SECOND: u8 = 7;
 const P_DOW: u8 = 8;
 const P_DOY: u8 = 9;
 const P_EPOCH: u8 = 10;
+const P_MILLISECOND: u8 = 11;
+const P_MICROSECOND: u8 = 12;
+const P_ISODOW: u8 = 13;
+const P_CENTURY: u8 = 14;
+const P_DECADE: u8 = 15;
 
-const PART_NAMES: [&[u8]; 11] = [
-    b"year", b"quarter", b"month", b"week", b"day", b"hour", b"minute", b"second", b"dow", b"doy",
+const PART_NAMES: [&[u8]; 16] = [
+    b"year",
+    b"quarter",
+    b"month",
+    b"week",
+    b"day",
+    b"hour",
+    b"minute",
+    b"second",
+    b"dow",
+    b"doy",
     b"epoch",
+    b"millisecond",
+    b"microsecond",
+    b"isodow",
+    b"century",
+    b"decade",
 ];
 
 /// Maps a part name (case-insensitive) to a number. Plurals and `dayofweek` / `dayofyear` are
@@ -213,6 +285,17 @@ fn part_id(s: &[u8]) -> Option<u8> {
     }
     if eq(s, b"dayofyear") {
         return Some(P_DOY);
+    }
+    // DuckDB's own short aliases. `ms`/`us` end in `s` but must not go through the
+    // plural stripping below, so they are matched first.
+    if eq(s, b"isoweekday") {
+        return Some(P_ISODOW);
+    }
+    if eq(s, b"ms") || eq(s, b"msec") || eq(s, b"msecs") {
+        return Some(P_MILLISECOND);
+    }
+    if eq(s, b"us") || eq(s, b"usec") || eq(s, b"usecs") {
+        return Some(P_MICROSECOND);
     }
     // A trailing `s` is dropped (`years` = `year`).
     let t = if s.len() > 1 && (s[s.len() - 1] | 0x20) == b's' { &s[..s.len() - 1] } else { s };
@@ -261,6 +344,35 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             ensure!(n >= 1, WrongArgCount);
             Ok((F_CONCAT, vec![Varchar; n], Varchar))
         }
+        // Unlike `concat`, a NULL argument is **skipped** (no separator emitted for it) and a
+        // NULL separator makes the whole row NULL. Verified against duckdb:
+        // `select concat_ws('-', 'a', NULL, 'b')` -> `a-b`,
+        // `select concat_ws(NULL, 'a', 'b')` -> NULL.
+        "concat_ws" => {
+            ensure!(n >= 1, WrongArgCount);
+            Ok((F_CONCAT_WS, vec![Varchar; n], Varchar))
+        }
+        // A negative count means "all but the last/first |n| characters" (DuckDB).
+        "left" => fixed(F_LEFT, &[Varchar, BigInt], n, 2, Varchar),
+        "right" => fixed(F_RIGHT, &[Varchar, BigInt], n, 2, Varchar),
+        // Code-point in / code-point out, so `chr(ascii(s))` round-trips a single character.
+        "ascii" | "unicode" | "ord" => fixed(F_ASCII, &[Varchar], n, 1, BigInt),
+        "chr" => fixed(F_CHR, &[BigInt], n, 1, Varchar),
+        // Splits into a LIST, which this engine represents as JSON text (see the module docs).
+        "string_split" | "str_split" | "string_to_array" | "split" => {
+            fixed(F_STRING_SPLIT, &[Varchar, Varchar], n, 2, Json)
+        }
+        // `hex` is overloaded in DuckDB: an integer argument is rendered in base 16, anything
+        // else is the hex dump of its bytes. `to_hex` is the integer-only spelling.
+        "hex" => {
+            ensure!(n == 1, WrongArgCount);
+            if args[0].is_integer() {
+                Ok((F_TO_HEX, vec![BigInt], Varchar))
+            } else {
+                Ok((F_HEX, vec![Varchar], Varchar))
+            }
+        }
+        "to_hex" => fixed(F_TO_HEX, &[BigInt], n, 1, Varchar),
         "length" | "len" | "char_length" | "character_length" => {
             fixed(F_LENGTH, &[Varchar], n, 1, BigInt)
         }
@@ -324,11 +436,32 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             Ok((if t == Double { F_MOD_F } else { F_MOD_I }, vec![t; 2], t))
         }
         "sqrt" => fixed(F_SQRT, &[Double], n, 1, Double),
+        "cbrt" => fixed(F_CBRT, &[Double], n, 1, Double),
         "exp" => fixed(F_EXP, &[Double], n, 1, Double),
         "ln" => fixed(F_LN, &[Double], n, 1, Double),
-        // DuckDB's `log(x)` is the common logarithm. The two-argument `log(b, x)` is unsupported.
-        "log" | "log10" => fixed(F_LOG10, &[Double], n, 1, Double),
+        // DuckDB's `log(x)` is the common logarithm; `log(b, x)` is base `b`.
+        "log" => {
+            ensure!((1..=2).contains(&n), WrongArgCount);
+            if n == 1 {
+                Ok((F_LOG10, vec![Double], Double))
+            } else {
+                Ok((F_LOG_BASE, vec![Double; 2], Double))
+            }
+        }
+        "log10" => fixed(F_LOG10, &[Double], n, 1, Double),
+        "log2" => fixed(F_LOG2, &[Double], n, 1, Double),
         "pow" | "power" => fixed(F_POW, &[Double, Double], n, 2, Double),
+        "radians" => fixed(F_RADIANS, &[Double], n, 1, Double),
+        "degrees" => fixed(F_DEGREES, &[Double], n, 1, Double),
+        // Defined on floating point only; an integer can never be NaN or infinite, and DuckDB
+        // resolves `isnan(1)` to the FLOAT overload too.
+        "isnan" => fixed(F_ISNAN, &[Double], n, 1, Boolean),
+        "isinf" => fixed(F_ISINF, &[Double], n, 1, Boolean),
+        "isfinite" => fixed(F_ISFINITE, &[Double], n, 1, Boolean),
+        "gcd" | "greatest_common_divisor" => fixed(F_GCD, &[BigInt, BigInt], n, 2, BigInt),
+        "lcm" | "least_common_multiple" => fixed(F_LCM, &[BigInt, BigInt], n, 2, BigInt),
+        "bit_count" => fixed(F_BIT_COUNT, &[BigInt], n, 1, BigInt),
+        "xor" => fixed(F_BIT_XOR, &[BigInt, BigInt], n, 2, BigInt),
         // The desugaring target of `&`/`|`/`<<`/`>>`/prefix `~` (see `sql::parser`).
         "bit_and" => fixed(F_BIT_AND, &[BigInt, BigInt], n, 2, BigInt),
         "bit_or" => fixed(F_BIT_OR, &[BigInt, BigInt], n, 2, BigInt),
@@ -357,7 +490,29 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "json_extract" => fixed(F_JSON_EXTRACT, &[Json, Varchar], n, 2, Json),
         "json_extract_string" => fixed(F_JSON_EXTRACT_STRING, &[Json, Varchar], n, 2, Varchar),
         "json_type" => json_path_opt(F_JSON_TYPE, n, Varchar),
-        "json_array_length" => json_path_opt(F_JSON_ARRAY_LENGTH, n, BigInt),
+        // `array_length`/`list_length` are DuckDB's LIST spellings of the same thing. They ride
+        // the existing ID: a LIST here *is* a JSON array (see the module docs).
+        "json_array_length" | "array_length" | "list_length" => {
+            json_path_opt(F_JSON_ARRAY_LENGTH, n, BigInt)
+        }
+        // The element argument keeps its own type and is serialized to JSON text per row, then
+        // compared byte-wise against each element -- the same equality JSON values already use
+        // in this engine (see `docs/sql/limitations.md`).
+        "list_contains" | "array_contains" | "list_has" | "array_has" => {
+            ensure!(n == 2, WrongArgCount);
+            ensure!(json_encodable(args[1]), TypeMismatch);
+            Ok((F_LIST_CONTAINS, vec![Json, args[1]], Boolean))
+        }
+        "list_position" | "list_indexof" | "array_position" | "array_indexof" => {
+            ensure!(n == 2, WrongArgCount);
+            ensure!(json_encodable(args[1]), TypeMismatch);
+            Ok((F_LIST_POSITION, vec![Json, args[1]], BigInt))
+        }
+        "list_sort" | "array_sort" => fixed(F_LIST_SORT, &[Json], n, 1, Json),
+        // Note `list_unique` is deliberately *not* an alias here: in DuckDB it returns the
+        // *count* of distinct elements, not the deduplicated list.
+        "list_distinct" | "array_distinct" => fixed(F_LIST_DISTINCT, &[Json], n, 1, Json),
+        "list_reverse" | "array_reverse" => fixed(F_LIST_REVERSE, &[Json], n, 1, Json),
         // They carry LIST/MAP-family names by DuckDB convention, but really they just read the
         // array/object shape of a Ty::Json (the design decision in the module docs at the top).
         "list_extract" | "array_extract" => fixed(F_LIST_EXTRACT, &[Json, BigInt], n, 2, Json),
@@ -429,6 +584,9 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "date_part" | "datepart" | "extract" => {
             fixed(F_DATE_PART, &[Varchar, Timestamp], n, 2, BigInt)
         }
+        // `date_sub` is deliberately not an alias of this: DuckDB's `date_sub` counts *complete*
+        // partitions where `date_diff` counts boundaries crossed, so the two disagree over a
+        // partial unit (`date_diff('day', '..23:00', '..01:00')` is 1, `date_sub` is 0).
         "date_diff" | "datediff" => {
             fixed(F_DATE_DIFF, &[Varchar, Timestamp, Timestamp], n, 3, BigInt)
         }
@@ -437,6 +595,26 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "date_add" => fixed(F_DATE_ADD, &[Varchar, BigInt, Timestamp], n, 3, Timestamp),
         "last_day" => fixed(F_LAST_DAY, &[Timestamp], n, 1, Date),
         "strftime" => fixed(F_STRFTIME, &[Timestamp, Varchar], n, 2, Varchar),
+        // English names, matching DuckDB's output exactly (`Monday`, `January`, ...).
+        // No locale support -- the engine carries no locale data at all.
+        "dayname" => fixed(F_DAYNAME, &[Timestamp], n, 1, Varchar),
+        "monthname" => fixed(F_MONTHNAME, &[Timestamp], n, 1, Varchar),
+        "make_date" => fixed(F_MAKE_DATE, &[BigInt, BigInt, BigInt], n, 3, Date),
+        // `make_timestamp(y, mo, d, h, mi, s)`. DuckDB's single-argument
+        // `make_timestamp(microseconds)` overload is not provided (`CAST` covers it).
+        // The seconds argument is DOUBLE in DuckDB; here it is BIGINT, so fractional seconds
+        // have to be written with `make_timestamp(...) + INTERVAL ... ` instead.
+        "make_timestamp" => fixed(
+            F_MAKE_TIMESTAMP,
+            &[BigInt, BigInt, BigInt, BigInt, BigInt, BigInt],
+            n,
+            6,
+            Timestamp,
+        ),
+        // The `epoch` shorthand is whole seconds; these are the finer-grained spellings.
+        "epoch_ms" => fixed(F_EPOCH_MS, &[Timestamp], n, 1, BigInt),
+        "epoch_us" => fixed(F_EPOCH_US, &[Timestamp], n, 1, BigInt),
+        "epoch_ns" => fixed(F_EPOCH_NS, &[Timestamp], n, 1, BigInt),
         // DuckDB's `to_timestamp` takes epoch seconds (DOUBLE), but here it is defined as a string
         // parser (the equivalent of `strptime`). A deliberate incompatibility.
         "to_date" => fixed(F_TO_DATE, &[Varchar], n, 1, Date),
@@ -452,6 +630,11 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "dayofweek" => shorthand(P_DOW, n),
         "dayofyear" => shorthand(P_DOY, n),
         "epoch" => shorthand(P_EPOCH, n),
+        "millisecond" => shorthand(P_MILLISECOND, n),
+        "microsecond" => shorthand(P_MICROSECOND, n),
+        "isodow" => shorthand(P_ISODOW, n),
+        "century" => shorthand(P_CENTURY, n),
+        "decade" => shorthand(P_DECADE, n),
 
         // Not implemented, since there is no clock (see the comments at the top of the module).
         _ => err!(FunctionNotFound),
@@ -552,6 +735,9 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
         F_NULLIF => return nullif(args, result_ty),
         F_GREATEST | F_LEAST => return extremum(id == F_GREATEST, args, result_ty),
         F_CONCAT => return concat_all(args, result_ty),
+        // Like `concat`, `concat_ws` decides NULL per argument rather than per row (a NULL
+        // value is skipped entirely, separator included), so it bypasses the row loop too.
+        F_CONCAT_WS => return concat_ws_build(args, result_ty),
         // The three regex functions do not ride the per-row eval_* loops. When the pattern column
         // is constant (stride 0) we want to compile once per batch, but carrying that cache into
         // eval_bool/eval_str's shared signature would be unnatural, so like F_CONCAT they are
@@ -850,8 +1036,8 @@ mod tests;
 // `call()` above dispatches into these submodule bodies.
 use bool_ops::eval_bool;
 use json::{
-    concat_all, extremum, fold_null, json_array_build, json_object_build, list_concat_build,
-    nullif, regexp_full_match_build,
+    concat_all, concat_ws_build, extremum, fold_null, json_array_build, json_object_build,
+    list_concat_build, nullif, regexp_full_match_build,
 };
 use numeric::{eval_f64, eval_i128, eval_int};
 use string::eval_str;

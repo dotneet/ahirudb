@@ -46,6 +46,51 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
         F_BIT_SHL => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shl(n)),
         F_BIT_SHR => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shr(n)),
         F_BIT_NOT => Some(!a.int(0)),
+        // The **code point** of the first character, not its first byte, so `chr(ascii(s))`
+        // round-trips (DuckDB's `ascii`/`unicode` behave the same). An empty string gives NULL,
+        // matching `select ascii('')` in duckdb; invalid UTF-8 gives NULL too.
+        F_ASCII => {
+            let s = a.bytes(0);
+            core::str::from_utf8(s).ok().and_then(|t| t.chars().next()).map(|c| c as i64)
+        }
+        F_BIT_XOR => Some(a.int(0) ^ a.int(1)),
+        F_BIT_COUNT => Some(a.int(0).count_ones() as i64),
+        // Always non-negative, matching DuckDB (`select gcd(-4, 6)` -> `2`).
+        F_GCD => Some(gcd(a.int(0), a.int(1))),
+        F_LCM => {
+            let (x, y) = (a.int(0), a.int(1));
+            let g = gcd(x, y);
+            if g == 0 {
+                Some(0)
+            } else {
+                // Divide first so the product does not overflow needlessly.
+                (x / g).checked_mul(y).map(|v| v.abs())
+            }
+        }
+        // Out-of-range components give NULL rather than silently normalizing
+        // (`make_date(2024, 13, 1)` is an error in DuckDB; NULL is this engine's convention
+        // for an undefined argument, the same as `sqrt(-1)`).
+        F_MAKE_DATE => make_date(a.int(0), a.int(1), a.int(2)),
+        F_MAKE_TIMESTAMP => {
+            let (h, mi, s) = (a.int(3), a.int(4), a.int(5));
+            if !(0..24).contains(&h) || !(0..60).contains(&mi) || !(0..60).contains(&s) {
+                None
+            } else {
+                let tod = h * US_PER_HOUR + mi * US_PER_MIN + s * US_PER_SEC;
+                make_date(a.int(0), a.int(1), a.int(2))
+                    .and_then(|d| d.checked_mul(US_PER_DAY))
+                    .and_then(|us| us.checked_add(tod))
+            }
+        }
+        // TIMESTAMP is already microseconds since the epoch, so these are pure rescalings.
+        F_EPOCH_MS => Some(a.int(0).div_euclid(1_000)),
+        F_EPOCH_US => Some(a.int(0)),
+        F_EPOCH_NS => a.int(0).checked_mul(1_000),
+        F_LIST_POSITION => match super::json::list_find(a)? {
+            // DuckDB gives NULL rather than 0 when the element is absent.
+            Some(0) | None => None,
+            found => found,
+        },
         F_DATE_PART => match part_id(a.bytes(0)) {
             Some(p) => date_part(p, a.int(1)),
             None => err!(TypeMismatch),
@@ -114,6 +159,31 @@ fn factorial(n: i64) -> Result<i128> {
     Ok(acc)
 }
 
+/// The greatest common divisor, always non-negative. `i64::MIN` has no positive absolute value,
+/// so it is handled through `unsigned_abs` and clamped on the way back out.
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut x, mut y) = (a.unsigned_abs(), b.unsigned_abs());
+    while y != 0 {
+        let t = x % y;
+        x = y;
+        y = t;
+    }
+    i64::try_from(x).unwrap_or(i64::MAX)
+}
+
+/// `make_date(y, m, d)` -> days since the epoch. Out-of-range month or day gives `None`
+/// (= SQL NULL); the day is checked against the real length of that month, so
+/// `make_date(2023, 2, 29)` is NULL while `make_date(2024, 2, 29)` is a date.
+fn make_date(y: i64, m: i64, d: i64) -> Option<i64> {
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    if d < 1 || d > days_in_month(y, m as u32) as i64 {
+        return None;
+    }
+    Some(days_from_civil(y, m as u32, d as u32))
+}
+
 /// Rounds away from zero to a power of ten (`round(12345, -2)` -> 12300).
 fn round_int(x: i64, k: i64) -> Option<i64> {
     if k > 18 {
@@ -177,6 +247,28 @@ pub(super) fn eval_f64(id: FuncId, a: &A) -> Result<Option<f64>> {
                 Some(f_ln(x) / core::f64::consts::LN_10)
             }
         }
+        F_LOG2 => {
+            if x <= 0.0 {
+                None
+            } else {
+                Some(f_ln(x) / core::f64::consts::LN_2)
+            }
+        }
+        // `log(base, x)`. A base of 1 would divide by zero, so it joins the "undefined gives
+        // NULL" cases rather than returning an infinity.
+        F_LOG_BASE => {
+            let b = x;
+            let v = a.flt(1);
+            if b <= 0.0 || b == 1.0 || v <= 0.0 {
+                None
+            } else {
+                Some(f_ln(v) / f_ln(b))
+            }
+        }
+        // Defined for negative input too (unlike `sqrt`), matching DuckDB.
+        F_CBRT => Some(if x < 0.0 { -f_pow(-x, 1.0 / 3.0) } else { f_pow(x, 1.0 / 3.0) }),
+        F_RADIANS => Some(x * (core::f64::consts::PI / 180.0)),
+        F_DEGREES => Some(x * (180.0 / core::f64::consts::PI)),
         F_POW => Some(f_pow(x, a.flt(1))),
         F_MOD_F => Some(x % a.flt(1)),
         _ => err!(Internal),

@@ -19,7 +19,9 @@ use crate::plan::compile::{
 #[cfg(feature = "ddl")]
 use crate::plan::MemScanSpec;
 use crate::plan::SetOpKind;
-use crate::plan::{Agg, AggKind, Node, Plan, ScanSpec, Scope, SortKey, WindowKind, WindowSpec};
+use crate::plan::{
+    Agg, AggKind, Node, Plan, ScanSpec, Scope, SecondArg, SortKey, WindowKind, WindowSpec,
+};
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{

@@ -1,5 +1,5 @@
 //! Strings (Bytes output)
-use super::datetime::strftime;
+use super::datetime::{date_part, strftime};
 use super::json::{json_extract_or_whole, write_json_scalar};
 use super::numeric::{pow10, round_half_up};
 use super::*;
@@ -174,6 +174,89 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                 out.extend_from_slice(&fill);
             }
         }
+        F_LEFT | F_RIGHT => {
+            let s = a.bytes(0);
+            let cl = cp_count(s) as i64;
+            let k = a.int(1);
+            // A negative count means "all but the last (LEFT) / first (RIGHT) |k| characters".
+            let take = if k < 0 { (cl + k).max(0) } else { k.min(cl) };
+            let cut = cp_byte(s, take as usize);
+            if id == F_LEFT {
+                out.extend_from_slice(&s[..cut]);
+            } else {
+                // RIGHT takes `take` characters off the end, so it skips the first `cl - take`.
+                let skip = cp_byte(s, (cl - take) as usize);
+                out.extend_from_slice(&s[skip..]);
+            }
+        }
+        F_CHR => {
+            let cp = a.int(0);
+            // Out of Unicode's range, or a surrogate half, has no UTF-8 encoding -> NULL
+            // (this engine's "undefined argument gives NULL" convention).
+            return match u32::try_from(cp).ok().and_then(char::from_u32) {
+                Some(c) => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
+        // Uppercase hex, matching DuckDB. `hex` dumps the argument's bytes; `to_hex` renders an
+        // integer in base 16 (negative values through their two's-complement bit pattern, again
+        // matching DuckDB: `select to_hex(-1)` -> `FFFFFFFFFFFFFFFF`).
+        F_HEX => {
+            for &b in a.bytes(0) {
+                out.push(hex_digit(b >> 4));
+                out.push(hex_digit(b & 0x0f));
+            }
+        }
+        F_TO_HEX => {
+            let v = a.int(0) as u64;
+            let mut started = false;
+            for shift in (0..16).rev() {
+                let d = ((v >> (shift * 4)) & 0x0f) as u8;
+                if d != 0 || started || shift == 0 {
+                    out.push(hex_digit(d));
+                    started = true;
+                }
+            }
+        }
+        F_DAYNAME | F_MONTHNAME => {
+            let name = if id == F_DAYNAME {
+                const D: [&[u8]; 7] = [
+                    b"Sunday",
+                    b"Monday",
+                    b"Tuesday",
+                    b"Wednesday",
+                    b"Thursday",
+                    b"Friday",
+                    b"Saturday",
+                ];
+                D[date_part(P_DOW, a.int(0)).unwrap_or(0).clamp(0, 6) as usize]
+            } else {
+                const M: [&[u8]; 12] = [
+                    b"January",
+                    b"February",
+                    b"March",
+                    b"April",
+                    b"May",
+                    b"June",
+                    b"July",
+                    b"August",
+                    b"September",
+                    b"October",
+                    b"November",
+                    b"December",
+                ];
+                M[date_part(P_MONTH, a.int(0)).unwrap_or(1).clamp(1, 12) as usize - 1]
+            };
+            out.extend_from_slice(name);
+        }
+        F_STRING_SPLIT => string_split(a.bytes(0), a.bytes(1), out),
+        F_LIST_SORT | F_LIST_DISTINCT | F_LIST_REVERSE => {
+            return super::json::list_rearrange(id, a.bytes(0), out);
+        }
         F_REVERSE => {
             let s = a.bytes(0);
             let mut hi = s.len();
@@ -305,6 +388,44 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
         _ => err!(Internal),
     }
     Ok(true)
+}
+
+/// One uppercase hex digit. `json.rs` and `exec::agg` carry their own copies for `\uXXXX`
+/// escapes (lowercase there); this one exists for `hex`/`to_hex`.
+fn hex_digit(n: u8) -> u8 {
+    if n < 10 {
+        b'0' + n
+    } else {
+        b'A' + (n - 10)
+    }
+}
+
+/// `string_split(s, sep)`. Writes a JSON array of strings, which is how this engine spells a
+/// LIST (see `expr::funcs`'s module docs).
+///
+/// An empty separator gives a single-element list holding the whole string, matching duckdb
+/// (`select string_split('abc', '')` -> `[abc]`); splitting into characters is not what it does.
+fn string_split(s: &[u8], sep: &[u8], out: &mut Vec<u8>) {
+    out.push(b'[');
+    if sep.is_empty() {
+        crate::json::write_json_string(s, out);
+        out.push(b']');
+        return;
+    }
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + sep.len() <= s.len() {
+        if &s[i..i + sep.len()] == sep {
+            crate::json::write_json_string(&s[start..i], out);
+            out.push(b',');
+            i += sep.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    crate::json::write_json_string(&s[start..], out);
+    out.push(b']');
 }
 
 /// `printf`'s maximum precision (the `N` of `%.<N>f`). `kernels::fmt_int`'s internal buffer is only

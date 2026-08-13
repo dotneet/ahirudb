@@ -22,8 +22,19 @@ SELECT pow(2, 10);        -- 1024   (alias: power)
 SELECT exp(1);            -- 2.718281828459045
 SELECT ln(2.718281828);   -- ~1
 SELECT log10(100);        -- 2
-SELECT log(1000);         -- ~3     (log is single-argument, always base-10; hand-rolled,
+SELECT log(1000);         -- ~3     (single-argument log is base-10; hand-rolled,
                           --         so expect ordinary floating-point noise, e.g. 2.9999999999999996)
+SELECT log(2, 8);         -- 3      (two-argument form is base `b`)
+SELECT log2(8);           -- 3
+SELECT cbrt(27);          -- 3      (defined for negative input too, unlike sqrt)
+SELECT pi();              -- 3.141592653589793
+SELECT radians(180);      -- 3.141592653589793
+SELECT degrees(pi());     -- 180
+SELECT gcd(12, 18);       -- 6      (alias: greatest_common_divisor)
+SELECT lcm(4, 6);         -- 12     (alias: least_common_multiple)
+SELECT bit_count(7);      -- 3
+SELECT xor(5, 3);         -- 6
+SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 ```
 
 | Function | Notes |
@@ -36,8 +47,18 @@ SELECT log(1000);         -- ~3     (log is single-argument, always base-10; han
 | `sqrt(x)` | Negative input returns `NULL` (DuckDB errors instead — an intentional divergence, matching this engine's general "prefer NULL over erroring mid-scan" policy) |
 | `exp(x)` | — |
 | `ln(x)` | `x ≤ 0` → `NULL` |
-| `log10(x)` / `log(x)` | Base-10; `x ≤ 0` → `NULL`. **The two-argument `log(base, x)` form is not implemented** |
+| `log10(x)` / `log(x)` | Base-10; `x ≤ 0` → `NULL` |
+| `log(base, x)` | Logarithm to `base`; `base ≤ 0`, `base = 1`, or `x ≤ 0` → `NULL` |
+| `log2(x)` | `x ≤ 0` → `NULL` |
+| `cbrt(x)` | Cube root; defined for negative input (unlike `sqrt`) |
 | `pow(x, y)` / `power(x, y)` | — |
+| `pi()` | Folded to a constant at plan time (there is no zero-argument call path at runtime) |
+| `radians(x)`, `degrees(x)` | Degree ↔ radian conversion |
+| `gcd(a, b)` / `greatest_common_divisor` | Always non-negative; `gcd(0, 0)` = 0 |
+| `lcm(a, b)` / `least_common_multiple` | Always non-negative; a value that overflows `BIGINT` → `NULL` |
+| `bit_count(x)` | Population count of the 64-bit two's-complement pattern |
+| `xor(a, b)` | Bitwise XOR (the function spelling; DuckDB's `#` operator is not implemented) |
+| `isnan(x)`, `isinf(x)`, `isfinite(x)` | Float predicates; `NULL` in, `NULL` out |
 
 All math kernels (`sqrt`, `ln`, `exp`, ...) are hand-rolled (Newton's
 method / series expansions) rather than delegating to a system math

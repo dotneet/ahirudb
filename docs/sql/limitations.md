@@ -21,7 +21,21 @@ user-visible effect.
 - **`ATTACH`** (attaching another database file)
 - **Named parameters** — only positional `?` placeholders are supported
 - Hashing/fuzzy-match functions commonly found in DuckDB: `md5`, `sha256`,
-  `levenshtein`, `jaro`, `soundex`, `uuid()`, `random()`
+  `hash`, `levenshtein`, `jaro`, `soundex`, `uuid()`, `random()`
+- **Trigonometric functions** (`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/
+  `atan2` and the hyperbolic family). Every float kernel here is
+  hand-rolled because the `no_std` wasm build has no libm (see
+  [functions-numeric.md](functions-numeric.md)), and a full set of series
+  expansions costs more code than the 1 MiB budget wants to spend on them.
+- **Unicode-table functions**: `strip_accents`, `nfc_normalize`,
+  `length_grapheme` and friends — the tables alone are tens of KB. This is
+  the same reason `upper`/`lower` are ASCII-only.
+- `strptime` (format-driven timestamp parsing). Use `to_timestamp`/
+  `to_date`, which parse the fixed ISO-ish shapes documented in
+  [functions-datetime.md](functions-datetime.md#truncating-formatting-parsing).
+- `date_sub` — deliberately *not* aliased to `date_diff`, because DuckDB's
+  `date_sub` counts complete partitions while `date_diff` counts boundaries
+  crossed, and the two disagree over a partial unit.
 - `now()` / `current_timestamp` / `current_date` as ordinary **scalar
   functions** you could invoke inside, say, a user-defined function — the
   no-argument keyword forms (`CURRENT_DATE`, `CURRENT_TIMESTAMP`, `now()`,
@@ -83,8 +97,17 @@ user-visible effect.
   lookaround, backreferences *inside a pattern*, named capture groups,
   non-greedy quantifiers, `\b`/`\B` word boundaries, or a case-insensitive
   flag.
-- **`log(x)`** is single-argument base-10 only; the two-argument
-  `log(base, x)` form isn't implemented.
+- **`quantile`/`percentile_cont`** are the *continuous* (interpolated)
+  quantile in all spellings. DuckDB's `quantile` is the discrete version,
+  and its `quantile_disc` isn't implemented. A list-valued fraction
+  (`quantile_cont(x, [0.25, 0.75])`) isn't supported either — the fraction
+  must be a single constant in `[0, 1]`.
+- **`make_date`/`make_timestamp`** return `NULL` for an out-of-range
+  component where DuckDB raises, and `make_timestamp` takes six integer
+  arguments only (no `DOUBLE` seconds, no single-argument microseconds
+  overload).
+- **`ntile(n)` with `n < 1`** returns `NULL` rather than raising as DuckDB
+  does — the same "prefer NULL over erroring mid-scan" policy as `sqrt(-1)`.
 - **`date_add`** has the signature `date_add(part, n, timestamp)`, not
   DuckDB's `date_add(timestamp, INTERVAL ...)` — there's no scalar-function
   overload that takes an `INTERVAL` value directly (interval arithmetic via

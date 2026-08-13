@@ -526,8 +526,10 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
   unpacking, `COLUMNS(lambda)`, and `* LIKE`-style star filtering are
   rejected with `UnsupportedFeature` (docs/sql/limitations.md)
 - Aggregates: `COUNT`/`COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
-  `stddev`/`variance`/`median`/`mode`/`approx_count_distinct`, `string_agg`,
-  `array_agg`, `FILTER (WHERE ...)` on any aggregate
+  `stddev`/`variance`/`stddev_pop`/`var_pop`/`median`/`quantile_cont`/
+  `mode`/`approx_count_distinct`, `string_agg`, `array_agg`,
+  `any_value`/`first`/`last`, `bool_and`/`bool_or`/`count_if`/`product`,
+  `arg_min`/`arg_max`, `FILTER (WHERE ...)` on any aggregate
 - Window functions, both inline `OVER (...)` and named `WINDOW w AS (...)` /
   `OVER w`, with a fixed default frame chosen automatically from whether
   `ORDER BY` is present (`RANGE UNBOUNDED PRECEDING` to current row if so,
@@ -537,16 +539,21 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
   rather than silently substituting the default and changing the query's
   meaning (`sql::parser::window_def_body`)
 - Scalar functions: string (`length`/`substring`/`upper`/`lower`/`trim`/
-  `replace`/`concat`/`split_part`/`starts_with`/`lpad`/`rpad`/`repeat`/
-  `reverse`/`instr`/...), numeric (`abs`/`round`/`floor`/`ceil`/`sqrt`/
-  `pow`/`mod`/`sign`/`ln`/`log10`/`exp`/...), date/time (`date_trunc`/
+  `replace`/`concat`/`concat_ws`/`split_part`/`string_split`/`starts_with`/
+  `lpad`/`rpad`/`repeat`/`reverse`/`instr`/`left`/`right`/`ascii`/`chr`/
+  `hex`/...), numeric (`abs`/`round`/`floor`/`ceil`/`sqrt`/`cbrt`/`pow`/
+  `mod`/`sign`/`ln`/`log`/`log2`/`log10`/`exp`/`pi`/`radians`/`degrees`/
+  `gcd`/`lcm`/`bit_count`/`isnan`/...), date/time (`date_trunc`/
   `date_part`/`extract`/`now`/`today`/`current_date`/`current_timestamp`/
-  `strftime`/`datediff`/`date_add`/...), `printf`/`format` (both `%`-style
+  `strftime`/`datediff`/`date_add`/`make_date`/`make_timestamp`/`dayname`/
+  `monthname`/`epoch_ms`/...), `typeof`, `printf`/`format` (both `%`-style
   and `{}`-style placeholders), `nullif`/`greatest`/`least`
 - `JSON` type with path operators (`->`, `->>`) and construction/extraction
   functions (`json_extract`, `json_type`, `json_array_length`,
-  `json_object`, `json_array`, `list_extract`, `map_extract`, ...) — `LIST`/
-  `MAP` values from Parquet share this same representation (§5)
+  `json_object`, `json_array`, `list_extract`, `map_extract`,
+  `list_contains`, `list_position`, `list_sort`, `list_distinct`,
+  `list_reverse`, ...) — `LIST`/`MAP` values from Parquet share this same
+  representation (§5)
 - Regular expressions: `regexp_matches`/`regexp_extract`/`regexp_replace`
 - `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL` arithmetic; `DECIMAL` with correct
   scale propagation through multiplication/division
