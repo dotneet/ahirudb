@@ -188,6 +188,19 @@ pub fn parse(argv: &[String]) -> Parsed {
             "echo" => o.echo = true,
             "bail" => o.bail = true,
             "batch" => o.batch = true,
+            "mode" => {
+                let v = value!("-mode");
+                match Mode::parse(&v) {
+                    Some(m) => {
+                        o.settings.mode = m;
+                        o.mode_set = true;
+                        if !sep_explicit {
+                            o.settings.separator = m.default_separator().to_string();
+                        }
+                    }
+                    None => return Parsed::Error(format!("unknown mode: {v}")),
+                }
+            }
             other => match Mode::parse(other) {
                 Some(m) => {
                     o.settings.mode = m;

@@ -90,7 +90,12 @@ fn fmt_date(days: i64) -> String {
 fn fmt_time(micros: i64) -> String {
     let rem = micros.rem_euclid(86_400_000_000);
     let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
-    format!("{h:02}:{mi:02}:{s:02}")
+    let subsec = rem % 1_000_000;
+    if subsec != 0 {
+        format!("{h:02}:{mi:02}:{s:02}.{subsec:06}")
+    } else {
+        format!("{h:02}:{mi:02}:{s:02}")
+    }
 }
 
 fn fmt_timestamp(micros: i64) -> String {
@@ -98,7 +103,12 @@ fn fmt_timestamp(micros: i64) -> String {
     let rem = micros.rem_euclid(86_400_000_000);
     let (y, m, d) = civil_from_days(days);
     let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
-    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+    let subsec = rem % 1_000_000;
+    if subsec != 0 {
+        format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}.{subsec:06}")
+    } else {
+        format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+    }
 }
 
 /// Turns a 16-byte UUID into `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.

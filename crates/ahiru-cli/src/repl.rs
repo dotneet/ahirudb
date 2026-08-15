@@ -697,6 +697,41 @@ enum Piece {
 /// Splits a script into dot commands and SQL statements.
 ///
 /// A dot command is a line whose first non-blank character is `.` *and* which
+fn is_only_trivia(s: &str) -> bool {
+    let mut chars = s.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '-' && chars.peek().map(|&(_, c2)| c2) == Some('-') {
+            for (_, c2) in chars.by_ref() {
+                if c2 == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && chars.peek().map(|&(_, c2)| c2) == Some('*') {
+            chars.next();
+            let mut prev = ' ';
+            for (_, c2) in chars.by_ref() {
+                if prev == '*' && c2 == '/' {
+                    break;
+                }
+                prev = c2;
+            }
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Splits a multi-statement script into sequential pieces (`Piece::Sql` /
+/// `Piece::Dot`).
+///
+/// A statement may span multiple lines; a line with a leading `.` only counts
+/// as a dot command when the preceding SQL statement is finished and `cur`
 /// starts at a statement boundary — inside an unterminated statement, a
 /// leading `.` is just SQL (a decimal point at the start of a continuation
 /// line, say).
@@ -704,7 +739,7 @@ fn split_script(text: &str) -> Vec<Piece> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for line in text.lines() {
-        if cur.trim().is_empty() && line.trim_start().starts_with('.') {
+        if is_only_trivia(&cur) && line.trim_start().starts_with('.') {
             cur.clear();
             out.push(Piece::Dot(line.trim().to_string()));
             continue;
@@ -721,7 +756,7 @@ fn split_script(text: &str) -> Vec<Piece> {
             cur = rest;
         }
     }
-    if !cur.trim().is_empty() {
+    if !cur.trim().is_empty() && !is_only_trivia(&cur) {
         out.push(Piece::Sql(cur));
     }
     out
@@ -749,15 +784,17 @@ fn needs_dummy_from(sql: &str) -> bool {
 /// after the inserted `FROM range(1)`. `AS order` / `AS limit` are aliases,
 /// not clauses, and must not be treated as insert points.
 fn dummy_from(sql: &str) -> Option<String> {
-    if !needs_dummy_from(sql) {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if !needs_dummy_from(trimmed) {
         return None;
     }
-    let words = top_level_words(sql);
-    let insert_at =
-        words.iter().find_map(|&(start, ref w)| clause_starts_at(sql, start, w).then_some(start));
+    let words = top_level_words(trimmed);
+    let insert_at = words
+        .iter()
+        .find_map(|&(start, ref w)| clause_starts_at(trimmed, start, w).then_some(start));
     Some(match insert_at {
-        Some(i) => format!("{} FROM range(1) {}", sql[..i].trim_end(), &sql[i..]),
-        None => format!("{sql} FROM range(1)"),
+        Some(i) => format!("{} FROM range(1) {}", trimmed[..i].trim_end(), &trimmed[i..]),
+        None => format!("{trimmed} FROM range(1)"),
     })
 }
 
@@ -984,6 +1021,10 @@ mod tests {
         assert_eq!(
             pieces(".mode csv\nSELECT 1; SELECT 2;\nSELECT 3"),
             vec!["dot:.mode csv", "sql:SELECT 1", "sql:SELECT 2", "sql:SELECT 3"]
+        );
+        assert_eq!(
+            pieces("-- set output mode\n.mode csv\nSELECT 1;"),
+            vec!["dot:.mode csv", "sql:SELECT 1"]
         );
     }
 

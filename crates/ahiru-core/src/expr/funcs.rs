@@ -202,6 +202,7 @@ const F_STRING_SPLIT: FuncId = 114;
 const F_LIST_SORT: FuncId = 115;
 const F_LIST_DISTINCT: FuncId = 116;
 const F_LIST_REVERSE: FuncId = 117;
+const F_UNHEX: FuncId = 118;
 
 // Integer output
 const F_ASCII: FuncId = 120;
@@ -373,6 +374,7 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             }
         }
         "to_hex" => fixed(F_TO_HEX, &[BigInt], n, 1, Varchar),
+        "unhex" | "from_hex" => fixed(F_UNHEX, &[Varchar], n, 1, Blob),
         "length" | "len" | "char_length" | "character_length" => {
             fixed(F_LENGTH, &[Varchar], n, 1, BigInt)
         }

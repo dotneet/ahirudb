@@ -526,9 +526,9 @@ fn ddl_tables_visible_in_dot_commands() {
     ]);
     assert!(r.ok, "{}", r.stderr);
     assert!(r.stdout.contains("users"), "{}", r.stdout);
-    assert!(r.stdout.contains("CREATE TABLE users ("), "{}", r.stdout);
-    assert!(r.stdout.contains("id integer"), "{}", r.stdout);
-    assert!(r.stdout.contains("name varchar"), "{}", r.stdout);
+    assert!(r.stdout.contains("CREATE TABLE users("), "{}", r.stdout);
+    assert!(r.stdout.contains("\"id\" INTEGER"), "{}", r.stdout);
+    assert!(r.stdout.contains("\"name\" VARCHAR"), "{}", r.stdout);
 }
 
 #[test]

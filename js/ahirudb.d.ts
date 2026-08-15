@@ -131,7 +131,7 @@ export type ParquetSource = TableSource;
  * (`ahiru_register_as`'s wire values). There is no explicit value for single-document
  * JSON yet — reach it via extension-based detection instead (see `DetectedFormatName`).
  */
-export type FormatName = 'parquet' | 'csv' | 'tsv' | 'jsonl';
+export type FormatName = 'auto' | 'parquet' | 'csv' | 'tsv' | 'jsonl';
 
 /**
  * Formats `detectFormat()` can infer from a registered name's extension.

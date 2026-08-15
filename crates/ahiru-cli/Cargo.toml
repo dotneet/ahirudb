@@ -16,7 +16,7 @@ path = "src/main.rs"
 # filesystem). Parquet output is opt-in on wasm for size reasons, but the
 # native CLI has no size constraint, so it is on by default (also required to
 # verify DuckDB interoperability end to end in `tests/copy.rs`).
-ahiru-core = { path = "../ahiru-core", features = ["std", "export", "export-parquet"] }
+ahiru-core = { path = "../ahiru-core", features = ["std", "export", "export-parquet", "ddl", "dml"] }
 # On wasm, ZSTD is lazily loaded as a separate module, but the native CLI may
 # link it directly (the size constraint applies only to the core .wasm).
 # Doing so also lets the CLI exercise the codec delegation protocol end to end.

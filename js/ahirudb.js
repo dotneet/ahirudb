@@ -1390,13 +1390,13 @@ export class AhiruDB {
       // candidates (a table name itself may contain a dot, as in `basic.csv`).
       if (s.includes('.')) for (const part of s.split('.')) mentioned.add(part.toLowerCase());
     };
-    for (const m of sql.matchAll(/[A-Za-z_][A-Za-z0-9_$.]*|'([^']*)'|"([^"]*)"/g)) {
+    for (const m of sql.matchAll(/[A-Za-z0-9_\p{L}\p{N}$.]+|'([^']*)'|"([^"]*)"/gu)) {
       add(m[1] ?? m[2] ?? m[0]);
     }
-    // `FROM parquet('https://...')` is contracted to register the path itself as the
+    // `FROM parquet('https://...')` or `read_parquet('...')` is contracted to register the path itself as the
     // table name (see resolve_from in plan/bind.rs).
-    // The function is named parquet, but an extension such as .csv is read as CSV.
-    for (const m of sql.matchAll(/parquet\(\s*'([^']*)'/gi)) {
+    // The function is named parquet/csv/json, but an extension such as .csv is read as CSV.
+    for (const m of sql.matchAll(/(?:read_)?(?:parquet|csv|json(?:l|_auto)?)\(\s*['"]([^'"]*)['"]/gi)) {
       const path = m[1];
       if (!this.#tables.has(path.toLowerCase())) this.register(path, path);
       add(path);

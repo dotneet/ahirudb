@@ -161,6 +161,7 @@ impl Bitmap {
         for (a, b) in self.words.iter_mut().zip(&other.words) {
             *a |= *b;
         }
+        self.clear_tail();
     }
 
     /// Inverts every bit, keeping the trailing padding bits at 0.

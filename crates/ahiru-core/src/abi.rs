@@ -169,15 +169,26 @@ unsafe fn slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 #[no_mangle]
 pub extern "C" fn ahiru_session_new() -> i32 {
     let s = state();
-    s.sessions.push(Some(Session::new()));
-    (s.sessions.len() - 1) as i32
+    if let Some(pos) = s.sessions.iter().position(|slot| slot.is_none()) {
+        s.sessions[pos] = Some(Session::new());
+        pos as i32
+    } else {
+        s.sessions.push(Some(Session::new()));
+        (s.sessions.len() - 1) as i32
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn ahiru_session_free(h: i32) {
+    if h < 0 {
+        return;
+    }
     let s = state();
     if let Some(slot) = s.sessions.get_mut(h as usize) {
         *slot = None;
+    }
+    while matches!(s.sessions.last(), Some(None)) {
+        s.sessions.pop();
     }
 }
 
@@ -198,6 +209,9 @@ pub extern "C" fn ahiru_set_now(h: i32, now_micros: i64) -> i32 {
 }
 
 fn session(h: i32) -> Option<&'static mut Session> {
+    if h < 0 {
+        return None;
+    }
     state().sessions.get_mut(h as usize)?.as_mut()
 }
 

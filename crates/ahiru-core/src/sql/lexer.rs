@@ -436,8 +436,18 @@ impl<'a> Lexer<'a> {
     fn skip_trivia(&mut self) -> Result<()> {
         let b = self.b();
         loop {
-            while self.pos < b.len() && matches!(b[self.pos], b' ' | b'\t' | b'\r' | b'\n') {
-                self.pos += 1;
+            while self.pos < b.len() {
+                if matches!(b[self.pos], b' ' | b'\t' | b'\r' | b'\n') {
+                    self.pos += 1;
+                } else if let Some(c) = self.src[self.pos..].chars().next() {
+                    if c.is_whitespace() {
+                        self.pos += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
             if self.pos + 1 < b.len() && b[self.pos] == b'-' && b[self.pos + 1] == b'-' {
                 self.pos += 2;

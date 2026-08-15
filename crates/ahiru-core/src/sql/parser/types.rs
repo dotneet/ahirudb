@@ -278,10 +278,17 @@ pub(super) fn parse_signed_int(s: &str) -> Option<i64> {
         return None;
     }
     let mut v: i64 = 0;
-    for &d in digits {
-        v = v.checked_mul(10)?.checked_add((d - b'0') as i64)?;
+    if neg {
+        for &d in digits {
+            v = v.checked_mul(10)?.checked_sub((d - b'0') as i64)?;
+        }
+        Some(v)
+    } else {
+        for &d in digits {
+            v = v.checked_mul(10)?.checked_add((d - b'0') as i64)?;
+        }
+        Some(v)
     }
-    Some(if neg { -v } else { v })
 }
 
 /// Adds one unit's worth into the `(months, days, micros)` accumulator.
@@ -352,4 +359,19 @@ pub(super) fn parse_interval_text(text: &str, pos: usize) -> Result<i128> {
     }
     ensure!(any, SyntaxError, pos);
     pack_interval_checked(months, days, micros, pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_signed_int_boundaries() {
+        assert_eq!(parse_signed_int("0"), Some(0));
+        assert_eq!(parse_signed_int("9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse_signed_int("+9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse_signed_int("-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(parse_signed_int("9223372036854775808"), None);
+        assert_eq!(parse_signed_int("-9223372036854775809"), None);
+    }
 }

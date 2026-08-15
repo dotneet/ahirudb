@@ -448,6 +448,14 @@ impl<'a> Writer<'a> {
             }
         };
 
+        if visible.is_empty() {
+            if duck {
+                let footer = format!("{total_rows} row{}", if total_rows == 1 { "" } else { "s" });
+                writeln!(self.out, "{footer}")?;
+            }
+            return Ok(());
+        }
+
         // --- Borders ---
         let mut top = String::from("┌");
         let mut mid = String::from("├");

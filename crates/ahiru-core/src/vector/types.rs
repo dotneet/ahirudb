@@ -224,7 +224,10 @@ impl Ty {
         // Addition and subtraction can carry into one more digit, so precision gets +1 (as in DuckDB).
         if let (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) = (a, b)
         {
-            return Some(Ty::decimal((p1 - s1).max(p2 - s2) + s1.max(s2) + 1, s1.max(s2)));
+            return Some(Ty::decimal(
+                p1.saturating_sub(s1).max(p2.saturating_sub(s2)) + s1.max(s2) + 1,
+                s1.max(s2),
+            ));
         }
         // Between numerics, widen. DECIMAL with floating point drops to DOUBLE.
         if a.is_numeric() && b.is_numeric() {

@@ -1282,8 +1282,7 @@ pub(super) fn bind_select_in(
         // after the sort) present, which row wins is decided by "deduplication after
         // sorting", so truncating with Top-N first would drop the correct representative.
         let topn = if sel.distinct_on.is_empty() && !distinct_after_sort {
-            sel.limit
-                .map(|l| l.saturating_add(sel.offset.unwrap_or(0)).min(usize::MAX as u64) as usize)
+            sel.limit.and_then(|l| usize::try_from(l.saturating_add(sel.offset.unwrap_or(0))).ok())
         } else {
             None
         };

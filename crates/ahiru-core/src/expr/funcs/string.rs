@@ -121,7 +121,7 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             };
             from = from.max(1);
             to = to.max(from);
-            let cap = s.len() as i64 + 1;
+            let cap = cp_count(s) as i64 + 1;
             let b0 = cp_byte(s, (from - 1).min(cap) as usize);
             let b1 = cp_byte(s, (to - 1).min(cap) as usize);
             out.extend_from_slice(&s[b0..b1.max(b0)]);
@@ -220,6 +220,23 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                     out.push(hex_digit(d));
                     started = true;
                 }
+            }
+        }
+        F_UNHEX => {
+            let s = a.bytes(0);
+            if !s.len().is_multiple_of(2) {
+                return Ok(false);
+            }
+            for i in (0..s.len()).step_by(2) {
+                let hi = match hex_val(s[i]) {
+                    Some(v) => v,
+                    None => return Ok(false),
+                };
+                let lo = match hex_val(s[i + 1]) {
+                    Some(v) => v,
+                    None => return Ok(false),
+                };
+                out.push((hi << 4) | lo);
             }
         }
         F_DAYNAME | F_MONTHNAME => {
@@ -397,6 +414,15 @@ fn hex_digit(n: u8) -> u8 {
         b'0' + n
     } else {
         b'A' + (n - 10)
+    }
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 

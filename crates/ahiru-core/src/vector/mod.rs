@@ -49,9 +49,12 @@ impl BytesData {
 
     #[inline]
     pub fn get(&self, i: usize) -> &[u8] {
+        if i + 1 >= self.offsets.len() {
+            return &[];
+        }
         let s = self.offsets[i] as usize;
         let e = self.offsets[i + 1] as usize;
-        &self.data[s..e]
+        self.data.get(s..e).unwrap_or(&[])
     }
 
     #[inline]
@@ -365,36 +368,17 @@ impl Vector {
                 self.push_null();
                 return;
             }
-            Value::Bool(x) => {
-                if let Data::Bool(b) = &mut self.data {
-                    b.push(*x)
-                }
-            }
-            Value::I32(x) => {
-                if let Data::I32(d) = &mut self.data {
-                    d.push(*x)
-                }
-            }
-            Value::I64(x) => {
-                if let Data::I64(d) = &mut self.data {
-                    d.push(*x)
-                }
-            }
-            Value::F64(x) => {
-                if let Data::F64(d) = &mut self.data {
-                    d.push(*x)
-                }
-            }
-            Value::I128(x) => {
-                if let Data::I128(d) = &mut self.data {
-                    d.push(*x)
-                }
-            }
-            Value::Bytes(x) => {
-                if let Data::Bytes(d) = &mut self.data {
-                    d.push(x)
-                }
-            }
+            _ => match (&mut self.data, v) {
+                (Data::Bool(b), Value::Bool(x)) => b.push(*x),
+                (Data::Bool(b), _) => b.push(v.as_bool().unwrap_or(false)),
+                (Data::I32(d), val) => d.push(val.as_i64().unwrap_or(0) as i32),
+                (Data::I64(d), val) => d.push(val.as_i64().unwrap_or(0)),
+                (Data::F64(d), val) => d.push(val.as_f64().unwrap_or(0.0)),
+                (Data::I128(d), Value::I128(x)) => d.push(*x),
+                (Data::I128(d), val) => d.push(val.as_i64().unwrap_or(0) as i128),
+                (Data::Bytes(d), Value::Bytes(x)) => d.push(x),
+                (Data::Bytes(d), _) => d.push(b""),
+            },
         }
         if let Some(b) = &mut self.validity {
             b.resize(self.data.len(), true);

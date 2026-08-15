@@ -337,11 +337,14 @@ fn read_data_page_v2(
     ensure!(def_len <= raw.len(), UnexpectedEof, 0);
 
     let page_validity = if desc.max_def_level > 0 {
-        ensure!(def_len > 0, BadPageHeader);
         let mut bm = Bitmap::with_capacity(n);
-        let bw = encoding::bit_width(desc.max_def_level as u32);
-        let mut d = RleDecoder::new(&raw[..def_len], bw);
-        d.read_levels_into(n, desc.max_def_level as u32, &mut bm)?;
+        if def_len > 0 {
+            let bw = encoding::bit_width(desc.max_def_level as u32);
+            let mut d = RleDecoder::new(&raw[..def_len], bw);
+            d.read_levels_into(n, desc.max_def_level as u32, &mut bm)?;
+        } else {
+            bm.push_n(true, n);
+        }
         Some(bm)
     } else {
         None
@@ -415,6 +418,9 @@ pub(crate) fn decode_dense(
     dict: Option<&Vector>,
 ) -> Result<Vector> {
     if enc.is_dictionary() {
+        if present == 0 {
+            return Ok(Vector::with_capacity(desc.ty, 0));
+        }
         let dict = match dict {
             Some(d) => d,
             None => err!(BadCompressedData),
@@ -450,13 +456,19 @@ pub(crate) fn decode_dense(
             }
         }
         // RLE is also used as the value encoding for BOOLEAN columns.
+        // In DataPageV1 it has a 4-byte length prefix; in DataPageV2 it is the raw RLE stream.
         Encoding::Rle => {
             ensure!(desc.ptype == PType::Boolean, UnsupportedEncoding);
-            ensure!(data.len() >= 4, UnexpectedEof, 0);
-            let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            ensure!(len <= data.len() - 4, UnexpectedEof, 4);
             let mut bm = Bitmap::with_capacity(present);
-            RleDecoder::new(&data[4..4 + len], 1).read_levels_into(present, 1, &mut bm)?;
+            if data.len() >= 4 {
+                let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                if len == data.len() - 4 {
+                    RleDecoder::new(&data[4..4 + len], 1).read_levels_into(present, 1, &mut bm)?;
+                    *v.data_mut() = Data::Bool(bm);
+                    return Ok(v);
+                }
+            }
+            RleDecoder::new(data, 1).read_levels_into(present, 1, &mut bm)?;
             *v.data_mut() = Data::Bool(bm);
         }
         _ => err!(UnsupportedEncoding),
@@ -510,12 +522,12 @@ fn decode_plain(desc: &ColumnDesc, data: &[u8], n: usize, out: &mut Vector) -> R
             ensure!(data.len() >= n * 12, UnexpectedEof, 0);
             let d = as_i64_vec(out, n)?;
             for c in data[..n * 12].chunks_exact(12) {
-                let nanos = i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+                let nanos = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
                 let julian = i32::from_le_bytes([c[8], c[9], c[10], c[11]]) as i64;
                 d.push(
                     (julian - JULIAN_EPOCH)
                         .saturating_mul(MICROS_PER_DAY)
-                        .saturating_add(nanos / 1000),
+                        .saturating_add((nanos / 1000) as i64),
                 );
             }
             Ok(())

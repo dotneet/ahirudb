@@ -64,6 +64,7 @@ fn init_flag_explicit(argv: &[String]) -> bool {
         "nullvalue",
         "maxrows",
         "maxwidth",
+        "mode",
     ];
     let mut explicit = false;
     let mut only_files = false;

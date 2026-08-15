@@ -278,8 +278,16 @@ fn one_frame(src: &[u8], mut pos: usize, out: &mut Vec<u8>, limit: usize) -> Res
 /// last stream taking whatever remains. Real Parquet pages follow libzstd.
 fn huf_4stream_sizes(regen: usize) -> Option<[usize; 4]> {
     let seg = regen.div_ceil(4);
-    let last = regen.checked_sub(seg.checked_mul(3)?)?;
-    Some([seg, seg, seg, last])
+    if let Some(mul) = seg.checked_mul(3) {
+        if let Some(last) = regen.checked_sub(mul) {
+            return Some([seg, seg, seg, last]);
+        }
+    }
+    let s0 = regen.div_ceil(4);
+    let s1 = (regen + 2) / 4;
+    let s2 = (regen + 1) / 4;
+    let s3 = regen / 4;
+    Some([s0, s1, s2, s3])
 }
 
 impl State {
@@ -613,13 +621,14 @@ mod predefined_tests {
     #[test]
     fn four_stream_sizes_match_libzstd() {
         assert_eq!(huf_4stream_sizes(4), Some([1, 1, 1, 1]));
+        assert_eq!(huf_4stream_sizes(5), Some([2, 1, 1, 1]));
         assert_eq!(huf_4stream_sizes(6), Some([2, 2, 2, 0]));
         assert_eq!(huf_4stream_sizes(7), Some([2, 2, 2, 1]));
         assert_eq!(huf_4stream_sizes(8), Some([2, 2, 2, 2]));
         // Differs from the RFC prose ((n+3)/4 … n/4 = 26,25,25,25).
         assert_eq!(huf_4stream_sizes(101), Some([26, 26, 26, 23]));
         assert_eq!(huf_4stream_sizes(102), Some([26, 26, 26, 24]));
-        for n in 6..128 {
+        for n in 0..128 {
             if let Some(sizes) = huf_4stream_sizes(n) {
                 assert_eq!(sizes.iter().sum::<usize>(), n, "n={n}");
             }

@@ -240,6 +240,11 @@ fn push_timestamp(out: &mut Vec<u8>, micros: i64) {
     push_padded(out, rem / 60_000_000 % 60, 2);
     out.push(b':');
     push_padded(out, rem / 1_000_000 % 60, 2);
+    let sub = rem % 1_000_000;
+    if sub != 0 {
+        out.push(b'.');
+        push_padded(out, sub, 6);
+    }
 }
 
 fn push_timestamptz(out: &mut Vec<u8>, micros: i64) {

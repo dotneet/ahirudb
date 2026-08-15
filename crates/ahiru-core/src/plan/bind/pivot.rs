@@ -261,11 +261,11 @@ pub fn desugar_unpivot(
     ensure!(!columns.is_empty(), SyntaxError);
     ensure!(columns.len() <= MAX_UNPIVOT_COLUMNS, ExpressionTooDeep);
 
-    // Targets must be unqualified bare column references (see the `UnpivotStmt` docs).
+    // Targets are column references (see the `UnpivotStmt` docs).
     let mut target_names: Vec<String> = Vec::with_capacity(columns.len());
     for &c in &columns {
         match arena.get(c) {
-            Expr::ColumnRef { qualifier: None, name } => target_names.push(name.clone()),
+            Expr::ColumnRef { name, .. } => target_names.push(name.clone()),
             _ => err!(UnsupportedFeature),
         }
     }

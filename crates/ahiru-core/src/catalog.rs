@@ -280,7 +280,7 @@ impl MemTable {
 pub struct Catalog {
     tables: Vec<Table>,
     #[cfg(feature = "ddl")]
-    mem: Vec<MemTable>,
+    mem: Vec<Option<MemTable>>,
     /// Views are `(name, the raw SQL of the query body)`. They are reparsed at bind time
     /// (`plan::bind::flatten_from`) on every reference. Holding an `ExprArena`/`QueryStmt`
     /// would make `catalog` depend on `sql::ast`, which is avoided.
@@ -371,22 +371,24 @@ impl Catalog {
 
     #[cfg(feature = "ddl")]
     pub fn mem_index_of(&self, name: &str) -> Option<usize> {
-        find_ci_index(self.mem.iter().map(|t| t.name.as_str()), name)
+        self.mem.iter().position(|t| {
+            t.as_ref().is_some_and(|t| eq_ascii_ci(t.name.as_bytes(), name.as_bytes()))
+        })
     }
 
     #[cfg(feature = "ddl")]
     pub fn mem_get(&self, i: usize) -> Option<&MemTable> {
-        self.mem.get(i)
+        self.mem.get(i).and_then(|t| t.as_ref())
     }
 
     #[cfg(feature = "ddl")]
     pub fn mem_get_mut(&mut self, i: usize) -> Option<&mut MemTable> {
-        self.mem.get_mut(i)
+        self.mem.get_mut(i).and_then(|t| t.as_mut())
     }
 
     #[cfg(feature = "ddl")]
     pub fn mem_names(&self) -> impl Iterator<Item = &str> {
-        self.mem.iter().map(|t| t.name.as_str())
+        self.mem.iter().filter_map(|t| t.as_ref().map(|t| t.name.as_str()))
     }
 
     /// Whether this name is free as a writable container (not taken by another
@@ -414,12 +416,19 @@ impl Catalog {
         match self.mem_index_of(name) {
             Some(i) => {
                 ensure!(replace, DuplicateTable);
-                self.mem[i] = MemTable { name: name.into(), schema, defaults, rows: Vec::new() };
+                self.mem[i] =
+                    Some(MemTable { name: name.into(), schema, defaults, rows: Vec::new() });
                 Ok(i)
             }
             None => {
-                self.mem.push(MemTable { name: name.into(), schema, defaults, rows: Vec::new() });
-                Ok(self.mem.len() - 1)
+                let table = MemTable { name: name.into(), schema, defaults, rows: Vec::new() };
+                if let Some(pos) = self.mem.iter().position(|slot| slot.is_none()) {
+                    self.mem[pos] = Some(table);
+                    Ok(pos)
+                } else {
+                    self.mem.push(Some(table));
+                    Ok(self.mem.len() - 1)
+                }
             }
         }
     }
@@ -430,7 +439,7 @@ impl Catalog {
     pub fn mem_drop(&mut self, name: &str) -> Result<()> {
         match self.mem_index_of(name) {
             Some(i) => {
-                self.mem.remove(i);
+                self.mem[i] = None;
                 Ok(())
             }
             None => err!(TableNotFound),
@@ -457,7 +466,7 @@ impl Catalog {
     /// appended to every existing row.
     #[cfg(feature = "ddl")]
     pub fn mem_add_column(&mut self, idx: usize, field: Field, value: Value) -> Result<()> {
-        let mt = match self.mem.get_mut(idx) {
+        let mt = match self.mem_get_mut(idx) {
             Some(t) => t,
             None => err!(TableNotFound),
         };
@@ -476,7 +485,7 @@ impl Catalog {
     /// `ALTER TABLE t DROP COLUMN col`. A missing column gives `ColumnNotFound`.
     #[cfg(feature = "ddl")]
     pub fn mem_drop_column(&mut self, idx: usize, col_name: &str) -> Result<()> {
-        let mt = match self.mem.get_mut(idx) {
+        let mt = match self.mem_get_mut(idx) {
             Some(t) => t,
             None => err!(TableNotFound),
         };
@@ -500,7 +509,7 @@ impl Catalog {
     /// and a `new` colliding with another existing column gives `DuplicateColumn`.
     #[cfg(feature = "ddl")]
     pub fn mem_rename_column(&mut self, idx: usize, old: &str, new: &str) -> Result<()> {
-        let mt = match self.mem.get_mut(idx) {
+        let mt = match self.mem_get_mut(idx) {
             Some(t) => t,
             None => err!(TableNotFound),
         };
@@ -529,7 +538,11 @@ impl Catalog {
             None => false,
         };
         ensure!(!self.name_taken_by_other(new_name) && !taken_by_other_mem, DuplicateTable);
-        self.mem[idx].name = new_name.into();
+        let mt = match self.mem.get_mut(idx).and_then(|t| t.as_mut()) {
+            Some(t) => t,
+            None => err!(TableNotFound),
+        };
+        mt.name = new_name.into();
         Ok(())
     }
 
