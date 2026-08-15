@@ -784,7 +784,7 @@ Three independent jobs: `test` (fmt --check, clippy -D warnings, and
 `cargo test --all` — cross-checked against a real DuckDB CLI binary
 installed in CI, see §12), `size` (builds the wasm target, runs
 `scripts/size.sh`, uploads the report, and posts it as a PR comment), and
-`js` (runs `scripts/size.sh` plus `node --test js/test/`). The size job is
+`js` (runs `scripts/size.sh` plus `node --test 'js/test/*.test.mjs'`). The size job is
 independent of the test job specifically so a size regression can't be
 missed just because the functional tests all pass.
 
