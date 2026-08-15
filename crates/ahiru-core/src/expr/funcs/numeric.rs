@@ -26,8 +26,10 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
             let d = if a.n() >= 2 { a.int(1) } else { 0 };
             if d >= 0 {
                 Some(x)
+            } else if let Some(k) = d.checked_neg() {
+                round_int(x, k)
             } else {
-                round_int(x, -d)
+                Some(0)
             }
         }
         F_MOD_I => {
@@ -64,7 +66,7 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
                 Some(0)
             } else {
                 // Divide first so the product does not overflow needlessly.
-                (x / g).checked_mul(y).map(|v| v.abs())
+                (x / g).checked_mul(y).and_then(|v| v.checked_abs())
             }
         }
         // Out-of-range components give NULL rather than silently normalizing

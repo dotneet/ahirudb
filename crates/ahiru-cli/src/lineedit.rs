@@ -621,7 +621,9 @@ fn redraw<W: Write>(stdout: &mut W, prompt: &str, buf: &Buffer) {
     // chars after the cursor, then reposition with an absolute move from
     // column 0 for simplicity and correctness with wide prompts.
     let _ = write!(stdout, "\r");
-    let col = prompt.chars().count() + buf.cursor;
+    let prompt_width = crate::output::str_width(prompt);
+    let buf_prefix: String = buf.chars[..buf.cursor].iter().collect();
+    let col = prompt_width + crate::output::str_width(&buf_prefix);
     if col > 0 {
         let _ = write!(stdout, "\x1b[{col}C");
     }

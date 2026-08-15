@@ -513,3 +513,27 @@ fn legacy_schema_still_works() {
     assert!(r.stdout.contains("columns:"), "{}", r.stdout);
     assert!(r.stdout.contains("row groups:"), "{}", r.stdout);
 }
+
+#[test]
+fn ddl_tables_visible_in_dot_commands() {
+    let r = run(&[
+        "-c",
+        "CREATE TABLE users (id INT, name VARCHAR)",
+        "-c",
+        ".tables",
+        "-c",
+        ".schema users",
+    ]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains("users"), "{}", r.stdout);
+    assert!(r.stdout.contains("CREATE TABLE users ("), "{}", r.stdout);
+    assert!(r.stdout.contains("id integer"), "{}", r.stdout);
+    assert!(r.stdout.contains("name varchar"), "{}", r.stdout);
+}
+
+#[test]
+fn insert_mode_blob_hex() {
+    let r = run(&["-mode", "insert", "-c", "SELECT unhex('deadbeef') AS b"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains("X'deadbeef'"), "{}", r.stdout);
+}

@@ -69,9 +69,20 @@ impl Engine {
         }
     }
 
-    /// Table names registered so far, in registration order (for `.tables`).
-    pub fn table_names(&self) -> &[String] {
-        &self.names
+    /// Table names registered so far (including file table aliases, in-memory tables, and views).
+    pub fn table_names(&self) -> Vec<String> {
+        let mut out = self.names.clone();
+        for name in self.s.catalog.mem_names() {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                out.push(name.to_string());
+            }
+        }
+        for name in self.s.catalog.view_names() {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                out.push(name.to_string());
+            }
+        }
+        out
     }
 
     /// Registers one command-line file argument. Accepted forms:
@@ -247,18 +258,7 @@ impl Engine {
 
     /// Column names and types of `table`, for `.schema` and `SUMMARIZE`.
     pub fn columns(&mut self, table: &str) -> R<Vec<(String, String, bool)>> {
-        let idx =
-            self.s.catalog.index_of(table).ok_or_else(|| format!("no such table: {table}"))?;
-        let t = self.s.catalog.get_mut(idx).ok_or("table not registered")?;
-        match t.resolve()? {
-            Ok(()) => {}
-            Err(_) => return Err("could not resolve schema".into()),
-        }
-        let t = self.s.catalog.get(idx).ok_or("table not registered")?;
-        Ok(t.schema()
-            .iter()
-            .map(|f| (f.name.clone(), f.ty.name().to_string(), f.nullable))
-            .collect())
+        self.describe_columns(table)
     }
 
     /// Column names and types of an arbitrary `FROM` item, via `DESCRIBE`.

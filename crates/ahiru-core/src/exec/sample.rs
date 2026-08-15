@@ -179,13 +179,16 @@ impl RowSample {
     fn finish(&mut self) {
         let n = self.total_rows;
         let k = self.target.min(n);
-        // A partial Fisher-Yates: picks the first `k` uniformly at random.
-        let mut idx: Vec<u64> = (0..n).collect();
+        // A sparse Fisher-Yates: tracks modified entries in a map so memory is O(k) rather than O(n).
+        let mut map = alloc::collections::BTreeMap::<u64, u64>::new();
+        let mut idx: Vec<u64> = Vec::with_capacity(k as usize);
         for i in 0..k {
             let j = i + self.rng.below(n - i);
-            idx.swap(i as usize, j as usize);
+            let vi = map.get(&i).copied().unwrap_or(i);
+            let vj = map.get(&j).copied().unwrap_or(j);
+            map.insert(j, vi);
+            idx.push(vj);
         }
-        idx.truncate(k as usize);
         idx.sort_unstable();
 
         let template: Vec<Ty> = self.batches[0].cols.iter().map(|c| c.ty()).collect();

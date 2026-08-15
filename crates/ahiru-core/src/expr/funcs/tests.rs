@@ -1310,3 +1310,18 @@ fn format_supports_positional_and_auto_placeholders() {
     let b = vs(&[Some("b")]);
     assert_eq!(f("{1}-{0}", &[&a, &b]), Some("b-a".to_string()));
 }
+
+#[test]
+fn numeric_min_edge_cases_do_not_panic() {
+    let min_i = vi(Ty::BigInt, &[Some(i64::MIN)]);
+    let one = vi(Ty::BigInt, &[Some(1)]);
+    let hundred = vi(Ty::BigInt, &[Some(100)]);
+
+    // lcm(i64::MIN, 1) should not panic, returns None (overflow)
+    let res = run("lcm", &[&min_i, &one]).unwrap();
+    assert_eq!(int_at(&res, 0), None);
+
+    // round(100, i64::MIN) should not panic, returns 0
+    let res = run("round", &[&hundred, &min_i]).unwrap();
+    assert_eq!(int_at(&res, 0), Some(0));
+}

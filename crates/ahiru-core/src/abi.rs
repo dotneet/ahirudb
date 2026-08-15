@@ -133,10 +133,14 @@ fn fail_code<T>(code: crate::error::Code, fallback: T) -> T {
 /// Reserves a buffer for the host to write into.
 #[no_mangle]
 pub extern "C" fn ahiru_alloc(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
+    if len == 0 {
+        return core::ptr::NonNull::dangling().as_ptr();
+    }
+    let layout = match core::alloc::Layout::from_size_align(len, 1) {
+        Ok(l) => l,
+        Err(_) => return core::ptr::null_mut(),
+    };
+    unsafe { alloc::alloc::alloc(layout) }
 }
 
 /// Returns a region reserved by `ahiru_alloc`.
@@ -145,8 +149,10 @@ pub extern "C" fn ahiru_alloc(len: usize) -> *mut u8 {
 /// `ptr` must be what `ahiru_alloc` returned for the same `len`.
 #[no_mangle]
 pub unsafe extern "C" fn ahiru_free(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        drop(unsafe { Vec::from_raw_parts(ptr, 0, len) });
+    if !ptr.is_null() && len > 0 {
+        if let Ok(layout) = core::alloc::Layout::from_size_align(len, 1) {
+            unsafe { alloc::alloc::dealloc(ptr, layout) };
+        }
     }
 }
 
@@ -681,10 +687,10 @@ fn encode_batch(b: &Batch) -> Vec<u8> {
                     put_u64(&mut out, *w);
                 }
             }
-            Data::I32(v) => put_slice(&mut out, v, 4),
-            Data::I64(v) => put_slice(&mut out, v, 8),
-            Data::F64(v) => put_slice(&mut out, v, 8),
-            Data::I128(v) => put_slice(&mut out, v, 16),
+            Data::I32(v) => put_slice(&mut out, v),
+            Data::I64(v) => put_slice(&mut out, v),
+            Data::F64(v) => put_slice(&mut out, v),
+            Data::I128(v) => put_slice(&mut out, v),
             Data::Bytes(bd) => {
                 put_u32(&mut out, (bd.offsets.len() * 4) as u32);
                 for o in &bd.offsets {
@@ -699,10 +705,11 @@ fn encode_batch(b: &Batch) -> Vec<u8> {
 }
 
 /// Writes a fixed-width numeric array in little-endian order.
-fn put_slice<T: Copy>(out: &mut Vec<u8>, v: &[T], width: usize) {
-    put_u32(out, (v.len() * width) as u32);
+fn put_slice<T: Copy>(out: &mut Vec<u8>, v: &[T]) {
+    let byte_len = core::mem::size_of_val(v);
+    put_u32(out, byte_len as u32);
     // wasm is little-endian, so the bytes can be copied straight across.
-    let bytes = unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * width) };
+    let bytes = unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, byte_len) };
     out.extend_from_slice(bytes);
 }
 

@@ -248,29 +248,27 @@ fn push_timestamptz(out: &mut Vec<u8>, micros: i64) {
 }
 
 fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {
-    let s = {
-        let mut buf = [0u8; 20];
-        let mut n = 0usize;
-        let neg = v < 0;
-        let mut u = v.unsigned_abs();
-        loop {
-            buf[n] = b'0' + (u % 10) as u8;
-            n += 1;
-            u /= 10;
-            if u == 0 {
-                break;
-            }
+    let neg = v < 0;
+    let mut buf = [0u8; 20];
+    let mut n = 0usize;
+    let mut u = v.unsigned_abs();
+    loop {
+        buf[n] = b'0' + (u % 10) as u8;
+        n += 1;
+        u /= 10;
+        if u == 0 {
+            break;
         }
-        let mut v: Vec<u8> = buf[..n].iter().rev().copied().collect();
-        if neg {
-            v.insert(0, b'-');
-        }
-        v
-    };
-    for _ in 0..width.saturating_sub(s.len()) {
+    }
+    if neg {
+        out.push(b'-');
+    }
+    for _ in 0..width.saturating_sub(n) {
         out.push(b'0');
     }
-    out.extend_from_slice(&s);
+    for i in (0..n).rev() {
+        out.push(buf[i]);
+    }
 }
 
 #[cfg(test)]

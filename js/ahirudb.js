@@ -340,11 +340,16 @@ function urlSource(url, fetchImpl) {
         /* HEAD unavailable. The range request below yields the total length. */
       }
       const r = await request(doFetch, url, { headers: { Range: 'bytes=0-0' } });
+      if (!r.ok) {
+        throw new AhiruError(Code.IO_FAILED, { detail: `${redactUrl(url)} -> HTTP ${r.status}` });
+      }
       const cr = r.headers?.get('content-range');
       const m = cr && /\/(\d+)\s*$/.exec(cr);
       if (m) return Number(m[1]);
-      const len = r.headers?.get('content-length');
-      if (r.ok && len) return Number(len);
+      if (r.status === 200) {
+        const len = r.headers?.get('content-length');
+        if (len) return Number(len);
+      }
       throw new AhiruError(Code.IO_FAILED, { detail: `cannot determine size of ${redactUrl(url)}` });
     },
     async read(offset, len) {
@@ -392,7 +397,7 @@ function urlSource(url, fetchImpl) {
         });
       }
       // Some servers ignore Range and return 200 with the whole thing. Slice out the requested window.
-      if (buf.byteLength >= offset + len) return buf.subarray(offset, offset + len);
+      if (buf.byteLength >= offset + len) return buf.slice(offset, offset + len);
       // A body of the requested length at offset 0 is the prefix we asked for.
       // The same length at a non-zero offset is *not* trustworthy: a Range-unaware
       // server often returns the first `len` bytes of the file (or an error page)
@@ -1107,6 +1112,7 @@ export class AhiruDB {
     // (standard (async) generator semantics), so the lock is always released.
     const release = await this.#sessionLock.acquire();
     try {
+      this.#assertOpen();
       await this.#bindTables(sql);
 
       const q = await this.#start(sql, params);
@@ -1153,7 +1159,12 @@ export class AhiruDB {
       // CURRENT_DATE/CURRENT_TIMESTAMP/now() (DESIGN.md §2).
       e.ahiru_set_now(this.#session, BigInt(Date.now()) * 1000n);
       const ptr = e.ahiru_alloc(bytes.length);
+      if (ptr === 0 && bytes.length > 0) throw new AhiruError(Code.OOM, { sql });
       const pptr = pbytes.length > 0 ? e.ahiru_alloc(pbytes.length) : 0;
+      if (pptr === 0 && pbytes.length > 0) {
+        e.ahiru_free(ptr, bytes.length);
+        throw new AhiruError(Code.OOM, { sql });
+      }
       // alloc may grow memory, so re-take the view right before writing.
       const mem = new Uint8Array(this.#memory.buffer);
       mem.set(bytes, ptr);
@@ -1193,7 +1204,7 @@ export class AhiruDB {
         if (rec === undefined) {
           throw new AhiruError(Code.INTERNAL, { sql, detail: `unknown table index ${req.table}` });
         }
-        const src = await this.#bytesAt(rec, req.offset, req.len, sql);
+        const src = await this.#bytesAt(rec, req.part, req.offset, req.len, sql);
         const out =
           req.codec === CODEC_GZIP ? await gunzip(src) : this.#zstd.decompress(src, req.outLen);
         if (out.length !== req.outLen) {
@@ -1238,22 +1249,22 @@ export class AhiruDB {
    * I/O if it is still cached). A request for a range never fetched at all is an
    * engine-side inconsistency, so it is reported rather than silently fetched.
    */
-  async #bytesAt(rec, offset, len, sql) {
+  async #bytesAt(rec, part, offset, len, sql) {
     for (const c of rec.resident) {
-      if (c.offset <= offset && offset + len <= c.offset + c.bytes.length) {
+      if (c.part === part && c.offset <= offset && offset + len <= c.offset + c.bytes.length) {
         return c.bytes.subarray(offset - c.offset, offset - c.offset + len);
       }
     }
     // Memory / Blob sources need no I/O to slice, so they keep no retained copy.
     if (rec.source.cacheable === false) return rec.source.read(offset, len);
     const everFetched = rec.fetched.some(
-      (r) => r.offset <= offset && offset + len <= r.offset + r.len,
+      (r) => r.part === part && r.offset <= offset && offset + len <= r.offset + r.len,
     );
-    if (everFetched) return this.#read(rec, offset, len, sql);
+    if (everFetched) return this.#read(rec, part, offset, len, sql);
     throw new AhiruError(Code.INTERNAL, {
       sql,
       detail:
-        `codec request for bytes we never fetched: table ${rec.name} [${offset}, ${offset + len})` +
+        `codec request for bytes we never fetched: table ${rec.name} part ${part} [${offset}, ${offset + len})` +
         ' — the engine should ask for these via NEED_IO first',
     });
   }
@@ -1291,7 +1302,7 @@ export class AhiruDB {
     }
 
     // Coalesced ranges are fetched in parallel, to avoid stacking round trips.
-    const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.offset, j.len, sql)));
+    const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.part, j.offset, j.len, sql)));
 
     let provided = 0;
     for (let i = 0; i < jobs.length; i++) {
@@ -1299,14 +1310,9 @@ export class AhiruDB {
       provided += this.#provide(table, part, offset, buffers[i], sql);
       // Only remote sources keep a retained copy. When codec delegation asks for a
       // compressed block, slicing it out of here avoids a refetch (memory sources just slice).
-      //
-      // The JS-side registration API (`register`/`registerParquet`) is one table =
-      // one file for now, so `part` is always 0, which is consistent with `rec`
-      // holding a single retained copy. When multi-file registration
-      // (`ahiru_register_multi`) becomes usable from JS, this copy must be split per file.
-      if (rec.source.cacheable !== false && !rec.resident.some((c) => c.offset === offset)) {
-        rec.resident.push({ offset, bytes: buffers[i] });
-        rec.fetched.push({ offset, len: buffers[i].byteLength });
+      if (rec.source.cacheable !== false && !rec.resident.some((c) => c.part === part && c.offset === offset)) {
+        rec.resident.push({ part, offset, bytes: buffers[i] });
+        rec.fetched.push({ part, offset, len: buffers[i].byteLength });
         // Drop oldest first, so this does not grow without bound. If a dropped range
         // is needed later it is refetched from the cache (`#bytesAt`).
         let held = rec.resident.reduce((a, c) => a + c.bytes.byteLength, 0);
@@ -1328,8 +1334,8 @@ export class AhiruDB {
   }
 
   /** Reads a byte range through the cache. */
-  async #read(rec, offset, len, sql) {
-    const key = `${rec.source.key}:${offset}:${len}`;
+  async #read(rec, part, offset, len, sql) {
+    const key = `${rec.source.key}:${part}:${offset}:${len}`;
     const cacheable = rec.source.cacheable !== false;
     if (cacheable) {
       const hit = this.#cache.get(key);
@@ -1402,6 +1408,7 @@ export class AhiruDB {
       const e = this.#exports;
       const name = textEncoder.encode(rec.name);
       const ptr = e.ahiru_alloc(name.length);
+      if (ptr === 0 && name.length > 0) throw new AhiruError(Code.OOM);
       new Uint8Array(this.#memory.buffer).set(name, ptr);
       // Older cores have no ahiru_register_as. For Auto the 4-argument version is
       // equivalent, but silently ignoring an explicit choice would read it as another format, so fail.

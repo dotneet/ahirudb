@@ -260,3 +260,21 @@ fn alter_table_on_file_backed_table_is_rejected_as_read_only() {
     // The file-side data is left untouched.
     assert_eq!(run(&mut s, "SELECT count(*) FROM t")[0][0].as_i64(), Some(2));
 }
+
+#[test]
+fn alter_table_default_value_preserved_on_insert() {
+    let mut s = Session::new();
+    s.prepare("CREATE TABLE t (id INT)", &[]).unwrap();
+    affected(&mut s, "INSERT INTO t VALUES (1)");
+
+    affected(&mut s, "ALTER TABLE t ADD COLUMN score INT NOT NULL DEFAULT 100");
+    // Existing row should be backfilled with 100.
+    assert_eq!(run(&mut s, "SELECT id, score FROM t")[0], vec![Value::I32(1), Value::I32(100)]);
+
+    // Subsequent INSERT omitting 'score' should receive the DEFAULT (100) rather than NULL.
+    affected(&mut s, "INSERT INTO t (id) VALUES (2)");
+    let rows = run(&mut s, "SELECT id, score FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![Value::I32(1), Value::I32(100)]);
+    assert_eq!(rows[1], vec![Value::I32(2), Value::I32(100)]);
+}

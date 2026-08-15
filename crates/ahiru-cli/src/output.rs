@@ -297,6 +297,18 @@ impl<'a> Writer<'a> {
             .map(|(v, ty)| {
                 if matches!(v, Value::Null) {
                     "NULL".to_string()
+                } else if *ty == Ty::Blob {
+                    if let Value::Bytes(b) = v {
+                        const HEX: &[u8; 16] = b"0123456789abcdef";
+                        let mut hex = String::with_capacity(b.len() * 2);
+                        for byte in b {
+                            hex.push(HEX[(byte >> 4) as usize] as char);
+                            hex.push(HEX[(byte & 0xf) as usize] as char);
+                        }
+                        format!("X'{hex}'")
+                    } else {
+                        "NULL".to_string()
+                    }
                 } else if *ty == Ty::Boolean || crate::render::is_numeric(*ty) {
                     crate::render::render(v, *ty, "NULL")
                 } else {
@@ -385,16 +397,16 @@ impl<'a> Writer<'a> {
 
         // --- Column content widths, across the header, the type line (duck
         // only) and every displayed data row. ---
-        let mut col_width: Vec<usize> = self.names.iter().map(|n| n.chars().count()).collect();
+        let mut col_width: Vec<usize> = self.names.iter().map(|n| str_width(n)).collect();
         if duck {
             for (w, ty) in col_width.iter_mut().zip(&self.types) {
-                *w = (*w).max(ty.name().to_ascii_lowercase().chars().count());
+                *w = (*w).max(str_width(&ty.name().to_ascii_lowercase()));
             }
         }
         for row in &display_rows {
             if let DisplayRow::Data(cells) = row {
                 for (w, cell) in col_width.iter_mut().zip(cells.iter()) {
-                    *w = (*w).max(cell.chars().count());
+                    *w = (*w).max(str_width(cell));
                 }
             }
         }
@@ -605,10 +617,41 @@ fn table_width(keep: &[usize], col_width: &[usize], elided: bool) -> usize {
     total
 }
 
+/// Returns the display column width of a single character in a monospace terminal.
+pub(crate) fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    if cp < 0x20 || (0x7f..0xa0).contains(&cp) || cp == 0x200b || cp == 0xfeff {
+        0
+    } else if (0x1100..=0x115f).contains(&cp)
+        || (0x2329..=0x232a).contains(&cp)
+        || (0x2e80..=0x303e).contains(&cp)
+        || (0x3040..=0xa4cf).contains(&cp)
+        || (0xac00..=0xd7a3).contains(&cp)
+        || (0xf900..=0xfaff).contains(&cp)
+        || (0xfe10..=0xfe19).contains(&cp)
+        || (0xfe30..=0xfe6f).contains(&cp)
+        || (0xff00..=0xff60).contains(&cp)
+        || (0xffe0..=0xffe6).contains(&cp)
+        || (0x1f300..=0x1f64f).contains(&cp)
+        || (0x1f680..=0x1f6ff).contains(&cp)
+        || (0x1f900..=0x1f9ff).contains(&cp)
+        || (0x20000..=0x3ffff).contains(&cp)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// Returns the display column width of a string in a monospace terminal.
+pub(crate) fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
 /// Pads `text` to `width` with one space of padding on each side, right- or
 /// left-aligned within that width.
 fn pad_cell(text: &str, width: usize, right_align: bool) -> String {
-    let len = text.chars().count();
+    let len = str_width(text);
     let fill = width.saturating_sub(len);
     if right_align {
         format!(" {}{text} ", " ".repeat(fill))
@@ -620,7 +663,7 @@ fn pad_cell(text: &str, width: usize, right_align: bool) -> String {
 /// Pads a short marker (`·` or `…`) centered within `width`, for elision rows
 /// and the elision column.
 fn pad_center(marker: &str, width: usize) -> String {
-    let len = marker.chars().count();
+    let len = str_width(marker);
     let fill = width.saturating_sub(len);
     let left = fill / 2;
     let right = fill - left;

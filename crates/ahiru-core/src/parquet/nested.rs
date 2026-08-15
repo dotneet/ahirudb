@@ -461,10 +461,11 @@ impl<'a> LeafCursor<'a> {
     }
 
     #[inline]
-    fn take_value(&mut self) -> Value {
+    fn take_value(&mut self) -> Result<Value> {
+        ensure!(self.val_idx < self.values.len(), BadCompressedData);
         let v = self.values.value_at(self.val_idx);
         self.val_idx += 1;
-        v
+        Ok(v)
     }
 }
 
@@ -532,7 +533,7 @@ fn consume_boundary(node: &NestedNode, cursors: &mut [LeafCursor]) {
 /// extra layer of nesting like `{"list": [...]}`).
 fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
-        NestedContent::Leaf(idx) => Ok(take_leaf_value(*idx, cursors)),
+        NestedContent::Leaf(idx) => take_leaf_value(*idx, cursors),
         NestedContent::Group(children) => {
             if children.len() == 1 && children[0].repetition == Repetition::Repeated {
                 return assemble(&children[0], cursors);
@@ -554,7 +555,7 @@ fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonV
 /// two or more children (e.g. a MAP's key/value), it becomes a named object.
 fn render_element(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
-        NestedContent::Leaf(idx) => Ok(take_leaf_value(*idx, cursors)),
+        NestedContent::Leaf(idx) => take_leaf_value(*idx, cursors),
         NestedContent::Group(children) => {
             if children.len() == 1 {
                 return assemble(&children[0], cursors);
@@ -568,11 +569,11 @@ fn render_element(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonV
     }
 }
 
-fn take_leaf_value(idx: usize, cursors: &mut [LeafCursor]) -> JsonValue {
+fn take_leaf_value(idx: usize, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     let ty = cursors[idx].ty;
-    let v = cursors[idx].take_value();
+    let v = cursors[idx].take_value()?;
     cursors[idx].advance_raw();
-    leaf_value_to_json(ty, v)
+    Ok(leaf_value_to_json(ty, v))
 }
 
 // --- Entry point ----------------------------------------------------------

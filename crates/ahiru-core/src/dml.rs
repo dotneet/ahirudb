@@ -67,7 +67,10 @@ pub(crate) fn insert(
     params: &[Value],
 ) -> Result<Prepared> {
     let idx = session.catalog.mem_index_writable(table)?;
-    let schema = session.catalog.mem_get(idx).unwrap().schema.clone();
+    let (schema, defaults) = {
+        let mt = session.catalog.mem_get(idx).unwrap();
+        (mt.schema.clone(), mt.defaults.clone())
+    };
     let col_idx = resolve_insert_columns(&schema, columns)?;
 
     // NOT NULL is checked over all schema columns at once, after the row is assembled.
@@ -78,7 +81,7 @@ pub(crate) fn insert(
             let mut out = Vec::with_capacity(value_rows.len());
             for row_exprs in value_rows {
                 ensure!(row_exprs.len() == col_idx.len(), ColumnCountMismatch);
-                let mut row = vec![Value::Null; schema.len()];
+                let mut row = defaults.clone();
                 for (&slot, &expr_id) in col_idx.iter().zip(row_exprs) {
                     row[slot] = eval_scalar(session, arena, expr_id, params, schema[slot].ty)?;
                 }
@@ -92,7 +95,7 @@ pub(crate) fn insert(
             ensure!(src_schema.len() == col_idx.len(), ColumnCountMismatch);
             let mut out = Vec::with_capacity(src_rows.len());
             for r in src_rows {
-                let mut row = vec![Value::Null; schema.len()];
+                let mut row = defaults.clone();
                 for (&slot, v) in col_idx.iter().zip(r) {
                     row[slot] = cast_value(session, v, schema[slot].ty)?;
                 }

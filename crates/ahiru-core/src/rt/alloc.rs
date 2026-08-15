@@ -168,11 +168,11 @@ unsafe impl GlobalAlloc for AhiruAlloc {
             let csize = unsafe { (*cur).size };
             if csize >= need {
                 unsafe { *prev = (*cur).next };
-                // Split the tail back onto the large list so a 64 KiB free
-                // block reused for 40 KiB does not lose 24 KiB (and so
-                // `heap_used` matches what `dealloc` will subtract).
+                // Split the tail back onto the large list only if it is large enough
+                // to be allocated from h.large (rem > MAX_SMALL), avoiding unallocatable
+                // zombie blocks on the large free list.
                 let rem = csize - need;
-                if rem > 0 {
+                if rem > MAX_SMALL {
                     let rest = unsafe { (cur as *mut u8).add(need) as *mut LargeNode };
                     unsafe {
                         (*rest).next = h.large;

@@ -93,10 +93,12 @@ impl ColumnMetaData {
     /// If a dictionary page exists, the range starts there.
     pub fn byte_range(&self) -> (u64, u64) {
         let start = match self.dictionary_page_offset {
-            Some(d) if d > 0 && d < self.data_page_offset => d,
-            _ => self.data_page_offset,
+            Some(d) if d > 0 && d < self.data_page_offset => d.max(0),
+            _ => self.data_page_offset.max(0),
         };
-        (start as u64, (start + self.total_compressed_size) as u64)
+        let len = self.total_compressed_size.max(0);
+        let end = (start as u64).saturating_add(len as u64);
+        (start as u64, end)
     }
 
     /// The byte range `[dictionary_page_offset, data_page_offset)` of the dictionary
@@ -105,7 +107,7 @@ impl ColumnMetaData {
     pub fn dictionary_page_range(&self) -> Option<(u64, u64)> {
         match self.dictionary_page_offset {
             Some(d) if d > 0 && d < self.data_page_offset => {
-                Some((d as u64, self.data_page_offset as u64))
+                Some((d as u64, (self.data_page_offset.max(0)) as u64))
             }
             _ => None,
         }

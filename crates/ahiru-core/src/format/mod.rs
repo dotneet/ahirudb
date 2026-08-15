@@ -88,6 +88,10 @@ pub enum PruneOp {
 /// breaks things in the worst way -- rows vanish -- so the safe definition is pinned in one place.
 pub fn range_may_match(p: &Pruner, min: &Value, max: &Value) -> bool {
     use core::cmp::Ordering::*;
+    // If stats are inverted (min > max, e.g. corrupted metadata), err safe and do not prune.
+    if min.partial_cmp_same(max) == Some(Greater) {
+        return true;
+    }
     if p.op == PruneOp::In {
         // OR semantics: if any one candidate could fall in the range, this split is kept.
         return core::iter::once(&p.value).chain(p.in_values.iter()).any(|v| {

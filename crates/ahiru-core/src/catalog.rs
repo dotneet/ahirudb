@@ -243,6 +243,7 @@ fn unify_schema(parts: &[TablePart]) -> Result<Vec<Field>> {
 pub struct MemTable {
     pub name: String,
     pub schema: Vec<Field>,
+    pub defaults: Vec<Value>,
     pub rows: Vec<Vec<Value>>,
 }
 
@@ -409,14 +410,15 @@ impl Catalog {
     pub fn mem_create(&mut self, name: &str, schema: Vec<Field>, replace: bool) -> Result<usize> {
         ensure!(!self.name_taken_by_other(name), DuplicateTable);
         ensure!(Self::unique_field_names(&schema), DuplicateColumn);
+        let defaults = vec![Value::Null; schema.len()];
         match self.mem_index_of(name) {
             Some(i) => {
                 ensure!(replace, DuplicateTable);
-                self.mem[i] = MemTable { name: name.into(), schema, rows: Vec::new() };
+                self.mem[i] = MemTable { name: name.into(), schema, defaults, rows: Vec::new() };
                 Ok(i)
             }
             None => {
-                self.mem.push(MemTable { name: name.into(), schema, rows: Vec::new() });
+                self.mem.push(MemTable { name: name.into(), schema, defaults, rows: Vec::new() });
                 Ok(self.mem.len() - 1)
             }
         }
@@ -464,6 +466,7 @@ impl Catalog {
             DuplicateColumn
         );
         mt.schema.push(field);
+        mt.defaults.push(value.clone());
         for row in &mut mt.rows {
             row.push(value.clone());
         }
@@ -486,6 +489,7 @@ impl Catalog {
             None => err!(ColumnNotFound),
         };
         mt.schema.remove(pos);
+        mt.defaults.remove(pos);
         for row in &mut mt.rows {
             row.remove(pos);
         }

@@ -245,7 +245,7 @@ impl Shell {
             let prompt =
                 if buf.trim().is_empty() { self.prompt.clone() } else { self.prompt_cont.clone() };
             let line = {
-                let names: Vec<String> = self.engine.table_names().to_vec();
+                let names = self.engine.table_names();
                 let complete = |word: &str| complete_word(word, &names);
                 ed.read_line(&prompt, &complete)
             };
@@ -449,8 +449,8 @@ impl Shell {
                 let pat = arg(0);
                 let mut text = String::new();
                 for n in self.engine.table_names() {
-                    if pat.map(|p| glob::matches(p, n)).unwrap_or(true) {
-                        text.push_str(n);
+                    if pat.map(|p| glob::matches(p, &n)).unwrap_or(true) {
+                        text.push_str(&n);
                         text.push('\n');
                     }
                 }
@@ -459,7 +459,7 @@ impl Shell {
             }
             "schema" => {
                 let pat = arg(0);
-                for n in self.engine.table_names().to_vec() {
+                for n in self.engine.table_names() {
                     if !pat.map(|p| glob::matches(p, &n)).unwrap_or(true) {
                         continue;
                     }

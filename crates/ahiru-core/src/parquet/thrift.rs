@@ -215,7 +215,7 @@ impl<'a> Thrift<'a> {
         }
         ensure!(size <= max, LimitExceeded, self.pos);
         // Each element needs at least 1 byte. Corruption if the declared size exceeds the remaining buffer.
-        ensure!(size <= self.remaining() || etype == ttype::BOOL_TRUE, UnexpectedEof, self.pos);
+        ensure!(size <= self.remaining(), UnexpectedEof, self.pos);
         Ok((etype, size))
     }
 
