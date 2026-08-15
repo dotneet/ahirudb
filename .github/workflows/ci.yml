@@ -151,5 +151,5 @@ jobs:
           chmod +x /usr/local/bin/duckdb
           duckdb -version
       - run: ./scripts/size.sh
-      - run: node --test 'js/test/*.test.mjs'
+      - run: node --test js/test/*.test.mjs
 
