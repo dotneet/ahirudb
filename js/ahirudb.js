@@ -211,6 +211,96 @@ function makeCache(spec, maxBytes) {
 /** The format argument of `ahiru_register_as`. 1:1 with `format_kind` in abi.rs. */
 const FORMAT_CODES = { auto: 0, parquet: 1, csv: 2, tsv: 3, jsonl: 4 };
 
+/** File-table functions whose first argument is a path registered by the host. */
+const FILE_FUNCTION_NAMES = new Set([
+  'parquet',
+  'read_parquet',
+  'read_csv',
+  'read_csv_auto',
+  'read_json',
+  'read_json_auto',
+]);
+
+const SQL_IDENTIFIER_CHAR = /[\p{L}\p{N}]/u;
+const SQL_WHITESPACE = /\s/u;
+
+function isSqlIdentifierChar(ch) {
+  return ch === '_' || ch === '$' || ch === '.' || SQL_IDENTIFIER_CHAR.test(ch);
+}
+
+/**
+ * Scans the small subset of SQL needed for host-side table binding.
+ *
+ * The core lexer ignores comments and folds doubled quotes (`''` / `""`). Keeping
+ * those rules here prevents text in comments from looking like a table reference
+ * and lets file paths containing an escaped quote reach the catalog unchanged.
+ */
+function scanSqlTokens(sql) {
+  const tokens = [];
+  let i = 0;
+  while (i < sql.length) {
+    const codePoint = sql.codePointAt(i);
+    const ch = String.fromCodePoint(codePoint);
+    if (SQL_WHITESPACE.test(ch)) {
+      i += ch.length;
+      continue;
+    }
+    if (ch === '-' && sql[i + 1] === '-') {
+      i += 2;
+      while (i < sql.length && sql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2);
+      i = end < 0 ? sql.length : end + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      let value = '';
+      let closed = false;
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
+            value += quote;
+            i += 2;
+            continue;
+          }
+          i++;
+          closed = true;
+          break;
+        }
+        const codePoint = sql.codePointAt(i);
+        const character = String.fromCodePoint(codePoint);
+        value += character;
+        i += character.length;
+      }
+      // The core reports an unterminated string as a syntax error. Do not bind
+      // anything from its incomplete tail before that error is produced.
+      if (closed) {
+        tokens.push({ type: quote === "'" ? 'string' : 'quoted-identifier', value });
+      }
+      continue;
+    }
+    if (isSqlIdentifierChar(ch)) {
+      const start = i;
+      i += ch.length;
+      while (i < sql.length) {
+        const codePoint = sql.codePointAt(i);
+        const character = String.fromCodePoint(codePoint);
+        if (!isSqlIdentifierChar(character)) break;
+        i += character.length;
+      }
+      tokens.push({ type: 'identifier', value: sql.slice(start, i) });
+      continue;
+    }
+    tokens.push({ type: 'punctuation', value: ch });
+    i += ch.length;
+  }
+  return tokens;
+}
+
 /**
  * Infers the format from the extension of the registered name.
  * A mirror of `format::FormatKind::detect`, so change both together.
@@ -1390,16 +1480,27 @@ export class AhiruDB {
       // candidates (a table name itself may contain a dot, as in `basic.csv`).
       if (s.includes('.')) for (const part of s.split('.')) mentioned.add(part.toLowerCase());
     };
-    for (const m of sql.matchAll(/[A-Za-z0-9_\p{L}\p{N}$.]+|'([^']*)'|"([^"]*)"/gu)) {
-      add(m[1] ?? m[2] ?? m[0]);
+    const tokens = scanSqlTokens(sql);
+    for (const token of tokens) {
+      if (
+        token.type === 'identifier' ||
+        token.type === 'string' ||
+        token.type === 'quoted-identifier'
+      ) {
+        add(token.value);
+      }
     }
     // `FROM parquet('https://...')` or `read_parquet('...')` is contracted to register the path itself as the
     // table name (see resolve_from in plan/bind.rs).
     // The function is named parquet/csv/json, but an extension such as .csv is read as CSV.
-    for (const m of sql.matchAll(/(?:read_)?(?:parquet|csv|json(?:l|_auto)?)\(\s*['"]([^'"]*)['"]/gi)) {
-      const path = m[1];
-      if (!this.#tables.has(path.toLowerCase())) this.register(path, path);
-      add(path);
+    for (let i = 0; i + 2 < tokens.length; i++) {
+      const fn = tokens[i];
+      if (fn.type !== 'identifier' || !FILE_FUNCTION_NAMES.has(fn.value.toLowerCase())) continue;
+      if (tokens[i + 1].type !== 'punctuation' || tokens[i + 1].value !== '(') continue;
+      const path = tokens[i + 2];
+      if (path.type !== 'string') continue;
+      if (!this.#tables.has(path.value.toLowerCase())) this.register(path.value, path.value);
+      add(path.value);
     }
 
     for (const [key, rec] of this.#tables) {

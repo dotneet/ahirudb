@@ -456,6 +456,68 @@ test('registration alone fetches not a single byte', async () => {
   }
 });
 
+test('SQL comments do not bind registered URLs', async () => {
+  const file = new Uint8Array(await readFile(WIDE));
+  const usedUrl = 'https://example.invalid/used.parquet';
+  const unusedUrl = 'https://example.invalid/unused.parquet';
+  const f = fakeFetcher(file, usedUrl);
+  const db = await openDb({ fetch: f.fetchImpl });
+  try {
+    db.register('used', usedUrl);
+    db.register('unused', unusedUrl);
+    await runTolerantly(
+      db,
+      `SELECT id FROM used
+       -- unused ${unusedUrl} read_parquet('${unusedUrl}')
+       /* FROM unused; read_parquet('${unusedUrl}') */
+       LIMIT 1`,
+    );
+    assert.ok(f.calls.some((call) => call.url === usedUrl), 'the referenced URL was not fetched');
+    assert.equal(
+      f.calls.some((call) => call.url === unusedUrl),
+      false,
+      'a URL mentioned only in comments was fetched',
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('escaped quotes in a file-table path are registered as one path', async () => {
+  const file = new Uint8Array(await readFile(WIDE));
+  const url = "https://example.invalid/a'b.parquet";
+  const f = fakeFetcher(file, url);
+  const db = await openDb({ fetch: f.fetchImpl });
+  try {
+    const escaped = url.replaceAll("'", "''");
+    await runTolerantly(db, `SELECT id FROM read_parquet('${escaped}') LIMIT 1`);
+    assert.ok(f.calls.some((call) => call.url === url), 'the escaped path was not fetched');
+    assert.equal(
+      f.calls.some((call) => call.url !== url),
+      false,
+      'a truncated path was fetched instead of the escaped path',
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('double-quoted file-table paths are not auto-registered', async () => {
+  const file = new Uint8Array(await readFile(WIDE));
+  const url = 'https://example.invalid/double-quoted.parquet';
+  const f = fakeFetcher(file, url);
+  const db = await openDb({ fetch: f.fetchImpl });
+  try {
+    await assert.rejects(
+      () => db.query(`SELECT id FROM read_parquet("${url}") LIMIT 1`),
+      (e) => e instanceof AhiruError,
+    );
+    assert.equal(f.calls.length, 0, 'a double-quoted path was fetched before the syntax error');
+  } finally {
+    db.close();
+  }
+});
+
 test('projection pushdown: only the bytes of the selected columns are fetched', async () => {
   const file = new Uint8Array(await readFile(WIDE));
   const f = fakeFetcher(file);
@@ -1639,6 +1701,24 @@ test('CSV can be read over range fetching too', { skip: FORMAT_SKIP }, async () 
       rows.map((r) => [Number(r.id), r.name]),
       duck(`SELECT id, name FROM '${BASIC}' LIMIT 5`).map((r) => [r.id, r.name]),
     );
+  } finally {
+    db.close();
+  }
+});
+
+test('read_csv_auto auto-registers its path', { skip: FORMAT_SKIP }, async () => {
+  const file = new Uint8Array(await readFile(CSV));
+  const f = fakeFetcher(file, 'https://example.invalid/auto.csv');
+  const db = await openFullDb({ fetch: f.fetchImpl });
+  try {
+    const rows = await db.query(
+      `SELECT id, name FROM read_csv_auto /* path */ ( '${f.url}' ) LIMIT 5`,
+    );
+    assert.deepEqual(
+      rows.map((r) => [Number(r.id), r.name]),
+      duck(`SELECT id, name FROM read_csv('${CSV}') LIMIT 5`).map((r) => [r.id, r.name]),
+    );
+    assert.ok(f.calls.some((call) => call.url === f.url), 'the auto-registered URL was not fetched');
   } finally {
     db.close();
   }

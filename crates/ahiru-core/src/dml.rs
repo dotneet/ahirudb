@@ -129,6 +129,10 @@ pub(crate) fn update(
             Some(i) => i,
             None => err!(ColumnNotFound),
         };
+        // DuckDB rejects assigning the same target column more than once. Check the
+        // resolved index (rather than the spelling) so this is case-insensitive and
+        // cannot be bypassed with quoted/unquoted variants of the same name.
+        ensure!(!set_cols.contains(&ci), DuplicateColumn);
         let prog = compile(arena, &scope, params, *expr_id)?;
         let prog =
             if prog.result_ty != schema[ci].ty { cast_program(prog, schema[ci].ty)? } else { prog };
@@ -348,6 +352,19 @@ mod tests {
         s.prepare("UPDATE t SET a = b, b = a", &[]).unwrap();
         let rows = ready_rows(&mut s, "SELECT a, b FROM t");
         assert_eq!(rows, vec![vec![Value::I32(2), Value::I32(1)]]);
+    }
+
+    #[test]
+    fn update_rejects_duplicate_target_columns_case_insensitively() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (a INTEGER)", &[]).unwrap();
+        s.prepare("INSERT INTO t VALUES (1)", &[]).unwrap();
+
+        // The first assignment must not be applied before the duplicate target is
+        // rejected, and changing only the target's case must not evade the check.
+        let r = s.prepare("UPDATE t SET a = 2, A = 3", &[]);
+        assert_eq!(crate::error::code_of(r), Some(Code::DuplicateColumn));
+        assert_eq!(ready_rows(&mut s, "SELECT a FROM t"), vec![vec![Value::I32(1)]]);
     }
 
     #[test]

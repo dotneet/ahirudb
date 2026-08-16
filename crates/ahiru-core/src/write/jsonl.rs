@@ -4,7 +4,7 @@
 //! in design, but with the dependency going only one way (write may call
 //! read, never the reverse). Number and string escaping are self-contained in this file.
 
-use crate::expr::funcs::civil_from_days;
+use crate::expr::funcs::{civil_from_days, fmt_time};
 use crate::prelude::*;
 use crate::vector::{Batch, Field, Ty, Value};
 use crate::write::TableSink;
@@ -65,6 +65,11 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
         Value::I32(x) if ty == Ty::Date => push_date_string(out, *x as i64),
         Value::I32(x) => push_int(out, *x as i128),
+        Value::I64(x) if ty == Ty::Time => {
+            out.push(b'"');
+            fmt_time(*x, out);
+            out.push(b'"');
+        }
         Value::I64(x) if ty == Ty::Timestamp => push_timestamp_string(out, *x),
         Value::I64(x) if ty == Ty::Timestamptz => push_timestamptz_string(out, *x),
         // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
@@ -99,6 +104,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
             _ => push_int(out, *x),
         },
         Value::F64(x) => push_f64(out, *x),
+        Value::Bytes(b) if ty == Ty::Blob => push_blob_string(out, b),
         // `Ty::Json` values are already-valid UTF-8 JSON text (`vector::Ty::Json`
         // doc; Parquet LIST/MAP/nested-STRUCT columns are exposed this way,
         // DESIGN.md §5). Embed them verbatim so nested arrays/objects come out
@@ -117,6 +123,29 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
             push_string(out, &hex);
         }
         Value::Bytes(b) => push_string(out, b),
+    }
+}
+
+/// Writes a BLOB as a JSON string containing DuckDB's textual form: one
+/// uppercase `\\xHH` escape per byte. The backslash is escaped for JSON, so the
+/// resulting NDJSON is valid even when the BLOB contains arbitrary bytes.
+fn push_blob_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'"');
+    for &b in bytes {
+        // Two backslashes in the JSON source decode to the one backslash in
+        // the textual BLOB representation.
+        out.extend_from_slice(b"\\\\x");
+        out.push(blob_hex_digit(b >> 4));
+        out.push(blob_hex_digit(b & 0x0f));
+    }
+    out.push(b'"');
+}
+
+fn blob_hex_digit(n: u8) -> u8 {
+    if n < 10 {
+        b'0' + n
+    } else {
+        b'A' + (n - 10)
     }
 }
 
@@ -352,6 +381,16 @@ mod tests {
             crate::format::FormatKind::Csv,
         );
         assert_eq!(lines, vec![r#"{"iv":"3 days"}"#]);
+    }
+
+    #[test]
+    fn time_and_blob_are_formatted_as_json_strings() {
+        let lines = run(
+            "SELECT TIME '12:34:56.123456' AS tm, unhex('00a1FEff') AS b FROM t LIMIT 1",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"tm":"12:34:56.123456","b":"\\x00\\xA1\\xFE\\xFF"}"#]);
     }
 
     #[test]

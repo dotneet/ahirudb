@@ -224,19 +224,20 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
         }
         F_UNHEX => {
             let s = a.bytes(0);
+            // DuckDB treats an odd-length input as if it had a leading zero nibble
+            // (`unhex('ABC')` -> `\x0A\xBC`). An invalid digit is an invalid conversion,
+            // not a per-row NULL; `Err` propagates through `call` as a query error.
+            let mut i = 0;
             if !s.len().is_multiple_of(2) {
-                return Ok(false);
+                let Some(v) = hex_val(s[0]) else { err!(InvalidCast) };
+                out.push(v);
+                i = 1;
             }
-            for i in (0..s.len()).step_by(2) {
-                let hi = match hex_val(s[i]) {
-                    Some(v) => v,
-                    None => return Ok(false),
-                };
-                let lo = match hex_val(s[i + 1]) {
-                    Some(v) => v,
-                    None => return Ok(false),
-                };
+            while i < s.len() {
+                let Some(hi) = hex_val(s[i]) else { err!(InvalidCast) };
+                let Some(lo) = hex_val(s[i + 1]) else { err!(InvalidCast) };
                 out.push((hi << 4) | lo);
+                i += 2;
             }
         }
         F_DAYNAME | F_MONTHNAME => {

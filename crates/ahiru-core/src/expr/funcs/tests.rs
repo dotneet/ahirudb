@@ -61,6 +61,13 @@ fn str_at(v: &Vector, i: usize) -> Option<String> {
     Some(String::from_utf8(v.bytes().get(i).to_vec()).unwrap())
 }
 
+fn bytes_at(v: &Vector, i: usize) -> Option<Vec<u8>> {
+    if !v.is_valid(i) {
+        return None;
+    }
+    Some(v.bytes().get(i).to_vec())
+}
+
 fn int_at(v: &Vector, i: usize) -> Option<i64> {
     if !v.is_valid(i) {
         return None;
@@ -121,6 +128,20 @@ fn string_basics() {
     assert_eq!(s1("trim", Some("\tab\t")).as_deref(), Some("\tab\t"));
     assert_eq!(s1("ltrim", Some("  ab  ")).as_deref(), Some("ab  "));
     assert_eq!(s1("rtrim", Some("  ab  ")).as_deref(), Some("  ab"));
+}
+
+#[test]
+fn unhex_uses_a_leading_zero_nibble_for_odd_lengths_and_errors_on_bad_digits() {
+    // duckdb: unhex('ABC')/from_hex('ABC') = BLOB '\x0A\xBC'.
+    let expected = Some(vec![0x0a, 0xbc]);
+    assert_eq!(bytes_at(&run("unhex", &[&vs(&[Some("ABC")])]).unwrap(), 0), expected);
+    assert_eq!(bytes_at(&run("from_hex", &[&vs(&[Some("ABC")])]).unwrap(), 0), expected);
+
+    // NULL still propagates through the ordinary function path, while malformed
+    // hexadecimal is a hard conversion error (DuckDB reports Invalid Input Error).
+    let null = run("unhex", &[&vs(&[None])]).unwrap();
+    assert_eq!(bytes_at(&null, 0), None);
+    assert_eq!(code_of(run("unhex", &[&vs(&[Some("ABCG")])])), Some(Code::InvalidCast));
 }
 
 #[test]

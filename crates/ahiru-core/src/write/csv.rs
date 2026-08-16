@@ -3,7 +3,7 @@
 //! RFC 4180 compliant. Only quotes fields that contain a comma, quote, or
 //! newline (smaller and more readable output than quoting every field).
 
-use crate::expr::funcs::civil_from_days;
+use crate::expr::funcs::{civil_from_days, fmt_time};
 use crate::prelude::*;
 use crate::vector::{Batch, Field, Ty, Value};
 use crate::write::TableSink;
@@ -101,6 +101,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty, delimiter: u8) {
         Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
         Value::I32(x) if ty == Ty::Date => push_date(out, *x as i64),
         Value::I32(x) => push_int(out, *x as i128),
+        Value::I64(x) if ty == Ty::Time => fmt_time(*x, out),
         Value::I64(x) if ty == Ty::Timestamp => push_timestamp(out, *x),
         Value::I64(x) if ty == Ty::Timestamptz => push_timestamptz(out, *x),
         // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
@@ -123,6 +124,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty, delimiter: u8) {
             _ => push_int(out, *x),
         },
         Value::F64(x) => push_f64(out, *x),
+        Value::Bytes(b) if ty == Ty::Blob => push_blob(out, b, delimiter),
         Value::Bytes(b) if ty == Ty::Uuid => {
             // UUID's physical representation is 16 raw bytes, so convert to text
             // first before deciding whether it needs quoting (it contains hyphens
@@ -134,6 +136,30 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty, delimiter: u8) {
             push_field(out, &hex, delimiter);
         }
         Value::Bytes(b) => push_field(out, b, delimiter),
+    }
+}
+
+/// Writes a BLOB in DuckDB's textual form: one uppercase `\\xHH` escape per byte.
+/// The result is ASCII, so it is safe to emit in a text CSV field even when the
+/// underlying value contains arbitrary bytes.
+fn push_blob(out: &mut Vec<u8>, bytes: &[u8], delimiter: u8) {
+    if bytes.is_empty() {
+        // Keep an empty BLOB distinct from NULL, just as an empty VARCHAR is.
+        push_field(out, b"", delimiter);
+        return;
+    }
+    for &b in bytes {
+        out.extend_from_slice(b"\\x");
+        out.push(blob_hex_digit(b >> 4));
+        out.push(blob_hex_digit(b & 0x0f));
+    }
+}
+
+fn blob_hex_digit(n: u8) -> u8 {
+    if n < 10 {
+        b'0' + n
+    } else {
+        b'A' + (n - 10)
     }
 }
 
@@ -354,6 +380,17 @@ mod tests {
             crate::format::FormatKind::Csv,
         );
         assert_eq!(out, "iv\n1 month 3 days 01:02:03\n");
+    }
+
+    #[test]
+    fn time_and_blob_are_formatted_as_text() {
+        let out = run_csv(
+            "SELECT TIME '12:34:56.123456' AS tm, unhex('00a1FEff') AS b FROM t LIMIT 1",
+            "t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "tm,b\n12:34:56.123456,\\x00\\xA1\\xFE\\xFF\n");
     }
 
     #[test]

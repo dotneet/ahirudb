@@ -146,6 +146,24 @@ fn csv_round_trip_preserves_decimal_boolean_and_timestamp() {
 }
 
 #[test]
+fn copy_formats_time_and_blob_as_duckdb_text() {
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"id\n1\n".to_vec(), FormatKind::Csv).unwrap();
+
+    let csv = copy_bytes(
+        &mut sess,
+        "COPY (SELECT TIME '12:34:56.123456' AS tm, unhex('00a1FEff') AS b FROM t) TO 'out.csv'",
+    );
+    assert_eq!(csv, b"tm,b\n12:34:56.123456,\\x00\\xA1\\xFE\\xFF\n");
+
+    let jsonl = copy_bytes(
+        &mut sess,
+        "COPY (SELECT TIME '12:34:56.123456' AS tm, unhex('00a1FEff') AS b FROM t) TO 'out.jsonl'",
+    );
+    assert_eq!(jsonl, b"{\"tm\":\"12:34:56.123456\",\"b\":\"\\\\x00\\\\xA1\\\\xFE\\\\xFF\"}\n",);
+}
+
+#[test]
 fn jsonl_round_trip_of_null_and_non_null_values_in_the_same_column() {
     let mut sess = Session::new();
     sess.register_bytes_as(
