@@ -234,13 +234,7 @@ impl<'a> Parser<'a> {
                     let ci = matches!(self.cur, Tok::TildeTildeStar | Tok::NotTildeTildeStar);
                     self.bump()?;
                     let pattern = self.expr_bp(BP_CONCAT + 1)?;
-                    lhs = self.arena.push(Expr::Like {
-                        arg: lhs,
-                        pattern,
-                        negated,
-                        escape: None,
-                        ci,
-                    });
+                    lhs = self.arena.push(Expr::Like { arg: lhs, pattern, negated, ci });
                     continue;
                 }
                 // `^@`: PostgreSQL/DuckDB's prefix ("starts with") operator.
@@ -511,7 +505,30 @@ impl<'a> Parser<'a> {
                     escape = bytes.first().copied();
                     self.bump()?;
                 }
-                Expr::Like { arg, pattern, negated, escape, ci: k == Kw::Ilike }
+                // With a custom escape the clause is desugared into a call to
+                // the scalar function `like_escape` (DuckDB implements it the
+                // same way), so neither binder nor VM need to know about it.
+                if let Some(esc) = escape {
+                    // A constant pattern ending in a lone escape character is a
+                    // syntax error (matching DuckDB); non-constant patterns are
+                    // caught at run time by `like_escape` itself.
+                    if let Expr::Literal(Value::Bytes(b)) = self.arena.get(pattern) {
+                        ensure!(!ends_with_dangling_escape(b, esc), SyntaxError, self.pos);
+                    }
+                    let ci = k == Kw::Ilike;
+                    // ILIKE folds case first (the same shape as the no-escape path).
+                    let arg = if ci { self.simple_call("lower", vec![arg]) } else { arg };
+                    let pattern =
+                        if ci { self.simple_call("lower", vec![pattern]) } else { pattern };
+                    let esc_lit = self.arena.push(Expr::Literal(Value::Bytes(vec![esc])));
+                    let call = self.simple_call("like_escape", vec![arg, pattern, esc_lit]);
+                    return Ok(if negated {
+                        self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: call })
+                    } else {
+                        call
+                    });
+                }
+                Expr::Like { arg, pattern, negated, ci: k == Kw::Ilike }
             }
             _ => err!(UnexpectedToken, self.pos),
         };
@@ -737,7 +754,7 @@ impl<'a> Parser<'a> {
             }
             Tok::QIdent(_) => return self.name_ref(),
             // A handful of reserved words are also DuckDB function names: `LEFT`/`RIGHT`
-            // (join kinds) and `FIRST`/`LAST` (`NULLS FIRST`/`NULLS LAST`). None of those
+            // (join kinds), `FIRST`/`LAST` (`NULLS FIRST`/`NULLS LAST`). None of those
             // clause positions can be followed by `(`, so one token of lookahead separates
             // the function call from the keyword unambiguously.
             Tok::Kw(k @ (Kw::Left | Kw::Right | Kw::First | Kw::Last))
@@ -752,9 +769,45 @@ impl<'a> Parser<'a> {
                 };
                 return self.call(String::from(name));
             }
+            // `REPLACE` is the same class as `LEFT` above, but only exists as a token
+            // under the `ddl` feature (`CREATE OR REPLACE`); without it `replace(...)`
+            // already parses through the ordinary identifier path.
+            #[cfg(feature = "ddl")]
+            Tok::Kw(Kw::Replace) if self.peek()? == Tok::LParen => {
+                self.bump()?;
+                return self.call(String::from("replace"));
+            }
+            // `IF(cond, then, else)` — DuckDB's spelling of `IIF`. Under `ddl`, IF is
+            // reserved (`CREATE TABLE IF NOT EXISTS`), so it needs this arm; without
+            // the feature it reaches `name_ref`/`call` as an ordinary identifier.
+            // `(` disambiguates from every other use of the keyword.
+            #[cfg(feature = "ddl")]
+            Tok::Kw(Kw::If) if self.peek()? == Tok::LParen => {
+                self.bump()?;
+                return self.if_call();
+            }
             _ => err!(UnexpectedToken, pos),
         };
         Ok(self.arena.push(node))
+    }
+
+    /// `IIF(cond, then, else)` / DuckDB's `if(cond, then, else)`: sugar for
+    /// `CASE WHEN cond THEN then ELSE else END`, desugared here so execution
+    /// never sees either spelling. The caller has verified that `self.cur` is
+    /// `(`; this consumes it.
+    fn if_call(&mut self) -> Result<ExprId> {
+        self.bump()?; // '('
+        let cond = self.expr()?;
+        self.expect(Tok::Comma)?;
+        let then_ = self.expr()?;
+        self.expect(Tok::Comma)?;
+        let else_ = self.expr()?;
+        self.expect(Tok::RParen)?;
+        Ok(self.arena.push(Expr::Case {
+            operand: None,
+            whens: vec![(cond, then_)],
+            else_: Some(else_),
+        }))
     }
 
     /// `[expr, expr, ...]`. Sugar that desugars directly to `list_value(expr, expr, ...)`
@@ -1027,30 +1080,21 @@ impl<'a> Parser<'a> {
         // `IIF(cond, then, else)` is sugar for `CASE WHEN cond THEN then ELSE else END`.
         // It is desugared to a CASE expression at the parser level (the same judgment as
         // `EXTRACT` -> `date_part`), so execution need not know about `iif` at all.
-        if eq_ascii_ci(name.as_bytes(), b"iif") && self.cur == Tok::LParen {
-            self.bump()?; // '('
-            let cond = self.expr()?;
-            self.expect(Tok::Comma)?;
-            let then_ = self.expr()?;
-            self.expect(Tok::Comma)?;
-            let else_ = self.expr()?;
-            self.expect(Tok::RParen)?;
-            return Ok(self.arena.push(Expr::Case {
-                operand: None,
-                whens: vec![(cond, then_)],
-                else_: Some(else_),
-            }));
-        }
-        // --- Standard SQL function syntax (keywords interposed among arguments) -------
-        //
-        // Handled like `EXTRACT(part FROM ts)`: only the syntax is absorbed here and
-        // desugared straight into existing scalar function calls. Neither execution nor
-        // the kernels need to know about the "standard syntax" of `position`/`substring`/`trim`.
-        //
-        // Unlike `EXTRACT`, an expression of arbitrary length precedes the keyword, so two
-        // tokens of lookahead cannot settle the shape. Instead `call_has_top_level` first
-        // checks "is there an `IN`/`FROM` at the same depth" before branching (without
-        // one, it is read as a conventional comma-separated argument list).
+        // DuckDB spells the same function `if(...)`, accepted here too.
+        if (eq_ascii_ci(name.as_bytes(), b"iif") || eq_ascii_ci(name.as_bytes(), b"if"))
+            && self.cur == Tok::LParen
+        {
+            return self.if_call();
+        } // --- Standard SQL function syntax (keywords interposed among arguments) -------
+          //
+          // Handled like `EXTRACT(part FROM ts)`: only the syntax is absorbed here and
+          // desugared straight into existing scalar function calls. Neither execution nor
+          // the kernels need to know about the "standard syntax" of `position`/`substring`/`trim`.
+          //
+          // Unlike `EXTRACT`, an expression of arbitrary length precedes the keyword, so two
+          // tokens of lookahead cannot settle the shape. Instead `call_has_top_level` first
+          // checks "is there an `IN`/`FROM` at the same depth" before branching (without
+          // one, it is read as a conventional comma-separated argument list).
         if eq_ascii_ci(name.as_bytes(), b"position")
             && self.cur == Tok::LParen
             && self.call_has_top_level(Tok::Kw(Kw::In))?
@@ -1453,4 +1497,24 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::End)?;
         Ok(self.arena.push(Expr::Case { operand, whens, else_ }))
     }
+}
+
+/// Whether walking `p` as LIKE-escape tokens leaves the last byte as an escape
+/// character with nothing following (`p = "x!"`, escape `!`). A doubled pair at
+/// the very end (`"x!!"` = a literal `!`) is valid and does not count. The same
+/// rule `like_escape` enforces at run time; this copy lets a *constant* pattern
+/// be rejected already at parse time.
+fn ends_with_dangling_escape(p: &[u8], esc: u8) -> bool {
+    let mut i = 0;
+    while i < p.len() {
+        if p[i] == esc {
+            if i + 1 >= p.len() {
+                return true;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }

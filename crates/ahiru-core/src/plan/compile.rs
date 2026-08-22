@@ -375,9 +375,9 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
                 && l1.iter().zip(l2).all(|(x, y)| eq(x, y))
         }
         (
-            Expr::Like { arg: a1, pattern: p1, negated: n1, escape: e1, ci: c1 },
-            Expr::Like { arg: a2, pattern: p2, negated: n2, escape: e2, ci: c2 },
-        ) => n1 == n2 && e1 == e2 && c1 == c2 && eq(a1, a2) && eq(p1, p2),
+            Expr::Like { arg: a1, pattern: p1, negated: n1, ci: c1 },
+            Expr::Like { arg: a2, pattern: p2, negated: n2, ci: c2 },
+        ) => n1 == n2 && c1 == c2 && eq(a1, a2) && eq(p1, p2),
         (
             Expr::Case { operand: o1, whens: w1, else_: e1 },
             Expr::Case { operand: o2, whens: w2, else_: e2 },
@@ -582,8 +582,7 @@ impl<'a> Compiler<'a> {
             }
             Expr::Between { arg, low, high, negated } => self.between(*arg, *low, *high, *negated),
             Expr::InList { arg, list, negated } => self.in_list(*arg, list.clone(), *negated),
-            Expr::Like { arg, pattern, negated, escape, ci } => {
-                ensure!(escape.is_none(), UnsupportedFeature);
+            Expr::Like { arg, pattern, negated, ci } => {
                 let (a, at) = self.expr(*arg)?;
                 let (p, pt) = self.expr(*pattern)?;
                 let mut a = self.coerce(a, at, Ty::Varchar)?;
@@ -1232,14 +1231,14 @@ mod tests {
         let mut a = ExprArena::new();
         let arg = a.push(Expr::ColumnRef { qualifier: None, name: "name".into() });
         let pattern = a.push(Expr::Literal(Value::Bytes(b"A%".to_vec())));
-        let id = a.push(Expr::Like { arg, pattern, negated: false, escape: None, ci: true });
+        let id = a.push(Expr::Like { arg, pattern, negated: false, ci: true });
         let p = compile(&a, &cols(), &[], id).unwrap();
         assert_eq!(p.result_ty, Ty::Boolean);
         // Two `lower()` calls (both sides), then one Like.
         assert_eq!(p.calls.len(), 2);
         assert!(p.instrs.iter().any(|i| i.op == OpCode::Like));
         // An ordinary LIKE, unlike ILIKE, does not call lower().
-        let id2 = a.push(Expr::Like { arg, pattern, negated: false, escape: None, ci: false });
+        let id2 = a.push(Expr::Like { arg, pattern, negated: false, ci: false });
         let p2 = compile(&a, &cols(), &[], id2).unwrap();
         assert!(p2.calls.is_empty());
     }

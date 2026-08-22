@@ -487,6 +487,62 @@ pub fn like(a: &Vector, b: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Boolean, Data::Bool(bits), combine_validity(a, sa, b, sb, n), None))
 }
 
+/// SQL `LIKE` with a custom escape character — the substance of
+/// `s LIKE p ESCAPE 'e'`. The desugaring target of that clause (see
+/// `sql::parser`; it becomes a call to a scalar function named `like_escape`,
+/// the same shape DuckDB uses internally).
+///
+/// The same two-pointer method as `like_match`, with one extra token kind: a
+/// pair `(esc, c)` makes the byte `c` literal (so `\%`-style pairs lose their
+/// wildcard meaning). Escaping any other character also means that literal,
+/// and an escape pair consumes exactly one pattern byte (the escape character
+/// itself is matched by doubling it: `'!' LIKE '!!' ESCAPE '!'`). All
+/// confirmed against DuckDB. A pattern whose last *token* is a lone escape
+/// character is rejected by the caller (`bool_ops`) before matching.
+pub(crate) fn like_escape_match(s: &[u8], p: &[u8], esc: u8) -> bool {
+    let (mut si, mut pi) = (0usize, 0usize);
+    // `star_p == usize::MAX` means "no `%` seen yet".
+    let (mut star_p, mut star_s) = (usize::MAX, 0usize);
+    while si < s.len() {
+        if pi < p.len() && p[pi] == esc && pi + 1 < p.len() {
+            // An escaped byte is always literal, even `%` or `_`.
+            if s[si] == p[pi + 1] {
+                si += 1;
+                pi += 2;
+                continue;
+            }
+        } else if pi < p.len() && p[pi] == b'_' {
+            si += utf8_len_at(s, si);
+            pi += 1;
+            continue;
+        } else if pi < p.len() && p[pi] == s[si] {
+            // Literal byte. An escape character not followed by anything was
+            // rejected by the caller, so reaching here means plain text.
+            si += 1;
+            pi += 1;
+            continue;
+        } else if pi < p.len() && p[pi] == b'%' {
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+            continue;
+        }
+        // Feed the previous `%` one more character (not byte -- see `like_match`)
+        // and retry.
+        if star_p != usize::MAX {
+            pi = star_p + 1;
+            star_s += utf8_len_at(s, star_s);
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 // --- Casts --------------------------------------------------------------------
 
 /// The family of conversions. It follows from the physical type, so no extra branching per logical type.

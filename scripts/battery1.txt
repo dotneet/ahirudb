@@ -1,0 +1,32 @@
+tests/data/basic.parquet|SELECT count(*), count(big), sum(big), avg(big), min(big), max(big) FROM t
+tests/data/basic.parquet|SELECT sum(big) FROM t WHERE id > 10000
+tests/data/basic.parquet|SELECT avg(big) FROM t WHERE big IS NULL
+tests/data/basic.parquet|SELECT -7 / 2, 7 / 2, -7 % 3, 7 % -3
+tests/data/basic.parquet|SELECT 5 / 0, -5.0 / 0.0, 0 / 0
+tests/data/basic.parquet|SELECT round(2.5), round(3.5), round(-2.5), round(1.005, 2)
+tests/data/basic.parquet|SELECT floor(-1.5), ceil(-1.5), trunc(-1.7)
+tests/data/basic.parquet|SELECT 'abc' || NULL, NULL || 'abc'
+tests/data/basic.parquet|SELECT substring('hello', -3), substring('hello', 2, 100), substring('hello', 10, 5)
+tests/data/basic.parquet|SELECT length('héllo'), upper('héllo'), reverse('abc')
+tests/data/basic.parquet|SELECT trim('  abc  '), ltrim('xxabc', 'x'), rtrim('abcxx', 'x')
+tests/data/basic.parquet|SELECT split_part('a,b,c', ',', 0), split_part('a,b,c', ',', 4), split_part('a,,b', ',', 2)
+tests/data/basic.parquet|SELECT replace('aaa', 'aa', 'b'), replace('', 'x', 'y')
+tests/data/basic.parquet|SELECT coalesce(NULL, NULL, 5), nullif(1, 1), nullif(1, 2)
+tests/data/basic.parquet|SELECT greatest(1, NULL, 3), least(1, NULL, 3)
+tests/data/basic.parquet|SELECT CASE WHEN NULL THEN 1 ELSE 2 END
+tests/data/basic.parquet|SELECT CASE 3 WHEN 1 THEN 'a' WHEN 3 THEN 'c' END
+tests/data/basic.parquet|SELECT CAST('12abc' AS INTEGER)
+tests/data/basic.parquet|SELECT TRY_CAST('12abc' AS INTEGER), TRY_CAST(NULL AS INTEGER)
+tests/data/basic.parquet|SELECT CAST(3.7 AS INTEGER), CAST(-3.7 AS INTEGER), CAST(true AS INTEGER)
+tests/data/basic.parquet|SELECT 9223372036854775807 + 1
+tests/data/basic.parquet|SELECT abs(-9223372036854775808)
+tests/data/basic.parquet|SELECT 1 = NULL, 1 != NULL, NULL IS NULL, NOT (1 = NULL)
+tests/data/basic.parquet|SELECT true AND NULL, false AND NULL, true OR NULL, false OR NULL
+tests/data/basic.parquet|SELECT count(DISTINCT flag) FROM t
+tests/data/basic.parquet|SELECT flag, count(*) FROM t GROUP BY flag ORDER BY flag NULLS FIRST
+tests/data/basic.parquet|SELECT id % 2 AS m, count(*) FROM t WHERE id < 10 GROUP BY m ORDER BY m
+tests/data/basic.parquet|SELECT count(*) FROM t HAVING count(*) > 0
+tests/data/basic.parquet|SELECT DISTINCT score FROM t WHERE id < 8 ORDER BY score
+tests/data/basic.parquet|SELECT name FROM t WHERE name LIKE '%5' AND id < 20 ORDER BY id
+tests/data/basic.parquet|SELECT name FROM t WHERE name ILIKE 'NAME_1_' AND id < 15 ORDER BY id
+tests/data/basic.parquet|SELECT 'a%c' LIKE 'a\%c', 'axc' LIKE 'a\%c', 'abc' LIKE 'a_c', 'a%c' LIKE 'a||%' ESCAPE '|'

@@ -99,6 +99,10 @@ const F_GLOB: FuncId = 44;
 /// function of this name (rather than adding a dedicated AST node like `Expr::Like`, everything
 /// is done through the existing function-call path).
 const F_REGEXP_FULL_MATCH: FuncId = 45;
+/// The desugaring target of `s LIKE p ESCAPE 'e'` / `ILIKE ... ESCAPE 'e'`
+/// (`sql::parser`). DuckDB implements the clause through an internal function
+/// of the same name and signature; the matcher is `kernels::like_escape_match`.
+const F_LIKE_ESC: FuncId = 46;
 
 // Floating-point output
 const F_ABS_F: FuncId = 50;
@@ -399,6 +403,11 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         // shell glob pattern (`*` `?` `[...]`). See the comments on `glob_match` for the supported
         // syntax.
         "glob" => fixed(F_GLOB, &[Varchar, Varchar], n, 2, Boolean),
+        // The desugaring target of `s LIKE p ESCAPE 'e'` / `ILIKE ... ESCAPE`
+        // (`sql::parser`; DuckDB implements the clause through a function of
+        // the same name and shape). The third argument is exactly one escape
+        // character. The matcher itself is `kernels::like_escape_match`.
+        "like_escape" => fixed(F_LIKE_ESC, &[Varchar, Varchar, Varchar], n, 3, Boolean),
         // `printf`/`format` differ in the range of format specifiers they support (printf: `%`
         // formats; format: `{}` placeholders), so their IDs are separate. Only the first argument
         // (the format string) is fixed to VARCHAR and the rest are passed with their original types

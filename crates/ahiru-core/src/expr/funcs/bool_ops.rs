@@ -15,6 +15,18 @@ pub(super) fn eval_bool(id: FuncId, a: &A) -> Result<Option<bool>> {
         _ => {}
     }
     let (s, p) = (a.bytes(0), a.bytes(1));
+    // `LIKE ... ESCAPE`'s desugaring target. The escape character is one
+    // single byte (enforced where the clause is parsed); anything else is an
+    // invalid argument.
+    if id == F_LIKE_ESC {
+        let e = a.bytes(2);
+        ensure!(e.len() == 1, TypeMismatch);
+        // A pattern ending in a lone escape character is invalid (DuckDB raises
+        // "Like pattern must not end with escape character!", even when the
+        // pattern is not a constant).
+        ensure!(!ends_with_dangling_escape(p, e[0]), SyntaxError);
+        return Ok(Some(kernels::like_escape_match(s, p, e[0])));
+    }
     Ok(Some(match id {
         F_STARTS_WITH => s.len() >= p.len() && &s[..p.len()] == p,
         F_ENDS_WITH => s.len() >= p.len() && &s[s.len() - p.len()..] == p,
@@ -25,6 +37,24 @@ pub(super) fn eval_bool(id: FuncId, a: &A) -> Result<Option<bool>> {
         F_GLOB => glob_match(s, p),
         _ => err!(Internal),
     }))
+}
+
+/// Whether walking `p` as escape tokens leaves its last byte as an escape
+/// character with nothing following (`"x!"` with escape `!`). A doubled pair
+/// at the very end (`"x!!"` = literal `!`) is valid and does not count.
+fn ends_with_dangling_escape(p: &[u8], esc: u8) -> bool {
+    let mut i = 0;
+    while i < p.len() {
+        if p[i] == esc {
+            if i + 1 >= p.len() {
+                return true;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Shell glob pattern matching. The same meaning as DuckDB's `GLOB` operator (all of the

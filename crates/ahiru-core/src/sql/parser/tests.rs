@@ -139,18 +139,13 @@ fn r(a: &ExprArena, id: ExprId) -> String {
         Expr::IsNull { arg, negated } => {
             format!("({} IS{} NULL)", r(a, *arg), if *negated { " NOT" } else { "" })
         }
-        Expr::Like { arg, pattern, negated, escape, ci } => {
-            let esc = match escape {
-                Some(c) => format!(" ESCAPE '{}'", *c as char),
-                None => String::new(),
-            };
+        Expr::Like { arg, pattern, negated, ci } => {
             format!(
-                "({}{} {} {}{})",
+                "({}{} {} {})",
                 r(a, *arg),
                 if *negated { " NOT" } else { "" },
                 if *ci { "ILIKE" } else { "LIKE" },
                 r(a, *pattern),
-                esc
             )
         }
         Expr::Function { name, args, distinct, star, filter } => {
@@ -572,7 +567,8 @@ fn predicates() {
     assert_eq!(ex("x NOT BETWEEN 1 AND 2"), "(x NOT BETWEEN 1i32 AND 2i32)");
     assert_eq!(ex("x LIKE 'a%'"), "(x LIKE 'a%')");
     assert_eq!(ex("x NOT LIKE 'a%'"), "(x NOT LIKE 'a%')");
-    assert_eq!(ex("x LIKE 'a!%' ESCAPE '!'"), "(x LIKE 'a!%' ESCAPE '!')");
+    // A custom escape desugars into a `like_escape` call (DuckDB's own shape).
+    assert_eq!(ex("x LIKE 'a!%' ESCAPE '!'"), "like_escape(x, 'a!%', '!')");
     // The AND separating BETWEEN's bounds is not swallowed as a logical operator.
     assert_eq!(ex("a BETWEEN 1 AND 2 AND b"), "((a BETWEEN 1i32 AND 2i32) AND b)");
     assert_eq!(ex("a BETWEEN 1 + 1 AND 2 * 3"), "(a BETWEEN (1i32 + 1i32) AND (2i32 * 3i32))");
@@ -592,7 +588,8 @@ fn ilike_predicate() {
     assert_eq!(ex("x ILIKE 'a%'"), "(x ILIKE 'a%')");
     assert_eq!(ex("x NOT ILIKE 'a%'"), "(x NOT ILIKE 'a%')");
     assert_eq!(ex("x ilike 'a%'"), "(x ILIKE 'a%')");
-    assert_eq!(ex("x ILIKE 'a!%' ESCAPE '!'"), "(x ILIKE 'a!%' ESCAPE '!')");
+    // With ESCAPE, ILIKE lowers both sides and then calls `like_escape`.
+    assert_eq!(ex("x ILIKE 'a!%' ESCAPE '!'"), "like_escape(lower(x), lower('a!%'), '!')");
     // ILIKE is a predicate too, so it binds tighter than AND.
     assert_eq!(ex("a ILIKE 'x' AND b"), "((a ILIKE 'x') AND b)");
     // `ILIKE` is fully reserved (unusable as a column name).

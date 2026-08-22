@@ -183,7 +183,6 @@ pub enum Expr {
         arg: ExprId,
         pattern: ExprId,
         negated: bool,
-        escape: Option<u8>,
         /// `ILIKE`. Compares case-insensitively.
         ci: bool,
     },
