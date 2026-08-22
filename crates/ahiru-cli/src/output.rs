@@ -2,10 +2,8 @@
 //! `.maxrows`, `.maxwidth`.
 //!
 //! Rows arrive one at a time and most modes stream them straight out; only the
-//! boxed modes (`Box`/`Duckbox`) and `Json` buffer, since they cannot know the
-//! column widths (boxed modes) or whether they are writing the first/last row
-//! (`Json`, which needs commas between array elements and `[]` for an empty
-//! result) until every row has been seen.
+//! boxed modes (`Box`/`Duckbox`) buffer because they cannot know the column
+//! widths until every row has been seen.
 
 use std::io::{self, Write};
 
@@ -140,10 +138,6 @@ pub struct Writer<'a> {
     rows: usize,
     /// Rendered cells, buffered for `Box`/`Duckbox` (need column widths).
     box_rows: Vec<Vec<String>>,
-    /// Pre-rendered `{"col":value,...}` fragments, buffered for `Json` (needs
-    /// to know the last row to place commas, and whether there were any rows
-    /// at all to choose between `[]` and a multi-line array).
-    json_rows: Vec<String>,
 }
 
 impl<'a> Writer<'a> {
@@ -155,7 +149,6 @@ impl<'a> Writer<'a> {
             types: Vec::new(),
             rows: 0,
             box_rows: Vec::new(),
-            json_rows: Vec::new(),
         }
     }
 
@@ -165,7 +158,6 @@ impl<'a> Writer<'a> {
         self.types = schema.iter().map(|f| f.ty).collect();
         self.rows = 0;
         self.box_rows.clear();
-        self.json_rows.clear();
         match self.settings.mode {
             Mode::Tsv | Mode::List => self.write_header_delim(),
             Mode::Csv => self.write_header_csv(),
@@ -184,11 +176,7 @@ impl<'a> Writer<'a> {
             Mode::Markdown => self.write_row_markdown(values),
             Mode::Insert => self.write_row_insert(values),
             Mode::JsonLines => self.write_row_jsonlines(values),
-            Mode::Json => {
-                let frag = self.json_row_fragment(values);
-                self.json_rows.push(frag);
-                Ok(())
-            }
+            Mode::Json => self.write_row_json(values),
             Mode::Box | Mode::Duckbox => {
                 let cells: Vec<String> = values
                     .iter()
@@ -309,6 +297,14 @@ impl<'a> Writer<'a> {
                     } else {
                         "NULL".to_string()
                     }
+                } else if matches!(ty, Ty::Float | Ty::Double)
+                    && matches!(v, Value::F64(f) if !f.is_finite())
+                {
+                    // Bare `inf`/`NaN` tokens are parsed as column names. A
+                    // quoted spelling is cast back to the target floating
+                    // type when the generated INSERT statement is replayed.
+                    let text = crate::render::render(v, *ty, "NULL");
+                    format!("'{}'", text.replace('\'', "''"))
                 } else if *ty == Ty::Boolean || crate::render::is_numeric(*ty) {
                     crate::render::render(v, *ty, "NULL")
                 } else {
@@ -320,7 +316,7 @@ impl<'a> Writer<'a> {
         writeln!(
             self.out,
             "INSERT INTO {} VALUES ({});",
-            self.settings.insert_table,
+            insert_target(&self.settings.insert_table),
             parts.join(", ")
         )
     }
@@ -332,9 +328,20 @@ impl<'a> Writer<'a> {
         writeln!(self.out, "{frag}")
     }
 
+    /// Streams one row into a JSON array. Prefixing rows after the first with a
+    /// comma keeps the exact output shape without retaining every rendered row
+    /// until `finish`.
+    fn write_row_json(&mut self, values: &[Value]) -> io::Result<()> {
+        let frag = self.json_row_fragment(values);
+        if self.rows == 1 {
+            write!(self.out, "[\n\t{frag}")
+        } else {
+            write!(self.out, ",\n\t{frag}")
+        }
+    }
+
     /// Renders one row as a compact `{"col":value,...}` fragment. Shared by
-    /// `Json` (buffered, assembled into an array in `finish_json`) and
-    /// `JsonLines` (written straight out, one per line).
+    /// `Json` (streamed as an array) and `JsonLines` (one object per line).
     fn json_row_fragment(&self, values: &[Value]) -> String {
         let mut out = String::from("{");
         for (i, (v, ty)) in values.iter().zip(&self.types).enumerate() {
@@ -350,19 +357,11 @@ impl<'a> Writer<'a> {
     }
 
     fn finish_json(&mut self) -> io::Result<()> {
-        if self.json_rows.is_empty() {
-            return writeln!(self.out, "[]");
+        if self.rows == 0 {
+            writeln!(self.out, "[]")
+        } else {
+            writeln!(self.out, "\n]")
         }
-        writeln!(self.out, "[")?;
-        let last = self.json_rows.len() - 1;
-        for (i, r) in self.json_rows.iter().enumerate() {
-            if i == last {
-                writeln!(self.out, "\t{r}")?;
-            } else {
-                writeln!(self.out, "\t{r},")?;
-            }
-        }
-        writeln!(self.out, "]")
     }
 
     // ---- Box / Duckbox ----
@@ -378,22 +377,27 @@ impl<'a> Writer<'a> {
         let n = self.names.len();
         let total_rows = self.box_rows.len();
 
-        // --- Row truncation: keep the first and last `maxrows/2` rows, with
-        // a single elision marker row spliced into the middle. ---
+        // --- Row truncation: split `maxrows` between the start and end, with
+        // a single elision marker row spliced into the middle. For an odd
+        // limit, the start gets the extra row so exactly `maxrows` data rows
+        // remain visible (including when the limit is one). ---
         let row_trunc = duck && self.settings.maxrows > 0 && total_rows > self.settings.maxrows;
-        let half = self.settings.maxrows / 2;
+        let tail_rows = self.settings.maxrows / 2;
+        let head_rows = tail_rows + self.settings.maxrows % 2;
         let display_rows: Vec<DisplayRow> = if row_trunc {
-            let mut v = Vec::with_capacity(half * 2 + 1);
-            v.extend(self.box_rows[..half].iter().map(|r| DisplayRow::Data(r.as_slice())));
+            let mut v = Vec::with_capacity(self.settings.maxrows + 1);
+            v.extend(self.box_rows[..head_rows].iter().map(|r| DisplayRow::Data(r.as_slice())));
             v.push(DisplayRow::Elision);
             v.extend(
-                self.box_rows[total_rows - half..].iter().map(|r| DisplayRow::Data(r.as_slice())),
+                self.box_rows[total_rows - tail_rows..]
+                    .iter()
+                    .map(|r| DisplayRow::Data(r.as_slice())),
             );
             v
         } else {
             self.box_rows.iter().map(|r| DisplayRow::Data(r.as_slice())).collect()
         };
-        let shown_rows = if row_trunc { half * 2 } else { total_rows };
+        let shown_rows = if row_trunc { self.settings.maxrows } else { total_rows };
 
         // --- Column content widths, across the header, the type line (duck
         // only) and every displayed data row. ---
@@ -536,6 +540,102 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// Render the target of generated INSERT statements as a safe SQL identifier.
+/// Keep ordinary names unquoted for compatibility, but quote qualified parts
+/// that contain punctuation, spaces, quotes, or a reserved word. The table name
+/// comes from `.mode insert TABLE`, so it is user-controlled output text rather
+/// than trusted SQL.
+fn insert_target(name: &str) -> String {
+    name.split('.').map(insert_identifier_part).collect::<Vec<_>>().join(".")
+}
+
+fn insert_identifier_part(part: &str) -> String {
+    let mut chars = part.chars();
+    let simple = chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+    const RESERVED: &[&str] = &[
+        "as",
+        "by",
+        "in",
+        "is",
+        "on",
+        "or",
+        "all",
+        "and",
+        "asc",
+        "end",
+        "not",
+        "case",
+        "cast",
+        "desc",
+        "else",
+        "from",
+        "full",
+        "join",
+        "last",
+        "left",
+        "like",
+        "null",
+        "show",
+        "then",
+        "true",
+        "when",
+        "with",
+        "cross",
+        "false",
+        "first",
+        "group",
+        "ilike",
+        "inner",
+        "limit",
+        "nulls",
+        "order",
+        "outer",
+        "right",
+        "union",
+        "where",
+        "escape",
+        "except",
+        "exists",
+        "having",
+        "offset",
+        "select",
+        "tables",
+        "window",
+        "between",
+        "explain",
+        "qualify",
+        "describe",
+        "distinct",
+        "intersect",
+        "if",
+        "to",
+        "add",
+        "drop",
+        "view",
+        "alter",
+        "table",
+        "column",
+        "create",
+        "rename",
+        "default",
+        "replace",
+        "set",
+        "into",
+        "delete",
+        "insert",
+        "update",
+        "values",
+        "copy",
+    ];
+    let lower = part.to_ascii_lowercase();
+    let reserved = RESERVED.contains(&lower.as_str());
+    if simple && !reserved {
+        return part.to_string();
+    }
+    format!("\"{}\"", part.replace('"', "\"\""))
+}
+
 /// Quotes a cell per RFC 4180 if it contains the separator, a `"`, or a
 /// line-ending character; doubles any internal `"`.
 fn csv_quote(s: &str, separator: &str) -> String {
@@ -567,6 +667,9 @@ fn md_escape(s: &str) -> String {
 /// text looks like actual JSON, and a JSON string otherwise.
 fn json_cell_value(v: &Value, ty: Ty) -> String {
     if matches!(v, Value::Null) {
+        return "null".to_string();
+    }
+    if matches!(v, Value::F64(x) if !x.is_finite()) {
         return "null".to_string();
     }
     if ty == Ty::Boolean || crate::render::is_numeric(ty) {
@@ -680,7 +783,22 @@ fn pad_center(marker: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::*;
+
+    struct SharedBuffer(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn field(name: &str, ty: Ty) -> Field {
         Field::new(name, ty, true)
@@ -785,6 +903,32 @@ mod tests {
     }
 
     #[test]
+    fn json_replaces_non_finite_floats_with_null() {
+        let schema = [
+            field("nan", Ty::Double),
+            field("pos_inf", Ty::Double),
+            field("neg_inf", Ty::Double),
+            field("finite", Ty::Double),
+        ];
+        let mut buf = Vec::new();
+        let mut w = writer(&mut buf, Settings { mode: Mode::Json, ..Settings::default() });
+        w.begin(&schema).unwrap();
+        w.row(&[
+            Value::F64(f64::NAN),
+            Value::F64(f64::INFINITY),
+            Value::F64(f64::NEG_INFINITY),
+            Value::F64(1.5),
+        ])
+        .unwrap();
+        w.finish().unwrap();
+
+        assert_eq!(
+            as_str(&buf),
+            "[\n\t{\"nan\":null,\"pos_inf\":null,\"neg_inf\":null,\"finite\":1.5}\n]\n"
+        );
+    }
+
+    #[test]
     fn json_empty_result_set() {
         let schema = [field("n", Ty::Int)];
         let mut buf = Vec::new();
@@ -792,6 +936,24 @@ mod tests {
         w.begin(&schema).unwrap();
         w.finish().unwrap();
         assert_eq!(as_str(&buf), "[]\n");
+    }
+
+    #[test]
+    fn json_streams_rows_before_finish() {
+        let schema = [field("n", Ty::Int)];
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = SharedBuffer(Rc::clone(&observed));
+        let mut w = Writer::new(&mut sink, Settings { mode: Mode::Json, ..Settings::default() });
+
+        w.begin(&schema).unwrap();
+        w.row(&[Value::I32(1)]).unwrap();
+        assert_eq!(as_str(&observed.borrow()), "[\n\t{\"n\":1}");
+
+        w.row(&[Value::I32(2)]).unwrap();
+        assert_eq!(as_str(&observed.borrow()), "[\n\t{\"n\":1},\n\t{\"n\":2}");
+
+        w.finish().unwrap();
+        assert_eq!(as_str(&observed.borrow()), "[\n\t{\"n\":1},\n\t{\"n\":2}\n]\n");
     }
 
     #[test]
@@ -836,6 +998,52 @@ mod tests {
     }
 
     #[test]
+    fn insert_quotes_non_finite_floats_for_sql_replay() {
+        let schema = [
+            field("nan", Ty::Double),
+            field("pos_inf", Ty::Double),
+            field("neg_inf", Ty::Float),
+            field("finite", Ty::Double),
+        ];
+        let mut buf = Vec::new();
+        let mut w = writer(
+            &mut buf,
+            Settings { mode: Mode::Insert, insert_table: "t".to_string(), ..Settings::default() },
+        );
+        w.begin(&schema).unwrap();
+        w.row(&[
+            Value::F64(f64::NAN),
+            Value::F64(f64::INFINITY),
+            Value::F64(f64::NEG_INFINITY),
+            Value::F64(1.5),
+        ])
+        .unwrap();
+        w.finish().unwrap();
+        assert_eq!(as_str(&buf), "INSERT INTO t VALUES ('NaN', 'inf', '-inf', 1.5);\n");
+    }
+
+    #[test]
+    fn insert_quotes_unsafe_table_names() {
+        let schema = [field("n", Ty::Int)];
+        let mut buf = Vec::new();
+        let mut w = writer(
+            &mut buf,
+            Settings {
+                mode: Mode::Insert,
+                insert_table: "x; DROP TABLE y; --".to_string(),
+                ..Settings::default()
+            },
+        );
+        w.begin(&schema).unwrap();
+        w.row(&[Value::I32(1)]).unwrap();
+        w.finish().unwrap();
+        assert_eq!(as_str(&buf), "INSERT INTO \"x; DROP TABLE y; --\" VALUES (1);\n");
+        assert_eq!(insert_target("else"), "\"else\"");
+        assert_eq!(insert_target("main.safe_name"), "main.safe_name");
+        assert_eq!(insert_target("main.has\"quote"), "main.\"has\"\"quote\"");
+    }
+
+    #[test]
     fn box_layout_2x2() {
         let schema = [field("a", Ty::Varchar), field("b", Ty::Int)];
         let mut buf = Vec::new();
@@ -872,6 +1080,46 @@ mod tests {
         assert!(out.contains("1"));
         assert!(out.contains("6"));
         assert!(out.contains('·'));
+    }
+
+    #[test]
+    fn duckbox_odd_row_limit_shows_exact_requested_count() {
+        let schema = [field("n", Ty::Int)];
+        let mut buf = Vec::new();
+        let mut w =
+            writer(&mut buf, Settings { mode: Mode::Duckbox, maxrows: 3, ..Settings::default() });
+        w.begin(&schema).unwrap();
+        for i in 1..=6 {
+            w.row(&[Value::I32(i)]).unwrap();
+        }
+        w.finish().unwrap();
+
+        let out = as_str(&buf);
+        assert!(out.lines().any(|line| line == "6 rows (3 shown)"), "footer missing in:\n{out}");
+        let cells: Vec<&str> =
+            out.lines().filter_map(|line| line.split('│').nth(1).map(str::trim)).collect();
+        assert!(cells.contains(&"1"));
+        assert!(cells.contains(&"2"));
+        assert!(cells.contains(&"6"));
+    }
+
+    #[test]
+    fn duckbox_one_row_limit_still_shows_data() {
+        let schema = [field("n", Ty::Int)];
+        let mut buf = Vec::new();
+        let mut w =
+            writer(&mut buf, Settings { mode: Mode::Duckbox, maxrows: 1, ..Settings::default() });
+        w.begin(&schema).unwrap();
+        w.row(&[Value::I32(7)]).unwrap();
+        w.row(&[Value::I32(8)]).unwrap();
+        w.finish().unwrap();
+
+        let out = as_str(&buf);
+        assert!(out.lines().any(|line| line == "2 rows (1 shown)"), "footer missing in:\n{out}");
+        assert!(out
+            .lines()
+            .filter_map(|line| line.split('│').nth(1).map(str::trim))
+            .any(|cell| cell == "7"));
     }
 
     #[test]

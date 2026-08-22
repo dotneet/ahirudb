@@ -130,8 +130,12 @@ impl Window {
         let cols = core::mem::take(&mut self.cols);
         let batch = if cols.is_empty() { Batch::rows_only(self.rows) } else { Batch::new(cols) };
         let mut out = Vec::with_capacity(self.windows.len());
+        let mut bytes: usize = batch.cols.iter().map(vector_bytes).sum();
         for spec in &self.windows {
-            out.push(compute(spec, &batch, self.rows, ctx)?);
+            let v = compute(spec, &batch, self.rows, ctx)?;
+            bytes = bytes.saturating_add(vector_bytes(&v));
+            ensure!(bytes <= MAX_BUFFER_BYTES, Oom);
+            out.push(v);
         }
         self.cols = batch.cols;
         self.out = out;
@@ -322,9 +326,16 @@ fn eval_partition(
                     // Omitted means 1. A negative offset reverses the direction.
                     None => 1,
                 };
-                let target = if back { p as i64 - off } else { p as i64 + off };
-                if target >= 0 && (target as usize) < n {
-                    let v = src.value_at(part[target as usize] as usize);
+                // An offset is user data. Checked arithmetic makes the out-of-range result
+                // follow the default/NULL branch instead of panicking in debug builds (or
+                // wrapping to an unrelated row in release/WASM builds).
+                let target =
+                    if back { (p as i64).checked_sub(off) } else { (p as i64).checked_add(off) };
+                if let Some(target) = target
+                    .and_then(|target| usize::try_from(target).ok())
+                    .filter(|&target| target < n)
+                {
+                    let v = src.value_at(part[target] as usize);
                     push_as(out, ty, &v)?;
                 } else {
                     // Outside the partition it is the default value, or NULL if none was given.
@@ -399,11 +410,14 @@ fn eval_partition(
                         None => n,
                     }
                 };
-                if k >= 1 && (k as usize) <= end {
-                    let v = src.value_at(part[k as usize - 1] as usize);
-                    push_as(out, ty, &v)?;
-                } else {
-                    out.push_null();
+                match usize::try_from(k).ok().filter(|&k| (1..=end).contains(&k)) {
+                    Some(k) => {
+                        let v = src.value_at(part[k - 1] as usize);
+                        push_as(out, ty, &v)?;
+                    }
+                    None => {
+                        out.push_null();
+                    }
                 }
             }
         }
@@ -424,7 +438,10 @@ fn eval_partition(
                     out.push_null();
                     continue;
                 }
-                let b = (buckets as usize).min(n.max(1));
+                // On 32-bit WASM, a direct cast can wrap a large positive count to zero and
+                // make the division below panic. Counts larger than the partition are equivalent
+                // to one bucket per row, so saturating at the partition size is sufficient.
+                let b = usize::try_from(buckets).unwrap_or(usize::MAX).min(n.max(1));
                 let (base, rem) = (n / b, n % b);
                 // Rows 0..rem*(base+1) fall in the larger buckets; the rest in the smaller ones.
                 let big = rem * (base + 1);
@@ -1307,6 +1324,25 @@ mod tests {
         assert_eq!(ints_at(&rows, 4), vec![Some(-9), Some(1), Some(2)]);
         assert_eq!(ints_at(&rows, 5), vec![Some(2), Some(3), None]);
         assert_eq!(ints_at(&rows, 6), vec![Some(1), Some(2), Some(3)]);
+    }
+
+    /// Extreme signed offsets are out of range, not arithmetic traps or wrapped row indexes.
+    #[test]
+    fn lag_and_lead_extreme_offsets_yield_null() {
+        let steps = gx(&[Some(1); 3], &[Some(10), Some(20), Some(30)]);
+        let ws = vec![
+            spec(WindowKind::Lag, Ty::Int)
+                .args(vec![load(Ty::Int, 1), konst(Ty::BigInt, Value::I64(i64::MIN))])
+                .order(vec![skey(1, Ty::Int)])
+                .build(),
+            spec(WindowKind::Lead, Ty::Int)
+                .args(vec![load(Ty::Int, 1), konst(Ty::BigInt, Value::I64(i64::MAX))])
+                .order(vec![skey(1, Ty::Int)])
+                .build(),
+        ];
+        let rows = run(steps, ws);
+        assert_eq!(ints_at(&rows, 2), vec![None, None, None]);
+        assert_eq!(ints_at(&rows, 3), vec![None, None, None]);
     }
 
     /// A NULL offset gives a NULL result (the same as DuckDB).

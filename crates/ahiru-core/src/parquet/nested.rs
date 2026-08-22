@@ -38,7 +38,7 @@ use alloc::borrow::Cow;
 
 use crate::expr::{funcs, kernels};
 use crate::parquet::encoding::{self, RleDecoder};
-use crate::parquet::meta::{decode_page_header, ColumnMetaData, PageHeader};
+use crate::parquet::meta::{decode_page_header, ColumnMetaData, PageHeader, MAX_PAGES_PER_COLUMN};
 use crate::parquet::reader::{self, PageCache};
 use crate::parquet::schema::{ColumnDesc, LeafDecodeInfo, NestedContent, NestedNode};
 use crate::parquet::*;
@@ -233,6 +233,9 @@ fn read_levels_v1(page: &[u8], n: usize, max_level: u16) -> Result<(Vec<u16>, us
     let mut d = RleDecoder::new(&page[4..4 + len], bw);
     let mut raw = Vec::with_capacity(n);
     d.read_u32(n, &mut raw)?;
+    for &level in &raw {
+        ensure!(level <= max_level as u32, BadCompressedData);
+    }
     Ok((raw.into_iter().map(|v| v as u16).collect(), 4 + len))
 }
 
@@ -245,6 +248,9 @@ fn read_levels_v2(data: &[u8], n: usize, max_level: u16) -> Result<Vec<u16>> {
     let mut d = RleDecoder::new(data, bw);
     let mut raw = Vec::with_capacity(n);
     d.read_u32(n, &mut raw)?;
+    for &level in &raw {
+        ensure!(level <= max_level as u32, BadCompressedData);
+    }
     Ok(raw.into_iter().map(|v| v as u16).collect())
 }
 
@@ -310,6 +316,7 @@ fn read_nested_page_v2(
     cache: &dyn PageCache,
 ) -> Result<()> {
     let dp = hdr.data_page_v2.as_ref().ok_or(reader::err_at(Code::BadPageHeader, 0))?;
+    ensure!(hdr.uncompressed_page_size >= 0, BadPageHeader);
     let n = reader::check_count(dp.num_values)?;
     let rep_len = reader::check_len(dp.repetition_levels_byte_length)?;
     let def_len = reader::check_len(dp.definition_levels_byte_length)?;
@@ -326,6 +333,7 @@ fn read_nested_page_v2(
         ensure!(want >= 0, BadPageHeader);
         reader::decompress(meta.codec, values_raw, want as i32, raw_off + skip as u64, cache)?
     } else {
+        ensure!(raw.len() == hdr.uncompressed_page_size as usize, BadCompressedData);
         Cow::Borrowed(values_raw)
     };
     let dense = reader::decode_dense(desc, dp.encoding, &values, present, dict)?;
@@ -368,9 +376,12 @@ fn read_nested_leaf_chunk(
     let mut values = Vector::with_capacity(info.ty, 0);
     let mut dict: Option<Vector> = None;
     let mut pos = 0usize;
+    let mut pages_seen = 0usize;
 
     while pos < buf.len() {
         let (hdr, hlen) = decode_page_header(&buf[pos..])?;
+        pages_seen = pages_seen.saturating_add(1);
+        ensure!(pages_seen <= MAX_PAGES_PER_COLUMN, LimitExceeded, pos);
         pos += hlen;
         let clen = hdr.compressed_page_size as usize;
         ensure!(clen <= buf.len().saturating_sub(pos), UnexpectedEof, pos);

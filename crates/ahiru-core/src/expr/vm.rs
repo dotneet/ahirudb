@@ -107,6 +107,14 @@ fn default_ty(p: PhysType) -> Ty {
 /// The result logical type of a binary operation. The binder is assumed to have aligned both
 /// sides, but when they are not (= cannot be unified) it falls back to the physical type's default.
 fn binary_ty(phys: PhysType, a: Ty, b: Ty) -> Ty {
+    // DATE arithmetic is deliberately compiled on the shared I32 lane even
+    // though DATE and INTEGER do not unify. Preserve the logical result here
+    // so the arithmetic kernel can reject DuckDB's reserved DATE infinity
+    // sentinels; DATE - DATE is the one shape whose result is an INTEGER day
+    // count and must not receive the DATE-only check.
+    if phys == PhysType::I32 && (a == Ty::Date && b != Ty::Date || b == Ty::Date && a != Ty::Date) {
+        return Ty::Date;
+    }
     match Ty::unify(a, b) {
         Some(t) if t.phys() == phys => t,
         _ => default_ty(phys),
@@ -708,6 +716,22 @@ mod tests {
         let r = cast_of(Ty::BigInt, Ty::Int, src).unwrap();
         assert_eq!(r.i32s()[0], 5);
         assert!(!r.is_valid(1));
+
+        // Logical integer widths are narrower than their shared physical
+        // vectors. Out-of-range signed and unsigned values must not survive
+        // a cast merely because they fit I32/I64/I128.
+        let src = col(
+            Ty::BigInt,
+            &[Some(Value::I64(127)), Some(Value::I64(128)), Some(Value::I64(-129))],
+        );
+        let r = cast_of(Ty::BigInt, Ty::TinyInt, src).unwrap();
+        assert!(r.is_valid(0));
+        assert!(!r.is_valid(1) && !r.is_valid(2));
+
+        let src = col(Ty::BigInt, &[Some(Value::I64(255)), Some(Value::I64(-1))]);
+        let r = cast_of(Ty::BigInt, Ty::UTinyInt, src).unwrap();
+        assert!(r.is_valid(0));
+        assert!(!r.is_valid(1));
     }
 
     #[test]
@@ -821,9 +845,9 @@ mod tests {
         let r = cast_of(Ty::Boolean, Ty::Varchar, src).unwrap();
         assert_eq!(r.bytes().get(0), b"true");
         assert_eq!(r.bytes().get(1), b"false");
-        let src = bytes(&[b"TRUE", b"false", b"1", b"zzz"]);
+        let src = bytes(&[b"TRUE", b"false", b"yes", b"n", b"1", b"zzz"]);
         let r = cast_of(Ty::Varchar, Ty::Boolean, src).unwrap();
-        assert_eq!(tri(&r), vec![T, F, T, N]);
+        assert_eq!(tri(&r), vec![T, F, T, F, T, N]);
     }
 
     #[test]

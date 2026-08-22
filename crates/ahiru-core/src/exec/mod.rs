@@ -595,12 +595,15 @@ impl Operator for Limit {
             let card = batch.card() as u64;
 
             // The OFFSET has not been fully consumed yet.
-            if self.seen + card <= self.offset {
-                self.seen += card;
-                continue;
+            if self.seen < self.offset {
+                let remaining = self.offset - self.seen;
+                if card <= remaining {
+                    self.seen = self.seen.saturating_add(card);
+                    continue;
+                }
             }
             let skip = self.offset.saturating_sub(self.seen);
-            self.seen += card;
+            self.seen = self.seen.saturating_add(card);
 
             let mut take = card - skip;
             if let Some(l) = self.limit {
@@ -609,7 +612,7 @@ impl Operator for Limit {
             if take == 0 {
                 continue;
             }
-            self.emitted += take;
+            self.emitted = self.emitted.saturating_add(take);
 
             if skip > 0 || take < card {
                 let base: Vec<u32> = match &batch.sel {
@@ -801,5 +804,32 @@ mod distinct_on_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec![Value::I32(1), Value::I32(10)]);
         assert_eq!(rows[1], vec![Value::I32(2), Value::I32(20)]);
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::expr::vm::Vm;
+
+    #[test]
+    fn offset_counter_does_not_overflow_at_u64_boundary() {
+        let mut op = Limit {
+            input: Box::new(Values::new(Batch::rows_only(2))),
+            limit: None,
+            offset: u64::MAX,
+            seen: u64::MAX - 1,
+            emitted: 0,
+        };
+        let mut catalog = Catalog::new();
+        let mut vm = Vm::new();
+        let mut ctx =
+            ExecContext { catalog: &mut catalog, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
+        let Step::Ready(batch) = op.next(&mut ctx).unwrap() else {
+            panic!("the row after the offset should be emitted");
+        };
+        assert_eq!(batch.card(), 1);
+        assert_eq!(op.seen, u64::MAX);
     }
 }

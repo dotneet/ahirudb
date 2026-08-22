@@ -165,7 +165,21 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
     let (n, sa, sb) = strides2(a.len(), b.len())?;
     let mut bad = None;
     let data = match phys {
-        PhysType::I32 => Data::I32(arith_i32(op, a.i32s(), sa, b.i32s(), sb, n, &mut bad)),
+        PhysType::I32 => {
+            let values = arith_i32(op, a.i32s(), sa, b.i32s(), sb, n, &mut bad);
+            if out_ty == Ty::Date {
+                // DuckDB reserves three physical i32 values for DATE special
+                // values. AhiruDB has no infinity literals, so a date
+                // arithmetic result reaching any of them is out of range,
+                // not a finite calendar date.
+                for (i, &value) in values.iter().enumerate() {
+                    if value <= i32::MIN + 1 || value == i32::MAX {
+                        funcs::set_null(&mut bad, i, n);
+                    }
+                }
+            }
+            Data::I32(values)
+        }
         PhysType::I64 => Data::I64(arith_i64(op, a.i64s(), sa, b.i64s(), sb, n, &mut bad)),
         PhysType::I128 => Data::I128(arith_i128(op, a.i128s(), sa, b.i128s(), sb, n, &mut bad)),
         PhysType::F64 => Data::F64(arith_f64(op, a.f64s(), sa, b.f64s(), sb, n)),
@@ -587,6 +601,36 @@ fn pow10_f64(k: u8) -> f64 {
     r
 }
 
+/// Parses the non-decimal spellings that DuckDB accepts when casting text to a
+/// floating-point value. These values are part of the IEEE representation used
+/// by the rest of the engine (for example `1.0 / 0.0` already produces `inf`),
+/// so treating them as an unreadable string would make text round-trips lossy.
+fn parse_special_f64(s: &[u8]) -> Option<f64> {
+    let mut lo = 0;
+    let mut hi = s.len();
+    while lo < hi && (s[lo] == b' ' || s[lo] == b'\t') {
+        lo += 1;
+    }
+    while hi > lo && (s[hi - 1] == b' ' || s[hi - 1] == b'\t') {
+        hi -= 1;
+    }
+    let s = &s[lo..hi];
+    let eq = |word: &[u8]| {
+        s.len() == word.len() && s.iter().zip(word).all(|(a, b)| a.to_ascii_lowercase() == *b)
+    };
+    if eq(b"nan") || eq(b"+nan") {
+        Some(f64::NAN)
+    } else if eq(b"-nan") {
+        Some(-f64::NAN)
+    } else if eq(b"inf") || eq(b"infinity") || eq(b"+inf") || eq(b"+infinity") {
+        Some(f64::INFINITY)
+    } else if eq(b"-inf") || eq(b"-infinity") {
+        Some(f64::NEG_INFINITY)
+    } else {
+        None
+    }
+}
+
 /// Rounding to the nearest even (banker's rounding). `core` has no `f64::round_ties_even`.
 ///
 /// Casting floating point to an integer rounds rather than truncates. The SQL standard calls it
@@ -667,6 +711,42 @@ fn store_i128(d: &mut Data, y: i128) -> bool {
             b.push_empty();
             false
         }
+    }
+}
+
+/// Checks the logical range in addition to the physical vector width. Several
+/// SQL integer types deliberately share an `I32`, `I64`, or `I128` backing
+/// store, so a physical `store_i128` check alone would let values such as 128
+/// enter TINYINT or -1 enter UTINYINT.
+fn fits_in_logical_type(to: Ty, y: i128) -> bool {
+    match to {
+        Ty::TinyInt => (-128..=127).contains(&y),
+        Ty::SmallInt => (-32_768..=32_767).contains(&y),
+        Ty::Int => (i32::MIN as i128..=i32::MAX as i128).contains(&y),
+        Ty::BigInt => (i64::MIN as i128..=i64::MAX as i128).contains(&y),
+        Ty::HugeInt => true,
+        Ty::UTinyInt => (0..=u8::MAX as i128).contains(&y),
+        Ty::USmallInt => (0..=u16::MAX as i128).contains(&y),
+        Ty::UInt => (0..=u32::MAX as i128).contains(&y),
+        Ty::UBigInt => (0..=u64::MAX as i128).contains(&y),
+        Ty::Decimal { precision, .. } => {
+            // precision <= 38, so 10^precision still fits in i128.
+            let Some(limit) = pow10_i128(precision as u32) else { return false };
+            let limit = limit - 1;
+            (-limit..=limit).contains(&y)
+        }
+        // BOOLEAN uses non-zero semantics and temporal types are checked by
+        // their physical representation/parsers elsewhere in this module.
+        _ => true,
+    }
+}
+
+fn store_i128_typed(d: &mut Data, to: Ty, y: i128) -> bool {
+    if !fits_in_logical_type(to, y) {
+        push_default(d);
+        false
+    } else {
+        store_i128(d, y)
     }
 }
 
@@ -987,9 +1067,9 @@ fn scale_f64(mut m: f64, e: i32) -> f64 {
 fn parse_bool(s: &[u8]) -> Option<bool> {
     let eq =
         |w: &[u8]| s.len() == w.len() && s.iter().zip(w).all(|(a, b)| a.to_ascii_lowercase() == *b);
-    if eq(b"true") || eq(b"t") {
+    if eq(b"true") || eq(b"t") || eq(b"yes") || eq(b"y") {
         Some(true)
-    } else if eq(b"false") || eq(b"f") {
+    } else if eq(b"false") || eq(b"f") || eq(b"no") || eq(b"n") {
         Some(false)
     } else {
         None
@@ -1133,7 +1213,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             let (mul, div, floor) = int_conv(from, to)?;
             for i in 0..n {
                 let ok = match rescale_i128(load_i128(src, i), mul, div, floor) {
-                    Some(y) => store_i128(&mut data, y),
+                    Some(y) => store_i128_typed(&mut data, to, y),
                     None => {
                         push_default(&mut data);
                         false
@@ -1170,7 +1250,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     f *= pow10_f64(s);
                 }
                 let ok = if f.is_finite() && (-I128_LIMIT..I128_LIMIT).contains(&f) {
-                    store_i128(&mut data, f_round(f) as i128)
+                    store_i128_typed(&mut data, to, f_round(f) as i128)
                 } else {
                     push_default(&mut data);
                     false
@@ -1237,10 +1317,11 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         (Fam::Str, Fam::Flt) => {
             let sv = a.bytes();
             for i in 0..n {
-                match parse_dec(sv.get(i)) {
+                match parse_special_f64(sv.get(i))
+                    .or_else(|| parse_dec(sv.get(i)).map(|(m, e, _)| scale_f64(m as f64, e)))
+                {
                     // Digits overflowing the mantissa are outside f64's precision and can be ignored.
-                    Some((m, e, _)) => {
-                        let mut f = scale_f64(m as f64, e);
+                    Some(mut f) => {
                         if to == Ty::Float {
                             f = f as f32 as f64;
                         }
@@ -1265,7 +1346,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     _ => funcs::parse_timestamp(b),
                 };
                 let ok = match v {
-                    Some(y) => store_i128(&mut data, y as i128),
+                    Some(y) => store_i128_typed(&mut data, to, y as i128),
                     None => {
                         push_default(&mut data);
                         false
@@ -1285,7 +1366,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                 let mut ok = false;
                 if is_bool {
                     if let Some(v) = parse_bool(b) {
-                        ok = store_i128(&mut data, v as i128);
+                        ok = store_i128_typed(&mut data, to, v as i128);
                     }
                 }
                 if !ok {
@@ -1311,7 +1392,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                                 pow10_i128((-k) as u32).and_then(|p| rescale_i128(m, 1, p, false))
                             };
                             match y {
-                                Some(y) => store_i128(&mut data, y),
+                                Some(y) => store_i128_typed(&mut data, to, y),
                                 None => {
                                     push_default(&mut data);
                                     false

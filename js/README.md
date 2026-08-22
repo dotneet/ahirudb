@@ -69,7 +69,7 @@ db.register('logs.csv', bytes);                // let the extension decide
 await db.query('SELECT * FROM "logs.csv"');    // reference it quoted on the SQL side
 ```
 
-`format` accepts `parquet` / `csv` / `tsv` / `jsonl`. An explicit value takes
+`format` accepts `parquet` / `csv` / `tsv` / `jsonl` / `json`. An explicit value takes
 priority even if it disagrees with the extension (decoupling the name from how
 it's read is the whole point of this option, so we don't validate that away).
 Only a misspelled value fails, with E409 — falling back to Auto would read it
@@ -78,10 +78,8 @@ as Parquet and fail with an opaque `BadMagic` instead.
 Extension-based detection recognizes `.csv` / `.tsv` / `.tab` / `.jsonl` /
 `.ndjson` / `.json`; anything else is treated as Parquet. `.json` means a
 single top-level JSON document (array of objects, or one object) — the
-`read_json`/`read_json_auto` shape, distinct from `.jsonl`'s one-object-per-line
-— and can currently only be reached through extension detection: there is no
-`format: 'json'` option, since `ahiru_register_as`'s explicit-format
-parameter doesn't have a wire value for it yet. CSV and JSONL are gated
+`read_json`/`read_json_auto` shape, distinct from `.jsonl`'s one-object-per-line.
+CSV, JSONL, and single-document JSON are gated
 behind wasm-side features (`--features csv,jsonl`), so they aren't present in
 the default distribution build. Registering them against a build that lacks
 the feature raises E409.
@@ -238,15 +236,19 @@ access to internal services:
 - Supply your own `ByteSource` implementations (via `register(name, source)`)
   instead of registering URLs at all, so the host never makes an HTTP request
   on the engine's behalf, or
-- Parse/filter the SQL yourself before running it (reject or rewrite
-  `parquet(...)` / `read_csv(...)` / `read_json(...)` calls with URL
-  arguments) — the engine and this host layer do not do this for you.
+- Set `sqlUrlPolicy: false` (or a synchronous/asynchronous callback that
+  allowlists the URL's origin) when constructing the database. The callback is
+  used only for HTTP(S) URLs discovered in SQL file-function calls and receives
+  `(url, { functionName, sql })`; explicit `register(name, url)` calls remain
+  the caller's responsibility. When a policy is configured, SQL-discovered
+  URLs also use `redirect: "error"`, so an allowed origin cannot redirect the
+  fetch to a different host behind the callback's decision.
 
-There is currently no built-in allowlist option. `AhiruDB.init({ fetch })`
-already lets a caller substitute their own `fetch` implementation for every
-outgoing URL request the host makes, though, so an allowlist can be built at
-that layer today (reject or redirect requests to disallowed hosts inside your
-`fetch` wrapper) without any change to this library.
+The default remains permissive for compatibility with the documented
+`parquet('URL')` shorthand. For untrusted SQL, explicitly set the policy to
+`false` or reject private/non-allowlisted origins in the callback. `AhiruDB.init({
+fetch })` also lets a caller enforce a final network-level policy for every URL
+request, including explicit registrations and the wasm/ZSTD URLs.
 
 ## Tests
 

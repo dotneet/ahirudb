@@ -11,7 +11,7 @@ use crate::parquet::bloom::BloomFilter;
 use crate::parquet::file::{footer_probe_range, parse_footer, ParquetFile};
 use crate::parquet::meta::{
     decode_bloom_filter_header, decode_column_index, decode_offset_index, ColumnIndex,
-    ColumnMetaData, OffsetIndex,
+    ColumnMetaData, OffsetIndex, MAX_PAGES_PER_COLUMN,
 };
 use crate::parquet::nested::read_nested_column;
 use crate::parquet::reader::{
@@ -127,7 +127,13 @@ impl ParquetFormat {
     fn num_rows(&self, split: usize) -> Result<usize> {
         let f = self.file()?;
         match f.meta.row_groups.get(split) {
-            Some(rg) => Ok(rg.num_rows.max(0) as usize),
+            Some(rg) => {
+                ensure!(rg.num_rows >= 0, BadThrift);
+                match usize::try_from(rg.num_rows) {
+                    Ok(n) => Ok(n),
+                    Err(_) => err!(LimitExceeded),
+                }
+            }
             None => err!(Internal),
         }
     }
@@ -187,7 +193,7 @@ impl ParquetFormat {
             } else {
                 collect_codec_pages(meta, buf, s, nrows, pages)?;
             }
-            push_codec_tasks(pages, out);
+            push_codec_tasks(pages, out)?;
         }
         Ok(())
     }
@@ -264,7 +270,7 @@ impl TableFormat for ParquetFormat {
 
     fn split_rows(&self, split: usize) -> Option<u64> {
         let f = self.file.as_ref()?;
-        f.meta.row_groups.get(split).map(|rg| rg.num_rows.max(0) as u64)
+        f.meta.row_groups.get(split).and_then(|rg| rg.num_rows.try_into().ok())
     }
 
     fn split_ranges(
@@ -327,7 +333,7 @@ impl TableFormat for ParquetFormat {
                             bufs.push((get_or_internal(src, s, e)?, s));
                         }
                         collect_codec_pages_selected(meta, dict, &bufs, &mut pages)?;
-                        push_codec_tasks(&pages, out);
+                        push_codec_tasks(&pages, out)?;
                     }
                     // This column could not be filtered (nested columns always land here).
                     None => {
@@ -634,10 +640,12 @@ impl TableFormat for ParquetFormat {
 }
 
 /// Converts a sequence of `CodecPage`s into `CodecTask`s and pushes them into `out`.
-fn push_codec_tasks(pages: &[CodecPage], out: &mut Vec<CodecTask>) {
+fn push_codec_tasks(pages: &[CodecPage], out: &mut Vec<CodecTask>) -> Result<()> {
+    ensure!(pages.len() <= MAX_PAGES_PER_COLUMN.saturating_sub(out.len()), LimitExceeded);
     for p in pages {
         out.push(CodecTask { codec: p.codec, offset: p.offset, len: p.len, out_len: p.out_len });
     }
+    Ok(())
 }
 
 /// Whether `[start, end)` overlaps any of `ranges` (ascending and merged).
@@ -1066,6 +1074,16 @@ mod tests {
         let mut f = ParquetFormat::new();
         let src = Source::remote(4);
         assert_eq!(crate::error::code_of(f.resolve(&src)), Some(crate::error::Code::BadMagic));
+    }
+
+    #[test]
+    fn negative_row_group_cardinality_is_rejected() {
+        let bytes = pagetest_bytes();
+        let mut f = ParquetFormat::new();
+        f.file = Some(crate::parquet::file::open_bytes(&bytes).unwrap());
+        f.file.as_mut().unwrap().meta.row_groups[0].num_rows = -1;
+        assert_eq!(crate::error::code_of(f.num_rows(0)), Some(crate::error::Code::BadThrift));
+        assert_eq!(f.split_rows(0), None);
     }
 
     #[test]

@@ -790,8 +790,13 @@ fn scan_number(b: &[u8], start: usize) -> Result<usize> {
         i += 1;
     }
     let d0 = i;
-    while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+    if b.get(i) == Some(&b'0') {
         i += 1;
+        ensure!(!matches!(b.get(i), Some(c) if c.is_ascii_digit()), SyntaxError, i);
+    } else {
+        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+            i += 1;
+        }
     }
     ensure!(i > d0, SyntaxError, start);
     if b.get(i) == Some(&b'.') {
@@ -822,13 +827,24 @@ fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
     let mut esc = false;
     loop {
         match byte_at(b, j)? {
-            b'"' => return Ok((&b[i + 1..j], esc, j + 1)),
-            b'\\' => {
-                // The next byte is always consumed, so `\"` is not mistaken for the terminator.
-                byte_at(b, j + 1)?;
-                esc = true;
-                j += 2;
+            b'"' => {
+                ensure!(core::str::from_utf8(&b[i + 1..j]).is_ok(), SyntaxError, i);
+                return Ok((&b[i + 1..j], esc, j + 1));
             }
+            b'\\' => {
+                // Validate escapes here because callers may only skip the string without
+                // decoding it. Otherwise invalid JSON such as `"\\q"` is accepted.
+                match byte_at(b, j + 1)? {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => j += 2,
+                    b'u' => {
+                        hex4(b, j + 2)?;
+                        j += 6;
+                    }
+                    _ => err!(SyntaxError, j + 1),
+                }
+                esc = true;
+            }
+            0x00..=0x1f => err!(SyntaxError, j),
             _ => j += 1,
         }
     }
@@ -1510,6 +1526,11 @@ mod tests {
         assert_eq!(resolve_err("[1,2,3] garbage"), Some(Code::SyntaxError));
         assert_eq!(resolve_err("{\"a\":1,}"), Some(Code::SyntaxError));
         assert_eq!(resolve_err("[{\"a\":1},]"), Some(Code::SyntaxError));
+        assert_eq!(resolve_err("{\"a\":\"x\ny\"}"), Some(Code::SyntaxError));
+        assert_eq!(resolve_err(r#"{"a":"\q"}"#), Some(Code::SyntaxError));
+        assert_eq!(resolve_err(r#"{"a":"\u12xz"}"#), Some(Code::SyntaxError));
+        assert_eq!(resolve_err("[01]"), Some(Code::SyntaxError));
+        assert_eq!(resolve_err("[-01]"), Some(Code::SyntaxError));
     }
 
     #[test]

@@ -182,6 +182,35 @@ fn integer_helpers() {
     assert_eq!(one(&mut sess, "lcm(0, 5)"), Value::I64(0));
     assert_eq!(one(&mut sess, "bit_count(7)"), Value::I64(3));
     assert_eq!(one(&mut sess, "xor(5, 3)"), Value::I64(6));
+    // The mathematical gcd of i64::MIN and zero is 2^63, which does not fit
+    // BIGINT. Do not silently clamp it to i64::MAX.
+    assert_eq!(one(&mut sess, "gcd(-9223372036854775808, 0)"), Value::Null);
+    // LCM can still resolve the same boundary input without taking abs(MIN):
+    // DuckDB short-circuits either zero factor to zero.
+    assert_eq!(one(&mut sess, "lcm(-9223372036854775808, 0)"), Value::I64(0));
+    assert_eq!(one(&mut sess, "lcm(0, -9223372036854775808)"), Value::I64(0));
+}
+
+#[test]
+fn integer_and_decimal_casts_enforce_logical_ranges() {
+    let mut sess = dual();
+    assert_eq!(one(&mut sess, "TRY_CAST('128' AS TINYINT)"), Value::Null);
+    assert_eq!(one(&mut sess, "TRY_CAST(-1 AS UTINYINT)"), Value::Null);
+    assert_eq!(one(&mut sess, "TRY_CAST(12345 AS DECIMAL(4, 0))"), Value::Null);
+    assert_eq!(one(&mut sess, "TRY_CAST(9999 AS DECIMAL(4, 0))"), Value::I64(9999));
+}
+
+#[test]
+fn boolean_text_cast_accepts_duckdb_yes_no_spellings() {
+    let mut sess = dual();
+    assert_eq!(one(&mut sess, "TRY_CAST('yes' AS BOOLEAN)"), Value::Bool(true));
+    assert_eq!(one(&mut sess, "TRY_CAST('y' AS BOOLEAN)"), Value::Bool(true));
+    assert_eq!(one(&mut sess, "TRY_CAST('no' AS BOOLEAN)"), Value::Bool(false));
+    assert_eq!(one(&mut sess, "TRY_CAST('n' AS BOOLEAN)"), Value::Bool(false));
+    // These are not DuckDB boolean spellings and remain NULL. The parser is
+    // intentionally exact rather than trimming arbitrary text.
+    assert_eq!(one(&mut sess, "TRY_CAST(' yes ' AS BOOLEAN)"), Value::Null);
+    assert_eq!(one(&mut sess, "TRY_CAST('on' AS BOOLEAN)"), Value::Null);
 }
 
 #[test]
@@ -235,6 +264,37 @@ fn make_date_and_make_timestamp_validate_their_components() {
 }
 
 #[test]
+fn date_arithmetic_rejects_duckdb_infinity_sentinels() {
+    let mut sess = dual();
+    // DuckDB reserves three i32 values for DATE special values. AhiruDB does
+    // not expose those literals, so arithmetic reaching any of them must be
+    // the existing per-row NULL for an out-of-range DATE, not a fake date.
+    assert_eq!(one(&mut sess, "CAST(DATE '1970-01-01' + 2147483647 AS VARCHAR)"), Value::Null);
+    assert_eq!(one(&mut sess, "CAST(DATE '1970-01-01' - 2147483647 AS VARCHAR)"), Value::Null);
+    assert_eq!(
+        one(&mut sess, "CAST(DATE '1970-01-01' + 2147483646 AS VARCHAR)"),
+        s("5881580-07-10")
+    );
+    assert_eq!(
+        one(&mut sess, "CAST(DATE '1970-01-01' - 2147483646 AS VARCHAR)"),
+        s("-5877641-06-25")
+    );
+    // The difference between the two finite endpoints is wider than I32;
+    // DATE - DATE is an INTEGER/BIGINT day count, not a wrapping I32 result.
+    assert_eq!(
+        one(&mut sess, "(DATE '1970-01-01' + 2147483646) - (DATE '1970-01-01' - 2147483646)"),
+        Value::I64(4_294_967_292)
+    );
+}
+
+#[test]
+fn time_endpoint_24_hours_round_trips_without_wrapping() {
+    let mut sess = dual();
+    // DuckDB preserves the valid TIME endpoint rather than formatting it as midnight.
+    assert_eq!(one(&mut sess, "CAST(CAST('24:00:00' AS TIME) AS VARCHAR)"), s("24:00:00"));
+}
+
+#[test]
 fn sub_second_parts_include_the_seconds_field() {
     let mut sess = dual();
     let ts = "TIMESTAMP '2021-08-03 11:59:44.123456'";
@@ -259,6 +319,25 @@ fn calendar_parts_isodow_century_and_decade() {
 }
 
 #[test]
+fn timestamp_text_cast_accepts_and_ignores_iso8601_zone_suffixes() {
+    let mut sess = dual();
+    // DuckDB's TIMESTAMP is without time zone: Z/offset suffixes are
+    // accepted, validated, and ignored rather than applied to the wall clock.
+    let plain = one(&mut sess, "CAST('2024-01-05 10:20:30' AS TIMESTAMP)");
+    assert_eq!(one(&mut sess, "CAST('2024-01-05 10:20:30Z' AS TIMESTAMP)"), plain);
+    assert_eq!(one(&mut sess, "CAST('2024-01-05 10:20:30+09:00' AS TIMESTAMP)"), plain);
+    assert_eq!(one(&mut sess, "CAST('2024-01-05 10:20:30+0900' AS TIMESTAMP)"), plain);
+    assert_eq!(one(&mut sess, "CAST('2024-01-05 10:20:30+99:99' AS TIMESTAMP)"), plain);
+    assert_eq!(one(&mut sess, "CAST('2024-01-05 10:20:30-03:30' AS TIMESTAMP)"), plain);
+    assert_eq!(
+        one(&mut sess, "TRY_CAST('2024-01-05 10:20:30+09:00junk' AS TIMESTAMP)"),
+        Value::Null
+    );
+    assert_eq!(one(&mut sess, "TRY_CAST('2024-01-05 10:20:30+9' AS TIMESTAMP)"), Value::Null);
+    assert_eq!(one(&mut sess, "TRY_CAST('2024-01-05 10:20:30z' AS TIMESTAMP)"), Value::Null);
+}
+
+#[test]
 fn epoch_variants_rescale_the_same_timestamp() {
     let mut sess = dual();
     let ts = "TIMESTAMP '1970-01-01 00:00:01.5'";
@@ -266,6 +345,18 @@ fn epoch_variants_rescale_the_same_timestamp() {
     assert_eq!(one(&mut sess, &format!("epoch_ms({ts})")), Value::I64(1_500));
     assert_eq!(one(&mut sess, &format!("epoch_us({ts})")), Value::I64(1_500_000));
     assert_eq!(one(&mut sess, &format!("epoch_ns({ts})")), Value::I64(1_500_000_000));
+}
+
+#[test]
+fn epoch_milliseconds_truncate_negative_subseconds_toward_zero() {
+    let mut sess = dual();
+    // DuckDB: epoch_ms(TIMESTAMP '1969-12-31 23:59:59.999999') = 0.
+    // Floor division would incorrectly return -1 here.
+    assert_eq!(one(&mut sess, "epoch_ms(TIMESTAMP '1969-12-31 23:59:59.999999')",), Value::I64(0));
+    assert_eq!(
+        one(&mut sess, "epoch_ms(TIMESTAMP '1969-12-31 23:59:58.999999')",),
+        Value::I64(-1000)
+    );
 }
 
 #[test]
@@ -299,6 +390,9 @@ fn list_membership_and_position() {
     assert_eq!(one(&mut sess, "list_position(['a', 'b'], 'b')"), Value::I64(2));
     // duckdb returns NULL, not 0, when the element is absent.
     assert_eq!(one(&mut sess, "list_position(['a', 'b'], 'z')"), Value::Null);
+    // Unlike list_contains, list_position treats a NULL needle as a
+    // searchable NULL list element.
+    assert_eq!(one(&mut sess, "list_position([1, 2, NULL], NULL)"), Value::I64(3));
     // A non-list argument is NULL rather than false.
     assert_eq!(one(&mut sess, "list_contains(CAST('5' AS JSON), 5)"), Value::Null);
 }
@@ -312,6 +406,8 @@ fn list_sort_distinct_and_reverse() {
     assert_eq!(one(&mut sess, "list_sort([10, 9])"), s("[9,10]"));
     // First-occurrence order is kept.
     assert_eq!(one(&mut sess, "list_distinct([1, 2, 1, 3])"), s("[1,2,3]"));
+    // SQL NULL elements are discarded, matching DuckDB.
+    assert_eq!(one(&mut sess, "list_distinct([1, NULL, 1, NULL])"), s("[1]"));
     assert_eq!(one(&mut sess, "list_reverse([1, 2, 3])"), s("[3,2,1]"));
     assert_eq!(one(&mut sess, "array_length(list_sort([3, 1, 2]))"), Value::I64(3));
 }

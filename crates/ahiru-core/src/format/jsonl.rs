@@ -143,6 +143,12 @@ impl TableFormat for JsonlFormat {
         // Not one line fit within the sample = one record exceeds 256 KiB.
         ensure!(!(truncated && lines == 0), LimitExceeded);
 
+        // Split indexes are `usize` throughout the execution layer. Do not
+        // silently truncate a huge remote file's u64 split count on 32-bit
+        // WASM (or for a deliberately tiny test split size).
+        let split_count = self.total_len.div_ceil(self.split_bytes.max(1));
+        ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
+
         // A JSON value can be missing at any time, so every column is nullable.
         self.schema =
             names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect();
@@ -1109,16 +1115,16 @@ mod tests {
 
     #[test]
     fn split_boundary_values_are_not_duplicated_or_dropped() {
-        // Lines are fixed at 11 bytes (`{"a":0000}\n`), and split sizes are tried both as multiples
+        // Lines are fixed at 11 bytes (`{"a":1000}\n`), and split sizes are tried both as multiples
         // of the line length (boundaries landing exactly at a line start = the case most prone to
         // dropping rows) and as non-multiples.
         let mut text = String::new();
-        for i in 0..500 {
-            text.push_str(&format!("{{\"a\":{i:04}}}\n"));
+        for i in 1000..1500 {
+            text.push_str(&format!("{{\"a\":{i}}}\n"));
         }
         let bytes = text.into_bytes();
         assert_eq!(bytes.len(), 500 * 11);
-        let expect: Vec<Value> = (0..500).map(Value::I64).collect();
+        let expect: Vec<Value> = (1000..1500).map(Value::I64).collect();
         for &sb in &[5u64, 10, 11, 12, 22, 23, 110, 121] {
             let cols = read_cols(&bytes, sb, None);
             assert_eq!(cols[0], expect, "a boundary row is off at split_bytes={sb}");
@@ -1175,11 +1181,12 @@ mod tests {
         assert_eq!(read_err("{\"a\":1.}\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("{\"a\":-}\n"), Some(Code::SyntaxError));
         assert_eq!(read_err("{\"a\":tru}\n"), Some(Code::SyntaxError));
+        assert_eq!(read_err("{\"a\":01}\n"), Some(Code::SyntaxError));
         // Unbalanced brackets.
         assert_eq!(read_err("{\"a\":[1,2}}\n"), Some(Code::SyntaxError));
         // \u's digits are not hex, or are too few.
         assert_eq!(read_err("{\"a\":\"\\u12zz\"}\n"), Some(Code::SyntaxError));
-        assert_eq!(read_err("{\"a\":\"\\u12\"}\n"), Some(Code::UnexpectedEof));
+        assert_eq!(read_err("{\"a\":\"\\u12\"}\n"), Some(Code::SyntaxError));
         // An unknown escape.
         assert_eq!(read_err("{\"a\":\"\\x\"}\n"), Some(Code::SyntaxError));
     }
@@ -1255,6 +1262,18 @@ mod tests {
             Err((off, len)) => assert_eq!((off, len), (0, 100)),
             Ok(()) => panic!("it cannot possibly resolve with no bytes"),
         }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn resolve_rejects_a_split_count_that_does_not_fit_usize() {
+        let mut f = JsonlFormat::new();
+        f.set_split_bytes(1);
+        let mut src = Source::remote(u64::MAX);
+        let mut sample = vec![0u8; SAMPLE_BYTES as usize];
+        sample[..8].copy_from_slice(b"{\"a\":1}\n");
+        src.insert(0, sample);
+        assert_eq!(code_of(f.resolve(&src)), Some(Code::LimitExceeded));
     }
 
     #[test]

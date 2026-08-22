@@ -239,7 +239,11 @@ pub trait TableFormat {
 ///
 /// A small helper shared by every format's `read_split`/`codec_tasks`.
 pub(crate) fn get_or_internal(src: &Source, start: u64, end: u64) -> Result<&[u8]> {
-    match src.get(start, (end - start) as usize) {
+    let len = match end.checked_sub(start).and_then(|n| usize::try_from(n).ok()) {
+        Some(len) => len,
+        None => err!(Internal),
+    };
+    match src.get(start, len) {
         Some(b) => Ok(b),
         None => err!(Internal),
     }
@@ -428,6 +432,12 @@ mod tests {
         assert!(range_may_match(&p, &Value::I64(0), &Value::I64(100)));
         // No candidate falls within [1000,2000], so it can be skipped.
         assert!(!range_may_match(&p, &Value::I64(1000), &Value::I64(2000)));
+    }
+
+    #[test]
+    fn invalid_source_range_returns_internal_without_panicking() {
+        let src = crate::catalog::Source::from_bytes(vec![1, 2, 3]);
+        assert_eq!(crate::error::code_of(get_or_internal(&src, 2, 1)), Some(Code::Internal));
     }
 
     #[test]

@@ -156,6 +156,52 @@ fn nested_query_forms_reach_the_subquery() {
     );
 }
 
+/// Each nested query block binds its own WITH list. The local CTE shadows an
+/// outer CTE with the same name, while a different local CTE can still refer
+/// to an outer definition, matching DuckDB's nested CTE scope rules.
+#[test]
+fn nested_query_blocks_bind_and_shadow_ctes() {
+    let mut db = session();
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT * FROM (WITH inner_cte AS (SELECT c FROM u) SELECT * FROM inner_cte) d",
+        ),
+        vec![vec![i64(9)]]
+    );
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT (WITH inner_cte AS (SELECT c FROM u) SELECT max(c) FROM inner_cte) FROM t",
+        ),
+        vec![vec![i64(9)]]
+    );
+    assert_eq!(
+        run(
+            &mut db,
+            "WITH outer_cte AS (SELECT c FROM u) SELECT * FROM \
+             (WITH inner_cte AS (SELECT * FROM outer_cte) SELECT * FROM inner_cte) d",
+        ),
+        vec![vec![i64(9)]]
+    );
+    assert_eq!(
+        run(
+            &mut db,
+            "WITH same_name AS (SELECT c FROM u) SELECT * FROM \
+             (WITH same_name AS (SELECT a FROM t) SELECT * FROM same_name) d",
+        ),
+        vec![vec![i64(1)]]
+    );
+    assert_eq!(
+        ahiru_core::error::code_of(db.prepare(
+            "SELECT * FROM (WITH local_cte AS (SELECT a FROM t), \
+             LOCAL_CTE AS (SELECT a FROM t) SELECT * FROM local_cte) d",
+            &[],
+        )),
+        Some(ahiru_core::error::Code::UnsupportedFeature)
+    );
+}
+
 /// A table named *only* inside a subquery still has to be reported as
 /// missing with `TableNotFound`, not silently ignored.
 #[test]

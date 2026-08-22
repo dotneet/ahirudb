@@ -71,17 +71,37 @@ pub(crate) fn bind_query_at(
         ctes.now_micros = now_micros;
     }
     let _ = now_micros;
-    for c in &q.ctes {
-        // A CTE may reference CTEs too (only ones defined earlier). CTE definitions are
-        // always uncorrelated (they have no outer scope).
-        bind_one_cte(catalog, arena, c, params, &mut ctes)?;
-    }
     bind_query_in(catalog, arena, q, params, &mut ctes, None)
 }
 
 /// `outer_scope` is used only when binding a correlated subquery. Top-level queries, CTEs,
 /// and FROM-clause derived tables always pass `None` (the backward-compatible default).
 fn bind_query_in(
+    catalog: &Catalog,
+    arena: &ExprArena,
+    q: &QueryStmt,
+    params: &[Value],
+    ctes: &mut CteScope,
+    outer_scope: Option<&Scope>,
+) -> Result<Plan> {
+    // Every query block owns its WITH clause. Keep the entries only while this
+    // block is being bound so nested derived/scalar subqueries can see outer CTEs
+    // while their own definitions shadow them. `bind_query_at` used to process
+    // only the top-level list, leaving nested WITH clauses invisible.
+    let cte_start = ctes.len();
+    for c in &q.ctes {
+        // A CTE may reference CTEs defined earlier in the same query block. CTE
+        // definitions are always uncorrelated (they have no outer scope).
+        bind_one_cte(catalog, arena, c, params, ctes, cte_start)?;
+    }
+    let result = bind_query_body(catalog, arena, q, params, ctes, outer_scope);
+    ctes.truncate(cte_start);
+    result
+}
+
+/// Binds the body and trailing clauses after `bind_query_in` has installed the
+/// query block's local CTE definitions.
+fn bind_query_body(
     catalog: &Catalog,
     arena: &ExprArena,
     q: &QueryStmt,
@@ -133,7 +153,23 @@ fn bind_query_in(
                 }
                 None => match arena.get(o.expr) {
                     Expr::ColumnRef { qualifier, name } => {
-                        scope.resolve(qualifier.as_deref(), name)?
+                        match scope.resolve(qualifier.as_deref(), name) {
+                            Ok(col) => col,
+                            Err(e) if e.code == crate::error::Code::ColumnNotFound => {
+                                // DuckDB also accepts an alias introduced by a
+                                // non-first branch of a set operation. The
+                                // output schema keeps the first branch's names,
+                                // so recover the corresponding ordinal from
+                                // the set-expression tree when the normal
+                                // output-scope lookup misses it.
+                                ensure!(qualifier.is_none(), ColumnNotFound);
+                                match set_output_alias(arena, &q.body, name) {
+                                    Some(col) if col < scope.len() => col,
+                                    _ => err!(ColumnNotFound),
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     _ => err!(UnsupportedFeature),
                 },
@@ -153,6 +189,30 @@ fn bind_query_in(
         node = Node::Limit { input: Box::new(node), limit: q.limit, offset: q.offset.unwrap_or(0) };
     }
     Ok(Plan { root: node, correlated })
+}
+
+/// Finds an explicit output alias in any leaf of a set-operation tree. Set
+/// operation result names normally come from the first SELECT, but DuckDB lets
+/// the trailing ORDER BY refer to an alias from another branch too. Star
+/// expansion makes an AST item index insufficient, so only alias-only branches
+/// are used here; ordinary output-scope resolution still handles their names.
+fn set_output_alias(arena: &ExprArena, e: &SetExpr, name: &str) -> Option<usize> {
+    match e {
+        SetExpr::Select(s) => {
+            if s.items.iter().any(|item| matches!(arena.get(item.expr), Expr::Star { .. })) {
+                return None;
+            }
+            s.items.iter().enumerate().find_map(|(i, item)| {
+                item.alias
+                    .as_deref()
+                    .filter(|alias| eq_ascii_ci(alias.as_bytes(), name.as_bytes()))
+                    .map(|_| i)
+            })
+        }
+        SetExpr::SetOp { left, right, .. } => {
+            set_output_alias(arena, left, name).or_else(|| set_output_alias(arena, right, name))
+        }
+    }
 }
 
 /// The returned `Vec<ExprId>` is the correlation keys `bind_select_in` detected (the same

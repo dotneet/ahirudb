@@ -210,8 +210,11 @@ pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Resul
         F_LIST_REVERSE => order.reverse(),
         F_LIST_SORT => order.sort_by(|&x, &y| cmp_elem(elems[x], elems[y])),
         // Keeps first-occurrence order (duckdb's `list_distinct` does not promise an order, and
-        // this way the function needs no comparator).
-        _ => order.retain(|&k| !elems[..k].iter().any(|e| e.0 == elems[k].0)),
+        // this way the function needs no comparator). SQL NULL list elements are not retained,
+        // matching DuckDB's `list_distinct([NULL, 1, NULL]) = [1]`.
+        _ => order.retain(|&k| {
+            elems[k].1 != crate::json::Kind::Null && !elems[..k].iter().any(|e| e.0 == elems[k].0)
+        }),
     }
     out.push(b'[');
     for (i, &k) in order.iter().enumerate() {

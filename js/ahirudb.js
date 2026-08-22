@@ -44,6 +44,9 @@ const IO_REQUEST_SIZE = 24;
 /** One element of `encode_codec`: table:u32 + part:u32 + codec:u32 + offset:u64 + len:u32 + out_len:u32. */
 const CODEC_REQUEST_SIZE = 28;
 
+/** Maximum decompressed bytes accepted for one Parquet page (mirrors codec.rs). */
+const MAX_DECOMPRESSED_PAGE_BYTES = 256 * 1024 * 1024;
+
 /** Parquet's Compression enum (parquet/mod.rs). Only the ones not built in are named. */
 const CODEC_NAMES = {
   0: 'UNCOMPRESSED',
@@ -81,21 +84,79 @@ const TY_UUID = 21;
 
 /** Adjacency threshold. Gaps narrower than this are coalesced, on the grounds that reading them is cheaper. */
 const COALESCE_GAP = 1024 * 1024;
+const DEFAULT_CACHE_SIZE = 64 * 1024 * 1024;
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder('utf-8');
+const textDecoder = new TextDecoder('utf-8', { fatal: true });
+
+/**
+ * Validate byte limits before they reach arithmetic or eviction comparisons.
+ * Number.isSafeInteger is intentional: these values are used as exact byte
+ * counts, so accepting NaN, fractions, or values above MAX_SAFE_INTEGER would
+ * make the limit either ineffective or ambiguous.
+ */
+function requireNonNegativeSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `${label} must be a non-negative safe integer`,
+    });
+  }
+  return value;
+}
+
+function requireSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value)) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `${label} must be a safe integer`,
+    });
+  }
+  return value;
+}
+
+/** Normalize the numeric form accepted by BigInt while rejecting lossy numbers. */
+function toExactIntegerBigInt(value, label) {
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `${label} must be a safe integer when passed as a number`,
+    });
+  }
+  try {
+    return BigInt(value);
+  } catch {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, { detail: `${label} must be an integer` });
+  }
+}
+
+const MAX_DATE_MILLIS = 8_640_000_000_000_000n;
+
+function dateFromMillis(millis, label) {
+  if (millis < -MAX_DATE_MILLIS || millis > MAX_DATE_MILLIS) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, { detail: `${label} is outside Date's range` });
+  }
+  return new Date(Number(millis));
+}
+
+/** Decode ABI text strictly; replacement characters would hide a corrupt wire buffer. */
+function decodeUtf8(bytes, what) {
+  try {
+    return textDecoder.decode(bytes);
+  } catch {
+    wireError(`invalid UTF-8 ${what}`);
+  }
+}
 
 // --- Time helpers ------------------------------------------------------------
 
 /** Turns a TIMESTAMP (microseconds since the epoch, BigInt) into a `Date`. */
 export function timestampToDate(micros) {
   // Date has millisecond precision, so the sub-millisecond remainder is dropped here.
-  return new Date(Number(BigInt(micros) / 1000n));
+  return dateFromMillis(toExactIntegerBigInt(micros, 'timestamp microseconds') / 1000n, 'timestamp');
 }
 
 /** Turns a DATE (days since the epoch, number) into a UTC `Date`. */
 export function dateToDate(days) {
-  return new Date(Number(days) * 86400000);
+  const exactDays = requireSafeInteger(days, 'date days');
+  return dateFromMillis(BigInt(exactDays) * 86400000n, 'date');
 }
 
 /**
@@ -116,7 +177,7 @@ export const timestamptzToDate = timestampToDate;
  * The three therefore cannot be returned as a single number.
  */
 export function unpackInterval(packed) {
-  const v = BigInt(packed);
+  const v = toExactIntegerBigInt(packed, 'packed interval');
   return {
     months: Number(BigInt.asIntN(32, v >> 96n)),
     days: Number(BigInt.asIntN(32, (v >> 64n) & 0xffffffffn)),
@@ -146,9 +207,26 @@ function formatUuid(bytes) {
 export class MemoryCache {
   #map = new Map();
   #bytes = 0;
+  #maxBytes;
 
-  constructor(maxBytes = 64 * 1024 * 1024) {
+  constructor(maxBytes = DEFAULT_CACHE_SIZE) {
     this.maxBytes = maxBytes;
+  }
+
+  get maxBytes() {
+    return this.#maxBytes;
+  }
+
+  set maxBytes(value) {
+    this.#maxBytes = requireNonNegativeSafeInteger(value, 'MemoryCache maxBytes');
+    // A public limit change takes effect immediately. Without this eviction,
+    // lowering the limit leaves the cache over budget until some later write
+    // happens (and forever for a read-only workload).
+    for (const k of this.#map.keys()) {
+      if (this.#bytes <= this.#maxBytes) break;
+      this.#bytes -= this.#map.get(k).byteLength;
+      this.#map.delete(k);
+    }
   }
 
   get size() {
@@ -209,7 +287,7 @@ function makeCache(spec, maxBytes) {
 // --- Format detection --------------------------------------------------------
 
 /** The format argument of `ahiru_register_as`. 1:1 with `format_kind` in abi.rs. */
-const FORMAT_CODES = { auto: 0, parquet: 1, csv: 2, tsv: 3, jsonl: 4 };
+const FORMAT_CODES = { auto: 0, parquet: 1, csv: 2, tsv: 3, jsonl: 4, json: 5 };
 
 /** File-table functions whose first argument is a path registered by the host. */
 const FILE_FUNCTION_NAMES = new Set([
@@ -332,9 +410,9 @@ let sourceSeq = 0;
  * `size()` and `read()` are separate so that registration performs no I/O.
  * The total byte length is needed by `ahiru_register`, so it is deferred to the first query.
  */
-function makeSource(spec, fetchImpl) {
+function makeSource(spec, fetchImpl, options = {}) {
   if (typeof spec === 'string' || spec instanceof URL) {
-    return urlSource(String(spec), fetchImpl);
+    return urlSource(String(spec), fetchImpl, options);
   }
   if (spec instanceof ArrayBuffer) return bytesSource(new Uint8Array(spec));
   if (ArrayBuffer.isView(spec)) {
@@ -350,7 +428,7 @@ function makeSource(spec, fetchImpl) {
     const size = typeof spec.size === 'function' ? () => spec.size() : () => spec.size;
     return {
       key,
-      size: async () => Number(await size()),
+      size: async () => toSafeSize(await size(), 'ByteSource size'),
       read: (o, l) => spec.read(o, l),
       // The caller's `read()` may return a view onto memory it still owns (e.g.
       // `buf.subarray(...)`), unlike the bytes this host produces itself from
@@ -377,7 +455,7 @@ function blobSource(blob) {
   const key = `blob:${++sourceSeq}`;
   return {
     key,
-    size: async () => blob.size,
+    size: async () => toSafeSize(blob.size, 'Blob size'),
     read: async (offset, len) =>
       new Uint8Array(await blob.slice(offset, offset + len).arrayBuffer()),
     cacheable: false,
@@ -404,6 +482,36 @@ function redactUrl(url) {
   }
 }
 
+function isHttpUrl(value) {
+  try {
+    const protocol = new URL(String(value)).protocol.toLowerCase();
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Validates a source length before it becomes a BigInt or a range clamp. */
+function toSafeSize(value, what) {
+  if (typeof value === 'string' && !/^\s*\d+\s*$/.test(value)) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `${what} ${value} is not a non-negative integer`,
+    });
+  }
+  let n;
+  try {
+    n = Number(value);
+  } catch {
+    n = NaN;
+  }
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `${what} ${String(value)} is not a non-negative safe integer`,
+    });
+  }
+  return n;
+}
+
 /** Network-layer failures are normalized to E504 too (so callers only need to look at code). */
 async function request(doFetch, url, init) {
   try {
@@ -413,7 +521,19 @@ async function request(doFetch, url, init) {
   }
 }
 
-function urlSource(url, fetchImpl) {
+/** Normalize failures while consuming a successful response body as well as fetch failures. */
+async function responseBytes(response, url) {
+  try {
+    return new Uint8Array(await response.arrayBuffer());
+  } catch (cause) {
+    throw new AhiruError(Code.IO_FAILED, {
+      detail: `read ${redactUrl(url)} response failed`,
+      cause,
+    });
+  }
+}
+
+function urlSource(url, fetchImpl, { rejectRedirects = false } = {}) {
   const doFetch = fetchImpl ?? globalThis.fetch;
   if (typeof doFetch !== 'function') {
     throw new TypeError('no fetch available. Pass an implementation via init({ fetch })');
@@ -422,34 +542,45 @@ function urlSource(url, fetchImpl) {
     key: `url:${url}`,
     async size() {
       // HEAD first. Some servers do not support it, so fall back to Content-Range.
+      let head = null;
       try {
-        const r = await doFetch(url, { method: 'HEAD' });
-        const len = r.headers?.get('content-length');
-        if (r.ok && len) return Number(len);
+        head = await doFetch(url, {
+          method: 'HEAD',
+          ...(rejectRedirects ? { redirect: 'error' } : {}),
+        });
       } catch {
         /* HEAD unavailable. The range request below yields the total length. */
       }
-      const r = await request(doFetch, url, { headers: { Range: 'bytes=0-0' } });
+      const headLen = head?.headers?.get('content-length');
+      // Keep validation outside the network-error catch. A malformed successful
+      // HEAD response is a server protocol error, not a reason to silently try a
+      // second request and potentially hide VALUE_OUT_OF_RANGE.
+      if (head?.ok && headLen) return toSafeSize(headLen, 'HTTP Content-Length');
+      const r = await request(doFetch, url, {
+        headers: { Range: 'bytes=0-0' },
+        ...(rejectRedirects ? { redirect: 'error' } : {}),
+      });
       if (!r.ok) {
         throw new AhiruError(Code.IO_FAILED, { detail: `${redactUrl(url)} -> HTTP ${r.status}` });
       }
       const cr = r.headers?.get('content-range');
       const m = cr && /\/(\d+)\s*$/.exec(cr);
-      if (m) return Number(m[1]);
+      if (m) return toSafeSize(m[1], 'HTTP Content-Range length');
       if (r.status === 200) {
         const len = r.headers?.get('content-length');
-        if (len) return Number(len);
+        if (len) return toSafeSize(len, 'HTTP Content-Length');
       }
       throw new AhiruError(Code.IO_FAILED, { detail: `cannot determine size of ${redactUrl(url)}` });
     },
     async read(offset, len) {
       const r = await request(doFetch, url, {
         headers: { Range: `bytes=${offset}-${offset + len - 1}` },
+        ...(rejectRedirects ? { redirect: 'error' } : {}),
       });
       if (!r.ok) {
         throw new AhiruError(Code.IO_FAILED, { detail: `${redactUrl(url)} -> HTTP ${r.status}` });
       }
-      const buf = new Uint8Array(await r.arrayBuffer());
+      const buf = await responseBytes(r, url);
       if (r.status === 206) {
         // A conforming server's Content-Range says exactly which bytes these are.
         // Trust that over just the body length -- otherwise a server that ignores
@@ -512,14 +643,26 @@ function urlSource(url, fetchImpl) {
  * defeat that intent by issuing them one at a time (DESIGN.md §6).
  */
 export function coalesceRanges(ranges, gap = COALESCE_GAP, totalLen = Infinity) {
+  requireNonNegativeSafeInteger(gap, 'coalescing gap');
   const sorted = ranges
-    .map((r) => ({ offset: Number(r.offset), len: Number(r.len) }))
+    .map((r) => {
+      const normalized = { offset: Number(r.offset), len: Number(r.len) };
+      ensureSafeRange(normalized.offset, normalized.len, 'I/O range');
+      return normalized;
+    })
     .filter((r) => r.len > 0)
     .sort((a, b) => a.offset - b.offset);
+  if (totalLen !== Infinity && (!Number.isSafeInteger(totalLen) || totalLen < 0)) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `file length ${totalLen} is not a non-negative safe integer`,
+    });
+  }
   const out = [];
   for (const r of sorted) {
     const prev = out[out.length - 1];
-    if (prev !== undefined && r.offset <= prev.offset + prev.len + gap) {
+    // Compare the gap by subtraction so adding the coalescing threshold cannot
+    // overflow the safe-integer range near a 2^53-sized file.
+    if (prev !== undefined && r.offset - (prev.offset + prev.len) <= gap) {
       const end = Math.max(prev.offset + prev.len, r.offset + r.len);
       prev.len = end - prev.offset;
       continue;
@@ -553,6 +696,25 @@ function toSafeNumber(big, what) {
 }
 
 /**
+ * JavaScript numbers can represent each u64 field safely while still losing
+ * precision when `offset + len` crosses 2^53. Reject that combination before
+ * it reaches a Range header or a custom ByteSource.
+ */
+function ensureSafeRange(offset, len, what) {
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(len) ||
+    offset < 0 ||
+    len < 0 ||
+    offset > Number.MAX_SAFE_INTEGER - len
+  ) {
+    throw new AhiruError(Code.VALUE_OUT_OF_RANGE, {
+      detail: `${what} [${offset}, ${offset} + ${len}) exceeds the safe numeric range`,
+    });
+  }
+}
+
+/**
  * `encode_io`: [count:u32][{table:u32, part:u32, offset:u64, len:u64}...]
  *
  * `part` says which file of a multi-file table (`ahiru_register_multi`) is meant.
@@ -561,16 +723,25 @@ function toSafeNumber(big, what) {
  * cannot uniquely identify the file the byte offsets are relative to.
  */
 export function decodeIoRequests(u8) {
+  if (u8.byteLength < 4) {
+    throw new AhiruError(Code.INTERNAL, { detail: 'malformed I/O request buffer' });
+  }
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const n = dv.getUint32(0, true);
+  if (n > Math.floor((u8.byteLength - 4) / IO_REQUEST_SIZE)) {
+    throw new AhiruError(Code.INTERNAL, { detail: 'truncated I/O request buffer' });
+  }
   const out = [];
   for (let i = 0; i < n; i++) {
     const p = 4 + i * IO_REQUEST_SIZE;
+    const offset = toSafeNumber(dv.getBigUint64(p + 8, true), 'I/O request offset');
+    const len = toSafeNumber(dv.getBigUint64(p + 16, true), 'I/O request length');
+    ensureSafeRange(offset, len, 'I/O request');
     out.push({
       table: dv.getUint32(p, true),
       part: dv.getUint32(p + 4, true),
-      offset: toSafeNumber(dv.getBigUint64(p + 8, true), 'I/O request offset'),
-      len: toSafeNumber(dv.getBigUint64(p + 16, true), 'I/O request length'),
+      offset,
+      len,
     });
   }
   return out;
@@ -581,38 +752,126 @@ export function decodeIoRequests(u8) {
  * `part` means the same thing as in `decodeIoRequests`.
  */
 export function decodeCodecRequests(u8) {
+  if (u8.byteLength < 4) {
+    throw new AhiruError(Code.INTERNAL, { detail: 'malformed codec request buffer' });
+  }
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const n = dv.getUint32(0, true);
+  if (n > Math.floor((u8.byteLength - 4) / CODEC_REQUEST_SIZE)) {
+    throw new AhiruError(Code.INTERNAL, { detail: 'truncated codec request buffer' });
+  }
   const out = [];
   for (let i = 0; i < n; i++) {
     const p = 4 + i * CODEC_REQUEST_SIZE;
+    const offset = toSafeNumber(dv.getBigUint64(p + 12, true), 'codec request offset');
+    const len = dv.getUint32(p + 20, true);
+    ensureSafeRange(offset, len, 'codec request');
+    const outLen = dv.getUint32(p + 24, true);
+    if (outLen > MAX_DECOMPRESSED_PAGE_BYTES) {
+      throw new AhiruError(Code.LIMIT_EXCEEDED, {
+        detail: `codec output exceeds the per-page limit (${outLen} > ${MAX_DECOMPRESSED_PAGE_BYTES})`,
+      });
+    }
     out.push({
       table: dv.getUint32(p, true),
       part: dv.getUint32(p + 4, true),
       codec: dv.getUint32(p + 8, true),
-      offset: toSafeNumber(dv.getBigUint64(p + 12, true), 'codec request offset'),
-      len: dv.getUint32(p + 20, true),
-      outLen: dv.getUint32(p + 24, true),
+      offset,
+      len,
+      outLen,
     });
   }
   return out;
 }
 
 /** `encode_schema`: [n:u32][{ty:u32, phys:u32, precision:u32, scale:u32, name_len:u32, name}...] */
+function wireError(detail) {
+  throw new AhiruError(Code.INTERNAL, { detail });
+}
+
+/** Returns the end offset after checking a variable-length wire field. */
+function wireEnd(u8, offset, length, what) {
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(length) ||
+    offset < 0 ||
+    length < 0 ||
+    offset > u8.byteLength - length
+  ) {
+    wireError(`truncated ${what}`);
+  }
+  return offset + length;
+}
+
+function wireU32(dv, u8, offset, what) {
+  wireEnd(u8, offset, 4, what);
+  return dv.getUint32(offset, true);
+}
+
+/** Physical representation required by one logical type-code/schema tuple. */
+function expectedPhysType(ty, precision) {
+  switch (ty) {
+    case 1:
+      return PHYS_BOOL;
+    case 0:
+    case 2:
+    case 3:
+    case 4:
+    case 7:
+    case 8:
+    case 16:
+      return PHYS_I32;
+    case 5:
+    case 9:
+    case 17:
+    case 18:
+    case 22:
+      return PHYS_I64;
+    case 6:
+    case 10:
+    case 19:
+      return PHYS_I128;
+    case 11:
+    case 12:
+      return PHYS_F64;
+    case TY_DECIMAL:
+      return precision <= 18 ? PHYS_I64 : PHYS_I128;
+    case TY_VARCHAR:
+    case 15:
+    case TY_JSON:
+    case TY_UUID:
+      return PHYS_BYTES;
+    default:
+      return -1;
+  }
+}
+
 export function decodeSchema(u8) {
+  if (u8.byteLength < 4) wireError('malformed schema buffer');
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-  const n = dv.getUint32(0, true);
+  const n = wireU32(dv, u8, 0, 'schema header');
+  // Every field has at least the five u32 words below. This guard also keeps a
+  // corrupt count from causing a huge allocation before the first bounds check.
+  if (n > Math.floor((u8.byteLength - 4) / 20)) wireError('truncated schema fields');
   const fields = [];
   let p = 4;
   for (let i = 0; i < n; i++) {
+    wireEnd(u8, p, 20, 'schema field');
     const ty = dv.getUint32(p, true);
     const phys = dv.getUint32(p + 4, true);
     const precision = dv.getUint32(p + 8, true);
     const scale = dv.getUint32(p + 12, true);
     const nameLen = dv.getUint32(p + 16, true);
     p += 20;
-    const name = textDecoder.decode(u8.subarray(p, p + nameLen));
-    p += nameLen;
+    const nameEnd = wireEnd(u8, p, nameLen, 'schema field name');
+    if (ty === TY_DECIMAL && (precision < 1 || precision > 38 || scale > precision)) {
+      wireError('invalid DECIMAL schema precision/scale');
+    }
+    if (phys !== expectedPhysType(ty, precision)) {
+      wireError('logical/physical schema type mismatch');
+    }
+    const name = decodeUtf8(u8.subarray(p, nameEnd), 'schema field name');
+    p = nameEnd;
     fields.push({
       name,
       type: TYPE_NAMES[ty] ?? `TYPE_${ty}`,
@@ -742,56 +1001,100 @@ function readI128(dv, off) {
  * Use it only when they can be fully read before the next wasm call (policy (b)(c) at the top).
  */
 export function decodeBatch(u8, schema, copy = true) {
+  if (u8.byteLength < 12) wireError('malformed result buffer');
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-  const magic = dv.getUint32(0, true);
+  const magic = wireU32(dv, u8, 0, 'result header');
   if (magic !== RESULT_MAGIC) {
     throw new AhiruError(Code.INTERNAL, {
       detail: `result magic mismatch: 0x${magic.toString(16)}`,
     });
   }
-  const numCols = dv.getUint32(4, true);
-  const numRows = dv.getUint32(8, true);
+  const numCols = wireU32(dv, u8, 4, 'result header');
+  const numRows = wireU32(dv, u8, 8, 'result header');
+  if (!Array.isArray(schema) || schema.length !== numCols) {
+    wireError('result column count does not match schema');
+  }
+  // A column always has phys:u32, validity_len:u32, and data_len:u32, even
+  // when it contains zero rows. Reject an impossible count before looping.
+  if (numCols > Math.floor((u8.byteLength - 12) / 12)) {
+    wireError('truncated result columns');
+  }
   let p = 12;
   const columns = [];
 
   for (let c = 0; c < numCols; c++) {
+    wireEnd(u8, p, 8, 'result column header');
     const phys = dv.getUint32(p, true);
     const validityLen = dv.getUint32(p + 4, true);
     p += 8;
     let valid = null;
     if (validityLen > 0) {
+      const minValidityLen = Math.ceil(numRows / 8);
+      if (validityLen < minValidityLen) wireError('short result validity bitmap');
       const bits = u8.subarray(p, p + validityLen);
+      p = wireEnd(u8, p, validityLen, 'result validity bitmap');
       // Bitmaps are always copied. Expanding to one byte per row is easier for
       // callers to handle, and it stays small (rows/8 -> rows).
       valid = new Uint8Array(numRows);
       for (let i = 0; i < numRows; i++) valid[i] = bitAt(bits, i);
-      p += validityLen;
     }
 
     const field = schema?.[c];
     const ty = field?.typeCode ?? -1;
+    const precision = field?.precision ?? 0;
+    const scale = field?.scale ?? 0;
+    if (
+      (ty === TY_DECIMAL &&
+        (!Number.isInteger(precision) ||
+          !Number.isInteger(scale) ||
+          precision < 1 ||
+          precision > 38 ||
+          scale < 0 ||
+          scale > precision)) ||
+      phys !== field?.physType ||
+      phys !== expectedPhysType(ty, precision)
+    ) {
+      wireError('result physical type does not match schema');
+    }
     let values;
 
     if (phys === PHYS_BYTES) {
-      const offsetsLen = dv.getUint32(p, true);
+      const offsetsLen = wireU32(dv, u8, p, 'result byte offsets length');
       p += 4;
-      const offsets = viewOrCopy(Uint32Array, u8, p, offsetsLen / 4, false);
-      p += offsetsLen;
-      const dataLen = dv.getUint32(p, true);
+      const expectedOffsetsLen = (numRows + 1) * Uint32Array.BYTES_PER_ELEMENT;
+      if (offsetsLen !== expectedOffsetsLen) wireError('invalid result byte offsets length');
+      const offsetsEnd = wireEnd(u8, p, offsetsLen, 'result byte offsets');
+      const offsets = viewOrCopy(Uint32Array, u8, p, numRows + 1, false);
+      p = offsetsEnd;
+      const dataLen = wireU32(dv, u8, p, 'result byte data length');
       p += 4;
-      const data = u8.subarray(p, p + dataLen);
-      p += dataLen;
+      const dataEnd = wireEnd(u8, p, dataLen, 'result byte data');
+      const data = u8.subarray(p, dataEnd);
+      p = dataEnd;
+      for (let i = 0; i <= numRows; i++) {
+        if (offsets[i] > dataLen || (i > 0 && offsets[i] < offsets[i - 1])) {
+          wireError('invalid result byte offsets');
+        }
+      }
       values = new Array(numRows);
       for (let i = 0; i < numRows; i++) {
         const s = offsets[i];
         const e = offsets[i + 1];
+        if (valid !== null && valid[i] === 0) {
+          // NULL values use an empty placeholder in the core. In particular,
+          // do not pass a zero-length placeholder to UUID formatting, which
+          // requires exactly 16 bytes and would otherwise throw TypeError.
+          values[i] = ty === TY_VARCHAR || ty === TY_JSON || ty === TY_UUID ? '' : data.slice(s, e);
+          continue;
+        }
         // VARCHAR / JSON are UTF-8 strings (JSON's physical representation is the
         // raw text before decoding, so it can be handed over as a string as is --
         // whether to `JSON.parse` is left to the caller); UUID is a hyphenated hex
         // string; everything else (BLOB) is returned as raw bytes.
         if (ty === TY_VARCHAR || ty === TY_JSON) {
-          values[i] = textDecoder.decode(data.subarray(s, e));
+          values[i] = decodeUtf8(data.subarray(s, e), 'result text value');
         } else if (ty === TY_UUID) {
+          if (e - s !== 16) wireError('invalid UUID result width');
           values[i] = formatUuid(data.subarray(s, e));
         } else {
           values[i] = data.slice(s, e);
@@ -801,30 +1104,43 @@ export function decodeBatch(u8, schema, copy = true) {
       continue;
     }
 
-    const dataLen = dv.getUint32(p, true);
+    const dataLen = wireU32(dv, u8, p, 'result column data length');
     p += 4;
     const dataAt = p;
-    p += dataLen;
+    const dataEnd = wireEnd(u8, p, dataLen, 'result column data');
+    p = dataEnd;
 
     switch (phys) {
       case PHYS_BOOL: {
         // Bool is a bitmap too. Expand it into a 0/1 Uint8Array.
+        const expected = Math.ceil(numRows / 64) * 8;
+        if (dataLen !== expected) wireError('invalid BOOLEAN result width');
         const bits = u8.subarray(dataAt, dataAt + dataLen);
         values = new Uint8Array(numRows);
         for (let i = 0; i < numRows; i++) values[i] = bitAt(bits, i);
         break;
       }
       case PHYS_I32:
+        if (dataLen !== numRows * Int32Array.BYTES_PER_ELEMENT) {
+          wireError('invalid I32 result width');
+        }
         values = viewOrCopy(Int32Array, u8, dataAt, numRows, copy);
         break;
       case PHYS_I64:
+        if (dataLen !== numRows * BigInt64Array.BYTES_PER_ELEMENT) {
+          wireError('invalid I64 result width');
+        }
         values = viewOrCopy(BigInt64Array, u8, dataAt, numRows, copy);
         break;
       case PHYS_F64:
+        if (dataLen !== numRows * Float64Array.BYTES_PER_ELEMENT) {
+          wireError('invalid F64 result width');
+        }
         values = viewOrCopy(Float64Array, u8, dataAt, numRows, copy);
         break;
       case PHYS_I128: {
         // There is no 128-bit TypedArray, so use an array of BigInt.
+        if (dataLen !== numRows * 16) wireError('invalid I128 result width');
         values = new Array(numRows);
         for (let i = 0; i < numRows; i++) values[i] = readI128(dv, dataAt + i * 16);
         break;
@@ -868,9 +1184,21 @@ export class Batch {
   }
 
   #index(k) {
-    if (typeof k === 'number') return k;
+    if (typeof k === 'number') {
+      if (!Number.isInteger(k) || k < 0 || k >= this.columns.length) {
+        throw new AhiruError(Code.COLUMN_NOT_FOUND, { detail: String(k) });
+      }
+      return k;
+    }
     const i = this.columns.findIndex((c) => c.name === k);
     if (i < 0) throw new AhiruError(Code.COLUMN_NOT_FOUND, { detail: String(k) });
+    return i;
+  }
+
+  #row(i) {
+    if (!Number.isInteger(i) || i < 0 || i >= this.numRows) {
+      throw new AhiruError(Code.VALUE_OUT_OF_RANGE, { detail: `row ${String(i)}` });
+    }
     return i;
   }
 
@@ -882,14 +1210,15 @@ export class Batch {
   /** Whether a row is NULL. Honors the validity bitmap. */
   isNull(k, row) {
     const v = this.columns[this.#index(k)].valid;
-    return v !== null && v[row] === 0;
+    return v !== null && v[this.#row(row)] === 0;
   }
 
   /** The value at row i, column k. NULL is `null`. */
   get(k, row) {
     const c = this.columns[this.#index(k)];
-    if (c.valid !== null && c.valid[row] === 0) return null;
-    return c.physType === PHYS_BOOL ? c.values[row] === 1 : c.values[row];
+    const i = this.#row(row);
+    if (c.valid !== null && c.valid[i] === 0) return null;
+    return c.physType === PHYS_BOOL ? c.values[i] === 1 : c.values[i];
   }
 
   /** Turns the batch into an array of plain objects. */
@@ -918,14 +1247,51 @@ export class Batch {
 // Node have built in; ZSTD goes to a separate wasm module.
 
 /** GZIP. Costing zero extra bytes is the whole point of this delegation. */
-async function gunzip(bytes) {
+async function gunzip(bytes, maxLen) {
   if (typeof DecompressionStream !== 'function') {
     throw new AhiruError(Code.UNSUPPORTED_CODEC, {
       detail: 'GZIP needs DecompressionStream (browser or Node 18+)',
     });
   }
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  let reader;
+  try {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxLen) {
+        await reader.cancel().catch(() => undefined);
+        throw new AhiruError(Code.LIMIT_EXCEEDED, {
+          detail: `GZIP output exceeds the declared page size (${total} > ${maxLen})`,
+        });
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  } catch (cause) {
+    if (cause instanceof AhiruError) throw cause;
+    throw new AhiruError(Code.BAD_COMPRESSED_DATA, {
+      detail: 'invalid GZIP data',
+      cause,
+    });
+  } finally {
+    try {
+      reader?.releaseLock();
+    } catch {
+      // The codec failure above is the useful normalized error; do not let a
+      // broken custom stream's cleanup mask it.
+    }
+  }
 }
 
 /** The ZSTD decoder carried by a separate wasm module. Not loaded until first requested. */
@@ -965,31 +1331,43 @@ class ZstdModule {
 
   decompress(src, outLen) {
     const e = this.#exports;
-    const srcPtr = e.zstd_alloc(src.length);
-    // zstd_alloc returns null on allocation failure (it uses try_reserve_exact,
-    // same as the core's #provide checks ahiru_alloc). Writing to a null pointer
-    // would corrupt the start of wasm memory instead of failing loudly.
-    if (srcPtr === 0) {
-      throw new AhiruError(Code.OOM, { detail: 'zstd module: allocation failed for the input buffer' });
+    let srcPtr = 0;
+    let dstPtr = 0;
+    try {
+      srcPtr = e.zstd_alloc(src.length);
+      // zstd_alloc returns null on allocation failure (it uses try_reserve_exact,
+      // same as the core's #provide checks ahiru_alloc). Writing to a null pointer
+      // would corrupt the start of wasm memory instead of failing loudly.
+      if (srcPtr === 0) {
+        throw new AhiruError(Code.OOM, { detail: 'zstd module: allocation failed for the input buffer' });
+      }
+      // Memory may grow on every alloc. Re-take the view each time (same policy as the core).
+      new Uint8Array(e.memory.buffer).set(src, srcPtr);
+      dstPtr = e.zstd_alloc(outLen);
+      if (dstPtr === 0) {
+        throw new AhiruError(Code.OOM, { detail: 'zstd module: allocation failed for the output buffer' });
+      }
+      const n = e.zstd_decompress(srcPtr, src.length, dstPtr, outLen);
+      if (n < 0) {
+        throw new AhiruError(Code.BAD_COMPRESSED_DATA, { detail: `zstd_decompress -> ${n}` });
+      }
+      if (n > outLen) {
+        throw new AhiruError(Code.BAD_COMPRESSED_DATA, {
+          detail: `zstd_decompress returned ${n} bytes for a ${outLen}-byte buffer`,
+        });
+      }
+      // Left inside wasm it would detach on the next alloc, so return a copy.
+      return new Uint8Array(e.memory.buffer, dstPtr, n).slice();
+    } finally {
+      // Free both host-owned side-module allocations even if the decoder traps
+      // or a later allocation/memory write fails. Keep the frees nested so a
+      // broken cleanup export cannot prevent the other allocation from being freed.
+      try {
+        if (srcPtr !== 0) e.zstd_free(srcPtr, src.length);
+      } finally {
+        if (dstPtr !== 0) e.zstd_free(dstPtr, outLen);
+      }
     }
-    // Memory may grow on every alloc. Re-take the view each time (same policy as the core).
-    new Uint8Array(e.memory.buffer).set(src, srcPtr);
-    const dstPtr = e.zstd_alloc(outLen);
-    if (dstPtr === 0) {
-      e.zstd_free(srcPtr, src.length);
-      throw new AhiruError(Code.OOM, { detail: 'zstd module: allocation failed for the output buffer' });
-    }
-    const n = e.zstd_decompress(srcPtr, src.length, dstPtr, outLen);
-    if (n < 0) {
-      e.zstd_free(srcPtr, src.length);
-      e.zstd_free(dstPtr, outLen);
-      throw new AhiruError(Code.BAD_COMPRESSED_DATA, { detail: `zstd_decompress -> ${n}` });
-    }
-    // Left inside wasm it would detach on the next alloc, so return a copy.
-    const out = new Uint8Array(e.memory.buffer, dstPtr, n).slice();
-    e.zstd_free(srcPtr, src.length);
-    e.zstd_free(dstPtr, outLen);
-    return out;
   }
 }
 
@@ -1034,9 +1412,17 @@ async function loadWasmBytes(wasmUrl, fetchImpl) {
     return new Uint8Array(await readFile(s.startsWith('file:') ? fileURLToPath(s) : s));
   }
   const doFetch = fetchImpl ?? globalThis.fetch;
-  const r = await doFetch(s);
-  if (!r.ok) throw new AhiruError(Code.IO_FAILED, { detail: `${s} -> HTTP ${r.status}` });
-  return new Uint8Array(await r.arrayBuffer());
+  if (typeof doFetch !== 'function') {
+    throw new TypeError('no fetch available. Pass an implementation via init({ fetch })');
+  }
+  // Keep wasm loading on the same normalized error path as table I/O. In
+  // particular, a signed wasm URL must not leak its query token in an
+  // exception message when a server rejects it or the network fails.
+  const r = await request(doFetch, s);
+  if (!r.ok) {
+    throw new AhiruError(Code.IO_FAILED, { detail: `${redactUrl(s)} -> HTTP ${r.status}` });
+  }
+  return responseBytes(r, s);
 }
 
 // --- Main --------------------------------------------------------------------
@@ -1051,6 +1437,8 @@ export class AhiruDB {
   /** When the cache was supplied from outside, close() must not clear it. */
   #ownsCache;
   #fetch;
+  /** Optional gate for URLs discovered directly in SQL file-function calls. */
+  #sqlUrlPolicy;
   #memoryLimit;
   /** Cap on the fetched bytes retained for codec delegation. */
   #residentLimit;
@@ -1060,6 +1448,10 @@ export class AhiruDB {
   #zstdOptions;
   /** Serializes query()/stream() against each other (see the Mutex doc comment). */
   #sessionLock = new Mutex();
+  /** Number of runs that have acquired the session lock and may still call wasm. */
+  #activeRuns = 0;
+  /** Prevents close() from freeing the session twice, including deferred close. */
+  #sessionFreed = false;
 
   constructor(instance, options) {
     this.#zstdOptions = {
@@ -1071,10 +1463,22 @@ export class AhiruDB {
     this.#exports = instance.exports;
     this.#memory = instance.exports.memory;
     this.#ownsCache = typeof options.cache !== 'object' || options.cache === null;
-    this.#cache = makeCache(options.cache, options.cacheSize ?? 64 * 1024 * 1024);
-    this.#residentLimit = options.cacheSize ?? 64 * 1024 * 1024;
+    const cacheSize = requireNonNegativeSafeInteger(
+      options.cacheSize ?? DEFAULT_CACHE_SIZE,
+      'cacheSize',
+    );
+    this.#cache = makeCache(options.cache, cacheSize);
+    this.#residentLimit = cacheSize;
     this.#fetch = options.fetch;
-    this.#memoryLimit = options.memoryLimit ?? 0;
+    if (
+      options.sqlUrlPolicy !== undefined &&
+      options.sqlUrlPolicy !== false &&
+      typeof options.sqlUrlPolicy !== 'function'
+    ) {
+      throw new TypeError('sqlUrlPolicy must be a function or false');
+    }
+    this.#sqlUrlPolicy = options.sqlUrlPolicy;
+    this.#memoryLimit = requireNonNegativeSafeInteger(options.memoryLimit ?? 0, 'memoryLimit');
     this.#session = this.#exports.ahiru_session_new();
     if (this.#session < 0) throw new AhiruError(Code.INTERNAL, { detail: 'session_new failed' });
   }
@@ -1119,6 +1523,11 @@ export class AhiruDB {
    * name from how it is read is the purpose of this option; blocking that with a check would defeat it.
    */
   register(name, source, { format } = {}) {
+    return this.#register(name, source, format, false);
+  }
+
+  /** Internal registration path for SQL-discovered URLs; reject HTTP redirects. */
+  #register(name, source, format, rejectRedirects) {
     this.#assertOpen();
     if (typeof name !== 'string' || name.length === 0) {
       throw new TypeError('register: a table name is required');
@@ -1130,11 +1539,11 @@ export class AhiruDB {
       // and obscure the cause. Reject unknown names here.
       if (code === undefined || code === FORMAT_CODES.auto) {
         throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
-          detail: `unknown format "${format}" (parquet / csv / tsv / jsonl)`,
+          detail: `unknown format "${format}" (parquet / csv / tsv / jsonl / json)`,
         });
       }
     }
-    const src = makeSource(source, this.#fetch);
+    const src = makeSource(source, this.#fetch, { rejectRedirects });
     // A duplicate name replaces the previous one (the wasm-side catalog follows the same rule).
     this.#tables.set(name.toLowerCase(), {
       name,
@@ -1178,10 +1587,14 @@ export class AhiruDB {
   close() {
     if (this.#closed) return;
     this.#closed = true;
-    this.#exports.ahiru_session_free(this.#session);
     this.#tables.clear();
     this.#byIndex.clear();
     if (this.#ownsCache) this.#cache.clear();
+    // A query may be suspended at a source/fetch await or a stream yield. Do not
+    // free the wasm session underneath it: the ABI state is shared by the whole
+    // instance, so a later session allocation could otherwise reuse this handle
+    // while the old run is still calling query_step/query_close.
+    if (this.#activeRuns === 0) this.#freeSession();
   }
 
   /** How many bytes the wasm heap currently holds. */
@@ -1201,15 +1614,19 @@ export class AhiruDB {
     // return/throw injected at the suspended yield, which still runs this `finally`
     // (standard (async) generator semantics), so the lock is always released.
     const release = await this.#sessionLock.acquire();
+    this.#activeRuns++;
     try {
       this.#assertOpen();
       await this.#bindTables(sql);
+      this.#assertOpen();
 
       const q = await this.#start(sql, params);
+      this.#assertOpen();
       try {
         const schema = this.#readSchema(q, sql);
         let lastSignature = null;
         for (;;) {
+          this.#assertOpen();
           const status = this.#exports.ahiru_query_step(q);
           this.#checkMemory(sql);
           if (status === STATUS_BATCH_READY) {
@@ -1219,10 +1636,12 @@ export class AhiruDB {
           }
           if (status === STATUS_NEED_IO) {
             lastSignature = await this.#pump(decodeIoRequests(this.#out()), lastSignature, sql);
+            this.#assertOpen();
             continue;
           }
           if (status === STATUS_NEED_CODEC) {
             await this.#decompress(decodeCodecRequests(this.#out()), sql);
+            this.#assertOpen();
             continue;
           }
           if (status === STATUS_DONE) return;
@@ -1232,7 +1651,9 @@ export class AhiruDB {
         this.#exports.ahiru_query_close(q);
       }
     } finally {
+      this.#activeRuns--;
       release();
+      if (this.#closed && this.#activeRuns === 0) this.#freeSession();
     }
   }
 
@@ -1248,24 +1669,31 @@ export class AhiruDB {
       // The core has no clock, so the query start time is passed in here for
       // CURRENT_DATE/CURRENT_TIMESTAMP/now() (DESIGN.md §2).
       e.ahiru_set_now(this.#session, BigInt(Date.now()) * 1000n);
-      const ptr = e.ahiru_alloc(bytes.length);
-      if (ptr === 0 && bytes.length > 0) throw new AhiruError(Code.OOM, { sql });
-      const pptr = pbytes.length > 0 ? e.ahiru_alloc(pbytes.length) : 0;
-      if (pptr === 0 && pbytes.length > 0) {
-        e.ahiru_free(ptr, bytes.length);
-        throw new AhiruError(Code.OOM, { sql });
+      let ptr = 0;
+      let pptr = 0;
+      let h;
+      try {
+        ptr = e.ahiru_alloc(bytes.length);
+        if (ptr === 0 && bytes.length > 0) throw new AhiruError(Code.OOM, { sql });
+        pptr = pbytes.length > 0 ? e.ahiru_alloc(pbytes.length) : 0;
+        if (pptr === 0 && pbytes.length > 0) throw new AhiruError(Code.OOM, { sql });
+        // alloc may grow memory, so re-take the view right before writing.
+        const mem = new Uint8Array(this.#memory.buffer);
+        mem.set(bytes, ptr);
+        if (pptr !== 0) mem.set(pbytes, pptr);
+        h = e.ahiru_query_start(this.#session, ptr, bytes.length, pptr, pbytes.length);
+      } finally {
+        try {
+          if (ptr !== 0) e.ahiru_free(ptr, bytes.length);
+        } finally {
+          if (pptr !== 0) e.ahiru_free(pptr, pbytes.length);
+        }
       }
-      // alloc may grow memory, so re-take the view right before writing.
-      const mem = new Uint8Array(this.#memory.buffer);
-      mem.set(bytes, ptr);
-      if (pptr !== 0) mem.set(pbytes, pptr);
-      const h = e.ahiru_query_start(this.#session, ptr, bytes.length, pptr, pbytes.length);
-      e.ahiru_free(ptr, bytes.length);
-      if (pptr !== 0) e.ahiru_free(pptr, pbytes.length);
       if (h >= 0) return h;
       if (h !== -2) throw this.#lastError(sql);
       // -2: not enough bytes to read the footer.
       lastSignature = await this.#pump(decodeIoRequests(this.#out()), lastSignature, sql);
+      this.#assertOpen();
     }
   }
 
@@ -1283,32 +1711,32 @@ export class AhiruDB {
           detail: `${CODEC_NAMES[req.codec] ?? `codec ${req.codec}`} is not handled by the host`,
         });
       }
-      // If there is even one ZSTD, load it once before going parallel.
+      // If there is even one ZSTD, load it once before decoding.
       if (req.codec === CODEC_ZSTD) this.#zstd ??= await ZstdModule.load(this.#zstdOptions);
     }
 
-    // Decompression is independent, so run it in parallel (GZIP is an async stream).
-    const outputs = await Promise.all(
-      requests.map(async (req) => {
-        const rec = this.#byIndex.get(req.table);
-        if (rec === undefined) {
-          throw new AhiruError(Code.INTERNAL, { sql, detail: `unknown table index ${req.table}` });
-        }
-        const src = await this.#bytesAt(rec, req.part, req.offset, req.len, sql);
-        const out =
-          req.codec === CODEC_GZIP ? await gunzip(src) : this.#zstd.decompress(src, req.outLen);
-        if (out.length !== req.outLen) {
-          throw new AhiruError(Code.BAD_COMPRESSED_DATA, {
-            sql,
-            detail: `expected ${req.outLen} bytes, got ${out.length}`,
-          });
-        }
-        return out;
-      }),
-    );
-
-    // Handing back to wasm is sequential, because memory moves on every alloc.
-    for (let i = 0; i < requests.length; i++) this.#provideCodec(requests[i], outputs[i], sql);
+    // Decode and provide one page at a time. A split may contain many pages;
+    // Promise.all would retain every decompressed block simultaneously and
+    // multiply the per-page cap into an unbounded host-side allocation.
+    for (const req of requests) {
+      const rec = this.#byIndex.get(req.table);
+      if (rec === undefined) {
+        throw new AhiruError(Code.INTERNAL, { sql, detail: `unknown table index ${req.table}` });
+      }
+      const src = await this.#bytesAt(rec, req.part, req.offset, req.len, sql);
+      const out =
+        req.codec === CODEC_GZIP
+          ? await gunzip(src, req.outLen)
+          : this.#zstd.decompress(src, req.outLen);
+      if (out.length !== req.outLen) {
+        throw new AhiruError(Code.BAD_COMPRESSED_DATA, {
+          sql,
+          detail: `expected ${req.outLen} bytes, got ${out.length}`,
+        });
+      }
+      this.#assertOpen();
+      this.#provideCodec(req, out, sql);
+    }
     this.#checkMemory(sql);
   }
 
@@ -1317,17 +1745,21 @@ export class AhiruDB {
     const e = this.#exports;
     const ptr = e.ahiru_alloc(bytes.length);
     if (ptr === 0 && bytes.length > 0) throw new AhiruError(Code.OOM, { sql });
-    new Uint8Array(this.#memory.buffer).set(bytes, ptr);
-    const rc = e.ahiru_provide_codec(
-      this.#session,
-      req.table,
-      req.part,
-      BigInt(req.offset),
-      req.len,
-      ptr,
-      bytes.length,
-    );
-    e.ahiru_free(ptr, bytes.length);
+    let rc;
+    try {
+      new Uint8Array(this.#memory.buffer).set(bytes, ptr);
+      rc = e.ahiru_provide_codec(
+        this.#session,
+        req.table,
+        req.part,
+        BigInt(req.offset),
+        req.len,
+        ptr,
+        bytes.length,
+      );
+    } finally {
+      e.ahiru_free(ptr, bytes.length);
+    }
     if (rc !== 0) throw this.#lastError(sql);
   }
 
@@ -1393,6 +1825,7 @@ export class AhiruDB {
 
     // Coalesced ranges are fetched in parallel, to avoid stacking round trips.
     const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.part, j.offset, j.len, sql)));
+    this.#assertOpen();
 
     let provided = 0;
     for (let i = 0; i < jobs.length; i++) {
@@ -1458,10 +1891,14 @@ export class AhiruDB {
     const e = this.#exports;
     const ptr = e.ahiru_alloc(bytes.byteLength);
     if (ptr === 0) throw new AhiruError(Code.OOM, { sql });
-    // alloc may have grown memory, so always re-take the view here.
-    new Uint8Array(this.#memory.buffer).set(bytes, ptr);
-    const rc = e.ahiru_provide(this.#session, table, part, BigInt(offset), ptr, bytes.byteLength);
-    e.ahiru_free(ptr, bytes.byteLength);
+    let rc;
+    try {
+      // alloc may have grown memory, so always re-take the view here.
+      new Uint8Array(this.#memory.buffer).set(bytes, ptr);
+      rc = e.ahiru_provide(this.#session, table, part, BigInt(offset), ptr, bytes.byteLength);
+    } finally {
+      e.ahiru_free(ptr, bytes.byteLength);
+    }
     if (rc !== 0) throw this.#lastError(sql);
     return bytes.byteLength;
   }
@@ -1499,7 +1936,34 @@ export class AhiruDB {
       if (tokens[i + 1].type !== 'punctuation' || tokens[i + 1].value !== '(') continue;
       const path = tokens[i + 2];
       if (path.type !== 'string') continue;
-      if (!this.#tables.has(path.value.toLowerCase())) this.register(path.value, path.value);
+      if (!this.#tables.has(path.value.toLowerCase())) {
+        const functionName = fn.value.toLowerCase();
+        if (isHttpUrl(path.value) && this.#sqlUrlPolicy !== undefined) {
+          const allowed =
+            this.#sqlUrlPolicy === false
+              ? false
+              : await this.#sqlUrlPolicy(path.value, { functionName, sql });
+          if (!allowed) {
+            throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
+              detail: `SQL URL policy rejected ${redactUrl(path.value)}`,
+            });
+          }
+        }
+        const detected = detectFormat(path.value);
+        const format = functionName.startsWith('read_csv')
+          ? detected === 'tsv'
+            ? 'tsv'
+            : 'csv'
+          : functionName.startsWith('read_json')
+            ? detected === 'jsonl'
+              ? 'jsonl'
+              : 'json'
+            : undefined;
+        // A policy-gated SQL URL must not escape its allowlist through an HTTP
+        // redirect. Keep the historical permissive behavior when no policy was
+        // configured at all.
+        this.#register(path.value, path.value, format, this.#sqlUrlPolicy !== undefined);
+      }
       add(path.value);
     }
 
@@ -1510,20 +1974,23 @@ export class AhiruDB {
       const name = textEncoder.encode(rec.name);
       const ptr = e.ahiru_alloc(name.length);
       if (ptr === 0 && name.length > 0) throw new AhiruError(Code.OOM);
-      new Uint8Array(this.#memory.buffer).set(name, ptr);
-      // Older cores have no ahiru_register_as. For Auto the 4-argument version is
-      // equivalent, but silently ignoring an explicit choice would read it as another format, so fail.
-      const hasRegisterAs = typeof e.ahiru_register_as === 'function';
-      if (!hasRegisterAs && rec.formatCode !== FORMAT_CODES.auto) {
+      let idx;
+      try {
+        // Older cores have no ahiru_register_as. For Auto the 4-argument version is
+        // equivalent, but silently ignoring an explicit choice would read it as another format, so fail.
+        const hasRegisterAs = typeof e.ahiru_register_as === 'function';
+        if (!hasRegisterAs && rec.formatCode !== FORMAT_CODES.auto) {
+          throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
+            detail: `this wasm core has no ahiru_register_as; format="${rec.format}" cannot be honoured`,
+          });
+        }
+        new Uint8Array(this.#memory.buffer).set(name, ptr);
+        idx = hasRegisterAs
+          ? e.ahiru_register_as(this.#session, ptr, name.length, BigInt(rec.size), rec.formatCode)
+          : e.ahiru_register(this.#session, ptr, name.length, BigInt(rec.size));
+      } finally {
         e.ahiru_free(ptr, name.length);
-        throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
-          detail: `this wasm core has no ahiru_register_as; format="${rec.format}" cannot be honoured`,
-        });
       }
-      const idx = hasRegisterAs
-        ? e.ahiru_register_as(this.#session, ptr, name.length, BigInt(rec.size), rec.formatCode)
-        : e.ahiru_register(this.#session, ptr, name.length, BigInt(rec.size));
-      e.ahiru_free(ptr, name.length);
       if (idx < 0) throw this.#lastError();
       rec.index = idx;
       this.#byIndex.set(idx, rec);
@@ -1555,6 +2022,12 @@ export class AhiruDB {
 
   #assertOpen() {
     if (this.#closed) throw new AhiruError(Code.INTERNAL, { detail: 'database is closed' });
+  }
+
+  #freeSession() {
+    if (this.#sessionFreed) return;
+    this.#sessionFreed = true;
+    this.#exports.ahiru_session_free(this.#session);
   }
 }
 

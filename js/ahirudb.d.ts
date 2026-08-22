@@ -106,6 +106,7 @@ export interface ByteRangeCache {
 
 /** An LRU cache keyed by `(source, offset, len)`. */
 export declare class MemoryCache implements ByteRangeCache {
+  /** A non-negative safe integer byte limit. Defaults to 64 MiB. */
   constructor(maxBytes?: number);
   maxBytes: number;
   readonly size: number;
@@ -128,17 +129,15 @@ export type ParquetSource = TableSource;
 
 /**
  * Formats that can be passed explicitly via `register(name, source, { format })`
- * (`ahiru_register_as`'s wire values). There is no explicit value for single-document
- * JSON yet — reach it via extension-based detection instead (see `DetectedFormatName`).
+ * (`ahiru_register_as`'s wire values).
  */
-export type FormatName = 'auto' | 'parquet' | 'csv' | 'tsv' | 'jsonl';
+export type FormatName = 'parquet' | 'csv' | 'tsv' | 'jsonl' | 'json';
 
 /**
  * Formats `detectFormat()` can infer from a registered name's extension.
- * Adds `'json'` (a top-level JSON document, `.json`) on top of `FormatName`,
- * which `register()`'s explicit `format` option cannot express.
+ * `'json'` denotes a top-level JSON document (a `.json` file).
  */
-export type DetectedFormatName = FormatName | 'json';
+export type DetectedFormatName = FormatName;
 
 export interface InitOptions {
   /** URL of the wasm. On Node it is read as a file path. */
@@ -151,14 +150,23 @@ export interface InitOptions {
   zstdUrl?: string | URL;
   zstdBinary?: Uint8Array | ArrayBuffer;
   zstdModule?: WebAssembly.Module;
-  /** Upper bound on the wasm heap, in bytes. Exceeding it throws E501. 0 means unlimited. */
+  /** Upper bound on the wasm heap, in bytes (non-negative safe integer). Exceeding it throws E501. 0 means unlimited. */
   memoryLimit?: number;
   /** "memory" (default) | "cache-api" (degrades to memory on Node) | "none" | your own implementation */
   cache?: 'memory' | 'cache-api' | 'none' | ByteRangeCache;
-  /** Byte limit for the memory cache. 64 MiB by default. */
+  /** Byte limit for the memory cache (non-negative safe integer). 64 MiB by default. */
   cacheSize?: number;
   /** The fetch used by URL sources. Defaults to globalThis.fetch. */
   fetch?: typeof globalThis.fetch;
+  /**
+   * Optional gate for HTTP(S) URLs discovered in SQL file-function calls such as
+   * `parquet('https://...')`. It receives `(url, { functionName, sql })` and may
+   * return a boolean or Promise<boolean>. `false` disables SQL URL auto-registration.
+   * Explicit `register(name, url)` calls are unaffected.
+   */
+  sqlUrlPolicy?:
+    | false
+    | ((url: string, context: { functionName: string; sql: string }) => boolean | Promise<boolean>);
 }
 
 export declare class AhiruDB {
@@ -200,14 +208,14 @@ export declare class AhiruError extends Error {
 export declare const Code: Readonly<Record<string, number>>;
 export declare function errorMessage(code: number): string;
 
-/** Converts a TIMESTAMP (microseconds since the epoch) to a Date. */
+/** Converts a TIMESTAMP (microseconds since the epoch) to a Date. Numeric inputs must be safe integers. */
 export declare function timestampToDate(micros: bigint | number): Date;
-/** Converts a DATE (days since the epoch) to a Date. */
+/** Converts a DATE (days since the epoch) to a Date. The day count must be a safe integer. */
 export declare function dateToDate(days: number): Date;
 /** Converts a TIMESTAMPTZ (UTC microseconds since the epoch) to a Date. Alias of `timestampToDate`. */
 export declare const timestamptzToDate: typeof timestampToDate;
 
-/** Coalesces nearby ranges (default threshold is 1 MiB). */
+/** Coalesces nearby ranges (default threshold is 1 MiB). `gap` must be a non-negative safe integer. */
 export declare function coalesceRanges(
   ranges: readonly { offset: number | bigint; len: number | bigint }[],
   gap?: number,
@@ -220,7 +228,7 @@ export declare function detectFormat(name: string): DetectedFormatName;
 /**
  * Opens the physical representation of an INTERVAL (months / days / microseconds
  * packed into a single i128) into `{ months, days, micros }`. Mirrors `unpack_interval`
- * in `vector::types`.
+ * in `vector::types`. Numeric inputs must be safe integers.
  */
 export declare function unpackInterval(packed: bigint | number): AhiruInterval;
 

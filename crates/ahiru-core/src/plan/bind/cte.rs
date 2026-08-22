@@ -70,10 +70,28 @@ pub(super) enum ResolvedCte {
 }
 
 impl CteScope {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn truncate(&mut self, start: usize) {
+        self.entries.truncate(start);
+    }
+
     // `pub(super)`: called from `from::flatten_from`, a sibling submodule,
     // to resolve `FromItem::Table` names against in-scope CTEs.
     pub(super) fn find(&self, name: &str) -> Option<usize> {
-        self.entries.iter().position(|e| eq_ascii_ci(e.name.as_bytes(), name.as_bytes()))
+        // Nested query blocks shadow outer CTEs, so the most recently installed
+        // definition is the visible one. Duplicate names within one block are
+        // rejected separately by `bind_one_cte`.
+        self.entries.iter().rposition(|e| eq_ascii_ci(e.name.as_bytes(), name.as_bytes()))
+    }
+
+    pub(super) fn find_in_scope(&self, name: &str, start: usize) -> Option<usize> {
+        self.entries[start..]
+            .iter()
+            .rposition(|e| eq_ascii_ci(e.name.as_bytes(), name.as_bytes()))
+            .map(|i| start + i)
     }
 
     /// Resolves the index `find` produced. The schema is always returned as a clone
@@ -105,7 +123,13 @@ pub(super) fn bind_one_cte(
     c: &Cte,
     params: &[Value],
     ctes: &mut CteScope,
+    scope_start: usize,
 ) -> Result<()> {
+    // CTE names share one case-insensitive namespace within a WITH clause.
+    // Keeping the first entry would make the second definition silently
+    // unreachable (and its body might still have side effects while binding),
+    // whereas DuckDB rejects duplicate names at bind time.
+    ensure!(ctes.find_in_scope(&c.name, scope_start).is_none(), UnsupportedFeature);
     if c.recursive {
         if let Some((anchor_expr, union_all, recursive_sel)) =
             split_recursive_cte(&c.query, &c.name)?
@@ -182,9 +206,11 @@ fn split_recursive_cte<'a>(
     if !set_expr_references(&query.body, name) {
         return Ok(None);
     }
-    // Allowing a nested WITH in a recursive CTE's body would complicate self-reference
-    // detection, and `bind_query_in` does not process a nested `q.ctes` in the first place (the
-    // same existing constraint as derived tables). It is clearly refused as out of scope.
+    // A nested WITH in a recursive CTE's body is refused because the self-reference
+    // detector below intentionally walks only the recursive query's FROM tree. The
+    // ordinary query binder supports nested WITH clauses, but extending recursive
+    // self-reference detection through their separate scopes would need a different
+    // recursive-plan construction path.
     ensure!(query.ctes.is_empty(), UnsupportedFeature);
     match &query.body {
         SetExpr::SetOp { op: SetOp::Union, all, left, right } => {

@@ -676,6 +676,9 @@ fn parse_rejects_bad_input() {
     let mut o = Vec::new();
     fmt_time(3_723_500_000, &mut o);
     assert_eq!(String::from_utf8(o).unwrap(), "01:02:03.5");
+    let mut o = Vec::new();
+    fmt_time(86_400_000_000, &mut o);
+    assert_eq!(String::from_utf8(o).unwrap(), "24:00:00");
 }
 
 // --- String <-> date-time casts (the kernels-side implementation is verified from here) ---
@@ -699,10 +702,55 @@ fn string_to_temporal_cast() {
     assert_eq!(int_at(&out, 1), Some(days_from_civil(2024, 1, 5) * US_PER_DAY));
     assert_eq!(int_at(&out, 2), None);
 
+    // DuckDB accepts ISO-8601 zone suffixes for TIMESTAMP text, but keeps the
+    // wall-clock fields unchanged because TIMESTAMP has no zone semantics.
+    let src = vs(&[
+        Some("2024-01-05 10:20:30Z"),
+        Some("2024-01-05 10:20:30+09:00"),
+        Some("2024-01-05 10:20:30+0900"),
+        Some("2024-01-05 10:20:30+99:99"),
+        Some("2024-01-05 10:20:30-03:30"),
+        Some("2024-01-05 10:20:30+09:00junk"),
+        Some("2024-01-05 10:20:30+9"),
+        Some("2024-01-05 10:20:30z"),
+    ]);
+    let out = kernels::cast(Ty::Varchar, Ty::Timestamp, &src).unwrap();
+    let expected = parse_timestamp(b"2024-01-05 10:20:30");
+    assert_eq!(int_at(&out, 0), expected);
+    assert_eq!(int_at(&out, 1), expected);
+    assert_eq!(int_at(&out, 2), expected);
+    assert_eq!(int_at(&out, 3), expected);
+    assert_eq!(int_at(&out, 4), expected);
+    assert_eq!(int_at(&out, 5), None);
+    assert_eq!(int_at(&out, 6), None);
+    assert_eq!(int_at(&out, 7), None);
+
     let src = vs(&[Some("01:02:03.5"), Some("nope")]);
     let out = kernels::cast(Ty::Varchar, Ty::Time, &src).unwrap();
     assert_eq!(int_at(&out, 0), Some(3_723_500_000));
     assert_eq!(int_at(&out, 1), None);
+}
+
+#[test]
+fn string_to_float_cast_accepts_ieee_spellings() {
+    let src = vs(&[
+        Some("NaN"),
+        Some("+NaN"),
+        Some("-NaN"),
+        Some("Infinity"),
+        Some("-inf"),
+        Some("  +infinity  "),
+        Some("not a number"),
+    ]);
+    let out = kernels::cast(Ty::Varchar, Ty::Double, &src).unwrap();
+    assert!(out.f64s()[0].is_nan());
+    assert!(out.f64s()[1].is_nan());
+    assert!(out.f64s()[2].is_nan());
+    assert!(out.f64s()[2].is_sign_negative());
+    assert_eq!(out.f64s()[3], f64::INFINITY);
+    assert_eq!(out.f64s()[4], f64::NEG_INFINITY);
+    assert_eq!(out.f64s()[5], f64::INFINITY);
+    assert!(!out.is_valid(6));
 }
 
 #[test]

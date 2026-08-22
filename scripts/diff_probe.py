@@ -5,9 +5,18 @@ Usage: python3 scripts/diff_probe.py queries.txt
 Each line in the file: <file1>,<file2>,...|<SQL>   (files relative to repo root)
 Lines starting with # are skipped.
 """
-import os, re, subprocess, sys
+import csv
+import io
+import os
+import re
+import subprocess
+import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Keep this distinct from ordinary SQL text. An empty CSV field is an empty
+# string, not NULL; both CLIs can spell NULL with this marker.
+NULL_TOKEN = "__AHIRU_DIFF_NULL__"
 
 def duck_source(path):
     p = os.path.join(REPO, path)
@@ -29,28 +38,40 @@ def run(cmd):
     return p.returncode, p.stdout, p.stderr
 
 def normalize(text):
+    """Parse CSV while preserving empty cells, row width, and string text.
+
+    The old line/regex parser called ``strip()`` on every line and mapped an
+    empty field to ``<null>``. That dropped trailing empty columns and made
+    empty strings compare equal to SQL NULL. ``csv.reader`` keeps quoted
+    commas/newlines and trailing empty fields intact; NULL is identified only
+    by the explicit marker configured in ``main``.
+    """
     rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.endswith("rows)") or line.endswith("row)"):
+    reader = csv.reader(io.StringIO(text, newline=""))
+    for cells in reader:
+        # A blank CSV record has no meaning here. A record of empty fields
+        # (",,,") is meaningful and is not filtered.
+        if not cells:
             continue
-        cells = []
-        for c in re.split(r"\t|,(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", line):
-            c = c.strip().strip('"')
-            if c in ("", "NULL", "\\N"): cells.append("<null>")
-            else:
-                try:
-                    f = float(c)
-                    if f != f or f in (float("inf"), float("-inf")):
-                        cells.append(c)
-                    elif f == int(f) and abs(f) < 9e15:
-                        cells.append(str(int(f)))
-                    else:
-                        cells.append("%.9f" % f)
-                except (ValueError, OverflowError):
-                    cells.append(c)
-        rows.append(tuple(cells))
-    return rows[1:]  # drop header
+        normalized = []
+        for cell in cells:
+            if cell == NULL_TOKEN:
+                normalized.append("<null>")
+                continue
+            try:
+                f = float(cell)
+                if f != f or f in (float("inf"), float("-inf")):
+                    normalized.append(cell)
+                elif f == int(f) and abs(f) < 9e15:
+                    normalized.append(str(int(f)))
+                else:
+                    normalized.append("%.9f" % f)
+            except (ValueError, OverflowError):
+                # Do not strip strings: surrounding/trailing whitespace is a
+                # part of a SQL VARCHAR value.
+                normalized.append(cell)
+        rows.append(tuple(normalized))
+    return rows[1:]  # drop the CSV header
 
 def main():
     qfile = sys.argv[1]
@@ -67,9 +88,10 @@ def main():
     bad = 0
     for ln, files, sql in cases:
         rc_a, out_a, err_a = run(["cargo", "run", "-q", "-p", "ahiru-cli", "--",
+                                  "-no-init", "-csv", "-nullvalue", NULL_TOKEN,
                                   "query"] + files + [sql])
         dsql = replace_tables(sql, files)
-        rc_d, out_d, err_d = run(["duckdb", "-csv", "-c", dsql])
+        rc_d, out_d, err_d = run(["duckdb", "-csv", "-nullvalue", NULL_TOKEN, "-c", dsql])
         if rc_a != 0:
             print("FAIL[line %d] ahiru error: %s\n  SQL: %s\n  %s" % (ln, err_a.strip()[:200], sql, err_a.strip().splitlines()[-1][:160] if err_a.strip() else ""))
             bad += 1

@@ -88,6 +88,9 @@ fn fmt_date(days: i64) -> String {
 /// Displays a TIME (microseconds since midnight) as `HH:MM:SS`. A simplification
 /// for CLI display only, dropping sub-microseconds (the same convention as the time part of `fmt_timestamp`).
 fn fmt_time(micros: i64) -> String {
+    if micros == 86_400_000_000 {
+        return "24:00:00".to_string();
+    }
     let rem = micros.rem_euclid(86_400_000_000);
     let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
     let subsec = rem % 1_000_000;
@@ -138,4 +141,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_endpoint_does_not_wrap_to_midnight() {
+        assert_eq!(render(&Value::I64(86_400_000_000), Ty::Time, "NULL"), "24:00:00");
+    }
 }

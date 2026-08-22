@@ -193,6 +193,17 @@ impl Session {
         };
         match t.parts.get_mut(part) {
             Some(p) => {
+                // Hosts must not be able to install bytes beyond the file's declared
+                // length.  Without this check a malformed offset/length was silently
+                // retained by `Source`, leaving the requested in-file range missing
+                // forever (or, for an offset near `u64::MAX`, reaching overflowing range
+                // arithmetic while chunks were coalesced).
+                let data_len = data.len() as u64;
+                let end = match offset.checked_add(data_len) {
+                    Some(end) => end,
+                    None => err!(ValueOutOfRange),
+                };
+                ensure!(offset <= p.source.total_len && end <= p.source.total_len, ValueOutOfRange);
                 p.source.insert(offset, data);
                 Ok(())
             }
@@ -380,7 +391,12 @@ impl Session {
         };
         match t.parts.get_mut(part) {
             Some(p) => {
-                p.source.insert_decoded(offset, len, data);
+                let end = match offset.checked_add(len as u64) {
+                    Some(end) => end,
+                    None => err!(ValueOutOfRange),
+                };
+                ensure!(offset <= p.source.total_len && end <= p.source.total_len, ValueOutOfRange);
+                p.source.insert_decoded(offset, len, data)?;
                 Ok(())
             }
             None => err!(TableNotFound),
@@ -537,5 +553,30 @@ fn describe_result(fields: &[Field]) -> Query {
 impl Default for Session {
     fn default() -> Self {
         Session::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{code_of, Code};
+    use crate::format::FormatKind;
+
+    #[test]
+    fn provide_rejects_ranges_outside_declared_file_length() {
+        let mut session = Session::new();
+        let table = session.register_remote_as("t.parquet", 10, FormatKind::Parquet).unwrap();
+
+        assert_eq!(code_of(session.provide(table, 0, 9, vec![1, 2])), Some(Code::ValueOutOfRange));
+        assert_eq!(
+            code_of(session.provide(table, 0, u64::MAX, vec![1])),
+            Some(Code::ValueOutOfRange)
+        );
+        assert_eq!(
+            code_of(session.provide_decoded(table, 0, 9, 2, vec![1])),
+            Some(Code::ValueOutOfRange)
+        );
+        // A valid in-file range remains accepted after rejected deliveries.
+        assert!(session.provide(table, 0, 9, vec![1]).is_ok());
     }
 }

@@ -705,6 +705,16 @@ pub fn decode_offset_index(buf: &[u8]) -> Result<OffsetIndex> {
         ensure!(p.compressed_page_size >= 0, BadThrift, t.pos());
         ensure!(p.first_row_index >= 0, BadThrift, t.pos());
     }
+    // OffsetIndex entries are consumed in this order by page selection. A
+    // corrupted or reordered index would make the selected pages carry the
+    // wrong absolute row numbers and could silently drop matching rows.
+    if let Some(first) = oi.page_locations.first() {
+        ensure!(first.first_row_index == 0, BadThrift, t.pos());
+    }
+    for pair in oi.page_locations.windows(2) {
+        ensure!(pair[1].offset > pair[0].offset, BadThrift, t.pos());
+        ensure!(pair[1].first_row_index > pair[0].first_row_index, BadThrift, t.pos());
+    }
     Ok(oi)
 }
 
@@ -1093,6 +1103,25 @@ mod tests {
     fn offset_index_rejects_negative_fields() {
         let buf = encode_offset_index(&[(-1, 10, 0)]);
         assert_eq!(code_of(decode_offset_index(&buf)), Some(Code::BadThrift));
+    }
+
+    #[test]
+    fn offset_index_rejects_reordered_pages_and_missing_first_row() {
+        for locs in [
+            // The pages are not in file order.
+            vec![(1004, 900, 200), (4, 1000, 0)],
+            // The pages are not in row order.
+            vec![(4, 1000, 200), (1004, 900, 0)],
+            // A page index that starts after row zero cannot safely drive pruning.
+            vec![(4, 1000, 1)],
+            // Equal first-row positions cannot describe two consecutive pages.
+            vec![(4, 1000, 0), (1004, 900, 0)],
+        ] {
+            assert_eq!(
+                code_of(decode_offset_index(&encode_offset_index(&locs))),
+                Some(Code::BadThrift)
+            );
+        }
     }
 
     #[test]

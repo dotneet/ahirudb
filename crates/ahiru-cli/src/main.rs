@@ -118,6 +118,7 @@ fn run(opts: Options, argv: &[String]) -> R<()> {
         if stdin.is_terminal() && !opts.batch {
             sh.interactive()?;
         } else {
+            sh.use_noninteractive_defaults();
             let mut text = String::new();
             std::io::stdin().lock().read_to_string(&mut text)?;
             sh.run_script(&text)?;
@@ -125,6 +126,7 @@ fn run(opts: Options, argv: &[String]) -> R<()> {
         return sh.into_result();
     }
 
+    sh.use_noninteractive_defaults();
     for j in &opts.jobs {
         match j {
             Job::Sql(sql) => sh.run_script(sql)?,

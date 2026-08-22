@@ -36,6 +36,10 @@ const RESULT_MAGIC: u32 = 0x4148_5231; // "AHR1"
 
 struct State {
     sessions: Vec<Option<Session>>,
+    /// Generation counter per session slot. Session handles use the same
+    /// packed index/generation representation as query handles, so a stale
+    /// handle cannot alias a later session that reuses the slot index.
+    session_generations: Vec<u32>,
     queries: Vec<Option<QuerySlot>>,
     /// Generation counter per query-handle slot index, bumped every time that
     /// slot is closed. Packed into the high bits of the handle returned by
@@ -66,11 +70,16 @@ struct QuerySlot {
 /// `ahiru_query_start` error/NEED_IO sentinels) hold the generation from
 /// `State::query_generations`. 65536 concurrently open, unclosed queries or
 /// 32768 open/close cycles on one slot are both far beyond anything a real
-/// caller does; going past either is treated as an error rather than risking
-/// two live handles aliasing the same bits.
+/// caller does. A slot that reaches the generation limit becomes a tombstone,
+/// and once all slots are exhausted a new query returns a resource-limit error
+/// rather than aliasing an old handle.
 const QUERY_IDX_BITS: u32 = 16;
 const QUERY_IDX_MASK: i32 = (1 << QUERY_IDX_BITS) - 1;
 const QUERY_GEN_MASK: u32 = (1 << (31 - QUERY_IDX_BITS)) - 1;
+/// A slot whose generation reached this value can no longer be reused. Keeping
+/// this sentinel outside the bits carried by a handle prevents generation
+/// wraparound from making an old handle valid again (the ABA problem).
+const QUERY_GEN_EXHAUSTED: u32 = QUERY_GEN_MASK + 1;
 
 fn make_query_handle(index: usize, generation: u32) -> i32 {
     (((generation & QUERY_GEN_MASK) as i32) << QUERY_IDX_BITS) | (index as i32 & QUERY_IDX_MASK)
@@ -88,6 +97,14 @@ fn split_query_handle(h: i32) -> Option<(usize, u32)> {
     Some((index, generation))
 }
 
+fn next_query_generation(generation: u32) -> u32 {
+    if generation >= QUERY_GEN_MASK {
+        QUERY_GEN_EXHAUSTED
+    } else {
+        generation + 1
+    }
+}
+
 struct Cell(UnsafeCell<Option<State>>);
 // wasm32 is single-threaded.
 unsafe impl Sync for Cell {}
@@ -99,6 +116,7 @@ fn state() -> &'static mut State {
     if slot.is_none() {
         *slot = Some(State {
             sessions: Vec::new(),
+            session_generations: Vec::new(),
             queries: Vec::new(),
             query_generations: Vec::new(),
             last_error: 0,
@@ -168,26 +186,81 @@ unsafe fn slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 
 #[no_mangle]
 pub extern "C" fn ahiru_session_new() -> i32 {
+    clear_error();
     let s = state();
-    if let Some(pos) = s.sessions.iter().position(|slot| slot.is_none()) {
-        s.sessions[pos] = Some(Session::new());
-        pos as i32
-    } else {
-        s.sessions.push(Some(Session::new()));
-        (s.sessions.len() - 1) as i32
+    let index = s
+        .sessions
+        .iter()
+        .enumerate()
+        .find_map(|(i, slot)| {
+            let generation = s.session_generations.get(i).copied().unwrap_or(0);
+            (slot.is_none() && generation <= QUERY_GEN_MASK).then_some(i)
+        })
+        .unwrap_or(s.sessions.len());
+    if index > QUERY_IDX_MASK as usize {
+        return fail_code(crate::error::Code::LimitExceeded, -1);
     }
+    if index >= s.session_generations.len() {
+        s.session_generations.resize(index + 1, 0);
+    }
+    let generation = s.session_generations[index];
+    if generation > QUERY_GEN_MASK {
+        return fail_code(crate::error::Code::LimitExceeded, -1);
+    }
+    if index == s.sessions.len() {
+        s.sessions.push(Some(Session::new()));
+    } else {
+        s.sessions[index] = Some(Session::new());
+    }
+    make_query_handle(index, generation)
 }
 
 #[no_mangle]
 pub extern "C" fn ahiru_session_free(h: i32) {
-    if h < 0 {
+    clear_error();
+    let Some((session_index, generation)) = split_query_handle(h) else {
+        return;
+    };
+    let s = state();
+    if s.session_generations.get(session_index).copied() != Some(generation) {
         return;
     }
-    let s = state();
-    if let Some(slot) = s.sessions.get_mut(h as usize) {
-        *slot = None;
+    let Some(slot) = s.sessions.get_mut(session_index) else {
+        return;
+    };
+    if slot.is_none() {
+        return;
+    }
+    *slot = None;
+    s.session_generations[session_index] = next_query_generation(generation);
+    // Query handles outlive the session slot in the global ABI state. Drop all
+    // queries owned by this session as part of freeing it; otherwise a caller
+    // that closes a session with an in-flight query retains its plan, scan
+    // buffers, and slot until some unrelated query happens to reuse the slot.
+    for (index, query) in s.queries.iter_mut().enumerate() {
+        let owned = query.as_ref().map(|q| q.session == session_index).unwrap_or(false);
+        if owned {
+            *query = None;
+            if let Some(generation) = s.query_generations.get_mut(index) {
+                *generation = next_query_generation(*generation);
+            }
+        }
+    }
+    // Reclaim the trailing run of ordinary empty slots. An exhausted slot is
+    // deliberately retained as a tombstone so a later append cannot reuse its
+    // index with a wrapped generation.
+    while matches!(s.queries.last(), Some(None)) {
+        let index = s.queries.len() - 1;
+        if s.query_generations.get(index).copied().unwrap_or(0) >= QUERY_GEN_EXHAUSTED {
+            break;
+        }
+        s.queries.pop();
     }
     while matches!(s.sessions.last(), Some(None)) {
+        let index = s.sessions.len() - 1;
+        if s.session_generations.get(index).copied().unwrap_or(0) >= QUERY_GEN_EXHAUSTED {
+            break;
+        }
         s.sessions.pop();
     }
 }
@@ -209,10 +282,12 @@ pub extern "C" fn ahiru_set_now(h: i32, now_micros: i64) -> i32 {
 }
 
 fn session(h: i32) -> Option<&'static mut Session> {
-    if h < 0 {
+    let (index, generation) = split_query_handle(h)?;
+    let s = state();
+    if s.session_generations.get(index).copied() != Some(generation) {
         return None;
     }
-    state().sessions.get_mut(h as usize)?.as_mut()
+    s.sessions.get_mut(index)?.as_mut()
 }
 
 /// Format codes. These map 1:1 to the constants on the JS side.
@@ -224,6 +299,7 @@ fn format_kind(v: u32) -> Result<crate::format::FormatKind> {
         2 => Csv,
         3 => Tsv,
         4 => Jsonl,
+        5 => Json,
         _ => err!(UnsupportedFeature),
     })
 }
@@ -247,7 +323,7 @@ pub unsafe extern "C" fn ahiru_register(
 ///
 /// Extension inference forces the table name to carry an extension (you would have to
 /// write `FROM "logs.csv"`). This entry point exists so the name and how it is read
-/// can be separated. `format` is 0=Auto, 1=Parquet, 2=Csv, 3=Tsv, 4=Jsonl.
+/// can be separated. `format` is 0=Auto, 1=Parquet, 2=Csv, 3=Tsv, 4=Jsonl, 5=Json.
 ///
 /// # Safety
 /// `name` must point at `name_len` bytes of valid UTF-8.
@@ -395,6 +471,9 @@ pub unsafe extern "C" fn ahiru_query_start(
     params_len: usize,
 ) -> i32 {
     clear_error();
+    let Some((session_index, _)) = split_query_handle(h) else {
+        return fail_code(crate::error::Code::Internal, -1);
+    };
     let bytes = unsafe { slice(sql, sql_len) };
     let sql = match core::str::from_utf8(bytes) {
         Ok(s) => s,
@@ -414,15 +493,17 @@ pub unsafe extern "C" fn ahiru_query_start(
             // Reuse the first closed slot instead of growing forever: a
             // long-lived module that runs many queries over its lifetime
             // would otherwise leak one `Vec` entry per query ever opened.
-            let index = st.queries.iter().position(|s| s.is_none()).unwrap_or(st.queries.len());
+            let index = st
+                .queries
+                .iter()
+                .enumerate()
+                .find_map(|(i, slot)| {
+                    let generation = st.query_generations.get(i).copied().unwrap_or(0);
+                    (slot.is_none() && generation <= QUERY_GEN_MASK).then_some(i)
+                })
+                .unwrap_or(st.queries.len());
             if index > QUERY_IDX_MASK as usize {
                 return fail_code(crate::error::Code::LimitExceeded, -1);
-            }
-            let slot = QuerySlot { session: h as usize, query: q, io: Vec::new() };
-            if index == st.queries.len() {
-                st.queries.push(Some(slot));
-            } else {
-                st.queries[index] = Some(slot);
             }
             // `query_generations` may already know this index (it survives
             // `ahiru_query_close`'s truncation of `queries`); only a genuinely
@@ -430,7 +511,17 @@ pub unsafe extern "C" fn ahiru_query_start(
             if index >= st.query_generations.len() {
                 st.query_generations.resize(index + 1, 0);
             }
-            make_query_handle(index, st.query_generations[index])
+            let generation = st.query_generations[index];
+            if generation > QUERY_GEN_MASK {
+                return fail_code(crate::error::Code::LimitExceeded, -1);
+            }
+            let slot = QuerySlot { session: session_index, query: q, io: Vec::new() };
+            if index == st.queries.len() {
+                st.queries.push(Some(slot));
+            } else {
+                st.queries[index] = Some(slot);
+            }
+            make_query_handle(index, generation)
         }
         // The stage where the footer must be fetched. The host satisfies the request and calls again.
         Ok(Prepared::NeedIo(io)) => {
@@ -446,26 +537,28 @@ pub unsafe extern "C" fn ahiru_query_start(
 pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
     clear_error();
     let st = state();
-    let Some((index, gen)) = split_query_handle(q) else { return STATUS_ERROR };
+    let Some((index, gen)) = split_query_handle(q) else {
+        return fail_code(crate::error::Code::Internal, STATUS_ERROR);
+    };
     if st.query_generations.get(index).copied() != Some(gen) {
         // Out of range, or a stale handle whose slot has since been closed
         // (and possibly reused for an unrelated query): reject rather than
         // silently stepping whatever now lives at `index`.
-        return STATUS_ERROR;
+        return fail_code(crate::error::Code::Internal, STATUS_ERROR);
     }
     let slot = match st.queries.get_mut(index).and_then(|s| s.as_mut()) {
         Some(s) => s,
-        None => return STATUS_ERROR,
+        None => return fail_code(crate::error::Code::Internal, STATUS_ERROR),
     };
     let sidx = slot.session;
     // The session and the query cannot be mutably borrowed at once, so take it out first.
     let mut query = match core::mem::replace(&mut st.queries[index], None) {
         Some(s) => s,
-        None => return STATUS_ERROR,
+        None => return fail_code(crate::error::Code::Internal, STATUS_ERROR),
     };
     let session = match st.sessions.get_mut(sidx).and_then(|s| s.as_mut()) {
         Some(s) => s,
-        None => return STATUS_ERROR,
+        None => return fail_code(crate::error::Code::Internal, STATUS_ERROR),
     };
     let r = session.step(&mut query.query);
     let status = match r {
@@ -509,7 +602,7 @@ pub extern "C" fn ahiru_query_close(q: i32) {
         *slot = None;
     }
     if let Some(g) = st.query_generations.get_mut(index) {
-        *g = g.wrapping_add(1) & QUERY_GEN_MASK;
+        *g = next_query_generation(*g);
     }
     // Shrink the trailing run of now-empty slots so a long-lived module that
     // closes its most recently opened queries also gets the `Vec`'s memory
@@ -517,6 +610,10 @@ pub extern "C" fn ahiru_query_close(q: i32) {
     // truncated (see its doc comment), so this can't reopen the ABA hazard
     // slot reuse alone would otherwise avoid.
     while matches!(st.queries.last(), Some(None)) {
+        let index = st.queries.len() - 1;
+        if st.query_generations.get(index).copied().unwrap_or(0) >= QUERY_GEN_EXHAUSTED {
+            break;
+        }
         st.queries.pop();
     }
 }
@@ -596,6 +693,7 @@ fn decode_multi_files(buf: &[u8]) -> Result<Vec<(String, u64)>> {
         pos += 8;
         out.push((path, total_len));
     }
+    ensure!(pos == buf.len(), BadThrift);
     Ok(out)
 }
 
@@ -649,6 +747,10 @@ fn decode_params(buf: &[u8]) -> Result<Vec<crate::vector::Value>> {
         };
         out.push(v);
     }
+    // A caller-provided length must describe exactly one parameter wire
+    // message. Silently ignoring trailing bytes makes malformed ABI input look
+    // valid and can hide a host-side framing bug.
+    ensure!(pos == buf.len(), BadThrift);
     Ok(out)
 }
 
@@ -849,6 +951,19 @@ mod tests {
     }
 
     #[test]
+    fn parameter_wire_data_rejects_trailing_bytes() {
+        assert!(decode_params(&[0, 0, 0, 0, 0xAA]).is_err());
+        assert!(decode_params(&[1, 0, 0, 0, 0, 0xAA]).is_err());
+    }
+
+    #[test]
+    fn multi_file_wire_data_rejects_trailing_bytes() {
+        let mut buf = encode_multi_files(&[("a.parquet", 100)]);
+        buf.push(0xAA);
+        assert!(decode_multi_files(&buf).is_err());
+    }
+
+    #[test]
     fn ahiru_register_multi_registers_all_parts() {
         let h = ahiru_session_new();
         let name = b"t";
@@ -954,5 +1069,48 @@ mod tests {
 
         ahiru_query_close(q2);
         ahiru_session_free(h);
+    }
+
+    #[test]
+    fn stale_session_handle_cannot_free_a_reused_slot() {
+        let h1 = ahiru_session_new();
+        let (index1, generation1) = split_query_handle(h1).unwrap();
+        ahiru_session_free(h1);
+
+        let h2 = ahiru_session_new();
+        let (index2, generation2) = split_query_handle(h2).unwrap();
+        assert_eq!(index1, index2, "test assumes the session slot was reused");
+        assert_ne!(generation1, generation2);
+        assert!(session(h1).is_none());
+        assert!(session(h2).is_some());
+
+        // A second free through the stale handle must not close the new
+        // session that happens to occupy the same slot index.
+        ahiru_session_free(h1);
+        assert!(session(h2).is_some());
+        ahiru_session_free(h2);
+    }
+
+    #[test]
+    fn query_generation_becomes_an_exhaustion_tombstone_instead_of_wrapping() {
+        assert_eq!(next_query_generation(0), 1);
+        assert_eq!(next_query_generation(QUERY_GEN_MASK - 1), QUERY_GEN_MASK);
+        assert_eq!(next_query_generation(QUERY_GEN_MASK), QUERY_GEN_EXHAUSTED);
+        assert_eq!(next_query_generation(QUERY_GEN_EXHAUSTED), QUERY_GEN_EXHAUSTED);
+    }
+
+    #[test]
+    fn freeing_a_session_invalidates_and_drops_its_query_handles() {
+        let h = ahiru_session_new();
+        let q = start_range_query(h);
+        let (index, generation) = split_query_handle(q).unwrap();
+        assert!(state().queries.iter().any(|slot| slot.is_some()));
+
+        ahiru_session_free(h);
+
+        assert_ne!(state().query_generations[index], generation);
+        assert!(state().queries.get(index).map_or(true, |slot| slot.is_none()));
+        assert_eq!(ahiru_query_step(q), STATUS_ERROR);
+        assert_eq!(ahiru_last_error(), crate::error::Code::Internal as u32);
     }
 }

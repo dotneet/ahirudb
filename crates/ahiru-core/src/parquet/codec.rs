@@ -21,14 +21,26 @@
 use crate::parquet::Compression;
 use crate::prelude::*;
 
+/// Maximum bytes a single Parquet page may produce after decompression.
+///
+/// The page header stores this value as a signed 32-bit integer, but accepting
+/// the full range would let a tiny compressed page request a multi-gigabyte
+/// allocation before the decoder can report malformed input.  This cap also
+/// bounds host-delegated codecs (GZIP/ZSTD) at the request boundary.
+pub const MAX_DECOMPRESSED_PAGE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Decompress with a built-in codec. Unsupported codecs return `UnsupportedCodec`,
 /// and the caller falls back to host delegation.
 ///
 /// `out_len` is the decompressed size declared by the page header. The decoder
 /// must never write beyond it (an upper bound against untrusted input).
 pub fn decompress(codec: Compression, src: &[u8], out_len: usize) -> Result<Vec<u8>> {
+    ensure!(out_len <= MAX_DECOMPRESSED_PAGE_BYTES, LimitExceeded);
     match codec {
-        Compression::Uncompressed => Ok(src.to_vec()),
+        Compression::Uncompressed => {
+            ensure!(src.len() == out_len, BadCompressedData);
+            Ok(src.to_vec())
+        }
         Compression::Snappy => {
             let mut out = Vec::with_capacity(out_len);
             snappy_decompress(src, out_len, &mut out)?;
@@ -880,9 +892,30 @@ mod tests {
     // --- Dispatch -----------------------------------------------------------
 
     #[test]
+    fn oversized_page_output_is_rejected_before_codec_allocation() {
+        let oversized = MAX_DECOMPRESSED_PAGE_BYTES + 1;
+        for codec in [Compression::Uncompressed, Compression::Snappy, Compression::Lz4Raw] {
+            assert_eq!(
+                code(decompress(codec, &[], oversized).unwrap_err()),
+                Code::LimitExceeded as u16,
+                "{codec:?} must reject an oversized declared output before decoding"
+            );
+        }
+        #[cfg(feature = "zstd")]
+        assert_eq!(
+            code(decompress(Compression::Zstd, &[], oversized).unwrap_err()),
+            Code::LimitExceeded as u16
+        );
+    }
+
+    #[test]
     fn decompress_dispatch() {
         let raw = decompress(Compression::Uncompressed, b"abc", 3).unwrap();
         assert_eq!(raw, b"abc");
+        assert_eq!(
+            code(decompress(Compression::Uncompressed, b"abc", 2).unwrap_err()),
+            Code::BadCompressedData as u16
+        );
 
         let s = decompress(Compression::Snappy, &hex(SNAPPY_HELLO), 43).unwrap();
         assert!(s == hello());

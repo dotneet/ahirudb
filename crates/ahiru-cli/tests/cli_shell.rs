@@ -199,6 +199,13 @@ fn a_piped_script_runs_statement_by_statement() {
 }
 
 #[test]
+fn noninteractive_default_is_tsv() {
+    let r = run_with_stdin(&[], Some("SELECT 1 AS a, 2 AS b;\n"));
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "a\tb\n1\t2\n");
+}
+
+#[test]
 fn a_piped_script_may_switch_modes_mid_stream() {
     let r = run_with_stdin(&[], Some(".mode csv\nSELECT 1 AS a;\n"));
     assert!(r.ok, "{}", r.stderr);
@@ -223,6 +230,16 @@ fn init_file_runs_before_the_command() {
     let _ = std::fs::remove_file(&p);
     assert!(r.ok, "{}", r.stderr);
     assert_eq!(r.stdout, "three\n3\n");
+}
+
+#[test]
+fn init_file_separator_survives_noninteractive_default_mode() {
+    let p = tmp_file("init_separator", "sql");
+    std::fs::write(&p, ".separator |\n").unwrap();
+    let r = run(&["-init", p.to_str().unwrap(), "-c", "SELECT 1 AS a, 2 AS b"]);
+    let _ = std::fs::remove_file(&p);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "a|b\n1|2\n");
 }
 
 #[test]
@@ -357,6 +374,31 @@ fn dot_once_redirects_exactly_one_statement() {
     assert_eq!(r.stdout, "b\n2\n");
 }
 
+#[test]
+fn dot_once_replaces_pending_excel_state_completely() {
+    let p = tmp_file("once_after_excel", "tsv");
+    let script = format!(".excel\n.once {}\nSELECT 1 AS a, 2 AS b", p.display());
+    let r = run(&["-c", &script]);
+    let written = std::fs::read_to_string(&p).unwrap_or_default();
+    let _ = std::fs::remove_file(&p);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(written, "a\tb\n1\t2\n");
+}
+
+#[test]
+fn replacing_dot_once_with_the_same_path_does_not_flush_stale_bytes_after_truncation() {
+    let p = tmp_file("once_same_path", "tsv");
+    let script = format!(
+        ".once {0}\n.print stale-content-that-must-disappear\n.once {0}\nSELECT 1 AS x",
+        p.display()
+    );
+    let r = run(&["-c", &script]);
+    let written = std::fs::read_to_string(&p).unwrap_or_default();
+    let _ = std::fs::remove_file(&p);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(written, "x\n1\n");
+}
+
 /// Dot-command output goes to the same sink as query results, so a schema
 /// dump can be redirected to a file like anything else.
 #[test]
@@ -454,6 +496,39 @@ fn dot_exit_sets_the_exit_code() {
     let r = run(&["-c", ".exit 3", "-c", "SELECT 1"]);
     assert!(!r.ok);
     assert!(!r.stdout.contains('1'), "statements after .exit must not run: {}", r.stdout);
+}
+
+#[test]
+fn dot_exit_removes_an_unconsumed_excel_temp() {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_ahiru"));
+    c.arg("-no-init")
+        .arg("-c")
+        .arg(".excel\n.shell sleep 5\n.exit")
+        .current_dir(repo_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = c.spawn().expect("failed to spawn ahiru");
+    let pid = child.id();
+    let path = std::env::temp_dir().join(format!("ahiru_{pid}_1.csv"));
+    let mut created = false;
+    for _ in 0..500 {
+        if path.exists() {
+            created = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(created, "the .excel temporary was not created: {}", path.display());
+    let status = child.wait().expect("failed to run ahiru");
+    assert!(status.success());
+    assert!(!path.exists(), "pending .excel temporary survived .exit: {}", path.display());
+}
+
+#[test]
+fn insert_mode_quotes_unsafe_target_names() {
+    let r = run(&["-c", ".mode insert \"x; DROP TABLE y; --\"\nSELECT 1 AS a"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "INSERT INTO \"x; DROP TABLE y; --\" VALUES (1);\n");
 }
 
 // ---- SUMMARIZE -----------------------------------------------------------

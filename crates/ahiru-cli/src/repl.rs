@@ -87,6 +87,18 @@ impl Shell {
         }
     }
 
+    /// Switch to the non-interactive default when no output mode was pinned.
+    /// Interactive sessions use Duckbox, while piped/stdin scripts and `-c`
+    /// jobs use tab-separated output (as documented by the CLI usage text).
+    pub fn use_noninteractive_defaults(&mut self) {
+        if !self.mode_set {
+            self.settings.mode = Mode::Tsv;
+            if !self.sep_explicit {
+                self.settings.separator = Mode::Tsv.default_separator().to_string();
+            }
+        }
+    }
+
     /// Writes a diagnostic (row counts, timings, errors) to the log target.
     fn diag(&mut self, msg: &str) {
         match &mut self.log {
@@ -107,6 +119,19 @@ impl Shell {
         let w = sink.as_write();
         let _ = w.write_all(text.as_bytes());
         let _ = w.flush();
+    }
+
+    /// Cancels a pending `.once`/`.excel` redirect before replacing it.
+    /// `.excel` carries extra CSV settings and a temporary path, so replacing
+    /// only the sink would leak both pieces of state into the new redirect.
+    fn cancel_pending_once(&mut self) {
+        if let Some(mut sink) = self.once.take() {
+            sink.flush();
+        }
+        self.once_settings = None;
+        if let Some(path) = self.excel.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Runs one SQL statement (no dot-command handling).
@@ -339,10 +364,10 @@ impl Shell {
         match cmd {
             "exit" | "quit" => {
                 let code = arg(0).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+                // `process::exit` skips Drop, so explicitly remove an
+                // unconsumed `.excel` temporary before leaving the process.
+                self.cancel_pending_once();
                 self.out.flush();
-                if let Some(mut s) = self.once.take() {
-                    s.flush();
-                }
                 std::process::exit(code as i32);
             }
             "help" => {
@@ -412,6 +437,7 @@ impl Shell {
             }
             "once" => {
                 let p = arg(0).ok_or(".once needs a file name")?;
+                self.cancel_pending_once();
                 self.once = Some(Sink::File(File::create(p).map_err(|e| format!("{p}: {e}"))?));
                 Ok(())
             }
@@ -421,6 +447,7 @@ impl Shell {
                     std::process::id(),
                     self.excel_seq()
                 ));
+                self.cancel_pending_once();
                 self.once = Some(Sink::File(
                     File::create(&p).map_err(|e| format!("{}: {e}", p.display()))?,
                 ));
@@ -529,6 +556,15 @@ impl Shell {
             }
             other => Err(format!("unknown command: .{other} (try .help)").into()),
         }
+    }
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        // EOF or an early CLI error can arrive after `.excel` but before its
+        // one statement. Do not leave that abandoned temporary file behind.
+        self.cancel_pending_once();
+        self.out.flush();
     }
 }
 
@@ -1053,6 +1089,16 @@ mod tests {
         assert_eq!(unescape("\\t"), "\t");
         assert_eq!(unescape("|"), "|");
         assert_eq!(unescape("\\\\"), "\\");
+    }
+
+    #[test]
+    fn dropping_shell_cleans_up_a_pending_excel_file() {
+        let mut shell = Shell::new(&crate::args::Options::default());
+        shell.run_dot(".excel").unwrap();
+        let path = shell.excel.clone().expect(".excel should create a pending path");
+        assert!(path.exists());
+        drop(shell);
+        assert!(!path.exists());
     }
 
     #[test]

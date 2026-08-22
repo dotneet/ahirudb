@@ -13,11 +13,11 @@ use alloc::borrow::Cow;
 
 use crate::parquet::codec;
 use crate::parquet::encoding::{self, RleDecoder};
-use crate::parquet::meta::{decode_page_header, ColumnMetaData, PageHeader};
+use crate::parquet::meta::{decode_page_header, ColumnMetaData, PageHeader, MAX_PAGES_PER_COLUMN};
 use crate::parquet::schema::ColumnDesc;
 use crate::parquet::*;
 use crate::prelude::*;
-use crate::vector::{Bitmap, Data, PhysType, Ty, Vector};
+use crate::vector::{Bitmap, Data, PhysType, Ty, Vector, BATCH_SIZE};
 
 /// Julian day number of the Unix epoch (1970-01-01). Used to convert INT96.
 const JULIAN_EPOCH: i64 = 2_440_588;
@@ -68,17 +68,27 @@ pub fn read_column_chunk(
     num_rows: usize,
     cache: &dyn PageCache,
 ) -> Result<Vector> {
-    let mut out = Vector::with_capacity(desc.ty, num_rows);
+    // Row-group cardinality comes from untrusted footer metadata.  Start with
+    // one execution batch rather than reserving the entire declared count;
+    // malformed metadata must not turn a tiny column chunk into an enormous
+    // allocation before its first page is validated.
+    let mut out = Vector::with_capacity(desc.ty, num_rows.min(BATCH_SIZE));
     // Only accumulate validity for columns that have a definition level.
-    let mut validity =
-        if desc.max_def_level > 0 { Some(Bitmap::with_capacity(num_rows)) } else { None };
+    let mut validity = if desc.max_def_level > 0 {
+        Some(Bitmap::with_capacity(num_rows.min(BATCH_SIZE)))
+    } else {
+        None
+    };
     let mut dict: Option<Vector> = None;
     let mut pos = 0usize;
     let mut rows_done = 0usize;
+    let mut pages_seen = 0usize;
 
     while rows_done < num_rows {
         ensure!(pos < buf.len(), UnexpectedEof, pos);
         let (hdr, hlen) = decode_page_header(&buf[pos..])?;
+        pages_seen = pages_seen.saturating_add(1);
+        ensure!(pages_seen <= MAX_PAGES_PER_COLUMN, LimitExceeded, pos);
         pos += hlen;
         let clen = hdr.compressed_page_size as usize;
         ensure!(clen <= buf.len() - pos, UnexpectedEof, pos);
@@ -91,7 +101,7 @@ pub fn read_column_chunk(
                 dict = Some(decode_dictionary_page(desc, meta, &hdr, raw, raw_off, cache)?);
             }
             _ => {
-                rows_done += decode_one_page(
+                let added = decode_one_page(
                     desc,
                     meta,
                     &hdr,
@@ -102,6 +112,8 @@ pub fn read_column_chunk(
                     &mut validity,
                     cache,
                 )?;
+                ensure!(added <= num_rows - rows_done, BadCompressedData, pos);
+                rows_done += added;
             }
         }
     }
@@ -260,14 +272,21 @@ pub(crate) fn decompress<'a>(
     raw_off: u64,
     cache: &'a dyn PageCache,
 ) -> Result<Cow<'a, [u8]>> {
+    ensure!(out_len >= 0, BadPageHeader);
+    let expected = out_len as usize;
+    ensure!(expected <= codec::MAX_DECOMPRESSED_PAGE_BYTES, LimitExceeded);
     if codec == Compression::Uncompressed {
+        ensure!(raw.len() == expected, BadCompressedData, raw.len());
         return Ok(Cow::Borrowed(raw));
     }
     if codec.is_builtin() {
-        return Ok(Cow::Owned(codec::decompress(codec, raw, out_len.max(0) as usize)?));
+        return Ok(Cow::Owned(codec::decompress(codec, raw, expected)?));
     }
     match cache.get(raw_off, raw.len() as u32) {
-        Some(d) => Ok(Cow::Borrowed(d)),
+        Some(d) => {
+            ensure!(d.len() == expected, BadCompressedData, raw_off as usize);
+            Ok(Cow::Borrowed(d))
+        }
         None => err!(UnsupportedCodec),
     }
 }
@@ -330,6 +349,7 @@ fn read_data_page_v2(
     cache: &dyn PageCache,
 ) -> Result<usize> {
     let dp = hdr.data_page_v2.as_ref().ok_or(err_at(Code::BadPageHeader, 0))?;
+    ensure!(hdr.uncompressed_page_size >= 0, BadPageHeader);
     let n = check_count(dp.num_values)?;
     let rep_len = check_len(dp.repetition_levels_byte_length)?;
     let def_len = check_len(dp.definition_levels_byte_length)?;
@@ -358,6 +378,7 @@ fn read_data_page_v2(
         ensure!(want >= 0, BadPageHeader);
         decompress(meta.codec, values_raw, want as i32, raw_off + def_len as u64, cache)?
     } else {
+        ensure!(raw.len() == hdr.uncompressed_page_size as usize, BadCompressedData);
         Cow::Borrowed(values_raw)
     };
 
@@ -627,6 +648,10 @@ pub(crate) fn is_unsigned(ty: Ty) -> bool {
 fn push_i32_values(desc: &ColumnDesc, vals: &[i32], out: &mut Vector) -> Result<()> {
     match desc.ty.phys() {
         PhysType::I32 => {
+            // Parquet stores INT8/INT16 (and their unsigned variants) in an
+            // INT32 physical slot.  Do not let a malformed annotation turn
+            // an arbitrary INT32 into a value of the narrower SQL type.
+            validate_i32_logical_range(desc.ty, vals)?;
             let d = as_i32_vec(out, vals.len())?;
             d.extend_from_slice(vals);
         }
@@ -659,6 +684,24 @@ fn push_i32_values(desc: &ColumnDesc, vals: &[i32], out: &mut Vector) -> Result<
         }
         _ => err!(UnsupportedType),
     }
+    Ok(())
+}
+
+/// Check the logical width of integer annotations stored as Parquet INT32.
+///
+/// The physical representation is deliberately wider than the SQL value for
+/// INT8/UINT8/INT16/UINT16.  A writer can still put any INT32 in such a page,
+/// so accepting it would silently produce values outside the schema's stated
+/// domain (and would treat negative values as valid unsigned values).
+fn validate_i32_logical_range(ty: Ty, vals: &[i32]) -> Result<()> {
+    let valid = match ty {
+        Ty::TinyInt => vals.iter().all(|&v| (-128..=127).contains(&v)),
+        Ty::SmallInt => vals.iter().all(|&v| (-32_768..=32_767).contains(&v)),
+        Ty::UTinyInt => vals.iter().all(|&v| (0..=255).contains(&v)),
+        Ty::USmallInt => vals.iter().all(|&v| (0..=65_535).contains(&v)),
+        _ => true,
+    };
+    ensure!(valid, ValueOutOfRange);
     Ok(())
 }
 
@@ -867,10 +910,14 @@ pub fn collect_codec_pages(
 
         match hdr.ptype {
             PageType::DataPage => {
-                rows_done += hdr.data_page.as_ref().map_or(0, |d| d.num_values.max(0) as usize)
+                let added = hdr.data_page.as_ref().map_or(0, |d| d.num_values.max(0) as usize);
+                ensure!(added <= num_rows - rows_done, BadCompressedData, pos);
+                rows_done += added;
             }
             PageType::DataPageV2 => {
-                rows_done += hdr.data_page_v2.as_ref().map_or(0, |d| d.num_values.max(0) as usize)
+                let added = hdr.data_page_v2.as_ref().map_or(0, |d| d.num_values.max(0) as usize);
+                ensure!(added <= num_rows - rows_done, BadCompressedData, pos);
+                rows_done += added;
             }
             _ => {}
         }
@@ -917,28 +964,38 @@ fn push_codec_page(
     clen: usize,
     out: &mut Vec<CodecPage>,
 ) -> Result<()> {
+    ensure!(out.len() < MAX_PAGES_PER_COLUMN, LimitExceeded);
+    let total_out_len = check_page_size(hdr.uncompressed_page_size)?;
     // v2 has uncompressed levels at the start, so only the range excluding that is delegated.
     let (off, len, out_len) = match (&hdr.data_page_v2, hdr.ptype) {
         (Some(dp), PageType::DataPageV2) => {
-            let skip = check_len(dp.repetition_levels_byte_length)?
-                + check_len(dp.definition_levels_byte_length)?;
+            let rep_len = check_len(dp.repetition_levels_byte_length)?;
+            let def_len = check_len(dp.definition_levels_byte_length)?;
+            ensure!(rep_len <= usize::MAX - def_len, BadPageHeader);
+            let skip = rep_len + def_len;
             ensure!(skip <= clen, BadPageHeader);
+            ensure!(skip <= total_out_len, BadPageHeader);
             if !dp.is_compressed {
                 (0, 0, 0)
             } else {
-                (
-                    raw_off + skip as u64,
-                    (clen - skip) as u32,
-                    (hdr.uncompressed_page_size as usize).saturating_sub(skip) as u32,
-                )
+                (raw_off + skip as u64, (clen - skip) as u32, (total_out_len - skip) as u32)
             }
         }
-        _ => (raw_off, clen as u32, hdr.uncompressed_page_size.max(0) as u32),
+        _ => (raw_off, clen as u32, total_out_len as u32),
     };
     if len > 0 {
         out.push(CodecPage { codec: meta.codec, offset: off, len, out_len });
     }
     Ok(())
+}
+
+/// Validate a page header's decompressed byte count before either allocating
+/// a built-in output buffer or asking the host to allocate one.
+fn check_page_size(size: i32) -> Result<usize> {
+    ensure!(size >= 0, BadPageHeader);
+    let size = size as usize;
+    ensure!(size <= codec::MAX_DECOMPRESSED_PAGE_BYTES, LimitExceeded);
+    Ok(size)
 }
 
 /// Enumerate the pages that need decompression delegated to the host, from
@@ -979,6 +1036,130 @@ fn push_codec_page_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parquet::meta::DataPageHeaderV2;
+
+    #[test]
+    fn uncompressed_pages_must_match_the_declared_size() {
+        let cache = NoPageCache;
+        assert_eq!(
+            crate::error::code_of(decompress(Compression::Uncompressed, b"abc", 2, 0, &cache,)),
+            Some(Code::BadCompressedData)
+        );
+        assert_eq!(
+            decompress(Compression::Uncompressed, b"abc", 3, 0, &cache).unwrap().as_ref(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn page_output_limit_applies_to_uncompressed_and_delegated_pages() {
+        let cache = NoPageCache;
+        let oversized = (codec::MAX_DECOMPRESSED_PAGE_BYTES + 1) as i32;
+        assert_eq!(
+            crate::error::code_of(decompress(Compression::Uncompressed, &[], oversized, 0, &cache)),
+            Some(Code::LimitExceeded)
+        );
+        assert_eq!(
+            crate::error::code_of(decompress(Compression::Gzip, &[], oversized, 0, &cache)),
+            Some(Code::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn huge_row_group_count_does_not_preallocate_the_declared_count() {
+        let desc = ColumnDesc {
+            name: "i".into(),
+            ty: Ty::Int,
+            nullable: false,
+            max_def_level: 0,
+            ptype: PType::Int32,
+            type_length: 0,
+            time_unit: None,
+            phys_cols: Vec::new(),
+            leaves: Vec::new(),
+            nested: None,
+        };
+        let meta = ColumnMetaData {
+            ptype: PType::Int32,
+            encodings: Vec::new(),
+            path_in_schema: Vec::new(),
+            codec: Compression::Uncompressed,
+            num_values: 0,
+            total_uncompressed_size: 0,
+            total_compressed_size: 0,
+            data_page_offset: 0,
+            index_page_offset: None,
+            dictionary_page_offset: None,
+            statistics: None,
+            bloom_filter_offset: None,
+            bloom_filter_length: None,
+        };
+        assert_eq!(
+            crate::error::code_of(read_column_chunk(
+                &desc,
+                &meta,
+                &[],
+                0,
+                usize::MAX,
+                &NoPageCache,
+            )),
+            Some(Code::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn delegated_page_scan_rejects_oversized_output_and_level_underflow() {
+        let meta = ColumnMetaData {
+            ptype: PType::Int32,
+            encodings: Vec::new(),
+            path_in_schema: Vec::new(),
+            codec: Compression::Gzip,
+            num_values: 1,
+            total_uncompressed_size: 0,
+            total_compressed_size: 0,
+            data_page_offset: 0,
+            index_page_offset: None,
+            dictionary_page_offset: None,
+            statistics: None,
+            bloom_filter_offset: None,
+            bloom_filter_length: None,
+        };
+        let oversized = PageHeader {
+            ptype: PageType::DataPage,
+            uncompressed_page_size: (codec::MAX_DECOMPRESSED_PAGE_BYTES + 1) as i32,
+            compressed_page_size: 1,
+            crc: None,
+            data_page: None,
+            dict_page: None,
+            data_page_v2: None,
+        };
+        assert_eq!(
+            crate::error::code_of(push_codec_page(&meta, &oversized, 0, 1, &mut Vec::new())),
+            Some(Code::LimitExceeded)
+        );
+
+        let bad_v2 = PageHeader {
+            ptype: PageType::DataPageV2,
+            uncompressed_page_size: 1,
+            compressed_page_size: 2,
+            crc: None,
+            data_page: None,
+            dict_page: None,
+            data_page_v2: Some(DataPageHeaderV2 {
+                num_values: 1,
+                num_nulls: 0,
+                num_rows: 1,
+                encoding: Encoding::Plain,
+                definition_levels_byte_length: 2,
+                repetition_levels_byte_length: 0,
+                is_compressed: true,
+            }),
+        };
+        assert_eq!(
+            crate::error::code_of(push_codec_page(&meta, &bad_v2, 0, 2, &mut Vec::new())),
+            Some(Code::BadPageHeader)
+        );
+    }
 
     #[test]
     fn be_signed_handles_sign_extension() {
@@ -1038,6 +1219,45 @@ mod tests {
         // -1i32 is 4294967295 as a u32.
         push_i32_values(&desc, &[-1, 7], &mut v).unwrap();
         assert_eq!(v.i64s(), &[4_294_967_295, 7]);
+    }
+
+    #[test]
+    fn narrow_integer_annotations_reject_out_of_range_int32_values() {
+        let make_desc = |ty| ColumnDesc {
+            name: "narrow".into(),
+            ty,
+            nullable: false,
+            max_def_level: 0,
+            ptype: PType::Int32,
+            type_length: 0,
+            time_unit: None,
+            phys_cols: Vec::new(),
+            leaves: Vec::new(),
+            nested: None,
+        };
+
+        // Check both the lower and upper boundary for each logical width.
+        for (ty, valid, invalid) in [
+            (Ty::TinyInt, -128, -129),
+            (Ty::TinyInt, 127, 128),
+            (Ty::SmallInt, -32_768, -32_769),
+            (Ty::SmallInt, 32_767, 32_768),
+            (Ty::UTinyInt, 0, -1),
+            (Ty::UTinyInt, 255, 256),
+            (Ty::USmallInt, 0, -1),
+            (Ty::USmallInt, 65_535, 65_536),
+        ] {
+            let desc = make_desc(ty);
+            let mut accepted = Vector::with_capacity(ty, 1);
+            push_i32_values(&desc, &[valid], &mut accepted).unwrap();
+
+            let mut rejected = Vector::with_capacity(ty, 1);
+            assert_eq!(
+                crate::error::code_of(push_i32_values(&desc, &[invalid], &mut rejected)),
+                Some(Code::ValueOutOfRange),
+                "{ty:?} accepted {invalid}"
+            );
+        }
     }
 
     #[test]

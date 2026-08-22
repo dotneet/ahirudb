@@ -16,6 +16,11 @@ use crate::rt::hash::eq_ascii_ci;
 use crate::vector::Value;
 use crate::vector::{Field, Ty};
 
+/// Maximum decompressed codec bytes retained for one source while a split is
+/// waiting to be decoded. This bounds the aggregate of many individually
+/// valid pages, not just the per-page cap in `parquet::codec`.
+pub const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+
 /// The set of byte ranges fetched so far.
 pub struct Source {
     pub total_len: u64,
@@ -53,7 +58,11 @@ impl Source {
 
     /// Registers fetched bytes. Adjacent and overlapping ranges are coalesced.
     pub fn insert(&mut self, off: u64, data: Vec<u8>) {
-        if data.is_empty() {
+        // A Source never stores bytes outside the file it describes.  Besides keeping
+        // `is_complete` meaningful, this guard prevents the coalescing arithmetic below
+        // from overflowing when a malformed host request supplies an offset near `u64::MAX`.
+        let Some(end) = off.checked_add(data.len() as u64) else { return };
+        if data.is_empty() || off > self.total_len || end > self.total_len {
             return;
         }
         self.chunks.push((off, data));
@@ -76,11 +85,12 @@ impl Source {
 
     /// Returns the parts of the requested range that have not been fetched yet.
     pub fn missing(&self, off: u64, len: u64) -> Option<(u64, u64)> {
-        if len == 0 || self.get(off, len as usize).is_some() {
-            None
-        } else {
-            Some((off, len.min(self.total_len.saturating_sub(off))))
+        let len = len.min(self.total_len.saturating_sub(off));
+        if len == 0 {
+            return None;
         }
+        let Ok(in_memory_len) = usize::try_from(len) else { return Some((off, len)) };
+        self.get(off, in_memory_len).is_none().then_some((off, len))
     }
 
     pub fn is_complete(&self) -> bool {
@@ -88,12 +98,17 @@ impl Source {
     }
 
     /// Registers a page the host decompressed.
-    pub fn insert_decoded(&mut self, offset: u64, len: u32, data: Vec<u8>) {
+    pub fn insert_decoded(&mut self, offset: u64, len: u32, data: Vec<u8>) -> Result<()> {
+        let old_len = self.decoded.iter().find(|(k, _)| *k == (offset, len)).map(|(_, d)| d.len());
+        let total = checked_decoded_bytes(self.decoded_bytes(), old_len, data.len())?;
         if let Some(e) = self.decoded.iter_mut().find(|(k, _)| *k == (offset, len)) {
             e.1 = data;
-            return;
+            debug_assert_eq!(self.decoded_bytes(), total);
+            return Ok(());
         }
         self.decoded.push(((offset, len), data));
+        debug_assert_eq!(self.decoded_bytes(), total);
+        Ok(())
     }
 
     /// Whether a decompressed page is already present.
@@ -102,7 +117,7 @@ impl Source {
     }
 
     pub fn decoded_bytes(&self) -> usize {
-        self.decoded.iter().map(|(_, d)| d.len()).sum()
+        self.decoded.iter().fold(0usize, |total, (_, d)| total.saturating_add(d.len()))
     }
 
     /// Discards decompressed pages. Called once a split has been fully processed.
@@ -110,6 +125,25 @@ impl Source {
     pub fn clear_decoded(&mut self) {
         self.decoded.clear();
     }
+}
+
+/// Calculate the post-insert retained size without allocating. `old_len` is
+/// the length of an existing entry being replaced, if any.
+fn checked_decoded_bytes(current: usize, old_len: Option<usize>, incoming: usize) -> Result<usize> {
+    ensure!(incoming <= crate::parquet::codec::MAX_DECOMPRESSED_PAGE_BYTES, LimitExceeded);
+    let base = match old_len {
+        Some(old) => match current.checked_sub(old) {
+            Some(base) => base,
+            None => err!(Internal),
+        },
+        None => current,
+    };
+    let total = match base.checked_add(incoming) {
+        Some(total) => total,
+        None => err!(Oom),
+    };
+    ensure!(total <= MAX_DECODED_BYTES, Oom);
+    Ok(total)
 }
 
 impl crate::parquet::reader::PageCache for Source {
@@ -600,6 +634,7 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::code_of;
     use crate::format::{CodecTask, Pruner, ResolveStep};
     use crate::vector::Vector;
 
@@ -649,6 +684,37 @@ mod tests {
     fn missing_range_is_clamped_to_file_length() {
         let s = Source::remote(120);
         assert_eq!(s.missing(100, 500), Some((100, 20)));
+    }
+
+    #[test]
+    fn source_rejects_ranges_outside_declared_file_length() {
+        let mut s = Source::remote(10);
+        s.insert(9, vec![1, 2]);
+        s.insert(u64::MAX, vec![3]);
+        assert_eq!(s.get(9, 1), None);
+        assert_eq!(s.missing(9, 1), Some((9, 1)));
+        assert_eq!(s.missing(10, 1), None);
+
+        s.insert(9, vec![4]);
+        assert_eq!(s.missing(9, 2), None, "the in-file portion is already cached");
+    }
+
+    #[test]
+    fn decoded_page_budget_rejects_per_page_and_aggregate_overflow() {
+        assert_eq!(
+            code_of(checked_decoded_bytes(
+                0,
+                None,
+                crate::parquet::codec::MAX_DECOMPRESSED_PAGE_BYTES + 1,
+            )),
+            Some(Code::LimitExceeded)
+        );
+        assert_eq!(code_of(checked_decoded_bytes(MAX_DECODED_BYTES - 1, None, 2)), Some(Code::Oom));
+        // Replacing one page charges only the new value, not the old entry twice.
+        assert_eq!(
+            checked_decoded_bytes(MAX_DECODED_BYTES, Some(4), 4).unwrap(),
+            MAX_DECODED_BYTES
+        );
     }
 
     #[test]

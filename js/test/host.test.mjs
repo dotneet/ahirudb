@@ -18,9 +18,11 @@ import {
   Batch,
   MemoryCache,
   coalesceRanges,
+  dateToDate,
   decodeBatch,
   decodeCodecRequests,
   decodeIoRequests,
+  decodeSchema,
   detectFormat,
   encodeParams,
   timestampToDate,
@@ -105,6 +107,20 @@ const NOZSTD_SKIP = (() => {
 async function openFullDb(options = {}) {
   return AhiruDB.init({ wasmUrl: FULL_WASM, ...options });
 }
+
+test('stale session handles cannot close a reused wasm session slot', async () => {
+  const { instance } = await WebAssembly.instantiate(await readFile(FULL_WASM), {});
+  const { ahiru_session_new, ahiru_session_free, ahiru_set_now } = instance.exports;
+
+  const stale = ahiru_session_new();
+  ahiru_session_free(stale);
+  const live = ahiru_session_new();
+  assert.notEqual(live, stale, 'reused session slots must receive a new generation');
+
+  ahiru_session_free(stale);
+  assert.equal(ahiru_set_now(live, 1n), 0, 'a stale free must not close the live session');
+  ahiru_session_free(live);
+});
 
 /**
  * The expression VM (crates/ahiru-core/src/expr/vm.rs) is still a stub, and
@@ -232,12 +248,158 @@ test('decodeBatch reads columnar buffers according to their types', () => {
   assert.ok(batch.column('b') instanceof BigInt64Array);
   assert.equal(batch.isNull('i', 1), true);
   assert.equal(batch.get('i', 1), null);
+  assert.throws(
+    () => batch.column(6),
+    (e) => e instanceof AhiruError && e.code === Code.COLUMN_NOT_FOUND,
+  );
+  for (const row of [-1, 1.5, 3]) {
+    assert.throws(
+      () => batch.get('i', row),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+    );
+    assert.throws(
+      () => batch.isNull('i', row),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+    );
+  }
 });
 
 test('decodeBatch rejects a bad magic number', () => {
   const buf = encodeBatch(0, []);
   buf[0] = 0;
   assert.throws(() => decodeBatch(buf, []), (e) => e instanceof AhiruError && e.code === 900);
+});
+
+test('wire decoders reject truncated schemas and result columns as AhiruError', () => {
+  const schema = new Uint8Array(4);
+  new DataView(schema.buffer).setUint32(0, 1, true);
+  assert.throws(
+    () => decodeSchema(schema),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+  const badDecimal = new Uint8Array(4 + 20);
+  const badDecimalDv = new DataView(badDecimal.buffer);
+  badDecimalDv.setUint32(0, 1, true);
+  badDecimalDv.setUint32(4, 13, true); // DECIMAL
+  badDecimalDv.setUint32(8, 2, true); // physical I64
+  badDecimalDv.setUint32(12, 0, true); // precision is invalid
+  badDecimalDv.setUint32(16, 1, true); // scale exceeds precision
+  badDecimalDv.setUint32(20, 0, true); // empty name
+  assert.throws(
+    () => decodeSchema(badDecimal),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+
+  const badPhysicalType = new Uint8Array(4 + 20);
+  const badPhysicalDv = new DataView(badPhysicalType.buffer);
+  badPhysicalDv.setUint32(0, 1, true);
+  badPhysicalDv.setUint32(4, 13, true); // DECIMAL(10, 1) must be physical I64.
+  badPhysicalDv.setUint32(8, 3, true); // F64 is not a valid DECIMAL representation.
+  badPhysicalDv.setUint32(12, 10, true);
+  badPhysicalDv.setUint32(16, 1, true);
+  badPhysicalDv.setUint32(20, 0, true);
+  assert.throws(
+    () => decodeSchema(badPhysicalType),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+
+  const result = new Uint8Array(12 + 12);
+  const dv = new DataView(result.buffer);
+  dv.setUint32(0, 0x41485231, true);
+  dv.setUint32(4, 1, true);
+  dv.setUint32(8, 1, true);
+  dv.setUint32(12, 1, true); // I32
+  dv.setUint32(16, 0, true); // no validity bitmap
+  dv.setUint32(20, 0, true); // but one row needs four data bytes
+  assert.throws(
+    () =>
+      decodeBatch(result, [
+        { name: 'x', type: 'INTEGER', typeCode: 4, physType: 1, precision: 0 },
+      ]),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+});
+
+test('wire decoders reject invalid UTF-8 instead of silently replacing it', () => {
+  const schema = new Uint8Array(4 + 20 + 1);
+  const schemaDv = new DataView(schema.buffer);
+  schemaDv.setUint32(0, 1, true);
+  schemaDv.setUint32(4, 14, true); // VARCHAR
+  schemaDv.setUint32(8, 5, true); // BYTES
+  schemaDv.setUint32(20, 1, true); // name_len
+  schema[24] = 0xff;
+  assert.throws(
+    () => decodeSchema(schema),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+
+  const result = new Uint8Array(12 + 8 + 4 + 8 + 4 + 1);
+  const resultDv = new DataView(result.buffer);
+  let p = 0;
+  resultDv.setUint32(p, 0x41485231, true); p += 4;
+  resultDv.setUint32(p, 1, true); p += 4;
+  resultDv.setUint32(p, 1, true); p += 4;
+  resultDv.setUint32(p, 5, true); p += 4; // BYTES
+  resultDv.setUint32(p, 0, true); p += 4; // no validity bitmap
+  resultDv.setUint32(p, 8, true); p += 4; // offsets_len
+  resultDv.setUint32(p, 0, true); p += 4;
+  resultDv.setUint32(p, 1, true); p += 4;
+  resultDv.setUint32(p, 1, true); p += 4; // data_len
+  result[p] = 0xff;
+  assert.throws(
+    () => decodeBatch(result, [{ name: 's', type: 'VARCHAR', typeCode: 14, physType: 5 }]),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+});
+
+test('decodeBatch rejects schema and physical-column mismatches as AhiruError', () => {
+  const result = new Uint8Array(12 + 12 + 8);
+  const dv = new DataView(result.buffer);
+  dv.setUint32(0, 0x41485231, true);
+  dv.setUint32(4, 1, true);
+  dv.setUint32(8, 1, true);
+  dv.setUint32(12, 3, true); // F64
+  dv.setUint32(16, 0, true);
+  dv.setUint32(20, 8, true);
+  dv.setFloat64(24, 1.5, true);
+
+  assert.throws(
+    () => decodeBatch(result, []),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+  assert.throws(
+    () =>
+      decodeBatch(result, [
+        { name: 'x', type: 'INTEGER', typeCode: 4, physType: 1, precision: 0 },
+      ]),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+});
+
+test('decodeBatch does not format a NULL UUID placeholder as a real value', () => {
+  const uuid = Uint8Array.from({ length: 16 }, (_, i) => i);
+  const result = new Uint8Array(12 + 8 + 8 + 4 + 12 + 4 + 16);
+  const dv = new DataView(result.buffer);
+  let p = 0;
+  dv.setUint32(p, 0x41485231, true); p += 4;
+  dv.setUint32(p, 1, true); p += 4;
+  dv.setUint32(p, 2, true); p += 4;
+  dv.setUint32(p, 5, true); p += 4; // Bytes
+  dv.setUint32(p, 8, true); p += 4; // validity bitmap (row 1 is NULL)
+  dv.setBigUint64(p, 1n, true); p += 8;
+  dv.setUint32(p, 12, true); p += 4; // three u32 offsets
+  dv.setUint32(p, 0, true); p += 4;
+  dv.setUint32(p, 16, true); p += 4;
+  dv.setUint32(p, 16, true); p += 4;
+  dv.setUint32(p, 16, true); p += 4;
+  result.set(uuid, p);
+
+  const batch = decodeBatch(result, [
+    { name: 'u', type: 'UUID', typeCode: 21, physType: 5, precision: 0 },
+  ]);
+  assert.equal(batch.get('u', 0), '00010203-0405-0607-0809-0a0b0c0d0e0f');
+  assert.equal(batch.get('u', 1), null);
+  assert.equal(batch.column('u')[1], '');
 });
 
 // --- Range coalescing --------------------------------------------------------
@@ -268,6 +430,13 @@ test('coalesceRanges fills gaps smaller than 1 MB into a single range', () => {
     coalesceRanges([{ offset: 60, len: 100 }, { offset: 0, len: 10 }, { offset: 70, len: 5 }], 0, 120),
     [{ offset: 0, len: 10 }, { offset: 60, len: 60 }],
   );
+  for (const gap of [NaN, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => coalesceRanges([], gap),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+      `expected invalid coalescing gap ${String(gap)} to be rejected`,
+    );
+  }
 });
 
 // --- Cache -------------------------------------------------------------------
@@ -285,6 +454,33 @@ test('MemoryCache evicts LRU entries at the capacity limit', () => {
   // An entry that exceeds the limit on its own is not admitted (it would evict everything else)
   c.set('big', new Uint8Array(1000));
   assert.equal(c.get('big'), undefined);
+});
+
+test('MemoryCache rejects ambiguous byte limits', () => {
+  for (const value of [NaN, -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => new MemoryCache(value),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+      `expected ${String(value)} to be rejected`,
+    );
+  }
+  assert.equal(new MemoryCache(0).size, 0);
+  assert.equal(new MemoryCache(Number.MAX_SAFE_INTEGER).size, 0);
+  const cache = new MemoryCache(1);
+  assert.throws(
+    () => {
+      cache.maxBytes = NaN;
+    },
+    (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+  );
+
+  const resized = new MemoryCache(4);
+  resized.set('oldest', Uint8Array.of(1, 2));
+  resized.set('newest', Uint8Array.of(3, 4));
+  resized.maxBytes = 2;
+  assert.equal(resized.size, 2);
+  assert.equal(resized.get('oldest'), undefined);
+  assert.deepEqual(resized.get('newest'), Uint8Array.of(3, 4));
 });
 
 // --- Error code table --------------------------------------------------------
@@ -396,6 +592,38 @@ test('TIMESTAMP comes back as microsecond BigInt and the helper turns it into a 
   }
 });
 
+test('temporal helpers reject lossy numeric inputs and Date overflow', () => {
+  const invalid = [NaN, 0.5, Number.MAX_SAFE_INTEGER + 1];
+  for (const value of invalid) {
+    assert.throws(
+      () => timestampToDate(value),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+      `timestamp ${String(value)} should be rejected`,
+    );
+    assert.throws(
+      () => unpackInterval(value),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+      `interval ${String(value)} should be rejected`,
+    );
+    assert.throws(
+      () => dateToDate(value),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+      `date ${String(value)} should be rejected`,
+    );
+  }
+  assert.equal(timestampToDate(1001n).getTime(), 1);
+  assert.equal(dateToDate(1).getTime(), 86400000);
+  assert.deepEqual(unpackInterval(0), { months: 0, days: 0, micros: 0n });
+  assert.throws(
+    () => timestampToDate(8_640_000_000_000_001_000n),
+    (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+  );
+  assert.throws(
+    () => dateToDate(100_000_001),
+    (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+  );
+});
+
 // --- Real data: range fetching -----------------------------------------------
 
 /** A fake fetch that slices a local buffer by Range. Records every request. */
@@ -497,6 +725,77 @@ test('escaped quotes in a file-table path are registered as one path', async () 
       false,
       'a truncated path was fetched instead of the escaped path',
     );
+  } finally {
+    db.close();
+  }
+});
+
+test('SQL URL policy can disable automatic URL registration without affecting explicit sources', async () => {
+  const calls = [];
+  const db = await openDb({
+    sqlUrlPolicy: async (url, context) => {
+      calls.push({ url, ...context });
+      return false;
+    },
+  });
+  try {
+    const url = 'https://example.invalid/private.parquet?token=POLICY_SECRET';
+    await assert.rejects(
+      () => db.query(`SELECT id FROM parquet('${url}') LIMIT 1`),
+      (e) => {
+        assert.ok(e instanceof AhiruError);
+        assert.equal(e.code, Code.UNSUPPORTED_FEATURE);
+        assert.ok(!e.message.includes('POLICY_SECRET'));
+        return true;
+      },
+    );
+    assert.deepEqual(calls, [
+      { url, functionName: 'parquet', sql: `SELECT id FROM parquet('${url}') LIMIT 1` },
+    ]);
+
+    db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
+  } finally {
+    db.close();
+  }
+});
+
+test('sqlUrlPolicy false rejects SQL URLs before any fetch', async () => {
+  let fetches = 0;
+  const db = await openDb({
+    sqlUrlPolicy: false,
+    fetch: async () => {
+      fetches++;
+      throw new Error('policy should reject before fetch');
+    },
+  });
+  try {
+    await assert.rejects(
+      () => db.query("SELECT id FROM parquet('https://127.0.0.1/secret.parquet') LIMIT 1"),
+      (e) => e instanceof AhiruError && e.code === Code.UNSUPPORTED_FEATURE,
+    );
+    assert.equal(fetches, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test('policy-gated SQL URLs disable HTTP redirects at the fetch boundary', async () => {
+  const calls = [];
+  const db = await openDb({
+    sqlUrlPolicy: () => true,
+    fetch: async (_target, init = {}) => {
+      calls.push(init);
+      if (init.redirect === 'error') throw new TypeError('redirect blocked');
+      throw new Error('test requires redirect protection');
+    },
+  });
+  try {
+    await assert.rejects(
+      () => db.query("SELECT id FROM parquet('https://example.invalid/redirect.parquet') LIMIT 1"),
+      (e) => e instanceof AhiruError && e.code === Code.IO_FAILED,
+    );
+    assert.ok(calls.length >= 2, 'HEAD fallback should attempt both requests');
+    assert.ok(calls.every((init) => init.redirect === 'error'));
   } finally {
     db.close();
   }
@@ -813,6 +1112,93 @@ test('a ByteSource that returns a short read fails instead of spinning', async (
   }
 });
 
+test('a ByteSource with an invalid size fails with VALUE_OUT_OF_RANGE', async () => {
+  const db = await openDb();
+  try {
+    db.registerParquet('t', {
+      key: 'bad-size',
+      size: Number.MAX_SAFE_INTEGER + 1,
+      read: () => new Uint8Array(0),
+    });
+    await assert.rejects(
+      () => db.query('SELECT id FROM t LIMIT 1'),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('a Blob-like source with an unsafe size fails with VALUE_OUT_OF_RANGE', async () => {
+  const db = await openDb();
+  try {
+    db.registerParquet('t', {
+      size: Number.MAX_SAFE_INTEGER + 1,
+      arrayBuffer: async () => new ArrayBuffer(0),
+      slice: () => ({ arrayBuffer: async () => new ArrayBuffer(0) }),
+    });
+    await assert.rejects(
+      () => db.query('SELECT id FROM t LIMIT 1'),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('an unsafe HEAD Content-Length is rejected without a fallback range request', async () => {
+  let calls = 0;
+  const db = await openDb({
+    fetch: async (_target, init = {}) => {
+      calls++;
+      assert.equal(init.method, 'HEAD', 'an invalid successful HEAD must not be retried as GET');
+      return new Response(null, {
+        headers: { 'content-length': String(Number.MAX_SAFE_INTEGER + 1) },
+      });
+    },
+  });
+  try {
+    db.registerParquet('t', 'https://example.invalid/unsafe-size.parquet');
+    await assert.rejects(
+      () => db.query('SELECT id FROM t LIMIT 1'),
+      (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('close during a pending range read aborts the run safely', async () => {
+  const fileBytes = new Uint8Array(await readFile(BASIC));
+  let entered;
+  const enteredPromise = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let release;
+  const releasePromise = new Promise((resolve) => {
+    release = resolve;
+  });
+  const db = await openDb();
+  db.registerParquet('t', {
+    key: 'close-during-read',
+    size: fileBytes.length,
+    read: async (offset, len) => {
+      entered();
+      await releasePromise;
+      return fileBytes.subarray(offset, offset + len);
+    },
+  });
+  const running = db.query('SELECT id FROM t LIMIT 1');
+  await enteredPromise;
+  db.close();
+  release();
+  await assert.rejects(
+    running,
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+});
+
 test('decodeIoRequests rejects an offset beyond Number.MAX_SAFE_INTEGER instead of truncating it', () => {
   const buf = new Uint8Array(4 + 24);
   const dv = new DataView(buf.buffer);
@@ -823,6 +1209,36 @@ test('decodeIoRequests rejects an offset beyond Number.MAX_SAFE_INTEGER instead 
   dv.setBigUint64(20, 10n, true); // len
   assert.throws(
     () => decodeIoRequests(buf),
+    (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+  );
+});
+
+test('decodeIoRequests rejects a range whose end crosses Number.MAX_SAFE_INTEGER', () => {
+  const buf = new Uint8Array(4 + 24);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, 1, true);
+  dv.setBigUint64(12, BigInt(Number.MAX_SAFE_INTEGER - 4), true);
+  dv.setBigUint64(20, 10n, true);
+  assert.throws(
+    () => decodeIoRequests(buf),
+    (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+  );
+});
+
+test('wire decoders report truncated request buffers as AhiruError', () => {
+  assert.throws(
+    () => decodeIoRequests(Uint8Array.of(1, 0, 0, 0)),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+  assert.throws(
+    () => decodeCodecRequests(Uint8Array.of(1, 0, 0, 0)),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+});
+
+test('coalesceRanges rejects an unsafe range end before creating a Range header', () => {
+  assert.throws(
+    () => coalesceRanges([{ offset: Number.MAX_SAFE_INTEGER - 4, len: 10 }]),
     (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
   );
 });
@@ -875,6 +1291,78 @@ test('a network failure redacts userinfo and the query string too', async () => 
   } finally {
     db.close();
   }
+});
+
+test('a response body failure is normalized and redacts the URL', async () => {
+  const url = 'https://example.invalid/data.parquet?token=SECRET_BODY';
+  const fetchImpl = async (_target, init = {}) => {
+    if ((init.method ?? 'GET') === 'HEAD') {
+      return new Response(null, { headers: { 'content-length': '1000' } });
+    }
+    return {
+      ok: true,
+      status: 206,
+      headers: new Headers({ 'content-range': 'bytes 0-999/1000' }),
+      arrayBuffer: async () => {
+        throw new Error('body stream failed');
+      },
+    };
+  };
+  const db = await openDb({ fetch: fetchImpl });
+  try {
+    db.registerParquet('t', url);
+    await assert.rejects(
+      () => db.query('SELECT id FROM t'),
+      (e) => {
+        assert.ok(e instanceof AhiruError);
+        assert.equal(e.code, Code.IO_FAILED);
+        assert.ok(!e.message.includes('SECRET_BODY'), `token leaked into the error: ${e.message}`);
+        assert.ok(e.message.includes('read https://example.invalid/data.parquet response failed'));
+        return true;
+      },
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('a WASM response body failure is normalized and redacts the URL', async () => {
+  const url = 'https://example.invalid/ahirudb.wasm?token=SECRET_WASM_BODY';
+  await assert.rejects(
+    () =>
+      AhiruDB.init({
+        wasmUrl: url,
+        fetch: async () => ({
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => {
+            throw new Error('wasm body stream failed');
+          },
+        }),
+      }),
+    (e) => {
+      assert.ok(e instanceof AhiruError);
+      assert.equal(e.code, Code.IO_FAILED);
+      assert.ok(!e.message.includes('SECRET_WASM_BODY'));
+      assert.ok(e.message.includes('read https://example.invalid/ahirudb.wasm response failed'));
+      return true;
+    },
+  );
+});
+
+test('wasm loading redacts query tokens from HTTP errors', async () => {
+  const url = 'https://example.invalid/ahirudb.wasm?token=SECRET789';
+  await assert.rejects(
+    () => AhiruDB.init({ wasmUrl: url, fetch: async () => new Response('nope', { status: 403 }) }),
+    (e) => {
+      assert.ok(e instanceof AhiruError);
+      assert.equal(e.code, Code.IO_FAILED);
+      assert.ok(!e.message.includes('SECRET789'), `token leaked into the error: ${e.message}`);
+      assert.ok(!e.message.includes('token='), `query string leaked into the error: ${e.message}`);
+      assert.ok(e.message.includes('https://example.invalid/ahirudb.wasm'));
+      return true;
+    },
+  );
 });
 
 // --- Errors ------------------------------------------------------------------
@@ -1014,6 +1502,18 @@ test('exceeding memoryLimit stops with E501', async () => {
     );
   } finally {
     db.close();
+  }
+});
+
+test('init rejects ambiguous cacheSize and memoryLimit values', async () => {
+  for (const option of ['cacheSize', 'memoryLimit']) {
+    for (const value of [NaN, -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(
+        () => openDb({ [option]: value }),
+        (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
+        `expected ${option}=${String(value)} to be rejected`,
+      );
+    }
   }
 });
 
@@ -1420,6 +1920,19 @@ test('decodeCodecRequests reads the request list', () => {
   ]);
 });
 
+test('decodeCodecRequests rejects a page output size that could exhaust host memory', () => {
+  const buf = new Uint8Array(4 + 28);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, 1, true);
+  // Leave the request otherwise well formed; only the declared output is hostile.
+  dv.setUint32(12, 2, true); // GZIP
+  dv.setUint32(28, 256 * 1024 * 1024 + 1, true);
+  assert.throws(
+    () => decodeCodecRequests(buf),
+    (e) => e instanceof AhiruError && e.code === Code.LIMIT_EXCEEDED,
+  );
+});
+
 const GZIP_PARQUET = join(ROOT, 'tests/data/gzip.parquet');
 
 /** Smooths over the BigInt vs number difference only. duckdb's JSON emits integers as numbers. */
@@ -1443,6 +1956,27 @@ test('GZIP is decompressed by the host DecompressionStream', { skip: needsVm }, 
     }
   } finally {
     db.close();
+  }
+});
+
+test('malformed GZIP failures become normalized codec errors', { skip: needsVm }, async () => {
+  const OriginalDecompressionStream = globalThis.DecompressionStream;
+  globalThis.DecompressionStream = class {
+    constructor() {
+      throw new Error('malformed gzip stream');
+    }
+  };
+  let db;
+  try {
+    db = await openDb();
+    db.register('g', new Uint8Array(await readFile(GZIP_PARQUET)));
+    await assert.rejects(
+      () => db.query('SELECT * FROM g LIMIT 1'),
+      (e) => e instanceof AhiruError && e.code === Code.BAD_COMPRESSED_DATA,
+    );
+  } finally {
+    db?.close();
+    globalThis.DecompressionStream = OriginalDecompressionStream;
   }
 });
 
@@ -1587,7 +2121,7 @@ test('an unknown format name is rejected at registration', async () => {
     // Falling back to Auto on a typo would read it as Parquet, fail with BadMagic,
     // and obscure the cause. Stop here instead.
     assert.throws(
-      () => db.register('t', new Uint8Array(8), { format: 'json' }),
+      () => db.register('t', new Uint8Array(8), { format: 'not-a-format' }),
       (e) => e instanceof AhiruError && e.code === Code.UNSUPPORTED_FEATURE,
     );
   } finally {
@@ -1632,6 +2166,7 @@ test('an explicit format wins over the extension', async () => {
 
 const CSV = join(ROOT, 'tests/data/basic.csv');
 const JSONL = join(ROOT, 'tests/data/basic.jsonl');
+const JSON_DOC = join(ROOT, 'tests/data/json_demo.json');
 
 test('CSV returns the same values as Parquet', { skip: FORMAT_SKIP }, async () => {
   const db = await openFullDb();
@@ -1719,6 +2254,43 @@ test('read_csv_auto auto-registers its path', { skip: FORMAT_SKIP }, async () =>
       duck(`SELECT id, name FROM read_csv('${CSV}') LIMIT 5`).map((r) => [r.id, r.name]),
     );
     assert.ok(f.calls.some((call) => call.url === f.url), 'the auto-registered URL was not fetched');
+  } finally {
+    db.close();
+  }
+});
+
+test('read_csv and read_json force their format for extensionless paths', { skip: FORMAT_SKIP }, async () => {
+  const csv = fakeFetcher(new Uint8Array(await readFile(CSV)), 'https://example.invalid/data-csv');
+  const jsonl = fakeFetcher(
+    new Uint8Array(await readFile(JSONL)),
+    'https://example.invalid/data-jsonl.jsonl',
+  );
+  const json = fakeFetcher(
+    new Uint8Array(await readFile(JSON_DOC)),
+    'https://example.invalid/data-json',
+  );
+  const db = await openFullDb({ fetch: async (target, init) => {
+    if (String(target) === csv.url) return csv.fetchImpl(target, init);
+    if (String(target) === jsonl.url) return jsonl.fetchImpl(target, init);
+    if (String(target) === json.url) return json.fetchImpl(target, init);
+    throw new Error(`unexpected URL ${target}`);
+  } });
+  try {
+    const csvRows = await db.query(`SELECT id, name FROM read_csv('${csv.url}') LIMIT 2`);
+    assert.deepEqual(
+      csvRows.map((r) => [Number(r.id), r.name]),
+      [[0, 'name_0'], [1, 'name_1']],
+    );
+    const jsonlRows = await db.query(`SELECT id, name FROM read_json('${jsonl.url}') LIMIT 2`);
+    assert.deepEqual(
+      jsonlRows.map((r) => [Number(r.id), r.name]),
+      [[0, 'name_0'], [1, 'name_1']],
+    );
+    const jsonRows = await db.query(`SELECT id, name FROM read_json('${json.url}') LIMIT 2`);
+    assert.deepEqual(
+      jsonRows.map((r) => [Number(r.id), r.name]),
+      [[1, 'widget'], [2, 'gadget']],
+    );
   } finally {
     db.close();
   }

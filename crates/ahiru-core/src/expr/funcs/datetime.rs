@@ -243,6 +243,13 @@ pub(crate) fn fmt_date(days: i64, out: &mut Vec<u8>) {
 
 /// `HH:MM:SS[.ffffff]`. Trailing zeros are dropped from the fraction (the same as DuckDB).
 pub(crate) fn fmt_time(us: i64, out: &mut Vec<u8>) {
+    // TIME permits the single endpoint 24:00:00. Keep that spelling instead of
+    // wrapping it to midnight: the parser deliberately accepts it and DuckDB
+    // preserves the endpoint when casting it back to VARCHAR.
+    if us == US_PER_DAY {
+        out.extend_from_slice(b"24:00:00");
+        return;
+    }
     let t = us.rem_euclid(US_PER_DAY);
     pad(t / US_PER_HOUR, 2, out);
     out.push(b':');
@@ -409,10 +416,45 @@ pub(crate) fn parse_timestamp(s: &[u8]) -> Option<i64> {
         return None;
     }
     let (t, j) = scan_time(s, i + 1)?;
-    if j != s.len() {
-        return None;
+    if j == s.len() {
+        return base.checked_add(t);
     }
-    base.checked_add(t)
+    // DuckDB accepts an ISO-8601 zone suffix when converting text to the
+    // *without-time-zone* TIMESTAMP type, but deliberately keeps the wall
+    // clock fields unchanged (the offset is meaningful only for TIMESTAMPTZ).
+    // Validate the suffix so malformed text still becomes NULL; do not apply
+    // it here, since this type has no zone semantics.
+    let k = scan_ignored_timestamp_offset(s, j)?;
+    if k == s.len() {
+        base.checked_add(t)
+    } else {
+        None
+    }
+}
+
+/// Reads the suffix grammar DuckDB accepts when casting text to plain
+/// `TIMESTAMP`: `Z`, `[+-]HH`, `[+-]HHMM`, or `[+-]HH:MM`.
+///
+/// The numeric fields are deliberately only lexical here. DuckDB ignores the
+/// offset for a without-time-zone value and accepts two-digit fields through
+/// `99`; requiring real clock ranges would reject text DuckDB accepts even
+/// though the fields are never applied.
+fn scan_ignored_timestamp_offset(s: &[u8], i: usize) -> Option<usize> {
+    match s.get(i) {
+        Some(b'Z') => Some(i + 1),
+        Some(b'+' | b'-') => {
+            let (_, j) = scan(s, i + 1, 2, 2)?;
+            if s.get(j) == Some(&b':') {
+                let (_, k) = scan(s, j + 1, 2, 2)?;
+                Some(k)
+            } else if j + 2 <= s.len() && s[j..j + 2].iter().all(u8::is_ascii_digit) {
+                Some(j + 2)
+            } else {
+                Some(j)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// VARCHAR -> TIME.

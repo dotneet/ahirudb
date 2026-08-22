@@ -47,7 +47,11 @@ pub(super) fn order_output_column(
         // Resolve aliases against the *expanded* output schema, not the
         // select-item index. `SELECT *, expr AS extra ORDER BY extra` has
         // `extra` as item 1 but schema column N after the star expands.
-        if let Some(i) = schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
+        // Output aliases are resolved last-wins when a SELECT list contains
+        // duplicate names. This is also the rule used by QUALIFY, and keeps
+        // ORDER BY consistent with the post-projection output scope.
+        if let Some(i) =
+            schema.iter().rposition(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
         {
             return Ok(Some(i));
         }

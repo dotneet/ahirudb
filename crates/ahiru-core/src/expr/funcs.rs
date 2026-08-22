@@ -776,7 +776,23 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
     }
     let (n, s) = strides(args)?;
     // The AND of the inputs' validity. NULL rows skip evaluation entirely (so no placeholder value is read).
-    let valid = combine(args, &s, n);
+    // list_position is the one strict-looking function whose second argument is
+    // intentionally still inspected when it is SQL NULL: DuckDB treats NULL as a
+    // searchable list element (list_position([1, NULL], NULL) = 2), while a NULL
+    // list remains NULL. Keep the normal strict propagation for every other function.
+    let valid = if id == F_LIST_POSITION {
+        if args[0].has_nulls() {
+            let mut m = Bitmap::with_capacity(n);
+            for i in 0..n {
+                m.push(args[0].is_valid(i * s[0]));
+            }
+            Some(m)
+        } else {
+            None
+        }
+    } else {
+        combine(args, &s, n)
+    };
     let live = |i: usize| valid.as_ref().is_none_or(|b| b.get(i));
     let mut data = Data::with_capacity(result_ty.phys(), n);
     let mut bad: Option<Bitmap> = None;
@@ -838,9 +854,9 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
                 let v = if live(i) { eval_int(id, &A { v: args, s: &s, i })? } else { Some(0) };
                 // For I32 output (DATE), out of range also makes just that row NULL.
                 let ok = match v {
-                    Some(x) => push_int(&mut data, x),
+                    Some(x) => push_int(&mut data, x, result_ty),
                     None => {
-                        push_int(&mut data, 0);
+                        push_int(&mut data, 0, result_ty);
                         false
                     }
                 };
@@ -954,10 +970,19 @@ fn merge(a: Option<Bitmap>, b: Option<Bitmap>) -> Option<Bitmap> {
 }
 
 /// Writes an i64 into an integer output. Out of range for DATE (I32) gives `false` (= NULL).
-fn push_int(d: &mut Data, x: i64) -> bool {
+///
+/// DuckDB reserves three physical i32 values for DATE special values (the two
+/// infinities and the adjacent lower sentinel). AhiruDB does not expose
+/// infinity literals, so allowing any sentinel to escape from date arithmetic
+/// would turn an out-of-range result into a fictitious finite calendar date.
+fn push_int(d: &mut Data, x: i64, ty: Ty) -> bool {
     match d {
         Data::I32(v) => match i32::try_from(x) {
             Ok(z) => {
+                if ty == Ty::Date && (z <= i32::MIN + 1 || z == i32::MAX) {
+                    v.push(0);
+                    return false;
+                }
                 v.push(z);
                 true
             }

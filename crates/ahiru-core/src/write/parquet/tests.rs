@@ -156,10 +156,39 @@ fn hugeint_round_trips_as_a_38_digit_decimal() {
     // HUGEINT has no Parquet physical type of its own, so it goes out as
     // DECIMAL(38, 0). The value survives; the type reads back as DECIMAL
     // (documented in the module doc).
-    let v = Value::I128(-170_141_183_460_469_231_731_687_303_715_884_105i128);
+    let v = Value::I128(-(10i128.pow(38) - 1));
     let (ty, got) = round_trip_one(Ty::HugeInt, v.clone());
     assert_eq!(ty, Ty::Decimal { precision: 38, scale: 0 });
     assert_eq!(got, v);
+}
+
+#[test]
+fn rejects_hugeint_outside_decimal38_range() {
+    let fields = [f("c", Ty::HugeInt)];
+    let mut sink = ParquetSink::new();
+    sink.begin(&fields).unwrap();
+    let mut column = Vector::new(Ty::HugeInt);
+    column.push_value(&Value::I128(10i128.pow(38)));
+    let batch = Batch::new(vec![column]);
+    assert_eq!(
+        crate::error::code_of(sink.write_batch(&fields, &batch)),
+        Some(crate::error::Code::ValueOutOfRange)
+    );
+}
+
+#[test]
+fn rejects_i64_decimal_outside_declared_precision() {
+    let ty = Ty::Decimal { precision: 2, scale: 0 };
+    let fields = [f("c", ty)];
+    let mut sink = ParquetSink::new();
+    sink.begin(&fields).unwrap();
+    let mut column = Vector::new(ty);
+    column.push_value(&Value::I64(100));
+    let batch = Batch::new(vec![column]);
+    assert_eq!(
+        crate::error::code_of(sink.write_batch(&fields, &batch)),
+        Some(crate::error::Code::ValueOutOfRange)
+    );
 }
 
 #[test]
@@ -269,6 +298,45 @@ fn a_result_with_no_columns_is_rejected() {
     assert_eq!(
         crate::error::code_of(sink.begin(&[])),
         Some(crate::error::Code::UnsupportedFeature)
+    );
+}
+
+#[test]
+fn rejects_a_batch_that_does_not_match_the_started_schema() {
+    let fields = [f("a", Ty::Int)];
+    let mut sink = ParquetSink::new();
+    sink.begin(&fields).unwrap();
+    let batch = Batch::new(Vec::new());
+    assert_eq!(
+        crate::error::code_of(sink.write_batch(&fields, &batch)),
+        Some(crate::error::Code::Internal)
+    );
+
+    let mut not_started = ParquetSink::new();
+    assert_eq!(
+        crate::error::code_of(not_started.write_batch(&[], &Batch::new(Vec::new()))),
+        Some(crate::error::Code::Internal)
+    );
+}
+
+#[test]
+fn enforces_lifecycle_and_resets_metadata_when_reused() {
+    let fields = [f("a", Ty::Int)];
+    let mut sink = ParquetSink::new();
+    assert_eq!(crate::error::code_of(sink.finish()), Some(crate::error::Code::Internal));
+    sink.begin(&fields).unwrap();
+    assert_eq!(crate::error::code_of(sink.begin(&fields)), Some(crate::error::Code::Internal));
+    let first = sink.finish().unwrap();
+    sink.begin(&fields).unwrap();
+    let second = sink.finish().unwrap();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn footer_length_is_bounded_before_u32_framing() {
+    assert_eq!(
+        crate::error::code_of(validate_footer_len(crate::parquet::file::MAX_FOOTER_LEN + 1)),
+        Some(crate::error::Code::LimitExceeded)
     );
 }
 

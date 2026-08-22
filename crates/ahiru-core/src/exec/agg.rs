@@ -621,11 +621,17 @@ impl HashAggregate {
                     Value::Bytes(b) => b.len(),
                     _ => 0,
                 };
+                // `old_len == 0` is also a valid accumulated value when the
+                // first input is the empty string. Use the non-NULL count
+                // (incremented at the top of `update`) to distinguish that
+                // case from an empty accumulator, otherwise the separator
+                // between `''` and the next value is silently omitted.
+                let needs_separator = st.n > 1;
                 let mut buf = match core::mem::replace(&mut st.acc, Value::Null) {
                     Value::Bytes(b) => b,
                     _ => Vec::new(),
                 };
-                if old_len > 0 {
+                if needs_separator {
                     buf.extend_from_slice(sep);
                 }
                 buf.extend_from_slice(bytes);
@@ -2337,6 +2343,18 @@ mod tests {
             None,
         );
         assert_eq!(run(op).unwrap()[0][0], Value::Null, "NULL when there is not a single non-NULL");
+    }
+
+    #[test]
+    fn string_agg_keeps_separator_after_an_empty_string() {
+        let steps = batches(vec![vec![strs(&[Some(""), Some("b")])]]);
+        let op = build(
+            steps,
+            vec![],
+            vec![agg_sep(AggKind::StringAgg, load(Ty::Varchar, 0), b",")],
+            None,
+        );
+        assert_eq!(run(op).unwrap()[0][0], Value::Bytes(b",b".to_vec()));
     }
 
     #[test]

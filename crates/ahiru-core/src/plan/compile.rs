@@ -858,11 +858,15 @@ impl<'a> Compiler<'a> {
         // `unify(Date, Int)` is None, so it does not ride the common-type path.
         if let Some((res, swap)) = date_arith(op, lt, rt) {
             let code = if op == BinaryOp::Add { OpCode::Add } else { OpCode::Sub };
-            // DATE - DATE is I32 minus I32, then widened to BIGINT.
+            // DATE - DATE must widen both day counts before subtraction. The
+            // result is a BIGINT, and subtracting the finite DATE endpoints
+            // can exceed the I32 lane even though each input fits in it.
             if res == Ty::BigInt {
+                let l = self.coerce(lr, lt, Ty::BigInt)?;
+                let r = self.coerce(rr, rt, Ty::BigInt)?;
                 let dst = self.prog.alloc_reg();
-                self.prog.push(Instr::new(code, crate::vector::PhysType::I32, dst, lr, rr));
-                return Ok((self.coerce(dst, Ty::Int, Ty::BigInt)?, Ty::BigInt));
+                self.prog.push(Instr::new(code, crate::vector::PhysType::I64, dst, l, r));
+                return Ok((dst, Ty::BigInt));
             }
             // DATE ± integer. The integer may be BIGINT (CSV inference) or NULL;
             // both are coerced to I32 days so the kernel sees matching physical types.

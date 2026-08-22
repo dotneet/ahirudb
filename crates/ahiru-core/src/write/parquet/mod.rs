@@ -70,7 +70,7 @@ mod thrift;
 use crate::parquet::{Compression, ConvertedType, Encoding, PType, PageType, Repetition};
 use crate::prelude::*;
 use crate::vector::{fmt_interval, unpack_interval, Batch, Bitmap, Field, Ty, Vector};
-use crate::write::TableSink;
+use crate::write::{validate_batch, TableSink};
 use thrift::{ttype, Writer};
 
 /// Rows per row group. Matches DuckDB's default, which keeps row groups
@@ -303,6 +303,8 @@ struct RowGroupMeta {
 
 pub struct ParquetSink {
     out: Vec<u8>,
+    began: bool,
+    schema: Vec<Field>,
     names: Vec<String>,
     plans: Vec<Plan>,
     cols: Vec<ColBuf>,
@@ -315,6 +317,8 @@ impl ParquetSink {
     pub fn new() -> Self {
         ParquetSink {
             out: Vec::new(),
+            began: false,
+            schema: Vec::new(),
             names: Vec::new(),
             plans: Vec::new(),
             cols: Vec::new(),
@@ -368,7 +372,7 @@ impl ParquetSink {
     }
 
     /// Serialize the `FileMetaData` footer.
-    fn footer(&self) -> Vec<u8> {
+    fn footer(&self) -> Result<Vec<u8>> {
         let mut w = Writer::new();
         w.begin_struct();
         w.field_i32(1, 1); // version
@@ -384,7 +388,9 @@ impl ParquetSink {
         }
         w.field_binary(6, b"ahirudb");
         w.end_struct();
-        w.into_bytes()
+        let footer = w.into_bytes();
+        validate_footer_len(footer.len())?;
+        Ok(footer)
     }
 
     fn write_row_group(&self, w: &mut Writer, rg: &RowGroupMeta) {
@@ -428,20 +434,66 @@ impl Default for ParquetSink {
 
 impl TableSink for ParquetSink {
     fn begin(&mut self, schema: &[Field]) -> Result<()> {
+        ensure!(!self.began, Internal);
         // A Parquet row group needs at least one column; there is no
         // meaningful file to write for a zero-column result.
         ensure!(!schema.is_empty(), UnsupportedFeature);
+        let plans = schema.iter().map(|f| plan_column(f.ty)).collect::<Result<Vec<_>>>()?;
+        self.out.clear();
+        self.schema = schema.to_vec();
         self.names = schema.iter().map(|f| f.name.clone()).collect();
-        self.plans = schema.iter().map(|f| plan_column(f.ty)).collect::<Result<Vec<_>>>()?;
+        self.plans = plans;
         self.cols = schema.iter().map(|_| ColBuf::new()).collect();
+        self.pending_rows = 0;
+        self.row_groups.clear();
+        self.total_rows = 0;
         self.out.extend_from_slice(crate::parquet::MAGIC);
+        self.began = true;
         Ok(())
     }
 
     fn write_batch(&mut self, schema: &[Field], batch: &Batch) -> Result<()> {
+        ensure!(self.began, Internal);
+        ensure!(self.schema.len() == schema.len(), Internal);
+        ensure!(
+            self.schema
+                .iter()
+                .zip(schema)
+                .all(|(a, b)| { a.name == b.name && a.ty == b.ty && a.nullable == b.nullable }),
+            Internal
+        );
+        validate_batch(schema, batch)?;
         ensure!(batch.cols.len() == self.plans.len(), Internal);
         ensure!(schema.len() == self.plans.len(), Internal);
         let rows = batch.num_rows();
+        // Parquet DECIMAL precision is part of the file schema, not merely a
+        // display hint. A 16-byte value can hold all of i128, but DECIMAL(38)
+        // only permits magnitudes below 10^38. Reject an out-of-range HUGEINT
+        // (or DECIMAL(p > 18)) before appending anything to the row-group
+        // buffers; otherwise a strict Parquet reader can reject the file.
+        for (col, plan) in batch.cols.iter().zip(&self.plans) {
+            let Some(Lg::Decimal { precision, .. }) = plan.logical else { continue };
+            for r in 0..rows {
+                if col.is_valid(r) {
+                    let fits = match plan.enc {
+                        Enc::I64 => col
+                            .i64s()
+                            .get(r)
+                            .copied()
+                            .map(|value| decimal_value_fits(value as i128, precision))
+                            .unwrap_or(false),
+                        Enc::I128Be => col
+                            .i128s()
+                            .get(r)
+                            .copied()
+                            .map(|value| decimal_value_fits(value, precision))
+                            .unwrap_or(false),
+                        _ => true,
+                    };
+                    ensure!(fits, ValueOutOfRange);
+                }
+            }
+        }
         for ((col, plan), buf) in batch.cols.iter().zip(&self.plans).zip(&mut self.cols) {
             for r in 0..rows {
                 if !col.is_valid(r) {
@@ -460,13 +512,26 @@ impl TableSink for ParquetSink {
     }
 
     fn finish(&mut self) -> Result<Vec<u8>> {
+        ensure!(self.began, Internal);
         self.flush_row_group()?;
-        let footer = self.footer();
+        let footer = self.footer()?;
+        // Keep the framing check at the point where the footer is appended
+        // and its length is narrowed to the trailing u32.
+        validate_footer_len(footer.len())?;
         self.out.extend_from_slice(&footer);
         self.out.extend_from_slice(&(footer.len() as u32).to_le_bytes());
         self.out.extend_from_slice(crate::parquet::MAGIC);
+        self.began = false;
         Ok(core::mem::take(&mut self.out))
     }
+}
+
+/// Keep writer output compatible with the reader's bounded footer parser and
+/// prevent the trailing u32 length field from truncating silently.
+fn validate_footer_len(len: usize) -> Result<()> {
+    ensure!(len <= crate::parquet::file::MAX_FOOTER_LEN, LimitExceeded);
+    ensure!(len <= u32::MAX as usize, LimitExceeded);
+    Ok(())
 }
 
 // --- value encoding ----------------------------------------------------------
@@ -530,6 +595,19 @@ fn encode_value(enc: Enc, col: &Vector, r: usize, buf: &mut ColBuf) {
             buf.plain.extend_from_slice(&text);
         }
     }
+}
+
+/// Whether an unscaled integer fits a Parquet DECIMAL with the given precision.
+/// Precision `p` permits values in `-(10^p - 1)..=(10^p - 1)`.
+fn decimal_value_fits(value: i128, precision: i32) -> bool {
+    if !(1..=38).contains(&precision) {
+        return false;
+    }
+    let mut limit = 1u128;
+    for _ in 0..precision {
+        limit *= 10;
+    }
+    value.unsigned_abs() < limit
 }
 
 /// Row `r` of a `Bytes` column, without the bounds assumption `BytesData::get`

@@ -442,8 +442,11 @@ fn source_bytes(
     let b = sources
         .get(&(table, part))
         .ok_or_else(|| String::from("unknown table/part for codec request"))?;
-    let s = offset as usize;
-    let e = s + len as usize;
+    let s = usize::try_from(offset)
+        .map_err(|_| String::from("codec request offset does not fit in usize"))?;
+    let e = s
+        .checked_add(len as usize)
+        .ok_or_else(|| String::from("codec request range overflows usize"))?;
     if e > b.len() {
         return Err(String::from("codec request out of range"));
     }
@@ -490,8 +493,15 @@ fn gunzip(src: &[u8]) -> R<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    c.stdin.take().ok_or("no stdin")?.write_all(src)?;
+    // Feed stdin on a separate thread while `wait_with_output` drains stdout.
+    // Writing the complete input first can deadlock when gzip emits more than
+    // the OS pipe buffer: the parent blocks on stdin while the child blocks on
+    // a full stdout pipe.
+    let mut stdin = c.stdin.take().ok_or("no stdin")?;
+    let input = src.to_vec();
+    let feeder = std::thread::spawn(move || stdin.write_all(&input));
     let out = c.wait_with_output()?;
+    feeder.join().map_err(|_| "gzip stdin feeder panicked")??;
     if !out.status.success() {
         return Err("gzip failed".into());
     }
@@ -562,5 +572,39 @@ mod tests {
             decompress_host(ahiru_core::parquet::Compression::Gzip, &out.stdout, 5).unwrap(),
             b"hello"
         );
+    }
+
+    #[test]
+    fn source_bytes_rejects_unrepresentable_and_overflowing_ranges() {
+        let mut sources = HashMap::new();
+        sources.insert((0, 0), vec![1, 2, 3]);
+
+        assert!(source_bytes(&sources, 0, 0, u64::MAX, 1).is_err());
+        assert!(source_bytes(&sources, 0, 0, 2, 2).is_err());
+        assert_eq!(source_bytes(&sources, 0, 0, 1, 2).unwrap(), &[2, 3]);
+    }
+
+    #[test]
+    fn gunzip_drains_output_while_feeding_large_input() {
+        // A highly-compressible payload expands far beyond a normal pipe
+        // buffer. The old write-all-then-wait sequence deadlocked here because
+        // gzip blocked on stdout before it could consume all of stdin.
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let plain = vec![b'x'; 1024 * 1024];
+        let mut c = Command::new("gzip")
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("gzip");
+        c.stdin.take().expect("stdin").write_all(&plain).unwrap();
+        let compressed = c.wait_with_output().unwrap();
+        assert!(compressed.status.success());
+
+        let restored = gunzip(&compressed.stdout).expect("large gzip stream should complete");
+        assert_eq!(restored, plain);
     }
 }

@@ -59,9 +59,10 @@ fn table_name_exists(session: &Session, name: &str) -> bool {
 }
 
 pub(crate) fn drop_table(session: &mut Session, name: &str, if_exists: bool) -> Result<Prepared> {
+    let existed = table_name_exists(session, name);
     match session.catalog.mem_drop(name) {
         Ok(()) => Ok(Prepared::Ready(count_result(0))),
-        Err(e) if if_exists && e.code == Code::TableNotFound => {
+        Err(e) if if_exists && !existed && e.code == Code::TableNotFound => {
             Ok(Prepared::Ready(count_result(0)))
         }
         Err(e) => Err(e),
@@ -165,9 +166,10 @@ pub(crate) fn create_view(
 }
 
 pub(crate) fn drop_view(session: &mut Session, name: &str, if_exists: bool) -> Result<Prepared> {
+    let existed = table_name_exists(session, name);
     match session.catalog.view_drop(name) {
         Ok(()) => Ok(Prepared::Ready(count_result(0))),
-        Err(e) if if_exists && e.code == Code::TableNotFound => {
+        Err(e) if if_exists && !existed && e.code == Code::TableNotFound => {
             Ok(Prepared::Ready(count_result(0)))
         }
         Err(e) => Err(e),
@@ -300,6 +302,24 @@ mod tests {
             crate::error::code_of(s.prepare("DROP TABLE nope", &[])),
             Some(Code::TableNotFound)
         );
+    }
+
+    #[test]
+    fn drop_if_exists_does_not_hide_a_same_name_object_of_another_kind() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+        s.prepare("CREATE VIEW v AS SELECT id FROM t", &[]).unwrap();
+
+        assert_eq!(
+            crate::error::code_of(s.prepare("DROP TABLE IF EXISTS v", &[])),
+            Some(Code::TableNotFound)
+        );
+        assert_eq!(
+            crate::error::code_of(s.prepare("DROP VIEW IF EXISTS t", &[])),
+            Some(Code::TableNotFound)
+        );
+        assert!(s.table_names().iter().any(|name| name == "t"));
+        assert!(s.table_names().iter().any(|name| name == "v"));
     }
 
     #[test]

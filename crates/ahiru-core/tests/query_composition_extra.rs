@@ -394,6 +394,17 @@ fn later_cte_references_earlier_cte() {
     );
 }
 
+/// CTE names are case-insensitive and cannot be defined twice in one WITH
+/// clause. DuckDB rejects both exact and case-variant duplicates at bind time;
+/// accepting the first definition would silently hide the second one.
+#[test]
+fn duplicate_cte_names_are_rejected_case_insensitively() {
+    let mut db = session_with_ab();
+    let err =
+        db.prepare("WITH c AS (SELECT k FROM a), C AS (SELECT k FROM b) SELECT * FROM c", &[]);
+    assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
+}
+
 // =========================================================================
 // Set operations: UNION/UNION ALL/INTERSECT/EXCEPT, NULL handling,
 // column-count mismatch, incompatible-type mismatch.
@@ -467,6 +478,31 @@ fn union_all_unifies_mismatched_numeric_literal_types() {
     let rows =
         run(&mut db, "SELECT 1 AS x FROM dual UNION ALL SELECT CAST(2.5 AS DOUBLE) FROM dual");
     assert_eq!(rows, vec![vec![f64v(1.0)], vec![f64v(2.5)]]);
+}
+
+/// DuckDB permits the final ORDER BY of a set operation to use an explicit
+/// alias introduced by a non-first branch. The result name still comes from
+/// the first branch, so the alias must resolve to its matching output ordinal.
+#[test]
+fn set_operation_order_by_can_use_a_later_branch_alias() {
+    let mut db = session_with_ab();
+    let rows = run(
+        &mut db,
+        "SELECT x AS first_name FROM range(3) t(x) UNION ALL \
+         SELECT x + 10 AS later_name FROM range(3) t(x) \
+         ORDER BY later_name",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![i64v(0)],
+            vec![i64v(1)],
+            vec![i64v(2)],
+            vec![i64v(10)],
+            vec![i64v(11)],
+            vec![i64v(12)]
+        ],
+    );
 }
 
 /// Set operations with a mismatched column *count* are rejected with a
@@ -858,6 +894,19 @@ fn order_by_alias_after_star_uses_the_alias_column() {
     let rows = run(&mut db, "SELECT *, score * 2 AS extra FROM t ORDER BY extra");
     assert_eq!(rows[0][0], Value::I64(1), "sorted by extra, not name: {rows:?}");
     assert_eq!(rows[1][0], Value::I64(2));
+}
+
+/// An unqualified `ORDER BY` alias resolves to the last output column when
+/// duplicate aliases are present, matching DuckDB's post-projection scope.
+/// duckdb: `SELECT x AS y, -x AS y FROM range(3) t(x) ORDER BY y`
+#[test]
+fn order_by_duplicate_alias_uses_last_output_alias() {
+    let mut db = Session::new();
+    let rows = run(&mut db, "SELECT x AS y, -x AS y FROM range(3) t(x) ORDER BY y");
+    assert_eq!(
+        rows,
+        vec![vec![i64v(2), i64v(-2)], vec![i64v(1), i64v(-1)], vec![i64v(0), i64v(0)],]
+    );
 }
 
 #[test]

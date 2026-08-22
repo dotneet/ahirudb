@@ -99,13 +99,25 @@ pub(crate) fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
     let mut esc = false;
     loop {
         match byte_at(b, j)? {
-            b'"' => return Ok((&b[i + 1..j], esc, j + 1)),
-            b'\\' => {
-                // The next byte is always consumed, so `\"` is not mistaken for the terminator.
-                byte_at(b, j + 1)?;
-                esc = true;
-                j += 2;
+            b'"' => {
+                ensure!(core::str::from_utf8(&b[i + 1..j]).is_ok(), SyntaxError, i);
+                return Ok((&b[i + 1..j], esc, j + 1));
             }
+            b'\\' => {
+                // Validate the escape while scanning. `skip_value`, used by CAST validation,
+                // does not necessarily decode the string later, so accepting an arbitrary
+                // escaped byte here would admit invalid JSON such as `"\\q"`.
+                match byte_at(b, j + 1)? {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => j += 2,
+                    b'u' => {
+                        hex4(b, j + 2)?;
+                        j += 6;
+                    }
+                    _ => err!(SyntaxError, j + 1),
+                }
+                esc = true;
+            }
+            0x00..=0x1f => err!(SyntaxError, j),
             _ => j += 1,
         }
     }
@@ -117,8 +129,13 @@ pub(crate) fn scan_number(b: &[u8], start: usize) -> Result<usize> {
         i += 1;
     }
     let d0 = i;
-    while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+    if b.get(i) == Some(&b'0') {
         i += 1;
+        ensure!(!matches!(b.get(i), Some(c) if c.is_ascii_digit()), SyntaxError, i);
+    } else {
+        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+            i += 1;
+        }
     }
     ensure!(i > d0, SyntaxError, start);
     if b.get(i) == Some(&b'.') {
@@ -778,26 +795,47 @@ fn hex_digit(n: u8) -> u8 {
     }
 }
 
-/// Writes arbitrary bytes (the contents of a UTF-8 VARCHAR) as a JSON string literal.
-/// Only control characters are escaped; non-ASCII UTF-8 bytes are embedded as they are
-/// (the same as DuckDB's default -- no conversion to `\uXXXX`).
+/// Writes bytes as a JSON string literal.
+///
+/// Valid non-ASCII UTF-8 bytes are embedded as-is. Invalid UTF-8 sequences are
+/// replaced with U+FFFD so the resulting JSON document is always valid UTF-8,
+/// even when a permissive byte-oriented input format supplied a malformed
+/// VARCHAR value.
 pub(crate) fn write_json_string(s: &[u8], out: &mut Vec<u8>) {
     out.push(b'"');
-    for &c in s {
-        match c {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x00..=0x1f => {
-                out.extend_from_slice(b"\\u00");
-                out.push(hex_digit(c >> 4));
-                out.push(hex_digit(c & 0xf));
+    let mut pos = 0usize;
+    while pos < s.len() {
+        let (valid, consumed, error_len) = match core::str::from_utf8(&s[pos..]) {
+            Ok(valid) => (valid.as_bytes(), s.len() - pos, None),
+            Err(e) => {
+                let n = e.valid_up_to();
+                (&s[pos..pos + n], n, e.error_len())
             }
-            _ => out.push(c),
+        };
+        for &c in valid {
+            match c {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                0x08 => out.extend_from_slice(b"\\b"),
+                0x0c => out.extend_from_slice(b"\\f"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                0x00..=0x1f => {
+                    out.extend_from_slice(b"\\u00");
+                    out.push(hex_digit(c >> 4));
+                    out.push(hex_digit(c & 0xf));
+                }
+                _ => out.push(c),
+            }
+        }
+        pos += consumed;
+        if pos < s.len() {
+            // `error_len` is None only when the remaining bytes are a
+            // truncated UTF-8 prefix. All of that prefix is one replacement
+            // character; a non-empty error consumes exactly that many bytes.
+            out.extend_from_slice("\u{FFFD}".as_bytes());
+            pos += error_len.unwrap_or(s.len() - pos).max(1);
         }
     }
     out.push(b'"');
@@ -966,6 +1004,14 @@ mod tests {
     }
 
     #[test]
+    fn write_json_string_replaces_invalid_utf8() {
+        let mut out = Vec::new();
+        write_json_string(b"a\x80\xE2\x82b", &mut out);
+        assert_eq!(out, "\"a\u{FFFD}\u{FFFD}b\"".as_bytes());
+        assert!(core::str::from_utf8(&out).is_ok());
+    }
+
+    #[test]
     fn array_elements_splits_top_level_values_only() {
         let got = array_elements(b"[1,[2,3],\"a,b\",null]").unwrap().unwrap();
         assert_eq!(got.len(), 4);
@@ -1061,12 +1107,19 @@ mod tests {
     }
 
     #[test]
-    fn raw_control_bytes_in_a_string_are_accepted_without_escaping() {
-        // RFC 8259 disallows raw control characters (0x00-0x1F) inside strings, but
-        // `scan_string` only looks at the positions of `"` and `\` and does not check
-        // for them. This is a known simplification -- being lenient was preferred over
-        // corrupting things by mistake -- pinned here as deliberate behavior (so that
-        // "tightening" it into a syntax error would be noticed).
-        assert!(whole(b"\"a\x01b\"").is_ok());
+    fn strings_reject_invalid_json_lexemes() {
+        assert_eq!(code_of(whole(b"\"a\x01b\"")), Some(Code::SyntaxError));
+        assert_eq!(code_of(whole(br#""a\q""#)), Some(Code::SyntaxError));
+        assert_eq!(code_of(whole(br#""a\u12xz""#)), Some(Code::SyntaxError));
+        assert_eq!(code_of(whole(b"\"a\xffb\"")), Some(Code::SyntaxError));
+    }
+
+    #[test]
+    fn numbers_reject_leading_zeroes() {
+        assert_eq!(code_of(whole(b"01")), Some(Code::SyntaxError));
+        assert_eq!(code_of(whole(b"-01")), Some(Code::SyntaxError));
+        assert_eq!(code_of(whole(b"[00]")), Some(Code::SyntaxError));
+        assert!(whole(b"0").is_ok());
+        assert!(whole(b"-0.1").is_ok());
     }
 }

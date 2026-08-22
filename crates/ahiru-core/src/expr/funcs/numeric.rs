@@ -58,15 +58,24 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
         F_BIT_XOR => Some(a.int(0) ^ a.int(1)),
         F_BIT_COUNT => Some(a.int(0).count_ones() as i64),
         // Always non-negative, matching DuckDB (`select gcd(-4, 6)` -> `2`).
-        F_GCD => Some(gcd(a.int(0), a.int(1))),
+        F_GCD => gcd(a.int(0), a.int(1)),
         F_LCM => {
             let (x, y) = (a.int(0), a.int(1));
-            let g = gcd(x, y);
-            if g == 0 {
+            if x == 0 || y == 0 {
+                // Short-circuit before gcd: lcm(i64::MIN, 0) is exactly zero
+                // even though abs(i64::MIN), and therefore its gcd with zero,
+                // is not representable as a positive BIGINT.
                 Some(0)
             } else {
-                // Divide first so the product does not overflow needlessly.
-                (x / g).checked_mul(y).and_then(|v| v.checked_abs())
+                match gcd(x, y) {
+                    None => None,
+                    // Both inputs are non-zero, so their gcd cannot be zero.
+                    Some(0) => None,
+                    Some(g) => {
+                        // Divide first so the product does not overflow needlessly.
+                        (x / g).checked_mul(y).and_then(|v| v.checked_abs())
+                    }
+                }
             }
         }
         // Out-of-range components give NULL rather than silently normalizing
@@ -85,7 +94,10 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
             }
         }
         // TIMESTAMP is already microseconds since the epoch, so these are pure rescalings.
-        F_EPOCH_MS => Some(a.int(0).div_euclid(1_000)),
+        // epoch_ms truncates toward zero, like DuckDB: one microsecond before
+        // the epoch is 0 milliseconds, not -1. epoch itself intentionally
+        // floors to whole seconds in date_part (a separate documented choice).
+        F_EPOCH_MS => Some(a.int(0) / 1_000),
         F_EPOCH_US => Some(a.int(0)),
         F_EPOCH_NS => a.int(0).checked_mul(1_000),
         F_LIST_POSITION => match super::json::list_find(a)? {
@@ -161,16 +173,16 @@ fn factorial(n: i64) -> Result<i128> {
     Ok(acc)
 }
 
-/// The greatest common divisor, always non-negative. `i64::MIN` has no positive absolute value,
-/// so it is handled through `unsigned_abs` and clamped on the way back out.
-fn gcd(a: i64, b: i64) -> i64 {
+/// The greatest common divisor, always non-negative. i64::MIN has no positive
+/// absolute value in BIGINT, so an unrepresentable result is returned as None.
+fn gcd(a: i64, b: i64) -> Option<i64> {
     let (mut x, mut y) = (a.unsigned_abs(), b.unsigned_abs());
     while y != 0 {
         let t = x % y;
         x = y;
         y = t;
     }
-    i64::try_from(x).unwrap_or(i64::MAX)
+    i64::try_from(x).ok()
 }
 
 /// `make_date(y, m, d)` -> days since the epoch. Out-of-range month or day gives `None`

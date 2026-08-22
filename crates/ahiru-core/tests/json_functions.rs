@@ -353,6 +353,17 @@ fn cast_varchar_to_json_round_trips_and_try_cast_is_lenient() {
 }
 
 #[test]
+fn cast_rejects_invalid_json_string_lexemes() {
+    let mut sess = session_with_basic();
+    assert_eq!(err_code(&mut sess, "CAST('{\"a\":\"x\ny\"}' AS JSON)"), Some(Code::InvalidCast));
+    assert_eq!(err_code(&mut sess, r#"CAST('{"a":"\q"}' AS JSON)"#), Some(Code::InvalidCast));
+    assert_eq!(err_code(&mut sess, r#"CAST('{"a":"\u12xz"}' AS JSON)"#), Some(Code::InvalidCast));
+    assert_eq!(err_code(&mut sess, "CAST('01' AS JSON)"), Some(Code::InvalidCast));
+    assert_eq!(err_code(&mut sess, "CAST('-01' AS JSON)"), Some(Code::InvalidCast));
+    assert_eq!(one(&mut sess, r#"CAST('{"a":"\u1234"}' AS JSON)"#), s(r#"{"a":"\u1234"}"#));
+}
+
+#[test]
 fn cast_invalid_json_text_errors_the_whole_query() {
     let mut sess = session_with_basic();
     // duckdb: CAST('not json' AS JSON) -> Conversion Error (not rounded down to NULL).

@@ -6,10 +6,11 @@
 use crate::expr::funcs::{civil_from_days, fmt_time};
 use crate::prelude::*;
 use crate::vector::{Batch, Field, Ty, Value};
-use crate::write::TableSink;
+use crate::write::{validate_batch, TableSink};
 
 pub struct CsvSink {
     out: Vec<u8>,
+    schema: Vec<Field>,
     /// Whether the header row has been written.
     began: bool,
     delimiter: u8,
@@ -21,7 +22,7 @@ impl CsvSink {
     }
 
     pub fn with_delimiter(delimiter: u8) -> Self {
-        CsvSink { out: Vec::new(), began: false, delimiter }
+        CsvSink { out: Vec::new(), schema: Vec::new(), began: false, delimiter }
     }
 }
 
@@ -33,6 +34,9 @@ impl Default for CsvSink {
 
 impl TableSink for CsvSink {
     fn begin(&mut self, schema: &[Field]) -> Result<()> {
+        ensure!(!self.began, Internal);
+        self.out.clear();
+        self.schema = schema.to_vec();
         for (i, f) in schema.iter().enumerate() {
             if i > 0 {
                 self.out.push(self.delimiter);
@@ -46,6 +50,15 @@ impl TableSink for CsvSink {
 
     fn write_batch(&mut self, schema: &[Field], batch: &Batch) -> Result<()> {
         ensure!(self.began, Internal);
+        ensure!(self.schema.len() == schema.len(), Internal);
+        ensure!(
+            self.schema
+                .iter()
+                .zip(schema)
+                .all(|(a, b)| { a.name == b.name && a.ty == b.ty && a.nullable == b.nullable }),
+            Internal
+        );
+        validate_batch(schema, batch)?;
         let n = batch.num_rows();
         for r in 0..n {
             for (i, (c, f)) in batch.cols.iter().zip(schema).enumerate() {
@@ -64,6 +77,8 @@ impl TableSink for CsvSink {
     }
 
     fn finish(&mut self) -> Result<Vec<u8>> {
+        ensure!(self.began, Internal);
+        self.began = false;
         Ok(core::mem::take(&mut self.out))
     }
 }
@@ -485,5 +500,37 @@ mod tests {
             "row with b=1: a must be empty string, not NULL"
         );
         assert_eq!(cols[0].value_at(1), Value::Null, "row with b=2: a must stay NULL");
+    }
+
+    #[test]
+    fn rejects_a_batch_that_does_not_match_the_started_schema() {
+        let mut sink = CsvSink::new();
+        let schema = [Field::new("a", Ty::Int, true)];
+        sink.begin(&schema).unwrap();
+        let batch = Batch::new(Vec::new());
+        assert_eq!(
+            crate::error::code_of(sink.write_batch(&schema, &batch)),
+            Some(crate::error::Code::Internal)
+        );
+
+        let mut wrong_type = crate::vector::Vector::new(Ty::BigInt);
+        wrong_type.push_value(&Value::I64(1));
+        let batch = Batch::new(vec![wrong_type]);
+        assert_eq!(
+            crate::error::code_of(sink.write_batch(&schema, &batch)),
+            Some(crate::error::Code::Internal)
+        );
+    }
+
+    #[test]
+    fn enforces_lifecycle_and_can_be_reused_after_finish() {
+        let schema = [Field::new("a", Ty::Int, true)];
+        let mut sink = CsvSink::new();
+        assert_eq!(crate::error::code_of(sink.finish()), Some(crate::error::Code::Internal));
+        sink.begin(&schema).unwrap();
+        assert_eq!(crate::error::code_of(sink.begin(&schema)), Some(crate::error::Code::Internal));
+        assert_eq!(sink.finish().unwrap(), b"a\n");
+        sink.begin(&schema).unwrap();
+        assert_eq!(sink.finish().unwrap(), b"a\n");
     }
 }

@@ -12,11 +12,12 @@ use crate::write::TableSink;
 pub struct JsonlSink {
     out: Vec<u8>,
     schema: Vec<Field>,
+    began: bool,
 }
 
 impl JsonlSink {
     pub fn new() -> Self {
-        JsonlSink { out: Vec::new(), schema: Vec::new() }
+        JsonlSink { out: Vec::new(), schema: Vec::new(), began: false }
     }
 }
 
@@ -28,11 +29,24 @@ impl Default for JsonlSink {
 
 impl TableSink for JsonlSink {
     fn begin(&mut self, schema: &[Field]) -> Result<()> {
+        ensure!(!self.began, Internal);
+        self.out.clear();
         self.schema = schema.to_vec();
+        self.began = true;
         Ok(())
     }
 
     fn write_batch(&mut self, schema: &[Field], batch: &Batch) -> Result<()> {
+        ensure!(self.began, Internal);
+        ensure!(self.schema.len() == schema.len(), Internal);
+        ensure!(
+            self.schema
+                .iter()
+                .zip(schema)
+                .all(|(a, b)| { a.name == b.name && a.ty == b.ty && a.nullable == b.nullable }),
+            Internal
+        );
+        crate::write::validate_batch(schema, batch)?;
         let n = batch.num_rows();
         for r in 0..n {
             self.out.push(b'{');
@@ -55,6 +69,8 @@ impl TableSink for JsonlSink {
     }
 
     fn finish(&mut self) -> Result<Vec<u8>> {
+        ensure!(self.began, Internal);
+        self.began = false;
         Ok(core::mem::take(&mut self.out))
     }
 }
@@ -299,31 +315,7 @@ fn push_padded(out: &mut Vec<u8>, v: i64, width: usize) {
 
 /// Writes as an escaped JSON string (including the surrounding quotes).
 fn push_string(out: &mut Vec<u8>, s: &[u8]) {
-    out.push(b'"');
-    for &b in s {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x00..=0x1f => {
-                out.extend_from_slice(b"\\u00");
-                out.push(hex_digit(b >> 4));
-                out.push(hex_digit(b & 0xf));
-            }
-            _ => out.push(b),
-        }
-    }
-    out.push(b'"');
-}
-
-fn hex_digit(n: u8) -> u8 {
-    if n < 10 {
-        b'0' + n
-    } else {
-        b'a' + (n - 10)
-    }
+    crate::json::write_json_string(s, out);
 }
 
 #[cfg(test)]
@@ -371,6 +363,15 @@ mod tests {
         csv.extend_from_slice(b"tab\"\"q\"\n"); // `""` is one embedded `"`
         let lines = run("SELECT s FROM t", csv, crate::format::FormatKind::Csv);
         assert_eq!(lines[0], "{\"s\":\"line1\\nline2\\ttab\\\"q\"}");
+    }
+
+    #[test]
+    fn malformed_utf8_in_a_text_source_is_replaced_in_jsonl() {
+        // The CSV reader is byte-oriented and can preserve malformed input as
+        // VARCHAR. JSON/NDJSON itself must be UTF-8, so export replaces the
+        // malformed byte rather than returning an invalid output buffer.
+        let lines = run("SELECT a FROM t", b"a\n\x80\n".to_vec(), crate::format::FormatKind::Csv);
+        assert_eq!(lines, vec!["{\"a\":\"�\"}"]);
     }
 
     #[test]
@@ -475,5 +476,29 @@ mod tests {
             run("SELECT id, xs FROM t WHERE id = 0", bytes, crate::format::FormatKind::Parquet);
         // list_varied.parquet: row 0's list itself is SQL NULL (see nested_files.rs).
         assert_eq!(lines, vec![r#"{"id":0,"xs":null}"#]);
+    }
+
+    #[test]
+    fn rejects_a_batch_that_does_not_match_the_started_schema() {
+        let mut sink = JsonlSink::new();
+        let schema = [Field::new("a", Ty::Int, true)];
+        sink.begin(&schema).unwrap();
+        let batch = Batch::new(Vec::new());
+        assert_eq!(
+            crate::error::code_of(sink.write_batch(&schema, &batch)),
+            Some(crate::error::Code::Internal)
+        );
+    }
+
+    #[test]
+    fn enforces_lifecycle_and_can_be_reused_after_finish() {
+        let schema = [Field::new("a", Ty::Int, true)];
+        let mut sink = JsonlSink::new();
+        assert_eq!(crate::error::code_of(sink.finish()), Some(crate::error::Code::Internal));
+        sink.begin(&schema).unwrap();
+        assert_eq!(crate::error::code_of(sink.begin(&schema)), Some(crate::error::Code::Internal));
+        assert!(sink.finish().unwrap().is_empty());
+        sink.begin(&schema).unwrap();
+        assert!(sink.finish().unwrap().is_empty());
     }
 }

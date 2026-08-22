@@ -188,6 +188,13 @@ impl TableFormat for CsvFormat {
 
         let names = column_names(&raw);
 
+        // `num_splits` returns a `usize` because the execution layer indexes
+        // splits with `usize`. Reject a remote file whose split count cannot
+        // be represented instead of truncating the u64 division on 32-bit
+        // WASM (or after a caller intentionally chooses a tiny test split).
+        let split_count = self.data_len().div_ceil(self.chunk_size());
+        ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
+
         // --- Type inference ---------------------------------------------------
         // Cut at the last line terminator so a truncated trailing record does not enter the inference.
         // (It may cut at a newline inside quotes, but all that happens then is "that column widens
@@ -1676,6 +1683,18 @@ mod tests {
         src.insert(off, body[off as usize..(off + len) as usize].to_vec());
         assert_eq!(f.resolve(&src).unwrap(), Ok(()));
         assert_eq!(names(&f), vec!["a", "b"]);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn resolve_rejects_a_split_count_that_does_not_fit_usize() {
+        let mut f = CsvFormat::new(b',');
+        f.split_bytes = 1;
+        let mut src = Source::remote(u64::MAX);
+        let mut sample = vec![0u8; SAMPLE_BYTES as usize];
+        sample[..2].copy_from_slice(b"a\n");
+        src.insert(0, sample);
+        assert_eq!(code_of(f.resolve(&src)), Some(Code::LimitExceeded));
     }
 
     #[test]

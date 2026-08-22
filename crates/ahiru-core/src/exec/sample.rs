@@ -66,17 +66,21 @@ pub struct Bernoulli {
     /// The probability of keeping a row (0.0..=1.0).
     p: f64,
     rng: Rng,
+    done: bool,
 }
 
 impl Bernoulli {
     pub fn new(input: Box<dyn Operator>, spec: &SampleSpec) -> Self {
         let p = (spec.amount / 100.0).clamp(0.0, 1.0);
-        Bernoulli { input, p, rng: Rng::new(spec.seed) }
+        Bernoulli { input, p, rng: Rng::new(spec.seed), done: p == 0.0 }
     }
 }
 
 impl Operator for Bernoulli {
     fn next(&mut self, ctx: &mut ExecContext) -> Result<Step> {
+        if self.done {
+            return Ok(Step::Done);
+        }
         loop {
             let mut batch = match self.input.next(ctx)? {
                 Step::Ready(b) => b,
@@ -145,11 +149,12 @@ impl RowSample {
         // rounds in others, suggesting it is implementation-defined, so plain round-to-nearest is
         // fixed here). A negative value cannot occur syntactically (`sql::parser` rejects it).
         let target = (spec.amount.max(0.0) + 0.5) as u64;
+        let phase = if target == 0 { Phase::Done } else { Phase::Buffering };
         RowSample {
             input,
             target,
             rng: Rng::new(spec.seed),
-            phase: Phase::Buffering,
+            phase,
             batches: Vec::new(),
             total_rows: 0,
             buffered_bytes: 0,
@@ -166,7 +171,12 @@ impl RowSample {
         if rows == 0 {
             return Ok(());
         }
-        self.total_rows = self.total_rows.saturating_add(rows as u64);
+        // Emission and vector gathers use u32 row indexes. In particular,
+        // zero-column batches contribute no vector bytes, so the byte cap
+        // alone cannot prevent their accumulated row numbers from wrapping.
+        ensure!(self.total_rows <= u32::MAX as u64, LimitExceeded);
+        ensure!(rows as u64 <= u32::MAX as u64 - self.total_rows, LimitExceeded);
+        self.total_rows += rows as u64;
         let bytes: usize = batch.cols.iter().map(vector_bytes).sum();
         self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
         ensure!(self.buffered_bytes <= MAX_BUFFER_BYTES, Oom);
@@ -335,6 +345,23 @@ mod tests {
     }
 
     #[test]
+    fn zero_percent_short_circuits_without_reading_input() {
+        struct MustNotRead;
+        impl Operator for MustNotRead {
+            fn next(&mut self, _ctx: &mut ExecContext) -> Result<Step> {
+                panic!("a zero-percent sample must not pull its input");
+            }
+        }
+
+        let mut op = Bernoulli::new(Box::new(MustNotRead), &spec(false, 0.0, 1));
+        let mut catalog = Catalog::new();
+        let mut vm = Vm::new();
+        let mut ctx =
+            ExecContext { catalog: &mut catalog, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
+        assert!(matches!(op.next(&mut ctx).unwrap(), Step::Done));
+    }
+
+    #[test]
     fn hundred_percent_keeps_everything() {
         let vals: Vec<i32> = (0..1000).collect();
         let steps = vec![Script::Rows(vec![ints(&vals)])];
@@ -435,12 +462,38 @@ mod tests {
     }
 
     #[test]
+    fn zero_rows_short_circuits_without_reading_input() {
+        struct MustNotRead;
+        impl Operator for MustNotRead {
+            fn next(&mut self, _ctx: &mut ExecContext) -> Result<Step> {
+                panic!("a zero-row sample must not pull its input");
+            }
+        }
+
+        let mut op = RowSample::new(Box::new(MustNotRead), &spec(true, 0.0, 1));
+        let mut catalog = Catalog::new();
+        let mut vm = Vm::new();
+        let mut ctx =
+            ExecContext { catalog: &mut catalog, vm: &mut vm, io: Vec::new(), codec: Vec::new() };
+        assert!(matches!(op.next(&mut ctx).unwrap(), Step::Done));
+    }
+
+    #[test]
     fn empty_input_yields_nothing() {
         let op = Box::new(RowSample::new(
             Box::new(Mock { steps: Vec::new(), pos: 0 }),
             &spec(true, 5.0, 1),
         ));
         assert!(drive(op).is_empty());
+    }
+
+    #[test]
+    fn row_count_rejects_cardinality_beyond_u32_indexes() {
+        let mut op =
+            RowSample::new(Box::new(Mock { steps: Vec::new(), pos: 0 }), &spec(true, 1.0, 1));
+        op.total_rows = u32::MAX as u64;
+        let err = op.absorb(Batch::rows_only(1)).unwrap_err();
+        assert_eq!(err.code, crate::error::Code::LimitExceeded);
     }
 
     #[test]

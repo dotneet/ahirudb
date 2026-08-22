@@ -71,6 +71,11 @@ fn uleb128(src: &[u8], pos: &mut usize) -> Result<u64> {
         ensure!(*pos < src.len(), UnexpectedEof, *pos);
         let b = src[*pos];
         *pos += 1;
+        // The tenth byte contributes only bit 63. Without this check a
+        // malformed value with any of the other payload bits set would
+        // silently wrap in the u64 shift and be interpreted as a valid small
+        // number by the decoder.
+        ensure!(shift < 63 || b <= 1, BadCompressedData, *pos - 1);
         result |= ((b & 0x7f) as u64) << shift;
         if b & 0x80 == 0 {
             return Ok(result);
@@ -150,6 +155,13 @@ impl<'a> RleDecoder<'a> {
                 v |= (self.data[self.pos + i] as u32) << (i * 8);
             }
             self.pos += nbytes;
+            // RLE stores a whole byte (or bytes) even when the declared bit
+            // width is smaller. The unused high bits must be zero; accepting
+            // them would turn malformed definition levels into NULLs and
+            // could also produce out-of-range dictionary indices.
+            if self.bit_width < 32 {
+                ensure!(v < (1u32 << self.bit_width), BadCompressedData, self.pos);
+            }
             self.rle_value = v;
             self.rle_left = count as usize;
         }
@@ -227,7 +239,9 @@ impl<'a> RleDecoder<'a> {
             if self.group_pos < self.group_len {
                 let take = core::cmp::min(need, self.group_len - self.group_pos);
                 for i in 0..take {
-                    let v = self.group[self.group_pos + i] == max_level;
+                    let level = self.group[self.group_pos + i];
+                    ensure!(level <= max_level, BadCompressedData);
+                    let v = level == max_level;
                     out.push(v);
                     present += v as usize;
                 }
@@ -237,6 +251,7 @@ impl<'a> RleDecoder<'a> {
                 // A column with no NULLs collapses into one giant RLE run. Since this is
                 // the dominant path, fill it word-at-a-time rather than bit-by-bit.
                 let take = core::cmp::min(need, self.rle_left);
+                ensure!(self.rle_value <= max_level, BadCompressedData);
                 let v = self.rle_value == max_level;
                 out.push_n(v, take);
                 if v {
@@ -688,6 +703,28 @@ mod tests {
         assert!(read_all(&[0x09, 0xff], 8, 8).is_err());
         // The varint never terminates.
         assert!(read_all(&[0x80, 0x80, 0x80], 8, 1).is_err());
+    }
+
+    #[test]
+    fn rle_rejects_uleb128_overflow_in_the_tenth_byte() {
+        // The final payload byte of a u64 ULEB128 value may only be 0 or 1.
+        // This otherwise decodes to a one-value RLE run after the overflowing
+        // high bits are truncated by a u64 shift.
+        let data = [0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x00];
+        assert!(read_all(&data, 0, 1).is_err());
+    }
+
+    #[test]
+    fn rle_rejects_values_that_do_not_fit_the_declared_width() {
+        // Width 1 has only the values 0 and 1; the high bits in an RLE value
+        // are not padding and must not be silently accepted.
+        assert!(read_all(&[0x02, 0xff], 1, 1).is_err());
+
+        // Bit-packed values need the same level-range validation. A wider
+        // stream can encode a value that exceeds the column's max_level.
+        let data = bp_run(&[2, 0, 0, 0, 0, 0, 0, 0], 2);
+        let mut levels = Bitmap::new();
+        assert!(RleDecoder::new(&data, 2).read_levels_into(8, 1, &mut levels).is_err());
     }
 
     #[test]

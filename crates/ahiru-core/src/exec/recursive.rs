@@ -123,6 +123,8 @@ impl RecursiveCte {
         // From here on lookups are by row number (both for duplicate checking and for storing into
         // the working table), so selection is materialized now.
         batch.materialize();
+        let input_rows = batch.num_rows();
+        let mut output_rows = input_rows;
         let cols = match &mut self.seen {
             None => batch.cols,
             Some(seen) => {
@@ -141,6 +143,7 @@ impl RecursiveCte {
                 if sel.is_empty() {
                     return Ok(None);
                 }
+                output_rows = sel.len();
                 if sel.len() == rows {
                     batch.cols
                 } else {
@@ -153,7 +156,10 @@ impl RecursiveCte {
         self.next_working_bytes = self.next_working_bytes.saturating_add(bytes);
         ensure!(self.next_working_bytes <= MAX_WORKING_BYTES, Oom);
 
-        let out = Batch::new(cols);
+        // `Batch::new(Vec::new())` cannot carry a row count. Preserve it explicitly for
+        // zero-column recursive relations (for example, a table after its only column was
+        // dropped); otherwise UNION ALL would turn every rows-only batch into an empty batch.
+        let out = if cols.is_empty() { Batch::rows_only(output_rows) } else { Batch::new(cols) };
         self.next_working.push(clone_batch(&out));
         Ok(Some(out))
     }
@@ -254,5 +260,23 @@ fn clone_batch(b: &Batch) -> Batch {
         Batch::rows_only(b.num_rows())
     } else {
         Batch::new(b.cols.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_preserves_rows_only_batches() {
+        let mut op = RecursiveCte::new(
+            Box::new(crate::exec::Values::new(Batch::rows_only(3))),
+            Node::WorkingTable { schema: Vec::new() },
+            true,
+        );
+        let out = op.process(Batch::rows_only(3)).unwrap().unwrap();
+        assert!(out.cols.is_empty());
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(op.next_working[0].num_rows(), 3);
     }
 }

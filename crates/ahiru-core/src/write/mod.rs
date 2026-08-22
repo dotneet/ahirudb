@@ -56,7 +56,9 @@ pub enum ExportFormat {
 ///
 /// Symmetric with the read side's `TableFormat` (one produces `Batch`, the
 /// other consumes it). Shares the core types (`Batch`/`Vector`/`Field`) but
-/// does not depend on any read-side type.
+/// does not depend on any read-side type. Call `begin` exactly once, followed
+/// by zero or more `write_batch` calls and one `finish`; the built-in sinks
+/// reject calls outside that order and may be started again after finishing.
 pub trait TableSink {
     /// Header-equivalent information. Implementations may write the first bytes here if needed.
     fn begin(&mut self, schema: &[Field]) -> Result<()>;
@@ -64,6 +66,22 @@ pub trait TableSink {
     fn write_batch(&mut self, schema: &[Field], batch: &Batch) -> Result<()>;
     /// Finalizes (footer, closing brackets, etc.) and returns the completed byte sequence.
     fn finish(&mut self) -> Result<Vec<u8>>;
+}
+
+/// Validate the dense batch contract shared by all sinks.
+///
+/// `export_all` materializes selections before calling a sink, but the sink
+/// implementations are public and can also be driven directly. Without this
+/// check a short/mismatched column is silently truncated by `zip` (CSV/JSONL)
+/// or padded with a physical zero (Parquet), producing plausible but corrupt
+/// output.
+pub(crate) fn validate_batch(schema: &[Field], batch: &Batch) -> Result<()> {
+    ensure!(batch.sel.is_none(), Internal);
+    ensure!(batch.cols.len() == schema.len(), Internal);
+    ensure!(batch.cols.iter().zip(schema).all(|(column, field)| column.ty() == field.ty), Internal);
+    let rows = batch.num_rows();
+    ensure!(batch.cols.iter().all(|c| c.len() == rows), Internal);
+    Ok(())
 }
 
 /// Executes a query and writes the whole result to `sink`.
