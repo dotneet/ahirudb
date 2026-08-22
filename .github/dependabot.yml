@@ -1,0 +1,19 @@
+version: 2
+
+updates:
+  # Cargo's native min-publish-age policy is still nightly-only. Apply the
+  # equivalent delay to automated stable-Cargo dependency update proposals.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # Keep Dependabot aligned with the resolver policy in js/.npmrc.
+  - package-ecosystem: npm
+    directory: /js
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
