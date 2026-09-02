@@ -525,8 +525,8 @@ fn factorial_of_33_is_the_largest_that_fits_and_34_overflows() {
 // -- the same syntax parsing to a different answer depending only on
 // whether the operand happened to be a literal. `!` now lives in
 // `expr_body`'s infix loop at its own precedence, `BP_BANG` (strictly
-// between every binary operator and the prefix operators `-`/`~`/`NOT`,
-// all of which read their operand at `BP_UNARY`) -- see `BP_BANG`'s doc in
+// between every binary operator and the prefix operators `-`/`+`/`NOT`,
+// which read their operand at `BP_UNARY`) -- see `BP_BANG`'s doc in
 // `sql::parser` for the full rationale. That fixes both paths uniformly:
 // `!` is left alone while a prefix operator reads its operand, so it ends
 // up applying to the *result* of the prefix operator, not the bare operand.
@@ -542,16 +542,19 @@ fn factorial_applies_after_unary_minus_for_columns_too() {
 }
 
 #[test]
-fn factorial_applies_after_bitwise_not_for_literals_and_columns() {
-    // duckdb: SELECT ~5! -> 1, matching `(~5)!` (`~(5!)` would be `-121`).
-    // Prefix `~` reads its operand at `BP_UNARY` exactly like unary `-`
-    // does, so the same rule applies here too.
+fn factorial_binds_tighter_than_bitwise_not_for_literals_and_columns() {
+    // `!` binds tighter than every binary operator, and prefix `~` lives
+    // inside the binary ladder (at `BP_OTHER`, so that `~1 * 2` is
+    // `~(1 * 2)` as duckdb has it), so `~5!` is `~(5!)` = -121 here.
+    // DuckDB answers 1 for `~5!` but 120 for the identically-shaped `@5!`
+    // (= `@(5!)`); there is no self-consistent rule that matches both, and
+    // `BP_BANG`'s doc in `sql::parser` explains the choice made here.
     let mut db = session_with_dual();
     let rows = run(&mut db, "SELECT ~5! FROM dual");
-    assert_eq!(rows, vec![vec![Value::I128(1)]]);
+    assert_eq!(rows, vec![vec![Value::I64(-121)]]);
     db.register_bytes_as("t", b"x\n5\n".to_vec(), FormatKind::Csv).unwrap();
     let rows = run(&mut db, "SELECT ~x! FROM t");
-    assert_eq!(rows, vec![vec![Value::I128(1)]]);
+    assert_eq!(rows, vec![vec![Value::I64(-121)]]);
 }
 
 #[test]

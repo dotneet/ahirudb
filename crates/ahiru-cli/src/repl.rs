@@ -806,13 +806,31 @@ fn split_script(text: &str) -> Vec<Piece> {
 /// and whose top level has no `FROM` and no set operation. Trailing clauses
 /// (`WHERE`, `ORDER BY`, `LIMIT`, …) stay after the inserted `FROM range(1)`.
 fn needs_dummy_from(sql: &str) -> bool {
-    const BLOCKERS: &[&str] = &["FROM", "UNION", "INTERSECT", "EXCEPT"];
+    const BLOCKERS: &[&str] = &["UNION", "INTERSECT", "EXCEPT"];
     let words = top_level_words(sql);
     match words.first() {
         Some((_, w)) if w == "SELECT" => {}
         _ => return false,
     }
-    !words.iter().any(|(_, w)| BLOCKERS.contains(&w.as_str()))
+    !words.iter().enumerate().any(|(i, (_, w))| {
+        BLOCKERS.contains(&w.as_str()) || (w == "FROM" && !is_distinct_from(&words, i))
+    })
+}
+
+/// True when the top-level word at `i` is the `FROM` of an
+/// `IS [NOT] DISTINCT FROM` comparison rather than a `FROM` clause. The
+/// operator reads as a `FROM` clause to a word scanner, which would suppress
+/// the dummy-`FROM` rewrite and make `SELECT 1 IS DISTINCT FROM 2` fail.
+fn is_distinct_from(words: &[(usize, String)], i: usize) -> bool {
+    let word = |n: usize| words.get(n).map(|(_, w)| w.as_str());
+    if i == 0 || word(i - 1) != Some("DISTINCT") {
+        return false;
+    }
+    match word(i.wrapping_sub(2)) {
+        Some("IS") => true,
+        Some("NOT") => word(i.wrapping_sub(3)) == Some("IS"),
+        _ => false,
+    }
 }
 
 /// Rewrites a clauseless `SELECT` so the engine's required `FROM` is present.
@@ -828,9 +846,12 @@ fn dummy_from(sql: &str) -> Option<String> {
     let insert_at = words
         .iter()
         .find_map(|&(start, ref w)| clause_starts_at(trimmed, start, w).then_some(start));
+    // The inserted clause always starts on a fresh line, and whatever follows
+    // starts on another: the insertion point can sit right after a `--`
+    // comment, which would otherwise swallow the whole ` FROM range(1)`.
     Some(match insert_at {
-        Some(i) => format!("{} FROM range(1) {}", trimmed[..i].trim_end(), &trimmed[i..]),
-        None => format!("{trimmed} FROM range(1)"),
+        Some(i) => format!("{}\nFROM range(1)\n{}", trimmed[..i].trim_end(), &trimmed[i..]),
+        None => format!("{trimmed}\nFROM range(1)"),
     })
 }
 
@@ -1005,7 +1026,7 @@ fn help_text(pattern: Option<&str>) -> String {
         (".help [PATTERN]", "Show this text"),
         (".import FILE TABLE", "Register FILE as TABLE"),
         (".log FILE|off", "Send diagnostics to FILE instead of stderr"),
-        (".maxrows N", "Rows shown in boxed modes before eliding (0 = all)"),
+        (".maxrows N", "Rows shown in duckbox mode before eliding (0 = all)"),
         (".maxwidth N", "Table width in boxed modes before eliding columns"),
         (
             ".mode MODE [TABLE]",
@@ -1125,25 +1146,53 @@ mod tests {
         assert!(needs_dummy_from("SELECT 1 AS x ORDER BY x"));
         assert_eq!(
             dummy_from("SELECT 1 LIMIT 5").as_deref(),
-            Some("SELECT 1 FROM range(1) LIMIT 5")
+            Some("SELECT 1\nFROM range(1)\nLIMIT 5")
         );
         assert_eq!(
             dummy_from("SELECT 1 AS x ORDER BY x").as_deref(),
-            Some("SELECT 1 AS x FROM range(1) ORDER BY x")
+            Some("SELECT 1 AS x\nFROM range(1)\nORDER BY x")
         );
-        assert_eq!(dummy_from("SELECT 1 + 1").as_deref(), Some("SELECT 1 + 1 FROM range(1)"));
+        assert_eq!(dummy_from("SELECT 1 + 1").as_deref(), Some("SELECT 1 + 1\nFROM range(1)"));
         // `AS order` / `AS limit` are aliases, not ORDER BY / LIMIT clauses.
         assert_eq!(
             dummy_from("SELECT 1 AS order").as_deref(),
-            Some("SELECT 1 AS order FROM range(1)")
+            Some("SELECT 1 AS order\nFROM range(1)")
         );
         assert_eq!(
             dummy_from("SELECT 1 AS limit").as_deref(),
-            Some("SELECT 1 AS limit FROM range(1)")
+            Some("SELECT 1 AS limit\nFROM range(1)")
         );
         assert_eq!(
             dummy_from("SELECT 1 WHERE false").as_deref(),
-            Some("SELECT 1 FROM range(1) WHERE false")
+            Some("SELECT 1\nFROM range(1)\nWHERE false")
+        );
+    }
+
+    #[test]
+    fn is_distinct_from_is_not_a_from_clause() {
+        assert!(needs_dummy_from("SELECT 1 IS DISTINCT FROM 2"));
+        assert!(needs_dummy_from("SELECT 1 IS NOT DISTINCT FROM 2"));
+        // A real FROM clause after the operator still counts.
+        assert!(!needs_dummy_from("SELECT a IS DISTINCT FROM b FROM t"));
+        // `SELECT DISTINCT ... FROM t` is a plain FROM clause, not the operator.
+        assert!(!needs_dummy_from("SELECT DISTINCT a FROM t"));
+        assert_eq!(
+            dummy_from("SELECT 1 IS DISTINCT FROM 2").as_deref(),
+            Some("SELECT 1 IS DISTINCT FROM 2\nFROM range(1)")
+        );
+    }
+
+    #[test]
+    fn dummy_from_survives_a_trailing_line_comment() {
+        // Appending on the same line would put `FROM range(1)` inside the
+        // comment, leaving the statement without its required FROM.
+        assert_eq!(
+            dummy_from("SELECT 1 -- note").as_deref(),
+            Some("SELECT 1 -- note\nFROM range(1)")
+        );
+        assert_eq!(
+            dummy_from("SELECT 1 -- note\nLIMIT 1").as_deref(),
+            Some("SELECT 1 -- note\nFROM range(1)\nLIMIT 1")
         );
     }
 

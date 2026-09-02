@@ -231,6 +231,30 @@ pub trait TableFormat {
     /// The returned columns must be in the same order and of the same count as `projection`, and
     /// all of the same length. The caller guarantees the ranges `split_ranges` named are present in `src`.
     fn read_split(&self, src: &Source, split: usize, projection: &[usize]) -> Result<Vec<Vector>>;
+
+    /// The Hive partition keys this part carries, as `(column name, raw value from the path)`.
+    ///
+    /// Only `format::partitioned` returns anything. `catalog::register_multi` uses it to type each
+    /// key **across every part of the table** rather than per directory -- see
+    /// `partitioned::hive_value_ty`.
+    fn hive_keys(&self) -> &[(String, String)] {
+        &[]
+    }
+
+    /// Fixes the column type of each Hive partition key. `types` is parallel to `hive_keys`.
+    /// Called once, before the first `resolve`.
+    fn set_hive_types(&mut self, _types: &[crate::vector::Ty]) {}
+
+    /// Whether this part's schema is *guessed* from a leading sample (CSV / JSONL / JSON) rather
+    /// than declared by the file (Parquet).
+    ///
+    /// `catalog::unify_schema` widens a disagreement between such parts to VARCHAR instead of
+    /// rejecting it, which is what DuckDB does when it unions text files whose sniffed types
+    /// differ. A declared schema keeps the strict treatment: a real Parquet type conflict is a
+    /// genuine error, not a guess to be papered over.
+    fn schema_is_inferred(&self) -> bool {
+        false
+    }
 }
 
 /// Extracts `[start, end)` from `src`. The caller is contracted to have the ranges (named by
@@ -273,7 +297,7 @@ impl FormatKind {
     /// counts as Parquet (the primary target format). A misdetection surfaces not as a magic-byte
     /// check but as a footer-resolution failure, and `BadMagic` is returned.
     pub fn detect(name: &str) -> FormatKind {
-        let path = name.split(['?', '#']).next().unwrap_or(name);
+        let path = strip_url_query(name);
         let ext = match path.rfind('.') {
             Some(i) => &path[i + 1..],
             None => return FormatKind::Parquet,
@@ -291,6 +315,19 @@ impl FormatKind {
             FormatKind::Parquet
         }
     }
+}
+
+/// Drops a URL's query string and fragment, leaving a plain path untouched.
+///
+/// `?` and `#` are perfectly ordinary characters in a file name (`data#1.csv`, `q?.csv`), so
+/// stripping unconditionally used to cut such a name down to `data` and detect it as Parquet --
+/// the file then failed with `BadMagic`, and a glob over a directory holding one failed entirely.
+/// Only a name carrying a scheme (`https://`, `s3://`, ...) is treated as a URL.
+pub(crate) fn strip_url_query(name: &str) -> &str {
+    if !name.contains("://") {
+        return name;
+    }
+    name.split(['?', '#']).next().unwrap_or(name)
 }
 
 /// Builds a format implementation.
@@ -392,6 +429,19 @@ mod tests {
         assert_eq!(FormatKind::detect("https://x/y/trips.jsonl#frag"), FormatKind::Jsonl);
         // It must not be fooled by an extension in the query string.
         assert_eq!(FormatKind::detect("https://x/y/data.parquet?name=a.csv"), FormatKind::Parquet);
+    }
+
+    #[test]
+    fn local_paths_keep_hash_and_question_mark() {
+        // `?` and `#` are ordinary file-name characters. Stripping them unconditionally cut
+        // `data#1.csv` down to `data`, which was then read as Parquet and failed with BadMagic --
+        // and a glob over a directory holding such a file failed entirely.
+        assert_eq!(FormatKind::detect("data#1.csv"), FormatKind::Csv);
+        assert_eq!(FormatKind::detect("/tmp/q?.jsonl"), FormatKind::Jsonl);
+        assert_eq!(FormatKind::detect("./a#b?c.tsv"), FormatKind::Tsv);
+        assert_eq!(strip_url_query("data#1.csv"), "data#1.csv");
+        assert_eq!(strip_url_query("https://x/data.csv?t=1"), "https://x/data.csv");
+        assert_eq!(strip_url_query("s3://b/data.csv#f"), "s3://b/data.csv");
     }
 
     #[test]

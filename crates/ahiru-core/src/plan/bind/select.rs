@@ -11,8 +11,8 @@ use super::agg::{
 use super::cte::CteScope;
 use super::from::{build_tree, flatten_from, full_scope, narrow_scope, rel_ranges, Rel};
 use super::refs::{
-    collect_join_refs, collect_refs, const_program, default_name, distinct_on_output_column,
-    group_name, order_output_column, push_u32, resolve_select_ref,
+    collect_join_refs, collect_outer_refs, collect_refs, const_program, default_name,
+    distinct_on_output_column, group_name, order_output_column, push_u32, resolve_group_ref,
 };
 use super::subquery::{
     and_all, build_quantified_comparison, build_semijoin, classify_conjunct, collect_colrefs,
@@ -162,6 +162,56 @@ fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprI
     Ok(out)
 }
 
+/// Makes a column reference spelled differently from its grouping expression resolve to the
+/// aggregate's grouping column.
+///
+/// `GROUP BY emp.dept` with `SELECT dept` (or the reverse) names one and the same input column,
+/// but the `structural: true` substitution installed for a grouping expression matches raw
+/// syntax, so the qualifier difference would leave `dept` compiled against the aggregate's
+/// output scope — where the input column no longer exists. Each such reference gets its own
+/// exact-node (`structural: false`) substitution instead, which cannot mis-match a same-named
+/// column of another relation the way a loosened structural comparison would.
+fn add_equivalent_group_subs(
+    arena: &ExprArena,
+    scope: &Scope,
+    sel: &SelectStmt,
+    group_exprs: &[ExprId],
+    subs: &mut Vec<Substitution>,
+) -> Result<()> {
+    // (input column, grouping column) for every grouping expression that is a plain column ref.
+    let mut gcols: Vec<(usize, usize)> = Vec::new();
+    for (i, &g) in group_exprs.iter().enumerate() {
+        if let Expr::ColumnRef { qualifier, name } = arena.get(g) {
+            if let Ok(c) = scope.resolve(qualifier.as_deref(), name) {
+                gcols.push((c, i));
+            }
+        }
+    }
+    if gcols.is_empty() {
+        return Ok(());
+    }
+    let mut refs = Vec::new();
+    for item in &sel.items {
+        collect_colrefs(arena, item.expr, &mut refs, 0)?;
+    }
+    for e in [sel.having, sel.qualify].into_iter().flatten() {
+        collect_colrefs(arena, e, &mut refs, 0)?;
+    }
+    for o in &sel.order_by {
+        collect_colrefs(arena, o.expr, &mut refs, 0)?;
+    }
+    for (rid, qual, name) in refs {
+        if group_exprs.contains(&rid) {
+            continue;
+        }
+        let Ok(c) = scope.resolve(qual.as_deref(), &name) else { continue };
+        if let Some(&(_, gi)) = gcols.iter().find(|&&(gc, _)| gc == c) {
+            subs.push(Substitution { expr: rid, column: gi, structural: false });
+        }
+    }
+    Ok(())
+}
+
 // --- Main --------------------------------------------------------------------
 
 /// When `outer_scope` is `Some`, this SELECT is bound as a correlated subquery: an equality
@@ -274,7 +324,7 @@ pub(super) fn bind_select_in(
         // first so pushdown reads the columns that expression actually uses.
         // Collecting the bare alias (`GROUP BY k` for `SELECT v+1 AS k`) would
         // look `k` up in the input scope and fail with `ColumnNotFound`.
-        let e = resolve_select_ref(arena, sel, *e)?;
+        let e = resolve_group_ref(arena, sel, &scope_all, *e)?;
         if ordinal_of(arena, e).is_none() {
             collect_refs(arena, &scope_all, e, &mut refs)?;
         }
@@ -283,7 +333,7 @@ pub(super) fn bind_select_in(
     if let Some(sets) = &sel.grouping_sets {
         for set in sets {
             for &e in set {
-                let e = resolve_select_ref(arena, sel, e)?;
+                let e = resolve_group_ref(arena, sel, &scope_all, e)?;
                 if ordinal_of(arena, e).is_none() {
                     collect_refs(arena, &scope_all, e, &mut refs)?;
                 }
@@ -311,6 +361,22 @@ pub(super) fn bind_select_in(
         if let Some(u) = r.unnest {
             collect_refs(arena, &scope_all, u, &mut refs)?;
         }
+    }
+    // Outer columns a *subquery body* references (`... WHERE s.flag = t.flag` inside a
+    // correlated subquery). Every pass above stops at the subquery boundary, so without this
+    // the outer column would be pruned from the scan and the subquery would then fail to bind
+    // against the narrowed scope. See `collect_outer_refs`.
+    for item in &sel.items {
+        collect_outer_refs(arena, &scope_all, item.expr, &mut refs, 0)?;
+    }
+    for e in [sel.filter, sel.having, sel.qualify].into_iter().flatten() {
+        collect_outer_refs(arena, &scope_all, e, &mut refs, 0)?;
+    }
+    for &e in group_by.iter().chain(&sel.distinct_on) {
+        collect_outer_refs(arena, &scope_all, e, &mut refs, 0)?;
+    }
+    for o in &sel.order_by {
+        collect_outer_refs(arena, &scope_all, o.expr, &mut refs, 0)?;
     }
 
     if star_all {
@@ -460,6 +526,37 @@ pub(super) fn bind_select_in(
     for o in &sel.order_by {
         collect_scalar_subqueries(arena, o.expr, &mut scalars, 0)?;
     }
+    // Whether this query aggregates. The authoritative value is `aggregating`, computed further
+    // down; this early probe is needed here because an *uncorrelated* scalar subquery in an
+    // aggregating query must be attached after the aggregate rather than before it. Attached
+    // before, its column is neither a grouping key nor an aggregate result, so it cannot
+    // survive the grouping — which is why such a query used to fail with `NotGrouped`.
+    let will_aggregate = {
+        let mut probe: Vec<ExprId> = Vec::new();
+        for item in &sel.items {
+            collect_aggregates(arena, item.expr, &mut probe, 0)?;
+        }
+        for e in [sel.having, sel.qualify].into_iter().flatten() {
+            collect_aggregates(arena, e, &mut probe, 0)?;
+        }
+        for o in &sel.order_by {
+            collect_aggregates(arena, o.expr, &mut probe, 0)?;
+        }
+        !probe.is_empty() || !group_by.is_empty() || sel.grouping_sets.is_some()
+    };
+    // Subqueries that WHERE or GROUP BY reads are consumed before the aggregate exists, so they
+    // can never be deferred past it.
+    let mut pre_only: Vec<ExprId> = Vec::new();
+    if will_aggregate {
+        if let Some(w) = sel.filter {
+            collect_scalar_subqueries(arena, w, &mut pre_only, 0)?;
+        }
+        for e in &group_by {
+            collect_scalar_subqueries(arena, *e, &mut pre_only, 0)?;
+        }
+    }
+    // Uncorrelated scalar subqueries held back until after the aggregate: `(expr, plan, label)`.
+    let mut deferred: Vec<(ExprId, Node, String)> = Vec::new();
     for (n, id) in scalars.iter().enumerate() {
         let q = match arena.get(*id) {
             Expr::ScalarSubquery(q) => q,
@@ -471,6 +568,11 @@ pub(super) fn bind_select_in(
         ensure!(plan.root.schema().len() - k == 1, TypeMismatch);
         let ty = plan.root.schema()[0].ty;
         let mut label = String::from("subq");
+        if k == 0 && will_aggregate && !pre_only.contains(id) {
+            push_u32(&mut label, n as u32);
+            deferred.push((*id, plan.root, label));
+            continue;
+        }
         push_u32(&mut label, n as u32);
 
         let mut right = plan.root;
@@ -598,9 +700,9 @@ pub(super) fn bind_select_in(
         if let Some(h) = sel.having {
             collect_aggregates(arena, h, &mut corr_agg_probe, 0)?;
         }
-        let will_aggregate =
+        let corr_aggregates =
             !corr_agg_probe.is_empty() || !group_by.is_empty() || sel.grouping_sets.is_some();
-        if will_aggregate {
+        if corr_aggregates {
             ensure!(
                 sel.items.len() == 1
                     && corr_agg_probe.len() == 1
@@ -610,7 +712,9 @@ pub(super) fn bind_select_in(
                     && sel.having.is_none()
                     && sel.qualify.is_none()
                     && !sel.distinct
-                    && sel.distinct_on.is_empty(),
+                    && sel.distinct_on.is_empty()
+                    // This path returns early, before deferred scalar subqueries are attached.
+                    && deferred.is_empty(),
                 UnsupportedFeature
             );
             let k = correlated_eq.len();
@@ -744,13 +848,27 @@ pub(super) fn bind_select_in(
     // GROUPING() is meaningless outside aggregation.
     ensure!(aggregating || grouping_calls.is_empty(), NotAggregate);
     let mut item_scope = scope.clone();
+    // The expressions of the deferred (uncorrelated, hence grouping-invariant) scalar
+    // subqueries, which `check_grouped` must let through and which are attached to the plan
+    // right after the aggregate below.
+    let const_subs: Vec<ExprId> = deferred.iter().map(|&(id, _, _)| id).collect();
+    // A HAVING reading one of them cannot be embedded into `Node::Aggregate` (the column does
+    // not exist yet at that point); it becomes a Filter applied after the attachment instead.
+    let having_deferred = match sel.having {
+        Some(h) if !const_subs.is_empty() => {
+            let mut hs = Vec::new();
+            collect_scalar_subqueries(arena, h, &mut hs, 0)?;
+            hs.iter().any(|e| const_subs.contains(e))
+        }
+        _ => false,
+    };
 
     if aggregating && sel.grouping_sets.is_none() && grouping_calls.is_empty() {
         // A plain `GROUP BY a, b, ...` (no GROUPING SETS-family extension).
         // The conventional path, embedding havings directly into a single existing Node::Aggregate.
         let mut group_exprs = Vec::new();
         for g in &group_by {
-            group_exprs.push(resolve_select_ref(arena, sel, *g)?);
+            group_exprs.push(resolve_group_ref(arena, sel, &scope, *g)?);
         }
 
         let mut groups = Vec::new();
@@ -773,16 +891,19 @@ pub(super) fn bind_select_in(
 
         // Rejects bare column references absent from GROUP BY. A column outside the aggregate has no determined value.
         for item in &sel.items {
-            check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, 0)?;
+            check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
         if let Some(h) = sel.having {
-            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, 0)?;
+            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
+        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &mut subs)?;
 
         let agg_scope = Scope::from_fields(out_fields.clone());
         let having = match sel.having {
-            Some(h) => Some(compile_predicate_with_subs(arena, &agg_scope, params, &subs, h)?),
-            None => None,
+            Some(h) if !having_deferred => {
+                Some(compile_predicate_with_subs(arena, &agg_scope, params, &subs, h)?)
+            }
+            _ => None,
         };
         node = Node::Aggregate { input: Box::new(node), groups, aggs, schema: out_fields, having };
         item_scope = agg_scope;
@@ -808,7 +929,7 @@ pub(super) fn bind_select_in(
         for set in &sets {
             let mut rs = Vec::with_capacity(set.len());
             for &g in set {
-                let r = resolve_select_ref(arena, sel, g)?;
+                let r = resolve_group_ref(arena, sel, &scope, g)?;
                 if !group_exprs.iter().any(|&e| expr_eq(arena, e, r)) {
                     group_exprs.push(r);
                 }
@@ -847,11 +968,12 @@ pub(super) fn bind_select_in(
         // across sets counts as "the grouping columns", so referencing bare in SELECT a column
         // absent from one set is not an error (it is simply NULL in those rows, as in DuckDB).
         for item in &sel.items {
-            check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, 0)?;
+            check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
         if let Some(h) = sel.having {
-            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, 0)?;
+            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
+        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &mut subs)?;
 
         // The arguments of GROUPING()/GROUPING_ID() must be grouping columns.
         // Only which column (an index into `group_exprs`) each argument points at is remembered;
@@ -865,7 +987,7 @@ pub(super) fn bind_select_in(
             ensure!(!args.is_empty(), WrongArgCount);
             let mut idxs = Vec::with_capacity(args.len());
             for a in args {
-                let r = resolve_select_ref(arena, sel, a)?;
+                let r = resolve_group_ref(arena, sel, &scope, a)?;
                 let pos = group_exprs.iter().position(|&g| expr_eq(arena, g, r));
                 idxs.push(match pos {
                     Some(p) => p,
@@ -885,8 +1007,10 @@ pub(super) fn bind_select_in(
         // per-row, so either gives the same result).
         let agg_scope = Scope::from_fields(out_fields.clone());
         let having = match sel.having {
-            Some(h) => Some(compile_predicate_with_subs(arena, &agg_scope, params, &subs, h)?),
-            None => None,
+            Some(h) if !having_deferred => {
+                Some(compile_predicate_with_subs(arena, &agg_scope, params, &subs, h)?)
+            }
+            _ => None,
         };
 
         let base_fields: Vec<Field> = out_fields[..base_cols].to_vec();
@@ -981,6 +1105,39 @@ pub(super) fn bind_select_in(
         ensure!(sel.having.is_none(), NotAggregate);
     }
 
+    // --- Uncorrelated scalar subqueries held back past the aggregate --------
+    // Attached here, between the aggregate and the window functions, by the same keyless LEFT
+    // JOIN used before the aggregate for the non-aggregating case. Being uncorrelated, the
+    // subquery yields the same single value for every row, so where the join sits does not
+    // change the result — only whether the value survives the grouping.
+    for (id, right, label) in deferred {
+        let ty = right.schema()[0].ty;
+        // The same cardinality check as the pre-aggregate path: two or more rows is an error,
+        // and `Limit(2)` bounds the cost of proving it.
+        let right = Node::Limit { input: Box::new(right), limit: Some(2), offset: 0 };
+        let right = Node::AssertMaxOneRow { input: Box::new(right), keys: Vec::new() };
+        let col = item_scope.len();
+        let mut full_schema = node.schema().to_vec();
+        full_schema.extend_from_slice(right.schema());
+        node = Node::Join {
+            left: Box::new(node),
+            right: Box::new(right),
+            kind: JoinKind::Left,
+            left_keys: Vec::new(),
+            right_keys: Vec::new(),
+            residual: None,
+            schema: full_schema,
+        };
+        item_scope.push(None, Field::new(label, ty, true));
+        subs.push(Substitution { expr: id, column: col, structural: false });
+    }
+    if having_deferred {
+        if let Some(h) = sel.having {
+            let pred = compile_predicate_with_subs(arena, &item_scope, params, &subs, h)?;
+            node = Node::Filter { input: Box::new(node), pred };
+        }
+    }
+
     // --- Window functions ---------------------------------------------------
     // Evaluated **after** aggregation. The x in `sum(x) OVER ()` may point at an aggregate
     // result, so the input scope is the aggregate's output (or the scan/join output if there is no aggregate).
@@ -1014,8 +1171,13 @@ pub(super) fn bind_select_in(
         }
         node = Node::Window { input: Box::new(node), windows: specs, schema: fields.clone() };
         // The window output is "the input's columns ++ the window columns", so existing column
-        // numbers do not shift and the aggregate replacements still apply.
-        item_scope = Scope::from_fields(fields);
+        // numbers do not shift and the aggregate replacements still apply. The input columns
+        // are appended onto the existing scope rather than rebuilt with `Scope::from_fields`,
+        // which would drop their table qualifiers and make `SELECT e.id, row_number() OVER ()`
+        // fail to resolve `e`.
+        for f in fields.into_iter().skip(base) {
+            item_scope.push(None, f);
+        }
     }
 
     // --- Projection ---------------------------------------------------------

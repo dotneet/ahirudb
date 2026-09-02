@@ -241,27 +241,80 @@ impl Table {
 /// require per-part renumbering that includes `Pruner`, a large change bearing on the
 /// correctness of statistics pruning). The design therefore errs on the safe side:
 /// files with a different ordering are clearly rejected rather than accepted and reordered.
+///
+/// One exception to "a type combination that cannot be unified is an error": when **every** part's
+/// schema is itself a guess from a leading sample (CSV / JSONL / JSON -- `TableFormat::
+/// schema_is_inferred`), a disagreement falls back to VARCHAR instead of failing. Two CSV files of
+/// the same shape can easily sniff differently -- one file's column happens to hold only digits
+/// and the next file's is empty, so one part says BIGINT and the other VARCHAR -- and DuckDB
+/// unions such files to VARCHAR rather than refusing to read them. Every value has a text form, so
+/// nothing is lost, and `exec::Scan` casts each part up to the unified type as it reads.
+/// A declared schema (Parquet) keeps the strict treatment: there, a type conflict is a real
+/// conflict rather than two guesses, and reporting it is the point.
 fn unify_schema(parts: &[TablePart]) -> Result<Vec<Field>> {
     let mut iter = parts.iter();
     let first = match iter.next() {
         Some(p) => p,
         None => return Ok(Vec::new()),
     };
+    let widen_to_text = parts.iter().all(|p| p.format.schema_is_inferred());
     let mut out: Vec<Field> = first.format.schema().to_vec();
     for part in iter {
         let s = part.format.schema();
         ensure!(s.len() == out.len(), TypeMismatch);
         for (o, f) in out.iter_mut().zip(s) {
             ensure!(eq_ascii_ci(o.name.as_bytes(), f.name.as_bytes()), TypeMismatch);
-            let ty = match Ty::unify(o.ty, f.ty) {
-                Some(t) => t,
-                None => err!(TypeMismatch),
+            let ty = match (Ty::unify(o.ty, f.ty), widen_to_text) {
+                (Some(t), _) => t,
+                (None, true) => Ty::Varchar,
+                (None, false) => err!(TypeMismatch),
             };
             o.ty = ty;
             o.nullable = o.nullable || f.nullable;
         }
     }
     Ok(out)
+}
+
+/// Types each Hive partition key **once per table** instead of once per directory.
+///
+/// `format::partitioned::hive_value_ty` can only see one directory's value, so a key written as
+/// `k=1` under one partition and `k=x` under another used to make the two parts disagree on that
+/// column's type -- and `unify_schema` then rejected the whole table with `TypeMismatch`, leaving
+/// entire directories unreadable. Widening the key across every part first (falling back to VARCHAR
+/// when the readings disagree) is what DuckDB does, and it keeps `WHERE year = 2024` an integer
+/// comparison wherever the key really is integral.
+fn unify_hive_key_types(parts: &mut [TablePart]) {
+    // `(key name, widened type)`. A table has a handful of partition keys, so a linear scan is fine.
+    let mut acc: Vec<(String, Ty)> = Vec::new();
+    for part in parts.iter() {
+        for (name, raw) in part.format.hive_keys() {
+            let ty = format::partitioned::hive_value_ty(raw);
+            match acc.iter_mut().find(|(n, _)| eq_ascii_ci(n.as_bytes(), name.as_bytes())) {
+                // Two readings that cannot be unified (INTEGER and VARCHAR) settle on VARCHAR,
+                // which every partition value can express.
+                Some((_, t)) => *t = Ty::unify(*t, ty).unwrap_or(Ty::Varchar),
+                None => acc.push((name.clone(), ty)),
+            }
+        }
+    }
+    if acc.is_empty() {
+        return;
+    }
+    for part in parts.iter_mut() {
+        let types: Vec<Ty> = part
+            .format
+            .hive_keys()
+            .iter()
+            .map(|(name, raw)| {
+                acc.iter()
+                    .find(|(n, _)| eq_ascii_ci(n.as_bytes(), name.as_bytes()))
+                    .map(|(_, t)| *t)
+                    .unwrap_or_else(|| format::partitioned::hive_value_ty(raw))
+            })
+            .collect();
+        part.format.set_hive_types(&types);
+    }
 }
 
 /// An in-memory table, exclusive to the `ddl`/`dml` features.
@@ -354,8 +407,9 @@ impl Catalog {
     /// Assumes the caller (`session.rs`) has already assembled each part's format
     /// (including wrapping for Hive partition columns). `catalog` merely bundles them
     /// as given and needs no knowledge that `format::partitioned` exists.
-    pub fn register_multi(&mut self, name: &str, parts: Vec<TablePart>) -> Result<usize> {
+    pub fn register_multi(&mut self, name: &str, mut parts: Vec<TablePart>) -> Result<usize> {
         ensure!(!parts.is_empty(), Internal);
+        unify_hive_key_types(&mut parts);
         // A file table must not silently shadow an in-memory table or view of
         // the same name (`CREATE TABLE t` then `register("t", …)` used to make
         // `SELECT` read the file and `INSERT` write the mem table).
@@ -739,11 +793,20 @@ mod tests {
         resolved: bool,
         rows_per_split: u64,
         splits: usize,
+        /// Stands in for a text format, whose column types are sniffed rather than declared.
+        inferred_schema: bool,
     }
 
     impl MockFormat {
         fn new(schema: Vec<Field>, total: u64, splits: usize, rows_per_split: u64) -> Self {
-            MockFormat { schema, total, resolved: false, rows_per_split, splits }
+            MockFormat {
+                schema,
+                total,
+                resolved: false,
+                rows_per_split,
+                splits,
+                inferred_schema: false,
+            }
         }
     }
 
@@ -765,6 +828,10 @@ mod tests {
 
         fn schema(&self) -> &[Field] {
             &self.schema
+        }
+
+        fn schema_is_inferred(&self) -> bool {
+            self.inferred_schema
         }
 
         fn num_splits(&self) -> usize {
@@ -816,6 +883,17 @@ mod tests {
                     v
                 })
                 .collect())
+        }
+    }
+
+    /// A part whose format reports `schema_is_inferred` as given (a text format when true).
+    fn mock_part_inferred(path: &str, schema: Vec<Field>, inferred: bool) -> TablePart {
+        let mut fmt = MockFormat::new(schema, 10, 1, 4);
+        fmt.inferred_schema = inferred;
+        TablePart {
+            path: path.into(),
+            source: Source::from_bytes(vec![0u8; 10]),
+            format: Box::new(fmt),
         }
     }
 
@@ -918,6 +996,30 @@ mod tests {
             p.source.insert(0, vec![0u8; 10]);
         }
         assert!(t.resolve().is_err());
+    }
+
+    #[test]
+    fn parts_whose_schemas_are_all_sniffed_widen_an_unfixable_type_to_varchar() {
+        // Two text parts (CSV / JSONL / JSON) that sniffed differently -- one file's column holds
+        // only digits, the next file's is empty -- used to be rejected outright, making the table
+        // unreadable over a placeholder file in a glob. Both types are guesses, so they widen to
+        // VARCHAR instead, as DuckDB does. The strict path is still exercised by
+        // `schema_type_mismatch_is_rejected_when_unify_fails` above, whose parts declare their
+        // schemas (Parquet).
+        let build = |a_inferred: bool, b_inferred: bool| {
+            vec![
+                mock_part_inferred("a.csv", vec![Field::new("id", Ty::Varchar, true)], a_inferred),
+                mock_part_inferred("b.csv", vec![Field::new("id", Ty::BigInt, true)], b_inferred),
+            ]
+        };
+        let out =
+            unify_schema(&build(true, true)).expect("two sniffed schemas widen instead of failing");
+        assert_eq!(out[0].ty, Ty::Varchar);
+        // A declared schema on either side keeps the strict rule: a Parquet type conflict is a
+        // real conflict, not two guesses.
+        assert!(unify_schema(&build(true, false)).is_err());
+        assert!(unify_schema(&build(false, true)).is_err());
+        assert!(unify_schema(&build(false, false)).is_err());
     }
 
     #[test]

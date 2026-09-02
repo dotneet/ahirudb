@@ -5,9 +5,49 @@
 //! classification used to detect correlated equality predicates
 //! (`classify_conjunct`/`ConjClass`).
 
+use super::agg::{
+    as_bare_aggregate, coalesce_count_column, collect_aggregates, drop_trailing_columns,
+};
 use super::cte::CteScope;
 use super::refs::{collect_refs, each_child, push_u32};
 use super::*;
+
+/// Whether this subquery is guaranteed to produce **exactly one row**, whatever its input.
+///
+/// An aggregate with no `GROUP BY` does: over an empty input it still emits a single row
+/// (`count(*)` = 0, `max(x)` = NULL — the `empty_input_ungrouped_emits_one_row` premise in
+/// `exec::agg`). That makes `EXISTS (SELECT count(*) ...)` unconditionally true and turns
+/// `x IN (SELECT count(*) ...)` into a plain comparison against that one value; rewriting
+/// either as an ordinary semi-join on the correlation key would instead drop every outer row
+/// whose correlated group happens to be empty.
+///
+/// Every clause that could remove the row (`HAVING`, `QUALIFY`, `LIMIT`/`OFFSET`) or split it
+/// into several (`GROUP BY`, `GROUP BY ALL`, `GROUPING SETS`) disqualifies the shape.
+fn always_one_row(arena: &ExprArena, q: &QueryStmt) -> Result<bool> {
+    if !q.ctes.is_empty() || q.limit.is_some() || q.offset.is_some() {
+        return Ok(false);
+    }
+    let sel = match &q.body {
+        SetExpr::Select(s) => s,
+        SetExpr::SetOp { .. } => return Ok(false),
+    };
+    if sel.from.is_none()
+        || !sel.group_by.is_empty()
+        || sel.group_by_all
+        || sel.grouping_sets.is_some()
+        || sel.having.is_some()
+        || sel.qualify.is_some()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+    {
+        return Ok(false);
+    }
+    let mut aggs = Vec::new();
+    for item in &sel.items {
+        collect_aggregates(arena, item.expr, &mut aggs, 0)?;
+    }
+    Ok(!aggs.is_empty())
+}
 
 /// Rewrites `EXISTS` / `IN (SELECT ...)` into semi-joins and anti-joins.
 #[allow(clippy::too_many_arguments)]
@@ -29,6 +69,18 @@ pub(super) fn build_semijoin(
             // Deeper correlation becomes a column reference absent from the inner `scope` and
             // naturally fails with `ColumnNotFound`).
             let plan = bind_query_in(catalog, arena, query, params, ctes, Some(scope))?;
+            // An ungrouped aggregate always yields exactly one row, so `EXISTS` over it is a
+            // constant: TRUE, or FALSE under `NOT EXISTS`. The subquery is still bound above
+            // so that its own errors are reported, then discarded. Rewriting it as a semi-join
+            // on the correlation key would wrongly drop the outer rows whose correlated group
+            // is empty — precisely the rows for which `count(*)` is 0 and `EXISTS` is still true.
+            if always_one_row(arena, query)? {
+                return Ok(if *negated {
+                    Node::Limit { input: Box::new(left), limit: Some(0), offset: 0 }
+                } else {
+                    left
+                });
+            }
             // Without correlation, all that matters is "is there at least one row on the right",
             // and no key is needed. With correlation, it checks whether at least one row matches
             // the correlation key. `EXISTS` asks only about row existence rather than about a
@@ -85,6 +137,18 @@ fn build_in_style_semijoin(
     ensure!(plan.root.schema().len() - k == 1, TypeMismatch);
     let rf = plan.root.schema()[0].clone();
 
+    // An ungrouped aggregate yields exactly one row, so membership in it is a plain comparison
+    // against that single value — including the NULL three-valued logic, which `=`/`<>` already
+    // carry. A semi-join on the correlation key would instead drop every outer row whose
+    // correlated group is empty, even though `count(*)` there is 0, not "no row".
+    if always_one_row(arena, query)? {
+        let is_count =
+            matches!(as_bare_aggregate(arena, query), Some(AggKind::Count | AggKind::CountStar));
+        return build_one_row_membership(
+            arena, params, left, scope, subs, schema, arg, negated, plan, is_count,
+        );
+    }
+
     let lp = compile_with_subs(arena, scope, params, subs, arg)?;
     let rscope = Scope::from_fields(plan.root.schema().to_vec());
     let rp = column_program(&rscope, 0)?;
@@ -121,6 +185,103 @@ fn build_in_style_semijoin(
         residual: None,
         schema,
     })
+}
+
+/// `x [NOT] IN (<subquery yielding exactly one row>)` as a comparison against that row's value.
+///
+/// The value is attached with a LEFT JOIN — keyless when uncorrelated, on the correlation key
+/// when correlated (the correlated form arrives already grouped by that key, one row per key,
+/// from `bind_select_in`'s aggregate decorrelation). A key with no matching inner rows is
+/// absent from that grouping, so the join leaves NULL, which is the right answer for every
+/// aggregate except the COUNT family — `is_count` patches those back to 0, exactly as the
+/// correlated scalar-subquery path does.
+///
+/// `x = v` / `x <> v` then give the correct three-valued result for `IN` / `NOT IN` over a
+/// one-element set, so no NULL-aware anti-join is involved and the correlated `NOT IN` that
+/// `build_in_style_semijoin` has to reject is expressible here.
+#[allow(clippy::too_many_arguments)]
+fn build_one_row_membership(
+    arena: &ExprArena,
+    params: &[Value],
+    left: Node,
+    scope: &Scope,
+    subs: &[Substitution],
+    out_schema: Vec<Field>,
+    arg: ExprId,
+    negated: bool,
+    plan: Plan,
+    is_count: bool,
+) -> Result<Node> {
+    let k = plan.correlated.len();
+    let orig_len = scope.len();
+
+    // x, the left-hand value, materialized as one extra column.
+    let x_prog = compile_with_subs(arena, scope, params, subs, arg)?;
+    let x_ty = x_prog.result_ty;
+    let mut exprs = Vec::with_capacity(orig_len + 1);
+    for i in 0..orig_len {
+        exprs.push(column_program(scope, i)?);
+    }
+    exprs.push(x_prog);
+    let mut ext_schema = out_schema.clone();
+    ext_schema.push(Field::new(String::from("__inagg_x"), x_ty, true));
+    let mut node = Node::Project { input: Box::new(left), exprs, schema: ext_schema };
+
+    // The subquery's single row, joined on the correlation key (keyless when uncorrelated).
+    // `plan.root`'s column order is [value, key0, key1, ...] — the convention `Plan::correlated`
+    // carries, shared with the scalar-subquery path.
+    let rscope = Scope::from_fields(plan.root.schema().to_vec());
+    let mut left_keys = Vec::with_capacity(k);
+    let mut right_keys = Vec::with_capacity(k);
+    for (i, &outer_e) in plan.correlated.iter().enumerate() {
+        let lp = compile_with_subs(arena, scope, params, subs, outer_e)?;
+        let rp = column_program(&rscope, 1 + i)?;
+        let want = Ty::unify_or_mismatch(lp.result_ty, rp.result_ty)?;
+        left_keys.push(cast_program(lp, want)?);
+        right_keys.push(cast_program(rp, want)?);
+    }
+    let value_col = orig_len + 1;
+    let mut full_schema = node.schema().to_vec();
+    full_schema.extend_from_slice(plan.root.schema());
+    node = Node::Join {
+        left: Box::new(node),
+        right: Box::new(plan.root),
+        kind: JoinKind::Left,
+        left_keys,
+        right_keys,
+        residual: None,
+        schema: full_schema,
+    };
+    if k > 0 {
+        node = drop_trailing_columns(node, k)?;
+        if is_count {
+            node = coalesce_count_column(node, value_col)?;
+        }
+    }
+
+    // The comparison is assembled in a temporary arena over a renamed view of the current
+    // schema, so that `compile` handles operator type dispatch and NULL semantics as usual.
+    // Only the two synthetic names are looked up, and both are unique within that view.
+    let mut cmp_fields = node.schema().to_vec();
+    ensure!(cmp_fields.len() > value_col, Internal);
+    cmp_fields[orig_len].name = String::from("__inagg_x");
+    cmp_fields[value_col].name = String::from("__inagg_v");
+    let cmp_scope = Scope::from_fields(cmp_fields);
+    let mut fa = ExprArena::new();
+    let x_ref = fa.push(Expr::ColumnRef { qualifier: None, name: String::from("__inagg_x") });
+    let v_ref = fa.push(Expr::ColumnRef { qualifier: None, name: String::from("__inagg_v") });
+    let op = if negated { BinaryOp::Ne } else { BinaryOp::Eq };
+    let cmp = fa.push(Expr::Binary { op, lhs: x_ref, rhs: v_ref });
+    let pred = compile_predicate(&fa, &cmp_scope, params, cmp)?;
+    node = Node::Filter { input: Box::new(node), pred };
+
+    // Drop the two intermediate columns, restoring the caller's schema.
+    let s = Scope::from_fields(node.schema().to_vec());
+    let mut trim = Vec::with_capacity(orig_len);
+    for i in 0..orig_len {
+        trim.push(column_program(&s, i)?);
+    }
+    Ok(Node::Project { input: Box::new(node), exprs: trim, schema: out_schema })
 }
 
 /// Builds the join-key pairs `(left, right)` corresponding to each item of `plan.correlated`.

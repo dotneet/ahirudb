@@ -953,3 +953,254 @@ fn qualify_uses_post_projection_names() {
     let rows = run(&mut db, "SELECT * RENAME (id AS pk) FROM t QUALIFY pk > 1 ORDER BY pk");
     assert_eq!(rows, vec![vec![i64v(2), i64v(20)]]);
 }
+
+// =========================================================================
+// Binder regressions: projection pushdown across a subquery boundary,
+// qualified references around window functions, `EXISTS`/`IN` over an
+// ungrouped aggregate, GROUP BY name resolution, scalar subqueries in an
+// aggregating query, and ORDER BY positional-term validation.
+//
+// Every expected value below was cross-checked against the `duckdb` CLI over
+// the same CSV fixtures.
+// =========================================================================
+
+/// `p(id, flag, name)`: two rows share a `flag`, every `name` is distinct.
+///
+/// ```text
+/// p: (1,x,a) (2,y,b) (3,x,c)
+/// ```
+/// Registered as a CSV byte source, i.e. a *file-backed* table, which is what
+/// projection pushdown prunes — an in-memory DDL table is never narrowed and
+/// would not exercise the pushdown path at all.
+fn session_with_p() -> Session {
+    let mut sess = Session::new();
+    csv(&mut sess, "p", "id,flag,name\n1,x,a\n2,y,b\n3,x,c\n");
+    sess
+}
+
+/// An outer column referenced *only* inside a correlated subquery must survive
+/// projection pushdown. `collect_refs` stops at the subquery boundary, so
+/// `p.flag` used to be pruned from the scan and the subquery then failed to
+/// bind against the narrowed scope with `TableNotFound`.
+/// duckdb: `SELECT id, (SELECT count(*) FROM p s WHERE s.flag = p.flag) FROM p ORDER BY id`
+#[test]
+fn outer_column_used_only_inside_a_subquery_is_not_pruned() {
+    let mut db = session_with_p();
+    let rows = run(
+        &mut db,
+        "SELECT id, (SELECT count(*) FROM p s WHERE s.flag = p.flag) FROM p ORDER BY id",
+    );
+    assert_eq!(rows, vec![vec![i64v(1), i64v(2)], vec![i64v(2), i64v(1)], vec![i64v(3), i64v(2)],]);
+
+    // The same for EXISTS ...
+    let rows = run(
+        &mut db,
+        "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM p s WHERE s.name = p.name) ORDER BY id",
+    );
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)], vec![i64v(3)]]);
+
+    // ... and for IN.
+    let rows = run(
+        &mut db,
+        "SELECT id FROM p WHERE id IN (SELECT s.id FROM p s WHERE s.flag = p.flag) ORDER BY id",
+    );
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)], vec![i64v(3)]]);
+}
+
+/// A table-qualified column in the SELECT list or QUALIFY of a query that also
+/// contains a window function. The scope rebuilt after the window columns used
+/// to drop table qualifiers, so `e.id` no longer resolved.
+/// duckdb: `SELECT e.id, row_number() OVER (ORDER BY e.id) FROM p e ORDER BY 1`
+#[test]
+fn qualified_columns_resolve_alongside_window_functions() {
+    let mut db = session_with_p();
+    let rows = run(&mut db, "SELECT e.id, row_number() OVER (ORDER BY e.id) FROM p e ORDER BY 1");
+    assert_eq!(rows, vec![vec![i64v(1), i64v(1)], vec![i64v(2), i64v(2)], vec![i64v(3), i64v(3)],]);
+
+    // The table's own name works as a qualifier too.
+    let rows = run(&mut db, "SELECT p.id, row_number() OVER () FROM p ORDER BY 1");
+    assert_eq!(rows.len(), 3);
+
+    // QUALIFY compiles against the same scope.
+    let rows = run(&mut db, "SELECT p.id FROM p QUALIFY row_number() OVER (ORDER BY p.id) = 1");
+    assert_eq!(rows, vec![vec![i64v(1)]]);
+}
+
+/// `nums`/`dup`: `nums` carries a NULL, `dup` has a duplicated value.
+///
+/// ```text
+/// nums: 1 2 3 NULL      dup: 1 1 2
+/// ```
+/// `nums` gets a second column purely so the NULL row is a line with a
+/// separator on it rather than a blank line at end of file.
+fn session_with_nums_dup() -> Session {
+    let mut sess = Session::new();
+    csv(&mut sess, "nums", "x,tag\n1,a\n2,b\n3,c\n,d\n");
+    csv(&mut sess, "dup", "x\n1\n1\n2\n");
+    sess
+}
+
+/// An aggregate with no GROUP BY produces exactly one row even over an empty
+/// input, so `EXISTS` over it is unconditionally true. Rewriting it as a
+/// semi-join on the correlation key instead dropped the outer rows whose
+/// correlated group is empty — the very rows for which `count(*)` is 0.
+/// duckdb: `SELECT x FROM nums WHERE EXISTS (SELECT count(*) FROM dup WHERE dup.x = nums.x) ORDER BY x`
+#[test]
+fn exists_over_an_ungrouped_aggregate_is_always_true() {
+    let mut db = session_with_nums_dup();
+    let rows = run(
+        &mut db,
+        "SELECT x FROM nums WHERE EXISTS (SELECT count(*) FROM dup WHERE dup.x = nums.x) ORDER BY x",
+    );
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)], vec![i64v(3)], vec![NULL]]);
+
+    // ... and `NOT EXISTS` is therefore unconditionally false.
+    let rows = run(
+        &mut db,
+        "SELECT count(*) FROM nums WHERE NOT EXISTS (SELECT count(*) FROM dup WHERE dup.x = nums.x)",
+    );
+    assert_eq!(rows, vec![vec![i64v(0)]]);
+}
+
+/// `IN` over an ungrouped aggregate is a comparison against that one value,
+/// with a missing correlated group counting as `count(*) = 0` rather than as
+/// "no row to match".
+/// duckdb: `SELECT x FROM nums WHERE 0 IN (SELECT count(*) FROM dup WHERE dup.x = nums.x + 10) ORDER BY x`
+#[test]
+fn in_over_an_ungrouped_aggregate_compares_against_the_single_value() {
+    let mut db = session_with_nums_dup();
+    // No `dup` row ever matches, so every group is empty and `count(*)` is 0.
+    let rows = run(
+        &mut db,
+        "SELECT x FROM nums WHERE 0 IN (SELECT count(*) FROM dup WHERE dup.x = nums.x + 10) ORDER BY x",
+    );
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)], vec![i64v(3)], vec![NULL]]);
+
+    // Only `x = 1` has two matching `dup` rows.
+    let rows = run(
+        &mut db,
+        "SELECT x FROM nums WHERE 2 IN (SELECT count(*) FROM dup WHERE dup.x = nums.x) ORDER BY x",
+    );
+    assert_eq!(rows, vec![vec![i64v(1)]]);
+
+    // An uncorrelated one-row aggregate, including the NULL-propagating `NOT IN`.
+    let rows = run(&mut db, "SELECT x FROM nums WHERE x IN (SELECT max(x) FROM dup) ORDER BY x");
+    assert_eq!(rows, vec![vec![i64v(2)]]);
+    let rows =
+        run(&mut db, "SELECT x FROM nums WHERE x NOT IN (SELECT max(x) FROM dup) ORDER BY x");
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(3)]]);
+}
+
+/// `GROUP BY <name>` binds an *input* column before a SELECT-list alias of the
+/// same name, as DuckDB and PostgreSQL do. ORDER BY keeps the opposite
+/// (alias-first) rule.
+/// duckdb: `SELECT id % 2 AS id, count(*) FROM p GROUP BY id ORDER BY 1, 2`
+#[test]
+fn group_by_name_prefers_the_input_column_over_a_select_alias() {
+    let mut db = session_with_p();
+    // Grouping by the table's `id` gives one group per row, not two groups of `id % 2`.
+    let rows = run(&mut db, "SELECT id % 2 AS id, count(*) FROM p GROUP BY id ORDER BY 1, 2");
+    assert_eq!(rows, vec![vec![i64v(0), i64v(1)], vec![i64v(1), i64v(1)], vec![i64v(1), i64v(1)]]);
+
+    // Consequently a select item that is not grouped is now correctly rejected,
+    // where the alias-first rule used to return a silently wrong answer.
+    // duckdb: `Binder Error: column "flag" must appear in the GROUP BY clause`
+    let err = db.prepare("SELECT flag AS id, count(*) FROM p GROUP BY id", &[]);
+    assert_eq!(code_of(err), Some(Code::NotGrouped));
+
+    // A name the FROM clause does not provide still falls back to the alias.
+    let rows = run(&mut db, "SELECT id % 2 AS k, count(*) FROM p GROUP BY k ORDER BY 1");
+    assert_eq!(rows, vec![vec![i64v(0), i64v(1)], vec![i64v(1), i64v(2)]]);
+
+    // ORDER BY stays alias-first: `id` here is the output `id % 2`.
+    let rows = run(&mut db, "SELECT id % 2 AS id, count(*) FROM p GROUP BY 1 ORDER BY id");
+    assert_eq!(rows, vec![vec![i64v(0), i64v(1)], vec![i64v(1), i64v(2)]]);
+}
+
+/// An uncorrelated scalar subquery is a constant with respect to the grouping,
+/// so it is legal in the SELECT list and in HAVING of an aggregating query.
+/// duckdb: `SELECT flag, count(*) + (SELECT max(id) FROM p) FROM p GROUP BY flag ORDER BY 1`
+#[test]
+fn uncorrelated_scalar_subquery_is_allowed_in_an_aggregating_query() {
+    let mut db = session_with_p();
+    let rows = run(
+        &mut db,
+        "SELECT flag, count(*) + (SELECT max(id) FROM p) FROM p GROUP BY flag ORDER BY 1",
+    );
+    assert_eq!(rows, vec![vec![s("x"), i64v(5)], vec![s("y"), i64v(4)]]);
+
+    // HAVING reads it too (`min(id)` is 1, so only the two-row group survives).
+    let rows = run(
+        &mut db,
+        "SELECT flag, count(*) FROM p GROUP BY flag HAVING count(*) > (SELECT min(id) FROM p) \
+         ORDER BY 1",
+    );
+    assert_eq!(rows, vec![vec![s("x"), i64v(2)]]);
+
+    // With no rows at all, the ungrouped aggregate must still emit its single
+    // row — the constant is joined on after the aggregate, not folded into it.
+    let rows = run(&mut db, "SELECT count(*) + (SELECT max(id) FROM p) FROM p WHERE id > 100");
+    assert_eq!(rows, vec![vec![i64v(3)]]);
+}
+
+/// A qualified and an unqualified spelling of one column match between SELECT
+/// and GROUP BY. Structural equality alone compares raw syntax, so both
+/// directions used to fail with `NotGrouped`.
+/// duckdb: `SELECT flag, count(*) FROM p GROUP BY p.flag ORDER BY 1`
+#[test]
+fn qualified_and_unqualified_group_by_refer_to_the_same_column() {
+    let mut db = session_with_p();
+    let rows = run(&mut db, "SELECT flag, count(*) FROM p GROUP BY p.flag ORDER BY 1");
+    assert_eq!(rows, vec![vec![s("x"), i64v(2)], vec![s("y"), i64v(1)]]);
+
+    let rows = run(&mut db, "SELECT e.flag, count(*) FROM p e GROUP BY flag ORDER BY 1");
+    assert_eq!(rows, vec![vec![s("x"), i64v(2)], vec![s("y"), i64v(1)]]);
+
+    // A join still keeps the two same-named columns apart.
+    let rows = run(
+        &mut db,
+        "SELECT a.flag, count(*) FROM p a JOIN p b ON a.id = b.id GROUP BY a.flag ORDER BY 1",
+    );
+    assert_eq!(rows, vec![vec![s("x"), i64v(2)], vec![s("y"), i64v(1)]]);
+}
+
+/// A positional ORDER BY / GROUP BY term outside `1..=<output columns>` is an
+/// error, not a silently ignored constant sort key.
+/// duckdb: `Binder Error: ORDER term out of range - should be between 1 and 1`
+#[test]
+fn out_of_range_positional_order_terms_are_rejected() {
+    let mut db = session_with_p();
+    for sql in [
+        "SELECT id FROM p ORDER BY 0",
+        "SELECT id FROM p ORDER BY -1",
+        "SELECT id FROM p ORDER BY 1.5",
+        "SELECT id FROM p ORDER BY 99",
+        "SELECT count(*) FROM p GROUP BY 0",
+    ] {
+        assert_eq!(code_of(db.prepare(sql, &[])), Some(Code::ColumnNotFound), "{sql}");
+    }
+    // A valid position is unaffected.
+    let rows = run(&mut db, "SELECT id FROM p ORDER BY 1");
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)], vec![i64v(3)]]);
+}
+
+/// A non-recursive CTE may be referenced more than once; each reference gets
+/// its own copy of the bound plan and recomputes the body.
+/// duckdb: `WITH c AS (SELECT id FROM p) SELECT c1.id FROM c c1 JOIN c c2 ON c1.id = c2.id ORDER BY 1`
+#[test]
+fn a_non_recursive_cte_can_be_referenced_more_than_once() {
+    let mut db = session_with_p();
+    let rows = run(
+        &mut db,
+        "WITH c AS (SELECT id FROM p) SELECT c1.id FROM c c1 JOIN c c2 ON c1.id = c2.id ORDER BY 1",
+    );
+    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)], vec![i64v(3)]]);
+
+    // Three references, and through a set operation as well.
+    let rows = run(
+        &mut db,
+        "WITH c AS (SELECT id FROM p WHERE id < 3) \
+         SELECT id FROM c UNION ALL SELECT id FROM c UNION ALL SELECT id FROM c ORDER BY 1",
+    );
+    assert_eq!(rows.len(), 6);
+}

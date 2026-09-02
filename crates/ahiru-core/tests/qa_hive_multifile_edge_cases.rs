@@ -180,3 +180,80 @@ fn mixed_int_and_bigint_partition_values_unify_and_compare() {
     let rows = run_all("SELECT id FROM t WHERE ts > 10 ORDER BY id", &mut sess);
     assert_eq!(rows, vec![vec![Value::I64(2)]]);
 }
+
+#[test]
+fn partition_values_that_disagree_across_partitions_unify_to_varchar() {
+    // Each directory used to be typed on its own: `k=1` said INTEGER while `k=x` said VARCHAR, and
+    // `catalog::unify_schema` then rejected the whole table with `TypeMismatch` -- whole
+    // directories became unreadable because of one sibling. A partition key's type is a property
+    // of the table, so it is now settled across every part, falling back to VARCHAR when the
+    // readings disagree. DuckDB reads the same layout with `k` as VARCHAR.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![
+            ("data/k=007/f.csv".into(), b"v\n1\n".to_vec()),
+            ("data/k=1e3/f.csv".into(), b"v\n2\n".to_vec()),
+            ("data/k=true/f.csv".into(), b"v\n3\n".to_vec()),
+            ("data/k=42/f.csv".into(), b"v\n4\n".to_vec()),
+        ],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT k, v FROM t ORDER BY v", &mut sess);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Bytes(b"007".to_vec()), Value::I64(1)],
+            vec![Value::Bytes(b"1e3".to_vec()), Value::I64(2)],
+            vec![Value::Bytes(b"true".to_vec()), Value::I64(3)],
+            // The one integral value is text too, since the column as a whole is VARCHAR.
+            vec![Value::Bytes(b"42".to_vec()), Value::I64(4)],
+        ]
+    );
+    let rows = run_all("SELECT v FROM t WHERE k = '007'", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(1)]]);
+}
+
+#[test]
+fn zero_padded_partition_values_keep_their_padding() {
+    // `month=01` read as the integer 1 comes back as `1` and loses the zero. DuckDB keeps `01`.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![
+            ("d/year=2024/month=01/f.csv".into(), b"v\n1\n".to_vec()),
+            ("d/year=2024/month=02/f.csv".into(), b"v\n2\n".to_vec()),
+            ("d/year=2025/month=01/f.csv".into(), b"v\n3\n".to_vec()),
+        ],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT DISTINCT month FROM t ORDER BY 1", &mut sess);
+    assert_eq!(rows, vec![vec![Value::Bytes(b"01".to_vec())], vec![Value::Bytes(b"02".to_vec())]]);
+
+    // `year` has no padding, so it stays a typed integer comparison across every partition.
+    let rows = run_all("SELECT v FROM t WHERE year = 2025", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(3)]]);
+    let rows = run_all("SELECT count(*) FROM t WHERE year > 2023", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(3)]]);
+}
+
+#[test]
+fn a_glob_containing_a_hash_in_a_file_name_still_detects_the_format() {
+    // `FormatKind::detect` used to strip everything after `?`/`#` even for a local path, so
+    // `data#1.csv` was detected as Parquet and failed with BadMagic -- taking the whole glob
+    // down with it.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![
+            ("dir/data#1.csv".into(), b"id\n7\n".to_vec()),
+            ("dir/q?2.csv".into(), b"id\n8\n".to_vec()),
+        ],
+        FormatKind::Auto,
+    )
+    .unwrap();
+    let rows = run_all("SELECT id FROM t ORDER BY id", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(7)], vec![Value::I64(8)]]);
+}

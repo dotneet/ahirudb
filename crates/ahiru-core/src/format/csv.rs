@@ -7,8 +7,11 @@
 //! 2. Skip **converting** columns that are not projected (scanning is needed regardless)
 //!
 //! The schema is inferred from the leading `SAMPLE_BYTES`, so later rows can fall outside it.
-//! A value that falls outside is not an error but NULL. Making that one cell NULL is more
-//! practical than failing the whole query over one anomalous row.
+//! A value that falls outside is an error (`InvalidCast`), not a silent NULL: turning it into
+//! NULL would drop data the file plainly contains, which is exactly the "silently wrong answer"
+//! `docs/DESIGN.md` §15 says the engine never produces. DuckDB reports the same situation as a
+//! conversion error. An empty (unquoted) field keeps its NULL meaning, since that is the only way
+//! CSV can spell NULL at all.
 //!
 //! Splitting a file that uses RFC 4180 quoting is unsafe in general: an embedded `\n` inside a
 //! quoted field is not a record boundary, but a fixed-size split cut has no way to know, from its
@@ -68,6 +71,18 @@ pub struct CsvFormat {
     /// to be read as a single split, which sidesteps the ambiguity entirely (at the cost of the
     /// per-split I/O parallelism, per `docs/sql/limitations.md`).
     quoted_sample: bool,
+    /// Set in `resolve` when the leading sample contains a `\r` but no `\n` at all: a file written
+    /// with classic Mac (CR-only) line endings.
+    ///
+    /// Such a file used to be read as one giant record -- a garbage header and zero data rows, with
+    /// no error at all. When this is set, a lone `\r` terminates a record (see `Scanner::cr_term`).
+    ///
+    /// Like `quoted_sample` it also forces the file to be read as a single split: `read_split`'s
+    /// boundary resynchronization scans for `\n`, which a CR-only file never contains, so every
+    /// split past the first would otherwise resolve to "no record starts here" and silently drop
+    /// its rows. A file that has any `\n` keeps the RFC 4180 reading exactly as before, so CRLF and
+    /// a `\r` inside a quoted field are unaffected.
+    cr_only: bool,
 }
 
 impl CsvFormat {
@@ -81,7 +96,22 @@ impl CsvFormat {
             split_bytes: TEXT_SPLIT_BYTES,
             max_record: TEXT_MAX_RECORD,
             quoted_sample: false,
+            cr_only: false,
         }
+    }
+
+    /// The byte that ends a record for this file: `\r` for a CR-only file, `\n` otherwise.
+    fn term_byte(&self) -> u8 {
+        if self.cr_only {
+            b'\r'
+        } else {
+            b'\n'
+        }
+    }
+
+    /// Whether the whole file must be read as one split. See `quoted_sample` and `cr_only`.
+    fn single_split(&self) -> bool {
+        self.quoted_sample || self.cr_only
     }
 
     pub fn delimiter(&self) -> u8 {
@@ -95,11 +125,12 @@ impl CsvFormat {
 
     /// 0 would break the split-count computation, so it is always rounded up to at least 1.
     ///
-    /// When the leading sample looked quoted (`quoted_sample`), this returns the whole data
-    /// region so `num_splits` collapses to (at most) 1 -- see `quoted_sample`'s doc comment for
-    /// why a quoted file cannot be safely resynchronized at an arbitrary split boundary.
+    /// When the leading sample looked quoted (`quoted_sample`) or used CR-only line endings
+    /// (`cr_only`), this returns the whole data region so `num_splits` collapses to (at most) 1 --
+    /// see those fields' doc comments for why such a file cannot be safely resynchronized at an
+    /// arbitrary split boundary.
     fn chunk_size(&self) -> u64 {
-        if self.quoted_sample {
+        if self.single_split() {
             self.data_len().max(1)
         } else {
             self.split_bytes.max(1)
@@ -170,8 +201,13 @@ impl TableFormat for CsvFormat {
             }
         }
 
+        // A file whose sample carries `\r` but not a single `\n` uses classic Mac (CR-only) line
+        // endings. Reading it under the RFC 4180 rules would swallow the whole file as one record,
+        // so a lone `\r` becomes the record terminator instead (see `cr_only`).
+        self.cr_only = !body.contains(&b'\n') && body.contains(&b'\r');
+
         // --- The header row -------------------------------------------------
-        let mut sc = Scanner::new(body, self.delimiter);
+        let mut sc = Scanner::new(body, self.delimiter).with_cr_term(self.cr_only);
         let mut raw: Vec<Vec<u8>> = Vec::new();
         let mut scratch = Vec::new();
         let terminated = loop {
@@ -200,8 +236,9 @@ impl TableFormat for CsvFormat {
         // (It may cut at a newline inside quotes, but all that happens then is "that column widens
         //  to VARCHAR", which errs safe.)
         let rest = &body[sc.pos()..];
+        let term = self.term_byte();
         let rest = if n < src.total_len {
-            match rest.iter().rposition(|&c| c == b'\n') {
+            match rest.iter().rposition(|&c| c == term) {
                 Some(i) => &rest[..i + 1],
                 None => &rest[..0],
             }
@@ -210,7 +247,7 @@ impl TableFormat for CsvFormat {
         };
 
         let mut cands = vec![Cand::Empty; names.len()];
-        let mut sc = Scanner::new(rest, self.delimiter);
+        let mut sc = Scanner::new(rest, self.delimiter).with_cr_term(self.cr_only);
         let mut rows = 0;
         'sample: while rows < SAMPLE_ROWS && !sc.at_end() {
             if sc.skip_blank_line() {
@@ -314,10 +351,10 @@ impl TableFormat for CsvFormat {
         // A quote past the leading sample on a remote (incomplete-at-resolve) file
         // cannot be turned into a single-split plan after the fact. Refusing beats
         // mis-resynchronizing a quoted newline at a later split boundary.
-        ensure!(self.quoted_sample || split == 0 || !buf.contains(&b'"'), UnsupportedFeature);
+        ensure!(self.single_split() || split == 0 || !buf.contains(&b'"'), UnsupportedFeature);
 
         let lead = (own_start - fetch_start) as usize;
-        let mut sc = Scanner::new(buf, self.delimiter);
+        let mut sc = Scanner::new(buf, self.delimiter).with_cr_term(self.cr_only);
         if lead > 0 {
             // If the byte just before the owned interval is a line terminator, a record starts at
             // the beginning. Otherwise it skips to just after the first line terminator (that
@@ -331,7 +368,8 @@ impl TableFormat for CsvFormat {
             // (i.e. `split > 0`) is unreachable for such a file, since there is only ever one
             // split. This byte scan is only ever live for files confirmed (by that sample) not to
             // use quoting, where an unquoted field can never contain the delimiter/`\n`/`\r`, so
-            // scanning for a raw `\n` here is exact, not a heuristic.
+            // scanning for a raw `\n` here is exact, not a heuristic. A CR-only file (`cr_only`)
+            // likewise collapses to one split, so this `\n` scan never runs for one.
             match buf.first() {
                 Some(&b'\n') => sc.seek(1),
                 _ => match buf.iter().skip(1).position(|&c| c == b'\n') {
@@ -364,7 +402,7 @@ impl TableFormat for CsvFormat {
                 if let Some(Some(slot)) = slot_of.get(fi) {
                     let v = field_value(buf, &f, &mut scratch);
                     if let Some(col) = cols.get_mut(*slot) {
-                        col.push(v, f.quoted);
+                        col.push(v, f.quoted)?;
                     }
                 } // Columns outside the projection are not converted. Only the scan is done.
                 fi += 1;
@@ -386,6 +424,11 @@ impl TableFormat for CsvFormat {
         }
 
         finish(cols, &uniq, projection)
+    }
+
+    /// CSV carries no schema, so every column type here is a guess from the leading sample.
+    fn schema_is_inferred(&self) -> bool {
+        true
     }
 }
 
@@ -482,11 +525,19 @@ struct Scanner<'a> {
     buf: &'a [u8],
     p: usize,
     delim: u8,
+    /// Whether a lone `\r` ends a record (a CR-only file -- see `CsvFormat::cr_only`).
+    /// Off by default, which is the RFC 4180 reading: only `\n` and `\r\n` end a record.
+    cr_term: bool,
 }
 
 impl<'a> Scanner<'a> {
     fn new(buf: &'a [u8], delim: u8) -> Self {
-        Scanner { buf, p: 0, delim }
+        Scanner { buf, p: 0, delim, cr_term: false }
+    }
+
+    fn with_cr_term(mut self, cr_term: bool) -> Self {
+        self.cr_term = cr_term;
+        self
     }
 
     fn pos(&self) -> usize {
@@ -510,6 +561,10 @@ impl<'a> Scanner<'a> {
             }
             Some(&b'\r') if self.buf.get(self.p + 1) == Some(&b'\n') => {
                 self.p += 2;
+                true
+            }
+            Some(&b'\r') if self.cr_term => {
+                self.p += 1;
                 true
             }
             _ => false,
@@ -560,11 +615,31 @@ impl<'a> Scanner<'a> {
                 return Ok(Span { start, end, quoted: false, escaped: false, term: Term::Record });
             }
             // CRLF. A lone `\r` is not a line terminator (the split-boundary scan looks only at
-            // `\n`, so the two interpretations are kept consistent).
-            if c == b'\r' && self.buf.get(self.p + 1) == Some(&b'\n') {
-                let end = self.p;
-                self.p += 2;
-                return Ok(Span { start, end, quoted: false, escaped: false, term: Term::Record });
+            // `\n`, so the two interpretations are kept consistent) -- unless this is a CR-only
+            // file, which has no `\n` to scan for and is therefore read as a single split.
+            if c == b'\r' {
+                if self.buf.get(self.p + 1) == Some(&b'\n') {
+                    let end = self.p;
+                    self.p += 2;
+                    return Ok(Span {
+                        start,
+                        end,
+                        quoted: false,
+                        escaped: false,
+                        term: Term::Record,
+                    });
+                }
+                if self.cr_term {
+                    let end = self.p;
+                    self.p += 1;
+                    return Ok(Span {
+                        start,
+                        end,
+                        quoted: false,
+                        escaped: false,
+                        term: Term::Record,
+                    });
+                }
             }
             self.p += 1;
         }
@@ -583,9 +658,15 @@ impl<'a> Scanner<'a> {
                 self.p += 1;
                 return Term::Record;
             }
-            if c == b'\r' && self.buf.get(self.p + 1) == Some(&b'\n') {
-                self.p += 2;
-                return Term::Record;
+            if c == b'\r' {
+                if self.buf.get(self.p + 1) == Some(&b'\n') {
+                    self.p += 2;
+                    return Term::Record;
+                }
+                if self.cr_term {
+                    self.p += 1;
+                    return Term::Record;
+                }
             }
             self.p += 1;
         }
@@ -649,12 +730,30 @@ impl Cand {
     }
 }
 
+/// Whether the value's leading digit run is zero padded (`007`, `0123`, `007.5`).
+///
+/// Such a value is text that merely looks numeric -- a zip code, an account number, a product ID --
+/// and reading it as a number destroys it (`007` becomes `7`). DuckDB's sniffer refuses it for the
+/// same reason, so inference keeps the column VARCHAR. A single `0`, and a fraction like `0.5`,
+/// have no padding and stay numeric.
+///
+/// This governs **inference only**. `parse_i64`/`parse_f64` stay permissive, so an explicitly
+/// numeric column still reads `007` as 7 (as DuckDB's `'007'::BIGINT` does).
+fn is_zero_padded(v: &[u8]) -> bool {
+    let ds = match v.first() {
+        Some(b'+') | Some(b'-') => v.get(1..).unwrap_or(&[]),
+        _ => v,
+    };
+    matches!((ds.first(), ds.get(1)), (Some(b'0'), Some(d)) if d.is_ascii_digit())
+}
+
 fn classify(v: &[u8]) -> Cand {
+    let padded = is_zero_padded(v);
     if parse_bool(v).is_some() {
         Cand::Bool
-    } else if parse_i64(v).is_some() {
+    } else if !padded && parse_i64(v).is_some() {
         Cand::Int
-    } else if parse_f64(v).is_some() {
+    } else if !padded && parse_f64(v).is_some() {
         Cand::Double
     } else if parse_date(v).is_some() {
         Cand::Date
@@ -667,8 +766,12 @@ fn classify(v: &[u8]) -> Cand {
 
 /// Widens the candidate type. Any combination leaving the lattice becomes VARCHAR.
 ///
-/// BOOLEAN + BIGINT becoming BIGINT is exactly as the lattice defines. `true` does not fit BIGINT,
-/// so that row becomes NULL when read.
+/// BOOLEAN mixed with a numeric type widens to **VARCHAR**, not to the numeric type: `true` has no
+/// numeric reading, so picking BIGINT would drop a value the inference sample itself just saw.
+/// DuckDB resolves the same mixture to VARCHAR.
+///
+/// DATE mixed with TIMESTAMP widens to TIMESTAMP, and a date-only value then reads as midnight
+/// (see `parse_ts`), so nothing is lost there.
 fn widen(a: Cand, b: Cand) -> Cand {
     use Cand::*;
     if a == b {
@@ -676,8 +779,6 @@ fn widen(a: Cand, b: Cand) -> Cand {
     }
     match (a, b) {
         (Empty, x) | (x, Empty) => x,
-        (Bool, Int) | (Int, Bool) => Int,
-        (Bool, Double) | (Double, Bool) => Double,
         (Int, Double) | (Double, Int) => Double,
         (Date, Ts) | (Ts, Date) => Ts,
         _ => Text,
@@ -857,8 +958,16 @@ fn parse_date(v: &[u8]) -> Option<i32> {
 }
 
 /// TIMESTAMP is microseconds since the epoch (I64).
-/// The accepted form is `YYYY-MM-DD[ T]HH:MM:SS[.ffffff]`. Time zones are unsupported.
+/// The accepted form is `YYYY-MM-DD[[ T]HH:MM:SS[.ffffff]]`.
+///
+/// A date-only value is accepted as that date's midnight, matching DuckDB's
+/// `TIMESTAMP '2024-01-02'`. Rejecting it would silently NULL every date-only row of a column that
+/// mixes dates and timestamps (`widen` settles such a column on TIMESTAMP).
 fn parse_ts(v: &[u8]) -> Option<i64> {
+    if v.len() == 10 {
+        let (y, m, d) = parse_ymd(v)?;
+        return days_from_civil(y, m, d).checked_mul(86_400)?.checked_mul(1_000_000);
+    }
     if v.len() < 19 {
         return None;
     }
@@ -944,12 +1053,17 @@ impl ColBuf {
     /// Pushes one cell.
     ///
     /// An unquoted empty cell is NULL and `""` is the empty string. Being able to distinguish them
-    /// is the only way CSV can express NULL, so that is not broken here.
-    /// A value not matching the inferred type is not an error but NULL.
-    fn push(&mut self, v: &[u8], quoted: bool) {
-        if v.is_empty() && !quoted {
+    /// is the only way CSV can express NULL, so that is not broken here. In a non-VARCHAR column
+    /// there is no such thing as an empty value, so `""` is NULL there too.
+    ///
+    /// A non-empty value that does not fit the inferred type is `InvalidCast`. The schema comes
+    /// from a bounded leading sample, so a later row can genuinely fall outside it -- but turning
+    /// that cell into NULL loses data the file plainly contains, without a word to the caller.
+    /// DuckDB reports the same situation as a conversion error, and suggests widening the sample.
+    fn push(&mut self, v: &[u8], quoted: bool) -> Result<()> {
+        if v.is_empty() && (!quoted || !matches!(self.data, Data::Bytes(_))) {
             self.push_null();
-            return;
+            return Ok(());
         }
         let ok = match &mut self.data {
             Data::Bool(b) => match parse_bool(v) {
@@ -996,7 +1110,7 @@ impl ColBuf {
                 }
             },
             Data::I128(d) => {
-                // Inference never picks I128. Filled with NULL just in case.
+                // Inference never picks I128, so reaching this is a bug rather than bad input.
                 d.push(0);
                 false
             }
@@ -1005,7 +1119,11 @@ impl ColBuf {
                 true
             }
         };
+        // The value has already been appended, so the buffer stays consistent even though the
+        // caller aborts the whole split here.
         self.validity.push(ok);
+        ensure!(ok, InvalidCast);
+        Ok(())
     }
 
     fn finish(self) -> Vector {
@@ -1198,11 +1316,13 @@ mod tests {
 
     #[test]
     fn widening_transitions() {
-        // BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR, and DATE -> TIMESTAMP.
+        // BIGINT -> DOUBLE -> VARCHAR, and DATE -> TIMESTAMP.
         let cases: &[(&[u8], Ty)] = &[
             (b"c\ntrue\nfalse\n", Ty::Boolean),
-            (b"c\ntrue\n1\n", Ty::BigInt),
-            (b"c\ntrue\n1.5\n", Ty::Double),
+            // BOOLEAN mixed with a number is VARCHAR (duckdb agrees): `true` has no numeric
+            // reading, so widening to the numeric type would drop the boolean rows.
+            (b"c\ntrue\n1\n", Ty::Varchar),
+            (b"c\ntrue\n1.5\n", Ty::Varchar),
             (b"c\ntrue\nx\n", Ty::Varchar),
             (b"c\n1\n2\n", Ty::BigInt),
             (b"c\n1\n2.5\n", Ty::Double),
@@ -1216,6 +1336,16 @@ mod tests {
             (b"c\n99999999999999999999\n", Ty::Double),
             // All-empty stays VARCHAR.
             (b"c\n\n\n", Ty::Varchar),
+            // A zero-padded digit run is text, not a number (duckdb agrees).
+            (b"c\n007\n0123\n", Ty::Varchar),
+            (b"c\n01\n02\n", Ty::Varchar),
+            (b"c\n007.5\n1\n", Ty::Varchar),
+            // ... but a lone `0` and a fraction below one are still numeric.
+            (b"c\n0\n1\n", Ty::BigInt),
+            (b"c\n0\n0.5\n", Ty::Double),
+            (b"c\n0e3\n1\n", Ty::Double),
+            // A zero-padded year must not be mistaken for a padded number.
+            (b"c\n0001-02-03\n", Ty::Date),
         ];
         for (csv, ty) in cases {
             let (f, _) = open(csv, b',');
@@ -1233,10 +1363,36 @@ mod tests {
         s.push_str("oops\n");
         let (f, src) = open(s.as_bytes(), b',');
         assert_eq!(types(&f), vec![Ty::BigInt]);
-        // A row the inference missed is NULL rather than an error.
+        // A row the inference missed is a clear error, not a silently dropped value.
+        assert_eq!(code_of(f.read_split(&src, 0, &[0])), Some(Code::InvalidCast));
+    }
+
+    #[test]
+    fn dates_and_timestamps_in_one_column_keep_both() {
+        // duckdb reads the date-only row as that date's midnight rather than NULL.
+        let (f, src) = open(b"c\n2024-01-01 10:00:00\n2024-01-02\n", b',');
+        assert_eq!(types(&f), vec![Ty::Timestamp]);
         let got = read_all(&f, &src, &[0]);
-        assert_eq!(got[0].len(), SAMPLE_ROWS + 1);
-        assert_eq!(got[0][SAMPLE_ROWS], Value::Null);
+        // duckdb: epoch_us(TIMESTAMP '2024-01-02') = 1704153600000000
+        assert_eq!(got[0][1], Value::I64(1_704_153_600_000_000));
+    }
+
+    #[test]
+    fn zero_padded_digits_keep_their_padding() {
+        let (f, src) = open(b"a\n007\n0123\n", b',');
+        assert_eq!(types(&f), vec![Ty::Varchar]);
+        let got = read_all(&f, &src, &[0]);
+        assert_eq!(text(&got[0][0]), "007");
+        assert_eq!(text(&got[0][1]), "0123");
+    }
+
+    #[test]
+    fn booleans_mixed_with_numbers_keep_both() {
+        let (f, src) = open(b"a\ntrue\n1\n", b',');
+        assert_eq!(types(&f), vec![Ty::Varchar]);
+        let got = read_all(&f, &src, &[0]);
+        assert_eq!(text(&got[0][0]), "true");
+        assert_eq!(text(&got[0][1]), "1");
     }
 
     #[test]
@@ -1272,6 +1428,24 @@ mod tests {
         assert_eq!(parse_ts(b"2024-01-01 00:00:00+00"), Some(1_704_067_200_000_000));
         // 09:00+09 is 00:00 UTC.
         assert_eq!(parse_ts(b"2024-01-01 09:00:00+09:00"), Some(1_704_067_200_000_000));
+        // A date-only value is that date's midnight (duckdb: TIMESTAMP '2024-01-01').
+        assert_eq!(parse_ts(b"2024-01-01"), Some(1_704_067_200_000_000));
+        assert_eq!(parse_ts(b"1969-12-31"), Some(-86_400_000_000));
+        assert_eq!(parse_ts(b"2023-02-29"), None);
+        assert_eq!(parse_ts(b"2024-01-01 "), None);
+
+        assert!(is_zero_padded(b"007"));
+        assert!(is_zero_padded(b"0123"));
+        assert!(is_zero_padded(b"007.5"));
+        assert!(is_zero_padded(b"-007"));
+        assert!(!is_zero_padded(b"0"));
+        assert!(!is_zero_padded(b"0.5"));
+        assert!(!is_zero_padded(b"0e3"));
+        assert!(!is_zero_padded(b""));
+        // The permissive parsers are untouched: an explicitly numeric column still reads `007`
+        // as 7, exactly as duckdb's `'007'::BIGINT` does.
+        assert_eq!(parse_i64(b"007"), Some(7));
+        assert_eq!(parse_f64(b"007.5"), Some(7.5));
     }
 
     // --- Quotes -------------------------------------------------------------
@@ -1446,10 +1620,13 @@ mod tests {
         }
         for size in 1..=17u64 {
             let (f, src) = open_split(s.as_bytes(), b',', size);
+            // The values are zero padded so every record is the same length; that also makes the
+            // column VARCHAR (`is_zero_padded`), which is beside the point of this test.
+            assert_eq!(types(&f), vec![Ty::Varchar, Ty::Varchar]);
             let got = read_all(&f, &src, &[0]);
             assert_eq!(got[0].len(), 64, "split_bytes={size}");
             for (i, v) in got[0].iter().enumerate() {
-                assert_eq!(*v, Value::I64(i as i64), "split_bytes={size}");
+                assert_eq!(text(v), std::format!("{i:03}"), "split_bytes={size}");
             }
         }
     }
@@ -1606,23 +1783,88 @@ mod tests {
     }
 
     #[test]
-    fn values_that_do_not_match_the_inferred_type_become_null() {
-        // Inference sees only the sample rows, so the rows that fall outside are placed after the sample.
+    fn values_that_do_not_match_the_inferred_type_are_an_error() {
+        // Inference sees only the sample rows, so the rows that fall outside are placed after the
+        // sample. Such a value used to be turned into NULL, silently dropping data the file
+        // plainly contains; duckdb reports it as a conversion error and so does this.
+        let head = "i,b,d,t\n";
+        let row = "1,true,2024-01-01,2024-01-01 00:00:00\n";
+        for col in 0..4 {
+            let mut s = String::from(head);
+            for _ in 0..SAMPLE_ROWS {
+                s.push_str(row);
+            }
+            // One bad cell in one column at a time.
+            let bad: Vec<&str> = (0..4).map(|c| if c == col { "x" } else { "1" }).collect();
+            s.push_str(&bad.join(","));
+            s.push('\n');
+            let (f, src) = open(s.as_bytes(), b',');
+            assert_eq!(types(&f), vec![Ty::BigInt, Ty::Boolean, Ty::Date, Ty::Timestamp]);
+            assert_eq!(
+                code_of(f.read_split(&src, 0, &[col])),
+                Some(Code::InvalidCast),
+                "column {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_cells_stay_null_in_every_type() {
+        // The one thing CSV can spell is NULL, and it must keep working: an unquoted empty field
+        // is NULL, and so is `""` in a column that is not VARCHAR (there is no empty BIGINT).
         let mut s = String::from("i,b,d,t\n");
-        for _ in 0..SAMPLE_ROWS {
+        for _ in 0..4 {
             s.push_str("1,true,2024-01-01,2024-01-01 00:00:00\n");
         }
-        s.push_str("x,x,x,x\n");
-        // A quoted empty string also becomes NULL in columns other than VARCHAR.
+        s.push_str(",,,\n");
         s.push_str("\"\",\"\",\"\",\"\"\n");
         let (f, src) = open(s.as_bytes(), b',');
         assert_eq!(types(&f), vec![Ty::BigInt, Ty::Boolean, Ty::Date, Ty::Timestamp]);
         let got = read_all(&f, &src, &[0, 1, 2, 3]);
         for (c, col) in got.iter().enumerate() {
             assert_ne!(col[0], Value::Null, "column {c}");
-            assert_eq!(col[SAMPLE_ROWS], Value::Null, "column {c}");
-            assert_eq!(col[SAMPLE_ROWS + 1], Value::Null, "column {c}");
+            assert_eq!(col[4], Value::Null, "column {c}");
+            assert_eq!(col[5], Value::Null, "column {c}");
         }
+    }
+
+    #[test]
+    fn cr_only_line_endings_are_read_as_records() {
+        // A classic Mac (CR-only) file used to parse as one giant record: a garbage header and
+        // zero rows, with no error at all. duckdb reads two rows here.
+        let (f, src) = open(b"a,b\r1,2\r3,4\r", b',');
+        assert!(f.cr_only);
+        assert_eq!(names(&f), vec!["a", "b"]);
+        assert_eq!(types(&f), vec![Ty::BigInt, Ty::BigInt]);
+        assert_eq!(f.num_splits(), 1, "a CR-only file is always a single split");
+        let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(3)]);
+        assert_eq!(got[1], vec![Value::I64(2), Value::I64(4)]);
+    }
+
+    #[test]
+    fn a_lone_cr_stays_data_when_the_file_has_newlines() {
+        // CRLF and a `\r` inside a quoted field must be untouched by the CR-only support.
+        let (crlf, csrc) = open(b"a,b\r\n1,x\r\n2,y\r\n", b',');
+        assert!(!crlf.cr_only);
+        let got = read_all(&crlf, &csrc, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+        assert_eq!(text(&got[1][0]), "x");
+
+        // An unquoted `\r` in a `\n`-terminated file is still an ordinary byte.
+        let (f, src) = open(b"a,b\n1,x\ry\n", b',');
+        assert!(!f.cr_only);
+        let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1)]);
+        assert_eq!(text(&got[1][0]), "x\ry");
+
+        // A quoted `\r` in a CR-only file belongs to the value, not to the record boundary.
+        let (q, qsrc) = open(b"a,b\r1,\"x\ry\"\r2,z\r", b',');
+        assert!(q.cr_only);
+        let got = read_all(&q, &qsrc, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+        assert_eq!(text(&got[1][0]), "x\ry");
+        assert_eq!(text(&got[1][1]), "z");
     }
 
     #[test]

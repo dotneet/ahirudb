@@ -63,18 +63,18 @@ impl<'a> Parser<'a> {
             // enters `predicate()` from the `Tok::Kw(Kw::Not)` branch, which has no arm for
             // `glob`, so it naturally becomes `UnexpectedToken`.
             if self.is_soft_kw(b"glob") {
-                if BP_CMP < min_bp {
+                if BP_PRED < min_bp {
                     break;
                 }
                 self.bump()?; // glob
-                let pattern = self.expr_bp(BP_CONCAT)?;
+                let pattern = self.expr_bp(BP_OTHER)?;
                 lhs = self.simple_call("glob", vec![lhs, pattern]);
                 continue;
             }
             // `SIMILAR TO` can take a leading `[NOT]` like `LIKE`, so the same check is
             // also added on the `predicate()` side (the `Tok::Kw(Kw::Not)` branch).
             if self.is_soft_kw(b"similar") && self.peek_is_to()? {
-                if BP_CMP < min_bp {
+                if BP_PRED < min_bp {
                     break;
                 }
                 lhs = self.similar_to(lhs, false)?;
@@ -116,7 +116,7 @@ impl<'a> Parser<'a> {
                 Tok::Le => (BinaryOp::Le, BP_CMP),
                 Tok::Gt => (BinaryOp::Gt, BP_CMP),
                 Tok::Ge => (BinaryOp::Ge, BP_CMP),
-                Tok::Concat => (BinaryOp::Concat, BP_CONCAT),
+                Tok::Concat => (BinaryOp::Concat, BP_OTHER),
                 Tok::Plus => (BinaryOp::Add, BP_ADD),
                 Tok::Minus => (BinaryOp::Sub, BP_ADD),
                 Tok::Star => (BinaryOp::Mul, BP_MUL),
@@ -140,38 +140,38 @@ impl<'a> Parser<'a> {
                 // already exist in `expr::funcs` or were added in this commit -- applying
                 // DESIGN.md §11's policy of not adding kernels).
                 Tok::Amp => {
-                    if BP_BITWISE < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     self.bump()?;
-                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    let rhs = self.expr_bp(BP_OTHER + 1)?;
                     lhs = self.simple_call("bit_and", vec![lhs, rhs]);
                     continue;
                 }
                 Tok::Pipe => {
-                    if BP_BITWISE < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     self.bump()?;
-                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    let rhs = self.expr_bp(BP_OTHER + 1)?;
                     lhs = self.simple_call("bit_or", vec![lhs, rhs]);
                     continue;
                 }
                 Tok::Shl => {
-                    if BP_BITWISE < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     self.bump()?;
-                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    let rhs = self.expr_bp(BP_OTHER + 1)?;
                     lhs = self.simple_call("bit_shift_left", vec![lhs, rhs]);
                     continue;
                 }
                 Tok::Shr => {
-                    if BP_BITWISE < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     self.bump()?;
-                    let rhs = self.expr_bp(BP_BITWISE + 1)?;
+                    let rhs = self.expr_bp(BP_OTHER + 1)?;
                     lhs = self.simple_call("bit_shift_right", vec![lhs, rhs]);
                     continue;
                 }
@@ -191,12 +191,12 @@ impl<'a> Parser<'a> {
                 // `prefix()`, so anything reaching here is necessarily infix (regex match).
                 // It expands to the same function as `SIMILAR TO` (see the `similar_to` docs).
                 Tok::Tilde | Tok::NotTilde => {
-                    if BP_CMP < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     let negate = self.cur == Tok::NotTilde;
                     self.bump()?;
-                    let rhs = self.expr_bp(BP_CMP + 1)?;
+                    let rhs = self.expr_bp(BP_OTHER + 1)?;
                     let call = self.simple_call("regexp_full_match", vec![lhs, rhs]);
                     lhs = if negate {
                         self.arena.push(Expr::Unary { op: UnaryOp::Not, arg: call })
@@ -211,8 +211,8 @@ impl<'a> Parser<'a> {
                 // keywords produce in `predicate()` below) rather than a
                 // fresh AST variant.
                 //
-                // The right operand is read at `BP_CONCAT + 1`, one notch
-                // *tighter* than `LIKE`'s own `BP_CONCAT` (see
+                // The right operand is read at `BP_OTHER + 1`, one notch
+                // *tighter* than `LIKE`'s own pattern read (see
                 // `predicate()`'s `Kw::Like | Kw::Ilike` arm) — this is a
                 // real, verified difference from the `LIKE` keyword, not a
                 // copy-paste slip:
@@ -227,13 +227,13 @@ impl<'a> Parser<'a> {
                 | Tok::NotTildeTilde
                 | Tok::TildeTildeStar
                 | Tok::NotTildeTildeStar => {
-                    if BP_CMP < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     let negated = matches!(self.cur, Tok::NotTildeTilde | Tok::NotTildeTildeStar);
                     let ci = matches!(self.cur, Tok::TildeTildeStar | Tok::NotTildeTildeStar);
                     self.bump()?;
-                    let pattern = self.expr_bp(BP_CONCAT + 1)?;
+                    let pattern = self.expr_bp(BP_OTHER + 1)?;
                     lhs = self.arena.push(Expr::Like { arg: lhs, pattern, negated, ci });
                     continue;
                 }
@@ -248,19 +248,19 @@ impl<'a> Parser<'a> {
                 //   duckdb: select 'a' || 'b' ^@ 'a'  -> true    i.e. ('a'||'b') ^@ 'a'
                 //   duckdb: select 'ab' ^@ 'a' || 'b' -> 'trueb' i.e. ('ab' ^@ 'a') || 'b'
                 //   duckdb: select 'ab' ^@ 'a' = true -> true    i.e. ('ab' ^@ 'a') = true
-                // So the operator itself sits at `BP_CMP` (the left side
+                // So the operator itself sits at `BP_OTHER` (the left side
                 // therefore already absorbed any `||`/arithmetic), while the
-                // right operand is read at `BP_CONCAT + 1` so a following
+                // right operand is read at `BP_OTHER + 1` so a following
                 // `||` binds to the *result*, not into the pattern.
                 // NULL on either side yields NULL (`duckdb -c "select NULL
                 // ^@ 'a', 'a' ^@ NULL"` -> both NULL), which is what
                 // `starts_with` already does.
                 Tok::CaretAt => {
-                    if BP_CMP < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     self.bump()?;
-                    let prefix = self.expr_bp(BP_CONCAT + 1)?;
+                    let prefix = self.expr_bp(BP_OTHER + 1)?;
                     lhs = self.simple_call("starts_with", vec![lhs, prefix]);
                     continue;
                 }
@@ -269,14 +269,14 @@ impl<'a> Parser<'a> {
                 // "select 'ab' ~~~ 'a' || '*'"` -> `false*`, i.e. `('ab' ~~~
                 // 'a') || '*'`, while `'ab' GLOB 'a' || '*'` -> `true`, i.e.
                 // `'ab' GLOB ('a'||'*')` — the `GLOB` keyword itself reads
-                // its pattern at `BP_CONCAT`, see the `is_soft_kw(b"glob")`
+                // its pattern at `BP_OTHER`, see the `is_soft_kw(b"glob")`
                 // block above).
                 Tok::TildeTildeTilde => {
-                    if BP_CMP < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     self.bump()?;
-                    let pattern = self.expr_bp(BP_CONCAT + 1)?;
+                    let pattern = self.expr_bp(BP_OTHER + 1)?;
                     lhs = self.simple_call("glob", vec![lhs, pattern]);
                     continue;
                 }
@@ -310,19 +310,40 @@ impl<'a> Parser<'a> {
                 // `||` (binding tighter than comparison, so `doc->'a' = 1` can be written
                 // without parentheses).
                 Tok::Arrow | Tok::LongArrow => {
-                    if BP_CONCAT < min_bp {
+                    if BP_OTHER < min_bp {
                         break;
                     }
                     let is_text = self.cur == Tok::LongArrow;
                     self.bump()?;
-                    let rhs = self.expr_bp(BP_CONCAT + 1)?;
+                    let rhs = self.expr_bp(BP_OTHER + 1)?;
                     let name = if is_text { "json_extract_string" } else { "json_extract" };
                     lhs = self.simple_call(name, vec![lhs, rhs]);
                     continue;
                 }
-                // Predicates (IS NULL / IN / BETWEEN / LIKE / ILIKE) are postfix at the same binding power as comparison.
-                Tok::Kw(Kw::Is | Kw::In | Kw::Between | Kw::Like | Kw::Ilike | Kw::Not) => {
+                // The `IS` family (`IS [NOT] NULL`/`TRUE`/`FALSE`/`UNKNOWN`,
+                // `IS [NOT] DISTINCT FROM`) is postfix/infix at the same
+                // binding power as comparison — see `BP_CMP`'s doc for the
+                // `duckdb` measurements that pin it there rather than one
+                // notch below, where PostgreSQL puts it.
+                Tok::Kw(Kw::Is) => {
                     if BP_CMP < min_bp {
+                        break;
+                    }
+                    lhs = self.predicate(lhs)?;
+                    continue;
+                }
+                // `[NOT] IN`/`[NOT] BETWEEN`/`[NOT] LIKE`/`[NOT] ILIKE`
+                // (and, via the `Kw::Not` arm, `NOT SIMILAR TO`) bind one
+                // notch *tighter* than comparison, so they attach to the
+                // operand rather than to a finished comparison. Confirmed
+                // with the `duckdb` CLI:
+                //   `false = true IN (false, true)`         -> false
+                //   `false = true BETWEEN false AND true`   -> false
+                //   `false = true LIKE 'x'`                 -> a binder error
+                //     naming `~~(BOOLEAN, STRING_LITERAL)`, i.e. the `LIKE`
+                //     took `true` (not `false = true`) as its left operand.
+                Tok::Kw(Kw::In | Kw::Between | Kw::Like | Kw::Ilike | Kw::Not) => {
+                    if BP_PRED < min_bp {
                         break;
                     }
                     lhs = self.predicate(lhs)?;
@@ -377,17 +398,31 @@ impl<'a> Parser<'a> {
             // Prefix `~` (bitwise NOT). Infix `~`/`!~` (regex match) are handled by the
             // infix loop in `expr_body` (the same token, with meaning fixed by position --
             // the same pattern as prefix versus infix `-`).
+            //
+            // Unlike unary `-`/`+`, `~` and `@` are **not** high-precedence
+            // prefix operators. PostgreSQL (and DuckDB after it) gives every
+            // prefix operator other than `+`/`-` the precedence of the "any
+            // other operator" band, i.e. `BP_OTHER` — looser than `*`, `+`
+            // and `^`, but tighter than `||` and the bitwise operators,
+            // which share that band and are left-associative. So the operand
+            // is read at `BP_OTHER + 1`. Verified against the `duckdb` CLI:
+            //   ~1 * 2      -> -3      = ~(1 * 2)
+            //   ~1 + 1      -> -3      = ~(1 + 1)
+            //   ~2 ^ 2      -> `~(DOUBLE)` binder error, i.e. ~(2 ^ 2)
+            //   ~1 || 'a'   -> '-2a'   = (~1) || 'a'
+            //   ~1 = -2     -> true    = (~1) = -2
+            //   @ -3 + 1    -> 2       = @(-3 + 1)
             Tok::Tilde => {
                 self.bump()?;
-                let arg = self.expr_bp(BP_UNARY)?;
+                let arg = self.expr_bp(BP_OTHER + 1)?;
                 Ok(self.simple_call("bit_not", vec![arg]))
             }
             // `@` (prefix only, no infix meaning): absolute value, sugar
             // for `abs(x)` (verified: `duckdb -c "select @(-5), @(-5.5)"`
-            // -> `5`, `5.5`).
+            // -> `5`, `5.5`). Same precedence as prefix `~` above.
             Tok::At => {
                 self.bump()?;
-                let arg = self.expr_bp(BP_UNARY)?;
+                let arg = self.expr_bp(BP_OTHER + 1)?;
                 Ok(self.simple_call("abs", vec![arg]))
             }
             _ => self.primary(),
@@ -483,15 +518,18 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Between) => {
                 self.bump()?;
-                // The bounds are read one level tighter than AND, so the separating AND is not swallowed.
-                let low = self.expr_bp(BP_CONCAT)?;
+                // The bounds are read at `BP_OTHER` -- tight enough that `||`, the
+                // bitwise operators and arithmetic all combine into a bound
+                // (`duckdb`: `1 BETWEEN 0 AND 1 & 1` -> true, `5 BETWEEN 1 << 1 AND 10`
+                // -> true), but loose enough that the separating `AND` is not swallowed.
+                let low = self.expr_bp(BP_OTHER)?;
                 self.expect_kw(Kw::And)?;
-                let high = self.expr_bp(BP_CONCAT)?;
+                let high = self.expr_bp(BP_OTHER)?;
                 Expr::Between { arg, low, high, negated }
             }
             Tok::Kw(k @ (Kw::Like | Kw::Ilike)) => {
                 self.bump()?;
-                let pattern = self.expr_bp(BP_CONCAT)?;
+                let pattern = self.expr_bp(BP_OTHER)?;
                 let mut escape = None;
                 if self.eat_kw(Kw::Escape)? {
                     let pos = self.pos;
@@ -550,7 +588,7 @@ impl<'a> Parser<'a> {
     fn similar_to(&mut self, arg: ExprId, negated: bool) -> Result<ExprId> {
         self.bump()?; // similar
         self.bump()?; // to
-        let pattern = self.expr_bp(BP_CONCAT)?;
+        let pattern = self.expr_bp(BP_OTHER)?;
         ensure!(!self.is(Tok::Kw(Kw::Escape)), UnsupportedFeature, self.pos);
         let call = self.simple_call("regexp_full_match", vec![arg, pattern]);
         if negated {
@@ -1223,13 +1261,13 @@ impl<'a> Parser<'a> {
     /// 'abc'), position(NULL in 'abc'), position('b' in NULL)"` -> `0`/`1`/NULL/NULL)
     /// -- that is exactly the existing `strpos` behavior, so nothing is done here.
     ///
-    /// The needle expression is read at `BP_CMP + 1`, so the separating `IN` is not
+    /// The needle expression is read at `BP_PRED + 1`, so the separating `IN` is not
     /// swallowed as the `x IN (...)` predicate (the same trick as reading `BETWEEN`'s
-    /// bounds at `BP_CONCAT`). `||` and arithmetic bind tighter than `BP_CMP` and so
+    /// bounds at `BP_OTHER`). `||` and arithmetic bind tighter than `BP_PRED` and so
     /// combine normally (`position('a' || 'b' in s)` works as intended).
     fn position_in_call(&mut self) -> Result<ExprId> {
         self.bump()?; // '('
-        let search = self.expr_bp(BP_CMP + 1)?;
+        let search = self.expr_bp(BP_PRED + 1)?;
         self.expect_kw(Kw::In)?;
         let string = self.expr()?;
         self.expect(Tok::RParen)?;

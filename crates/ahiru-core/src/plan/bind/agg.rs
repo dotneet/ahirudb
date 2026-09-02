@@ -462,12 +462,17 @@ fn agg_name(fname: &str, arena: &ExprArena, arg: ExprId) -> String {
 }
 
 /// Detects a bare column reference that is not in GROUP BY.
+///
+/// `const_subs` lists the scalar subqueries that are constant with respect to
+/// the grouping (uncorrelated ones, which `bind_select_in` attaches *after* the
+/// aggregate). Any other scalar subquery varies per input row and is rejected.
 pub(super) fn check_grouped(
     arena: &ExprArena,
     scope: &Scope,
     id: ExprId,
     groups: &[ExprId],
     aggs: &[ExprId],
+    const_subs: &[ExprId],
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
@@ -480,15 +485,38 @@ pub(super) fn check_grouped(
     match arena.get(id) {
         Expr::ColumnRef { qualifier, name } => {
             // A column that exists in the input reaching here = it is in neither GROUP BY nor an aggregate.
-            if scope.resolve(qualifier.as_deref(), name).is_ok() {
+            if let Ok(col) = scope.resolve(qualifier.as_deref(), name) {
+                // `GROUP BY emp.dept` and `SELECT dept` name the same column in
+                // two spellings, which `expr_eq` (raw syntax) does not match.
+                // Resolve both sides against the input scope before deciding.
+                if grouped_column(arena, scope, groups, col) {
+                    return Ok(());
+                }
                 err!(NotGrouped);
             }
         }
-        // Scalar subqueries are attached alongside as pre-aggregation columns, so referencing
-        // one bare above the aggregate would shift the column numbers. Rejected like a column reference.
-        Expr::ScalarSubquery(_) => err!(NotGrouped),
+        // An uncorrelated scalar subquery is a constant, and so is legal anywhere in an
+        // aggregating query. A correlated one is attached as a pre-aggregation column whose
+        // value varies per input row, so referencing it above the aggregate is rejected like
+        // a bare column reference.
+        Expr::ScalarSubquery(_) if !const_subs.contains(&id) => err!(NotGrouped),
         _ => {}
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, d))
+    each_child(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, const_subs, d))
+}
+
+/// Whether any grouping expression is a column reference naming input column `col`.
+pub(super) fn grouped_column(
+    arena: &ExprArena,
+    scope: &Scope,
+    groups: &[ExprId],
+    col: usize,
+) -> bool {
+    groups.iter().any(|&g| match arena.get(g) {
+        Expr::ColumnRef { qualifier, name } => {
+            scope.resolve(qualifier.as_deref(), name).is_ok_and(|c| c == col)
+        }
+        _ => false,
+    })
 }

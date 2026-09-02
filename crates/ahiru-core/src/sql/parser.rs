@@ -38,16 +38,45 @@ const MAX_LINKS: u16 = 64;
 type StarModifiers = (Vec<String>, Vec<(ExprId, String)>, Vec<(String, String)>);
 
 // Binding power. Larger binds tighter.
+//
+// The ladder below reproduces PostgreSQL's (and therefore DuckDB's) operator
+// precedence table, which is the source of truth for every level here:
+//
+//   OR < AND < NOT < IS-family < comparison < BETWEEN/IN/LIKE
+//      < "any other operator" < `+ -` < `* / %` < `^` < unary `+ -`
+//
+// Two consequences that are easy to get wrong and are verified against the
+// `duckdb` CLI in `sql::parser::tests`:
+//   * `BETWEEN`/`IN`/`LIKE` bind **tighter** than `=`, so
+//     `false = true IN (false, true)` is `false = (true IN (false, true))`.
+//   * `||` and the bitwise operators share one band, so `1 & 2 || 3` is
+//     `(1 & 2) || 3` and `1 BETWEEN 0 AND 1 & 1` is `1 BETWEEN 0 AND (1 & 1)`.
 const BP_OR: u8 = 1;
 const BP_AND: u8 = 2;
 const BP_NOT: u8 = 3;
+// `= <> < <= > >=`, plus the `IS` family (`IS [NOT] NULL`/`TRUE`/`FALSE`/
+// `UNKNOWN`, `IS [NOT] DISTINCT FROM`, and the `ISNULL`/`NOTNULL` postfix
+// aliases). PostgreSQL puts `IS` one notch *below* comparison, but DuckDB
+// collapses the two — confirmed with the `duckdb` CLI:
+//   `1 IS DISTINCT FROM 1 = 1` -> false  = `(1 IS DISTINCT FROM 1) = 1`
+//   `2 = 1 IS DISTINCT FROM 1` -> true   = `(2 = 1) IS DISTINCT FROM 1`
+// Both are exactly "one left-associative band", which is what this level is.
 const BP_CMP: u8 = 4;
-// `&`/`|`/`<<`/`>>`. Tighter than comparison, looser than `||` and arithmetic
-// (confirmed with the `duckdb` CLI: `1 + 2 & 3` = `(1 + 2) & 3`, `1 & 2 = 0` = `(1 & 2) = 0`).
-// The relative precedence among those four operators has not been measured, so they are
-// simply collapsed into one level.
-const BP_BITWISE: u8 = 5;
-const BP_CONCAT: u8 = 6;
+// `[NOT] BETWEEN`/`[NOT] IN`/`[NOT] LIKE`/`[NOT] ILIKE`/`[NOT] SIMILAR TO`/
+// `GLOB`. One notch tighter than comparison, so a predicate never attaches to
+// a finished comparison (confirmed with the `duckdb` CLI: `false = true IN
+// (false, true)` -> false, `true = 'a' GLOB 'a'` -> true).
+const BP_PRED: u8 = 5;
+// PostgreSQL's "any other operator" band: `||`, the bitwise operators
+// `&`/`|`/`<<`/`>>`, the JSON path operators `->`/`->>`, `^@`, the regex
+// operators `~`/`!~`, and the `~~` (LIKE) punctuation family. Tighter than
+// every predicate, looser than `+`/`-`.
+//
+// Confirmed with the `duckdb` CLI: `1 + 2 & 3` = `(1 + 2) & 3`, `3 & 2 = 2` =
+// `(3 & 2) = 2`, `1 & 2 || 3` = `(1 & 2) || 3` (= `'03'`), `1 || 2 & 3` =
+// `(1 || 2) & 3`. The relative precedence *within* the band has not been
+// measured, so it is one left-associative level.
+const BP_OTHER: u8 = 6;
 const BP_ADD: u8 = 7;
 const BP_MUL: u8 = 8;
 // `^`/`**`. Confirmed with the `duckdb` CLI: `2 + 3^2` = `2 + (3^2)`, `-2^2` = `(-2)^2`
@@ -57,19 +86,27 @@ const BP_POW: u8 = 9;
 // Postfix `!` (factorial). DuckDB's own precedence for `!` is internally
 // inconsistent Postgres legacy (`3! ^ 2` parses fine but `2 ^ 3!` is a
 // syntax error; `2 + 3!` silently reads as `(2+3)!` while `3! + 1` is a
-// syntax error) — not worth replicating. This engine instead picks a
-// self-consistent rule: `!` binds looser than every prefix operator
-// (`-`/`~`/`NOT`, all read at `BP_UNARY`) but tighter than every binary
-// operator. Concretely, `BP_BANG` sits strictly between `BP_POW` (the
-// strongest binary operator) and `BP_UNARY`, and `prefix()` always reads
-// its operand at `BP_UNARY` — so a `!` following `-x`/`~x` is left alone
-// by the inner (operand) parse and only picked up once the outer loop
-// already has the completed `-x`/`~x` node as `lhs`. That makes `-4!` and
-// `-x!` (literal and column operand alike) both parse as `(-x)!`, matching
-// DuckDB's actual behavior there, while deliberately diverging from
-// DuckDB on the binary-operator cases documented in
-// docs/sql/limitations.md (`2 + 3!` = `2 + (3!)` = `8` here, not
-// `(2+3)!` = `120`).
+// syntax error; `~5!` is `(~5)!` while `@5!` is `@(5!)`) — not worth
+// replicating. This engine instead picks a self-consistent rule: `!` binds
+// tighter than every binary operator, and looser than the prefix operators
+// that sit above the binary ladder (`-`/`+`/`NOT`). Concretely, `BP_BANG`
+// sits strictly between `BP_POW` (the strongest binary operator) and
+// `BP_UNARY`, which is where `prefix()` reads the operand of `-`/`+` — so a
+// `!` following `-x` is left alone by the inner (operand) parse and only
+// picked up once the outer loop already has the completed `-x` node as
+// `lhs`. That makes `-4!` and `-x!` (literal and column operand alike) both
+// parse as `(-x)!`, matching DuckDB.
+//
+// The prefix operators `~`/`@` are the exception, and necessarily so: they
+// live *inside* the binary ladder (`BP_OTHER`, see item 1 of this rule's
+// rationale in `prefix()`), so `!` — being tighter than every binary
+// operator — binds tighter than them too: `~5!` is `~(5!)` here. DuckDB
+// answers `(~5)!` for that one spelling while answering `@(5!)` for the
+// identically-shaped `@5!`, so there is no self-consistent rule that agrees
+// with it on both; this engine treats the two prefix operators alike.
+//
+// The binary-operator cases documented in docs/sql/limitations.md
+// (`2 + 3!` = `2 + (3!)` = `8` here, not `(2+3)!` = `120`) are unchanged.
 const BP_BANG: u8 = 10;
 const BP_UNARY: u8 = 11;
 
@@ -317,10 +354,30 @@ impl<'a> Parser<'a> {
         Ok(s)
     }
 
+    /// The alias that follows an explicit `AS`.
+    ///
+    /// Any reserved word is accepted here. `AS` has already fixed the position, so a
+    /// keyword in it cannot mean anything but a name, and DuckDB accepts every one of
+    /// `SELECT 1 AS limit / offset / all / end / distinct` (the quoted spellings
+    /// already worked). Only the *bare* (no-`AS`) alias in `opt_alias` still has to
+    /// stop at a reserved word, because there a keyword really can be the start of the
+    /// next clause.
+    ///
+    /// The spelling comes back from the lexer rather than the `KEYWORDS` table so the
+    /// alias keeps the case the user typed, exactly like an ordinary identifier.
+    fn alias_after_as(&mut self) -> Result<String> {
+        if matches!(self.cur, Tok::Kw(_)) {
+            let s = self.lex.text_from(self.pos).to_owned();
+            self.bump()?;
+            return Ok(s);
+        }
+        self.ident()
+    }
+
     /// `[AS] alias`. Reserved words are `Tok::Kw`, so a clause boundary is never mistaken for an alias.
     fn opt_alias(&mut self) -> Result<Option<String>> {
         if self.eat_kw(Kw::As)? {
-            return Ok(Some(self.ident()?));
+            return Ok(Some(self.alias_after_as()?));
         }
         match self.cur {
             // If a bare alias without `AS` swallowed what was actually the head of a
@@ -347,6 +404,9 @@ impl<'a> Parser<'a> {
     }
 
     /// A non-negative integer. Used by LIMIT / OFFSET and by DECIMAL precision.
+    ///
+    /// `_` digit separators are skipped, exactly as in `types::int_literal` (the lexer
+    /// has already validated their placement).
     fn uint(&mut self) -> Result<u64> {
         let pos = self.pos;
         let text = match self.cur {
@@ -355,6 +415,9 @@ impl<'a> Parser<'a> {
         };
         let mut v: u64 = 0;
         for &d in text.as_bytes() {
+            if d == b'_' {
+                continue;
+            }
             v = match v.checked_mul(10).and_then(|x| x.checked_add((d - b'0') as u64)) {
                 Some(x) => x,
                 None => err!(NumberOverflow, pos),

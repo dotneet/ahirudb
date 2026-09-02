@@ -26,6 +26,7 @@ import {
   detectFormat,
   encodeParams,
   timestampToDate,
+  timestamptzToDate,
   unpackInterval,
 } from '../ahirudb.js';
 import { Code, errorMessage } from '../errors.js';
@@ -622,6 +623,23 @@ test('temporal helpers reject lossy numeric inputs and Date overflow', () => {
     () => dateToDate(100_000_001),
     (e) => e instanceof AhiruError && e.code === Code.VALUE_OUT_OF_RANGE,
   );
+});
+
+test('timestampToDate floors toward the past for pre-epoch instants', () => {
+  // BigInt division truncates toward zero, which for a negative timestamp
+  // rounds forward in time. The Date must always be the millisecond that
+  // contains the instant.
+  assert.equal(timestampToDate(-999n).toISOString(), '1969-12-31T23:59:59.999Z');
+  assert.equal(timestampToDate(-1n).toISOString(), '1969-12-31T23:59:59.999Z');
+  assert.equal(timestampToDate(-1500n).toISOString(), '1969-12-31T23:59:59.998Z');
+  assert.equal(timestampToDate(-1000n).toISOString(), '1969-12-31T23:59:59.999Z');
+  assert.equal(timestampToDate(-2000n).toISOString(), '1969-12-31T23:59:59.998Z');
+  // Exact multiples and positive values are unchanged.
+  assert.equal(timestampToDate(0n).getTime(), 0);
+  assert.equal(timestampToDate(999n).getTime(), 0);
+  assert.equal(timestampToDate(-86_400_000_000n).toISOString(), '1969-12-31T00:00:00.000Z');
+  // The alias shares the implementation.
+  assert.equal(timestamptzToDate(-999n).toISOString(), '1969-12-31T23:59:59.999Z');
 });
 
 // --- Real data: range fetching -----------------------------------------------
