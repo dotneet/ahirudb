@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read-only by default; the one job that writes (the size comment) asks for
+# what it needs itself.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -97,6 +102,13 @@ jobs:
   # so it gets its own job and acts as a hard gate (DESIGN.md §11).
   size:
     runs-on: ubuntu-latest
+    # The size comment posts to the PR, which the default read-only token
+    # cannot do. A pull_request run from a fork gets a read-only token no
+    # matter what is asked for here, which is why the comment step tolerates
+    # its own failure rather than failing the gate.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
@@ -107,9 +119,14 @@ jobs:
           sudo apt-get update && sudo apt-get install -y binaryen
           cargo install twiggy --locked || true
 
+      # pipefail matters here: without it `tee` decides the step's exit status,
+      # so a size.sh that died partway through still looked like a pass and the
+      # gate silently measured nothing.
       - name: measure
         id: measure
+        shell: bash
         run: |
+          set -o pipefail
           ./scripts/size.sh | tee size-report.txt
           echo "size=$(wc -c < target/ahiru-core.wasm | tr -d ' ')" >> "$GITHUB_OUTPUT"
 
@@ -122,6 +139,7 @@ jobs:
       # a justification in the PR body.
       - name: comment size on PR
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |

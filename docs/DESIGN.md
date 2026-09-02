@@ -195,7 +195,10 @@ used either — the engine already needs its own open-addressing table for
 aggregation (§9), so that's the only hash table in the codebase.
 
 Post-build: `wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory
---enable-nontrapping-float-to-int` (see `scripts/size.sh`).
+--enable-nontrapping-float-to-int --enable-sign-ext` (see `scripts/size.sh`).
+`--enable-sign-ext` is required, not cosmetic: rustc emits `i32.extend8_s` /
+`i32.extend16_s`, and a binaryen whose default feature set is plain MVP
+refuses to validate the module without it.
 
 **Dependencies are kept at essentially zero.** `ahiru-core`'s only
 non-dev dependency is the in-workspace `ahiru-zstd` crate, optional behind
