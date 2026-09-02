@@ -185,22 +185,73 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
         PhysType::F64 => Data::F64(arith_f64(op, a.f64s(), sa, b.f64s(), sb, n)),
         _ => err!(TypeMismatch),
     };
+    let mut data = data;
+    wrap_unsigned(out_ty, &mut data);
     Ok(finish(out_ty, data, combine_validity(a, sa, b, sb, n), bad))
 }
 
+/// Folds an arithmetic result back into an unsigned type's own domain.
+///
+/// Unsigned integers are stored in the *next wider signed* physical type
+/// (DESIGN.md §8: `UINTEGER` lives in an `I64`, `UBIGINT` in an `I128`), so the
+/// signed wrap that `int_arith` performs happens at the wrong width. `1::UINTEGER -
+/// 2::UINTEGER` produced `-1` and still called itself a `UINTEGER`, a value outside
+/// the declared type's domain. Masking to the type's own bit width makes the answer
+/// `4294967295` instead — the same "integer arithmetic overflow wraps" rule the
+/// signed types already follow and that docs/sql/limitations.md documents, now
+/// applied consistently at every unsigned width.
+///
+/// (DuckDB raises an out-of-range error here instead. Wrapping is chosen over
+/// raising because this engine's arithmetic kernels have no per-row error channel —
+/// `int_arith` is deliberately branch-free apart from division by zero — and
+/// because wrapping is already the documented contract for the signed widths;
+/// making unsigned the one exception would be the surprising choice.)
+///
+/// A two's-complement `AND` with the mask is exactly the unsigned wrap: `-1 & 0xFF`
+/// is `255`.
+fn wrap_unsigned(out_ty: Ty, data: &mut Data) {
+    let bits: u32 = match out_ty {
+        Ty::UTinyInt => 8,
+        Ty::USmallInt => 16,
+        Ty::UInt => 32,
+        Ty::UBigInt => 64,
+        _ => return,
+    };
+    // Computed at `u128` width so the 64-bit case cannot itself overflow the shift.
+    let mask: u128 = (1u128 << bits) - 1;
+    match data {
+        Data::I32(v) => {
+            for x in v.iter_mut() {
+                *x &= mask as i32;
+            }
+        }
+        Data::I64(v) => {
+            for x in v.iter_mut() {
+                *x &= mask as i64;
+            }
+        }
+        Data::I128(v) => {
+            for x in v.iter_mut() {
+                *x &= mask as i128;
+            }
+        }
+        _ => {}
+    }
+}
+
 // --- Comparison ---------------------------------------------------------------
-// A three-way comparison code (plus "unordered" for NaN) ANDed with a mask folds the six operators into one.
+// A three-way comparison code ANDed with a mask folds the six operators into one.
+// Every physical type, floating point included, produces a total order, so there is
+// no fourth "unordered" state to carry (see `cmp_f64`).
 
 const C_LT: u8 = 1;
 const C_EQ: u8 = 2;
 const C_GT: u8 = 4;
-/// The state where NaN makes the comparison unordered. Only `<>` treats it as true (per IEEE).
-const C_UN: u8 = 8;
 
 fn cmp_mask(op: OpCode) -> Result<u8> {
     Ok(match op {
         OpCode::Eq => C_EQ,
-        OpCode::Ne => C_LT | C_GT | C_UN,
+        OpCode::Ne => C_LT | C_GT,
         OpCode::Lt => C_LT,
         OpCode::Le => C_LT | C_EQ,
         OpCode::Gt => C_GT,
@@ -242,20 +293,22 @@ int_cmp!(cmp_i32, i32);
 int_cmp!(cmp_i64, i64);
 int_cmp!(cmp_i128, i128);
 
+/// Floating point compares under a **total** order, not IEEE's partial one: `NaN`
+/// sorts above every other value (`+inf` included) and equals itself, and `-0.0`
+/// equals `0.0`.
+///
+/// IEEE's "unordered" answer (every operator false, `<>` true) is what a bare
+/// `f64` comparison gives, and it is what this kernel used to return. It made the
+/// engine self-contradictory: `exec::rowkey::canonical_f64` collapses all `NaN`s to
+/// one key, so a hash join on a `NaN` column matched rows that `=` said were not
+/// equal, and the same query took a different answer depending on whether the
+/// planner picked the hash or the nested-loop path. Adopting the total order — which
+/// is also DuckDB's semantics, and already what `exec::rowkey::ord_f64` uses for
+/// `ORDER BY`, `MIN`/`MAX`, grouping and `DISTINCT` — makes all of those agree.
 fn cmp_f64(a: &[f64], sa: usize, b: &[f64], sb: usize, n: usize, mask: u8) -> Bitmap {
     let mut out = Bitmap::with_capacity(n);
     for i in 0..n {
-        let x = a[i * sa];
-        let y = b[i * sb];
-        let c = if x < y {
-            C_LT
-        } else if x > y {
-            C_GT
-        } else if x == y {
-            C_EQ
-        } else {
-            C_UN
-        };
+        let c = ord_code(crate::exec::rowkey::ord_f64(a[i * sa], b[i * sb]));
         out.push(mask & c != 0);
     }
     out
@@ -631,6 +684,95 @@ fn parse_special_f64(s: &[u8]) -> Option<f64> {
     }
 }
 
+/// `round(x * 10^scale)` as an `i128`, or `None` when the value has no such
+/// representation (non-finite, or out of `i128` range).
+///
+/// The scaling deliberately never happens in `f64`. `x *= pow10_f64(scale)` rounds
+/// once into the product and then a second time into the integer, so
+/// `CAST(<double> AS DECIMAL(38,1))` lost digits the value actually had: the double
+/// nearest `12345678901234567890.5` came out as `12345678901234566758.4`, off by more
+/// than a thousand. Instead the double is rendered as its shortest round-tripping
+/// decimal (the exact same text [`fmt_f64`] produces) and rescaled with the integer
+/// arithmetic the `VARCHAR -> DECIMAL` path already uses, so
+/// `CAST(x AS DECIMAL(p,s))` and `CAST(CAST(x AS VARCHAR) AS DECIMAL(p,s))` now agree
+/// by construction.
+///
+/// `scale == 0` (every integer target, and `DECIMAL(p,0)`) keeps the direct
+/// `f_round` path: it is already exact, and it is what carries this engine's
+/// documented round-half-to-even rule for float-to-integer casts.
+fn f64_to_scaled_i128(x: f64, scale: u8, buf: &mut Vec<u8>) -> Option<i128> {
+    if !x.is_finite() {
+        return None;
+    }
+    if scale == 0 {
+        if !(-I128_LIMIT..I128_LIMIT).contains(&x) {
+            return None;
+        }
+        return Some(f_round(x) as i128);
+    }
+    buf.clear();
+    crate::expr::float::write_f64_finite(buf, x);
+    // A shortest-round-trip rendering never has more than 17 significant digits, so
+    // `parse_dec` can always hold the mantissa and never reports it inexact.
+    let (m, e, _) = parse_dec(buf)?;
+    let k = e + scale as i32;
+    if k >= 0 {
+        pow10_i128(k as u32).and_then(|p| m.checked_mul(p))
+    } else if -k > 38 {
+        // Scaled away entirely; every digit is below the target scale.
+        Some(0)
+    } else {
+        pow10_i128((-k) as u32).and_then(|p| rescale_i128(m, 1, p, false))
+    }
+}
+
+/// Reads text as an `f64`, exactly.
+///
+/// The whole string (after trimming spaces/tabs) must be a number; `core`'s own
+/// `FromStr` does the digits, which means the result is the correctly-rounded nearest
+/// `f64` rather than an approximation. It used to be `parse_dec` + `scale_f64`
+/// (mantissa times a binary-decomposed power of ten), which accumulated error and
+/// overflowed to infinity near `f64::MAX`, so text produced by [`fmt_f64`] did not
+/// read back as the same value. `core::num::dec2flt` is already linked into this
+/// crate (the CSV/JSONL readers and `write::float`'s round-trip check both use it),
+/// so this costs no extra code.
+///
+/// `parse_special_f64` runs first because it accepts spellings `FromStr` does not
+/// (`+nan`, `-nan`) and because it fixes the sign of `-nan`, which is otherwise lost.
+fn parse_f64(s: &[u8]) -> Option<f64> {
+    if let Some(v) = parse_special_f64(s) {
+        return Some(v);
+    }
+    let mut lo = 0;
+    let mut hi = s.len();
+    while lo < hi && (s[lo] == b' ' || s[lo] == b'\t') {
+        lo += 1;
+    }
+    while hi > lo && (s[hi - 1] == b' ' || s[hi - 1] == b'\t') {
+        hi -= 1;
+    }
+    core::str::from_utf8(&s[lo..hi]).ok()?.parse::<f64>().ok()
+}
+
+/// Applies the target floating-point width.
+///
+/// `DOUBLE -> FLOAT` keeps `f32` precision (while still being stored as an `f64`).
+/// A finite double whose magnitude exceeds `f32::MAX` has no `FLOAT` representation,
+/// so it converts to NULL rather than silently becoming infinity — `TRY_CAST(1e39 AS
+/// FLOAT)` was returning `inf`, which claims the value survived the narrowing. An
+/// infinity that was already in the input still passes straight through.
+fn narrow_f64(f: f64, to: Ty) -> Option<f64> {
+    if to != Ty::Float {
+        return Some(f);
+    }
+    let g = f as f32 as f64;
+    if g.is_infinite() && f.is_finite() {
+        None
+    } else {
+        Some(g)
+    }
+}
+
 /// Rounding to the nearest even (banker's rounding). `core` has no `f64::round_ties_even`.
 ///
 /// Casting floating point to an integer rounds rather than truncates. The SQL standard calls it
@@ -852,92 +994,32 @@ pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
     }
 }
 
-/// The decimal rendering of an f64. The shortest round-trip representation (Ryu/Grisu) is too
-/// heavy in size, so this is an approximate rendering rounded to 15 digits with trailing zeros dropped.
+/// The decimal rendering of an f64.
+///
+/// Finite values go through [`crate::expr::float::write_f64_finite`], the crate's one
+/// shortest-round-trip formatter (also used by the CSV/JSONL/Parquet writers), so
+/// `CAST(x AS VARCHAR)` is lossless: re-reading the text always reproduces the exact
+/// same `f64` bit pattern. This used to be a hand-rolled 15-significant-digit
+/// approximation, which was neither round-trippable (`0.1 + 0.2` came back as a
+/// different double) nor even correct for integral values inside `f64`'s exact range
+/// (`9007199254740993.0` printed as `9007199254740990`).
+///
+/// Non-finite values keep this engine's own spellings (`NaN` / `Inf` / `-Inf`) rather
+/// than the writers' format-specific ones; `parse_special_f64` reads all of them back.
 pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
     if x.is_nan() {
         out.extend_from_slice(b"NaN");
         return;
     }
-    if x < 0.0 {
-        out.push(b'-');
-    }
-    let v = funcs::f_abs(x);
-    if v == f64::INFINITY {
+    if x == f64::INFINITY {
         out.extend_from_slice(b"Inf");
         return;
     }
-    if v == 0.0 {
-        out.push(b'0');
+    if x == f64::NEG_INFINITY {
+        out.extend_from_slice(b"-Inf");
         return;
     }
-    // Normalizes m into [1e14, 1e15) while preserving v = m * 10^e10.
-    let mut m = v;
-    let mut e10: i32 = 0;
-    while m >= 1e15 {
-        if m >= 1e31 {
-            m /= 1e16;
-            e10 += 16;
-        } else {
-            m /= 10.0;
-            e10 += 1;
-        }
-    }
-    while m < 1e14 {
-        if m < 1e-2 {
-            m *= 1e16;
-            e10 -= 16;
-        } else {
-            m *= 10.0;
-            e10 -= 1;
-        }
-    }
-    let mut mant = (m + 0.5) as u64;
-    if mant >= 1_000_000_000_000_000 {
-        mant /= 10;
-        e10 += 1;
-    }
-    let mut digits = [0u8; 15];
-    let mut t = mant;
-    for i in (0..15).rev() {
-        digits[i] = b'0' + (t % 10) as u8;
-        t /= 10;
-    }
-    let mut k = 15usize;
-    while k > 1 && digits[k - 1] == b'0' {
-        k -= 1;
-    }
-    // v = 0.d1..dk × 10^p
-    let p = e10 + 15;
-    if !(-3..=17).contains(&p) {
-        // Exponential notation.
-        out.push(digits[0]);
-        if k > 1 {
-            out.push(b'.');
-            out.extend_from_slice(&digits[1..k]);
-        }
-        out.push(b'e');
-        let e = p - 1;
-        if e < 0 {
-            out.push(b'-');
-        }
-        fmt_int((if e < 0 { -(e as i64) } else { e as i64 }) as u128, false, 0, out);
-    } else if p <= 0 {
-        out.extend_from_slice(b"0.");
-        for _ in 0..(-p) {
-            out.push(b'0');
-        }
-        out.extend_from_slice(&digits[..k]);
-    } else if (p as usize) >= k {
-        out.extend_from_slice(&digits[..k]);
-        for _ in 0..(p as usize - k) {
-            out.push(b'0');
-        }
-    } else {
-        out.extend_from_slice(&digits[..p as usize]);
-        out.push(b'.');
-        out.extend_from_slice(&digits[p as usize..k]);
-    }
+    crate::expr::float::write_f64_finite(out, x);
 }
 
 /// Reads a decimal number as `mant * 10^exp`. `None` (= NULL) if it cannot be read.
@@ -1044,26 +1126,6 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
     Some((mant, exp, inexact))
 }
 
-/// `m * 10^e`. Multiplied via binary decomposition, so the error is smaller than multiplying by 10 e times.
-fn scale_f64(mut m: f64, e: i32) -> f64 {
-    const TAB: [f64; 9] = [1e1, 1e2, 1e4, 1e8, 1e16, 1e32, 1e64, 1e128, 1e256];
-    let neg = e < 0;
-    let mut k = if neg { -e } else { e };
-    if k > 400 {
-        k = 400;
-    }
-    for (j, p) in TAB.iter().enumerate() {
-        if (k >> j) & 1 == 1 {
-            if neg {
-                m /= *p;
-            } else {
-                m *= *p;
-            }
-        }
-    }
-    m
-}
-
 fn parse_bool(s: &[u8]) -> Option<bool> {
     let eq =
         |w: &[u8]| s.len() == w.len() && s.iter().zip(w).all(|(a, b)| a.to_ascii_lowercase() == *b);
@@ -1133,6 +1195,36 @@ fn cast_str_to_uuid(a: &Vector) -> Result<Vector> {
     Ok(finish(Ty::Uuid, Data::Bytes(out), a.validity().cloned(), bad))
 }
 
+/// `VARCHAR -> INTERVAL`.
+///
+/// Delegates to the SQL parser's own `INTERVAL '...'` literal reader, so the text a
+/// cast accepts and the text a literal accepts can never drift apart, and every
+/// spelling `fmt_interval` produces (`1 day`, `2 mons 3 days 04:05:06`, a bare
+/// `HH:MM:SS`) reads back to the same packed value. An unreadable string follows the
+/// same convention DATE/TIME/TIMESTAMP parsing already uses here: that row is NULL,
+/// not an error (docs/sql/limitations.md).
+fn cast_str_to_interval(a: &Vector) -> Result<Vector> {
+    let n = a.len();
+    let sv = a.bytes();
+    let mut out = Vec::with_capacity(n);
+    let mut bad = None;
+    for i in 0..n {
+        // `pos` only names a byte offset inside a SQL statement for the error message,
+        // and the error is discarded here, so 0 is as meaningful as anything.
+        let v = core::str::from_utf8(sv.get(i))
+            .ok()
+            .and_then(|t| crate::sql::parser::types::parse_interval_text(t, 0).ok());
+        match v {
+            Some(packed) => out.push(packed),
+            None => {
+                out.push(0);
+                funcs::set_null(&mut bad, i, n);
+            }
+        }
+    }
+    Ok(finish(Ty::Interval, Data::I128(out), a.validity().cloned(), bad))
+}
+
 /// `Cast`. Unimplemented combinations give `InvalidCast` rather than silently returning a broken value.
 /// A per-row conversion failure (out of range, unparsable) is not an error; just that row becomes NULL.
 ///
@@ -1179,6 +1271,31 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         out.retype(to);
         return Ok(out);
     }
+    // INTERVAL is I128-backed like HUGEINT and DECIMAL(p>18), but the value in that
+    // i128 is three packed fields (months/days/microseconds), not a number. Letting it
+    // reach the generic `(Fam::Int, _)` arms would render `INTERVAL '1 day'` as the raw
+    // packed integer `18446744073709551616`, and read text back as a plain number. Only
+    // INTERVAL <-> VARCHAR is meaningful, and both directions go through the interval
+    // literal's own text form so `CAST(CAST(i AS VARCHAR) AS INTERVAL)` is the identity.
+    if to == Ty::Interval {
+        ensure!(from == Ty::Varchar, InvalidCast);
+        return cast_str_to_interval(a);
+    }
+    if from == Ty::Interval {
+        ensure!(to == Ty::Varchar, InvalidCast);
+        let sv = a.i128s();
+        let mut data = Data::with_capacity(PhysType::Bytes, n);
+        let mut buf = Vec::new();
+        if let Data::Bytes(d) = &mut data {
+            for packed in sv.iter().take(n) {
+                buf.clear();
+                let (months, days, micros) = unpack_interval(*packed);
+                crate::vector::fmt_interval(months, days, micros, &mut buf);
+                d.push(&buf);
+            }
+        }
+        return Ok(finish(to, data, a.validity().cloned(), None));
+    }
     // UUID is handled separately for the same reason: only VARCHAR <-> UUID is supported.
     // Its physical representation is `Bytes`, the same as VARCHAR/BLOB, but UUID's text form
     // (hyphenated hex) differs from the raw bytes, so it cannot ride the generic `(Fam::Str,
@@ -1209,6 +1326,17 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
     let mut data = Data::with_capacity(to.phys(), n);
     let mut bad: Option<Bitmap> = None;
     match (fam(from), fam(to)) {
+        (Fam::Int, Fam::Int) if to == Ty::Boolean => {
+            // BOOLEAN is "is this value zero", not "does it round to zero". Going through
+            // `int_conv` would rescale a DECIMAL first, so `CAST(DECIMAL '0.1' AS BOOLEAN)`
+            // rounded to 0 and answered false.
+            // `int_conv` also rejected DATE/TIME/TIMESTAMP -> BOOLEAN, which is still not a
+            // meaningful conversion, so that rejection is repeated here rather than lost.
+            ensure!(!from.is_temporal(), InvalidCast);
+            for i in 0..n {
+                store_i128(&mut data, (load_i128(src, i) != 0) as i128);
+            }
+        }
         (Fam::Int, Fam::Int) => {
             let (mul, div, floor) = int_conv(from, to)?;
             for i in 0..n {
@@ -1232,28 +1360,36 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                 if s > 0 {
                     f /= pow10_f64(s);
                 }
-                if to == Ty::Float {
-                    f = f as f32 as f64;
+                match narrow_f64(f, to) {
+                    Some(f) => push_f64(&mut data, f),
+                    None => {
+                        push_default(&mut data);
+                        funcs::set_null(&mut bad, i, n);
+                    }
                 }
-                push_f64(&mut data, f);
             }
         }
         (Fam::Flt, Fam::Int) => {
             ensure!(!to.is_temporal(), InvalidCast);
             let s = dec_scale(to);
             let sv = a.f64s();
+            let mut buf = Vec::new();
             // The index is used not only to fetch the value but also to name the row for `set_null`.
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
-                let mut f = sv[i];
-                if s > 0 {
-                    f *= pow10_f64(s);
-                }
-                let ok = if f.is_finite() && (-I128_LIMIT..I128_LIMIT).contains(&f) {
-                    store_i128_typed(&mut data, to, f_round(f) as i128)
+                let f = sv[i];
+                let ok = if to == Ty::Boolean {
+                    // "Not zero", not "does not round to zero": `CAST(0.4 AS BOOLEAN)` is
+                    // true, and so is any NaN (it is not the value zero).
+                    store_i128(&mut data, (f != 0.0) as i128)
                 } else {
-                    push_default(&mut data);
-                    false
+                    match f64_to_scaled_i128(f, s, &mut buf) {
+                        Some(y) => store_i128_typed(&mut data, to, y),
+                        None => {
+                            push_default(&mut data);
+                            false
+                        }
+                    }
                 };
                 if !ok {
                     funcs::set_null(&mut bad, i, n);
@@ -1265,9 +1401,13 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             // `n` is the row count after strides are applied and is not necessarily `sv.len()`.
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
-                // DOUBLE -> FLOAT drops to f32 precision (while still stored as f64).
-                let f = if to == Ty::Float { sv[i] as f32 as f64 } else { sv[i] };
-                push_f64(&mut data, f);
+                match narrow_f64(sv[i], to) {
+                    Some(f) => push_f64(&mut data, f),
+                    None => {
+                        push_default(&mut data);
+                        funcs::set_null(&mut bad, i, n);
+                    }
+                }
             }
         }
         (Fam::Int, Fam::Str) => {
@@ -1317,16 +1457,8 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         (Fam::Str, Fam::Flt) => {
             let sv = a.bytes();
             for i in 0..n {
-                match parse_special_f64(sv.get(i))
-                    .or_else(|| parse_dec(sv.get(i)).map(|(m, e, _)| scale_f64(m as f64, e)))
-                {
-                    // Digits overflowing the mantissa are outside f64's precision and can be ignored.
-                    Some(mut f) => {
-                        if to == Ty::Float {
-                            f = f as f32 as f64;
-                        }
-                        push_f64(&mut data, f);
-                    }
+                match parse_f64(sv.get(i)).and_then(|f| narrow_f64(f, to)) {
+                    Some(f) => push_f64(&mut data, f),
                     None => {
                         push_default(&mut data);
                         funcs::set_null(&mut bad, i, n);
@@ -1575,17 +1707,54 @@ mod tests {
             fmt_f64(x, &mut o);
             s(&o)
         };
-        assert_eq!(f(0.0), "0");
+        // Shortest round-trip form, so integral values keep a `.0` and the
+        // fixed/exponential switch matches the writers (and DuckDB) exactly.
+        assert_eq!(f(0.0), "0.0");
+        assert_eq!(f(-0.0), "-0.0");
         assert_eq!(f(1.5), "1.5");
         assert_eq!(f(-2.25), "-2.25");
-        assert_eq!(f(100.0), "100");
+        assert_eq!(f(100.0), "100.0");
         assert_eq!(f(0.5), "0.5");
         assert_eq!(f(0.001), "0.001");
         assert_eq!(f(f64::INFINITY), "Inf");
         assert_eq!(f(f64::NEG_INFINITY), "-Inf");
         assert_eq!(f(f64::NAN), "NaN");
-        assert_eq!(f(1e20), "1e20");
-        assert_eq!(f(1.5e-8), "1.5e-8");
+        assert_eq!(f(1e20), "1e+20");
+        assert_eq!(f(1.5e-8), "1.5e-08");
+        // The whole point: these were "9007199254740990" and "0.3" before.
+        assert_eq!(f(9007199254740993.0), "9007199254740992.0");
+        assert_eq!(f(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(f(f64::MAX), "1.7976931348623157e+308");
+    }
+
+    /// Every value [`fmt_f64`] prints reads back as the exact same bit pattern.
+    #[test]
+    fn fmt_f64_round_trips_through_parse_f64() {
+        let cases = [
+            0.0,
+            -0.0,
+            1.0,
+            0.1,
+            0.1 + 0.2,
+            1.5e-8,
+            9007199254740993.0,
+            1234567890123456.0,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324,
+            -1.7976931348623157e308,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for x in cases {
+            let mut o = Vec::new();
+            fmt_f64(x, &mut o);
+            let back = parse_f64(&o).expect("re-readable");
+            assert_eq!(back.to_bits(), x.to_bits(), "round trip of {}", s(&o));
+        }
+        let mut o = Vec::new();
+        fmt_f64(f64::NAN, &mut o);
+        assert!(parse_f64(&o).expect("re-readable").is_nan());
     }
 
     #[test]
@@ -1730,5 +1899,136 @@ mod tests {
         let r = ts_add_interval(&a, &b).unwrap();
         assert!(!r.is_valid(0));
         assert!(r.is_valid(1));
+    }
+
+    // --- Fixes: conversions and unsigned arithmetic --------------------------
+
+    fn dbl(vals: &[f64]) -> Vector {
+        let mut v = Vector::new(Ty::Double);
+        for x in vals {
+            v.push_value(&crate::vector::Value::F64(*x));
+        }
+        v
+    }
+
+    fn txt(vals: &[&str]) -> Vector {
+        let mut v = Vector::new(Ty::Varchar);
+        for x in vals {
+            v.push_value(&crate::vector::Value::Bytes(x.as_bytes().to_vec()));
+        }
+        v
+    }
+
+    #[test]
+    fn parse_f64_is_exact_and_total() {
+        assert_eq!(parse_f64(b"0.30000000000000004"), Some(0.1 + 0.2));
+        assert_eq!(parse_f64(b"1.7976931348623157e+308"), Some(f64::MAX));
+        assert_eq!(parse_f64(b"  1.5  "), Some(1.5));
+        assert_eq!(parse_f64(b"5e-324"), Some(5e-324));
+        assert!(parse_f64(b"nan").unwrap().is_nan());
+        assert!(parse_f64(b"-NaN").unwrap().is_sign_negative());
+        assert_eq!(parse_f64(b"Infinity"), Some(f64::INFINITY));
+        assert_eq!(parse_f64(b"1,5"), None);
+        assert_eq!(parse_f64(b""), None);
+        assert_eq!(parse_f64(b"1 2"), None);
+    }
+
+    #[test]
+    fn narrow_f64_rejects_only_new_infinities() {
+        assert_eq!(narrow_f64(1e39, Ty::Float), None);
+        assert_eq!(narrow_f64(-1e39, Ty::Float), None);
+        assert_eq!(narrow_f64(f64::INFINITY, Ty::Float), Some(f64::INFINITY));
+        assert_eq!(narrow_f64(1e39, Ty::Double), Some(1e39));
+        assert_eq!(narrow_f64(1.1, Ty::Float), Some(1.1f32 as f64));
+        assert!(narrow_f64(f64::NAN, Ty::Float).unwrap().is_nan());
+    }
+
+    #[test]
+    fn f64_to_scaled_i128_never_multiplies_in_floating_point() {
+        let mut buf = Vec::new();
+        // 12345678901234567890.5 is not representable; the nearest double is
+        // 12345678901234567168, whose shortest rendering is 1.2345678901234567e19.
+        assert_eq!(
+            f64_to_scaled_i128(12345678901234567890.5, 1, &mut buf),
+            Some(123456789012345670000)
+        );
+        assert_eq!(f64_to_scaled_i128(1.5, 1, &mut buf), Some(15));
+        assert_eq!(f64_to_scaled_i128(0.1, 20, &mut buf), Some(10000000000000000000));
+        assert_eq!(f64_to_scaled_i128(1e-300, 37, &mut buf), Some(0));
+        assert_eq!(f64_to_scaled_i128(1e300, 1, &mut buf), None);
+        assert_eq!(f64_to_scaled_i128(f64::NAN, 1, &mut buf), None);
+        assert_eq!(f64_to_scaled_i128(f64::INFINITY, 0, &mut buf), None);
+        // scale 0 keeps the documented round-half-to-even rule.
+        assert_eq!(f64_to_scaled_i128(2.5, 0, &mut buf), Some(2));
+        assert_eq!(f64_to_scaled_i128(3.5, 0, &mut buf), Some(4));
+        assert_eq!(f64_to_scaled_i128(-2.5, 0, &mut buf), Some(-2));
+    }
+
+    #[test]
+    fn cast_to_boolean_asks_whether_the_value_is_zero() {
+        let out =
+            cast(Ty::Double, Ty::Boolean, &dbl(&[0.4, -0.4, 1e-300, 0.0, -0.0, f64::NAN])).unwrap();
+        let bits = out.bools();
+        assert!(bits.get(0) && bits.get(1) && bits.get(2));
+        assert!(!bits.get(3) && !bits.get(4));
+        assert!(bits.get(5), "NaN is not the value zero");
+
+        // DECIMAL keeps its unscaled integer, so 0.1 must not round to 0 first.
+        let dec = Ty::decimal(3, 1);
+        let mut d = Vector::new(dec);
+        d.push_value(&crate::vector::Value::I64(1));
+        d.push_value(&crate::vector::Value::I64(0));
+        let out = cast(dec, Ty::Boolean, &d).unwrap();
+        assert!(out.bools().get(0));
+        assert!(!out.bools().get(1));
+    }
+
+    #[test]
+    fn interval_casts_use_the_interval_text_form() {
+        let day = crate::vector::pack_interval(0, 1, 0);
+        let mut v = Vector::new(Ty::Interval);
+        v.push_value(&crate::vector::Value::I128(day));
+        let out = cast(Ty::Interval, Ty::Varchar, &v).unwrap();
+        assert_eq!(s(out.bytes().get(0)), "1 day");
+
+        let back = cast(Ty::Varchar, Ty::Interval, &txt(&["1 day", "junk"])).unwrap();
+        assert_eq!(back.i128s()[0], day);
+        assert!(!back.is_valid(1), "unreadable interval text is NULL");
+
+        // Only VARCHAR converts; the packed representation is not a number.
+        assert!(cast(Ty::Interval, Ty::BigInt, &v).is_err());
+        assert!(cast(Ty::Int, Ty::Interval, &Vector::new(Ty::Int)).is_err());
+    }
+
+    #[test]
+    fn unsigned_arithmetic_wraps_inside_its_declared_width() {
+        let sub = |ty: Ty, x: i64, y: i64| {
+            let mut a = Vector::new(ty);
+            let mut b = Vector::new(ty);
+            match ty.phys() {
+                PhysType::I32 => {
+                    a.push_value(&crate::vector::Value::I32(x as i32));
+                    b.push_value(&crate::vector::Value::I32(y as i32));
+                }
+                PhysType::I64 => {
+                    a.push_value(&crate::vector::Value::I64(x));
+                    b.push_value(&crate::vector::Value::I64(y));
+                }
+                _ => {
+                    a.push_value(&crate::vector::Value::I128(x as i128));
+                    b.push_value(&crate::vector::Value::I128(y as i128));
+                }
+            }
+            let out = arith(OpCode::Sub, ty, &a, &b).unwrap();
+            load_i128(out.data(), 0)
+        };
+        assert_eq!(sub(Ty::UTinyInt, 1, 2), 255);
+        assert_eq!(sub(Ty::USmallInt, 1, 2), 65_535);
+        assert_eq!(sub(Ty::UInt, 1, 2), 4_294_967_295);
+        assert_eq!(sub(Ty::UBigInt, 1, 2), 18_446_744_073_709_551_615);
+        // In-range results and the signed types are untouched.
+        assert_eq!(sub(Ty::UInt, 5, 2), 3);
+        assert_eq!(sub(Ty::Int, 1, 2), -1);
+        assert_eq!(sub(Ty::BigInt, 1, 2), -1);
     }
 }

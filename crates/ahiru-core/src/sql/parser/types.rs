@@ -533,7 +533,7 @@ fn parse_time_component(s: &str) -> Option<i64> {
 /// The compound form `'<n> <unit> [<n> <unit> ...] [HH:MM[:SS[.frac]]]'`. Terms are
 /// simply added, so repeated units accumulate (DuckDB likewise treats `'1 month 1
 /// month'` as `2 months`), and any term may be fractional or a bare time component.
-pub(super) fn parse_interval_text(text: &str, pos: usize) -> Result<i128> {
+pub(crate) fn parse_interval_text(text: &str, pos: usize) -> Result<i128> {
     let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
     let mut any = false;
     let mut it = text.split_ascii_whitespace();

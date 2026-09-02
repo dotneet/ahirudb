@@ -77,11 +77,35 @@ pub enum QueryStep {
     Done,
 }
 
+/// A host-supplied decompressor for codecs the core does not carry.
+///
+/// `NEED_CODEC` is normally answered by the host between two `step` calls
+/// (DESIGN.md §6). The one-shot statements — `COPY`, `CREATE TABLE AS`,
+/// `INSERT ... SELECT` — run to completion *inside* `prepare`, so there is no
+/// step boundary at which the host could be re-entered; without a hook they
+/// can only fail. Registering one lets those paths service the request
+/// in-process, using bytes the preceding `NEED_IO` already delivered.
+///
+/// It is a plain `fn` pointer, not a boxed closure: it costs one word on
+/// `Session` and needs no allocation, which matters for the wasm budget
+/// (DESIGN.md §3). The source bytes are handed in by the engine, so the hook
+/// never has to reach back into the catalog.
+///
+/// A host that has no such decompressor simply leaves it unset, and those
+/// statements report `UnsupportedCodec` — the same behaviour as before, but
+/// with an error that names the actual problem.
+#[cfg(any(feature = "ddl", feature = "export"))]
+pub type CodecHook =
+    fn(codec: crate::parquet::Compression, src: &[u8], out_len: usize) -> Result<Vec<u8>>;
+
 pub struct Session {
     pub catalog: Catalog,
     /// `pub(crate)`: used by the `ddl`/`dml` modules for per-row expression evaluation
     /// (VALUES/SET/WHERE). Not exposed outside the crate (no effect on the existing ABI/JS surface).
     pub(crate) vm: Vm,
+    /// The host decompressor used by the non-streaming statements. See [`CodecHook`].
+    #[cfg(any(feature = "ddl", feature = "export"))]
+    codec_hook: Option<CodecHook>,
     /// The query start time for `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()`
     /// (microseconds since the epoch, UTC). The wasm core has no clock, so the host
     /// passes it explicitly via `set_now`. Unset, it is the epoch (1970-01-01) --
@@ -92,7 +116,52 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Self {
-        Session { catalog: Catalog::new(), vm: Vm::new(), now_micros: 0 }
+        Session {
+            catalog: Catalog::new(),
+            vm: Vm::new(),
+            #[cfg(any(feature = "ddl", feature = "export"))]
+            codec_hook: None,
+            now_micros: 0,
+        }
+    }
+
+    /// Registers the host decompressor described by [`CodecHook`].
+    ///
+    /// Only the one-shot statements (`COPY`, `CREATE TABLE AS`,
+    /// `INSERT ... SELECT`) consult it; the streaming `prepare`/`step` path is
+    /// unaffected and keeps returning `NEED_CODEC` to the host as before.
+    #[cfg(any(feature = "ddl", feature = "export"))]
+    pub fn set_codec_hook(&mut self, hook: CodecHook) {
+        self.codec_hook = Some(hook);
+    }
+
+    /// Answers a batch of `NEED_CODEC` requests in-process via the registered
+    /// [`CodecHook`], caching each result exactly as `provide_decoded` would.
+    ///
+    /// The compressed bytes were already delivered by the preceding `NEED_IO`
+    /// (DESIGN.md §6), so they are read straight out of the `Source` rather
+    /// than asked for again.
+    #[cfg(any(feature = "ddl", feature = "export"))]
+    pub(crate) fn service_codec(&mut self, reqs: &[CodecRequest]) -> Result<()> {
+        let hook = match self.codec_hook {
+            Some(hook) => hook,
+            None => err!(UnsupportedCodec),
+        };
+        for r in reqs {
+            let part = match self.catalog.get(r.table).and_then(|t| t.parts.get(r.part)) {
+                Some(part) => part,
+                None => err!(TableNotFound),
+            };
+            let src = match part.source.get(r.offset, r.len as usize) {
+                Some(src) => src,
+                // The bytes should already be here; if they are not, this is a
+                // genuine I/O gap rather than a codec problem.
+                None => err!(IoFailed),
+            };
+            let data = hook(r.codec, src, r.out_len as usize)?;
+            self.provide_decoded(r.table, r.part, r.offset, r.len, data)?;
+        }
+        Ok(())
     }
 
     /// Sets the query start time. Later `prepare` calls use it as the value of

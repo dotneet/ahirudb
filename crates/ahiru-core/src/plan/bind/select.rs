@@ -212,6 +212,37 @@ fn add_equivalent_group_subs(
     Ok(())
 }
 
+/// The name of an unaliased output column, at output position `pos`.
+///
+/// A column reference keeps its own name and a bare `UNNEST(x)` keeps
+/// `duckdb`'s `unnest`, both via [`default_name`]. Anything else -- a literal,
+/// an arithmetic expression, a function call -- gets `col<pos>`.
+///
+/// The position matters. [`default_name`]'s own fallback numbers the column by
+/// the expression's *arena id*, which is an implementation detail of parsing:
+/// `SELECT 1, 2` yields `col0, col1` but `SELECT 1+1, 2` yields `col2, col3`,
+/// and `SELECT count(*), sum(a), sum(b)` yields `col0, col2, col4`. Those
+/// names are not internal -- they become CSV headers, JSON object keys, and,
+/// through `CREATE TABLE AS`, persisted column names -- so an unrelated edit
+/// to one select item silently renamed the others. Numbering by output
+/// position instead makes them dense and stable.
+///
+/// `duckdb` goes further and names such a column after the expression text
+/// (`(1 + 1)`, `count_star()`). Reproducing that would mean carrying a
+/// deparser for the whole expression grammar in a crate that deliberately
+/// links no `core::fmt` (DESIGN.md §4), which is not worth the bytes; stable
+/// positional names are the part that actually fixes the bug.
+fn output_name(arena: &ExprArena, id: ExprId, pos: usize) -> String {
+    match arena.get(id) {
+        Expr::ColumnRef { .. } | Expr::Unnest(_) => default_name(arena, id),
+        _ => {
+            let mut s = String::from("col");
+            push_u32(&mut s, pos as u32);
+            s
+        }
+    }
+}
+
 // --- Main --------------------------------------------------------------------
 
 /// When `outer_scope` is `Some`, this SELECT is bound as a correlated subquery: an equality
@@ -1272,7 +1303,7 @@ pub(super) fn bind_select_in(
                 let p = compile_with_subs(arena, &item_scope, params, &subs, item.expr)?;
                 let name = match &item.alias {
                     Some(a) => a.clone(),
-                    None => default_name(arena, item.expr),
+                    None => output_name(arena, item.expr, schema.len()),
                 };
                 schema.push(Field::new(name, p.result_ty, true));
                 exprs.push(p);

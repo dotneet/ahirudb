@@ -586,7 +586,7 @@ impl<'a> Parser<'a> {
 
 mod expr;
 mod select;
-mod types;
+pub(crate) mod types;
 
 #[cfg(feature = "ddl")]
 mod ddl;

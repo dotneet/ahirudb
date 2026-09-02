@@ -59,8 +59,15 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Engine {
+        let mut s = Session::new();
+        // `COPY`, `CREATE TABLE AS` and `INSERT ... SELECT` complete inside
+        // `Session::prepare`, so there is no step boundary at which the loop in
+        // `run` could answer a `NEED_CODEC`. Handing the core the same
+        // decompressor up front lets those statements read a GZIP-compressed
+        // Parquet source too, instead of failing (see `Session::set_codec_hook`).
+        s.set_codec_hook(core_codec_hook);
         Engine {
-            s: Session::new(),
+            s,
             sources: HashMap::new(),
             registered: HashSet::new(),
             names: Vec::new(),
@@ -711,6 +718,30 @@ fn gunzip(src: &[u8]) -> R<Vec<u8>> {
         return Err("gzip failed".into());
     }
     Ok(out.stdout)
+}
+
+/// [`decompress_host`] in the shape `ahiru-core` can call back into.
+///
+/// `COPY`, `CREATE TABLE AS` and `INSERT ... SELECT` finish inside
+/// `Session::prepare`, so the codec loop in [`Engine::run`] never gets a turn
+/// on them; the core calls this instead (registered via
+/// `Session::set_codec_hook`). The streaming path is unchanged and still
+/// answers `NEED_CODEC` in that loop.
+///
+/// The core is `no_std` and its errors are numeric codes, so the host's
+/// descriptive `String` error collapses to `BadCompressedData` (the bytes did
+/// not decompress) or `UnsupportedCodec` (this host has no such decoder).
+fn core_codec_hook(
+    codec: ahiru_core::parquet::Compression,
+    src: &[u8],
+    out_len: usize,
+) -> ahiru_core::error::Result<Vec<u8>> {
+    use ahiru_core::error::{Code, Error};
+    use ahiru_core::parquet::Compression;
+    if !matches!(codec, Compression::Zstd | Compression::Gzip) {
+        return Err(Error::new(Code::UnsupportedCodec));
+    }
+    decompress_host(codec, src, out_len).map_err(|_| Error::new(Code::BadCompressedData))
 }
 
 #[cfg(test)]

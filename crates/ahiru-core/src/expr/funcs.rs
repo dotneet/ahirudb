@@ -11,7 +11,11 @@
 //!    inside `eval_str` / `eval_int` / `eval_f64` / `eval_bool`. A loop per function would grow
 //!    the code with the number of functions.
 //! 2. **Separate IDs per type family.** `abs` has different IDs for integers and floating point.
-//!    Logical types are never consulted at runtime, so the loop has one fewer check.
+//!    Logical types are, as a rule, not consulted at runtime, so the loop has one fewer check.
+//!    The exceptions are the handful of functions whose *whole job* is to render or measure a
+//!    value the way its logical type dictates, and which therefore cannot be split by ID at all:
+//!    `printf`/`format` (whose argument types are only known per call site, see `write_display`)
+//!    and `hex`/`to_hex` (which needs the argument's bit width). Those read `Vector::ty()`.
 //! 3. **Any-type functions are written by composing kernels.** `coalesce` / `nullif` /
 //!    `greatest` / `least` carry no code for the six physical types and lower to combinations of
 //!    `kernels::pick` / `compare` / `logic` / `is_null`.
@@ -369,15 +373,25 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         }
         // `hex` is overloaded in DuckDB: an integer argument is rendered in base 16, anything
         // else is the hex dump of its bytes. `to_hex` is the integer-only spelling.
+        //
+        // An integer argument keeps its own type rather than being coerced to BIGINT: HUGEINT
+        // needs all 128 bits of its pattern, and a UBIGINT above `i64::MAX` would not survive
+        // the cast at all (it became NULL). `eval_str` reads the width back off the vector.
         "hex" => {
             ensure!(n == 1, WrongArgCount);
             if args[0].is_integer() {
-                Ok((F_TO_HEX, vec![BigInt], Varchar))
+                Ok((F_TO_HEX, vec![args[0]], Varchar))
             } else {
                 Ok((F_HEX, vec![Varchar], Varchar))
             }
         }
-        "to_hex" => fixed(F_TO_HEX, &[BigInt], n, 1, Varchar),
+        "to_hex" => {
+            ensure!(n == 1, WrongArgCount);
+            // Non-integer arguments (DOUBLE, and NULL with no settled type) keep the previous
+            // "round through BIGINT" leniency.
+            let t = if args[0].is_integer() { args[0] } else { BigInt };
+            Ok((F_TO_HEX, vec![t], Varchar))
+        }
         "unhex" | "from_hex" => fixed(F_UNHEX, &[Varchar], n, 1, Blob),
         "length" | "len" | "char_length" | "character_length" => {
             fixed(F_LENGTH, &[Varchar], n, 1, BigInt)
@@ -1034,6 +1048,20 @@ impl<'b> A<'_, 'b> {
             Some((v, j)) => match v.data() {
                 Data::I64(d) => d.get(j).copied().unwrap_or(0),
                 Data::I32(d) => d.get(j).copied().unwrap_or(0) as i64,
+                _ => 0,
+            },
+            None => 0,
+        }
+    }
+
+    /// The full-width integer value. Needed by the few functions that must see HUGEINT/UBIGINT
+    /// patterns rather than the BIGINT-shaped view `int` gives (`hex`/`to_hex`).
+    fn i128(&self, k: usize) -> i128 {
+        match self.at(k) {
+            Some((v, j)) => match v.data() {
+                Data::I128(d) => d.get(j).copied().unwrap_or(0),
+                Data::I64(d) => d.get(j).copied().unwrap_or(0) as i128,
+                Data::I32(d) => d.get(j).copied().unwrap_or(0) as i128,
                 _ => 0,
             },
             None => 0,

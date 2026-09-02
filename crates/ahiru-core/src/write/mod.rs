@@ -12,12 +12,22 @@
 //!
 //! The read engine's core design is to "stop and return a request when bytes
 //! are missing" (DESIGN.md §6), but this write driver does not expose that
-//! type. If `export_all` hits `NEED_IO` / `NEED_CODEC` while executing the
-//! query, it fails with `Err(IoFailed)`. It only works when all data is
-//! already in memory (CLI usage, or when the JS side has already fully
-//! fetched the table). A resumable write path that cooperates with the
-//! host's fetch loop would need an ABI shaped like `ahiru_query_step` for the
-//! write side too; that is deferred past v1.
+//! type. If `export_all` hits `NEED_IO` while executing the query, it fails
+//! with `Err(IoFailed)`. It only works when all data is already in memory
+//! (CLI usage, or when the JS side has already fully fetched the table). A
+//! resumable write path that cooperates with the host's fetch loop would need
+//! an ABI shaped like `ahiru_query_step` for the write side too; that is
+//! deferred past v1.
+//!
+//! `NEED_CODEC` is **not** part of that limitation, even though it used to be
+//! treated as one. A codec request never means "bytes are missing": the
+//! compressed bytes were already delivered by the preceding `NEED_IO`, and
+//! only the decompression itself is delegated (DESIGN.md §6, "Codec
+//! delegation protocol"). Since nothing has to be fetched, the export driver
+//! answers it in place through [`Session::set_codec_hook`] and carries on --
+//! so a GZIP-compressed source works here exactly as it does on the streaming
+//! query path. A host that registers no hook gets `UnsupportedCodec`, which
+//! at least names the real problem.
 
 #[cfg(feature = "csv")]
 pub mod csv;
@@ -86,8 +96,9 @@ pub(crate) fn validate_batch(schema: &[Field], batch: &Batch) -> Result<()> {
 
 /// Executes a query and writes the whole result to `sink`.
 ///
-/// **Non-resumable**: fails with `IoFailed` if `NEED_IO` / `NEED_CODEC` occurs
-/// during execution (see module doc).
+/// **Non-resumable**: fails with `IoFailed` if `NEED_IO` occurs during
+/// execution. `NEED_CODEC` is answered in place via the session's codec hook
+/// (see module doc).
 pub fn export_all(
     session: &mut Session,
     sql: &str,
@@ -106,7 +117,13 @@ pub fn export_all(
                 b.materialize();
                 sink.write_batch(&q.schema, &b)?;
             }
-            QueryStep::NeedIo(_) | QueryStep::NeedCodec(_) => err!(IoFailed),
+            QueryStep::NeedIo(_) => err!(IoFailed),
+            // The compressed bytes are already in memory; only the inflate is
+            // missing. Service it in place through the session's codec hook,
+            // the same work the host does between two `step` calls
+            // (DESIGN.md §6). With no hook registered this reports
+            // `UnsupportedCodec`.
+            QueryStep::NeedCodec(reqs) => session.service_codec(&reqs)?,
             QueryStep::Done => break,
         }
     }
@@ -141,7 +158,13 @@ fn export_query(
                 b.materialize();
                 sink.write_batch(&q.schema, &b)?;
             }
-            QueryStep::NeedIo(_) | QueryStep::NeedCodec(_) => err!(IoFailed),
+            QueryStep::NeedIo(_) => err!(IoFailed),
+            // The compressed bytes are already in memory; only the inflate is
+            // missing. Service it in place through the session's codec hook,
+            // the same work the host does between two `step` calls
+            // (DESIGN.md §6). With no hook registered this reports
+            // `UnsupportedCodec`.
+            QueryStep::NeedCodec(reqs) => session.service_codec(&reqs)?,
             QueryStep::Done => break,
         }
     }

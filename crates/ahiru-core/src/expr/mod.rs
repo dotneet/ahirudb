@@ -24,6 +24,27 @@ pub mod kernels;
 pub mod regex;
 pub mod vm;
 
+// The shortest-round-trip `f64` -> text formatter. It physically lives in
+// `write/float.rs` (where it started life, shared by the CSV and JSONL
+// writers), but the always-on `CAST(<double> AS VARCHAR)` path needs the very
+// same rendering, and `write` as a whole is gated behind the opt-in `export`
+// feature. Including the file here by path, rather than copying it, keeps a
+// single source of truth for float formatting across the whole crate: a fix
+// to the algorithm cannot land on the cast path and miss the writers, or the
+// other way round. See the note in the module's own docs about why one shared
+// copy matters. (Follow-up for whoever owns `write/`: once `write/mod.rs`
+// switches its `mod float;` to `use crate::expr::float;`, the module stops
+// being compiled twice in builds that enable `export` + `csv`/`jsonl`.)
+// `clippy::duplicate_mod` is exactly the follow-up above: with `export` +
+// `csv`/`jsonl` all enabled, this file is compiled as both `expr::float` and
+// `write::float`. The alternative -- a second copy of a 600-line intricate
+// algorithm -- is strictly worse, and this crate's own `write/float.rs` module
+// doc explains why one shared copy matters. Removing the duplication needs a
+// one-line change in `write/mod.rs`, which is not this module's to make.
+#[allow(clippy::duplicate_mod)]
+#[path = "../write/float.rs"]
+pub(crate) mod float;
+
 use crate::prelude::*;
 use crate::vector::{PhysType, Ty, Value};
 
@@ -171,6 +192,20 @@ pub struct Program {
     /// `plan::compile::Compiler::lambda_call`).
     pub lambdas: Vec<Program>,
     pub num_regs: u16,
+    /// Set when one of the `u16`-wide counters below (registers, constants,
+    /// calls, casts, lambdas) ran out of room while this program was being
+    /// built.
+    ///
+    /// The counters cannot simply be widened: `Instr` is a packed 12-byte
+    /// record whose operand fields are `u16` by design (DESIGN.md §9). So
+    /// instead of truncating an index — which silently aliases two different
+    /// values onto one register, and in `profile.wasm` (overflow checks off,
+    /// `panic = "abort"`) does so with no diagnostic at all — the builder
+    /// saturates and records it here, and `expr::vm::Vm::eval` refuses to run
+    /// the program with `LimitExceeded`. That turns "wrong answer, silently"
+    /// into "clean error", which is the rule the rest of the engine follows
+    /// for resource ceilings (DESIGN.md §9).
+    pub overflow: bool,
     /// The register the result lands in.
     pub result: Reg,
     /// The result's logical type.
@@ -186,32 +221,61 @@ impl Program {
             casts: Vec::new(),
             lambdas: Vec::new(),
             num_regs: 0,
+            overflow: false,
             result: 0,
             result_ty: Ty::Null,
         }
     }
 
     /// Allocates a new register.
+    ///
+    /// A register number is a `u16`, so at most `u16::MAX` of them exist. Past
+    /// that the allocation saturates and sets [`Program::overflow`] instead of
+    /// wrapping around and handing out a register that is already in use.
     pub fn alloc_reg(&mut self) -> Reg {
-        let r = self.num_regs;
-        self.num_regs += 1;
-        r
+        match self.num_regs.checked_add(1) {
+            Some(next) => {
+                let r = self.num_regs;
+                self.num_regs = next;
+                r
+            }
+            None => {
+                self.overflow = true;
+                Reg::MAX
+            }
+        }
+    }
+
+    /// Reserves the next index in a side table, or records the overflow.
+    /// `len` is the table's length *before* the push the caller is about to do.
+    fn next_index(&mut self, len: usize) -> Option<u16> {
+        if self.overflow || len >= u16::MAX as usize {
+            self.overflow = true;
+            return None;
+        }
+        Some(len as u16)
     }
 
     pub fn add_const(&mut self, ty: Ty, v: Value) -> u16 {
         // Identical constants are shared. Constants are usually few, so a linear scan suffices.
-        for (i, (t, existing)) in self.consts.iter().enumerate() {
-            if *t == ty && *existing == v {
-                return i as u16;
+        // The scan is skipped once the program is already doomed, so a pathologically large
+        // literal list stops costing quadratic work the moment the limit is hit.
+        if !self.overflow {
+            for (i, (t, existing)) in self.consts.iter().enumerate() {
+                if *t == ty && *existing == v {
+                    return i as u16;
+                }
             }
         }
+        let Some(i) = self.next_index(self.consts.len()) else { return 0 };
         self.consts.push((ty, v));
-        (self.consts.len() - 1) as u16
+        i
     }
 
     pub fn add_call(&mut self, func: u16, args: Vec<Reg>, result_ty: Ty) -> u16 {
+        let Some(i) = self.next_index(self.calls.len()) else { return 0 };
         self.calls.push(CallSpec { func, args, result_ty, lambda: None });
-        (self.calls.len() - 1) as u16
+        i
     }
 
     /// For `list_transform`/`list_filter`/`list_reduce`. `lambda` is the index `add_lambda` returned.
@@ -222,19 +286,29 @@ impl Program {
         result_ty: Ty,
         lambda: u16,
     ) -> u16 {
+        let Some(i) = self.next_index(self.calls.len()) else { return 0 };
         self.calls.push(CallSpec { func, args, result_ty, lambda: Some(lambda) });
-        (self.calls.len() - 1) as u16
+        i
     }
 
     /// Embeds a lambda body program and returns the index to pass to `CallSpec::lambda`.
+    ///
+    /// A body that itself overflowed poisons the enclosing program: the body is
+    /// executed through the same `Vm::eval` gate, but failing here as well means
+    /// the outer program never starts either.
     pub fn add_lambda(&mut self, body: Program) -> u16 {
+        if body.overflow {
+            self.overflow = true;
+        }
+        let Some(i) = self.next_index(self.lambdas.len()) else { return 0 };
         self.lambdas.push(body);
-        (self.lambdas.len() - 1) as u16
+        i
     }
 
     pub fn add_cast(&mut self, from: Ty, to: Ty) -> u16 {
+        let Some(i) = self.next_index(self.casts.len()) else { return 0 };
         self.casts.push(CastSpec { from, to });
-        (self.casts.len() - 1) as u16
+        i
     }
 
     pub fn push(&mut self, i: Instr) {
@@ -250,5 +324,73 @@ impl Program {
 impl Default for Program {
     fn default() -> Self {
         Program::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Register numbers are `u16`. Past `u16::MAX` the allocator must not hand
+    /// out a register that is already live: two values sharing one register is a
+    /// wrong answer, and in `profile.wasm` (overflow checks off) it used to
+    /// happen silently.
+    #[test]
+    fn register_allocation_saturates_instead_of_wrapping() {
+        let mut p = Program::new();
+        for i in 0..u16::MAX {
+            assert_eq!(p.alloc_reg(), i);
+        }
+        assert!(!p.overflow, "exactly u16::MAX registers still fit");
+        assert_eq!(p.alloc_reg(), u16::MAX);
+        assert!(p.overflow);
+        // It stays saturated rather than wrapping back to 0.
+        assert_eq!(p.alloc_reg(), u16::MAX);
+        assert_eq!(p.num_regs, u16::MAX);
+    }
+
+    /// The side tables are indexed by `u16` too, and `(len - 1) as u16` used to
+    /// truncate silently once a table passed 65536 entries.
+    #[test]
+    fn side_table_indices_report_overflow_instead_of_truncating() {
+        let mut p = Program::new();
+        for i in 0..(u16::MAX as i32) {
+            assert_eq!(p.add_const(Ty::Int, Value::I32(i)), i as u16);
+        }
+        assert!(!p.overflow);
+        assert_eq!(p.add_const(Ty::Int, Value::I32(-1)), 0);
+        assert!(p.overflow);
+        // An index already in the pool still resolves; only new entries fail.
+        assert_eq!(p.consts.len(), u16::MAX as usize);
+    }
+
+    #[test]
+    fn cast_and_call_tables_share_the_same_guard() {
+        let mut p = Program::new();
+        for _ in 0..u16::MAX {
+            p.add_cast(Ty::Int, Ty::BigInt);
+        }
+        assert!(!p.overflow);
+        p.add_cast(Ty::Int, Ty::BigInt);
+        assert!(p.overflow);
+
+        let mut q = Program::new();
+        for _ in 0..u16::MAX {
+            q.add_call(0, Vec::new(), Ty::Int);
+        }
+        assert!(!q.overflow);
+        q.add_call(0, Vec::new(), Ty::Int);
+        assert!(q.overflow);
+    }
+
+    /// A lambda body that overflowed poisons the program that embeds it, so the
+    /// outer program never starts either.
+    #[test]
+    fn a_poisoned_lambda_body_poisons_its_parent() {
+        let mut body = Program::new();
+        body.overflow = true;
+        let mut p = Program::new();
+        p.add_lambda(body);
+        assert!(p.overflow);
     }
 }

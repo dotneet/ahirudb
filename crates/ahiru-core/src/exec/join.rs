@@ -1019,7 +1019,8 @@ mod tests {
         );
     }
 
-    /// `encode_key` normalizes -0.0 and NaN, so both join.
+    /// `encode_key` normalizes -0.0 and NaN, so both join -- and `expr::kernels::cmp_f64`
+    /// agrees, so the nested-loop path (`ON a.x = b.x OR false`) produces the same rows.
     #[test]
     fn float_keys_canonicalise_zero_and_nan() {
         let left = vec![ready(vec![dbls(&[-0.0, f64::NAN, 1.5])])];

@@ -11,7 +11,7 @@
 //! conversion, NULLs, and three-valued logic exactly the same as in `SELECT`, and adds no code size.
 
 use crate::ddl::{count_result, eval_scalar, run_query_to_rows};
-use crate::plan::compile::{cast_program, compile};
+use crate::plan::compile::{cast_program, compile, compile_predicate};
 use crate::plan::Scope;
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
@@ -29,6 +29,22 @@ fn cast_value(session: &mut Session, v: Value, target_ty: Ty) -> Result<Value> {
     let mut arena = ExprArena::new();
     let id = arena.push(crate::sql::ast::Expr::Literal(v));
     eval_scalar(session, &arena, id, &[], target_ty)
+}
+
+/// The name-resolution scope for `UPDATE`/`DELETE` against `table`.
+///
+/// Every column carries the target table as its qualifier, so a `SET`
+/// expression or `WHERE` clause may write `t.c` as well as bare `c` -- the
+/// spelling `duckdb` accepts, and the natural one when the predicate was
+/// copied out of a `SELECT`. A plain `Scope::from_fields` leaves the qualifier
+/// unset, which made `t.c` resolve as "column `c` of an unknown table `t`" and
+/// fail with `TableNotFound`.
+fn table_scope(table: &str, schema: &[Field]) -> Scope {
+    let mut scope = Scope::new();
+    for f in schema {
+        scope.push(Some(String::from(table)), f.clone());
+    }
+    scope
 }
 
 /// Resolves `columns` (the column-name list of `INSERT INTO t (a, b) ...`) into indices
@@ -120,7 +136,7 @@ pub(crate) fn update(
 ) -> Result<Prepared> {
     let idx = session.catalog.mem_index_writable(table)?;
     let schema = session.catalog.mem_get(idx).unwrap().schema.clone();
-    let scope = Scope::from_fields(schema.clone());
+    let scope = table_scope(table, &schema);
 
     let mut set_cols = Vec::with_capacity(assignments.len());
     let mut set_progs = Vec::with_capacity(assignments.len());
@@ -139,8 +155,11 @@ pub(crate) fn update(
         set_cols.push(ci);
         set_progs.push(prog);
     }
+    // `compile_predicate`, not `compile`: it is what `SELECT`'s WHERE uses, so
+    // `WHERE NULL` becomes a BOOLEAN NULL (matching nothing) instead of a
+    // `TypeMismatch`, and a non-boolean predicate is rejected identically.
     let pred = match filter {
-        Some(e) => Some(compile(arena, &scope, params, e)?),
+        Some(e) => Some(compile_predicate(arena, &scope, params, e)?),
         None => None,
     };
 
@@ -218,8 +237,9 @@ pub(crate) fn delete(
     let pred = match filter {
         Some(e) => {
             let schema = session.catalog.mem_get(idx).unwrap().schema.clone();
-            let scope = Scope::from_fields(schema);
-            Some(compile(arena, &scope, params, e)?)
+            let scope = table_scope(table, &schema);
+            // Same as `update`: see the comment on its `compile_predicate` call.
+            Some(compile_predicate(arena, &scope, params, e)?)
         }
         None => None,
     };
