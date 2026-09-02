@@ -118,16 +118,17 @@ The design rests on three pillars:
 
 ## 3. Size budget
 
-### Measured (2026-08-13, via `./scripts/size.sh`, `wasm-opt -Oz` applied)
+### Measured (2026-09-03, via `./scripts/size.sh`, `wasm-opt -Oz` applied)
 
 | Configuration | raw | gzip -9 | of 1 MiB budget |
 |---|---:|---:|---:|
-| Parquet only, ZSTD off | 467,319 B | 204,626 B | 44.6% |
-| + CSV | 491,713 B | 214,882 B | 46.9% |
-| + JSONL | 501,478 B | 218,506 B | 47.8% |
-| + CSV + JSONL (all read formats) | 510,581 B | 222,953 B | **48.7%** |
-| Parquet only, **default build** (ZSTD on) | 481,241 B | 210,142 B | 45.9% |
-| `ahiru-zstd.wasm` standalone (opt-out fallback) | 12,668 B | 6,621 B | separate budget |
+| Parquet only, ZSTD off | 536,873 B | 233,080 B | 51.2% |
+| + CSV | 562,133 B | 243,608 B | 53.6% |
+| + JSONL | 572,319 B | 247,138 B | 54.6% |
+| + CSV + JSONL (all read formats) | 581,963 B | 252,056 B | **55.5%** |
+| Parquet only, **default build** (ZSTD on) | 551,004 B | 238,391 B | 52.5% |
+| Everything on, including the opt-in `ddl`/`dml`/`export` features | 626,962 B | 270,260 B | 59.8% (not gated) |
+| `ahiru-zstd.wasm` standalone (opt-out fallback) | 12,814 B | 6,699 B | separate budget |
 
 The CI size gate (`size` job in `.github/workflows/ci.yml`) judges the
 **fully-loaded configuration** (all read formats on) against the 1 MiB raw
@@ -137,7 +138,7 @@ pass wouldn't actually protect anyone shipping the full feature set.
 what a read-only distribution actually ships; turning them on is a separate,
 deliberate size trade a consumer makes.
 
-At 48.7% of budget with the entire current SQL surface (§7) — aggregation,
+At 55.5% of budget with the entire current SQL surface (§7) — aggregation,
 joins, window functions, CTEs including `WITH RECURSIVE`, subqueries, JSON,
 regex, `PIVOT`/`UNPIVOT`, lambda expressions, DDL/DML, and more, all
 included — there is still comfortable headroom. The original per-subsystem
@@ -555,6 +556,10 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
   `list_reverse`, ...) — `LIST`/`MAP` values from Parquet share this same
   representation (§5)
 - Regular expressions: `regexp_matches`/`regexp_extract`/`regexp_replace`
+  — a hand-written Thompson NFA (linear time, no backtracking blowup on
+  adversarial input) that steps one whole UTF-8 scalar at a time, so no
+  operation can emit invalid UTF-8; POSIX bracket expressions
+  (`[[:alpha:]]`) are supported, ASCII-only
 - `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL` arithmetic; `DECIMAL` with correct
   scale propagation through multiplication/division
 - Table functions: `generate_series(...)`, `range(...)`, `UNNEST(...)`
@@ -917,7 +922,7 @@ skeptical reader) — see §14.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Kernel explosion causing size overrun | Was high | §11's five tactics. Current measured size is 48.7% of budget with the full feature set (§3) — the risk materialized far less than originally feared, and this is no longer the primary size concern |
+| Kernel explosion causing size overrun | Was high | §11's five tactics. Current measured size is 55.5% of budget with the full feature set (§3) — the risk materialized far less than originally feared, and this is no longer the primary size concern |
 | ~~ZSTD essentially mandatory and awkward as a side load~~ | ~~Medium~~ | **Resolved (2026-08-11)**: ZSTD measured at ~13 KB (the original 1.1 MB estimate was a large overestimate), so it's now bundled by default via the `zstd` feature instead of shipped as a separate module (§6). Opting out falls back to the standalone `ahiru-zstd` module |
 | ~~Nested types (LIST/STRUCT) unsupported~~ | ~~Medium~~ | **Resolved**: `STRUCT` flattens to dotted columns; `LIST`/`MAP` (and `STRUCT` containing them) expose as `JSON`-typed columns (§5) |
 | Rust `no_std` constraint slows development | Medium | `ahiru-cli` (native) allows `std`, switched via `#[cfg]`; tests are written against the `std` build. In practice this was enough — no nightly toolchain was ever needed either (§4), which removed a second source of development friction this document originally anticipated |
@@ -941,6 +946,8 @@ behavior rather than a silent wrong answer.
 | Hash join build side | The side with fewer known rows becomes the build side, but Parquet row counts aren't always known ahead of a nested source (subquery, CTE); in that case it isn't guaranteed to pick the smaller side | Correct results either way, just potentially more memory than optimal |
 | Dictionary encoding is not preserved through execution | Decoded to plain values at the Parquet read boundary (§5, §9), not kept dictionary-coded for `GROUP BY`/equality | A plausible optimization (DuckDB-style dictionary-aware execution) that was never built, not a correctness gap |
 | CSV split resync | A quoted newline at a split boundary cannot be resynchronized from that split's bytes alone | Quoting forces a single split (the whole file is scanned when it is already resident; a remote file whose sample has no `"` but a later split does is rejected rather than mis-parsed) |
+| Text-format type inference is sampled | CSV/JSONL column types are sniffed from a leading sample (up to 256 KiB); a later value that does not fit raises a conversion error | Loud rather than silent. This used to write `NULL` for the offending row, which destroyed data invisibly — exactly the failure mode this section rules out. DuckDB instead re-sniffs and widens the column, so the same file reads there and errors here |
+| `CAST` of unparseable or out-of-range numeric/text input yields `NULL` | `CAST('abc' AS INTEGER)` and `CAST(3000000000 AS INTEGER)` are `NULL`, not errors — `CAST` and `TRY_CAST` are indistinguishable outside JSON (`docs/sql/types.md`) | The one place the engine is quieter than it should be, and a known gap rather than a choice: a strict variant needs a flag through the cast kernels *plus* a `LIMIT`/`Project` ordering change, so a row a `LIMIT` would have discarded can't fail the query |
 | No continuous fuzzing | Bounds/limits exist and are unit-tested, but no `cargo-fuzz` corpus runs in CI (§5, §14) | A real, tracked gap, not a design choice |
 | `LZO` / `BROTLI` codecs | Unsupported (`UnsupportedCodec`) | Fits the existing host-delegation framework (§6) if ever needed — would be a JS-side-only addition |
 | `PIVOT`/`UNPIVOT` value auto-detection | `PIVOT ... ON x` requires an explicit `IN (...)` list; DuckDB's auto-detect-distinct-values form isn't supported | Must enumerate pivot values explicitly |
@@ -964,8 +971,24 @@ to be explicit:
 - Integer arithmetic overflow wraps. `SUM` alone accumulates in `i128` and
   returns `ValueOutOfRange` on overflow of *that*.
 - Grouping and join keys treat `-0.0`/`0.0` as identical and collapse all
-  `NaN`s to one representative; comparison operators still treat `NaN` as
-  false everywhere except `<>`.
+  `NaN`s to one representative.
+- **`NaN` compares under the total order the sort and hash paths already
+  use**, not under IEEE rules: `NaN` is equal to itself and greater than
+  everything else including `+inf`. This is what makes `=`, `IN`, joins,
+  `GROUP BY`, `DISTINCT`, and `ORDER BY` agree with each other, and it
+  matches DuckDB. Under the old IEEE-comparison rule a hash join matched
+  `NaN` keys while the nested-loop path did not, which meant the same query
+  gave different answers depending on which join algorithm the planner
+  picked — the kind of divergence §15 exists to rule out.
+- **`SUM`/`AVG` over `DOUBLE` use Neumaier compensated summation**, on both
+  the aggregate and the window path, so a running total does not lose the
+  small addends to a large one: `sum([1e100, 1.0, -1e100])` is `1.0` here,
+  from `SELECT sum(x)` and `SELECT sum(x) OVER ()` alike, where an
+  uncompensated accumulator (DuckDB's included) gives `0.0`.
+- `abs`/`sign` clear the sign bit rather than negating, so neither can
+  return `-0.0`. `sqrt` and `cbrt` are correctly rounded; `exp`/`ln` are
+  within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see
+  `docs/sql/functions-numeric.md`).
 
 ---
 
@@ -1023,11 +1046,24 @@ Symmetric to the read side's `TableFormat` (which produces `Batch`es):
 change a line of read-side code (this is the argument for why the opt-out is
 safe).
 
-**v1 limitation**: `export_all` is non-resumable. If `NEED_IO`/`NEED_CODEC`
-happens mid-export, it fails with `IoFailed`. Usable only when all source
-data is already in memory (CLI usage, or a JS caller that pre-fetched the
-table fully). A resumable export ABI mirroring `ahiru_query_step` (something
-like `ahiru_export_step`) would be needed for the general case; not built.
+**v1 limitation**: `export_all` is non-resumable. If `NEED_IO` happens
+mid-export, it fails with `IoFailed`. Usable only when all source data is
+already in memory (CLI usage, or a JS caller that pre-fetched the table
+fully). A resumable export ABI mirroring `ahiru_query_step` (something like
+`ahiru_export_step`) would be needed for the general case; not built.
+
+`NEED_CODEC` is **not** part of that limitation, though it used to be
+treated as one. A codec request never means "bytes are missing": the
+compressed bytes were already delivered by the preceding `NEED_IO` (§6,
+"Codec delegation protocol"), and only the decompression is delegated.
+Since nothing has to be fetched, the export driver answers it in place
+through the escape hatch `Session::set_codec_hook` — a host-supplied
+decompressor the one-shot statements consult directly — and carries on, so
+a GZIP-compressed source exports exactly as it queries. The native CLI
+always registers one. A host that registers none gets `UnsupportedCodec`,
+which at least names the real problem, rather than an `IoFailed` that does
+not. The streaming `prepare`/`step` path is untouched and still returns
+`NEED_CODEC` to the host as before.
 
 `COPY (SELECT ...) TO 'x.csv'` is wired end-to-end via `Stmt::Copy` in the
 SQL grammar (see §7). The core itself never touches a filesystem — writing
@@ -1090,9 +1126,12 @@ semantics matching DuckDB (each `SET` expression evaluates against the
 pre-update row).
 
 **`CREATE TABLE AS SELECT`/`INSERT ... SELECT` are also non-resumable**, for
-the same reason and the same constraint as `export_all`: a `NEED_IO`/
-`NEED_CODEC` mid-execution fails with `IoFailed`; only usable when the
-source data is fully in memory already (see `src/ddl.rs::run_query_to_rows`).
+the same reason and the same constraint as `export_all`: a `NEED_IO`
+mid-execution fails with `IoFailed`; only usable when the source data is
+fully in memory already (see `src/ddl.rs::run_query_to_rows`). As on the
+export path, `NEED_CODEC` is serviced in place through
+`Session::set_codec_hook` rather than failing, so both statements work over
+a GZIP-compressed Parquet source.
 
 **Guard against writing to read-only tables**: `INSERT`/`UPDATE`/`DELETE`
 against a file-backed table return `ReadOnlyTable` (`dml::mem_index_writable`).
@@ -1213,7 +1252,7 @@ answer themselves during implementation rather than needing an upfront
 decision:
 
 - ~~**Is 1 MiB raw or gzip?**~~ Resolved as raw, and met as raw (§3) — with
-  enough margin (48.7% of budget) that the question stopped being live.
+  enough margin (55.5% of budget) that the question stopped being live.
 - ~~**Is an Arrow JS dependency acceptable?**~~ Resolved by not needing the
   question: the result wire format ended up being a small bespoke format
   instead of Arrow IPC (§10), so Arrow JS was never pulled in at all.

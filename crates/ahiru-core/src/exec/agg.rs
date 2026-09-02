@@ -905,7 +905,7 @@ fn fabs(x: f64) -> f64 {
 /// A non-finite correction (`sum` and `x` are both infinite, or the total just
 /// overflowed) is dropped rather than carried: `inf - inf` is NaN, and letting
 /// that into `comp` would poison an otherwise well-defined infinite sum.
-fn neumaier_add(sum: f64, comp: f64, x: f64) -> (f64, f64) {
+pub(super) fn neumaier_add(sum: f64, comp: f64, x: f64) -> (f64, f64) {
     let t = sum + x;
     // Subtract the larger magnitude from the total first; that difference is
     // exact, so what remains is precisely the bits `t` could not represent.
@@ -918,7 +918,7 @@ fn neumaier_add(sum: f64, comp: f64, x: f64) -> (f64, f64) {
 /// A zero compensation is skipped rather than added, so a sum of nothing but
 /// negative zeros stays `-0.0` instead of being flipped to `0.0` by
 /// `-0.0 + 0.0` (`SUM` over floats otherwise matches `duckdb` on signed zero).
-fn compensated(sum: f64, comp: f64) -> f64 {
+pub(super) fn compensated(sum: f64, comp: f64) -> f64 {
     if comp == 0.0 {
         sum
     } else {
@@ -1038,7 +1038,7 @@ fn push_int_text(out: &mut Vec<u8>, v: i128, scale: u8) {
 
 /// A simple decimal rendering of f64. Rounded to 15 significant digits with trailing zeros
 /// dropped. A full CAST-grade round-trippable representation is unnecessary (this is only for
-/// ArrayAgg's display), so it is not built as rigorously as `expr::kernels::fmt_f64` (which is private and uncallable).
+/// ArrayAgg's display), so it is not built as rigorously as `expr::kernels::fmt_f64`.
 fn push_f64_text(out: &mut Vec<u8>, x: f64) {
     if x.is_nan() {
         out.extend_from_slice(b"NaN");

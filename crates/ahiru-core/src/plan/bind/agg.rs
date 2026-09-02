@@ -520,3 +520,44 @@ pub(super) fn grouped_column(
         _ => false,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::PhysType;
+
+    /// `coalesce_programs` is the merge call site that never had a size guard of its own
+    /// (`and_programs` did, which is why the defect only ever showed up here). The guard
+    /// now lives inside `merge_program_bodies`, so this path has to be covered too:
+    /// past the `u16` ceiling the merge must poison the program instead of wrapping
+    /// `num_regs` and aliasing two distinct registers onto one.
+    #[test]
+    fn coalescing_past_the_register_ceiling_poisons_the_program() {
+        let mut a = Program::new();
+        a.num_regs = 60_000;
+        a.result = 59_999;
+        a.result_ty = Ty::BigInt;
+        a.push(Instr::new(OpCode::Add, PhysType::I64, a.result, 0, 0));
+        let mut b = Program::new();
+        b.num_regs = 10_000;
+        b.result = 9_999;
+        b.result_ty = Ty::BigInt;
+        b.push(Instr::new(OpCode::Add, PhysType::I64, b.result, 0, 0));
+
+        let p = coalesce_programs(a, b);
+        assert!(p.overflow, "the coalesced program must be poisoned");
+        // 60_000 registers plus the one `coalesce_programs` allocates for the result --
+        // never the 4_465 a wrapping `base + rhs.num_regs` would have produced.
+        assert_eq!(p.num_regs, 60_001);
+        assert!(p.result < p.num_regs);
+    }
+
+    /// The ordinary shape (`coalesce_zero`-sized programs) must still merge normally.
+    #[test]
+    fn a_coalesce_that_fits_is_not_poisoned() {
+        let scope = Scope::from_fields(vec![Field::new("n", Ty::BigInt, true)]);
+        let p = coalesce_zero(&scope, 0).unwrap();
+        assert!(!p.overflow);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::Coalesce));
+    }
+}

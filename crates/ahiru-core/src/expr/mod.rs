@@ -24,25 +24,13 @@ pub mod kernels;
 pub mod regex;
 pub mod vm;
 
-// The shortest-round-trip `f64` -> text formatter. It physically lives in
-// `write/float.rs` (where it started life, shared by the CSV and JSONL
-// writers), but the always-on `CAST(<double> AS VARCHAR)` path needs the very
-// same rendering, and `write` as a whole is gated behind the opt-in `export`
-// feature. Including the file here by path, rather than copying it, keeps a
-// single source of truth for float formatting across the whole crate: a fix
-// to the algorithm cannot land on the cast path and miss the writers, or the
-// other way round. See the note in the module's own docs about why one shared
-// copy matters. (Follow-up for whoever owns `write/`: once `write/mod.rs`
-// switches its `mod float;` to `use crate::expr::float;`, the module stops
-// being compiled twice in builds that enable `export` + `csv`/`jsonl`.)
-// `clippy::duplicate_mod` is exactly the follow-up above: with `export` +
-// `csv`/`jsonl` all enabled, this file is compiled as both `expr::float` and
-// `write::float`. The alternative -- a second copy of a 600-line intricate
-// algorithm -- is strictly worse, and this crate's own `write/float.rs` module
-// doc explains why one shared copy matters. Removing the duplication needs a
-// one-line change in `write/mod.rs`, which is not this module's to make.
-#[allow(clippy::duplicate_mod)]
-#[path = "../write/float.rs"]
+// The crate's one shortest-round-trip `f64` -> text formatter. It started life
+// under `write/`, shared by the CSV and JSONL writers, but the always-on
+// `CAST(<double> AS VARCHAR)` path needs exactly the same rendering while
+// `write` as a whole is gated behind the opt-in `export` feature. It therefore
+// lives here, in an unconditionally compiled module, and `write/mod.rs`
+// re-exports it. One module, one copy: a fix to the algorithm cannot land on
+// the cast path and miss the writers, or the other way round.
 pub(crate) mod float;
 
 use crate::prelude::*;

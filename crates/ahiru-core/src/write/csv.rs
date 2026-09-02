@@ -242,7 +242,7 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 /// not just here), so this is hand-rolled. The shortest-round-trip digit
 /// generation itself (`normalize_and_correct` / `shortest_digits` /
 /// `nearest_at_length` / `cmp_midpoint` / `Big`, and the fixed-vs-exponential
-/// rendering) is shared with the JSONL writer -- see `write/float.rs`'s
+/// rendering) is shared with the JSONL writer -- see `expr/float.rs`'s
 /// module doc for why that lives in one place instead of being duplicated
 /// per format.
 ///
@@ -427,7 +427,7 @@ mod tests {
         // see that file's equivalent test). Everything else -- shortest
         // round-trip digit generation, exact-tie regression cases, and the
         // std-Display property test -- is covered once, for both writers,
-        // in `write/float.rs`'s own test module.
+        // in `expr/float.rs`'s own test module.
         let mut out = Vec::new();
         push_f64(&mut out, f64::NAN);
         assert_eq!(out, b"NaN");

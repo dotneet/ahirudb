@@ -31,12 +31,14 @@
 
 #[cfg(feature = "csv")]
 pub mod csv;
-// Shared `f64` shortest-round-trip formatting for `csv`/`jsonl`. Only built
-// when at least one of them is, since it has no other caller; private since
-// its API (`write_f64_finite`) is an internal implementation detail of those
-// two writers, not part of this crate's public surface.
+// Shared `f64` shortest-round-trip formatting for `csv`/`jsonl`. The module
+// itself lives in `expr/`, which is always compiled, because the `CAST(<double>
+// AS VARCHAR)` kernel needs the identical rendering and is not gated behind
+// `export`; this is a re-export so `super::float::write_f64_finite` keeps
+// resolving inside the writers. Only bound when at least one writer is built,
+// since it has no other caller here.
 #[cfg(any(feature = "csv", feature = "jsonl"))]
-mod float;
+pub(crate) use crate::expr::float;
 #[cfg(feature = "jsonl")]
 pub mod jsonl;
 #[cfg(feature = "export-parquet")]

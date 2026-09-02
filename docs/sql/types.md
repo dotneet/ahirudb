@@ -49,10 +49,29 @@ them in:
 - Otherwise the narrower type widens to the wider one, in this order:
   `BOOLEAN < TINYINT/UTINYINT < SMALLINT/USMALLINT < INTEGER/UINTEGER <
   BIGINT/UBIGINT < DECIMAL < HUGEINT < FLOAT < DOUBLE < DATE < TIME <
-  TIMESTAMP < TIMESTAMPTZ < VARCHAR < BLOB`.
-- Two `DECIMAL`s unify to a `DECIMAL` wide enough for both: the new
-  precision is `max(p1 - s1, p2 - s2) + max(s1, s2) + 1` (the `+1` covers
-  carry on addition, matching DuckDB), and the new scale is `max(s1, s2)`.
+  TIMESTAMP < TIMESTAMPTZ < VARCHAR < BLOB`. This ordering does **not**
+  decide a `DECIMAL`-with-integer pair, even though `HUGEINT` outranks
+  `DECIMAL` in it: the `DECIMAL` rule below is checked first and wins.
+- A `DECIMAL` combined with another `DECIMAL` — or with an **integer**,
+  which counts as a `DECIMAL` of scale 0 — unifies to a `DECIMAL` wide
+  enough for both: the new precision is
+  `max(p1 - s1, p2 - s2) + max(s1, s2) + 1` (the `+1` covers carry on
+  addition, matching DuckDB), and the new scale is `max(s1, s2)`. The
+  precision is capped at 38.
+
+  Widening the `DECIMAL` side rather than the integer side is what keeps
+  the fractional digits: `DECIMAL(4,1) + BIGINT` becomes `DECIMAL(21,1)`
+  and `DECIMAL(4,1) + HUGEINT` becomes `DECIMAL(38,1)` (uncapped it would
+  be 40), so both of these are `8.5` and not `9`:
+
+  ```sql
+  SELECT CAST('7.5' AS DECIMAL(4,1)) + 1::BIGINT;    -- 8.5
+  SELECT CAST('7.5' AS DECIMAL(4,1)) + 1::HUGEINT;   -- 8.5
+  ```
+
+  `typeof` here reports a bare `DECIMAL` without the precision and scale,
+  so it cannot be used to observe the unified width the way DuckDB's
+  `typeof` can.
 - A `DECIMAL` combined with `FLOAT`/`DOUBLE` always becomes `DOUBLE` (never a
   wider `DECIMAL`); `FLOAT` combined with any other numeric type always
   becomes `DOUBLE` (never stays `FLOAT`).
@@ -70,6 +89,26 @@ them in:
 A plain (unsuffixed) integer literal is `INTEGER` if it fits, else `BIGINT`,
 else `HUGEINT`.
 
+Numeric literals accept **`_` as a digit separator** between digits
+(`1_000_000`, `1_0.5_5`, `1.5e1_0`), and a float may be written in
+**leading-dot form** (`.5` is `0.5`) — both matching DuckDB.
+
+A literal with a decimal point or an exponent (`1.005`, `.5`, `1e3`) is
+**`DOUBLE`**. DuckDB types the same literal as a `DECIMAL` wide enough to
+hold it exactly (`typeof(1.005)` is `DECIMAL(4,3)` there, `DOUBLE` here).
+The consequence is that exact-decimal identities hold in DuckDB and not
+here:
+
+```sql
+SELECT 0.1 + 0.2 = 0.3;                          -- false here, true in DuckDB
+SELECT CAST(123456789012345678.005 AS DECIMAL(30,3));
+-- 123456789012345680.000 here (the literal was rounded to a DOUBLE first);
+-- 123456789012345678.005 in DuckDB
+```
+
+Write `CAST('0.1' AS DECIMAL(...))` — or a `DECIMAL`-typed column — when
+you need exact decimal arithmetic on constants.
+
 ## CAST and TRY_CAST
 
 > The `SELECT`s on this page are written as bare expressions for brevity.
@@ -83,11 +122,31 @@ SELECT CAST(1.2345 AS DECIMAL(10, 2));   -- 1.23
 SELECT TRY_CAST('not a number' AS INTEGER);  -- NULL, no error
 ```
 
-`CAST` raises an error on a conversion it can't perform (e.g. `CAST('abc' AS
-INTEGER)`, or non-JSON text `CAST AS JSON`). `TRY_CAST` never raises — a
-failed conversion becomes `NULL` for that row instead of aborting the query.
-This matters most when casting a whole column: a single bad row with `CAST`
-fails the entire query, while `TRY_CAST` just nulls that row out.
+`TRY_CAST` never raises — a failed conversion becomes `NULL` for that row
+instead of aborting the query.
+
+**`CAST` behaves the same way for numeric and text conversions**, which is
+a deliberate divergence from DuckDB: unparseable text and an out-of-range
+value both become `NULL` silently rather than failing the query.
+
+```sql
+SELECT CAST('abc' AS INTEGER);          -- NULL here; DuckDB raises a conversion error
+SELECT CAST(3000000000 AS INTEGER);     -- NULL here; DuckDB raises "value out of range"
+SELECT CAST(1e300::DOUBLE AS FLOAT);    -- NULL here (not `inf`); DuckDB raises
+```
+
+This is the same convention already documented for `DATE`/`TIME`/
+`TIMESTAMP` (see [Typed date/time literals](#typed-datetime-literals)) and
+`UUID` (see [UUID](#uuid)) — `CAST` and `TRY_CAST` are indistinguishable
+outside the JSON case. It is a known gap rather than a design goal:
+matching DuckDB needs a strict-cast flag threaded through the cast kernels
+*and* a change to the `LIMIT`/`Project` evaluation order, so that a row a
+`LIMIT` would have discarded cannot fail the query on a value the user
+never asked to see. Until both land, treat `CAST` as `TRY_CAST` and use
+`WHERE ... IS NOT NULL` (or `TRY_CAST` explicitly, to say so) rather than
+relying on a cast to reject bad data.
+
+The one conversion that does raise is non-JSON text `CAST AS JSON`.
 
 Accepted `CAST` type-name spellings (case-insensitive):
 
@@ -114,10 +173,21 @@ TIMESTAMP | DATETIME
 TIMESTAMPTZ | TIMESTAMP WITH TIME ZONE
 JSON
 UUID
+INTERVAL
 ```
 
-`INTERVAL` has no `CAST` spelling — the only way to produce one is the
-`INTERVAL '...'` literal syntax below.
+`INTERVAL` is nameable in a type position, and casts round-trip through
+text in both directions:
+
+```sql
+SELECT CAST('1 day' AS INTERVAL);                        -- 1 day
+SELECT CAST(INTERVAL '1 day 02:03:04' AS VARCHAR);       -- '1 day 02:03:04'
+SELECT CAST(CAST(INTERVAL '3 months 4 days 05:06:07' AS VARCHAR) AS INTERVAL);
+-- 3 months 4 days 05:06:07
+```
+
+The text form is the same one the CSV/JSONL/Parquet exports write (see
+[Interval literals](#interval-literals) below).
 
 ## NULL and three-valued logic
 
@@ -156,8 +226,41 @@ it needs to be explicit:
   [functions-numeric.md](functions-numeric.md#factorial)).
 - `-0.0` and `0.0` are treated as identical for grouping/join keys; all
   `NaN` values collapse to one representative for grouping purposes.
-  Comparison operators still treat `NaN` as not-equal-to-anything (`false`)
-  except `<>`, which is `true`.
+- **`NaN` compares under a total order, not under IEEE rules** (matching
+  DuckDB): `NaN` is equal to itself and greater than everything else,
+  including `+inf`. So `=`, `<>`, `<`/`>`, `IN`, join conditions,
+  `GROUP BY`, `DISTINCT`, and `ORDER BY` all agree with each other, and a
+  hash join and a nested-loop join over the same `NaN` keys produce the
+  same rows.
+
+  ```sql
+  SELECT 'nan'::DOUBLE = 'nan'::DOUBLE;     -- true
+  SELECT 'nan'::DOUBLE > 'inf'::DOUBLE;     -- true
+  SELECT 'nan'::DOUBLE IN ('nan'::DOUBLE, 1.0);  -- true
+  ```
+
+  `ORDER BY` therefore sorts a `DOUBLE` column as
+  `-inf < ... < +inf < NaN`, with `NULL`s placed by the usual
+  `NULLS FIRST`/`NULLS LAST` rule.
+- `CAST(<finite double> AS VARCHAR)` produces the **shortest decimal string
+  that round-trips** back to the same `DOUBLE` — `100.0`, `1e+30`,
+  `1e-05`, `0.1` — the same formatter the CSV/JSONL writers use, so a
+  finite value survives a cast to text and back unchanged.
+- A **non-finite** `DOUBLE` casts to the lowercase `nan`, `inf`, `-inf`,
+  matching DuckDB, and that is also how the value displays when selected
+  bare. The cast round-trips like the finite case does:
+
+  ```sql
+  SELECT CAST('inf'::DOUBLE AS VARCHAR);                    -- inf
+  SELECT CAST('-inf'::DOUBLE AS VARCHAR);                   -- -inf
+  SELECT CAST('nan'::DOUBLE AS VARCHAR);                    -- nan
+  SELECT CAST(CAST('inf'::DOUBLE AS VARCHAR) AS DOUBLE);    -- inf (infinite)
+  ```
+
+  These are deliberately *not* the spellings the CSV/JSONL writers use.
+  Those write the values out longhand as `NaN`, `Infinity`, `-Infinity`
+  (quoted, in the JSONL case); see
+  [ddl-dml.md](ddl-dml.md#jsonl-output).
 
 ## Typed date/time literals
 

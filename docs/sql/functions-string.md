@@ -49,7 +49,7 @@ SELECT string_split('a,b,c', ',');   -- ["a","b","c"]  (a LIST, i.e. JSON text)
 | `length(s)` | `len`, `char_length`, `character_length` | counts codepoints |
 | `left(s, n)` | — | First `n` codepoints; negative `n` drops the last `\|n\|` instead |
 | `right(s, n)` | — | Last `n` codepoints; negative `n` drops the first `\|n\|` instead |
-| `string_split(s, sep)` | `str_split`, `string_to_array`, `split` | Returns a LIST (JSON text — see [functions-json.md](functions-json.md)). An empty `sep` gives a one-element list holding the whole string, matching DuckDB (it does **not** split into characters) |
+| `string_split(s, sep)` | `str_split`, `string_to_array`, `split` | Returns a LIST (JSON text — see [functions-json.md](functions-json.md)). An empty `sep` gives a one-element list holding the whole string (`string_split('abc','')` → `["abc"]`), where DuckDB 1.4 splits into characters (`[a, b, c]`) — a divergence |
 
 `left` and `right` are reserved words (they introduce a join kind), but a
 `(` immediately after the keyword is unambiguous, so writing them as
@@ -112,6 +112,15 @@ SELECT ascii('A');                   -- 65       (codepoint; aliases: unicode, o
 SELECT chr(9731);                    -- '☃'
 SELECT hex('AB');                    -- '4142'   (byte dump; an integer argument uses to_hex)
 SELECT to_hex(255);                  -- 'FF'     (negatives use the two's-complement pattern)
+```
+
+`hex`/`to_hex` render an integer at **its own declared width**, not
+truncated to 64 bits: a `HUGEINT` prints 128 bits, and a `UBIGINT` above
+`i64::MAX` prints its true value rather than a sign-extended one.
+
+```sql
+SELECT to_hex(-1::HUGEINT);                 -- 'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF' (32 nibbles)
+SELECT hex(18446744073709551615::UBIGINT);  -- 'FFFFFFFFFFFFFFFF'
 ```
 
 `concat` is special-cased: unlike most functions, it never returns `NULL`
@@ -187,8 +196,29 @@ untrusted). As a result, it does **not** support: lookaround
 (`(?=...)`/`(?!...)`), backreferences inside the pattern itself
 (`\1` in the *pattern*, as opposed to the *replacement* — see below),
 named capture groups, non-greedy quantifiers (`*?`, `+?`), `\b`/`\B` word
-boundaries, or a case-insensitive flag. `regexp_replace`'s replacement
+boundaries, or a case-insensitive flag — neither the inline `(?i)` form nor
+the `'i'` flag argument is accepted. `regexp_replace`'s replacement
 string does support `\1`/`\2`-style backreferences to captured groups.
+
+**Matching is per UTF-8 character, not per byte.** `.`, a character class,
+and a quantifier each consume one whole Unicode scalar value, so
+`regexp_replace('日本語abc', '.', 'X', 'g')` is `'XXXXXX'` (six characters
+replaced, not twelve bytes), `regexp_matches('日本', '^..$')` is true, and
+no regex operation can produce invalid UTF-8 by cutting a character in
+half.
+
+**POSIX bracket expressions are supported, and match ASCII only:**
+
+```sql
+SELECT regexp_extract('abc123', '[[:alpha:]]+');   -- 'abc'
+SELECT regexp_extract('abc123', '[[:digit:]]+');   -- '123'
+SELECT regexp_extract('ｱあ漢', '[[:alpha:]]+');     -- ''  (no ASCII letters)
+```
+
+`[[:alpha:]]`, `[[:digit:]]`, `[[:alnum:]]`, `[[:space:]]`, `[[:upper:]]`,
+`[[:lower:]]`, `[[:punct:]]` and friends are ASCII-restricted for the same
+reason `upper`/`lower` are: the Unicode tables cost more than the size
+budget allows (see [limitations.md](limitations.md#not-supported-at-all)).
 
 ## printf / format
 
@@ -213,3 +243,31 @@ mismatches (e.g. `%d` accepts a `FLOAT` argument) rather than erroring.
 `format` supports `{}`/`{n}` placeholders and `{{`/`}}` literal-brace
 escapes, but not a format mini-language (`{:.2f}` is not supported — cast
 or round the value yourself first).
+
+**`%s` and `{}` render every type exactly as `CAST(... AS VARCHAR)` does**,
+including the ones with no plain numeric spelling — `DATE`, `TIME`,
+`TIMESTAMP`, `DECIMAL`, `HUGEINT`, `INTERVAL`, and `UUID` all print their
+text form rather than the physical value underneath:
+
+```sql
+SELECT printf('%s', DATE '2020-01-02');                  -- '2020-01-02'
+SELECT printf('%s', TIMESTAMP '2020-01-02 03:04:05');    -- '2020-01-02 03:04:05'
+SELECT printf('%s', CAST('1.25' AS DECIMAL(5,2)));       -- '1.25'
+SELECT printf('%s', 170141183460469231731687303715884105727::HUGEINT);
+-- '170141183460469231731687303715884105727'
+SELECT format('{}', INTERVAL '2 months');                -- '2 months'
+```
+
+`%d` and `%f`, by contrast, **reject an `INTERVAL` argument** with a
+`TypeMismatch` — there is no meaningful single number to print for a value
+that carries separate month, day, and microsecond components.
+
+`%f` output is **correctly rounded, half-to-even**, computed from an exact
+decimal expansion of the `DOUBLE` rather than by multiplying in floating
+point (`printf('%.2f', 0.125)` is `'0.12'`, `printf('%.2f', 0.135)` is
+`'0.14'`). The precision in `%.<N>f` is **clamped at 32**, so
+`printf('%.40f', 1.0)` yields 32 digits after the point, not 40. With no
+precision given, `%f` prints the value's full exact expansion the way C's
+`printf` does — see
+[limitations.md](limitations.md#partially-supported) for how that differs
+from DuckDB on very large magnitudes and on `-0.0`.

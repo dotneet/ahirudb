@@ -46,11 +46,6 @@ user-visible effect.
 
 ## Partially supported
 
-- **`LIKE`/`ILIKE ... ESCAPE '<char>'`** parses but a custom escape
-  character is not actually implemented (the query fails with
-  `UnsupportedFeature` at prepare time) — use `LIKE`/`ILIKE` without an
-  `ESCAPE` clause, or use `GLOB`/`SIMILAR TO`/`regexp_matches` instead if
-  you need to match a literal `%`/`_`.
 - **Window function frames** are always the standard default (`RANGE
   UNBOUNDED PRECEDING` through the current row if the window has an `ORDER
   BY`, the whole partition if it doesn't), chosen automatically — there is
@@ -96,7 +91,11 @@ user-visible effect.
   to avoid backtracking blowups on adversarial input) does not support
   lookaround, backreferences *inside a pattern*, named capture groups,
   non-greedy quantifiers, `\b`/`\B` word boundaries, or a case-insensitive
-  flag.
+  flag (neither `(?i)` nor the `'i'` flag argument). Matching itself is
+  per UTF-8 character — `.`, character classes, and quantifiers each
+  consume one whole scalar value — and POSIX bracket expressions
+  (`[[:alpha:]]`, `[[:digit:]]`, ...) are supported but match ASCII only.
+  See [functions-string.md](functions-string.md#regular-expressions).
 - **`quantile`/`percentile_cont`** are the *continuous* (interpolated)
   quantile in all spellings. DuckDB's `quantile` is the discrete version,
   and its `quantile_disc` isn't implemented. A list-valued fraction
@@ -149,9 +148,69 @@ user-visible effect.
   it parses `3! ^ 2` fine (`36.0`) but rejects `2 ^ 3!` as a syntax error,
   and silently reads `2 + 3!` as `(2+3)!` = `120` while rejecting
   `3! + 1` outright. We chose the conventional, self-consistent reading
-  on purpose instead: `!` binds looser than the prefix operators (so
-  `-x!` is `(-x)!` for any `x`, matching DuckDB) but tighter than every
-  binary operator. See [functions-numeric.md](functions-numeric.md#factorial).
+  on purpose instead: `!` binds tighter than every binary operator, and
+  tighter than the prefix operators `~` and `@`. Unary `-` still binds
+  tighter than `!` (so `-x!` is `(-x)!` for any `x`, matching DuckDB), but
+  `~` and `@` do not:
+
+  ```sql
+  SELECT ~5!;        -- -121 here (~(5!) = ~120); DuckDB gives 1 ((~5)! = (-6)! = 1)
+  SELECT @(-5)!;     -- 1 here (@((-5)!) = @1); DuckDB gives 120 ((@(-5))! = 5!)
+  SELECT @5!;        -- 120 in both, but by different groupings
+  ```
+
+  This is a deliberate divergence. DuckDB's ladder puts `~`/`@` above `!`,
+  which is what makes `~5!` collapse to `1`; ours puts every prefix
+  operator except `-` below the postfix, which keeps `!` reading as an
+  ordinary suffix on its operand. See
+  [functions-numeric.md](functions-numeric.md#factorial).
+- **Unsigned integer arithmetic wraps within its declared unsigned
+  width** rather than raising. `SELECT 0::UTINYINT - 1` is `-1` here and
+  `SELECT 0::UBIGINT - 1` is `18446744073709551615`; DuckDB raises an
+  out-of-range error for both. This follows the same rule as signed
+  overflow (see [Rounding conventions](#rounding-conventions-to-be-aware-of)
+  below): arithmetic wraps, it doesn't error. The result stays inside the
+  declared width — it can no longer leak a negative value out of a
+  narrower unsigned column, which it used to.
+- **`length`/`len` on a list measures its JSON text, not its elements.**
+  `SELECT length([1,2,3])` is `7` (the length of `[1,2,3]`), because lists
+  and JSON documents are one logical type here (see
+  [JSON is also the list type](#json-is-also-the-list-type) below) and
+  `length` is the string function. Use **`array_length`/`list_length`**,
+  which return the element count (`3`).
+- **`UPDATE`/`DELETE` do not accept a table alias or a subquery in
+  `WHERE`.** `UPDATE t AS x SET ...` and `DELETE FROM t AS x` are syntax
+  errors; `UPDATE t SET ... WHERE a IN (SELECT ...)` fails with
+  `unsupported SQL feature`. Table-*qualified* columns do work
+  (`UPDATE t SET b = 1 WHERE t.a = 1`) — it is only the alias binding and
+  the correlated/uncorrelated subquery that are missing.
+- **Text parts whose sniffed schemas disagree widen to `VARCHAR`; Parquet
+  parts stay strict.** Registering `a.csv` (whose column `a` sniffs as
+  `BIGINT`) together with `b.csv` (whose `a` sniffs as `VARCHAR`) gives one
+  `VARCHAR` column rather than an error, because a sniffed type is a guess
+  about the file, not a declaration by it. Two Parquet parts whose column
+  `a` really is declared as different physical types still fail with
+  `TypeMismatch` — there the schema is authoritative, and a silent widening
+  would be hiding a mistake rather than tolerating one. See
+  [data-sources.md](data-sources.md#text-format-type-inference).
+- **A value outside the inference sample that doesn't fit the inferred type
+  is an error, not a `NULL`.** If a CSV column sniffs as an integer from
+  its first 256 KiB and row 60,001 holds `notanumber`, the query fails with
+  `invalid cast`. DuckDB re-sniffs and widens the column instead, so the
+  same file counts fine there. Erroring is the deliberate choice: silently
+  nulling the row destroyed data, and this engine would rather fail loudly.
+  Cast the column explicitly (`CAST(... AS VARCHAR)` at the source, or a
+  Parquet conversion) if the input really is mixed.
+- **`VALUES` is only a source for `INSERT`.** `INSERT INTO t VALUES (...)`
+  works; `(VALUES (1,2)) AS x(a,b)` in a `FROM` clause, and a top-level
+  `VALUES` statement, are both syntax errors. Use a real table, a
+  `range(n)`-anchored `SELECT`, or a `UNION ALL` chain instead.
+- **`printf('%f', ...)` prints the value's full exact binary expansion**,
+  as C's `printf` does. `printf('%f', 1e300)` therefore prints all 301
+  integer digits of the `DOUBLE` nearest `1e300`, where DuckDB prints the
+  shortest round-trip digits and pads the rest with zeros. Both are
+  "correct"; neither is the other. Relatedly, `printf('%f', -0.0)` is
+  `-0.000000` here (C's rendering) and `0.000000` in DuckDB.
 
 ## JSON is also the list type
 
@@ -282,6 +341,12 @@ that scenario — the session itself doesn't survive it either.
   CLI, `register` of a buffer) scan the whole file at resolve time, so a
   late quote still forces a single split and is read correctly. Files that
   quote consistently from early on, or don't quote at all, are unaffected.
+
+  **A CR-only (classic Mac) CSV/TSV file is read as a single split for the
+  same reason**, and with the same memory consequence. Split-boundary
+  resynchronization scans for `\n`, which such a file never contains, so
+  there is no boundary to resynchronize on; the file is read whole instead
+  of guessing. CRLF files, and a `\r` inside a quoted field, are unaffected.
 - **Low-selectivity `IN`-list pruning**: predicate pushdown for `WHERE x IN
   (...)` skips whole RowGroups/pages when the candidate values cluster
   together. If a list's values are scattered widely enough that nearly
@@ -301,3 +366,24 @@ scale reduction rounds away from zero, integer arithmetic overflow wraps
 rather than erroring (except `SUM` and `factorial`/`!`, see
 [functions-numeric.md](functions-numeric.md#factorial)), and division by
 zero returns `NULL` rather than raising an error.
+
+The one deliberate divergence is **float summation**. `SUM`/`AVG` over
+`DOUBLE` use Neumaier compensated summation, so they recover the low-order
+bits a plain running accumulator drops (`sum([1e100, 1.0, -1e100])` is
+`1.0` here and `0.0` in DuckDB). The cost is that the compensated result is
+the correctly rounded value of the *exact* sum — with ties going to even
+when the exact sum lands exactly between two doubles, as it does for
+`n = 3` and `n = 6` below — while DuckDB's accumulated error happens to
+land on the neighboring double, which prints as the shorter literal:
+
+```sql
+SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(3));  -- 0.30000000000000004 here, 0.3 in DuckDB
+SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(6));  -- 0.6000000000000001  here, 0.6 in DuckDB
+SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(7));  -- 0.7000000000000001  here, 0.7 in DuckDB
+```
+
+Both engines are within a ulp of the true sum; neither is wrong. What
+matters here is that the value is now the same whichever path computes it:
+the blocking aggregate and the window form (`sum(x) OVER ()`) use the same
+compensated accumulator and agree on every case above, so a query's answer
+does not change when a `GROUP BY` is rewritten as a window.

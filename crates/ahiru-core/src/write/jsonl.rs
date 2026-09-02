@@ -252,7 +252,7 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 /// shortest-round-trip digit generation itself (`normalize_and_correct` /
 /// `shortest_digits` / `nearest_at_length` / `cmp_midpoint` / `Big`, and the
 /// fixed-vs-exponential rendering) is shared with the CSV writer -- see
-/// `write/float.rs`'s module doc for why that lives in one place instead of
+/// `expr/float.rs`'s module doc for why that lives in one place instead of
 /// being duplicated per format.
 ///
 /// The only thing that differs between the two writers is how non-finite
@@ -478,7 +478,7 @@ mod tests {
         // `duckdb`'s unquoted tokens here). Everything else -- shortest
         // round-trip digit generation, exact-tie regression cases, and the
         // std-Display property test -- is covered once, for both writers, in
-        // `write/float.rs`'s own test module.
+        // `expr/float.rs`'s own test module.
         let mut out = Vec::new();
         push_f64(&mut out, f64::NAN);
         assert_eq!(out, br#""NaN""#);

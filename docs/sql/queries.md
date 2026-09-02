@@ -43,6 +43,19 @@ real table needs an anchor. `range(1)`/`generate_series(1)` work for this
 SELECT 1 + 1 FROM range(1);
 ```
 
+**Any keyword works as an output alias after an explicit `AS`** — no
+quoting needed:
+
+```sql
+SELECT x AS select, y AS table, z AS order FROM t;
+```
+
+Without the `AS`, an alias still has to be a non-keyword identifier
+(`SELECT 1 select` is a syntax error, as in DuckDB). The one place the
+`AS` form is still ambiguous is a `FROM`-less `SELECT` in the CLI, where
+`SELECT 1 AS from` reads `from` as the start of a `FROM` clause; write the
+alias quoted (`AS "from"`) there.
+
 ## WHERE, operators, and predicates
 
 Standard comparison/boolean/arithmetic operators, plus:
@@ -99,8 +112,9 @@ SELECT 3 IS TRUE, NULL IS TRUE, NULL IS NOT TRUE;   -- true, false, true
 -- IS [NOT] DISTINCT FROM: NULL-safe equality/inequality (never UNKNOWN,
 -- always TRUE/FALSE -- NULL is treated as equal to NULL and unequal to
 -- anything else)
-SELECT a, b FROM (VALUES (1,1), (1,2), (1,NULL), (NULL,NULL)) x(a,b)
-  WHERE a IS DISTINCT FROM b;
+-- (`VALUES` is only an INSERT source here, not a table -- see
+-- limitations.md; use a real table for a scratch example.)
+SELECT a, b FROM t WHERE a IS DISTINCT FROM b;
 
 -- :: cast shorthand for CAST(... AS ...). Binds tighter than unary
 -- operators: -1::VARCHAR is -(1::VARCHAR), i.e. '-1', not (-1)::VARCHAR
@@ -182,6 +196,20 @@ WITH regional_totals AS (
 )
 SELECT * FROM regional_totals WHERE total > 100;
 ```
+
+A CTE can be referenced any number of times, including in a self-join:
+
+```sql
+WITH regional_totals AS (
+  SELECT region, sum(amount) AS total FROM orders GROUP BY region
+)
+SELECT a.region, b.total FROM regional_totals a
+  JOIN regional_totals b ON a.region = b.region ORDER BY 1;
+```
+
+The body is **recomputed per reference** — a CTE is a named subquery, not a
+materialized temporary table, so referencing an expensive CTE twice costs
+twice.
 
 Recursive CTEs (`WITH RECURSIVE`) work through a non-recursive "anchor"
 member `UNION ALL`'d (or `UNION`'d, for dedup-until-fixed-point) with a
@@ -286,6 +314,29 @@ SELECT flag, id % 3 AS m, count(*) c
 FROM t GROUP BY GROUPING SETS ((flag, id % 3), (flag), ())
 HAVING grouping(flag) = 0 ORDER BY 1, 2;
 ```
+
+### How a bare name resolves in GROUP BY vs ORDER BY
+
+The two clauses deliberately resolve a bare name differently, matching
+DuckDB and PostgreSQL:
+
+- **`GROUP BY` prefers an input column** over a select-list alias.
+- **`ORDER BY` prefers the select-list alias** over an input column.
+
+So in `SELECT b AS a, count(*) FROM t GROUP BY a`, the `a` in `GROUP BY`
+is the table's own column `a` — not the alias for `b` — and the query is
+rejected, because `b` then appears in the select list without being
+grouped or aggregated. `SELECT b AS a FROM t ORDER BY a` sorts by `b`,
+because there `a` is the alias.
+
+An alias that shadows nothing is unambiguous either way:
+
+```sql
+SELECT a + 100 AS a, count(*) FROM t GROUP BY a ORDER BY 1;
+-- GROUP BY a groups on the input column a; ORDER BY 1 is positional
+```
+
+When in doubt, group by the expression itself and order by position.
 
 ### GROUP BY ALL
 

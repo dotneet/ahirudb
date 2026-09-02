@@ -996,7 +996,7 @@ pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
 
 /// The decimal rendering of an f64.
 ///
-/// Finite values go through [`crate::expr::float::write_f64_finite`], the crate's one
+/// Finite values go through `expr::float::write_f64_finite`, the crate's one
 /// shortest-round-trip formatter (also used by the CSV/JSONL/Parquet writers), so
 /// `CAST(x AS VARCHAR)` is lossless: re-reading the text always reproduces the exact
 /// same `f64` bit pattern. This used to be a hand-rolled 15-significant-digit
@@ -1004,19 +1004,28 @@ pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
 /// different double) nor even correct for integral values inside `f64`'s exact range
 /// (`9007199254740993.0` printed as `9007199254740990`).
 ///
-/// Non-finite values keep this engine's own spellings (`NaN` / `Inf` / `-Inf`) rather
-/// than the writers' format-specific ones; `parse_special_f64` reads all of them back.
-pub(crate) fn fmt_f64(x: f64, out: &mut Vec<u8>) {
+/// Non-finite values are spelled `nan` / `inf` / `-inf`, matching DuckDB
+/// (`duckdb -csv -c "SELECT 'inf'::DOUBLE"` prints `inf`). They are deliberately *not*
+/// the writers' spellings: CSV writes `NaN` / `Infinity` / `-Infinity` and JSONL writes
+/// those as quoted JSON strings, because each of those formats has its own reader to
+/// satisfy. `parse_special_f64` is case-insensitive and accepts every one of these
+/// spellings, so `CAST(CAST(x AS VARCHAR) AS DOUBLE)` round-trips whichever is used.
+///
+/// Public so a host can spell a DOUBLE exactly the way `CAST(x AS VARCHAR)` does. The
+/// CLI's cell renderer calls it for that reason: it used to use Rust's `Display`, which
+/// disagrees with the cast on large and small magnitudes (`1e30` printed as
+/// `1000000000000000000000000000000` in a result table but `1e+30` after a cast).
+pub fn fmt_f64(x: f64, out: &mut Vec<u8>) {
     if x.is_nan() {
-        out.extend_from_slice(b"NaN");
+        out.extend_from_slice(b"nan");
         return;
     }
     if x == f64::INFINITY {
-        out.extend_from_slice(b"Inf");
+        out.extend_from_slice(b"inf");
         return;
     }
     if x == f64::NEG_INFINITY {
-        out.extend_from_slice(b"-Inf");
+        out.extend_from_slice(b"-inf");
         return;
     }
     crate::expr::float::write_f64_finite(out, x);
@@ -1716,9 +1725,10 @@ mod tests {
         assert_eq!(f(100.0), "100.0");
         assert_eq!(f(0.5), "0.5");
         assert_eq!(f(0.001), "0.001");
-        assert_eq!(f(f64::INFINITY), "Inf");
-        assert_eq!(f(f64::NEG_INFINITY), "-Inf");
-        assert_eq!(f(f64::NAN), "NaN");
+        // DuckDB's spellings, which the CSV/JSONL writers deliberately do not share.
+        assert_eq!(f(f64::INFINITY), "inf");
+        assert_eq!(f(f64::NEG_INFINITY), "-inf");
+        assert_eq!(f(f64::NAN), "nan");
         assert_eq!(f(1e20), "1e+20");
         assert_eq!(f(1.5e-8), "1.5e-08");
         // The whole point: these were "9007199254740990" and "0.3" before.

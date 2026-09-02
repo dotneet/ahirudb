@@ -33,6 +33,9 @@
 //!
 //! There is no overflow handling. Once accumulation exceeds `MAX_BUFFER_BYTES` it returns `Oom`.
 
+// Shared with the blocking aggregate path so window SUM/AVG over DOUBLE cannot
+// drift from the grouped ones; see `Acc::comp`.
+use crate::exec::agg::{compensated, neumaier_add};
 use crate::exec::rowkey::{encode_key, ord_f64, pow10, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
 use crate::plan::{AggKind, SortKey, WindowKind, WindowSpec};
@@ -532,11 +535,24 @@ struct Acc {
     n: i64,
     /// The accumulated value. `Value::Null` means "no non-NULL input yet".
     acc: Value,
+    /// The Neumaier compensation term for SUM/AVG over DOUBLE, mirroring
+    /// `exec::agg::State::comp`. Without it `sum(x) OVER ()` over ten rows of
+    /// `0.1` lands on 0.9999999999999999 while the blocking `sum(x)` over the
+    /// same rows returns 1.0 -- the same query, two answers.
+    ///
+    /// Compensated summation is not exactly reversible, so this would be wrong
+    /// for a frame that has to *remove* values as it advances. It is sound here
+    /// because this accumulator is strictly additive: as the comment on the
+    /// `WindowKind::Agg` arm above records, a frame only ever extends forward
+    /// (one peer group at a time), which is also why MEDIAN/MODE have no window
+    /// version at all. `value()` folds the term in without consuming it, so the
+    /// running state stays intact for the next peer group.
+    comp: f64,
 }
 
 impl Acc {
     fn new() -> Self {
-        Acc { n: 0, acc: Value::Null }
+        Acc { n: 0, acc: Value::Null, comp: 0.0 }
     }
 
     fn add(&mut self, kind: AggKind, col: Option<&Vector>, row: usize) -> Result<()> {
@@ -562,11 +578,12 @@ impl Acc {
                 Data::I64(v) => self.add_int(v[row] as i128)?,
                 Data::I128(v) => self.add_int(v[row])?,
                 Data::F64(v) => {
-                    let s = match &self.acc {
-                        Value::F64(s) => s + v[row],
-                        _ => v[row],
+                    let (s, comp) = match &self.acc {
+                        Value::F64(s) => neumaier_add(*s, self.comp, v[row]),
+                        _ => (v[row], 0.0),
                     };
                     self.acc = Value::F64(s);
+                    self.comp = comp;
                 }
                 _ => err!(TypeMismatch),
             },
@@ -657,8 +674,13 @@ impl Acc {
         match kind {
             AggKind::CountStar | AggKind::Count => Value::I64(self.n),
             // A frame with not a single non-NULL input is NULL.
-            AggKind::Sum
-            | AggKind::Min
+            // SUM over DOUBLE folds the compensation term back in here, exactly
+            // once per emitted value, without clearing it.
+            AggKind::Sum => match &self.acc {
+                Value::F64(s) => Value::F64(compensated(*s, self.comp)),
+                v => v.clone(),
+            },
+            AggKind::Min
             | AggKind::Max
             | AggKind::AnyValue
             | AggKind::Last
@@ -673,7 +695,9 @@ impl Acc {
             AggKind::Avg => match &self.acc {
                 // Integers are summed exactly in i128 and divided exactly once.
                 Value::I128(s) if self.n > 0 => Value::F64(*s as f64 / div / self.n as f64),
-                Value::F64(s) if self.n > 0 => Value::F64(s / self.n as f64),
+                Value::F64(s) if self.n > 0 => {
+                    Value::F64(compensated(*s, self.comp) / self.n as f64)
+                }
                 _ => Value::Null,
             },
             // Aggregates with no window version never reach here (rejected before `add`).

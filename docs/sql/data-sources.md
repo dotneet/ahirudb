@@ -21,7 +21,60 @@ default wasm build to protect the size budget — see
 build enable them.
 
 Format is normally inferred from the file name's extension; an unrecognized
-extension defaults to Parquet.
+extension defaults to Parquet. A **local** file name that contains `#` or
+`?` is detected by its extension like any other — the URL query/fragment
+strip that would otherwise cut `data.csv?v=2` down to `data.csv` only
+applies to actual URLs, so a file genuinely named `report#final.csv` reads
+as CSV rather than as Parquet.
+
+## Referring to a file from SQL
+
+A quoted path in SQL auto-registers the file it names, but **only in table
+position** — directly after `FROM` or `JOIN`, or as the first argument of a
+reader function (`read_csv`, `read_json`, `parquet`, ...):
+
+```sql
+SELECT count(*) FROM 'data/events.csv';          -- registers and reads the file
+SELECT count(*) FROM read_csv('data/events.csv');-- same
+SELECT '/etc/passwd';                            -- just a string: '/etc/passwd'
+SELECT length('./foo.csv');                      -- just a string: 9
+```
+
+A string literal anywhere else stays a string. This is what keeps an
+ordinary `'/'` or `'.'` in a comparison or a `split_part` call from walking
+the filesystem.
+
+Paths in table position are glob patterns. A backslash escapes a glob
+metacharacter, so the literal file `star*.csv` is nameable:
+
+```sql
+SELECT * FROM 'star\*.csv';   -- exactly the file called star*.csv
+SELECT * FROM 'star*.csv';    -- every file matching star*.csv
+```
+
+## Text-format type inference
+
+CSV/TSV column types are sniffed from a leading sample of the file (up to
+256 KiB), JSON/JSONL types from the values actually seen. What the sniffer
+does with an ambiguous or mixed column:
+
+| Input | Inferred | Why |
+|---|---|---|
+| `007`, `042` | `VARCHAR` | A leading zero is significant — reading these as `7`/`42` would destroy the padding |
+| `true`, `1` | `VARCHAR` | `BOOLEAN` mixed with a number widens rather than picking one |
+| `2020-01-02 03:04:05`, `2020-01-03` | `TIMESTAMP` | A bare date in a `TIMESTAMP` column reads as midnight (`2020-01-03 00:00:00`) |
+| NDJSON lines that aren't objects (`1`, `"two"`) | one `VARCHAR` column named `json` | There are no object keys to make columns out of; the raw line is the value |
+
+A value **outside** the sample that doesn't fit the inferred type raises a
+conversion error rather than becoming `NULL` — see
+[limitations.md](limitations.md#partially-supported), where the divergence
+from DuckDB (which re-sniffs and widens) is spelled out.
+
+When several **text** parts are registered as one multi-part table and
+their sniffed schemas disagree, the column widens to `VARCHAR`. Parquet
+parts stay strict: a declared type mismatch between two Parquet parts is a
+`TypeMismatch` error, since a Parquet schema is a declaration rather than a
+guess.
 
 ### JSON / JSONL shapes
 
@@ -84,6 +137,14 @@ on top of whatever the file itself contains:
 SELECT count(*) FROM t;                                  -- all partitions, 1000 rows
 SELECT count(*) FROM t WHERE year = 2024 AND month = 1;   -- 300 rows, one partition pruned in
 ```
+
+A partition key's **type is decided once for the whole table**, not per
+partition: `k=1`/`k=2` gives an `INTEGER` virtual column, and `k=1`/`k=abc`
+gives `VARCHAR`, because the partitions disagree and the union has to
+widen. A zero-padded value stays `VARCHAR` (`k=007`/`k=42` is a `VARCHAR`
+column holding `007` and `42`), the same rule the CSV sniffer uses — so
+`007` keeps its padding rather than being flattened to `7`. Typing the key
+once means a predicate on it compares the same way in every partition.
 
 Registering a glob pattern or a directory of partitions is a host-side (JS
 API / CLI-glue) concern — the engine core itself has no filesystem access

@@ -39,8 +39,8 @@ SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 
 | Function | Notes |
 |---|---|
-| `abs(x)` / `@x` (prefix) | Integer overflow case (`abs(i64::MIN)`) returns `NULL` rather than overflowing |
-| `sign(x)` | Returns -1/0/1; on floats, preserves signed-zero/NaN pass-through |
+| `abs(x)` / `@x` (prefix) | Integer overflow case (`abs(i64::MIN)`) returns `NULL` rather than overflowing. Never returns a negative zero: `1 / abs(-0.0)` is positive infinity, not negative |
+| `sign(x)` | Returns -1/0/1; `NaN` passes through. Never returns a negative zero — `sign(-0.0)` is `+0.0` (DuckDB returns integer `0`) |
 | `ceil(x)` / `ceiling(x)`, `floor(x)`, `trunc(x)` | No-op (identity) on integer input; real work only happens on float input |
 | `round(x[, d])` | `d` > 0 rounds to `d` decimal places (half-away-from-zero); `d` < 0 rounds to a power of ten; `d` on an integer input with `d ≥ 0` is a no-op |
 | `mod(a, b)` | Integer: `b = 0` or `MIN_VALUE % -1` returns `NULL` (no error/panic). Float: plain `%` |
@@ -60,10 +60,25 @@ SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 | `xor(a, b)` | Bitwise XOR (the function spelling; DuckDB's `#` operator is not implemented) |
 | `isnan(x)`, `isinf(x)`, `isfinite(x)` | Float predicates; `NULL` in, `NULL` out |
 
-All math kernels (`sqrt`, `ln`, `exp`, ...) are hand-rolled (Newton's
-method / series expansions) rather than delegating to a system math
-library, since the engine is `no_std` and has no libm available in the
-wasm build.
+All math kernels (`sqrt`, `ln`, `exp`, ...) are hand-rolled rather than
+delegating to a system math library, since the engine is `no_std` and has
+no libm available in the wasm build. Their accuracy varies by function, and
+it's worth knowing which is which:
+
+- **`sqrt` and `cbrt` are correctly rounded** — the result is always the
+  representable `DOUBLE` nearest the true value. (`cbrt` no longer routes
+  through `exp(ln(x)/3)`, which was the old source of error; measured
+  against exact arithmetic it is now more accurate than DuckDB's own
+  `cbrt`, which is off by 1 ulp on a small share of inputs.)
+- **`exp` and `ln` are within 1 ulp**, correctly rounded on the large
+  majority of inputs and one ulp out on a small remainder (roughly 2% of a
+  log-uniform sample over `1e-8`–`1e8`).
+- **`log10`, `log2`, and `log(base, x)` are the loose ones** — up to 2 ulp,
+  and not correctly rounded on a substantial fraction of inputs, because
+  they are derived from `ln` with a second rounding step rather than
+  computed directly. `SELECT log(1000)` returning `2.9999999999999996`
+  instead of `3` is this, not a bug. Round the result if you are going to
+  compare it for equality.
 
 ## NULL-aware / multi-value helpers
 
@@ -134,21 +149,25 @@ overflow gets (see [types.md](types.md#rounding-and-floating-point-conventions))
 Only integer input is accepted — a `DOUBLE` argument (`4.5!`,
 `factorial(4.0)`) is a type error, matching DuckDB.
 
-**Precedence:** `!` binds looser than the prefix operators (`-`, `~`,
-`NOT`) but tighter than every binary operator. The first part is what
-makes `-4!` mean `(-4)!` = `1`, not `-(4!)` = `-24` — this holds for any
-operand, not just literals (`-x!` for a column `x` behaves the same way).
-The second part means a `!` always applies to just its immediately
-preceding operand: `2 + 3!` is `2 + (3!)` = `8`, and `x!::VARCHAR` casts
-the factorial result (`CAST(x! AS VARCHAR)`), not `x` before it's
-factorialized.
+**Precedence:** `!` binds looser than unary `-` and `NOT`, tighter than the
+prefix operators `~` and `@`, and tighter than every binary operator.
+
+Unary minus first: `-4!` means `(-4)!` = `1`, not `-(4!)` = `-24` — and
+this holds for any operand, not just literals (`-x!` for a column `x`
+behaves the same way). Prefix `~`/`@` go the other way, applying to the
+factorial's *result*: `~5!` is `~(5!)` = `-121`, and `@(-5)!` is
+`@((-5)!)` = `1`, not `(@(-5))!` = `120`. Binary operators are looser still,
+so a `!` always applies to just its immediately preceding operand:
+`2 + 3!` is `2 + (3!)` = `8`, and `x!::VARCHAR` casts the factorial result
+(`CAST(x! AS VARCHAR)`), not `x` before it's factorialized.
 
 This is a deliberate divergence from DuckDB for expressions mixing `!`
-with binary operators. DuckDB's own grammar for postfix `!` is internally
-inconsistent Postgres legacy — `3! ^ 2` parses (`36.0`) but `2 ^ 3!` is a
-syntax error there, and `2 + 3!` silently reads as `(2+3)!` = `120` while
-`3! + 1` is rejected outright — so there's no single coherent rule to
-match. See [limitations.md](limitations.md#partially-supported) for the
+with binary operators and with prefix `~`/`@` (DuckDB binds both of those
+tighter than `!`, so `~5!` there is `(~5)!` = `1`). DuckDB's own grammar for
+postfix `!` is internally inconsistent Postgres legacy — `3! ^ 2` parses
+(`36.0`) but `2 ^ 3!` is a syntax error there, and `2 + 3!` silently reads
+as `(2+3)!` = `120` while `3! + 1` is rejected outright — so there's no
+single coherent rule to match. See [limitations.md](limitations.md#partially-supported) for the
 full comparison table.
 
 Note that `!` is *not* a general prefix logical-NOT operator in ahirudb

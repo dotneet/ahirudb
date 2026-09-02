@@ -1052,7 +1052,11 @@ mod tests {
         ])
         .unwrap();
         w.finish().unwrap();
-        assert_eq!(as_str(&buf), "INSERT INTO t VALUES ('NaN', 'inf', '-inf', 1.5);\n");
+        // The renderer now shares the engine's own float formatter
+        // (`expr::kernels::fmt_f64`), so a rendered DOUBLE is spelled exactly as
+        // `CAST(x AS VARCHAR)` spells it -- and both are DuckDB's `nan`/`inf`/`-inf`.
+        // `parse_special_f64` is case-insensitive, so the quoted form still replays.
+        assert_eq!(as_str(&buf), "INSERT INTO t VALUES ('nan', 'inf', '-inf', 1.5);\n");
     }
 
     #[test]
