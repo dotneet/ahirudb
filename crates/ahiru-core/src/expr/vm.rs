@@ -28,6 +28,11 @@ impl Vm {
     /// Evaluates `p` against `batch` and returns the result vector.
     /// The returned vector's length is `batch.card()`.
     pub fn eval(&mut self, p: &Program, batch: &Batch) -> Result<Vector> {
+        // A program whose register/side-table counters saturated while it was
+        // being compiled cannot be executed: its `u16` operand fields would
+        // alias two different values onto the same slot, which is a wrong
+        // answer rather than a slow one. See `Program::overflow`.
+        ensure!(!p.overflow, LimitExceeded);
         let n = batch.card();
         while self.regs.len() < p.num_regs as usize {
             self.regs.push(Vector::new(Ty::Null));
@@ -515,13 +520,44 @@ mod tests {
     }
 
     #[test]
-    fn nan_is_unordered_but_not_equal() {
-        let a = col(Ty::Double, &[Some(Value::F64(f64::NAN))]);
-        let b = col(Ty::Double, &[Some(Value::F64(1.0))]);
-        assert!(!eval2(OpCode::Eq, PhysType::F64, a.clone(), b.clone()).bools().get(0));
-        assert!(!eval2(OpCode::Lt, PhysType::F64, a.clone(), b.clone()).bools().get(0));
-        assert!(!eval2(OpCode::Ge, PhysType::F64, a.clone(), b.clone()).bools().get(0));
-        assert!(eval2(OpCode::Ne, PhysType::F64, a, b).bools().get(0));
+    /// NaN participates in a total order (DuckDB's semantics): it is greater than
+    /// every other value, including `+inf`, and equal to itself. That is also what
+    /// `exec::rowkey` uses for join keys, grouping and `ORDER BY`, so the hash-join
+    /// and nested-loop paths of the same query cannot disagree.
+    fn nan_sorts_above_everything_and_equals_itself() {
+        let nan = col(Ty::Double, &[Some(Value::F64(f64::NAN))]);
+        let one = col(Ty::Double, &[Some(Value::F64(1.0))]);
+        let inf = col(Ty::Double, &[Some(Value::F64(f64::INFINITY))]);
+        let bit = |op, a: Vector, b: Vector| eval2(op, PhysType::F64, a, b).bools().get(0);
+
+        assert!(bit(OpCode::Eq, nan.clone(), nan.clone()));
+        assert!(!bit(OpCode::Ne, nan.clone(), nan.clone()));
+        assert!(!bit(OpCode::Eq, nan.clone(), one.clone()));
+        assert!(bit(OpCode::Ne, nan.clone(), one.clone()));
+        assert!(!bit(OpCode::Lt, nan.clone(), one.clone()));
+        assert!(bit(OpCode::Ge, nan.clone(), one.clone()));
+        assert!(bit(OpCode::Gt, nan.clone(), inf.clone()));
+        assert!(bit(OpCode::Lt, inf, nan.clone()));
+        // -0.0 and 0.0 stay equal, as IEEE says and as the row-key encoding assumes.
+        let zero = col(Ty::Double, &[Some(Value::F64(0.0))]);
+        let neg_zero = col(Ty::Double, &[Some(Value::F64(-0.0))]);
+        assert!(bit(OpCode::Eq, zero.clone(), neg_zero.clone()));
+        assert!(!bit(OpCode::Lt, neg_zero, zero));
+    }
+
+    /// A program whose counters saturated during compilation is refused rather
+    /// than run with two values aliased onto one register.
+    #[test]
+    fn an_overflowed_program_is_refused() {
+        let mut p = Program::new();
+        let r = p.alloc_reg();
+        p.push(Instr::with_aux(OpCode::LoadCol, PhysType::I32, r, 0, 0, 0));
+        p.result = r;
+        let batch = Batch::new(vec![ints(&[1, 2])]);
+        assert!(Vm::new().eval(&p, &batch).is_ok());
+
+        p.overflow = true;
+        assert_eq!(code_of(Vm::new().eval(&p, &batch)), Some(Code::LimitExceeded));
     }
 
     #[test]

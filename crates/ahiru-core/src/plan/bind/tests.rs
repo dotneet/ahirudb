@@ -302,9 +302,12 @@ fn ungrouped_column_is_rejected() {
     let g = col(&mut a, "id");
     let other = col(&mut a, "score");
     // GROUP BY id, yet score is referenced bare.
-    assert_eq!(code_of(check_grouped(&a, &scope(), other, &[g], &[], 0)), Some(Code::NotGrouped));
+    assert_eq!(
+        code_of(check_grouped(&a, &scope(), other, &[g], &[], &[], 0)),
+        Some(Code::NotGrouped)
+    );
     // The grouped column itself passes.
-    assert!(check_grouped(&a, &scope(), g, &[g], &[], 0).is_ok());
+    assert!(check_grouped(&a, &scope(), g, &[g], &[], &[], 0).is_ok());
 }
 
 #[test]
@@ -317,7 +320,7 @@ fn grouped_expression_matches_structurally() {
     let c2 = col(&mut a, "ID");
     let l2 = a.push(Expr::Literal(Value::I32(1)));
     let e = a.push(Expr::Binary { op: BinaryOp::Add, lhs: c2, rhs: l2 });
-    assert!(check_grouped(&a, &scope(), e, &[g], &[], 0).is_ok());
+    assert!(check_grouped(&a, &scope(), e, &[g], &[], &[], 0).is_ok());
 }
 
 #[test]

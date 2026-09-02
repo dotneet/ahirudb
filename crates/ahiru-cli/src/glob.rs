@@ -274,7 +274,7 @@ fn dedup_unsorted(paths: &mut Vec<PathBuf>) {
 
 /// Strips backslash-escaping from a literal (non-metacharacter) glob
 /// component so `\[literal\]` in a pattern becomes `[literal]` on disk.
-fn unescape_literal(comp: &str) -> String {
+pub fn unescape_literal(comp: &str) -> String {
     let mut out = String::with_capacity(comp.len());
     let mut chars = comp.chars();
     while let Some(c) = chars.next() {

@@ -5,21 +5,54 @@
 //! it through `Vm::eval`", it builds a small one-row batch per array element and repeatedly
 //! evaluates `body` (already compiled by `plan::compile::Compiler::lambda_call`).
 //!
-//! A parameter's type is always `Ty::Json` (the same as `list_extract`'s result). JSON `null` is
+//! A parameter's declared type is `Ty::Json` (the same as `list_extract`'s result). JSON `null` is
 //! the SQL NULL representation of a list element (that is how `json_array`/`list_value` embed a
-//! NULL argument; see the module docs at the top), so it is bound directly as SQL NULL.
+//! NULL argument; see the module docs at the top), so it is bound directly as SQL NULL, and a
+//! JSON *string* element is bound as the VARCHAR it stands for rather than as its serialized
+//! form -- see [`lambda_param_vector`].
 use super::json::write_json_scalar;
 use super::*;
 
 /// Turns one array element into a length-1 vector for a lambda parameter.
-fn lambda_param_vector(span: &[u8], kind: crate::json::Kind) -> Vector {
-    let mut v = Vector::new(Ty::Json);
+///
+/// A string element is bound as `Ty::Varchar` holding the decoded characters, not as `Ty::Json`
+/// holding the two-quotes-and-escapes serialization. Binding the serialization made the
+/// documented idiom `CAST(x AS VARCHAR)` (a no-op retype between two `Bytes` types) hand back
+/// `"a"` rather than `a`, so `length(CAST(x AS VARCHAR))` measured the quotes and
+/// `upper(CAST(x AS VARCHAR))` produced the doubly-serialized `"\"A\""` -- and there was no
+/// spelling that got at the plain element at all.
+///
+/// The declared type stays `Ty::Json` for every other kind, so numbers and nested
+/// arrays/objects keep round-tripping through their JSON text as before. Both types are
+/// physically `Bytes`, so the body's already-compiled instructions do not care which one arrives;
+/// what the logical type decides is how `write_json_scalar` re-serializes the result (a VARCHAR
+/// gets quoted and escaped, JSON text is embedded verbatim).
+fn lambda_param_vector(span: &[u8], kind: crate::json::Kind) -> Result<Vector> {
     if kind == crate::json::Kind::Null {
+        let mut v = Vector::new(Ty::Json);
         v.push_null();
-    } else {
-        v.push_value(&Value::Bytes(span.to_vec()));
+        return Ok(v);
     }
-    v
+    if kind == crate::json::Kind::Str {
+        let mut text = Vec::new();
+        crate::json::write_extracted_text(span, kind, &mut text)?;
+        let mut v = Vector::new(Ty::Varchar);
+        v.push_value(&Value::Bytes(text));
+        return Ok(v);
+    }
+    let mut v = Vector::new(Ty::Json);
+    v.push_value(&Value::Bytes(span.to_vec()));
+    Ok(v)
+}
+
+/// The same binding, for a JSON value that arrives as bare text rather than as an already-scanned
+/// element (`list_reduce`'s accumulator and its `initial` argument).
+fn bind_json_text(text: &[u8]) -> Result<Vector> {
+    match text.first() {
+        Some(&c) => lambda_param_vector(text, crate::json::kind_of(c)),
+        // Empty text is not a JSON value at all; bind it as the empty JSON it already was.
+        None => lambda_param_vector(text, crate::json::Kind::Object),
+    }
 }
 
 /// The execution body of `list_transform`/`list_filter`/`list_reduce`. Called from the `Call`
@@ -62,7 +95,7 @@ pub fn call_lambda(
         buf.push(b'[');
         let mut first = true;
         for (span, kind) in elems {
-            let param = lambda_param_vector(span, kind);
+            let param = lambda_param_vector(span, kind)?;
             let elem_batch = Batch::new(vec![param]);
             let r = vm.eval(body, &elem_batch)?;
             match func {
@@ -154,15 +187,18 @@ fn call_list_reduce(args: &[&Vector], result_ty: Ty, body: &Program) -> Result<V
             }
         };
         for (span, kind) in iter {
-            let mut acc_v = Vector::new(Ty::Json);
-            match acc.as_ref() {
-                Some(acc_text) => acc_v.push_value(&Value::Bytes(acc_text.clone())),
+            let acc_v = match acc.as_ref() {
+                Some(acc_text) => bind_json_text(acc_text)?,
                 // A NULL accumulator is still passed in so a non-strict body
                 // (`coalesce(acc, x)`) can recover. Breaking here would make
                 // `list_reduce([NULL, 1], (acc, x) -> coalesce(acc, x))` NULL.
-                None => acc_v.push_null(),
-            }
-            let x_v = lambda_param_vector(span, kind);
+                None => {
+                    let mut v = Vector::new(Ty::Json);
+                    v.push_null();
+                    v
+                }
+            };
+            let x_v = lambda_param_vector(span, kind)?;
             let batch = Batch::new(vec![acc_v, x_v]);
             let r = vm.eval(body, &batch)?;
             if !r.is_valid(0) {

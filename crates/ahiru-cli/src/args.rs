@@ -102,7 +102,7 @@ options:
   -noheader            omit the header row
   -separator SEP       column separator for csv/tsv/list modes
   -nullvalue STR       text printed for NULL (default: NULL)
-  -maxrows N           rows shown in boxed modes before eliding (0 = all)
+  -maxrows N           rows shown in duckbox mode before eliding (0 = all)
   -maxwidth N          table width in boxed modes before eliding columns
   -readonly            reject INSERT/UPDATE/DELETE/CREATE/DROP/COPY
   -timer               print query wall time

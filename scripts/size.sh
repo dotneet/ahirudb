@@ -33,8 +33,12 @@ build_one() { # $1=features, $2=output path
   cargo build "${args[@]}" >/dev/null 2>&1
   cp target/wasm32-unknown-unknown/wasm/ahiru_core.wasm "$out"
   if command -v wasm-opt >/dev/null 2>&1; then
+    # --enable-sign-ext is not optional: rustc emits i32.extend8_s/16_s, and a
+    # binaryen whose default feature set is plain MVP (Ubuntu's package, which
+    # CI installs) rejects the module outright without it. That failure used to
+    # be swallowed by the CI pipeline, leaving the size gate measuring nothing.
     wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory \
-    --enable-nontrapping-float-to-int -o "$out.opt" "$out"
+    --enable-nontrapping-float-to-int --enable-sign-ext -o "$out.opt" "$out"
     mv "$out.opt" "$out"
   fi
 }
@@ -119,7 +123,7 @@ if [ -n "$ZSTD_SRC" ]; then
   cp "$ZSTD_SRC" "$ZSTD_OUT"
   if command -v wasm-opt >/dev/null 2>&1; then
     wasm-opt -Oz --strip-debug --strip-producers --enable-bulk-memory \
-      --enable-nontrapping-float-to-int \
+      --enable-nontrapping-float-to-int --enable-sign-ext \
       -o "$ZSTD_OUT.opt" "$ZSTD_OUT" && mv "$ZSTD_OUT.opt" "$ZSTD_OUT"
   fi
   ZSIZE=$(wc -c < "$ZSTD_OUT" | tr -d ' ')

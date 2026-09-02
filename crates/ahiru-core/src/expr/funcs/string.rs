@@ -1,7 +1,6 @@
 //! Strings (Bytes output)
 use super::datetime::{date_part, strftime};
 use super::json::{json_extract_or_whole, write_json_scalar};
-use super::numeric::{pow10, round_half_up};
 use super::*;
 
 /// The number of UTF-8 code points. It merely does not count continuation bytes.
@@ -212,9 +211,20 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             }
         }
         F_TO_HEX => {
-            let v = a.int(0) as u64;
+            // The bit pattern is read at the argument's own width, not through BIGINT: casting
+            // first truncated `hex(-1::HUGEINT)` to 16 digits and turned anything above
+            // `i64::MAX` (a large UBIGINT, say) into NULL. Like DuckDB, only HUGEINT is rendered
+            // at 128 bits; every narrower integer type is widened to 64
+            // (`hex(-1::TINYINT)` is `FFFFFFFFFFFFFFFF` there too).
+            let nibbles = match a.at(0) {
+                Some((v, _)) if v.ty() == Ty::HugeInt => 32,
+                _ => 16,
+            };
+            let x = a.i128(0);
+            let mask = if nibbles == 32 { u128::MAX } else { u64::MAX as u128 };
+            let v = (x as u128) & mask;
             let mut started = false;
-            for shift in (0..16).rev() {
+            for shift in (0..nibbles).rev() {
                 let d = ((v >> (shift * 4)) & 0x0f) as u8;
                 if d != 0 || started || shift == 0 {
                     out.push(hex_digit(d));
@@ -330,8 +340,15 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
         F_REPEAT => {
             let s = a.bytes(0);
             let k = a.int(1);
+            // The output is empty whenever the input is empty or the count is not positive, and
+            // the loop below must not be entered in that case: `repeat('', 9223372036854775807)`
+            // passes the length check (the product is zero) and would then spin for effectively
+            // forever appending nothing. DuckDB returns `''` immediately.
+            if s.is_empty() || k <= 0 {
+                return Ok(true);
+            }
             ensure!(k.saturating_mul(s.len() as i64) <= MAX_STR, LimitExceeded);
-            for _ in 0..k.max(0) {
+            for _ in 0..k {
                 out.extend_from_slice(s);
             }
         }
@@ -455,9 +472,11 @@ fn string_split(s: &[u8], sep: &[u8], out: &mut Vec<u8>) {
     out.push(b']');
 }
 
-/// `printf`'s maximum precision (the `N` of `%.<N>f`). `kernels::fmt_int`'s internal buffer is only
-/// 48 bytes, so passing a scale much larger than this would index the buffer out of range (=
-/// panic). 32 leaves ample safety margin.
+/// `printf`'s maximum precision (the `N` of `%.<N>f`). A larger precision is silently clamped to
+/// this. `fmt_fixed` itself is exact at any precision, so the cap is purely a bound on how much
+/// output one specifier may produce; C's `printf` would keep going. (Known difference from
+/// DuckDB, which follows C: `printf('%.40f', 0.1)` prints 40 fractional digits there and 32
+/// here.)
 const MAX_PRINTF_PREC: u32 = 32;
 
 /// The cap on `printf`/`format`'s width specification. A limit so a malicious query cannot eat
@@ -546,8 +565,8 @@ fn printf_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
         let mut body = Vec::new();
         match conv {
             b'd' => {
-                let x = numeric_i64(v, row)?;
-                kernels::fmt_int(x.unsigned_abs() as u128, x < 0, 0, &mut body);
+                let x = numeric_i128(v, row)?;
+                kernels::fmt_int(x.unsigned_abs(), x < 0, 0, &mut body);
             }
             b'f' => {
                 let x = numeric_f64(v, row)?;
@@ -627,51 +646,140 @@ fn parse_format_index(digits: &[u8]) -> usize {
     v
 }
 
-/// `%d`. Only BOOLEAN and integer types are supported. Floating point is truncated toward zero
-/// (Rust's `f64 as i64` merely saturates out of range and does not panic).
-fn numeric_i64(v: &Vector, row: usize) -> Result<i64> {
-    Ok(match v.data() {
-        Data::Bool(b) => b.get(row) as i64,
-        Data::I32(d) => d[row] as i64,
-        Data::I64(d) => d[row],
-        Data::F64(d) => d[row] as i64,
-        Data::I128(_) | Data::Bytes(_) => err!(TypeMismatch),
+/// DECIMAL's scale, or 0 for every other type. `%d`/`%f` have to divide it out: the physical
+/// value of `1.5::DECIMAL(3,1)` is the integer 15.
+///
+/// INTERVAL is rejected outright instead: it shares I128 with HUGEINT but its physical value is
+/// three packed fields, not a number (DuckDB rejects `%d`/`%f` on an interval too). `%s`/`{}`
+/// render it properly through `write_display`.
+fn scale_of(v: &Vector) -> Result<u8> {
+    Ok(match v.ty() {
+        Ty::Decimal { scale, .. } => scale,
+        Ty::Interval => err!(TypeMismatch),
+        _ => 0,
     })
 }
 
-/// `%f`. BOOLEAN, integer types, and floating point are supported.
+/// `%d`. BOOLEAN and every integer type (HUGEINT included) are supported; DECIMAL is truncated
+/// toward zero, and so is floating point (Rust's `f64 as i128` merely saturates out of range and
+/// does not panic). The result is i128 so HUGEINT keeps its full range.
+fn numeric_i128(v: &Vector, row: usize) -> Result<i128> {
+    let s = scale_of(v)?;
+    let x = match v.data() {
+        Data::Bool(b) => b.get(row) as i128,
+        Data::I32(d) => d[row] as i128,
+        Data::I64(d) => d[row] as i128,
+        Data::I128(d) => d[row],
+        Data::F64(d) => d[row] as i128,
+        Data::Bytes(_) => err!(TypeMismatch),
+    };
+    Ok(if s > 0 { x / pow10_i128(s) } else { x })
+}
+
+/// `%f`. BOOLEAN, every integer type, DECIMAL, and floating point are supported.
 fn numeric_f64(v: &Vector, row: usize) -> Result<f64> {
-    Ok(match v.data() {
+    let s = scale_of(v)?;
+    let x = match v.data() {
         Data::Bool(b) => b.get(row) as i64 as f64,
         Data::I32(d) => d[row] as f64,
         Data::I64(d) => d[row] as f64,
+        Data::I128(d) => d[row] as f64,
         Data::F64(d) => d[row],
-        Data::I128(_) | Data::Bytes(_) => err!(TypeMismatch),
-    })
+        Data::Bytes(_) => err!(TypeMismatch),
+    };
+    // DuckDB also routes DECIMAL through a double for `%f`, so the f64 division matches it
+    // (`printf('%.2f', 1234567890123456789.5::DECIMAL(20,1))` loses the same digits there).
+    Ok(if s > 0 { x / pow10_i128(s) as f64 } else { x })
 }
 
-/// The general stringification used by `%s` (printf) and `{}` (format). The supported physical
-/// types are BOOLEAN, integers (I32/I64), floating point (F64), and byte sequences (VARCHAR/JSON
-/// are emitted as is). DATE/TIME/TIMESTAMP/DECIMAL/INTERVAL/HUGEINT (physical type I128, or
-/// DECIMAL's scale) merely emit the internal representation as a number, with no calendar or
-/// decimal-point conversion (a design decision to narrow the scope. If a calendar rendering is
-/// needed, the caller should `CAST(.. AS VARCHAR)` first).
+/// `10^k` as an integer, for DECIMAL scales (which never exceed 38).
+fn pow10_i128(k: u8) -> i128 {
+    let mut r: i128 = 1;
+    for _ in 0..k.min(38) {
+        r *= 10;
+    }
+    r
+}
+
+/// The general stringification used by `%s` (printf) and `{}` (format).
+///
+/// VARCHAR/JSON/BLOB are emitted verbatim; every other type is rendered exactly the way
+/// `CAST(x AS VARCHAR)` renders it, by running that very cast (`kernels::cast`) on the one row.
+/// Going through the cast rather than re-deriving the text here is what keeps the two spellings
+/// in step, and it is what fixes the logical types whose physical value used to leak out:
+/// `printf('%s', DATE '2024-01-01')` printed `19723`, `format('{}', TIME '10:00:00')` printed
+/// `36000000000`, and DECIMAL dropped its decimal point (`1.5::DECIMAL(3,1)` -> `15`).
+/// HUGEINT and INTERVAL, which used to be rejected outright, come along for free.
 fn write_display(v: &Vector, row: usize, out: &mut Vec<u8>) -> Result<()> {
-    match v.data() {
-        Data::Bool(b) => out.extend_from_slice(if b.get(row) { b"true" } else { b"false" }),
-        Data::I32(d) => kernels::fmt_int(d[row].unsigned_abs() as u128, d[row] < 0, 0, out),
-        Data::I64(d) => kernels::fmt_int(d[row].unsigned_abs() as u128, d[row] < 0, 0, out),
-        Data::F64(d) => kernels::fmt_f64(d[row], out),
-        Data::Bytes(b) => out.extend_from_slice(b.get(row)),
-        Data::I128(_) => err!(UnsupportedFeature),
+    ensure!(row < v.len(), Internal);
+    let ty = v.ty();
+    if matches!(ty, Ty::Varchar | Ty::Json | Ty::Blob) {
+        out.extend_from_slice(v.bytes().get(row));
+        return Ok(());
+    }
+    let text = kernels::cast(ty, Ty::Varchar, &v.gather(&[row as u32]))?;
+    if text.is_valid(0) {
+        out.extend_from_slice(text.bytes().get(0));
     }
     Ok(())
 }
 
-/// `%f`'s fixed-point notation. It multiplies by `10^prec`, turns it into an integer by rounding
-/// away from zero, and hands it to `kernels::fmt_int` (which takes care of inserting the decimal point).
-/// `prec` is already clamped to `MAX_PRINTF_PREC` by the caller (`printf_scan`), so `fmt_int`'s
-/// internal 48-byte buffer cannot overflow.
+/// One limb of the little-endian base-10^9 magnitudes `fmt_fixed` works in.
+const BIG_BASE: u64 = 1_000_000_000;
+
+/// Multiplies a base-10^9 magnitude in place by a small factor (only 2, 5 and 10 are used).
+fn big_mul_small(v: &mut Vec<u32>, m: u32) {
+    let mut carry: u64 = 0;
+    for limb in v.iter_mut() {
+        let t = *limb as u64 * m as u64 + carry;
+        *limb = (t % BIG_BASE) as u32;
+        carry = t / BIG_BASE;
+    }
+    while carry > 0 {
+        v.push((carry % BIG_BASE) as u32);
+        carry /= BIG_BASE;
+    }
+}
+
+/// Divides a base-10^9 magnitude in place by ten, returning the decimal digit dropped.
+fn big_div10(v: &mut Vec<u32>) -> u8 {
+    let mut rem: u64 = 0;
+    for limb in v.iter_mut().rev() {
+        let cur = rem * BIG_BASE + *limb as u64;
+        *limb = (cur / 10) as u32;
+        rem = cur % 10;
+    }
+    while v.len() > 1 && v[v.len() - 1] == 0 {
+        v.pop();
+    }
+    rem as u8
+}
+
+/// Adds one to a base-10^9 magnitude in place (the carry of a round-up).
+fn big_inc(v: &mut Vec<u32>) {
+    for limb in v.iter_mut() {
+        *limb += 1;
+        if (*limb as u64) < BIG_BASE {
+            return;
+        }
+        *limb = 0;
+    }
+    v.push(1);
+}
+
+/// `%f`'s fixed-point notation, correctly rounded.
+///
+/// The value is expanded exactly: an f64 is `mant * 2^e2` with `mant` a 53-bit integer, so
+/// `|x| * 10^prec` is `mant * 2^e2 * 10^prec`, which is a whole number once the negative powers
+/// of two are turned into powers of five (`2^-k = 5^k / 10^k`). Only when `prec` is smaller than
+/// `k` does anything have to be discarded, and that single rounding is round-half-to-even on the
+/// true binary value -- the rule C's `printf` follows.
+///
+/// The previous implementation formed `|x| * 10^prec` in f64 and printed the resulting integer,
+/// which reported whatever noise that product carried: `printf('%f', 1e20)` came out as
+/// `100000000000000004764.729344`, `printf('%.0f', 2.5)` as `3` (rounding halves away from zero
+/// rather than to even), and `printf('%.20f', 0.1)` as an f64-shaped `0.10000000000000000000`
+/// instead of the true `0.10000000000000000555`.
 fn fmt_fixed(x: f64, prec: u8, out: &mut Vec<u8>) {
     if x.is_nan() {
         out.extend_from_slice(b"nan");
@@ -686,17 +794,92 @@ fn fmt_fixed(x: f64, prec: u8, out: &mut Vec<u8>) {
         out.extend_from_slice(b"inf");
         return;
     }
-    let scaled = round_half_up(ax * pow10(prec as u32));
-    // A value too large to fit u128 gives up and falls back to a simple rendering
-    // (being within u128's range is confirmed before handing it to `fmt_int`).
-    if scaled >= 1.0e33 {
-        if neg {
-            out.push(b'-');
-        }
-        kernels::fmt_f64(ax, out);
-        return;
+    let bits = ax.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & 0x000f_ffff_ffff_ffff;
+    // Subnormals have no implicit leading one and a fixed exponent.
+    let (mant, e2) = if biased == 0 { (frac, -1074) } else { (frac | (1u64 << 52), biased - 1075) };
+    let mut v = vec![(mant % BIG_BASE) as u32, (mant / BIG_BASE) as u32];
+    while v.len() > 1 && v[v.len() - 1] == 0 {
+        v.pop();
     }
-    kernels::fmt_int(scaled as u128, neg, prec, out);
+    let p = prec as i32;
+    if e2 >= 0 {
+        // A whole number already; scaling by 10^prec only appends zeros.
+        for _ in 0..e2 {
+            big_mul_small(&mut v, 2);
+        }
+        for _ in 0..p {
+            big_mul_small(&mut v, 10);
+        }
+    } else {
+        let k = -e2;
+        for _ in 0..k {
+            big_mul_small(&mut v, 5);
+        }
+        // `v` now holds |x| * 10^k exactly.
+        if p >= k {
+            for _ in 0..(p - k) {
+                big_mul_small(&mut v, 10);
+            }
+        } else {
+            // Discard k - p digits, remembering the highest one dropped (the guard) and whether
+            // anything below it was non-zero (the sticky bit), then round half to even.
+            let mut guard = 0u8;
+            let mut sticky = false;
+            for _ in 0..(k - p) {
+                sticky |= guard != 0;
+                guard = big_div10(&mut v);
+            }
+            if guard > 5 || (guard == 5 && (sticky || v[0] % 2 == 1)) {
+                big_inc(&mut v);
+            }
+        }
+    }
+    write_scaled(&v, neg, prec as usize, out);
+}
+
+/// Writes a base-10^9 magnitude as decimal with a point `prec` digits from the right.
+fn write_scaled(v: &[u32], neg: bool, prec: usize, out: &mut Vec<u8>) {
+    let mut digits: Vec<u8> = Vec::with_capacity(v.len() * 9);
+    let mut top = v[v.len() - 1];
+    let mut buf = [0u8; 9];
+    let mut n = 0usize;
+    while top > 0 {
+        buf[n] = b'0' + (top % 10) as u8;
+        top /= 10;
+        n += 1;
+    }
+    if n == 0 {
+        digits.push(b'0');
+    }
+    for i in (0..n).rev() {
+        digits.push(buf[i]);
+    }
+    for &limb in v[..v.len() - 1].iter().rev() {
+        let mut w = limb;
+        let mut b = [0u8; 9];
+        for slot in b.iter_mut().rev() {
+            *slot = b'0' + (w % 10) as u8;
+            w /= 10;
+        }
+        digits.extend_from_slice(&b);
+    }
+    if neg {
+        out.push(b'-');
+    }
+    if digits.len() > prec {
+        out.extend_from_slice(&digits[..digits.len() - prec]);
+    } else {
+        out.push(b'0');
+    }
+    if prec > 0 {
+        out.push(b'.');
+        for _ in digits.len()..prec {
+            out.push(b'0');
+        }
+        out.extend_from_slice(&digits[digits.len().saturating_sub(prec)..]);
+    }
 }
 
 /// Applies width, zero padding, and left alignment (shared by `%d`/`%f`/`%s`). `body` is the

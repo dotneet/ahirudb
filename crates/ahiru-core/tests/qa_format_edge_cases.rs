@@ -112,11 +112,14 @@ fn crlf_and_lf_records_mixed_in_the_same_file_are_both_accepted() {
 }
 
 #[test]
-fn csv_values_outside_the_sampled_type_become_null_through_sql_not_an_error() {
+fn csv_values_outside_the_sampled_type_are_a_conversion_error_not_a_silent_null() {
     // The inferred type comes from the first SAMPLE_ROWS rows only
-    // (`format::csv`'s module doc); values that don't fit later become NULL
-    // rather than failing the whole query. Exercise this through actual SQL
-    // (WHERE / aggregate), not just direct `read_split` calls.
+    // (`format::csv`'s module doc), so a later row can genuinely fall
+    // outside it. Such a value used to be turned into NULL, which quietly
+    // dropped data the file plainly contains and made `count(n)` disagree
+    // with `count(*)` for no visible reason -- the "silently wrong answer"
+    // `docs/DESIGN.md` §15 says the engine never produces. It is now
+    // `InvalidCast`, which is what DuckDB reports for the same file.
     let mut csv = String::from("n\n");
     for i in 0..1001 {
         csv.push_str(&format!("{i}\n"));
@@ -124,10 +127,22 @@ fn csv_values_outside_the_sampled_type_become_null_through_sql_not_an_error() {
     csv.push_str("not_a_number\n");
     let mut sess = Session::new();
     sess.register_bytes_as("t", csv.into_bytes(), FormatKind::Csv).unwrap();
-    let rows = run_all("SELECT count(*) FROM t", &mut sess);
-    assert_eq!(rows, [[Value::I64(1002)]]);
-    let nulls = run_all("SELECT count(*) FROM t WHERE n IS NULL", &mut sess);
-    assert_eq!(nulls, [[Value::I64(1)]]);
+    let mut q = match sess.prepare("SELECT count(*) FROM t", &[]).unwrap() {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("in-memory bytes never need IO"),
+    };
+    assert_eq!(code_of(sess.step(&mut q)), Some(Code::InvalidCast));
+
+    // An empty field keeps its NULL meaning -- that is the only thing CSV
+    // can spell, and it must not be caught up in the new error.
+    let mut sess = Session::new();
+    // (A second column keeps the empty cell on a line of its own from being
+    // skipped as a blank line.)
+    sess.register_bytes_as("t", b"k,n\n1,1\n2,\n3,3\n".to_vec(), FormatKind::Csv).unwrap();
+    assert_eq!(
+        run_all("SELECT count(*), count(n) FROM t", &mut sess),
+        [[Value::I64(3), Value::I64(2)]]
+    );
 }
 
 #[test]
@@ -168,18 +183,20 @@ fn header_only_csv_part_with_all_varchar_columns_unifies_with_a_typed_data_part(
 }
 
 #[test]
-fn header_only_csv_part_with_a_numeric_sibling_column_is_a_type_mismatch() {
-    // Companion to the case above, and a real gotcha worth pinning: because
-    // an empty part's columns always default to VARCHAR regardless of what
-    // the *other* parts' data looks like, unioning a header-only CSV with a
-    // part that has actual numeric data in the same column position is
-    // rejected by `catalog::unify_schema` (`Ty::unify(Varchar, BigInt)` is
-    // `None`) even though the empty part contributes zero conflicting rows.
-    // This falls straight out of two independently documented behaviors
-    // (empty-sample columns default to VARCHAR; part schemas are unified
-    // strictly, never silently coerced) but is easy to trip over in
-    // practice (e.g. a placeholder/template file in a glob), so it's worth
-    // asserting explicitly rather than leaving it as an emergent surprise.
+fn header_only_csv_part_with_a_numeric_sibling_column_widens_to_varchar() {
+    // Companion to the case above. An empty part's columns always default to
+    // VARCHAR regardless of what the *other* parts' data looks like, so
+    // unioning a header-only CSV with a part holding actual numeric data in
+    // the same column position used to be rejected outright
+    // (`Ty::unify(Varchar, BigInt)` is `None`) even though the empty part
+    // contributes zero conflicting rows -- a placeholder or template file in
+    // a glob made the whole table unreadable.
+    //
+    // Both parts' types are *guesses* from a leading sample, so
+    // `catalog::unify_schema` now widens the disagreement to VARCHAR rather
+    // than failing, which is what DuckDB does when it unions text files.
+    // (Parquet, whose schema is declared rather than sniffed, still reports a
+    // real type conflict -- see `multi_file_smoke.rs`.)
     let mut sess = Session::new();
     sess.register_multi_bytes(
         "t",
@@ -190,8 +207,25 @@ fn header_only_csv_part_with_a_numeric_sibling_column_is_a_type_mismatch() {
         FormatKind::Csv,
     )
     .unwrap();
-    let r = sess.prepare("SELECT count(*) FROM t", &[]);
-    assert_eq!(code_of(r), Some(Code::TypeMismatch));
+    let rows = run_all("SELECT id FROM t ORDER BY id", &mut sess);
+    assert_eq!(rows, [[s("1")], [s("2")]]);
+}
+
+#[test]
+fn multi_part_csv_columns_that_sniff_differently_union_as_text() {
+    // The repro that motivated the widening above: one file's column holds a
+    // number and the next file's is empty, so the two parts sniff BIGINT and
+    // VARCHAR. DuckDB unions such files to VARCHAR; this used to be
+    // `TypeMismatch`.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![("a.csv".into(), b"id,v\n1,10\n".to_vec()), ("b.csv".into(), b"id,v\n2,\n".to_vec())],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT id, v FROM t ORDER BY id", &mut sess);
+    assert_eq!(rows, [[Value::I64(1), s("10")], [Value::I64(2), Value::Null]]);
 }
 
 // --- JSONL / JSON: schema promotion through SQL ----------------------------
@@ -287,4 +321,94 @@ fn jsonl_z_suffix_is_a_timestamp() {
     let rows = run_all("SELECT t FROM t", &mut sess);
     assert_eq!(rows[0][0], Value::I64(1_577_836_800_000_000));
     assert_eq!(rows[1][0], Value::I64(1_577_836_800_000_000));
+}
+
+#[test]
+fn cr_only_line_endings_are_read_instead_of_returning_zero_rows() {
+    // A classic Mac (CR-only) file used to parse as one giant record: a garbage single-row header
+    // and `(0 rows)`, with no error at all. DuckDB reads the two data rows.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a,b\r1,x\r3,y\r".to_vec(), FormatKind::Csv).unwrap();
+    let rows = run_all("SELECT a, b FROM t ORDER BY a", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(1), s("x")], vec![Value::I64(3), s("y")]]);
+}
+
+#[test]
+fn zero_padded_digit_strings_keep_their_padding() {
+    // `007` read as a number comes back as `7`, silently corrupting zip codes, account numbers and
+    // product IDs. DuckDB keeps such a column VARCHAR; a lone `0` and `0.5` stay numeric.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a\n007\n0123\n".to_vec(), FormatKind::Csv).unwrap();
+    assert_eq!(run_all("SELECT a FROM t", &mut sess), vec![vec![s("007")], vec![s("0123")]]);
+
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a\n0\n1\n".to_vec(), FormatKind::Csv).unwrap();
+    assert_eq!(
+        run_all("SELECT a FROM t ORDER BY a", &mut sess),
+        [[Value::I64(0)], [Value::I64(1)]]
+    );
+}
+
+#[test]
+fn booleans_mixed_with_numbers_widen_to_text_instead_of_nulling_the_booleans() {
+    // Widening BOOLEAN + BIGINT to BIGINT nulled the `true` row -- data the inference sample
+    // itself had just seen. DuckDB resolves the mixture to VARCHAR.
+    for body in [&b"a\ntrue\n1\n"[..], &b"a\ntrue\n1.5\n"[..]] {
+        let mut sess = Session::new();
+        sess.register_bytes_as("t", body.to_vec(), FormatKind::Csv).unwrap();
+        let rows = run_all("SELECT a FROM t", &mut sess);
+        assert_eq!(rows[0], vec![s("true")], "{:?}", String::from_utf8_lossy(body));
+        assert_ne!(rows[1][0], Value::Null);
+    }
+}
+
+#[test]
+fn dates_mixed_with_timestamps_read_the_date_as_midnight() {
+    // The column widens to TIMESTAMP, and a date-only value used to fail to parse there and become
+    // NULL. DuckDB reads it as that date's midnight.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a\n2024-01-01 10:00:00\n2024-01-02\n".to_vec(), FormatKind::Csv)
+        .unwrap();
+    let rows = run_all("SELECT count(a) FROM t", &mut sess);
+    assert_eq!(rows, [[Value::I64(2)]]);
+    // duckdb: epoch_us(TIMESTAMP '2024-01-02') = 1704153600000000
+    let rows = run_all("SELECT a FROM t ORDER BY a", &mut sess);
+    assert_eq!(rows[1], vec![Value::I64(1_704_153_600_000_000)]);
+}
+
+#[test]
+fn jsonl_values_outside_the_sampled_type_are_a_conversion_error() {
+    // Same rule as CSV: inference sees a bounded leading sample, and a later line holding a value
+    // the inferred type cannot express is `InvalidCast` rather than a silently NULLed row.
+    let mut jsonl = String::new();
+    for _ in 0..1001 {
+        jsonl.push_str("{\"a\":1}\n");
+    }
+    jsonl.push_str("{\"a\":2.5}\n");
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", jsonl.into_bytes(), FormatKind::Jsonl).unwrap();
+    let mut q = match sess.prepare("SELECT count(*) FROM t", &[]).unwrap() {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("in-memory bytes never need IO"),
+    };
+    assert_eq!(code_of(sess.step(&mut q)), Some(Code::InvalidCast));
+
+    // A missing key and an explicit `null` still mean NULL.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"{\"a\":1}\n{}\n{\"a\":null}\n".to_vec(), FormatKind::Jsonl)
+        .unwrap();
+    assert_eq!(
+        run_all("SELECT count(*), count(a) FROM t", &mut sess),
+        [[Value::I64(3), Value::I64(1)]]
+    );
+}
+
+#[test]
+fn ndjson_lines_that_are_not_objects_read_as_a_raw_json_column() {
+    // NDJSON permits any JSON value per line. Such a file used to be rejected with a syntax
+    // error; DuckDB gives it a single column named `json` holding each line's raw text.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"1\n[1,2]\n\"s\"\n".to_vec(), FormatKind::Jsonl).unwrap();
+    let rows = run_all("SELECT json FROM t", &mut sess);
+    assert_eq!(rows, vec![vec![s("1")], vec![s("[1,2]")], vec![s("\"s\"")]]);
 }

@@ -8,13 +8,15 @@ use super::*;
 
 /// A table defined by `WITH`.
 ///
-/// **An ordinary CTE can be referenced only once.** The plan tree is held by ownership and
-/// `Node` cannot be cloned, so a second reference is an error. Referencing it several times
-/// requires writing two derived tables. Refusing explicitly beats breaking silently.
+/// **An ordinary CTE may be referenced any number of times.** There is no materialization
+/// cache: each reference gets its own copy of the bound plan tree, so the body is *recomputed*
+/// per reference (`WITH a AS (...) SELECT ... FROM a a1 JOIN a a2` scans the source twice).
+/// That costs repeated work for a self-join, which is the price of not holding a whole
+/// intermediate result in memory — a non-goal of this engine (DESIGN.md §1).
 ///
-/// The sole exception is a self-reference inside a recursive CTE's recursive term
-/// (`CtePlan::Recursive` / `ResolvedCte::WorkingTable`): that is a light reference carrying
-/// only a schema and owning no real data, so it may be referenced any number of times, as in a self-join.
+/// A self-reference inside a recursive CTE's recursive term (`CtePlan::Recursive` /
+/// `ResolvedCte::WorkingTable`) is different again: it is a light leaf carrying only a schema
+/// and owning no data, fed by the `RecursiveCte` operator at runtime.
 #[derive(Default)]
 pub struct CteScope {
     entries: Vec<CteEntry>,
@@ -42,14 +44,12 @@ pub(super) const MAX_VIEW_DEPTH: u32 = 16;
 
 /// The substance of a CTE.
 enum CtePlan {
-    /// Bound and not yet taken.
+    /// Bound. Cloned once per reference.
     Ready(Box<Node>),
     /// In the middle of binding a recursive CTE's own recursive term, where the self-reference
     /// has no real plan yet. The referencing side receives a `Node::WorkingTable` (a leaf
     /// swapped at runtime for the previous iteration's new rows; see `exec::recursive`).
     Recursive,
-    /// Already taken.
-    Taken,
 }
 
 struct CteEntry {
@@ -94,20 +94,15 @@ impl CteScope {
             .map(|i| start + i)
     }
 
-    /// Resolves the index `find` produced. The schema is always returned as a clone
-    /// (`ResolvedCte::WorkingTable` may be referenced any number of times, so the
-    /// "take only once" constraint is lifted at the cost of a copy).
+    /// Resolves the index `find` produced. Both the schema and the plan are returned as
+    /// clones, so one CTE can back any number of references (each of which then owns its own
+    /// copy of the plan tree and recomputes the body; see the `CteScope` docs).
     pub(super) fn resolve(&mut self, i: usize) -> Result<(ResolvedCte, Vec<Field>)> {
-        let e = &mut self.entries[i];
+        let e = &self.entries[i];
         let schema = e.schema.clone();
-        match core::mem::replace(&mut e.plan, CtePlan::Taken) {
-            CtePlan::Ready(node) => Ok((ResolvedCte::Plan(node), schema)),
-            CtePlan::Recursive => {
-                // Not taken, so it is put back. It can be referenced any number of times.
-                e.plan = CtePlan::Recursive;
-                Ok((ResolvedCte::WorkingTable, schema))
-            }
-            CtePlan::Taken => err!(UnsupportedFeature),
+        match &e.plan {
+            CtePlan::Ready(node) => Ok((ResolvedCte::Plan(node.clone()), schema)),
+            CtePlan::Recursive => Ok((ResolvedCte::WorkingTable, schema)),
         }
     }
 }

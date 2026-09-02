@@ -2600,12 +2600,22 @@ fn factorial_precedence_is_self_consistent_but_diverges_from_duckdb_on_binary_op
 }
 
 #[test]
-fn factorial_applies_after_bitwise_not_too() {
-    // duckdb: SELECT ~5! -> 1 (confirmed: same as `(~5)!`, matching
-    // `(~5)! = factorial(-6) = 1`; `~(5!)` is a different value, `-121`).
-    // Prefix `~` reads its operand at `BP_UNARY` exactly like unary `-`
-    // does, so the same `BP_BANG < BP_UNARY` rule applies uniformly.
-    assert_eq!(ex("~5!"), "factorial(bit_not(5i32))");
+fn factorial_binds_tighter_than_the_in_ladder_prefix_operators() {
+    // `!` binds tighter than every binary operator, and `~`/`@` are prefix
+    // operators that live *inside* the binary ladder (`BP_OTHER`, see
+    // `prefix()`), so `!` binds tighter than them: `~5!` is `~(5!)` = -121
+    // and `@5!` is `@(5!)` = 120.
+    //
+    // DuckDB itself is self-contradictory here -- `~5!` -> 1 (i.e. `(~5)!`)
+    // but `@5!` -> 120 (i.e. `@(5!)`), for two identically-shaped
+    // expressions -- so no single rule agrees with it on both. `BP_BANG`'s
+    // doc in `sql::parser` has the full rationale. `@5!` matches DuckDB
+    // either way (`(@5)!` and `@(5!)` are both 120); `~5!` is the one
+    // deliberate divergence.
+    assert_eq!(ex("~5!"), "bit_not(factorial(5i32))");
+    assert_eq!(ex("@5!"), "abs(factorial(5i32))");
+    // Unary `-`/`+` still sit *above* `BP_BANG`, so they are unaffected.
+    assert_eq!(ex("-5!"), "factorial(-5i32)");
 }
 
 #[test]
@@ -2841,4 +2851,240 @@ fn order_by_all_is_rejected_for_pivot_and_unpivot() {
         code("UNPIVOT t ON a, b INTO NAME n VALUE v ORDER BY ALL"),
         Code::UnsupportedFeature as u16
     );
+}
+
+// --- Operator precedence against the PostgreSQL/DuckDB ladder --------------
+//
+// Every expectation below was measured with the `duckdb` CLI (its `EXPLAIN`
+// output prints the parse tree fully parenthesized, which is what pins the
+// grouping rather than just the value). See the `BP_*` constants in
+// `sql::parser` for the ladder these tests fix in place.
+
+#[test]
+fn non_arithmetic_prefix_operators_bind_below_multiplication() {
+    // `~`/`@` are not high-precedence prefix operators: PostgreSQL gives every
+    // prefix operator except `+`/`-` the "any other operator" precedence, so
+    // their operand extends over `*`, `+` and `^` but stops at `||` and the
+    // bitwise operators.
+    //   duckdb: ~1 * 2 -> -3 (= ~(1*2)), ~1 + 1 -> -3, ~1 || 'a' -> '-2a',
+    //           ~1 = -2 -> true, @ -3 + 1 -> 2
+    assert_eq!(ex("~1 * 2"), "bit_not((1i32 * 2i32))");
+    assert_eq!(ex("~id + 1"), "bit_not((id + 1i32))");
+    assert_eq!(ex("@id - 5"), "abs((id - 5i32))");
+    assert_eq!(ex("~2 ^ 2"), "bit_not(pow(2i32, 2i32))");
+    // ... but stops before the operators of its own band, which are
+    // left-associative, and before comparison.
+    assert_eq!(ex("~1 || 'a'"), "(bit_not(1i32) || 'a')");
+    assert_eq!(ex("~1 & 2"), "bit_and(bit_not(1i32), 2i32)");
+    assert_eq!(ex("~1 = -2"), "(bit_not(1i32) = -2i32)");
+    // Unary `-`/`+` keep their high precedence.
+    assert_eq!(ex("-1 * 2"), "(-1i32 * 2i32)");
+}
+
+#[test]
+fn in_between_like_bind_tighter_than_comparison() {
+    // duckdb: `false = true IN (false, true)` -> false, i.e.
+    // `false = (true IN (false, true))`; likewise for BETWEEN/LIKE/ILIKE and
+    // their NOT-prefixed forms. Before this, they sat at `BP_CMP` and attached
+    // to the *finished* comparison instead.
+    assert_eq!(ex("a = b IN (c, d)"), "(a = (b IN [c, d]))");
+    assert_eq!(ex("a = b NOT IN (c, d)"), "(a = (b NOT IN [c, d]))");
+    assert_eq!(ex("a = b BETWEEN c AND d"), "(a = (b BETWEEN c AND d))");
+    assert_eq!(ex("a = b NOT BETWEEN c AND d"), "(a = (b NOT BETWEEN c AND d))");
+    assert_eq!(ex("a = b LIKE 'x'"), "(a = (b LIKE 'x'))");
+    assert_eq!(ex("a = b ILIKE 'x'"), "(a = (b ILIKE 'x'))");
+    // The predicate still binds looser than everything above it, so the left
+    // operand absorbs arithmetic and `||` as before.
+    assert_eq!(ex("a + 1 IN (c)"), "((a + 1i32) IN [c])");
+    // And a predicate applied to a finished predicate stays left-associative.
+    assert_eq!(ex("a IN (b) IN (c)"), "((a IN [b]) IN [c])");
+}
+
+#[test]
+fn is_family_stays_at_comparison_strength() {
+    // PostgreSQL puts `IS` one notch below comparison, DuckDB collapses the two.
+    //   duckdb: `1 IS DISTINCT FROM 1 = 1` -> false, `2 = 1 IS DISTINCT FROM 1`
+    //           -> true, `1 = 1 IS NOT NULL` -> true, `true = 1 ISNULL` -> false
+    // All four are "one left-associative band", which is what `BP_CMP` is.
+    assert_eq!(ex("a = b IS NULL"), "((a = b) IS NULL)");
+    assert_eq!(ex("a = b ISNULL"), "((a = b) IS NULL)");
+    assert_eq!(ex("a = b NOTNULL"), "((a = b) IS NOT NULL)");
+    // A predicate binds tighter than `IS`, and `IS` tighter than nothing else
+    // in that band, so the two compose left to right in source order.
+    assert_eq!(ex("a IN (b) IS NULL"), "((a IN [b]) IS NULL)");
+    assert_eq!(ex("a IS NULL IN (b)"), "((a IS NULL) IN [b])");
+}
+
+#[test]
+fn bitwise_and_concat_share_one_left_associative_band() {
+    // duckdb: `1 & 2 || 3` -> '03' (= `(1&2) || 3`), `1 || 2 & 3` -> a binder
+    // error naming `&(VARCHAR, INTEGER)` (= `(1||2) & 3`), `1 + 2 & 3` -> 3
+    // (= `(1+2) & 3`), `3 & 2 = 2` -> true (= `(3&2) = 2`).
+    assert_eq!(ex("1 & 2 || 3"), "(bit_and(1i32, 2i32) || 3i32)");
+    assert_eq!(ex("1 || 2 & 3"), "bit_and((1i32 || 2i32), 3i32)");
+    assert_eq!(ex("1 + 2 & 3"), "bit_and((1i32 + 2i32), 3i32)");
+    assert_eq!(ex("3 & 2 = 2"), "(bit_and(3i32, 2i32) = 2i32)");
+    assert_eq!(ex("1 << 2 | 3"), "bit_or(bit_shift_left(1i32, 2i32), 3i32)");
+}
+
+#[test]
+fn between_bounds_reach_into_the_bitwise_band() {
+    // The bounds are read at `BP_OTHER`, so `||`, `&`, `<<` and arithmetic all
+    // combine into a bound while the separating `AND` still terminates the low
+    // one. duckdb: `1 BETWEEN 0 AND 1 & 1` -> true, `2 BETWEEN 1 AND 1 << 2` ->
+    // true, `5 BETWEEN 1 << 1 AND 10` -> true (the last was an outright syntax
+    // error here before).
+    assert_eq!(ex("1 BETWEEN 0 AND 1 & 1"), "(1i32 BETWEEN 0i32 AND bit_and(1i32, 1i32))");
+    assert_eq!(ex("2 BETWEEN 1 AND 1 << 2"), "(2i32 BETWEEN 1i32 AND bit_shift_left(1i32, 2i32))");
+    assert_eq!(
+        ex("5 BETWEEN 1 << 1 AND 10"),
+        "(5i32 BETWEEN bit_shift_left(1i32, 1i32) AND 10i32)"
+    );
+    // The `AND` that separates the bounds is still not swallowed.
+    assert_eq!(ex("a BETWEEN b AND c AND d"), "((a BETWEEN b AND c) AND d)");
+}
+
+#[test]
+fn other_band_operators_bind_tighter_than_comparison() {
+    // `^@`, the regex operators and the `~~` LIKE-punctuation family all live in
+    // the "any other operator" band, so a comparison on their left is *not*
+    // their left operand. duckdb: `true = 'ab' ^@ 'a'` -> true,
+    // `true = 'a' ~ 'a'` -> true, `true = 'a' GLOB 'a'` -> true,
+    // `'a' ~ 'a' || 'b'` -> 'trueb'.
+    assert_eq!(ex("a = 'ab' ^@ 'a'"), "(a = starts_with('ab', 'a'))");
+    assert_eq!(ex("a = 'x' ~ 'y'"), "(a = regexp_full_match('x', 'y'))");
+    assert_eq!(ex("a = 'x' ~~ 'y'"), "(a = ('x' LIKE 'y'))");
+    assert_eq!(ex("a = 'x' GLOB 'y'"), "(a = glob('x', 'y'))");
+    // Their right operand still stops before `||`, so a trailing `||` applies to
+    // the result (duckdb: `'a' ~ 'a' || 'b'` -> 'trueb').
+    assert_eq!(ex("'x' ~ 'y' || 'z'"), "(regexp_full_match('x', 'y') || 'z')");
+}
+
+#[test]
+fn position_and_pivot_still_stop_before_their_own_in_keyword() {
+    // Both read their operand one notch tighter than `BP_PRED` so the `IN` that
+    // separates the two halves is not eaten as the `x IN (...)` predicate. The
+    // constant moved with `IN`'s precedence; this pins that they moved together.
+    assert_eq!(ex("position('a' || 'b' in s)"), "strpos(s, ('a' || 'b'))");
+    // `PIVOT ... ON <expr> IN (...)` is not a `Stmt::Select`, so only that it
+    // still parses (rather than swallowing the `IN` into the `ON` expression)
+    // is checked here.
+    assert_eq!(code("PIVOT t ON a IN (1, 2) USING sum(b)"), 0);
+    assert_eq!(code("PIVOT t ON a || 'x' IN (1, 2) USING sum(b)"), 0);
+}
+
+// --- Numeric literals ------------------------------------------------------
+
+#[test]
+fn underscore_digit_separators_in_numeric_literals() {
+    // DuckDB accepts `_` *between digits* only. Before this, `number()` stopped
+    // at the `_`, so `SELECT 1_000` silently became the literal `1` with an
+    // implicit alias `_000`, and `SELECT 1_000 + 1` was a syntax error.
+    assert_eq!(ex("1_000"), "1000i32");
+    assert_eq!(ex("1_000 + 1"), "(1000i32 + 1i32)");
+    assert_eq!(ex("1_0_0"), "100i32");
+    assert_eq!(ex("1_000_000"), "1000000i32");
+    assert_eq!(ex("1_000.5"), "1000.5f64");
+    assert_eq!(ex("1.0_5"), "1.05f64");
+    assert_eq!(ex("1e1_0"), "10000000000f64");
+    // Leading, trailing, doubled, and point/exponent-adjacent underscores all
+    // end the number, leaving an identifier behind -- exactly as in duckdb,
+    // where `1__0`, `100_`, `1._5`, `1_e5` and `1e_5` all answer a bare `1`
+    // or `100` with an implicit alias.
+    assert_eq!(sel("SELECT 1__0"), "SELECT 1i32 AS __0");
+    assert_eq!(sel("SELECT 100_"), "SELECT 100i32 AS _");
+    assert_eq!(sel("SELECT 1e_5"), "SELECT 1i32 AS e_5");
+    // `_100` is an ordinary identifier, not a number.
+    assert_eq!(ex("_100"), "_100");
+    // LIMIT/OFFSET go through `Parser::uint`, which skips separators too.
+    assert_eq!(sel("SELECT a FROM t LIMIT 1_000"), "SELECT a FROM t LIMIT 1000");
+}
+
+#[test]
+fn leading_dot_float_literals() {
+    // duckdb: `SELECT .5` -> 0.5, `SELECT .5 + 1` -> 1.5. `5.` already worked.
+    assert_eq!(ex(".5"), "0.5f64");
+    assert_eq!(ex(".5 + 1"), "(0.5f64 + 1i32)");
+    assert_eq!(ex(".5e1"), "5f64");
+    assert_eq!(ex("5."), "5f64");
+    // A `.` not followed by a digit is still the qualification separator, and a
+    // digit after a qualified name is still a syntax error (as in duckdb).
+    assert_eq!(ex("t.c"), "t.c");
+    assert_eq!(ex("t.*"), "t.*");
+    assert_eq!(code("SELECT t.5 FROM t"), Code::UnexpectedToken as u16);
+}
+
+// --- Aliases ---------------------------------------------------------------
+
+#[test]
+fn reserved_words_are_accepted_as_aliases_after_an_explicit_as() {
+    // duckdb accepts every one of these; the quoted spellings already worked
+    // here. `AS` has already fixed the position, so a keyword there can only be
+    // a name.
+    assert_eq!(sel("SELECT 1 AS limit"), "SELECT 1i32 AS limit");
+    assert_eq!(sel("SELECT 1 AS offset"), "SELECT 1i32 AS offset");
+    assert_eq!(sel("SELECT 1 AS all"), "SELECT 1i32 AS all");
+    assert_eq!(sel("SELECT 1 AS end"), "SELECT 1i32 AS end");
+    assert_eq!(sel("SELECT 1 AS distinct"), "SELECT 1i32 AS distinct");
+    assert_eq!(sel("SELECT 1 AS select"), "SELECT 1i32 AS select");
+    // The spelling keeps the case the user typed, like any identifier.
+    assert_eq!(sel("SELECT 1 AS LIMIT"), "SELECT 1i32 AS LIMIT");
+    // Table aliases take the same path.
+    assert_eq!(sel("SELECT a FROM t AS order"), "SELECT a FROM t AS order");
+    // A *bare* alias must still stop at a reserved word, or a clause boundary
+    // would be eaten as a name.
+    assert_eq!(sel("SELECT a FROM t WHERE b"), "SELECT a FROM t WHERE b");
+    assert_eq!(sel("SELECT a FROM t LIMIT 1"), "SELECT a FROM t LIMIT 1");
+}
+
+// --- INTERVAL --------------------------------------------------------------
+
+#[test]
+fn interval_is_nameable_in_a_type_position() {
+    // `INTERVAL` is a first-class type (DESIGN.md §8) but was missing from the
+    // `TYPES` table, so it could not be *named* as one: every spelling below
+    // used to fail with `InvalidCast`.
+    assert_eq!(ex("CAST(NULL AS INTERVAL)"), "CAST(NULL AS INTERVAL)");
+    assert_eq!(ex("CAST(x AS INTERVAL)"), "CAST(x AS INTERVAL)");
+    assert_eq!(ex("x::INTERVAL"), "CAST(x AS INTERVAL)");
+    assert_eq!(ex("TRY_CAST(x AS interval)"), "TRY_CAST(x AS INTERVAL)");
+}
+
+#[test]
+fn interval_text_accepts_time_components_fractions_and_weeks() {
+    let lit =
+        |m: i32, d: i32, u: i64| format!("INTERVAL({}i128)", crate::vector::pack_interval(m, d, u));
+    const US_PER_SEC: i64 = 1_000_000;
+    // A bare `HH:MM[:SS[.frac]]` component -- the shape an interval *prints* as,
+    // so an interval this engine emitted can now be read back in.
+    // duckdb: '1:30:00' -> 01:30:00, '01:02:03.5' -> 01:02:03.5,
+    //         '01:02' -> 01:02:00, '100:00:00' -> 100:00:00, '-1:30:00' -> -01:30:00
+    assert_eq!(ex("INTERVAL '1:30:00'"), lit(0, 0, 90 * 60 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL '01:02:03.5'"), lit(0, 0, 3723 * US_PER_SEC + 500_000));
+    assert_eq!(ex("INTERVAL '01:02'"), lit(0, 0, 62 * 60 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL '100:00:00'"), lit(0, 0, 100 * 60 * 60 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL '-1:30:00'"), lit(0, 0, -90 * 60 * US_PER_SEC));
+    // Fractional amounts cascade into the next smaller field, as in duckdb:
+    //   '1.5 days' -> 1 day 12:00:00     '0.5 months' -> 15 days
+    //   '1.25 years' -> 1 year 3 months  '1.5 weeks' -> 10 days 12:00:00
+    assert_eq!(ex("INTERVAL '1.5 days'"), lit(0, 1, 12 * 60 * 60 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL '0.5 months'"), lit(0, 15, 0));
+    assert_eq!(ex("INTERVAL '1.25 years'"), lit(15, 0, 0));
+    assert_eq!(ex("INTERVAL '1.5 hours'"), lit(0, 0, 90 * 60 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL '1.5 seconds'"), lit(0, 0, US_PER_SEC + 500_000));
+    // `week`/`weeks`, singular and plural (duckdb: '3 weeks' -> 21 days).
+    assert_eq!(ex("INTERVAL '3 weeks'"), lit(0, 21, 0));
+    assert_eq!(ex("INTERVAL '1 week'"), lit(0, 7, 0));
+    assert_eq!(ex("INTERVAL '1.5 weeks'"), lit(0, 10, 12 * 60 * 60 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL 3 WEEK"), lit(0, 21, 0));
+    // Several terms in one string, including a time component alongside units.
+    assert_eq!(ex("INTERVAL '1 day 01:02:03'"), lit(0, 1, 3723 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL '2 days 03:04:05.678'"), lit(0, 2, 11045 * US_PER_SEC + 678_000));
+    assert_eq!(ex("INTERVAL '-2 days -03:04:05'"), lit(0, -2, -11045 * US_PER_SEC));
+    assert_eq!(ex("INTERVAL '1 day 2 hours 3 minutes'"), lit(0, 1, 7380 * US_PER_SEC));
+    // Malformed text is still rejected rather than silently truncated.
+    assert_eq!(code("SELECT INTERVAL '1 bogus'"), Code::SyntaxError as u16);
+    assert_eq!(code("SELECT INTERVAL '1 day 2'"), Code::SyntaxError as u16);
+    assert_eq!(code("SELECT INTERVAL '1:2:3:4'"), Code::SyntaxError as u16);
+    assert_eq!(code("SELECT INTERVAL ''"), Code::SyntaxError as u16);
 }

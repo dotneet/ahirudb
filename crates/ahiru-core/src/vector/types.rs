@@ -220,14 +220,29 @@ impl Ty {
         if b == Null {
             return Some(a);
         }
-        // Between two DECIMALs, align precision/scale.
+        // Between two DECIMALs -- or a DECIMAL and an integer, which counts as a DECIMAL
+        // with scale 0 -- align precision/scale.
         // Addition and subtraction can carry into one more digit, so precision gets +1 (as in DuckDB).
-        if let (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) = (a, b)
-        {
-            return Some(Ty::decimal(
-                p1.saturating_sub(s1).max(p2.saturating_sub(s2)) + s1.max(s2) + 1,
-                s1.max(s2),
-            ));
+        //
+        // The integer case must be handled here rather than falling through to the
+        // rank-based widening below: HUGEINT outranks DECIMAL, so `DECIMAL(4,1) + HUGEINT`
+        // would otherwise unify to HUGEINT and round 7.5 down to 8 before adding. Widening
+        // the DECIMAL side instead keeps the fractional part and leaves room for the
+        // integer's digits, matching DuckDB (`DECIMAL(4,1) + BIGINT` -> `DECIMAL(21,1)`,
+        // `DECIMAL(4,1) + HUGEINT` -> `DECIMAL(38,1)`).
+        if matches!(a, Decimal { .. }) || matches!(b, Decimal { .. }) {
+            // `as_decimal` is `None` for FLOAT/DOUBLE, so the DECIMAL-with-float case
+            // still falls through to the DOUBLE rule below.
+            if let (Some((p1, s1)), Some((p2, s2))) = (a.as_decimal(), b.as_decimal()) {
+                let scale = s1.max(s2);
+                return Some(Ty::decimal(
+                    p1.saturating_sub(s1)
+                        .max(p2.saturating_sub(s2))
+                        .saturating_add(scale)
+                        .saturating_add(1),
+                    scale,
+                ));
+            }
         }
         // Between numerics, widen. DECIMAL with floating point drops to DOUBLE.
         if a.is_numeric() && b.is_numeric() {

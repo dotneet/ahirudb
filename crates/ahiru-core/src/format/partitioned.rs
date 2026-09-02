@@ -17,15 +17,21 @@ use crate::vector::{Field, Ty, Value, Vector};
 
 pub struct PartitionedFormat {
     inner: Box<dyn TableFormat>,
-    /// `(column name, constant value)`. Extracted from the file's path exactly once.
-    partition_cols: Vec<(String, Value)>,
+    /// `(column name, raw value)`. Extracted from the file's path exactly once, percent-decoded but
+    /// left untyped: a partition key's type is a property of the **table**, not of one directory,
+    /// so it is settled across every part by `catalog::register_multi` (`set_hive_types`).
+    keys: Vec<(String, String)>,
+    /// The column type of each key, parallel to `keys`. Defaults to this part's own reading of the
+    /// raw value, which is already right for a single-part table.
+    types: Vec<Ty>,
     /// `inner`'s schema plus the partition columns. Empty until `resolve` completes.
     schema: Vec<Field>,
 }
 
 impl PartitionedFormat {
-    pub fn new(inner: Box<dyn TableFormat>, partition_cols: Vec<(String, Value)>) -> Self {
-        PartitionedFormat { inner, partition_cols, schema: Vec::new() }
+    pub fn new(inner: Box<dyn TableFormat>, keys: Vec<(String, String)>) -> Self {
+        let types = keys.iter().map(|(_, v)| hive_value_ty(v)).collect();
+        PartitionedFormat { inner, keys, types, schema: Vec::new() }
     }
 
     /// Extracts `key=value` from the path's directory part (each segment except the file name).
@@ -34,8 +40,8 @@ impl PartitionedFormat {
     /// A URL's query string and fragment are dropped beforehand, as in `FormatKind::detect`.
     /// A segment with an empty `key` or `value` is ignored (so a merely decorative directory name
     /// containing an `=` is not misdetected).
-    pub fn parse_hive_path(path: &str) -> Vec<(String, Value)> {
-        let path = path.split(['?', '#']).next().unwrap_or(path);
+    pub fn parse_hive_path(path: &str) -> Vec<(String, String)> {
+        let path = crate::format::strip_url_query(path);
         let segs: Vec<&str> = path.split('/').collect();
         if segs.len() < 2 {
             return Vec::new();
@@ -48,9 +54,15 @@ impl PartitionedFormat {
             if k.is_empty() || v.is_empty() {
                 continue;
             }
-            out.push((k.to_string(), infer_value(&percent_decode(v))));
+            out.push((k.to_string(), percent_decode(v)));
         }
         out
+    }
+
+    /// The constant value of partition key `i`, built to match its settled column type.
+    fn value_of(&self, i: usize) -> Value {
+        let Some((_, raw)) = self.keys.get(i) else { return Value::Null };
+        typed_value(raw, self.types.get(i).copied().unwrap_or(Ty::Varchar))
     }
 
     /// A projection keeping only `inner`'s columns. Partition columns (indices at or beyond
@@ -100,8 +112,8 @@ impl PartitionedFormat {
                     });
                 }
             } else {
-                let (_, v) = &self.partition_cols[col - inner_n];
-                if !range_may_match(p, v, v) {
+                let v = self.value_of(col - inner_n);
+                if !range_may_match(p, &v, &v) {
                     return (inner_proj, inner_pruners, true);
                 }
             }
@@ -149,24 +161,39 @@ fn hex_val(b: u8) -> Option<u8> {
 /// it does not fit 32 bits), and anything else is VARCHAR.
 /// Signs and decimal points are excluded from "digits only" (partitions containing `-1` or `1.5`
 /// are rare in practice, and wrongly treating them as numeric is the more dangerous mistake).
-fn infer_value(s: &str) -> Value {
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+///
+/// A zero-padded run of digits (`k=007`, `month=01`) stays VARCHAR, for the same reason
+/// `format::csv::is_zero_padded` keeps such a CSV column VARCHAR: reading it as a number destroys
+/// the value. DuckDB keeps `month=01` as `01` too.
+///
+/// This types one directory's value in isolation. `catalog::register_multi` widens the result
+/// across every part of the table before anything is read, so a key that is `k=1` under one
+/// directory and `k=x` under another comes out VARCHAR everywhere rather than making the table
+/// unreadable.
+pub(crate) fn hive_value_ty(s: &str) -> Ty {
+    let digits_only = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let zero_padded = s.len() > 1 && s.starts_with('0');
+    if digits_only && !zero_padded {
         if let Ok(v) = s.parse::<i64>() {
-            return match i32::try_from(v) {
-                Ok(v32) => Value::I32(v32),
-                Err(_) => Value::I64(v),
-            };
+            return if i32::try_from(v).is_ok() { Ty::Int } else { Ty::BigInt };
         }
     }
-    Value::Bytes(s.as_bytes().to_vec())
+    Ty::Varchar
 }
 
-fn value_ty(v: &Value) -> Ty {
-    match v {
-        Value::I32(_) => Ty::Int,
-        Value::I64(_) => Ty::BigInt,
-        // `infer_value` produces nothing else.
-        _ => Ty::Varchar,
+/// Builds the constant for a partition value under an already-settled column type.
+/// A value that does not fit the type falls back to its text, which cannot lose information.
+fn typed_value(s: &str, ty: Ty) -> Value {
+    match ty {
+        Ty::Int => match s.parse::<i32>() {
+            Ok(v) => Value::I32(v),
+            Err(_) => Value::Bytes(s.as_bytes().to_vec()),
+        },
+        Ty::BigInt => match s.parse::<i64>() {
+            Ok(v) => Value::I64(v),
+            Err(_) => Value::Bytes(s.as_bytes().to_vec()),
+        },
+        _ => Value::Bytes(s.as_bytes().to_vec()),
     }
 }
 
@@ -184,7 +211,7 @@ impl TableFormat for PartitionedFormat {
         let step = self.inner.resolve(src)?;
         if step.is_ok() && self.schema.is_empty() {
             let mut schema = self.inner.schema().to_vec();
-            for (name, v) in &self.partition_cols {
+            for (i, (name, _)) in self.keys.iter().enumerate() {
                 // If a partition column collides with one of the file's own column names, the schema
                 // ends up with two columns of the same name. Which one is looked up would depend on
                 // column-resolution implementation details, and the unintended value could silently
@@ -196,7 +223,8 @@ impl TableFormat for PartitionedFormat {
                         .any(|f| crate::rt::hash::eq_ascii_ci(f.name.as_bytes(), name.as_bytes())),
                     DuplicateColumn
                 );
-                schema.push(Field::new(name.clone(), value_ty(v), false));
+                let ty = self.types.get(i).copied().unwrap_or(Ty::Varchar);
+                schema.push(Field::new(name.clone(), ty, false));
             }
             self.schema = schema;
         }
@@ -294,11 +322,27 @@ impl TableFormat for PartitionedFormat {
                 };
                 out.push(inner_cols[pos].clone());
             } else {
-                let (_, v) = &self.partition_cols[col - inner_n];
-                out.push(constant_vector(value_ty(v), v, rows));
+                let i = col - inner_n;
+                let ty = self.types.get(i).copied().unwrap_or(Ty::Varchar);
+                out.push(constant_vector(ty, &self.value_of(i), rows));
             }
         }
         Ok(out)
+    }
+
+    fn hive_keys(&self) -> &[(String, String)] {
+        &self.keys
+    }
+
+    fn set_hive_types(&mut self, types: &[Ty]) {
+        if types.len() == self.types.len() {
+            self.types.copy_from_slice(types);
+        }
+    }
+
+    /// A partitioned table's schema is only as declared as the file it wraps.
+    fn schema_is_inferred(&self) -> bool {
+        self.inner.schema_is_inferred()
     }
 }
 
@@ -312,9 +356,34 @@ mod tests {
         let cols = PartitionedFormat::parse_hive_path("data/year=2024/month=01/part.parquet");
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].0, "year");
-        assert!(matches!(cols[0].1, Value::I32(2024)));
+        assert_eq!(cols[0].1, "2024");
+        assert_eq!(hive_value_ty(&cols[0].1), Ty::Int);
         assert_eq!(cols[1].0, "month");
-        assert!(matches!(cols[1].1, Value::I32(1)));
+        // `01` keeps its padding, so it is VARCHAR rather than the integer 1 (duckdb agrees).
+        assert_eq!(cols[1].1, "01");
+        assert_eq!(hive_value_ty(&cols[1].1), Ty::Varchar);
+    }
+
+    #[test]
+    fn hive_value_types() {
+        assert_eq!(hive_value_ty("2024"), Ty::Int);
+        assert_eq!(hive_value_ty("0"), Ty::Int);
+        assert_eq!(hive_value_ty("99999999999"), Ty::BigInt);
+        assert_eq!(hive_value_ty("007"), Ty::Varchar);
+        assert_eq!(hive_value_ty("01"), Ty::Varchar);
+        assert_eq!(hive_value_ty("1e3"), Ty::Varchar);
+        assert_eq!(hive_value_ty("true"), Ty::Varchar);
+        assert_eq!(hive_value_ty("-1"), Ty::Varchar);
+        assert_eq!(hive_value_ty(""), Ty::Varchar);
+    }
+
+    #[test]
+    fn a_local_path_with_a_hash_is_not_truncated() {
+        // `#` and `?` are ordinary file-name characters; only a URL carries a fragment/query.
+        let cols = PartitionedFormat::parse_hive_path("data/k=a#b/part.parquet");
+        assert_eq!(cols[0].1, "a#b");
+        let cols = PartitionedFormat::parse_hive_path("https://h/k=a/f.parquet?token=1");
+        assert_eq!(cols[0].1, "a");
     }
 
     #[test]
@@ -333,29 +402,31 @@ mod tests {
     #[test]
     fn non_numeric_values_stay_varchar() {
         let cols = PartitionedFormat::parse_hive_path("data/region=us-east/f.parquet");
-        assert!(matches!(&cols[0].1, Value::Bytes(b) if b == b"us-east"));
+        assert_eq!(cols[0].1, "us-east");
+        assert_eq!(hive_value_ty(&cols[0].1), Ty::Varchar);
     }
 
     #[test]
     fn large_numeric_values_become_bigint() {
         let cols = PartitionedFormat::parse_hive_path("data/ts=99999999999/f.parquet");
-        assert!(matches!(cols[0].1, Value::I64(99_999_999_999)));
+        assert_eq!(hive_value_ty(&cols[0].1), Ty::BigInt);
+        assert_eq!(typed_value(&cols[0].1, Ty::BigInt), Value::I64(99_999_999_999));
     }
 
     #[test]
     fn percent_encoded_values_are_decoded() {
         // Measured with duckdb: `region=us%20east` becomes "us east".
         let cols = PartitionedFormat::parse_hive_path("data/region=us%20east/f.parquet");
-        assert!(matches!(&cols[0].1, Value::Bytes(b) if b == b"us east"));
+        assert_eq!(cols[0].1, "us east");
     }
 
     #[test]
     fn malformed_percent_escape_is_left_as_is() {
         // When what follows `%` is not hex, or is cut off partway, it passes through.
         let cols = PartitionedFormat::parse_hive_path("data/x=100%off/f.parquet");
-        assert!(matches!(&cols[0].1, Value::Bytes(b) if b == b"100%off"));
+        assert_eq!(cols[0].1, "100%off");
         let cols = PartitionedFormat::parse_hive_path("data/x=abc%2/f.parquet");
-        assert!(matches!(&cols[0].1, Value::Bytes(b) if b == b"abc%2"));
+        assert_eq!(cols[0].1, "abc%2");
     }
 
     // --- A fake for verifying behavior against an isolated TableFormat -------
@@ -419,8 +490,8 @@ mod tests {
         let mut f = PartitionedFormat::new(
             inner,
             vec![
-                ("year".to_string(), Value::I32(2024)),
-                ("region".to_string(), Value::Bytes(b"us".to_vec())),
+                ("year".to_string(), "2024".to_string()),
+                ("region".to_string(), "us".to_string()),
             ],
         );
         assert!(f.resolve(&fake_source()).unwrap().is_ok());
@@ -437,7 +508,7 @@ mod tests {
     fn read_split_appends_constant_partition_columns() {
         let inner =
             Box::new(FakeFormat { schema: vec![Field::new("id", Ty::Int, false)], rows: 4 });
-        let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), Value::I32(2024))]);
+        let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), "2024".to_string())]);
         f.resolve(&fake_source()).unwrap().unwrap();
 
         let cols = f.read_split(&fake_source(), 0, &[0, 1]).unwrap();
@@ -458,7 +529,7 @@ mod tests {
             schema: vec![Field::new("id", Ty::Int, false), Field::new("year", Ty::Int, false)],
             rows: 3,
         });
-        let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), Value::I32(2024))]);
+        let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), "2024".to_string())]);
         assert!(f.resolve(&fake_source()).is_err());
     }
 
@@ -467,7 +538,7 @@ mod tests {
         // The row count is still known even when none of inner's columns are selected.
         let inner =
             Box::new(FakeFormat { schema: vec![Field::new("id", Ty::Int, false)], rows: 5 });
-        let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), Value::I32(2024))]);
+        let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), "2024".to_string())]);
         f.resolve(&fake_source()).unwrap().unwrap();
 
         let cols = f.read_split(&fake_source(), 0, &[1]).unwrap();

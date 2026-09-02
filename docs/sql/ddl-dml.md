@@ -165,7 +165,14 @@ exceptions:
   `INTERVAL` type, which cannot represent signed components. It reads back
   as `VARCHAR`.
 - **HUGEINT** is written as `DECIMAL(38, 0)`, since Parquet has no 128-bit
-  integer type. Values keep their exact value but read back as `DECIMAL`.
+  integer type. It reads back as `DECIMAL`. A `DECIMAL(38, 0)` holds 38
+  decimal digits, which is slightly narrower than a full 128-bit integer,
+  so a magnitude at or above `10^38` is **rejected** with a
+  `ValueOutOfRange` error rather than being written wrong. Everything
+  below that keeps its exact value. (DuckDB writes `HUGEINT` to Parquet as
+  `DOUBLE`, so this mapping is the more faithful of the two in range as
+  well as in exactness — it just refuses the last fraction of the type's
+  domain instead of silently rounding it.)
 
 The full table is in the module doc of
 `crates/ahiru-core/src/write/parquet/mod.rs`.
@@ -176,9 +183,42 @@ the destination path back to the host, which performs the actual file
 write. In the native CLI this happens automatically; a JS host would do
 the equivalent via its own file-write API.
 
+### JSONL output
+
+The JSONL writer keeps its output valid JSON, which takes two decisions
+worth knowing about:
+
+- A **`DECIMAL`** is written as a JSON *number* (`{"d":1.25}`), not as a
+  quoted string. It reads back as `DOUBLE`, here and in DuckDB.
+- A **non-finite `DOUBLE`** is written as one of the quoted strings
+  `"NaN"`, `"Infinity"`, `"-Infinity"`. JSON has no literal for these, and
+  a bare `NaN` token would make the file unparseable by any strict reader.
+  The cost is that such a column reads back as `VARCHAR` rather than
+  `DOUBLE` — again in both engines, so the file round-trips through either.
+
+```sql
+COPY (SELECT CAST('1.25' AS DECIMAL(5,2)) AS d, 'nan'::DOUBLE AS n FROM range(1))
+  TO 'out.jsonl';
+-- {"d":1.25,"n":"NaN"}
+```
+
 **Limitation:** `COPY`/CTAS/`INSERT ... SELECT` are non-resumable — if
 reading the source data would require pausing for I/O partway through
-(`NEED_IO`/`NEED_CODEC`), the statement fails with `IoFailed` instead of
-suspending and resuming. They only work when the source data is already
-fully available in memory (typical CLI usage, or a JS caller that
-pre-fetched the table).
+(`NEED_IO`), the statement fails with `IoFailed` instead of suspending and
+resuming. They only work when the source data is already fully available in
+memory (typical CLI usage, or a JS caller that pre-fetched the table).
+
+A delegated **codec** request (`NEED_CODEC`) is different, and no longer a
+failure: the write paths service it in place through the session's codec
+hook (`Session::set_codec_hook`), which the native CLI always registers.
+So `COPY`, `CREATE TABLE AS`, and `INSERT ... SELECT` all work over a
+GZIP-compressed Parquet source:
+
+```sql
+CREATE TABLE m AS SELECT id, v FROM 'gzipped.parquet';
+COPY (SELECT id, v FROM 'gzipped.parquet') TO 'out.csv';
+```
+
+A host that registers no hook gets `UnsupportedCodec` — which at least
+names the real problem — rather than the `IoFailed` these statements used
+to report.

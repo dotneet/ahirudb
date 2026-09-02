@@ -17,6 +17,12 @@
 //! **Structural access into the nesting (extracting or expanding elements) is unsupported.**
 //! Needing it would mean adding LIST/STRUCT to the type system.
 //!
+//! ## Lines that are not objects
+//!
+//! NDJSON permits any JSON value per line, not just objects. When the inference sample holds such
+//! a line, the whole file reads as a single VARCHAR column named `json` carrying each line's raw
+//! JSON text -- the shape DuckDB gives the same file.
+//!
 //! ## Type inference
 //!
 //! Looking at up to `SAMPLE_LINES` rows within the leading `SAMPLE_BYTES`, each column widens
@@ -50,6 +56,14 @@ pub struct JsonlFormat {
     resolved: bool,
     total_len: u64,
     split_bytes: u64,
+    /// Set when the sample holds a line whose top-level value is not an object.
+    ///
+    /// NDJSON does not actually require objects -- a line may be any JSON value -- so a file of
+    /// bare scalars or arrays used to be rejected outright with `SyntaxError`. DuckDB instead
+    /// gives the whole file a single column named `json` holding each line's raw JSON text, and so
+    /// does this: one non-object line anywhere in the sample switches the file into that shape
+    /// (object lines then come back as their raw text too, exactly as DuckDB renders them).
+    raw_json: bool,
 }
 
 impl JsonlFormat {
@@ -59,6 +73,7 @@ impl JsonlFormat {
             resolved: false,
             total_len: 0,
             split_bytes: TEXT_SPLIT_BYTES,
+            raw_json: false,
         }
     }
 
@@ -114,6 +129,7 @@ impl TableFormat for JsonlFormat {
         let mut pos = skip_bom(buf);
         let mut lines = 0usize;
         let mut truncated = false;
+        let mut raw = false;
         while pos < buf.len() && lines < SAMPLE_LINES {
             let (line, next, terminated) = next_line(buf, pos);
             pos = next;
@@ -125,6 +141,11 @@ impl TableFormat for JsonlFormat {
                 continue;
             }
             lines += 1;
+            // A line that is not an object puts the whole file into raw-JSON mode (see `raw_json`).
+            if byte_at(line, skip_ws(line, 0))? != b'{' {
+                raw = true;
+                break;
+            }
             let mut it = Members::new(line)?;
             while let Some(m) = it.next()? {
                 let name = member_key(&m, &mut key)?;
@@ -149,9 +170,14 @@ impl TableFormat for JsonlFormat {
         let split_count = self.total_len.div_ceil(self.split_bytes.max(1));
         ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
 
-        // A JSON value can be missing at any time, so every column is nullable.
-        self.schema =
-            names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect();
+        self.raw_json = raw;
+        self.schema = if raw {
+            // One VARCHAR column holding each line's raw JSON text, named as DuckDB names it.
+            vec![Field::new(String::from("json"), Ty::Varchar, true)]
+        } else {
+            // A JSON value can be missing at any time, so every column is nullable.
+            names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect()
+        };
         self.resolved = true;
         Ok(Ok(()))
     }
@@ -250,6 +276,18 @@ impl TableFormat for JsonlFormat {
                 continue;
             }
 
+            if self.raw_json {
+                // The line is still validated as one complete JSON value; only its shape is free.
+                let start = skip_ws(line, 0);
+                let end = skip_value(line, start)?;
+                ensure!(skip_ws(line, end) == line.len(), SyntaxError, end);
+                let body = &line[start..end];
+                for b in builders.iter_mut() {
+                    b.push(Some(Cell::Bytes(body)));
+                }
+                continue;
+            }
+
             for s in slots.iter_mut() {
                 *s = None;
             }
@@ -268,6 +306,11 @@ impl TableFormat for JsonlFormat {
         }
 
         Ok(builders.into_iter().map(|b| b.finish()).collect())
+    }
+
+    /// JSONL carries no schema, so every column type here is a guess from the leading sample.
+    fn schema_is_inferred(&self) -> bool {
+        true
     }
 }
 
@@ -379,9 +422,9 @@ impl Builder {
         }
     }
 
-    /// Both `None` and a physical type mismatch give NULL. Discarding a value of the wrong type is
-    /// because inference comes from a sample and later rows can fall outside (it is not an error).
-    fn push(&mut self, cell: Option<Cell<'_>>) {
+    /// `None` is NULL. A physical type mismatch also lands as NULL here, but the caller
+    /// (`push_member`) turns it into `InvalidCast` -- see there for why.
+    fn push(&mut self, cell: Option<Cell<'_>>) -> bool {
         let ok = match (&mut self.data, &cell) {
             (Data::Bool(d), Some(Cell::Bool(v))) => {
                 d.push(*v);
@@ -417,6 +460,7 @@ impl Builder {
             self.any_null = true;
         }
         self.valid.push(ok);
+        ok
     }
 
     fn finish(self) -> Vector {
@@ -426,6 +470,12 @@ impl Builder {
 }
 
 /// Pushes one member according to the column's type. A missing key (`None`) and `null` are both NULL.
+///
+/// A value that is *present* but does not fit the column's type is `InvalidCast`. The schema comes
+/// from a bounded leading sample (`SAMPLE_BYTES` / `SAMPLE_LINES`), so a later line can genuinely
+/// hold a `2.5` where the sample only ever showed integers -- but silently turning that cell into
+/// NULL loses data the file plainly contains, which is the "silently wrong answer" `docs/DESIGN.md`
+/// §15 says the engine never produces. DuckDB reports the same situation as a conversion error.
 fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -> Result<()> {
     let m = match m {
         Some(m) if m.kind != Kind::Null => m,
@@ -434,7 +484,7 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
             return Ok(());
         }
     };
-    match b.ty {
+    let ok = match b.ty {
         Ty::Boolean => b.push(match m.kind {
             Kind::Bool => Some(Cell::Bool(m.val.first() == Some(&b't'))),
             _ => None,
@@ -460,11 +510,12 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
             Kind::Str => {
                 scratch.clear();
                 decode_string(m.str_body(), scratch)?;
-                b.push(Some(Cell::Bytes(scratch)));
+                b.push(Some(Cell::Bytes(scratch)))
             }
             _ => b.push(Some(Cell::Bytes(m.val))),
         },
-    }
+    };
+    ensure!(ok, InvalidCast);
     Ok(())
 }
 
@@ -959,19 +1010,32 @@ mod tests {
         let cols = read_all("{\"a\":1e3}\n{\"a\":-1.5E-2}\n{\"a\":7}\n");
         assert_eq!(cols[0], [Value::F64(1000.0), Value::F64(-0.015), Value::F64(7.0)]);
 
-        // Inference sees only the sample (SAMPLE_LINES rows). When a row outside it carries a value
-        // of the wrong type, that row alone becomes NULL rather than an error.
+        // Inference sees only the sample (SAMPLE_LINES rows). A row outside it carrying a value of
+        // the wrong type used to become NULL, silently dropping data the file plainly contains; it
+        // is now a clear `InvalidCast`.
+        for tail in ["{\"a\":1.5}", "{\"a\":\"x\"}", "{\"a\":[1]}"] {
+            let mut text = String::new();
+            for _ in 0..SAMPLE_LINES {
+                text.push_str("{\"a\":1}\n");
+            }
+            text.push_str(tail);
+            text.push('\n');
+            let mut f = JsonlFormat::new();
+            let src = Source::from_bytes(text.into_bytes());
+            f.resolve(&src).unwrap().unwrap();
+            assert_eq!(code_of(f.read_split(&src, 0, &[0])), Some(Code::InvalidCast), "{tail}");
+        }
+        // A missing key and an explicit `null` are still NULL, not an error.
         let mut text = String::new();
         for _ in 0..SAMPLE_LINES {
             text.push_str("{\"a\":1}\n");
         }
-        text.push_str("{\"a\":1.5}\n{\"a\":\"x\"}\n{\"a\":[1]}\n{\"a\":2}\n");
+        text.push_str("{}\n{\"a\":null}\n{\"a\":2}\n");
         let cols = read_all(&text);
-        assert_eq!(cols[0].len(), SAMPLE_LINES + 4);
+        assert_eq!(cols[0].len(), SAMPLE_LINES + 3);
         assert_eq!(cols[0][SAMPLE_LINES], Value::Null);
         assert_eq!(cols[0][SAMPLE_LINES + 1], Value::Null);
-        assert_eq!(cols[0][SAMPLE_LINES + 2], Value::Null);
-        assert_eq!(cols[0][SAMPLE_LINES + 3], Value::I64(2));
+        assert_eq!(cols[0][SAMPLE_LINES + 2], Value::I64(2));
     }
 
     // --- Strings ------------------------------------------------------------
@@ -1161,16 +1225,37 @@ mod tests {
     }
 
     #[test]
+    fn non_object_lines_read_as_one_raw_json_column() {
+        // NDJSON permits any JSON value per line. Such a file used to be rejected with
+        // SyntaxError; duckdb gives it a single column named `json` holding each line's raw text.
+        let mut f = JsonlFormat::new();
+        let src = Source::from_bytes(b"1\n[1,2]\n\"s\"\n".to_vec());
+        f.resolve(&src).unwrap().unwrap();
+        assert_eq!(f.schema().len(), 1);
+        assert_eq!(f.schema()[0].name, "json");
+        assert_eq!(f.schema()[0].ty, Ty::Varchar);
+        let cols = read_all("1\n[1,2]\n\"s\"\n");
+        assert_eq!(cols[0], [s("1"), s("[1,2]"), s("\"s\"")]);
+
+        // One non-object line anywhere puts the whole file into that shape, objects included --
+        // duckdb behaves the same way.
+        let cols = read_all("{\"a\":1}\n5\n");
+        assert_eq!(cols[0], [s("{\"a\":1}"), s("5")]);
+
+        // The raw text is still validated as one complete JSON value per line.
+        assert_eq!(read_err("[1,2\n"), Some(Code::UnexpectedEof));
+        assert_eq!(read_err("1 2\n"), Some(Code::SyntaxError));
+    }
+
+    #[test]
     fn malformed_input_is_an_error_not_a_panic() {
         // An unclosed string.
         assert_eq!(read_err("{\"a\":\"abc}\n"), Some(Code::UnexpectedEof));
         // An unclosed object.
         assert_eq!(read_err("{\"a\":1\n"), Some(Code::UnexpectedEof));
         assert_eq!(read_err("{\"a\":{\"b\":1}\n"), Some(Code::UnexpectedEof));
-        // A line that is not an object.
-        assert_eq!(read_err("[1,2,3]\n"), Some(Code::SyntaxError));
-        assert_eq!(read_err("42\n"), Some(Code::SyntaxError));
-        assert_eq!(read_err("\"x\"\n"), Some(Code::SyntaxError));
+        // A line that is not an object is no longer an error -- it puts the file into raw-JSON
+        // mode (see `raw_json` and `non_object_lines_read_as_one_raw_json_column`).
         // Garbage following the close.
         assert_eq!(read_err("{\"a\":1}{\"a\":2}\n"), Some(Code::SyntaxError));
         // A missing separator or colon, and a trailing comma.

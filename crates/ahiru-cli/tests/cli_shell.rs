@@ -612,3 +612,206 @@ fn insert_mode_blob_hex() {
     assert!(r.ok, "{}", r.stderr);
     assert!(r.stdout.contains("X'deadbeef'"), "{}", r.stdout);
 }
+
+// ---- regressions ---------------------------------------------------------
+
+/// Runs the CLI with a deadline, failing the test if it hasn't exited in
+/// time. Used where the bug under test was a *hang*: asserting on the output
+/// alone would just block the suite forever instead of reporting a failure.
+fn run_with_deadline(args: &[&str], deadline: std::time::Duration) -> Run {
+    use std::io::Read;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ahiru"))
+        .arg("-no-init")
+        .args(args)
+        .current_dir(repo_root())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ahiru");
+    // Drain both pipes on their own threads: polling `try_wait` while the
+    // child fills a pipe buffer would deadlock.
+    let mut so = child.stdout.take().expect("no stdout");
+    let mut se = child.stderr.take().expect("no stderr");
+    let out_thread = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b);
+        b
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b);
+        b
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break Some(s),
+            None => {
+                if start.elapsed() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out_thread.join().expect("stdout thread")).into_owned();
+    let stderr = String::from_utf8_lossy(&err_thread.join().expect("stderr thread")).into_owned();
+    let Some(status) = status else {
+        panic!("ahiru {args:?} did not finish within {deadline:?}");
+    };
+    Run { stdout, stderr, ok: status.success() }
+}
+
+/// A separator or dot written as a value literal used to be handed to
+/// `autoregister`, which saw `Path::new("/").is_dir()` and recursively walked
+/// the whole root filesystem — the query never returned.
+#[test]
+fn a_separator_literal_does_not_walk_the_filesystem() {
+    let deadline = std::time::Duration::from_secs(60);
+    for (sql, want) in [
+        ("SELECT '/' AS s", "s\n/\n"),
+        ("SELECT '.' AS s", "s\n.\n"),
+        ("SELECT '..' AS s", "s\n..\n"),
+        ("SELECT replace('a/b', '/', '-') AS s", "s\na-b\n"),
+        ("SELECT replace('a.b', '.', '-') AS s", "s\na-b\n"),
+    ] {
+        let r = run_with_deadline(&["-csv", "-c", sql], deadline);
+        assert!(r.ok, "{sql}: {}", r.stderr);
+        assert_eq!(r.stdout, want, "{sql}");
+    }
+}
+
+/// The counterpart to the test above: a literal that really is in table
+/// position must still auto-register, directory form included.
+#[test]
+fn table_position_literals_still_auto_register() {
+    let r = run(&["-csv", "-c", &format!("SELECT count(*) AS n FROM '{BASIC}'")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "n\n1000\n");
+
+    let r = run(&["-csv", "-c", "SELECT count(*) AS n FROM 'tests/data/hive/'"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.starts_with("n\n"), "{}", r.stdout);
+    let n: usize = r.stdout.lines().nth(1).expect("a row").parse().expect("a count");
+    assert!(n > 0, "expected rows from the hive directory, got {n}");
+
+    // A reader function's first argument is a path; its option values are not.
+    let r = run(&["-csv", "-c", "SELECT count(*) AS n FROM read_csv('tests/data/orders.csv')"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.starts_with("n\n"), "{}", r.stdout);
+}
+
+/// `IS [NOT] DISTINCT FROM` contains the word `FROM`, which the FROM-less
+/// `SELECT` rewrite used to mistake for a real FROM clause.
+#[test]
+fn is_distinct_from_needs_no_from_clause() {
+    for (sql, want) in [
+        ("SELECT 1 IS DISTINCT FROM 2 AS x", "x\ntrue\n"),
+        ("SELECT 1 IS NOT DISTINCT FROM 1 AS x", "x\ntrue\n"),
+    ] {
+        let r = run(&["-csv", "-c", sql]);
+        assert!(r.ok, "{sql}: {}", r.stderr);
+        assert_eq!(r.stdout, want, "{sql}");
+    }
+}
+
+/// The dummy `FROM range(1)` used to be appended on the same line, where a
+/// trailing `--` comment swallowed it.
+#[test]
+fn a_trailing_line_comment_does_not_swallow_the_dummy_from() {
+    let r = run(&["-csv", "-c", "SELECT 1 AS x -- note"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "x\n1\n");
+
+    // Same rewrite, but with a tail clause after the comment.
+    let r = run(&["-csv", "-c", "SELECT 1 AS x -- note\nLIMIT 1"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "x\n1\n");
+
+    // And through stdin, which takes the same path.
+    let r = run_with_stdin(&["-csv"], Some("SELECT 1 AS x -- note\n"));
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "x\n1\n");
+}
+
+/// A `\` in a spec escapes a glob metacharacter, so the spec names a file
+/// that really contains `*` / `?`. That unescaping only happened inside
+/// `glob::expand`, so a non-glob path kept its backslashes and never resolved.
+#[test]
+fn an_escaped_glob_metacharacter_names_a_literal_file() {
+    let dir = tmp_file("escaped_meta", "d");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create dir");
+    std::fs::write(dir.join("star*.csv"), b"v\n7\n").expect("write star file");
+    std::fs::write(dir.join("q?.csv"), b"v\n8\n").expect("write question file");
+
+    let base = dir.display().to_string();
+    // Auto-registration from SQL.
+    let r = run(&["-csv", "-c", &format!("SELECT v FROM '{base}/star\\*.csv'")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n7\n");
+
+    let r = run(&["-csv", "-c", &format!("SELECT v FROM '{base}/q\\?.csv'")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n8\n");
+
+    // And as a command-line file argument.
+    let r = run(&["-csv", "-c", "SELECT v FROM t", &format!("{base}/star\\*.csv")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n7\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `std::io::Error` carries no path, so the failure used to read
+/// "No such file or directory (os error 2)" with no hint which file it meant.
+#[test]
+fn a_missing_file_argument_is_named_in_the_error() {
+    let r = run(&["-c", "SELECT 1", "no/such/file.parquet"]);
+    assert!(!r.ok);
+    assert!(r.stderr.contains("no/such/file.parquet"), "{}", r.stderr);
+}
+
+/// A zero-width combining mark occupies no terminal column, so a boxed cell
+/// holding one must be exactly as wide as the same cell without it.
+#[test]
+fn a_combining_mark_does_not_widen_a_boxed_cell() {
+    let plain = run(&["-box", "-c", "SELECT 'e' AS c"]);
+    assert!(plain.ok, "{}", plain.stderr);
+    let combined = run(&["-box", "-c", "SELECT 'e' || chr(769) AS c"]);
+    assert!(combined.ok, "{}", combined.stderr);
+
+    let borders = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| l.starts_with('\u{250c}') || l.starts_with('\u{2514}'))
+            .map(String::from)
+            .collect()
+    };
+    assert_eq!(borders(&plain.stdout), borders(&combined.stdout), "{}", combined.stdout);
+    assert!(!borders(&combined.stdout).is_empty(), "{}", combined.stdout);
+}
+
+/// `-maxrows` only ever truncated `duckbox`, but the help text promised
+/// "boxed modes".
+#[test]
+fn maxrows_help_matches_its_behavior() {
+    let r = run(&["--help"]);
+    assert!(r.ok);
+    assert!(r.stdout.contains("-maxrows"), "{}", r.stdout);
+    assert!(r.stdout.contains("duckbox mode before eliding"), "{}", r.stdout);
+
+    // `box` really does ignore `-maxrows`, while `duckbox` honours it.
+    let sql = "SELECT range AS x FROM range(6)";
+    let boxed = run(&["-box", "-maxrows", "2", "-c", sql]);
+    assert!(boxed.ok, "{}", boxed.stderr);
+    assert_eq!(boxed.stdout.matches('\u{2502}').count() / 2, 7, "{}", boxed.stdout);
+
+    let duck = run(&["-duckbox", "-maxrows", "2", "-c", sql]);
+    assert!(duck.ok, "{}", duck.stderr);
+    assert!(duck.stdout.contains('\u{b7}'), "duckbox should elide: {}", duck.stdout);
+}

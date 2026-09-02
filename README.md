@@ -26,8 +26,8 @@ JSON path operators, lambdas, regular expressions.
 
 | Build | raw | gzip -9 | of 1 MiB budget |
 |---|---:|---:|---:|
-| Parquet only, ZSTD included (default) | 450.3 KiB | 197.9 KiB | 44.0% |
-| Plus CSV + JSONL + JSON (everything read-side) | 477.9 KiB | 209.8 KiB | **46.7%** |
+| Parquet only, ZSTD included (default) | 538.1 KiB | 232.8 KiB | 52.5% |
+| Plus CSV + JSONL + JSON (everything read-side) | 568.3 KiB | 246.2 KiB | **55.5%** |
 
 Measured by [`./scripts/size.sh`](scripts/size.sh) with `wasm-opt`. CI fails the
 build if the fully-loaded configuration exceeds 1 MiB.

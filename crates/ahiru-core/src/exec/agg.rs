@@ -104,6 +104,10 @@ struct State {
     mean: f64,
     /// The Welford accumulator for StdDev/Variance (the sum of squared deviations, M2).
     m2: f64,
+    /// The Neumaier compensation term for SUM/AVG over DOUBLE: the low-order
+    /// bits repeatedly lost when the running total in `acc` is rounded. Added
+    /// back exactly once, on output. Left at 0.0 for every other operation.
+    comp: f64,
     /// The non-NULL values Median/Quantile hold until output.
     median_vals: Vec<f64>,
     /// Mode's current highest vote count.
@@ -120,6 +124,7 @@ impl State {
             acc: Value::Null,
             mean: 0.0,
             m2: 0.0,
+            comp: 0.0,
             median_vals: Vec::new(),
             mode_best: 0,
             key: Value::Null,
@@ -530,11 +535,14 @@ impl HashAggregate {
             }
             Op::SumF64 | Op::AvgF64 => {
                 let x = as_f64(col, row)?;
-                let sum = match &st.acc {
-                    Value::F64(s) => s + x,
-                    _ => x,
-                };
-                st.acc = Value::F64(sum);
+                match &st.acc {
+                    Value::F64(s) => {
+                        let (sum, comp) = neumaier_add(*s, st.comp, x);
+                        st.acc = Value::F64(sum);
+                        st.comp = comp;
+                    }
+                    _ => st.acc = Value::F64(x),
+                }
             }
             Op::Min | Op::Max => {
                 let take = match &st.acc {
@@ -691,8 +699,16 @@ impl HashAggregate {
                 Value::I64(c) => out.push_value(&Value::I64(*c)),
                 _ => out.push_value(&Value::I64(0)),
             },
+            // The compensation term is folded back in exactly once, here.
+            Op::SumF64 => {
+                let st = &self.states[ai][g];
+                match &st.acc {
+                    Value::F64(s) => out.push_value(&Value::F64(compensated(*s, st.comp))),
+                    // No non-NULL input: the group's SUM is NULL.
+                    acc => out.push_value(acc),
+                }
+            }
             Op::SumInt
-            | Op::SumF64
             | Op::Min
             | Op::Max
             | Op::StringAgg
@@ -718,7 +734,9 @@ impl HashAggregate {
             Op::AvgF64 => {
                 let st = &self.states[ai][g];
                 match &st.acc {
-                    Value::F64(s) if st.n > 0 => out.push_value(&Value::F64(s / st.n as f64)),
+                    Value::F64(s) if st.n > 0 => {
+                        out.push_value(&Value::F64(compensated(*s, st.comp) / st.n as f64))
+                    }
                     _ => out.push_null(),
                 }
             }
@@ -865,6 +883,49 @@ fn as_f64(col: &Vector, row: usize) -> Result<f64> {
     })
 }
 
+/// `|x|`. `core` has no `f64::abs` (it lives in libm alongside `sqrt`, see
+/// `f_sqrt`), and clearing the sign bit is exact for every input including
+/// zeros, infinities and NaN.
+fn fabs(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() & !(1u64 << 63))
+}
+
+/// One Neumaier-compensated addition: returns the new running total and the
+/// new compensation term.
+///
+/// Adding f64s naively loses the low-order bits of every intermediate sum, so
+/// `SUM(0.1)` over ten rows lands on 0.9999999999999999 instead of 1.0.
+/// Neumaier's variant of Kahan summation recovers those bits by computing the
+/// exact rounding error of each addition and carrying it in `comp`, which the
+/// caller folds back in once at output ([`compensated`]). It costs three extra
+/// flops and one comparison per row -- cheap enough to be unconditional --
+/// and, unlike plain Kahan, stays correct when a single value is much larger
+/// than the running total.
+///
+/// A non-finite correction (`sum` and `x` are both infinite, or the total just
+/// overflowed) is dropped rather than carried: `inf - inf` is NaN, and letting
+/// that into `comp` would poison an otherwise well-defined infinite sum.
+pub(super) fn neumaier_add(sum: f64, comp: f64, x: f64) -> (f64, f64) {
+    let t = sum + x;
+    // Subtract the larger magnitude from the total first; that difference is
+    // exact, so what remains is precisely the bits `t` could not represent.
+    let c = if fabs(sum) >= fabs(x) { (sum - t) + x } else { (x - t) + sum };
+    (t, if c.is_finite() { comp + c } else { comp })
+}
+
+/// Applies a compensation term to a running total.
+///
+/// A zero compensation is skipped rather than added, so a sum of nothing but
+/// negative zeros stays `-0.0` instead of being flipped to `0.0` by
+/// `-0.0 + 0.0` (`SUM` over floats otherwise matches `duckdb` on signed zero).
+pub(super) fn compensated(sum: f64, comp: f64) -> f64 {
+    if comp == 0.0 {
+        sum
+    } else {
+        sum + comp
+    }
+}
+
 /// Compares row `row` of a column with the accumulated value. A physical type mismatch is a caller bug.
 fn cmp_at(col: &Vector, row: usize, acc: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
@@ -977,7 +1038,7 @@ fn push_int_text(out: &mut Vec<u8>, v: i128, scale: u8) {
 
 /// A simple decimal rendering of f64. Rounded to 15 significant digits with trailing zeros
 /// dropped. A full CAST-grade round-trippable representation is unnecessary (this is only for
-/// ArrayAgg's display), so it is not built as rigorously as `expr::kernels::fmt_f64` (which is private and uncallable).
+/// ArrayAgg's display), so it is not built as rigorously as `expr::kernels::fmt_f64`.
 fn push_f64_text(out: &mut Vec<u8>, x: f64) {
     if x.is_nan() {
         out.extend_from_slice(b"NaN");

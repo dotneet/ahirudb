@@ -22,7 +22,7 @@ pub fn render(v: &Value, ty: Ty, null: &str) -> String {
         Value::I64(x) => fmt_scaled(*x as i128, ty),
         Value::I128(x) if ty == Ty::Interval => fmt_interval_value(*x),
         Value::I128(x) => fmt_scaled(*x, ty),
-        Value::F64(x) => x.to_string(),
+        Value::F64(x) => fmt_double(*x),
         Value::Bytes(b) if ty == Ty::Uuid => fmt_uuid(b),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             Ok(s) => s.to_string(),
@@ -49,6 +49,20 @@ pub fn is_numeric(ty: Ty) -> bool {
             | Double
             | Decimal { .. }
     )
+}
+
+/// A DOUBLE, spelled exactly as `CAST(<double> AS VARCHAR)` spells it.
+///
+/// Rust's `Display` for `f64` is also shortest-round-trip, but it never switches to
+/// exponential notation, so `1e30` came out as `1000000000000000000000000000000` in a
+/// result table while the same value cast to VARCHAR (or exported to CSV/JSONL) came
+/// out as `1e+30`. Going through the engine's own formatter makes every CLI output
+/// mode agree with the cast and with the writers, since all of them share one
+/// implementation.
+fn fmt_double(x: f64) -> String {
+    let mut out = Vec::new();
+    ahiru_core::expr::kernels::fmt_f64(x, &mut out);
+    String::from_utf8(out).unwrap_or_default()
 }
 
 fn fmt_interval_value(packed: i128) -> String {

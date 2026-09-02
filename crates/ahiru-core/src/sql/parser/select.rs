@@ -610,7 +610,7 @@ impl<'a> Parser<'a> {
         let alias = if self.eat_kw(Kw::As)? {
             Some(match self.cur {
                 Tok::Str(_) => self.string_lit()?,
-                _ => self.ident()?,
+                _ => self.alias_after_as()?,
             })
         } else {
             self.opt_alias()?
@@ -1007,11 +1007,11 @@ impl<'a> Parser<'a> {
         self.bump()?; // PIVOT
         let from = self.parse_from_item()?;
         self.expect_kw(Kw::On)?;
-        // We want to stop just before `IN (...)`, so the `IN` predicate (of the same binding
-        // power as comparison) is not swallowed (nothing below `BP_CMP + 1` is combined).
+        // We want to stop just before `IN (...)`, so the `IN` predicate (which binds at
+        // `BP_PRED`) is not swallowed (nothing below `BP_PRED + 1` is combined).
         // Multiple columns as in `ON a, b` are unsupported -- the comma is left over, so it
         // matches neither IN nor USING afterwards and naturally becomes a syntax error.
-        let on = self.expr_bp(BP_CMP + 1)?;
+        let on = self.expr_bp(BP_PRED + 1)?;
         let in_list = if self.eat_kw(Kw::In)? {
             self.expect(Tok::LParen)?;
             let mut vals = Vec::new();

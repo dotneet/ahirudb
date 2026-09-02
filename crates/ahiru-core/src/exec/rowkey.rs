@@ -42,9 +42,13 @@ pub fn encode_key(cols: &[&Vector], row: usize, out: &mut Vec<u8>) {
 
 /// Normalizes a floating-point bit representation.
 ///
-/// `-0.0` and `0.0` are the same value and belong in the same group. NaN is always false under
-/// comparison operators, but grouping collapses them into one (the same behavior as DuckDB).
-/// Using the raw bits as the key would split those two into separate groups.
+/// `-0.0` and `0.0` are the same value and belong in the same group, and all NaNs collapse into
+/// one (the same behavior as DuckDB). Using the raw bits as the key would split both of those
+/// into separate groups.
+///
+/// This is the same equality `expr::kernels::cmp_f64` implements for `=` — floating point
+/// compares under a total order there, so an equi-join and the `=` predicate the planner might
+/// use instead can never disagree about a NaN key.
 #[inline]
 pub fn canonical_f64(v: f64) -> u64 {
     if v.is_nan() {
@@ -77,7 +81,9 @@ pub fn pow10(scale: u8) -> f64 {
 /// That way MAX returns NaN only when there is no other value, and MIN prefers anything but NaN
 /// (only an all-NaN group gives NaN). It does not contradict `encode_key`/`canonical_f64`
 /// collapsing NaN into one group.
-/// Shared by the MIN/MAX-family aggregates in `exec::agg`/`exec::window`.
+/// Shared by the MIN/MAX-family aggregates in `exec::agg`/`exec::window`, and by
+/// `expr::kernels::cmp_f64`, which is what makes `=` agree with an equi-join on a NaN key.
+#[inline]
 pub fn ord_f64(a: f64, b: f64) -> core::cmp::Ordering {
     use core::cmp::Ordering::*;
     if a < b {

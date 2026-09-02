@@ -422,6 +422,31 @@ fn is_ident_cont(c: u8) -> bool {
     is_ident_start(c) || c.is_ascii_digit()
 }
 
+/// Scans one run of digits starting at `i`, accepting `_` separators that sit
+/// between two digits, and returns the index just past the run. See `Lexer::number`
+/// for the rule and the `duckdb` measurements behind it.
+///
+/// The "preceded by a digit" half of the test looks at `b[i - 1]`, which is correct
+/// for every caller: a run starts either at the first byte of the literal (where
+/// `i == 0` short-circuits, or the previous byte belongs to an earlier token and is
+/// not a digit, since a digit there would have been part of this literal) or right
+/// after a `.`/`e`/sign, none of which is a digit.
+fn digit_run(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() {
+        // A separator only continues the run when a digit sits on both sides of it.
+        let separator = b[i] == b'_'
+            && i > 0
+            && b[i - 1].is_ascii_digit()
+            && i + 1 < b.len()
+            && b[i + 1].is_ascii_digit();
+        if !(b[i].is_ascii_digit() || separator) {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
         Lexer { src, pos: 0 }
@@ -477,6 +502,17 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The source text of the token most recently returned by [`Lexer::next_token`],
+    /// given that token's start offset (`Token::pos`).
+    ///
+    /// `self.pos` is the scan cursor, which sits exactly at the end of that token
+    /// (trivia is skipped at the *start* of `next_token`, never after a token), so the
+    /// slice is the token's own spelling. Used to recover a reserved word's original
+    /// spelling when the parser accepts one as an alias right after `AS`.
+    pub(crate) fn text_from(&self, start: usize) -> &'a str {
+        &self.src[start..self.pos]
+    }
+
     pub fn next_token(&mut self) -> Result<Token<'a>> {
         self.skip_trivia()?;
         let b = self.b();
@@ -485,7 +521,13 @@ impl<'a> Lexer<'a> {
             return Ok(Token { tok: Tok::Eof, pos: start });
         }
         let c = b[start];
-        let tok = if c.is_ascii_digit() {
+        // `.5` is a float literal, `.` alone is the qualification/struct-field
+        // separator (`t.c`, `s.field`). One byte of lookahead is all that separates
+        // them, and it is the same rule PostgreSQL and DuckDB use, so a `.` directly
+        // followed by a digit is never a separator (`t.5` is a syntax error there too).
+        let tok = if c.is_ascii_digit()
+            || (c == b'.' && start + 1 < b.len() && b[start + 1].is_ascii_digit())
+        {
             self.number()
         } else if c == b'\'' {
             self.quoted(b'\'')?
@@ -514,20 +556,28 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A numeric literal. `self.pos` is either an ASCII digit or the `.` of a
+    /// leading-dot float (`.5`); `next_token` is what settles that.
+    ///
+    /// Underscore digit separators (`1_000`) are accepted with DuckDB's rule: an
+    /// underscore is part of the number only when it sits **between two digits**.
+    /// Leading, trailing and doubled underscores, and underscores next to the
+    /// decimal point or the exponent marker, all end the number instead — the rest
+    /// then lexes as a separate identifier, exactly as DuckDB does (confirmed with
+    /// the `duckdb` CLI: `1__0`, `100_`, `1._5`, `1_e5` and `1e_5` all answer `1`
+    /// or `100`, i.e. a literal plus an implicit alias, while `1_000`, `1_0_0`,
+    /// `1.0_5` and `1e1_0` are single numbers).
+    ///
+    /// The returned slice keeps its underscores; `int_literal`/`float_literal`/
+    /// `Parser::uint` skip them while converting, so lexing stays allocation-free.
     fn number(&mut self) -> Tok<'a> {
         let b = self.b();
         let start = self.pos;
-        let mut i = start;
         let mut is_float = false;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
+        let mut i = digit_run(b, start);
         if i < b.len() && b[i] == b'.' {
             is_float = true;
-            i += 1;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
+            i = digit_run(b, i + 1);
         }
         if i < b.len() && (b[i] | 0x20) == b'e' {
             // An exponent needs at least one digit. Without one, everything from `e` on is a separate token.
@@ -536,10 +586,7 @@ impl<'a> Lexer<'a> {
                 j += 1;
             }
             if j < b.len() && b[j].is_ascii_digit() {
-                while j < b.len() && b[j].is_ascii_digit() {
-                    j += 1;
-                }
-                i = j;
+                i = digit_run(b, j);
                 is_float = true;
             }
         }

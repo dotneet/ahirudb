@@ -215,9 +215,21 @@ SELECT list_transform(json_array(1, 2, 3), x -> x + id) FROM t;
 -- error: ColumnNotFound -- `id` isn't visible inside the lambda body
 ```
 
-Because list elements are `JSON`-typed text, arithmetic on them needs an
-explicit round-trip cast (`CAST(CAST(x AS VARCHAR) AS INTEGER)`); this is
-the single most common idiom you'll see in lambda bodies:
+A **string** element is bound as plain `VARCHAR`, with its JSON quotes
+already stripped, so string functions work on it directly and
+`CAST(x AS VARCHAR)` gives `a`, not `"a"`:
+
+```sql
+SELECT list_filter(json_array('a', 'bb'), x -> length(CAST(x AS VARCHAR)) = 1);
+-- '["a"]'  (length is 1, not 3)
+SELECT list_transform(json_array('a', 'b'), x -> upper(CAST(x AS VARCHAR)));
+-- '["A","B"]'
+```
+
+The round-trip caveat applies to **numbers**: a numeric element is still
+`JSON`-typed text, so arithmetic on it needs an explicit
+`CAST(CAST(x AS VARCHAR) AS INTEGER)`. This is the single most common
+idiom you'll see in lambda bodies:
 
 ```sql
 -- list_transform: map each element

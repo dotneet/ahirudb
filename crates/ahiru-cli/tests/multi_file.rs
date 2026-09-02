@@ -110,22 +110,28 @@ fn multi_file_union_rows_match_duckdb() {
 }
 
 /// The Hive partition columns (`year`, `month`) appear in the schema, and
-/// `WHERE year = 2024 AND month = 1` returns only the rows of the matching files.
+/// `WHERE year = 2024 AND month = '01'` returns only the rows of the matching files.
+///
+/// `month` is VARCHAR, not an integer: the directories spell it `month=01`, and a zero-padded
+/// value read as a number would come back as `1` and lose its padding (DuckDB keeps `01` too).
+/// `year=2024` has no padding and stays INTEGER, so a typed integer comparison still works there.
 #[test]
 fn hive_partition_columns_are_queryable_and_filterable() {
     let all = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t");
     assert_eq!(body(all), vec![vec!["1000".to_string()]]);
 
-    let jan24 = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2024 AND month = 1");
+    let jan24 = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2024 AND month = '01'");
     assert_eq!(body(jan24), vec![vec!["300".to_string()]]);
 
-    let feb24 = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2024 AND month = 2");
+    let feb24 = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2024 AND month = '02'");
     assert_eq!(body(feb24), vec![vec!["400".to_string()]]);
 
     let y25 = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2025");
     assert_eq!(body(y25), vec![vec!["300".to_string()]]);
 
-    // The values themselves are right too.
+    // The values themselves are right too. (`normalize_cell` reads a numeric-looking cell as a
+    // number, so the padding of `01` is not visible here; that the VARCHAR value keeps its zero
+    // is checked directly in `format::partitioned`'s unit tests.)
     let rows = run_ahiru_multi(&HIVE, "SELECT year, month FROM t WHERE id = 0");
     assert_eq!(body(rows), vec![vec!["2024".to_string(), "1".to_string()]]);
 }
@@ -138,7 +144,7 @@ fn hive_partition_filter_matches_duckdb() {
         return;
     }
     let glob = repo_path("tests/data/hive/*/*/*.parquet");
-    let ahiru = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2024 AND month = 1");
+    let ahiru = run_ahiru_multi(&HIVE, "SELECT count(*) FROM t WHERE year = 2024 AND month = '01'");
     let duckdb = run_duckdb(&format!(
         "SELECT count(*) FROM read_parquet('{glob}', hive_partitioning=true) WHERE year=2024 AND month=1"
     ));

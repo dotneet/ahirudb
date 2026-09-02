@@ -211,6 +211,11 @@ impl TableFormat for JsonFormat {
 
         Ok(builders.into_iter().map(|b| b.finish()).collect())
     }
+
+    /// JSON carries no schema, so every column type here is a guess from the leading sample.
+    fn schema_is_inferred(&self) -> bool {
+        true
+    }
 }
 
 // --- Schema inference ----------------------------------------------------------

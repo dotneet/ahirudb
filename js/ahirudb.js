@@ -149,8 +149,16 @@ function decodeUtf8(bytes, what) {
 
 /** Turns a TIMESTAMP (microseconds since the epoch, BigInt) into a `Date`. */
 export function timestampToDate(micros) {
-  // Date has millisecond precision, so the sub-millisecond remainder is dropped here.
-  return dateFromMillis(toExactIntegerBigInt(micros, 'timestamp microseconds') / 1000n, 'timestamp');
+  // Date has millisecond precision, so the sub-millisecond remainder is dropped
+  // here. BigInt division truncates toward zero, which for a negative instant
+  // would round *up* (-999us -> 0ms, i.e. forward in time); floor instead so the
+  // result is always the millisecond that contains the instant.
+  const exact = toExactIntegerBigInt(micros, 'timestamp microseconds');
+  let millis = exact / 1000n;
+  if (exact < 0n && exact % 1000n !== 0n) {
+    millis -= 1n;
+  }
+  return dateFromMillis(millis, 'timestamp');
 }
 
 /** Turns a DATE (days since the epoch, number) into a UTC `Date`. */

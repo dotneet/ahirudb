@@ -179,8 +179,13 @@ pub(crate) fn drop_view(session: &mut Session, name: &str, if_exists: bool) -> R
 /// Runs a `SELECT` to completion without resuming and extracts the result as rows.
 /// Used by both `CREATE TABLE AS` and `INSERT INTO ... SELECT` (`dml`).
 ///
-/// **Not resumable**: see the module docs. A `NEED_IO`/`NEED_CODEC` during schema
-/// resolution or scanning gives `IoFailed`.
+/// **Not resumable across the host boundary**: this runs to completion inside
+/// `Session::prepare`, so a `NEED_IO` (bytes that were never fetched) gives
+/// `IoFailed`. A `NEED_CODEC` is different — the compressed bytes are already
+/// in memory and only need inflating, so it is serviced in place through the
+/// session's [`Session::set_codec_hook`] hook, the same way the host services
+/// it between two `step` calls. Without a hook registered it is reported as
+/// `UnsupportedCodec`.
 pub(crate) fn run_query_to_rows(
     session: &mut Session,
     arena: &ExprArena,
@@ -210,14 +215,19 @@ pub(crate) fn run_query_to_rows(
             io: Vec::new(),
             codec: Vec::new(),
         };
-        match op.next(&mut ctx)? {
+        let step = op.next(&mut ctx)?;
+        // Ends the `&mut session` borrow held by `ctx` so the codec arm below
+        // can hand the requests back to the session.
+        let pending = core::mem::take(&mut ctx.codec);
+        match step {
             Step::Ready(mut b) => {
                 b.materialize();
                 for r in 0..b.num_rows() {
                     rows.push(b.cols.iter().map(|c| c.value_at(r)).collect());
                 }
             }
-            Step::NeedIo | Step::NeedCodec => err!(IoFailed),
+            Step::NeedIo => err!(IoFailed),
+            Step::NeedCodec => session.service_codec(&pending)?,
             Step::Done => break,
         }
     }

@@ -12,14 +12,15 @@
 //!
 //! ## Supported syntax (anything else gives `Err(UnsupportedFeature)` or `Err(SyntaxError)`)
 //!
-//! - Literal characters (**byte-wise**. Unlike `upper`/`lower` and friends it is unaware of
-//!   UTF-8 code points. A multi-byte character is treated as an exact byte-sequence match, so it
-//!   works fine as a literal, but note that `.` matches "one byte").
-//! - `.` (any single byte other than a newline)
+//! - Literal characters (**per UTF-8 scalar value**. Both the pattern and the subject are decoded
+//!   as UTF-8, so a multi-byte character is one unit of matching, exactly as in `upper`/`lower`)
+//! - `.` (any single character other than a newline)
 //! - `*` `+` `?` (greedy quantifiers)
 //! - `{n}` `{n,}` `{n,m}` (bounded repetition. As in RE2, DuckDB's internal engine, `n` and `m`
 //!   go up to 1000)
-//! - Character classes `[abc]` `[^abc]`, ranges `[a-z]`, and the shorthands `\d \D \w \W \s \S`
+//! - Character classes `[abc]` `[^abc]`, ranges `[a-z]`, the shorthands `\d \D \w \W \s \S`, and
+//!   the POSIX names `[[:alpha:]]` and friends (see `posix_class`). Class members are code points,
+//!   so `[^a]` matches one whole multi-byte character rather than one of its bytes.
 //! - Anchors `^` `$` (no `(?m)`-style multiline. `^` matches only the start of the input and `$`
 //!   only its end)
 //! - Alternation `|`
@@ -102,63 +103,223 @@ const MAX_REPEAT: u32 = 1000;
 const MAX_STEPS: u32 = 8_000_000;
 
 // ============================================================================
+// UTF-8 decoding
+// ============================================================================
+
+/// The largest Unicode scalar value.
+const MAX_CP: u32 = 0x10_FFFF;
+
+/// Decodes the UTF-8 scalar value starting at `s[i]` and returns `(code point, byte width)`.
+///
+/// Both the pattern and the subject go through this, so matching always advances by whole
+/// characters and can never cut a well-formed sequence in half (which is what used to let
+/// `regexp_replace` emit strings that were not valid UTF-8).
+///
+/// A byte that does not begin a well-formed sequence (only possible on input that was not valid
+/// UTF-8 to begin with) is reported as a one-byte scalar equal to the byte itself. That keeps the
+/// simulation advancing and keeps every match boundary on a byte the input already had, rather
+/// than inventing one.
+///
+/// Callers must ensure `i < s.len()`.
+fn decode_utf8(s: &[u8], i: usize) -> (u32, usize) {
+    let b0 = s[i];
+    if b0 < 0x80 {
+        return (b0 as u32, 1);
+    }
+    let cont = |k: usize| -> Option<u32> {
+        match s.get(i + k) {
+            Some(&b) if b & 0xC0 == 0x80 => Some((b & 0x3F) as u32),
+            _ => None,
+        }
+    };
+    // 0xC0/0xC1 are excluded: they could only encode an overlong form.
+    if (0xC2..0xE0).contains(&b0) {
+        if let Some(c1) = cont(1) {
+            return ((((b0 & 0x1F) as u32) << 6) | c1, 2);
+        }
+    } else if (0xE0..0xF0).contains(&b0) {
+        if let (Some(c1), Some(c2)) = (cont(1), cont(2)) {
+            let cp = (((b0 & 0x0F) as u32) << 12) | (c1 << 6) | c2;
+            // Reject overlong forms and the UTF-16 surrogate range.
+            if cp >= 0x800 && !(0xD800..0xE000).contains(&cp) {
+                return (cp, 3);
+            }
+        }
+    } else if (0xF0..0xF5).contains(&b0) {
+        if let (Some(c1), Some(c2), Some(c3)) = (cont(1), cont(2), cont(3)) {
+            let cp = (((b0 & 0x07) as u32) << 18) | (c1 << 12) | (c2 << 6) | c3;
+            if (0x1_0000..=MAX_CP).contains(&cp) {
+                return (cp, 4);
+            }
+        }
+    }
+    (b0 as u32, 1)
+}
+
+/// The byte width of the character starting at `s[i]` (`decode_utf8` without the code point).
+fn char_width(s: &[u8], i: usize) -> usize {
+    decode_utf8(s, i).1
+}
+
+// ============================================================================
 // Character classes
 // ============================================================================
 
-/// Holds a set of the 256 byte values as a bitmask. Ranges, negation, and union all take
-/// fixed-length loops, so the amount of code does not grow with the pattern's size.
-#[derive(Clone, Copy)]
-struct ClassSet([u64; 4]);
+/// A set of Unicode scalar values.
+///
+/// ASCII (which is what patterns overwhelmingly use) is a plain 128-bit mask, and everything above
+/// it is a short list of sorted, disjoint, non-adjacent inclusive ranges. Keeping the two halves
+/// apart is what makes negation cheap: `[^a]` must cover all 1.1M code points, which no bitmap
+/// this crate can afford would.
+#[derive(Clone, Default)]
+struct ClassSet {
+    /// Membership of `0..=0x7F`.
+    ascii: [u64; 2],
+    /// Membership of `0x80..=MAX_CP`, sorted and merged.
+    hi: Vec<(u32, u32)>,
+}
 
 impl ClassSet {
     fn new() -> Self {
-        ClassSet([0; 4])
+        ClassSet { ascii: [0; 2], hi: Vec::new() }
     }
 
-    fn set(&mut self, b: u8) {
-        self.0[(b >> 6) as usize] |= 1u64 << (b & 63);
+    fn set(&mut self, cp: u32) {
+        self.set_range(cp, cp);
     }
 
-    fn set_range(&mut self, lo: u8, hi: u8) {
+    fn set_range(&mut self, lo: u32, hi: u32) {
+        if lo > hi {
+            return;
+        }
         let mut b = lo;
-        loop {
-            self.set(b);
-            if b == hi {
-                break;
-            }
+        while b <= hi && b < 0x80 {
+            self.ascii[(b >> 6) as usize] |= 1u64 << (b & 63);
             b += 1;
         }
+        if hi >= 0x80 {
+            self.add_hi(lo.max(0x80), hi.min(MAX_CP));
+        }
+    }
+
+    /// Inserts `lo..=hi` (both `>= 0x80`) into `hi`, merging with any range it touches so the list
+    /// stays sorted, disjoint and non-adjacent. Linear rather than binary, since a class holds a
+    /// handful of ranges at most.
+    fn add_hi(&mut self, lo: u32, hi: u32) {
+        if lo > hi {
+            return;
+        }
+        let mut i = 0;
+        while i < self.hi.len() && self.hi[i].1 + 1 < lo {
+            i += 1;
+        }
+        let (mut nlo, mut nhi) = (lo, hi);
+        while i < self.hi.len() && self.hi[i].0 <= nhi + 1 {
+            nlo = nlo.min(self.hi[i].0);
+            nhi = nhi.max(self.hi[i].1);
+            self.hi.remove(i);
+        }
+        self.hi.insert(i, (nlo, nhi));
     }
 
     fn negate(&mut self) {
-        for w in self.0.iter_mut() {
-            *w = !*w;
+        self.ascii[0] = !self.ascii[0];
+        self.ascii[1] = !self.ascii[1];
+        let mut out = Vec::with_capacity(self.hi.len() + 1);
+        let mut next = 0x80u32;
+        for &(lo, hi) in &self.hi {
+            if lo > next {
+                out.push((next, lo - 1));
+            }
+            next = hi + 1;
         }
+        if next <= MAX_CP {
+            out.push((next, MAX_CP));
+        }
+        self.hi = out;
     }
 
     fn union(&mut self, other: &ClassSet) {
-        for i in 0..4 {
-            self.0[i] |= other.0[i];
+        self.ascii[0] |= other.ascii[0];
+        self.ascii[1] |= other.ascii[1];
+        for &(lo, hi) in &other.hi {
+            self.add_hi(lo, hi);
         }
     }
 
-    fn test(&self, b: u8) -> bool {
-        (self.0[(b >> 6) as usize] >> (b & 63)) & 1 != 0
+    fn test(&self, cp: u32) -> bool {
+        if cp < 0x80 {
+            return (self.ascii[(cp >> 6) as usize] >> (cp & 63)) & 1 != 0;
+        }
+        self.hi.iter().any(|&(lo, hi)| cp >= lo && cp <= hi)
     }
 }
 
 fn digit_set() -> ClassSet {
     let mut s = ClassSet::new();
-    s.set_range(b'0', b'9');
+    s.set_range(b'0' as u32, b'9' as u32);
     s
 }
 
 fn word_set() -> ClassSet {
     let mut s = digit_set();
-    s.set_range(b'a', b'z');
-    s.set_range(b'A', b'Z');
-    s.set(b'_');
+    s.set_range(b'a' as u32, b'z' as u32);
+    s.set_range(b'A' as u32, b'Z' as u32);
+    s.set(b'_' as u32);
     s
+}
+
+/// The POSIX bracket-expression classes (`[[:alpha:]]` and friends).
+///
+/// All of them are ASCII-only, matching RE2 (which is what DuckDB uses) with no Unicode tables:
+/// `duckdb -c "select regexp_matches('é','[[:alpha:]]')"` is false. That is also why they cost
+/// almost nothing in wasm size, so supporting them beats erroring on them — the previous behavior
+/// silently reinterpreted `[[:alpha:]]` as the ordinary set `[:alph]` followed by a literal `]`,
+/// which is the one failure mode this module is written to avoid.
+fn posix_class(name: &[u8]) -> Option<ClassSet> {
+    let mut s = ClassSet::new();
+    let alpha = |s: &mut ClassSet| {
+        s.set_range(b'a' as u32, b'z' as u32);
+        s.set_range(b'A' as u32, b'Z' as u32);
+    };
+    let digit = |s: &mut ClassSet| s.set_range(b'0' as u32, b'9' as u32);
+    let punct = |s: &mut ClassSet| {
+        s.set_range(0x21, 0x2F);
+        s.set_range(0x3A, 0x40);
+        s.set_range(0x5B, 0x60);
+        s.set_range(0x7B, 0x7E);
+    };
+    match name {
+        b"alpha" => alpha(&mut s),
+        b"digit" => digit(&mut s),
+        b"alnum" => {
+            alpha(&mut s);
+            digit(&mut s);
+        }
+        b"upper" => s.set_range(b'A' as u32, b'Z' as u32),
+        b"lower" => s.set_range(b'a' as u32, b'z' as u32),
+        b"space" => s.union(&space_set()),
+        b"blank" => {
+            s.set(b' ' as u32);
+            s.set(b'\t' as u32);
+        }
+        b"punct" => punct(&mut s),
+        b"xdigit" => {
+            digit(&mut s);
+            s.set_range(b'a' as u32, b'f' as u32);
+            s.set_range(b'A' as u32, b'F' as u32);
+        }
+        b"word" => s.union(&word_set()),
+        b"cntrl" => {
+            s.set_range(0x00, 0x1F);
+            s.set(0x7F);
+        }
+        b"ascii" => s.set_range(0x00, 0x7F),
+        b"graph" => s.set_range(0x21, 0x7E),
+        b"print" => s.set_range(0x20, 0x7E),
+        _ => return None,
+    }
+    Some(s)
 }
 
 /// RE2's `\s` is `[\t\n\f\r ]` (it does not include `\v`). Confirmed by measuring through DuckDB
@@ -166,7 +327,7 @@ fn word_set() -> ClassSet {
 fn space_set() -> ClassSet {
     let mut s = ClassSet::new();
     for &b in &[b' ', b'\t', b'\n', 0x0c, b'\r'] {
-        s.set(b);
+        s.set(b as u32);
     }
     s
 }
@@ -177,7 +338,8 @@ fn space_set() -> ClassSet {
 
 enum Ast {
     Empty,
-    Char(u8),
+    /// One literal Unicode scalar value.
+    Char(u32),
     Any,
     Class(ClassSet),
     Concat(Vec<Ast>),
@@ -358,8 +520,11 @@ impl<'a> Parser<'a> {
             // Reaching here means a `{` at the head of an atom, with nothing to apply to, so
             // treating it as a literal is always right).
             _ => {
-                self.i += 1;
-                Ok(Ast::Char(c))
+                // A multi-byte character is one atom, so that a quantifier after it applies to the
+                // whole character rather than to its last byte.
+                let (cp, w) = decode_utf8(self.s, self.i);
+                self.i += w;
+                Ok(Ast::Char(cp))
             }
         }
     }
@@ -402,7 +567,7 @@ impl<'a> Parser<'a> {
         self.i += 1;
         Ok(match c {
             b'.' | b'*' | b'+' | b'?' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'|' | b'^'
-            | b'$' | b'\\' => Ast::Char(c),
+            | b'$' | b'\\' => Ast::Char(c as u32),
             b'd' => Ast::Class(digit_set()),
             b'D' => {
                 let mut s = digit_set();
@@ -427,6 +592,39 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Reads a POSIX bracket expression `[:name:]` (or the negated `[:^name:]`) at `self.i`,
+    /// which must point at the `[`.
+    ///
+    /// `Ok(None)` means "this is not a bracket expression after all" (no closing `:]` before the
+    /// end of the pattern), in which case `self.i` is untouched and the caller keeps treating the
+    /// `[` as a literal. A well-formed bracket expression naming a class this engine does not know
+    /// is an `UnsupportedFeature` error rather than a silent reinterpretation.
+    fn try_parse_posix(&mut self) -> Result<Option<ClassSet>> {
+        let start = self.i + 2; // past "[:"
+        let mut j = start;
+        while j + 1 < self.s.len() && !(self.s[j] == b':' && self.s[j + 1] == b']') {
+            j += 1;
+        }
+        if j + 1 >= self.s.len() {
+            return Ok(None);
+        }
+        let mut name = &self.s[start..j];
+        let neg = name.first() == Some(&b'^');
+        if neg {
+            name = &name[1..];
+        }
+        match posix_class(name) {
+            Some(mut set) => {
+                if neg {
+                    set.negate();
+                }
+                self.i = j + 2; // past ":]"
+                Ok(Some(set))
+            }
+            None => err!(UnsupportedFeature),
+        }
+    }
+
     fn parse_class(&mut self) -> Result<Ast> {
         self.i += 1; // '['
         let negate = self.peek() == Some(b'^');
@@ -442,12 +640,33 @@ impl<'a> Parser<'a> {
                     self.i += 1;
                     break;
                 }
+                // A POSIX bracket expression `[:name:]` / `[:^name:]`. It is only a class when a
+                // closing `:]` is actually present; otherwise the `[` stays an ordinary literal
+                // member (`[[]` is still a class containing `[`).
+                Some(b'[') if self.s.get(self.i + 1) == Some(&b':') => {
+                    match self.try_parse_posix()? {
+                        Some(t) => set.union(&t),
+                        None => {
+                            self.i += 1;
+                            set.set(b'[' as u32);
+                        }
+                    }
+                    first = false;
+                }
                 Some(b'\\') => {
                     self.i += 1;
                     let c = match self.peek() {
                         Some(c) => c,
                         None => err!(SyntaxError),
                     };
+                    if c >= 0x80 {
+                        // An escaped multi-byte character is a literal member of the class.
+                        let (cp, w) = decode_utf8(self.s, self.i);
+                        self.i += w;
+                        set.set(cp);
+                        first = false;
+                        continue;
+                    }
                     self.i += 1;
                     match c {
                         b'd' => set.union(&digit_set()),
@@ -471,12 +690,15 @@ impl<'a> Parser<'a> {
                         // Inside a class, escaping `]` `\` `^` `-` and so on is a practical need,
                         // so other characters are allowed as literals too (separate from the strict
                         // escape rules outside a class).
-                        _ => set.set(c),
+                        _ => set.set(c as u32),
                     }
                     first = false;
                 }
-                Some(lo) => {
-                    self.i += 1;
+                Some(_) => {
+                    // Members are whole characters, so `[^é]` excludes the character rather than
+                    // each of its bytes, and `[à-ÿ]` is a code-point range.
+                    let (lo, w) = decode_utf8(self.s, self.i);
+                    self.i += w;
                     first = false;
                     // A range `a-z`. A trailing `-` (with `]` next) or a leading `-` is treated as a
                     // literal.
@@ -485,9 +707,9 @@ impl<'a> Parser<'a> {
                         && self.s.get(self.i + 1) != Some(&b']')
                     {
                         self.i += 1;
-                        let hi = self.s[self.i];
-                        ensure!(hi != b'\\', SyntaxError);
-                        self.i += 1;
+                        ensure!(self.s[self.i] != b'\\', SyntaxError);
+                        let (hi, hw) = decode_utf8(self.s, self.i);
+                        self.i += hw;
                         ensure!(lo <= hi, SyntaxError);
                         set.set_range(lo, hi);
                     } else {
@@ -509,7 +731,8 @@ impl<'a> Parser<'a> {
 
 #[derive(Clone, Copy)]
 enum Inst {
-    Char(u8),
+    /// Consumes exactly the given Unicode scalar value (however many bytes it takes).
+    Char(u32),
     Any,
     Class(u16),
     Split(u32, u32),
@@ -555,7 +778,7 @@ impl Compiler {
             }
             Ast::Class(set) => {
                 let idx = self.classes.len() as u16;
-                self.classes.push(*set);
+                self.classes.push(set.clone());
                 self.emit(Inst::Class(idx))?;
                 Ok(())
             }
@@ -743,12 +966,23 @@ fn add_thread(
 
 /// Finds the leftmost match in the input. On success it returns the capture positions (group 0 =
 /// the whole match; the slot value `u32::MAX` means "not captured").
-///
-/// This is a "search" that shifts the start position one byte at a time, not an anchored match.
-/// Rather than running a dedicated loop, it simply keeps adding a new starting thread at **lower
-/// priority than the existing threads** while no match has been found (the standard Pike's VM
-/// technique). That automatically guarantees "the first one found = the leftmost".
 pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
+    find_from(prog, input, 0)
+}
+
+/// Finds the leftmost match that starts at or after `start`, reported in **absolute** offsets into
+/// `input`.
+///
+/// Callers that scan a string repeatedly (`replace_into`'s global mode) must use this rather than
+/// re-running `find` on `&input[pos..]`: the sub-slice would make `^` match at every restart
+/// position, since `Inst::Bol` tests `sp == 0`. Passing the whole string plus a start cursor keeps
+/// both `^` and `$` measured against the real ends of the string.
+///
+/// This is a "search" that shifts the start position one character at a time, not an anchored
+/// match. Rather than running a dedicated loop, it simply keeps adding a new starting thread at
+/// **lower priority than the existing threads** while no match has been found (the standard Pike's
+/// VM technique). That automatically guarantees "the first one found = the leftmost".
+pub fn find_from(prog: &Program, input: &[u8], start: usize) -> Result<Option<[u32; SLOTS]>> {
     let mut gen = vec![0u32; prog.insts.len()];
     let mut gen_id: u32 = 0;
     let mut steps: u32 = 0;
@@ -756,23 +990,34 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
     let mut nlist: Vec<Thread> = Vec::new();
     let mut matched: Option<[u32; SLOTS]> = None;
     let len = input.len();
+    if start > len {
+        return Ok(None);
+    }
 
     gen_id += 1;
-    add_thread(prog, &mut clist, &mut gen, gen_id, 0, [u32::MAX; SLOTS], 0, len, &mut steps)?;
+    add_thread(prog, &mut clist, &mut gen, gen_id, 0, [u32::MAX; SLOTS], start, len, &mut steps)?;
 
-    let mut sp = 0usize;
+    let mut sp = start;
     loop {
-        if clist.is_empty() && (matched.is_some() || sp > len) {
+        if clist.is_empty() && matched.is_some() {
             break;
         }
-        let byte = input.get(sp).copied();
+        // One step of the simulation consumes one whole UTF-8 scalar value, never one byte, so a
+        // multi-byte character can neither be matched piecewise by `.` nor be split across a match
+        // boundary (which would let the caller slice out invalid UTF-8).
+        let (ch, next_sp) = if sp < len {
+            let (cp, w) = decode_utf8(input, sp);
+            (Some(cp), sp + w)
+        } else {
+            (None, sp)
+        };
         gen_id += 1;
         let mut idx = 0;
         while idx < clist.len() {
             let th = clist[idx];
             match prog.insts[th.pc as usize] {
                 Inst::Char(c) => {
-                    if byte == Some(c) {
+                    if ch == Some(c) {
                         add_thread(
                             prog,
                             &mut nlist,
@@ -780,15 +1025,15 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
                             gen_id,
                             th.pc + 1,
                             th.saves,
-                            sp + 1,
+                            next_sp,
                             len,
                             &mut steps,
                         )?;
                     }
                 }
                 Inst::Any => {
-                    if let Some(b) = byte {
-                        if b != b'\n' {
+                    if let Some(c) = ch {
+                        if c != b'\n' as u32 {
                             add_thread(
                                 prog,
                                 &mut nlist,
@@ -796,7 +1041,7 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
                                 gen_id,
                                 th.pc + 1,
                                 th.saves,
-                                sp + 1,
+                                next_sp,
                                 len,
                                 &mut steps,
                             )?;
@@ -804,8 +1049,8 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
                     }
                 }
                 Inst::Class(ci) => {
-                    if let Some(b) = byte {
-                        if prog.classes[ci as usize].test(b) {
+                    if let Some(c) = ch {
+                        if prog.classes[ci as usize].test(c) {
                             add_thread(
                                 prog,
                                 &mut nlist,
@@ -813,7 +1058,7 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
                                 gen_id,
                                 th.pc + 1,
                                 th.saves,
-                                sp + 1,
+                                next_sp,
                                 len,
                                 &mut steps,
                             )?;
@@ -833,7 +1078,7 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
             }
             idx += 1;
         }
-        if byte.is_some() && matched.is_none() {
+        if ch.is_some() && matched.is_none() {
             add_thread(
                 prog,
                 &mut nlist,
@@ -841,17 +1086,17 @@ pub fn find(prog: &Program, input: &[u8]) -> Result<Option<[u32; SLOTS]>> {
                 gen_id,
                 0,
                 [u32::MAX; SLOTS],
-                sp + 1,
+                next_sp,
                 len,
                 &mut steps,
             )?;
         }
         core::mem::swap(&mut clist, &mut nlist);
         nlist.clear();
-        if byte.is_none() {
+        if ch.is_none() {
             break;
         }
-        sp += 1;
+        sp = next_sp;
     }
     Ok(matched)
 }
@@ -1097,34 +1342,32 @@ fn replace_into(prog: &Program, text: &[u8], repl: &[u8], global: bool, out: &mu
     let mut pos = 0usize;
     let mut prev_end: Option<usize> = None;
     while pos <= len {
-        let mut saves = match find(prog, &text[pos..]) {
+        // The whole string is searched from a cursor rather than `&text[pos..]`, so that `^` keeps
+        // meaning "the start of the string" instead of "the start of whatever is left".
+        let saves = match find_from(prog, text, pos) {
             Ok(Some(sv)) => sv,
             _ => break,
         };
-        for x in saves.iter_mut() {
-            if *x != u32::MAX {
-                *x += pos as u32;
-            }
-        }
         let mstart = saves[0] as usize;
         let mend = saves[1] as usize;
-        if mstart == mend && Some(mstart) == prev_end {
-            if mstart < len {
-                out.push(text[mstart]);
+        // Advancing past a zero-length match steps one whole character, so a multi-byte character
+        // is copied through intact.
+        let skip_one = |out: &mut Vec<u8>, at: usize| -> usize {
+            if at < len {
+                let w = char_width(text, at);
+                out.extend_from_slice(&text[at..at + w]);
+                at + w
+            } else {
+                at + 1
             }
-            pos = mstart + 1;
+        };
+        if mstart == mend && Some(mstart) == prev_end {
+            pos = skip_one(out, mstart);
             continue;
         }
         out.extend_from_slice(&text[pos..mstart]);
         emit_repl(&toks, text, &saves, out);
-        if mend > mstart {
-            pos = mend;
-        } else {
-            if mend < len {
-                out.push(text[mend]);
-            }
-            pos = mend + 1;
-        }
+        pos = if mend > mstart { mend } else { skip_one(out, mend) };
         prev_end = Some(mend);
     }
     out.extend_from_slice(&text[pos.min(len)..]);
@@ -1265,6 +1508,73 @@ mod tests {
         assert!(m("ab", "ab$"));
         assert!(!m("\n", "^$")); // $ matches only the end of the input (not before a newline)
         assert!(m("", "^$"));
+    }
+
+    // --- UTF-8 awareness (cross-checked with DuckDB) -------------------------
+
+    #[test]
+    fn dot_and_classes_consume_whole_characters() {
+        // duckdb: regexp_matches('héllo','h.llo') = true, regexp_full_match('héllo','h..llo') = false
+        assert!(m("héllo", "h.llo"));
+        assert!(!m("héllo", "^h..llo$"));
+        assert!(m("é", "^.$"));
+        assert!(!m("é", "^..$"));
+        // A negated class must not match half of a multi-byte character.
+        assert!(m("héllo", "h[^x]llo"));
+        assert!(m("あ", "^[^a]$"));
+        assert!(!m("あ", "^[^a][^a]$"));
+        // Code-point ranges, and the shorthand classes' complements.
+        assert!(m("héllo", "h[à-ÿ]llo"));
+        assert!(!m("héllo", "h[à-å]llo"));
+        assert!(m("é", "^\\D$"));
+        assert!(m("é", "^\\W$"));
+        assert!(!m("é", "^\\w$"));
+        // A literal multi-byte character is one atom, so a quantifier applies to all of it.
+        assert!(m("ééé", "^é{3}$"));
+        assert!(m("ééé", "^é+$"));
+        assert!(!m("éé", "^é{3}$"));
+        assert_eq!(ext("naïve", "^(.)(.)(.)", 3).as_deref(), Some("ï"));
+        assert_eq!(ext("日本語abc", "[^a-z]+", 0).as_deref(), Some("日本語"));
+    }
+
+    #[test]
+    fn match_boundaries_stay_on_character_boundaries() {
+        // Every slice a caller takes out of `find`'s result must still be valid UTF-8; before the
+        // UTF-8-aware VM, `h.` here matched `h` plus the first byte of `é`.
+        // duckdb: regexp_extract('héllo','h.') = 'hé'
+        let prog = compile(b"h.").unwrap();
+        let text = "héllo".as_bytes();
+        let saves = find(&prog, text).unwrap().unwrap();
+        let piece = &text[saves[0] as usize..saves[1] as usize];
+        assert_eq!(core::str::from_utf8(piece), Ok("hé"));
+    }
+
+    // --- POSIX bracket expressions (cross-checked with DuckDB) ---------------
+
+    #[test]
+    fn posix_classes() {
+        assert!(m("abc", "[[:alpha:]]+"));
+        assert!(m("123", "^[[:digit:]]+$"));
+        assert!(m("a1", "^[[:alnum:]]+$"));
+        assert!(m(" ", "[[:space:]]"));
+        assert!(m("A", "[[:upper:]]"));
+        assert!(!m("a", "^[[:upper:]]$"));
+        assert!(m("a", "[[:lower:]]"));
+        assert!(m("!", "[[:punct:]]"));
+        assert!(m("deadBEEF", "^[[:xdigit:]]+$"));
+        assert!(!m("g", "^[[:xdigit:]]$"));
+        // Mixing a POSIX name with ordinary members inside one bracket expression.
+        assert!(m("a-b", "^[[:alpha:]-]+$"));
+        assert!(m("x", "[[:alpha:][:digit:]]"));
+        // Negated form, and the ASCII-only semantics RE2/DuckDB use
+        // (duckdb: regexp_matches('é','[[:alpha:]]') = false).
+        assert!(m("a", "[[:^digit:]]"));
+        assert!(!m("é", "[[:alpha:]]"));
+        // A `[` that does not open a bracket expression is still a literal member.
+        assert!(m("[", "^[[]$"));
+        assert!(m("[:", "^[[:]+$"));
+        // An unknown class name is an error, never a silently different set.
+        assert_eq!(code_of(compile(b"[[:nope:]]").map(|_| ())), Some(Code::UnsupportedFeature));
     }
 
     #[test]

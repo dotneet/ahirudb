@@ -59,8 +59,15 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Engine {
+        let mut s = Session::new();
+        // `COPY`, `CREATE TABLE AS` and `INSERT ... SELECT` complete inside
+        // `Session::prepare`, so there is no step boundary at which the loop in
+        // `run` could answer a `NEED_CODEC`. Handing the core the same
+        // decompressor up front lets those statements read a GZIP-compressed
+        // Parquet source too, instead of failing (see `Session::set_codec_hook`).
+        s.set_codec_hook(core_codec_hook);
         Engine {
-            s: Session::new(),
+            s,
             sources: HashMap::new(),
             registered: HashSet::new(),
             names: Vec::new(),
@@ -126,7 +133,7 @@ impl Engine {
         // first path's format to every part would read CSV as Parquet (or vice versa).
         if paths.len() == 1 {
             let kind = FormatKind::detect(&paths[0].to_string_lossy());
-            let bytes = std::fs::read(&paths[0])?;
+            let bytes = read_file(&paths[0])?;
             let a = self.s.register_bytes_as(name, bytes.clone(), kind)?;
             self.sources.insert((a, 0), bytes.clone());
             self.remember(name);
@@ -140,7 +147,7 @@ impl Engine {
         } else {
             let mut files = Vec::with_capacity(paths.len());
             for p in &paths {
-                files.push((p.to_string_lossy().into_owned(), std::fs::read(p)?));
+                files.push((p.to_string_lossy().into_owned(), read_file(p)?));
             }
             let a = self.s.register_multi_bytes(name, files.clone(), FormatKind::Auto)?;
             for (p, (_, bytes)) in files.into_iter().enumerate() {
@@ -161,19 +168,29 @@ impl Engine {
         }
     }
 
-    /// Registers any file path that appears as a string literal in `sql` and
-    /// isn't registered yet, so `SELECT * FROM 'data/x.parquet'` works without
-    /// naming the file on the command line first. Paths that don't exist are
-    /// left alone — the engine's own "table not found" error is the better
-    /// message for a typo than anything we could produce here.
+    /// Registers any file path that appears as a string literal *in table
+    /// position* in `sql` and isn't registered yet, so
+    /// `SELECT * FROM 'data/x.parquet'` works without naming the file on the
+    /// command line first. Paths that don't exist are left alone — the
+    /// engine's own "table not found" error is the better message for a typo
+    /// than anything we could produce here.
+    ///
+    /// Only table-position literals are considered (see
+    /// [`table_source_literals`]). An ordinary value literal must never reach
+    /// the filesystem probe below: `replace(p, '/', '-')` would otherwise hit
+    /// the `is_dir` branch and walk the whole root filesystem.
     pub fn autoregister(&mut self, sql: &str) {
-        for lit in string_literals(sql) {
-            if self.registered.contains(&lit) {
+        for lit in table_source_literals(sql) {
+            if self.registered.contains(&lit) || is_degenerate_path(&lit) {
                 continue;
             }
+            // Probe the unescaped path: `'star\*.csv'` is not a glob (the
+            // metacharacter is escaped), and the file it names on disk is
+            // `star*.csv`.
+            let probe = literal_path(&lit);
             let looks_like_path = glob::is_pattern(&lit)
-                || Path::new(&lit).is_dir()
-                || (is_supported_path(Path::new(&lit)) && Path::new(&lit).exists());
+                || probe.is_dir()
+                || (is_supported_path(&probe) && probe.exists());
             if !looks_like_path {
                 continue;
             }
@@ -268,8 +285,12 @@ impl Engine {
     /// is what `SUMMARIZE` needs, since its target is written by the user in
     /// whatever form they like.
     pub fn describe_columns(&mut self, target: &str) -> R<Vec<(String, String, bool)>> {
-        self.autoregister(target);
-        let mut q = match self.s.prepare(&format!("DESCRIBE {target}"), &[])? {
+        // Autoregister the whole statement, not the bare target: a target of
+        // `'x.parquet'` only reads as a table reference with the `DESCRIBE`
+        // keyword in front of it.
+        let sql = format!("DESCRIBE {target}");
+        self.autoregister(&sql);
+        let mut q = match self.s.prepare(&sql, &[])? {
             Prepared::Ready(q) => q,
             Prepared::NeedIo(_) => return Err("unexpected io request".into()),
         };
@@ -318,7 +339,7 @@ fn spec_exists(spec: &str) -> bool {
     if glob::is_pattern(spec) {
         !glob::expand(spec).is_empty()
     } else {
-        Path::new(spec).exists()
+        literal_path(spec).exists()
     }
 }
 
@@ -328,6 +349,33 @@ fn is_identifier(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with(|c: char| c.is_ascii_digit())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Reads a file, naming it in the error. `std::io::Error` carries no path, so
+/// a bare `?` here yields "No such file or directory (os error 2)" with no
+/// hint about *which* file the user got wrong.
+fn read_file(p: &Path) -> R<Vec<u8>> {
+    std::fs::read(p)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("{}: {e}", p.display()).into() })
+}
+
+/// Resolves one non-glob spec component to a path on disk.
+///
+/// A spec is glob syntax even when it has no metacharacters left, so `\`
+/// escapes a character that should be matched literally: `star\*.csv` names
+/// the file `star*.csv`. A path that exists exactly as written still wins, so
+/// a name that genuinely contains a backslash keeps resolving.
+fn literal_path(part: &str) -> PathBuf {
+    let raw = PathBuf::from(part);
+    if !part.contains('\\') || raw.exists() {
+        return raw;
+    }
+    let unescaped = PathBuf::from(glob::unescape_literal(part));
+    if unescaped.exists() {
+        unescaped
+    } else {
+        raw
+    }
 }
 
 /// Expands one file spec into the concrete files that make up the table.
@@ -346,7 +394,8 @@ fn resolve_spec(spec: &str) -> R<Vec<PathBuf>> {
             }
             out.extend(m);
         } else {
-            let p = Path::new(part);
+            let p = literal_path(part);
+            let p = p.as_path();
             if p.is_dir() {
                 let mut m = glob::walk_dir(p);
                 m.sort();
@@ -362,47 +411,210 @@ fn resolve_spec(spec: &str) -> R<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Single-quoted string literals in `sql`, with `''` escapes resolved.
-fn string_literals(sql: &str) -> Vec<String> {
-    let b: Vec<char> = sql.chars().collect();
+/// Table functions whose first argument names a file (or a glob, or a list of
+/// files). Matched case-insensitively against the identifier in front of `(`.
+const READER_FUNCTIONS: &[&str] = &[
+    "PARQUET",
+    "READ_PARQUET",
+    "CSV",
+    "READ_CSV",
+    "READ_CSV_AUTO",
+    "JSON",
+    "READ_JSON",
+    "READ_JSON_AUTO",
+    "JSONL",
+    "NDJSON",
+    "READ_JSONL",
+    "READ_NDJSON",
+];
+
+/// Keywords after which a string literal names a table (`FROM 'x.csv'`,
+/// `t JOIN 'y.csv'`, `COPY t FROM 'z.csv'`, `DESCRIBE 'x.csv'`).
+const FROM_ITEM_STARTERS: &[&str] = &["FROM", "JOIN", "DESCRIBE"];
+
+/// Keywords that end a `FROM` item list, after which a literal is an ordinary
+/// value again. `AS` is deliberately absent: it introduces an alias, and the
+/// item list may continue past it (`FROM 'a.csv' AS a, 'b.csv'`).
+const FROM_ITEM_ENDERS: &[&str] = &[
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "WINDOW",
+    "QUALIFY",
+    "ORDER",
+    "LIMIT",
+    "OFFSET",
+    "ON",
+    "USING",
+    "SELECT",
+    "VALUES",
+    "SET",
+    "RETURNING",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "WITH",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "INTO",
+    "TO",
+];
+
+/// One parenthesis level while scanning for table-position literals.
+#[derive(Clone, Copy, Default)]
+struct Frame {
+    /// A `FROM` / `JOIN` / `DESCRIBE` item list is open at this level.
+    from_item: bool,
+    /// This level is the argument list of a [`READER_FUNCTIONS`] call, so its
+    /// first argument is a path.
+    reader_args: bool,
+    /// Argument index within the current parenthesis level (comma-separated).
+    arg: usize,
+    /// This level is a `[...]` list sitting in a path position, so *every*
+    /// literal in it is a path (`read_parquet(['a.parquet', 'b.parquet'])`).
+    list: bool,
+}
+
+impl Frame {
+    /// Whether a string literal directly at this level names a table.
+    fn is_path_position(&self) -> bool {
+        if self.list {
+            true
+        } else if self.reader_args {
+            self.arg == 0
+        } else {
+            self.from_item
+        }
+    }
+}
+
+/// Single-quoted string literals in `sql` that sit in *table position*, with
+/// `''` escapes resolved.
+///
+/// A literal is in table position when it follows `FROM` / `JOIN` /
+/// `DESCRIBE` at the same parenthesis depth, or when it is the first argument
+/// of a file-reading table function (`read_csv('x.csv', delim='.')` — the
+/// `'.'` is an option value, not a path). Every other literal is an ordinary
+/// value: `SELECT '/'`, `replace(p, '/', '-')` and `string_split(x, '.')` must
+/// not be mistaken for data sources, or [`Engine::autoregister`] would try to
+/// register `/` and walk the entire filesystem.
+fn table_source_literals(sql: &str) -> Vec<String> {
+    let cs: Vec<char> = sql.chars().collect();
     let mut out = Vec::new();
+    let mut stack = vec![Frame::default()];
+    let mut prev_word: Option<String> = None;
     let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            '-' if i + 1 < b.len() && b[i + 1] == '-' => {
-                while i < b.len() && b[i] != '\n' {
+    while i < cs.len() {
+        match cs[i] {
+            '-' if cs.get(i + 1) == Some(&'-') => {
+                while i < cs.len() && cs[i] != '\n' {
                     i += 1;
                 }
             }
+            '/' if cs.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < cs.len() && !(cs[i] == '*' && cs.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(cs.len());
+            }
             '"' => {
                 i += 1;
-                while i < b.len() && b[i] != '"' {
+                while i < cs.len() && cs[i] != '"' {
                     i += 1;
                 }
                 i += 1;
+                prev_word = None;
             }
             '\'' => {
                 i += 1;
                 let mut s = String::new();
-                while i < b.len() {
-                    if b[i] == '\'' {
-                        if i + 1 < b.len() && b[i + 1] == '\'' {
+                while i < cs.len() {
+                    if cs[i] == '\'' {
+                        if cs.get(i + 1) == Some(&'\'') {
                             s.push('\'');
                             i += 2;
                             continue;
                         }
                         break;
                     }
-                    s.push(b[i]);
+                    s.push(cs[i]);
                     i += 1;
                 }
                 i += 1;
-                out.push(s);
+                if stack.last().copied().unwrap_or_default().is_path_position() {
+                    out.push(s);
+                }
+                prev_word = None;
             }
-            _ => i += 1,
+            '(' => {
+                let reader = prev_word.as_deref().is_some_and(|w| READER_FUNCTIONS.contains(&w));
+                stack.push(Frame { reader_args: reader, ..Frame::default() });
+                prev_word = None;
+                i += 1;
+            }
+            '[' => {
+                let list = stack.last().copied().unwrap_or_default().is_path_position();
+                stack.push(Frame { list, ..Frame::default() });
+                prev_word = None;
+                i += 1;
+            }
+            ')' | ']' => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                prev_word = None;
+                i += 1;
+            }
+            ',' => {
+                if let Some(f) = stack.last_mut() {
+                    f.arg += 1;
+                }
+                prev_word = None;
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                i += 1;
+                while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                    i += 1;
+                }
+                let w: String = cs[start..i].iter().collect::<String>().to_ascii_uppercase();
+                // `IS [NOT] DISTINCT FROM` is a comparison operator, not a
+                // FROM clause; its right operand is a value.
+                let distinct_from = w == "FROM" && prev_word.as_deref() == Some("DISTINCT");
+                if let Some(f) = stack.last_mut() {
+                    if !distinct_from && FROM_ITEM_STARTERS.contains(&w.as_str()) {
+                        f.from_item = true;
+                    } else if FROM_ITEM_ENDERS.contains(&w.as_str()) {
+                        f.from_item = false;
+                    }
+                }
+                prev_word = Some(w);
+            }
+            c => {
+                i += 1;
+                // Whitespace keeps `prev_word`: `IS DISTINCT FROM` and
+                // `read_csv ('x')` both need to see the word before it.
+                if !c.is_whitespace() {
+                    prev_word = None;
+                }
+            }
         }
     }
     out
+}
+
+/// True for a literal that cannot usefully name a data source: an empty
+/// string, or a path built only from separators and `.` / `..` components.
+///
+/// Such a literal is almost always an ordinary value (`'/'` as a delimiter,
+/// `'.'` as a split character). Probing it would resolve to a directory —
+/// the filesystem root or the working directory — and walking that is both
+/// pointless and, at `/`, effectively unbounded.
+fn is_degenerate_path(lit: &str) -> bool {
+    lit.is_empty() || lit.split('/').all(|c| c.is_empty() || c == "." || c == "..")
 }
 
 /// The leading keyword of `sql` if it mutates state, for `-readonly`.
@@ -508,16 +720,122 @@ fn gunzip(src: &[u8]) -> R<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// [`decompress_host`] in the shape `ahiru-core` can call back into.
+///
+/// `COPY`, `CREATE TABLE AS` and `INSERT ... SELECT` finish inside
+/// `Session::prepare`, so the codec loop in [`Engine::run`] never gets a turn
+/// on them; the core calls this instead (registered via
+/// `Session::set_codec_hook`). The streaming path is unchanged and still
+/// answers `NEED_CODEC` in that loop.
+///
+/// The core is `no_std` and its errors are numeric codes, so the host's
+/// descriptive `String` error collapses to `BadCompressedData` (the bytes did
+/// not decompress) or `UnsupportedCodec` (this host has no such decoder).
+fn core_codec_hook(
+    codec: ahiru_core::parquet::Compression,
+    src: &[u8],
+    out_len: usize,
+) -> ahiru_core::error::Result<Vec<u8>> {
+    use ahiru_core::error::{Code, Error};
+    use ahiru_core::parquet::Compression;
+    if !matches!(codec, Compression::Zstd | Compression::Gzip) {
+        return Err(Error::new(Code::UnsupportedCodec));
+    }
+    decompress_host(codec, src, out_len).map_err(|_| Error::new(Code::BadCompressedData))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn extracts_string_literals() {
-        assert_eq!(string_literals("SELECT * FROM 'a.parquet'"), vec!["a.parquet"]);
-        assert_eq!(string_literals("SELECT 'it''s'"), vec!["it's"]);
-        assert_eq!(string_literals("-- 'no'\nSELECT 'yes'"), vec!["yes"]);
-        assert_eq!(string_literals("SELECT \"'x'\" FROM t"), Vec::<String>::new());
+    fn extracts_table_position_literals() {
+        assert_eq!(table_source_literals("SELECT * FROM 'a.parquet'"), vec!["a.parquet"]);
+        assert_eq!(
+            table_source_literals("SELECT * FROM t JOIN 'b.csv' ON t.a = b.a"),
+            vec!["b.csv"]
+        );
+        assert_eq!(table_source_literals("DESCRIBE 'a.parquet'"), vec!["a.parquet"]);
+        assert_eq!(table_source_literals("COPY t FROM 'a.csv'"), vec!["a.csv"]);
+        assert_eq!(table_source_literals("SELECT * FROM 'it''s.csv'"), vec!["it's.csv"]);
+        assert_eq!(table_source_literals("-- FROM 'no'\nSELECT * FROM 'yes.csv'"), vec!["yes.csv"]);
+        assert_eq!(
+            table_source_literals("SELECT * FROM 'a.csv' AS a, 'b.csv' AS b"),
+            vec!["a.csv", "b.csv"]
+        );
+    }
+
+    #[test]
+    fn ignores_value_literals() {
+        // The bug this guards: any of these used to be probed with `is_dir`,
+        // and `'/'` sent the CLI walking the whole filesystem.
+        for sql in [
+            "SELECT '/'",
+            "SELECT '.' FROM range(1)",
+            "SELECT replace(path, '/', '-') FROM t",
+            "SELECT string_split(x, '.') FROM 'a.csv'",
+            "SELECT * FROM t WHERE p = '/'",
+            "SELECT * FROM t ORDER BY replace(x, '/', '-')",
+            "SELECT 1 IS DISTINCT FROM '/'",
+            "SELECT \"'/'\" FROM t",
+        ] {
+            let got = table_source_literals(sql);
+            assert!(!got.iter().any(|l| l == "/" || l == "."), "{sql} yielded {got:?}");
+        }
+    }
+
+    #[test]
+    fn reader_function_takes_only_its_first_argument() {
+        assert_eq!(table_source_literals("SELECT * FROM read_csv('a.csv')"), vec!["a.csv"]);
+        assert_eq!(
+            table_source_literals("SELECT * FROM read_csv('a.csv', delim='.')"),
+            vec!["a.csv"]
+        );
+        assert_eq!(
+            table_source_literals("SELECT * FROM read_parquet(['a.parquet', 'b.parquet'])"),
+            vec!["a.parquet", "b.parquet"]
+        );
+        // A plain scalar function in a FROM-adjacent position is not a reader.
+        assert_eq!(
+            table_source_literals("SELECT * FROM t WHERE x = concat('/', 'a')"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn degenerate_paths_are_never_probed() {
+        assert!(is_degenerate_path(""));
+        assert!(is_degenerate_path("/"));
+        assert!(is_degenerate_path("."));
+        assert!(is_degenerate_path(".."));
+        assert!(is_degenerate_path("//"));
+        assert!(is_degenerate_path("./../"));
+        assert!(!is_degenerate_path("a.csv"));
+        assert!(!is_degenerate_path("./data"));
+        assert!(!is_degenerate_path("/tmp"));
+    }
+
+    #[test]
+    fn literal_path_unescapes_glob_escapes_when_needed() {
+        let dir = std::env::temp_dir().join(format!("ahiru-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let star = dir.join("star*.csv");
+        std::fs::write(&star, b"v\n1\n").unwrap();
+
+        let spec = format!("{}/star\\*.csv", dir.display());
+        assert_eq!(literal_path(&spec), star);
+        // A path without a backslash is passed through untouched.
+        let plain = format!("{}/plain.csv", dir.display());
+        assert_eq!(literal_path(&plain), PathBuf::from(&plain));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_error_names_the_file() {
+        let msg = read_file(Path::new("no/such/file.parquet")).unwrap_err().to_string();
+        assert!(msg.contains("no/such/file.parquet"), "{msg}");
     }
 
     #[test]

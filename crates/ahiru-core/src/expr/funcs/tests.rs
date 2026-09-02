@@ -2,7 +2,7 @@
 // `write::csv`/`write::jsonl`). Here it is taken directly from the implementation so the tests pass
 // regardless of the feature.
 use super::datetime::civil_from_days;
-use super::numeric::{f_exp, f_ln, f_pow, f_sqrt};
+use super::numeric::{f_cbrt, f_exp, f_ln, f_pow, f_sqrt};
 use super::*;
 use crate::error::code_of;
 use crate::vector::Value;
@@ -1393,4 +1393,101 @@ fn numeric_min_edge_cases_do_not_panic() {
     // round(100, i64::MIN) should not panic, returns 0
     let res = run("round", &[&hundred, &min_i]).unwrap();
     assert_eq!(int_at(&res, 0), Some(0));
+}
+
+// --- Correctly-rounded math kernels -------------------------------------
+
+/// Every value here is the exact double `f64::sqrt`/`cbrt`/`exp`/`ln` produce on the host (and
+/// what `duckdb -c` prints), spelled out so a regression back to "within a few ulps" fails.
+#[test]
+fn sqrt_and_cbrt_are_correctly_rounded() {
+    // 1.4142135623730951 — spelled through the constant because clippy rejects the literal.
+    assert_eq!(f_sqrt(2.0), core::f64::consts::SQRT_2);
+    assert_eq!(f_sqrt(300.0), 17.320_508_075_688_775);
+    assert_eq!(f_sqrt(1e300), 1e150);
+    // Subnormal input: the exponent-halving seed is unusable there, so it is scaled first.
+    assert_eq!(f_sqrt(5e-324), 2.222_758_749_485_077_5e-162);
+    assert_eq!(f_sqrt(1e-310), 9.999_999_999_999_986e-156);
+    // Perfect squares/cubes must land exactly on the integer.
+    for n in 1..=64u32 {
+        let x = n as f64;
+        assert_eq!(f_sqrt(x * x), x, "sqrt({})", x * x);
+        assert_eq!(f_cbrt(x * x * x), x, "cbrt({})", x * x * x);
+        assert_eq!(f_cbrt(-(x * x * x)), -x, "cbrt(-{})", x * x * x);
+    }
+    assert_eq!(f_cbrt(2.0), 1.259_921_049_894_873_2);
+    assert_eq!(f_cbrt(1e-310), 4.641_588_833_612_774e-104);
+    assert_eq!(f_cbrt(0.0), 0.0);
+    assert_eq!(f_cbrt(f64::INFINITY), f64::INFINITY);
+}
+
+#[test]
+fn exp_ln_and_pow_hit_the_reference_values() {
+    // The straight Taylor/atanh Horner forms these replaced were one ulp high here.
+    assert_eq!(f_exp(1.0), core::f64::consts::E);
+    assert_eq!(f_exp(0.0), 1.0);
+    assert_eq!(f_exp(-1.0), 0.367_879_441_171_442_33);
+    assert_eq!(f_ln(10.0), core::f64::consts::LN_10);
+    assert_eq!(f_ln(2.0), core::f64::consts::LN_2);
+    assert_eq!(f_ln(1.0), 0.0);
+    // Subnormals still go through the 2^64 pre-scaling.
+    assert_eq!(f_ln(5e-324), -744.440_071_921_381_2);
+    // A negative integer exponent takes the reciprocal of the exact positive power rather than
+    // squaring 1/x: `pow(10, -2)` used to be 0.010000000000000002.
+    assert_eq!(f_pow(10.0, -2.0), 0.01);
+    assert_eq!(f_pow(2.0, -2.0), 0.25);
+    assert_eq!(f_pow(2.0, 10.0), 1024.0);
+    assert_eq!(f_pow(10.0, 3.0), 1000.0);
+}
+
+#[test]
+fn abs_and_sign_never_return_negative_zero() {
+    // duckdb: abs(-0.0) -> 0, sign(-0.0) -> 0. `x < 0.0` is false for -0.0, so the old
+    // comparison-based forms handed the negative zero straight back.
+    assert!(!f_abs(-0.0).is_sign_negative());
+    assert_eq!(f_abs(-0.0), 0.0);
+    let neg_zero = || flt_at(&run("sign", &[&vf(&[Some(-0.0)])]).unwrap(), 0).unwrap();
+    assert!(!neg_zero().is_sign_negative());
+    let abs0 = || flt_at(&run("abs", &[&vf(&[Some(-0.0)])]).unwrap(), 0).unwrap();
+    assert!(!abs0().is_sign_negative());
+    // NaN has no sign to report and is passed through by `sign`.
+    assert!(flt_at(&run("sign", &[&vf(&[Some(f64::NAN)])]).unwrap(), 0).unwrap().is_nan());
+}
+
+// --- repeat / hex -------------------------------------------------------
+
+#[test]
+fn repeat_with_an_empty_string_returns_immediately() {
+    // Used to spin forever: the length check passes (0 * anything = 0) and the loop then ran
+    // `i64::MAX` times appending nothing. duckdb returns '' instantly.
+    let out = run("repeat", &[&vs(&[Some("")]), &vi(Ty::BigInt, &[Some(i64::MAX)])]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some(""));
+    // A non-empty string with a huge count is a clean LimitExceeded, not an unbounded allocation.
+    let err = run("repeat", &[&vs(&[Some("a")]), &vi(Ty::BigInt, &[Some(i64::MAX)])]);
+    assert_eq!(code_of(err.map(|_| ())), Some(crate::error::Code::LimitExceeded));
+    // A negative count is the empty string, as before.
+    let out = run("repeat", &[&vs(&[Some("ab")]), &vi(Ty::BigInt, &[Some(-1)])]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some(""));
+    let out = run("repeat", &[&vs(&[Some("ab")]), &vi(Ty::BigInt, &[Some(3)])]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some("ababab"));
+}
+
+#[test]
+fn hex_reads_the_arguments_own_width() {
+    // duckdb widens every narrow integer type to 64 bits and only HUGEINT to 128.
+    let mut huge = Vector::new(Ty::HugeInt);
+    huge.push_value(&Value::I128(-1));
+    huge.push_value(&Value::I128(i128::MAX));
+    let out = run("hex", &[&huge]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"));
+    assert_eq!(str_at(&out, 1).as_deref(), Some("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"));
+    // A UBIGINT above i64::MAX used to become NULL on the way through the BIGINT cast.
+    let mut ubig = Vector::new(Ty::UBigInt);
+    ubig.push_value(&Value::I128(u64::MAX as i128));
+    let out = run("to_hex", &[&ubig]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some("FFFFFFFFFFFFFFFF"));
+    let out = run("hex", &[&vi(Ty::BigInt, &[Some(-1), Some(0), Some(255)])]).unwrap();
+    assert_eq!(str_at(&out, 0).as_deref(), Some("FFFFFFFFFFFFFFFF"));
+    assert_eq!(str_at(&out, 1).as_deref(), Some("0"));
+    assert_eq!(str_at(&out, 2).as_deref(), Some("FF"));
 }

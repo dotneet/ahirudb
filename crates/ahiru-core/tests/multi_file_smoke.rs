@@ -108,6 +108,9 @@ fn hive_partitioned_files_expose_partition_columns() {
     let total = run_all("SELECT count(*) AS n FROM t", &mut s);
     assert_eq!(total[0][0], Value::I64(1000));
 
-    let filtered = run_all("SELECT count(*) AS n FROM t WHERE year = 2024 AND month = 1", &mut s);
+    // `month` is VARCHAR: the directories spell it `month=01`, and a zero-padded value read as a
+    // number would lose its padding. `year` has none and stays INTEGER.
+    let filtered =
+        run_all("SELECT count(*) AS n FROM t WHERE year = 2024 AND month = '01'", &mut s);
     assert_eq!(filtered[0][0], Value::I64(300));
 }

@@ -90,8 +90,9 @@ pub struct Settings {
     pub header: bool,
     pub separator: String,
     pub null: String,
-    /// Max rows shown in the boxed modes before the middle is elided.
-    /// 0 disables truncation.
+    /// Max rows shown in `duckbox` mode before the middle is elided.
+    /// 0 disables truncation. `box` never truncates rows (it has no footer
+    /// to report the true count), matching DuckDB.
     pub maxrows: usize,
     /// Max total width of a boxed table before middle columns are elided.
     /// 0 disables truncation.
@@ -728,10 +729,42 @@ fn table_width(keep: &[usize], col_width: &[usize], elided: bool) -> usize {
     total
 }
 
+/// True for a code point that advances the cursor by nothing: the common
+/// combining-mark blocks, the zero-width format controls, and the variation
+/// selectors.
+///
+/// This is deliberately a short list of whole blocks rather than a full
+/// Unicode width table — the CLI only needs the cases a user is likely to
+/// paste into a terminal (`e` + U+0301, Devanagari/Arabic vowel signs,
+/// emoji variation selectors).
+fn is_zero_width(cp: u32) -> bool {
+    matches!(
+        cp,
+        // Combining diacritical marks (base, extended, supplement, symbols)
+        0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20f0
+        // Combining Cyrillic, Hebrew points, Arabic marks
+        | 0x0483..=0x0489
+        | 0x0591..=0x05bd | 0x05bf | 0x05c1..=0x05c2 | 0x05c4..=0x05c5 | 0x05c7
+        | 0x0610..=0x061a | 0x064b..=0x065f | 0x0670 | 0x06d6..=0x06dc
+        // Devanagari and Thai above/below signs
+        | 0x0900..=0x0902 | 0x093a | 0x093c | 0x0941..=0x0948 | 0x0951..=0x0957
+        | 0x0e31 | 0x0e34..=0x0e3a | 0x0e47..=0x0e4e
+        // Zero-width format controls and bidi embedding controls
+        | 0x200c..=0x200f | 0x202a..=0x202e
+        // Combining half marks and variation selectors
+        | 0xfe00..=0xfe0f | 0xfe20..=0xfe2f | 0xe0100..=0xe01ef
+    )
+}
+
 /// Returns the display column width of a single character in a monospace terminal.
 pub(crate) fn char_width(c: char) -> usize {
     let cp = c as u32;
-    if cp < 0x20 || (0x7f..0xa0).contains(&cp) || cp == 0x200b || cp == 0xfeff {
+    // Zero-advance: control characters, plus the combining marks and format
+    // controls that render on top of the previous cell. Counting a combining
+    // mark as 1 makes a boxed cell claim more columns than the terminal draws,
+    // and the border comes out short.
+    if cp < 0x20 || (0x7f..0xa0).contains(&cp) || cp == 0x200b || cp == 0xfeff || is_zero_width(cp)
+    {
         0
     } else if (0x1100..=0x115f).contains(&cp)
         || (0x2329..=0x232a).contains(&cp)
@@ -1019,7 +1052,11 @@ mod tests {
         ])
         .unwrap();
         w.finish().unwrap();
-        assert_eq!(as_str(&buf), "INSERT INTO t VALUES ('NaN', 'inf', '-inf', 1.5);\n");
+        // The renderer now shares the engine's own float formatter
+        // (`expr::kernels::fmt_f64`), so a rendered DOUBLE is spelled exactly as
+        // `CAST(x AS VARCHAR)` spells it -- and both are DuckDB's `nan`/`inf`/`-inf`.
+        // `parse_special_f64` is case-insensitive, so the quoted form still replays.
+        assert_eq!(as_str(&buf), "INSERT INTO t VALUES ('nan', 'inf', '-inf', 1.5);\n");
     }
 
     #[test]

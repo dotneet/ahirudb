@@ -234,7 +234,37 @@ fn interval_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<IntervalOp> {
 /// to merge a call-free `lhs` with a `rhs` holding one `CallSpec`, leaving the
 /// `Call` instruction pointing into an empty `calls` table (`Internal` at
 /// runtime), while the same conjuncts in the opposite order happened to work.
+///
+/// Every one of those indices is a `u16` (`Instr` is a packed 12-byte record whose
+/// operand fields are `u16` by design, DESIGN.md §9), so the rebase is only legal
+/// while each shifted table still fits. Past that, adding `base`/`kbase`/... would
+/// wrap and alias two distinct registers or side-table entries onto one -- and in
+/// `profile.wasm`, where overflow checks are off, it would do so with no diagnostic
+/// at all. So the room is checked up front here, once, for every table; when it is
+/// not there the merge is abandoned and `lhs` is poisoned through
+/// [`Program::overflow`], which makes `expr::vm::Vm::eval` refuse the program with
+/// `LimitExceeded` (the same "clean error, never a wrong answer" rule the rest of
+/// the engine follows for resource ceilings). The guard belongs here rather than at
+/// the call sites because not every caller had one: `and_programs` checked, but
+/// `plan::bind::agg::coalesce_programs` did not.
 pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg) {
+    // Checking the five table sums is enough to make every individual shift below
+    // safe: each index inside `rhs` is already bounded by the corresponding `rhs`
+    // count, so if the sum fits, so does every shifted index.
+    let fits = |a: usize, b: usize| a + b <= u16::MAX as usize;
+    if rhs.overflow
+        || !fits(lhs.num_regs as usize, rhs.num_regs as usize)
+        || !fits(lhs.consts.len(), rhs.consts.len())
+        || !fits(lhs.casts.len(), rhs.casts.len())
+        || !fits(lhs.calls.len(), rhs.calls.len())
+        || !fits(lhs.lambdas.len(), rhs.lambdas.len())
+    {
+        lhs.overflow = true;
+        // `rhs` is dropped unmerged. The caller still gets two in-range register
+        // numbers to build its combining instruction from, so the program stays
+        // structurally valid -- it simply never runs.
+        return (lhs.result, lhs.result);
+    }
     let base = lhs.num_regs;
     let kbase = lhs.consts.len() as u16;
     let cbase = lhs.casts.len() as u16;
@@ -288,7 +318,9 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
 }
 
 pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
-    ensure!(lhs.num_regs as usize + rhs.num_regs as usize <= u16::MAX as usize, LimitExceeded);
+    // No register-count guard here: `merge_program_bodies` owns that check for every
+    // caller now (it used to be duplicated here, and only here, covering `num_regs`
+    // alone while the constant/cast/call/lambda tables could still wrap).
     let (a, b) = merge_program_bodies(&mut lhs, rhs);
     let dst = lhs.alloc_reg();
     lhs.push(Instr::new(OpCode::And, crate::vector::PhysType::Bool, dst, a, b));
@@ -1620,5 +1652,80 @@ mod tests {
                 assert!((l as usize) < p.lambdas.len(), "lambda index out of range");
             }
         }
+    }
+
+    /// A `Program` with `n` registers, one instruction, and `k` constants. Registers are
+    /// counted, not materialized, so this stays cheap at the `u16` ceiling.
+    fn sized_program(n: u16, k: usize) -> Program {
+        let mut p = Program::new();
+        p.num_regs = n;
+        p.result = n.saturating_sub(1);
+        p.result_ty = Ty::Boolean;
+        for i in 0..k {
+            p.consts.push((Ty::BigInt, Value::I64(i as i64)));
+        }
+        p.push(Instr::new(OpCode::And, crate::vector::PhysType::Bool, p.result, 0, 0));
+        p
+    }
+
+    /// The register rebase must saturate into [`Program::overflow`] rather than wrap.
+    ///
+    /// This is the defect the guard on `and_programs` used to hide: the merge itself did
+    /// `lhs.num_regs = base + rhs.num_regs` and `i2.a += base` on `u16`s, so in
+    /// `profile.wasm` (overflow checks off) a large enough merge aliased two distinct
+    /// registers onto one and answered the query wrongly, with no diagnostic.
+    #[test]
+    fn merging_past_the_register_ceiling_poisons_the_program() {
+        let mut lhs = sized_program(60_000, 0);
+        let rhs = sized_program(10_000, 0);
+        let (a, b) = merge_program_bodies(&mut lhs, rhs);
+        assert!(lhs.overflow, "the merged program must be poisoned");
+        // `num_regs` must not have wrapped to 4464.
+        assert_eq!(lhs.num_regs, 60_000);
+        // The returned registers stay inside the program that is actually there.
+        assert!(a < lhs.num_regs && b < lhs.num_regs);
+    }
+
+    /// The side tables are `u16`-indexed too, and only `num_regs` was ever checked.
+    #[test]
+    fn merging_past_a_side_table_ceiling_poisons_the_program() {
+        let mut lhs = sized_program(4, 40_000);
+        let rhs = sized_program(4, 30_000);
+        merge_program_bodies(&mut lhs, rhs);
+        assert!(lhs.overflow);
+        assert_eq!(lhs.consts.len(), 40_000);
+    }
+
+    /// An already-poisoned right-hand side poisons the merge, the same way
+    /// `Program::add_lambda` propagates a poisoned body.
+    #[test]
+    fn merging_a_poisoned_right_hand_side_poisons_the_result() {
+        let mut lhs = sized_program(4, 0);
+        let mut rhs = sized_program(4, 0);
+        rhs.overflow = true;
+        merge_program_bodies(&mut lhs, rhs);
+        assert!(lhs.overflow);
+    }
+
+    /// A merge that fits must be unaffected by the guard.
+    #[test]
+    fn a_merge_that_fits_is_not_poisoned() {
+        let mut lhs = sized_program(60_000, 100);
+        let rhs = sized_program(5_000, 100);
+        merge_program_bodies(&mut lhs, rhs);
+        assert!(!lhs.overflow);
+        assert_eq!(lhs.num_regs, 65_000);
+        assert_eq!(lhs.consts.len(), 200);
+    }
+
+    /// `Vm::eval` is the gate the poison flag feeds: a poisoned program never runs.
+    #[test]
+    fn a_poisoned_merged_program_is_refused_at_evaluation() {
+        let mut lhs = sized_program(60_000, 0);
+        merge_program_bodies(&mut lhs, sized_program(10_000, 0));
+        assert!(lhs.overflow);
+        let batch = crate::vector::Batch::rows_only(1);
+        let mut vm = crate::expr::vm::Vm::new();
+        assert_eq!(code_of(vm.eval(&lhs, &batch)), Some(crate::error::Code::LimitExceeded));
     }
 }

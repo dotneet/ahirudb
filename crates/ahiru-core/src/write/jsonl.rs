@@ -89,27 +89,26 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         Value::I64(x) if ty == Ty::Timestamp => push_timestamp_string(out, *x),
         Value::I64(x) if ty == Ty::Timestamptz => push_timestamptz_string(out, *x),
         // `Ty::Decimal` with precision <= 18 is stored as `Value::I64`, not
-        // `Value::I128` (`vector/types.rs`'s doc on `Decimal`). This arm was
-        // missing, so a DECIMAL(10,2) value of 12.50 (stored as the I64
-        // 1250) wrote out as the bare number `1250` instead of the string
-        // `"12.50"` — a real round-trip bug found during QA, symmetric with
-        // the `Value::I128` arm below (same reasoning: DECIMAL is written as
-        // a string to avoid JSON-number rounding).
+        // `Value::I128` (`vector/types.rs`'s doc on `Decimal`). Without this
+        // arm a DECIMAL(10,2) value of 12.50 (stored as the I64 1250) would
+        // write out as the unscaled integer `1250`, silently dropping the
+        // decimal point. Symmetric with the `Value::I128` arm below.
         Value::I64(x) if matches!(ty, Ty::Decimal { .. }) => {
             let Ty::Decimal { scale, .. } = ty else { unreachable!() };
-            out.push(b'"');
             push_decimal(out, *x as i128, scale);
-            out.push(b'"');
         }
         Value::I64(x) => push_int(out, *x as i128),
         Value::I128(x) => match ty {
-            // A DECIMAL as a JSON number picks up rounding error, so write it as a string to keep it exact.
-            // JSON has no standard type that safely represents arbitrary-precision numbers.
-            Ty::Decimal { scale, .. } => {
-                out.push(b'"');
-                push_decimal(out, *x, scale);
-                out.push(b'"');
-            }
+            // Written as a JSON *number*, matching `duckdb`'s `COPY ... TO
+            // 'x.json'` (`{"d":12.345}`, not `{"d":"12.345"}`). The digits
+            // themselves are emitted exactly -- JSON puts no bound on a
+            // number's precision -- so nothing is lost in the file. A reader
+            // that materializes every number as an f64 (this crate's own JSONL
+            // reader included) will round it, but quoting it does not avoid
+            // that: it just turns the column into VARCHAR, which no consumer
+            // expects for a numeric column and which `duckdb` does not
+            // produce either.
+            Ty::Decimal { scale, .. } => push_decimal(out, *x, scale),
             // INTERVAL has no native JSON type, so write it as a string.
             Ty::Interval => {
                 let (months, days, micros) = crate::vector::unpack_interval(*x);
@@ -221,8 +220,31 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
     }
 }
 
-/// JSON does not allow NaN/Infinity (RFC 8259), so they fall back to `null`.
-/// DuckDB's `TO JSON` takes the same stance.
+/// Non-finite doubles are written as the JSON *strings* `"NaN"`, `"Infinity"`
+/// and `"-Infinity"`.
+///
+/// RFC 8259 has no literal for these, so a writer has to pick one of three
+/// stances:
+///
+/// 1. `null` -- what this used to do. It is valid JSON, but it silently turns
+///    a NaN into a missing value: the reader cannot tell the difference, and
+///    a genuine NULL in the same column becomes indistinguishable from one.
+///    That is data loss, so it is rejected.
+/// 2. The bare tokens `NaN` / `Infinity`, which is what `duckdb` writes. It
+///    round-trips through `duckdb`, but the output is not JSON, and this
+///    crate's own JSONL reader (which goes through the strict scanner in
+///    `crate::json`, shared with `json_valid()` and the JSON functions)
+///    rejects it outright -- so we would be writing files we cannot read.
+/// 3. Quoted strings, chosen here. The output stays strict JSON, the value
+///    survives, and reading it back gives the text `NaN` / `Infinity` /
+///    `-Infinity`, which `CAST(... AS DOUBLE)` turns back into the original
+///    value. Both this engine and `duckdb` read the file the same way.
+///
+/// The cost is that the column comes back as VARCHAR rather than DOUBLE, and
+/// that the file differs from `duckdb`'s byte-for-byte. Matching `duckdb`
+/// exactly would mean loosening `crate::json`'s scanner to accept non-JSON
+/// number tokens everywhere it is used, which is a much wider change than the
+/// export path.
 ///
 /// For finite values: `core` has no float formatting (`core::fmt`'s
 /// Display/Debug machinery alone costs 30-60 KB, DESIGN.md §4, so this crate
@@ -230,17 +252,24 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 /// shortest-round-trip digit generation itself (`normalize_and_correct` /
 /// `shortest_digits` / `nearest_at_length` / `cmp_midpoint` / `Big`, and the
 /// fixed-vs-exponential rendering) is shared with the CSV writer -- see
-/// `write/float.rs`'s module doc for why that lives in one place instead of
+/// `expr/float.rs`'s module doc for why that lives in one place instead of
 /// being duplicated per format.
 ///
 /// The only thing that differs between the two writers is how non-finite
-/// values are spelled: JSON has no NaN/Infinity literal (so this writes
-/// `null`), while CSV writes `NaN` / `Infinity` / `-Infinity` -- that split
-/// is why this function itself is not shared, only what it delegates to
-/// below.
+/// values are spelled: CSV writes the bare words `NaN` / `Infinity` /
+/// `-Infinity`, while JSON has to quote them -- that split is why this
+/// function itself is not shared, only what it delegates to below.
 fn push_f64(out: &mut Vec<u8>, v: f64) {
-    if !v.is_finite() {
-        out.extend_from_slice(b"null");
+    if v.is_nan() {
+        out.extend_from_slice(b"\"NaN\"");
+        return;
+    }
+    if v == f64::INFINITY {
+        out.extend_from_slice(b"\"Infinity\"");
+        return;
+    }
+    if v == f64::NEG_INFINITY {
+        out.extend_from_slice(b"\"-Infinity\"");
         return;
     }
     super::float::write_f64_finite(out, v);
@@ -407,10 +436,10 @@ mod tests {
     // Regression test for a real round-trip bug found during QA, symmetric
     // with the one in `write/csv.rs`: DECIMAL with precision <= 18 is
     // stored as `Value::I64` (`vector/types.rs`'s doc on `Ty::Decimal`),
-    // but the decimal-scaling + string-quoting logic used to live only on
-    // the `Value::I128` arm. A DECIMAL(10,2) column (I64 storage) wrote out
-    // as a bare unscaled JSON number (`1250` instead of the quoted string
-    // `"12.50"`), silently dropping the decimal point.
+    // but the decimal-scaling logic used to live only on the `Value::I128`
+    // arm. A DECIMAL(10,2) column (I64 storage) wrote out as a bare unscaled
+    // integer (`1250` instead of `12.50`), silently dropping the decimal
+    // point. It is a JSON number, matching `duckdb` -- see `push_value`.
     #[test]
     fn decimal_stored_as_i64_keeps_its_decimal_point() {
         let lines = run(
@@ -418,7 +447,19 @@ mod tests {
             b"a\n12.5\n".to_vec(),
             crate::format::FormatKind::Csv,
         );
-        assert_eq!(lines, vec![r#"{"a":"12.50"}"#]);
+        assert_eq!(lines, vec![r#"{"a":12.50}"#]);
+    }
+
+    // DECIMAL with precision > 18 is stored as `Value::I128` and takes the
+    // other arm of `push_value`; it must render as an unquoted number too.
+    #[test]
+    fn wide_decimal_is_also_an_unquoted_json_number() {
+        let lines = run(
+            "SELECT CAST(a AS DECIMAL(30,4)) AS a FROM t",
+            b"a\n-12.345\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"a":-12.3450}"#]);
     }
 
     #[test]
@@ -429,24 +470,39 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_values_render_as_json_null() {
+    fn non_finite_values_render_as_quoted_json_strings() {
         // JSONL's own share of `push_f64`: non-finite handling is the one
         // thing that is not shared with the CSV writer (JSON has no
-        // NaN/Infinity literal, so this writes `null` instead of CSV's `NaN`
-        // / `Infinity` / `-Infinity` -- see that file's equivalent test).
-        // Everything else -- shortest round-trip digit generation,
-        // exact-tie regression cases, and the std-Display property test --
-        // is covered once, for both writers, in `write/float.rs`'s own test
-        // module.
+        // NaN/Infinity literal, so these are quoted where CSV writes them
+        // bare -- see `push_f64`'s doc for why quoting beats `null` and beats
+        // `duckdb`'s unquoted tokens here). Everything else -- shortest
+        // round-trip digit generation, exact-tie regression cases, and the
+        // std-Display property test -- is covered once, for both writers, in
+        // `expr/float.rs`'s own test module.
         let mut out = Vec::new();
         push_f64(&mut out, f64::NAN);
-        assert_eq!(out, b"null");
+        assert_eq!(out, br#""NaN""#);
+        out.clear();
+        push_f64(&mut out, -f64::NAN);
+        assert_eq!(out, br#""NaN""#);
         out.clear();
         push_f64(&mut out, f64::INFINITY);
-        assert_eq!(out, b"null");
+        assert_eq!(out, br#""Infinity""#);
         out.clear();
         push_f64(&mut out, f64::NEG_INFINITY);
-        assert_eq!(out, b"null");
+        assert_eq!(out, br#""-Infinity""#);
+    }
+
+    // A SQL NULL must stay distinguishable from a NaN. Before, both wrote
+    // `null` and the difference was lost on the way out.
+    #[test]
+    fn null_and_nan_stay_distinguishable() {
+        let lines = run(
+            "SELECT CAST(NULL AS DOUBLE) AS a, 'nan'::DOUBLE AS b FROM t LIMIT 1",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"a":null,"b":"NaN"}"#]);
     }
 
     // Regression test for a real bug found during QA: a `Ty::Json` column

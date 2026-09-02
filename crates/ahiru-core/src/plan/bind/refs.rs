@@ -8,16 +8,38 @@ use super::*;
 
 // --- Reference resolution for ORDER BY / GROUP BY ---------------------------
 
-/// Reads `GROUP BY 1` / `GROUP BY alias` as the corresponding SELECT expression.
+/// Reads `GROUP BY <name>` as either the input column of that name or, failing
+/// that, the SELECT-list alias of that name.
+///
+/// Unlike ORDER BY (`order_output_column`), an *input* column wins over a
+/// select-list alias that shadows it: `SELECT id % 2 AS id ... GROUP BY id`
+/// groups by the table's `id`, not by `id % 2`. DuckDB and PostgreSQL both
+/// bind the input column first here, and only fall back to the alias for a
+/// name the FROM clause does not provide.
+pub(super) fn resolve_group_ref(
+    arena: &ExprArena,
+    sel: &SelectStmt,
+    scope: &Scope,
+    id: ExprId,
+) -> Result<ExprId> {
+    if let Expr::ColumnRef { qualifier: None, name } = arena.get(id) {
+        if scope.resolve(None, name).is_ok() {
+            return Ok(id);
+        }
+    }
+    resolve_select_ref(arena, sel, id)
+}
+
+/// Reads `ORDER BY 1` / `ORDER BY alias` as the corresponding SELECT expression.
+/// Alias-first; see `resolve_group_ref` for the GROUP BY rule.
 pub(super) fn resolve_select_ref(
     arena: &ExprArena,
     sel: &SelectStmt,
     id: ExprId,
 ) -> Result<ExprId> {
-    if let Some(n) = ordinal_of(arena, id) {
-        let i = n as usize;
-        ensure!(i >= 1 && i <= sel.items.len(), ColumnNotFound);
-        return Ok(sel.items[i - 1].expr);
+    if let Some(n) = numeric_ordinal_of(arena, id) {
+        let i = ordinal_index(n, sel.items.len())?;
+        return Ok(sel.items[i].expr);
     }
     if let Expr::ColumnRef { qualifier: None, name } = arena.get(id) {
         for item in &sel.items {
@@ -38,10 +60,8 @@ pub(super) fn order_output_column(
     o: &OrderByItem,
     schema: &[Field],
 ) -> Result<Option<usize>> {
-    if let Some(n) = ordinal_of(arena, o.expr) {
-        let i = n as usize;
-        ensure!(i >= 1 && i <= schema.len(), ColumnNotFound);
-        return Ok(Some(i - 1));
+    if let Some(n) = numeric_ordinal_of(arena, o.expr) {
+        return Ok(Some(ordinal_index(n, schema.len())?));
     }
     if let Expr::ColumnRef { qualifier: None, name } = arena.get(o.expr) {
         // Resolve aliases against the *expanded* output schema, not the
@@ -96,11 +116,54 @@ pub(super) fn distinct_on_output_column(
 
 /// Returns the value if it is a positive integer literal.
 pub(super) fn ordinal_of(arena: &ExprArena, id: ExprId) -> Option<u32> {
-    match arena.get(id) {
-        Expr::Literal(Value::I32(v)) if *v > 0 => Some(*v as u32),
-        Expr::Literal(Value::I64(v)) if *v > 0 && *v <= u32::MAX as i64 => Some(*v as u32),
+    match numeric_ordinal_of(arena, id) {
+        Some(NumericTerm::Int(v)) if v > 0 && v <= u32::MAX as i64 => Some(v as u32),
         _ => None,
     }
+}
+
+/// A numeric literal written where an `ORDER BY` / `GROUP BY` term goes.
+///
+/// Kept separate from `ordinal_of` because an out-of-range value must be an
+/// *error*, not a fall-through to "an ordinary constant sort key": `ORDER BY 0`
+/// and `ORDER BY 1.5` are rejected by DuckDB ("ORDER term out of range"), and
+/// silently treating them as a constant would make the clause a no-op.
+#[derive(Clone, Copy)]
+pub(super) enum NumericTerm {
+    Int(i64),
+    /// A non-integer numeric literal (`1.5`). Never a valid position.
+    Fractional,
+}
+
+/// Recognizes a numeric literal, including one behind a unary minus (the
+/// parser keeps `-1` as `Unary(Neg, 1)` rather than folding it).
+pub(super) fn numeric_ordinal_of(arena: &ExprArena, id: ExprId) -> Option<NumericTerm> {
+    match arena.get(id) {
+        Expr::Literal(Value::I32(v)) => Some(NumericTerm::Int(*v as i64)),
+        Expr::Literal(Value::I64(v)) => Some(NumericTerm::Int(*v)),
+        Expr::Literal(Value::I128(v)) => Some(match i64::try_from(*v) {
+            Ok(v) => NumericTerm::Int(v),
+            // Beyond i64 it cannot be a valid position either way.
+            Err(_) => NumericTerm::Fractional,
+        }),
+        Expr::Literal(Value::F64(_)) => Some(NumericTerm::Fractional),
+        Expr::Unary { op: UnaryOp::Neg, arg } => match numeric_ordinal_of(arena, *arg)? {
+            NumericTerm::Int(v) => Some(NumericTerm::Int(v.checked_neg()?)),
+            NumericTerm::Fractional => Some(NumericTerm::Fractional),
+        },
+        _ => None,
+    }
+}
+
+/// Converts a positional term into a 0-based column index, rejecting anything
+/// outside `1..=len`.
+fn ordinal_index(n: NumericTerm, len: usize) -> Result<usize> {
+    let v = match n {
+        NumericTerm::Int(v) => v,
+        NumericTerm::Fractional => err!(ColumnNotFound),
+    };
+    ensure!(v >= 1 && v as u64 <= len as u64, ColumnNotFound);
+    Ok(v as usize - 1)
 }
 
 // --- Traversal helpers -------------------------------------------------------
@@ -207,6 +270,149 @@ fn collect_refs_at(
     }
     let d = depth + 1;
     each_child(arena, id, &mut |c| collect_refs_at(arena, scope, c, out, d))
+}
+
+/// Collects, for projection pushdown only, every column reference in an expression **including
+/// those inside subquery bodies** that resolves in `scope`.
+///
+/// `each_child` deliberately stops at a subquery boundary, because a subquery's expressions are
+/// resolved in a different scope. That is right for name resolution but wrong for pushdown: an
+/// outer column used *only* inside a correlated subquery — `SELECT id, (SELECT count(*) FROM t s
+/// WHERE s.flag = t.flag) FROM t` — would be pruned from the scan, and binding the subquery
+/// against the narrowed outer scope would then fail with `TableNotFound`.
+///
+/// References that do not resolve in `scope` belong to the subquery's own scope and are
+/// ignored rather than reported (unlike `collect_refs`, this walker never validates: the
+/// ordinary `collect_refs` pass over the same expressions does that). An inner column that
+/// merely shares a name with an outer one is therefore over-collected, which costs one extra
+/// column read and never a wrong answer.
+pub(super) fn collect_outer_refs(
+    arena: &ExprArena,
+    scope: &Scope,
+    id: ExprId,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    if let Expr::ColumnRef { qualifier, name } = arena.get(id) {
+        if let Ok(i) = scope.resolve(qualifier.as_deref(), name) {
+            out.push(i);
+        }
+        return Ok(());
+    }
+    let d = depth + 1;
+    match arena.get(id) {
+        Expr::ScalarSubquery(q)
+        | Expr::Exists { query: q, .. }
+        | Expr::InSubquery { query: q, .. }
+        | Expr::QuantifiedComparison { query: q, .. } => {
+            query_outer_refs(arena, scope, q, out, d)?;
+        }
+        _ => {}
+    }
+    each_child(arena, id, &mut |c| collect_outer_refs(arena, scope, c, out, d))
+}
+
+fn query_outer_refs(
+    arena: &ExprArena,
+    scope: &Scope,
+    q: &QueryStmt,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    let d = depth + 1;
+    for c in &q.ctes {
+        query_outer_refs(arena, scope, &c.query, out, d)?;
+    }
+    set_expr_outer_refs(arena, scope, &q.body, out, d)?;
+    for o in &q.order_by {
+        collect_outer_refs(arena, scope, o.expr, out, d)?;
+    }
+    Ok(())
+}
+
+fn set_expr_outer_refs(
+    arena: &ExprArena,
+    scope: &Scope,
+    body: &SetExpr,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    let d = depth + 1;
+    match body {
+        SetExpr::Select(s) => select_outer_refs(arena, scope, s, out, d),
+        SetExpr::SetOp { left, right, .. } => {
+            set_expr_outer_refs(arena, scope, left, out, d)?;
+            set_expr_outer_refs(arena, scope, right, out, d)
+        }
+    }
+}
+
+fn select_outer_refs(
+    arena: &ExprArena,
+    scope: &Scope,
+    s: &SelectStmt,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    let d = depth + 1;
+    for item in &s.items {
+        collect_outer_refs(arena, scope, item.expr, out, d)?;
+    }
+    for e in [s.filter, s.having, s.qualify].into_iter().flatten() {
+        collect_outer_refs(arena, scope, e, out, d)?;
+    }
+    for &e in s.group_by.iter().chain(&s.distinct_on) {
+        collect_outer_refs(arena, scope, e, out, d)?;
+    }
+    if let Some(sets) = &s.grouping_sets {
+        for set in sets {
+            for &e in set {
+                collect_outer_refs(arena, scope, e, out, d)?;
+            }
+        }
+    }
+    for o in &s.order_by {
+        collect_outer_refs(arena, scope, o.expr, out, d)?;
+    }
+    for (_, def) in &s.windows {
+        for &p in &def.partition_by {
+            collect_outer_refs(arena, scope, p, out, d)?;
+        }
+        for o in &def.order_by {
+            collect_outer_refs(arena, scope, o.expr, out, d)?;
+        }
+    }
+    match &s.from {
+        Some(f) => from_outer_refs(arena, scope, f, out, d),
+        None => Ok(()),
+    }
+}
+
+fn from_outer_refs(
+    arena: &ExprArena,
+    scope: &Scope,
+    f: &FromItem,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    let d = depth + 1;
+    match f {
+        FromItem::Join { left, right, on, .. } => {
+            if let Some(on) = on {
+                collect_outer_refs(arena, scope, *on, out, d)?;
+            }
+            from_outer_refs(arena, scope, left, out, d)?;
+            from_outer_refs(arena, scope, right, out, d)
+        }
+        FromItem::Subquery { query, .. } => query_outer_refs(arena, scope, query, out, d),
+        FromItem::Unnest { expr, .. } => collect_outer_refs(arena, scope, *expr, out, d),
+        FromItem::Table { .. } | FromItem::File { .. } | FromItem::GenerateSeries { .. } => Ok(()),
+    }
 }
 
 pub(super) fn collect_join_refs(

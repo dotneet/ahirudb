@@ -462,12 +462,17 @@ fn agg_name(fname: &str, arena: &ExprArena, arg: ExprId) -> String {
 }
 
 /// Detects a bare column reference that is not in GROUP BY.
+///
+/// `const_subs` lists the scalar subqueries that are constant with respect to
+/// the grouping (uncorrelated ones, which `bind_select_in` attaches *after* the
+/// aggregate). Any other scalar subquery varies per input row and is rejected.
 pub(super) fn check_grouped(
     arena: &ExprArena,
     scope: &Scope,
     id: ExprId,
     groups: &[ExprId],
     aggs: &[ExprId],
+    const_subs: &[ExprId],
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
@@ -480,15 +485,79 @@ pub(super) fn check_grouped(
     match arena.get(id) {
         Expr::ColumnRef { qualifier, name } => {
             // A column that exists in the input reaching here = it is in neither GROUP BY nor an aggregate.
-            if scope.resolve(qualifier.as_deref(), name).is_ok() {
+            if let Ok(col) = scope.resolve(qualifier.as_deref(), name) {
+                // `GROUP BY emp.dept` and `SELECT dept` name the same column in
+                // two spellings, which `expr_eq` (raw syntax) does not match.
+                // Resolve both sides against the input scope before deciding.
+                if grouped_column(arena, scope, groups, col) {
+                    return Ok(());
+                }
                 err!(NotGrouped);
             }
         }
-        // Scalar subqueries are attached alongside as pre-aggregation columns, so referencing
-        // one bare above the aggregate would shift the column numbers. Rejected like a column reference.
-        Expr::ScalarSubquery(_) => err!(NotGrouped),
+        // An uncorrelated scalar subquery is a constant, and so is legal anywhere in an
+        // aggregating query. A correlated one is attached as a pre-aggregation column whose
+        // value varies per input row, so referencing it above the aggregate is rejected like
+        // a bare column reference.
+        Expr::ScalarSubquery(_) if !const_subs.contains(&id) => err!(NotGrouped),
         _ => {}
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, d))
+    each_child(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, const_subs, d))
+}
+
+/// Whether any grouping expression is a column reference naming input column `col`.
+pub(super) fn grouped_column(
+    arena: &ExprArena,
+    scope: &Scope,
+    groups: &[ExprId],
+    col: usize,
+) -> bool {
+    groups.iter().any(|&g| match arena.get(g) {
+        Expr::ColumnRef { qualifier, name } => {
+            scope.resolve(qualifier.as_deref(), name).is_ok_and(|c| c == col)
+        }
+        _ => false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::PhysType;
+
+    /// `coalesce_programs` is the merge call site that never had a size guard of its own
+    /// (`and_programs` did, which is why the defect only ever showed up here). The guard
+    /// now lives inside `merge_program_bodies`, so this path has to be covered too:
+    /// past the `u16` ceiling the merge must poison the program instead of wrapping
+    /// `num_regs` and aliasing two distinct registers onto one.
+    #[test]
+    fn coalescing_past_the_register_ceiling_poisons_the_program() {
+        let mut a = Program::new();
+        a.num_regs = 60_000;
+        a.result = 59_999;
+        a.result_ty = Ty::BigInt;
+        a.push(Instr::new(OpCode::Add, PhysType::I64, a.result, 0, 0));
+        let mut b = Program::new();
+        b.num_regs = 10_000;
+        b.result = 9_999;
+        b.result_ty = Ty::BigInt;
+        b.push(Instr::new(OpCode::Add, PhysType::I64, b.result, 0, 0));
+
+        let p = coalesce_programs(a, b);
+        assert!(p.overflow, "the coalesced program must be poisoned");
+        // 60_000 registers plus the one `coalesce_programs` allocates for the result --
+        // never the 4_465 a wrapping `base + rhs.num_regs` would have produced.
+        assert_eq!(p.num_regs, 60_001);
+        assert!(p.result < p.num_regs);
+    }
+
+    /// The ordinary shape (`coalesce_zero`-sized programs) must still merge normally.
+    #[test]
+    fn a_coalesce_that_fits_is_not_poisoned() {
+        let scope = Scope::from_fields(vec![Field::new("n", Ty::BigInt, true)]);
+        let p = coalesce_zero(&scope, 0).unwrap();
+        assert!(!p.overflow);
+        assert!(p.instrs.iter().any(|i| i.op == OpCode::Coalesce));
+    }
 }

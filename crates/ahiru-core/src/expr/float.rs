@@ -1,5 +1,12 @@
-//! Shared `f64` -> shortest-round-trip decimal text, used by both the CSV
-//! and JSONL writers (`write/csv.rs`, `write/jsonl.rs`).
+//! Shared `f64` -> shortest-round-trip decimal text: the crate's single float
+//! formatter, used by the `CAST(<double> AS VARCHAR)` kernel
+//! (`expr::kernels::fmt_f64`), by the CSV and JSONL writers (`write/csv.rs`,
+//! `write/jsonl.rs`, which re-export this module through `write/mod.rs`), and
+//! through `fmt_f64` by the CLI's cell renderer.
+//!
+//! It lives under `expr/` rather than `write/` because `expr` is compiled
+//! unconditionally while all of `write` is gated behind the opt-in `export`
+//! feature, and the cast path needs this formatter in every build.
 //!
 //! `core` has no float formatting (`core::fmt`'s Display/Debug machinery
 //! alone costs 30-60 KB, DESIGN.md §4, so this crate avoids it everywhere,
@@ -83,7 +90,7 @@ const SCALE_F: f64 = 1e16;
 /// Together this sidesteps implementing a full from-scratch correctly-rounded
 /// *shortest* decimal conversion (Ryū/Grisu/Dragon4-style, meaningfully more
 /// code and a lookup table) while still landing on the same output.
-pub(super) fn write_f64_finite(out: &mut Vec<u8>, v: f64) {
+pub(crate) fn write_f64_finite(out: &mut Vec<u8>, v: f64) {
     if v == 0.0 {
         out.extend_from_slice(if v.is_sign_negative() { b"-0.0" } else { b"0.0" });
         return;
