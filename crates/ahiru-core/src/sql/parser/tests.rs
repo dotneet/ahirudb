@@ -3088,3 +3088,18 @@ fn interval_text_accepts_time_components_fractions_and_weeks() {
     assert_eq!(code("SELECT INTERVAL '1:2:3:4'"), Code::SyntaxError as u16);
     assert_eq!(code("SELECT INTERVAL ''"), Code::SyntaxError as u16);
 }
+
+#[test]
+fn unicode_whitespace_separates_tokens_instead_of_joining_them() {
+    // `is_ident_cont` accepts every byte >= 0x80 so a multi-byte character stays inside one
+    // identifier, but `skip_trivia` treats every Unicode space as trivia. When the two
+    // disagreed, an ideographic space (U+3000, common in SQL pasted from Japanese text) or a
+    // non-breaking space was swallowed together with the word after it, so `SELECT id\u{3000}
+    // FROM t` lexed as the single identifier `id\u{3000}FROM` and failed to parse.
+    assert_eq!(sel("SELECT id\u{3000}FROM t"), sel("SELECT id FROM t"));
+    assert_eq!(sel("SELECT id,\u{a0}name FROM t"), sel("SELECT id, name FROM t"));
+    assert_eq!(sel("SELECT id\u{3000}AS\u{3000}x FROM t"), sel("SELECT id AS x FROM t"));
+    // A non-ASCII character that is not whitespace still belongs to the identifier.
+    assert_eq!(sel("SELECT 日本語 FROM t"), "SELECT 日本語 FROM t");
+    assert_eq!(sel("SELECT id AS 列名 FROM t"), "SELECT id AS 列名 FROM t");
+}

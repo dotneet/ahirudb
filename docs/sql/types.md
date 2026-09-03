@@ -367,14 +367,19 @@ adding an interval to a `DATE`/`TIMESTAMP` uses real calendar arithmetic.
 The normalization applies everywhere a value is compared or keyed:
 
 ```sql
-SELECT INTERVAL 1 DAY = INTERVAL 24 HOUR;   -- true
-SELECT INTERVAL 1 MONTH = INTERVAL 30 DAY;  -- true
+SELECT INTERVAL 1 DAY = INTERVAL 24 HOUR;        -- true
+SELECT INTERVAL 1 MONTH = INTERVAL 30 DAY;       -- true
+SELECT INTERVAL 1 MONTH > INTERVAL 29 DAY;       -- true
+SELECT INTERVAL '23 hours' < INTERVAL 1 DAY;     -- true
+SELECT INTERVAL '90 minutes'
+       BETWEEN INTERVAL 1 HOUR AND INTERVAL 2 HOUR;  -- true
 -- ORDER BY, DISTINCT, GROUP BY, UNION, equi-joins and min/max agree:
 -- 23:00:00 < 1 day < 25:00:00
 ```
 
-`<`, `<=`, `>` and `>=` between two intervals are not accepted yet
-(`ORDER BY` on an interval column works).
+`=`, `<>`, `<`, `<=`, `>`, `>=` and `BETWEEN` all use that same flattened
+span, so an interval comparison agrees with `ORDER BY` on an interval
+column.
 
 ## UUID
 

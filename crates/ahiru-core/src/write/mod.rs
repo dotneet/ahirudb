@@ -219,6 +219,14 @@ pub(crate) fn copy(
 }
 
 /// Resolves `format` if given, otherwise infers it from `path`'s extension.
+///
+/// Only a *recognized* extension picks the format. The read side's `FormatKind::detect`
+/// resolves an unknown or absent extension to Parquet, which is the right guess when opening
+/// an existing file but the wrong one when creating a new one: `COPY ... TO 'report'` would
+/// silently produce a Parquet file under a name that reads as text. DuckDB writes CSV there,
+/// and CSV is the format a reader can still make sense of without the extension, so an
+/// unrecognized extension takes that route here too. Ask for `(FORMAT PARQUET)` to write
+/// Parquet under an unusual name.
 fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
     match format {
         Some(f) => format_by_name(f),
@@ -237,14 +245,31 @@ fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
             crate::format::FormatKind::Jsonl | crate::format::FormatKind::Json => {
                 Ok(ExportFormat::Jsonl)
             }
-            // `detect` resolves both `.parquet` and any unknown extension
-            // to `Parquet`, mirroring the read side. Without
-            // `export-parquet` there is no sink for it, so say so rather
-            // than quietly picking some other format.
+            // `detect` resolves `.parquet` *and* any unknown extension to `Parquet`, so the
+            // two are separated here: a literal `.parquet` writes Parquet, anything else
+            // falls through to the CSV default described above. Without the sink for the
+            // chosen format there is nothing to write with, so say so rather than quietly
+            // picking another one.
             #[cfg(feature = "export-parquet")]
-            crate::format::FormatKind::Parquet => Ok(ExportFormat::Parquet),
+            crate::format::FormatKind::Parquet if has_parquet_extension(path) => {
+                Ok(ExportFormat::Parquet)
+            }
+            #[cfg(feature = "csv")]
+            crate::format::FormatKind::Parquet => Ok(ExportFormat::Csv),
             _ => err!(UnsupportedFeature),
         },
+    }
+}
+
+/// Whether `path` ends in `.parquet` (case-insensitively). Used to tell a real Parquet
+/// destination apart from the unknown extension that `FormatKind::detect` also reports as
+/// `Parquet`.
+#[cfg(feature = "export-parquet")]
+fn has_parquet_extension(path: &str) -> bool {
+    let path = crate::format::strip_url_query(path);
+    match path.rfind('.') {
+        Some(i) => eq_ascii_ci(path[i + 1..].as_bytes(), b"parquet"),
+        None => false,
     }
 }
 

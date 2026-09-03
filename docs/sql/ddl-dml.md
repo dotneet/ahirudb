@@ -143,8 +143,14 @@ COPY t TO 'out.csv';   -- shorthand for COPY (SELECT * FROM t) TO 'out.csv'
 ```
 
 `FORMAT` defaults to whatever `path`'s extension implies, and is
-case-insensitive when given explicitly. As on the read side, an extension
-that isn't recognised (including no extension at all) means Parquet.
+case-insensitive when given explicitly. Only `.csv`, `.tsv`/`.tab`,
+`.jsonl`/`.ndjson`, `.json` and `.parquet` are recognised; **any other
+extension, or none at all, writes CSV** (as DuckDB does). The read side
+guesses Parquet for an unknown extension instead, because there the file
+already exists and Parquet is the likelier thing to be opening; when
+*creating* a file, silently producing Parquet under a name like `report`
+would be the more surprising of the two. Name the file `.parquet`, or say
+`(FORMAT parquet)`, to write Parquet under an unusual name.
 
 ### Parquet output
 

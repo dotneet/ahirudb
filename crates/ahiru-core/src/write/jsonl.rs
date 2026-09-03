@@ -30,6 +30,15 @@ impl Default for JsonlSink {
 impl TableSink for JsonlSink {
     fn begin(&mut self, schema: &[Field]) -> Result<()> {
         ensure!(!self.began, Internal);
+        // A JSON object's keys are its column identity, so two columns of the same name would
+        // be written as two entries with one key. Every reader keeps just one of them (the
+        // last, in practice), silently dropping the other column -- and this sink's own output
+        // would no longer round-trip. CSV can carry a repeated header because its columns are
+        // positional; JSON cannot, so the export is refused instead, as DuckDB refuses it
+        // ("Duplicate struct entry name"). Rename one of the columns with `AS`.
+        for (i, f) in schema.iter().enumerate() {
+            ensure!(!schema[..i].iter().any(|g| g.name == f.name), DuplicateColumn);
+        }
         self.out.clear();
         self.schema = schema.to_vec();
         self.began = true;
@@ -568,6 +577,23 @@ mod tests {
             crate::error::code_of(sink.write_batch(&schema, &batch)),
             Some(crate::error::Code::Internal)
         );
+    }
+
+    #[test]
+    fn duplicate_column_names_are_refused_instead_of_writing_one_key_twice() {
+        // `{"a":1,"a":2}` loses a column in every reader, so the export is refused, as
+        // duckdb refuses `COPY (SELECT 1 AS a, 2 AS a) TO 'x.jsonl'` with
+        // "Duplicate struct entry name". CSV is unaffected: its columns are positional.
+        let dup = [Field::new("a", Ty::Int, true), Field::new("a", Ty::Int, true)];
+        let mut sink = JsonlSink::new();
+        assert_eq!(
+            crate::error::code_of(sink.begin(&dup)),
+            Some(crate::error::Code::DuplicateColumn)
+        );
+        // Names that merely differ in case are distinct JSON keys and stay allowed.
+        let mixed = [Field::new("a", Ty::Int, true), Field::new("A", Ty::Int, true)];
+        sink.begin(&mixed).unwrap();
+        assert!(sink.finish().unwrap().is_empty());
     }
 
     #[test]

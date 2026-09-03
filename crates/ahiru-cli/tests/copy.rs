@@ -348,3 +348,52 @@ fn copy_parquet_spanning_multiple_row_groups_reads_back_intact() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&ahiru_out);
 }
+
+#[test]
+fn copy_to_an_unrecognized_extension_writes_csv_like_duckdb() {
+    // `FormatKind::detect` reports Parquet for any unknown extension, which suits the read
+    // side (the file exists; Parquet is the likely thing being opened) but not the write side:
+    // `COPY ... TO 'report'` used to produce a Parquet file under a text-looking name.
+    // duckdb -c "COPY (SELECT 1 AS a, 'x' AS b) TO 'noext'" writes CSV, and so does this now.
+    for ext in ["txt", "out", "dat"] {
+        let out_path = tmp_path("unknown_ext", ext);
+        let _ = std::fs::remove_file(&out_path);
+        run_ahiru_copy(
+            &["tests/data/basic.csv"],
+            &format!(
+                "COPY (SELECT id AS a, name AS b FROM t WHERE id < 2 ORDER BY id) TO '{}'",
+                out_path.display()
+            ),
+        );
+        let body = std::fs::read_to_string(&out_path).expect("no file written");
+        assert_eq!(body, "a,b\n0,name_0\n1,name_1\n", "unexpected body for .{ext}");
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    // An explicit FORMAT still wins, so Parquet under an unusual name stays reachable.
+    let parquet_path = tmp_path("unknown_ext_forced", "dat");
+    let _ = std::fs::remove_file(&parquet_path);
+    run_ahiru_copy(
+        &["tests/data/basic.csv"],
+        &format!(
+            "COPY (SELECT id FROM t WHERE id < 2) TO '{}' (FORMAT parquet)",
+            parquet_path.display()
+        ),
+    );
+    let magic = std::fs::read(&parquet_path).expect("no file written");
+    assert_eq!(&magic[..4], b"PAR1", "explicit FORMAT parquet did not write Parquet");
+    let _ = std::fs::remove_file(&parquet_path);
+
+    // And a `.parquet` name is still Parquet without asking, in either case.
+    for ext in ["parquet", "PARQUET"] {
+        let p = tmp_path("known_ext", ext);
+        let _ = std::fs::remove_file(&p);
+        run_ahiru_copy(
+            &["tests/data/basic.csv"],
+            &format!("COPY (SELECT id FROM t WHERE id < 2) TO '{}'", p.display()),
+        );
+        let magic = std::fs::read(&p).expect("no file written");
+        assert_eq!(&magic[..4], b"PAR1", ".{ext} should still write Parquet");
+        let _ = std::fs::remove_file(&p);
+    }
+}

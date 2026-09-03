@@ -124,15 +124,47 @@ fn cast_string_fraction_rounds_like_numeric_cast() {
 }
 
 #[test]
-fn between_on_interval_or_json_is_type_mismatch() {
+fn between_on_json_is_type_mismatch() {
+    // JSON compares by raw bytes, so an ordering comparison would read as a value order it is
+    // not. INTERVAL is the opposite case and is covered by `interval_ordering_comparisons`.
     let mut db = session_with_dual();
-    assert_eq!(
-        code_of(db.prepare("SELECT 1 FROM dual WHERE INTERVAL '1' DAY BETWEEN INTERVAL '0' DAY AND INTERVAL '2' DAY", &[])),
-        Some(Code::TypeMismatch)
-    );
     assert_eq!(
         code_of(db.prepare("SELECT 1 FROM dual WHERE CAST('[1]' AS JSON) BETWEEN CAST('[0]' AS JSON) AND CAST('[2]' AS JSON)", &[])),
         Some(Code::TypeMismatch)
+    );
+    assert_eq!(
+        code_of(db.prepare("SELECT 1 FROM dual WHERE CAST('[1]' AS JSON) < CAST('[2]' AS JSON)", &[])),
+        Some(Code::TypeMismatch)
+    );
+}
+
+#[test]
+fn interval_ordering_comparisons() {
+    // `<`/`<=`/`>`/`>=`/BETWEEN flatten months/days/microseconds the same way `=`, ORDER BY,
+    // GROUP BY and equi-joins do (1 month = 30 days, 1 day = 24 hours), so they agree with the
+    // rest of the engine. Every expected value below is DuckDB's:
+    //   duckdb -c "SELECT INTERVAL '1 month' > INTERVAL '29 days', INTERVAL '1 month' >
+    //   INTERVAL '31 days', INTERVAL '23 hours' < INTERVAL '1 day', INTERVAL '90 minutes'
+    //   BETWEEN INTERVAL '1 hour' AND INTERVAL '2 hours'"  ->  true, false, true, true
+    let mut db = session_with_dual();
+    let rows = run(
+        &mut db,
+        "SELECT INTERVAL '1' MONTH > INTERVAL '29' DAY, \
+                INTERVAL '1' MONTH > INTERVAL '31' DAY, \
+                INTERVAL '23' HOUR < INTERVAL '1' DAY, \
+                INTERVAL '1' DAY >= INTERVAL '24' HOUR, \
+                INTERVAL '90' MINUTE BETWEEN INTERVAL '1' HOUR AND INTERVAL '2' HOUR \
+         FROM dual",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]]
     );
 }
 
