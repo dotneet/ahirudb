@@ -36,6 +36,19 @@ use select::bind_select_in;
 
 /// The FROM-clause nesting limit. The parser limits it too; this is a second layer of defense.
 const MAX_FROM_DEPTH: u32 = 64;
+/// The recursion limit for the pre-bind table-reference walk
+/// (`from::referenced_in_query` and friends).
+///
+/// Kept separate from `MAX_FROM_DEPTH` because that walk spends more frames per
+/// syntactic level than the binder does: two per nested query block (the query
+/// itself, then the FROM item or expression it descends into) plus one per
+/// JOIN / set-operation link. The parser caps nesting at 64 levels and the whole
+/// statement at 64 such links, so `2 * 64 + 64` frames is the most a parseable
+/// statement can need; the budget must stay above that. A statement the binder
+/// accepts but the walk rejects is not merely a stricter limit — the missed
+/// table never gets its schema resolved and binding fails with `Internal` (see
+/// `from::referenced_in_query`).
+const MAX_REF_DEPTH: u32 = 4 * MAX_FROM_DEPTH;
 /// The expression nesting limit.
 const MAX_EXPR_DEPTH: u32 = 64;
 

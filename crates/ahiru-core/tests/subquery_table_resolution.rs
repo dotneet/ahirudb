@@ -202,6 +202,114 @@ fn nested_query_blocks_bind_and_shadow_ctes() {
     );
 }
 
+/// A CTE on the *left* of a join hid the file table on the right.
+///
+/// The FROM walk's `Join` arm propagated the left side's `TableNotFound` (a
+/// CTE name is not in the catalog) with `?` before it ever visited the right
+/// side, so `u` was never resolved and binding died with `Internal`. Naming
+/// `u` anywhere else in the statement made the identical join work, which is
+/// what kept this hidden. Values checked against the `duckdb` CLI.
+#[test]
+fn cte_on_the_left_of_a_join_still_resolves_the_right_table() {
+    let mut db = session();
+    assert_eq!(
+        run(
+            &mut db,
+            "WITH agg AS (SELECT a * 9 AS k FROM t) \
+             SELECT agg.k, u.c FROM agg JOIN u ON agg.k = u.c",
+        ),
+        vec![vec![i64(9), i64(9)]]
+    );
+    assert_eq!(
+        run(
+            &mut db,
+            "WITH agg AS (SELECT a * 9 AS k FROM t) \
+             SELECT agg.k, u.c FROM agg LEFT JOIN u ON agg.k = u.c",
+        ),
+        vec![vec![i64(9), i64(9)]]
+    );
+    assert_eq!(
+        run(
+            &mut db,
+            "WITH agg AS (SELECT a FROM t) SELECT agg.a, u.c FROM agg, u WHERE agg.a < u.c",
+        ),
+        vec![vec![i64(1), i64(9)]]
+    );
+}
+
+/// The same shape inside a recursive CTE: the recursive term lists the
+/// working table first, so the join's left side is again a name the catalog
+/// does not have. duckdb returns 1..9 for this.
+#[test]
+fn recursive_term_with_the_working_table_first_resolves_the_joined_table() {
+    let mut db = session();
+    assert_eq!(
+        run(
+            &mut db,
+            "WITH RECURSIVE r(n) AS (SELECT a FROM t UNION ALL \
+             SELECT r.n + 1 FROM r JOIN u ON r.n < u.c) SELECT * FROM r",
+        ),
+        (1..=9).map(|n| vec![i64(n)]).collect::<Vec<_>>()
+    );
+}
+
+/// `SELECT x FROM (SELECT x FROM (... FROM t ...))`, nested `n` deep.
+fn nested_derived(n: usize) -> String {
+    let mut sql = String::from("SELECT x FROM ");
+    for _ in 0..n {
+        sql.push_str("(SELECT x FROM ");
+    }
+    sql.push_str("(SELECT a AS x FROM t)");
+    for _ in 0..n {
+        sql.push(')');
+    }
+    sql
+}
+
+/// A left-deep chain of `n` derived-table joins.
+fn join_chain(n: usize) -> String {
+    let mut sql = String::from("SELECT d0.x FROM (SELECT a AS x FROM t) d0");
+    for i in 1..=n {
+        sql.push_str(&format!(" JOIN (SELECT a AS x FROM t) d{i} ON d{i}.x = d0.x"));
+    }
+    sql
+}
+
+/// The pre-bind reference walk used to spend three frames per nesting level
+/// against the same 64-unit budget the binder charges one for, so around 20
+/// nested derived tables (or 60 join links) it gave up — and the error was
+/// discarded, leaving the innermost table unresolved and binding failing with
+/// `Internal`. Every depth must now either work or say "too deep";
+/// `Internal` is never an acceptable answer to a well-formed query.
+#[test]
+fn deep_nesting_binds_or_fails_cleanly() {
+    // Binding a query nested this deep recurses once per level, and an
+    // unoptimized test build spends far more stack per frame than the
+    // shipping `wasm` profile does, so the harness's default thread stack is
+    // not enough. The stack size is a property of this test, not of the
+    // engine: the release CLI runs the same statements on its main thread.
+    std::thread::Builder::new()
+        .stack_size(32 << 20)
+        .spawn(|| {
+            let mut db = session();
+            // Depths that used to trip the old budget.
+            assert_eq!(run(&mut db, &nested_derived(25)), vec![vec![i64(1)]]);
+            assert_eq!(run(&mut db, &join_chain(62)), vec![vec![i64(1)]]);
+            // Across the parser's cap the only acceptable failure is "too deep".
+            for n in 0..=70 {
+                for sql in [nested_derived(n), join_chain(n)] {
+                    match ahiru_core::error::code_of(db.prepare(&sql, &[]).map(|_| ())) {
+                        None | Some(ahiru_core::error::Code::ExpressionTooDeep) => {}
+                        other => panic!("depth {n}: unexpected {other:?} for {sql}"),
+                    }
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 /// A table named *only* inside a subquery still has to be reported as
 /// missing with `TableNotFound`, not silently ignored.
 #[test]

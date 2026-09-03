@@ -678,6 +678,52 @@ fn lag_and_lead_return_null_at_partition_edges() {
     );
 }
 
+/// `lag`/`lead`'s third argument is the value used outside the partition, and
+/// the function's result type is the *first* argument's. The default used to
+/// be pushed into the output column by physical type alone, so an INTEGER `1`
+/// landed in a DECIMAL(6,2) column as 0.01 and a DATE in a TIMESTAMP column as
+/// a microsecond count, while a physically incompatible default (an INTEGER
+/// default for a VARCHAR column, a DOUBLE one for an INTEGER column) failed
+/// with a type mismatch instead of being cast.
+///
+/// duckdb, on `wd(id, s, x) = (1,'a',1.5) (2,'b',2.25) (3,'c',0.5)`:
+/// ```text
+/// SELECT id, lag(CAST(x AS DECIMAL(6,2)), 1, 1) OVER (ORDER BY id),
+///            lag(s, 1, 0) OVER (ORDER BY id),
+///            lead(id, 1, 1.5) OVER (ORDER BY id),
+///            lag(CAST('2020-01-05 00:00:00' AS TIMESTAMP), 1, DATE '1999-12-31')
+///              OVER (ORDER BY id)
+///   FROM wd ORDER BY id
+/// 1|1.00|0|2|1999-12-31 00:00:00
+/// 2|1.50|a|3|2020-01-05 00:00:00
+/// 3|2.25|b|2|2020-01-05 00:00:00
+/// ```
+#[test]
+fn lag_and_lead_cast_the_default_to_the_value_type() {
+    let mut db = Session::new();
+    csv(&mut db, "wd", "id,s,x\n1,a,1.5\n2,b,2.25\n3,c,0.5\n");
+    let rows = run(
+        &mut db,
+        "SELECT id, lag(CAST(x AS DECIMAL(6,2)), 1, 1) OVER (ORDER BY id) d, \
+                lag(s, 1, 0) OVER (ORDER BY id) sd, \
+                lead(id, 1, 1.5) OVER (ORDER BY id) nd, \
+                lag(CAST('2020-01-05 00:00:00' AS TIMESTAMP), 1, DATE '1999-12-31') \
+                  OVER (ORDER BY id) td \
+         FROM wd ORDER BY id",
+    );
+    // DECIMAL(6,2) is the unscaled integer; TIMESTAMP is epoch microseconds.
+    let ts_1999 = 946_598_400_000_000;
+    let ts_2020 = 1_578_182_400_000_000;
+    assert_eq!(
+        rows,
+        vec![
+            vec![i64v(1), i64v(100), s("0"), i64v(2), i64v(ts_1999)],
+            vec![i64v(2), i64v(150), s("a"), i64v(3), i64v(ts_2020)],
+            vec![i64v(3), i64v(225), s("b"), i64v(2), i64v(ts_2020)],
+        ]
+    );
+}
+
 /// `first_value` under the default `RANGE`-with-`ORDER BY` frame is
 /// constant within a partition (the frame always starts at the partition's
 /// first row), while `last_value` under the default `WholePartition` frame

@@ -183,6 +183,19 @@ WHERE c.id IN (SELECT o.customer_id FROM orders o WHERE o.region = c.region)
 ORDER BY c.id;
 ```
 
+In an aggregating query, a correlated scalar subquery may correlate **only
+on grouping columns** — then its value is constant within a group and it is
+evaluated once per group, after the aggregate:
+
+```sql
+SELECT c.region, count(*), (SELECT count(*) FROM orders o WHERE o.region = c.region)
+FROM customers c GROUP BY c.region;
+```
+
+Correlating on a column that is not a grouping key (`o.customer_id = c.id`
+above, with `GROUP BY c.region`) is rejected with *column must appear in
+GROUP BY*, as it is in DuckDB: such a subquery has no single value per group.
+
 `NOT IN (subquery)` follows standard SQL's NULL-aware semantics: if the
 subquery's result set contains even one `NULL`, the whole `NOT IN` becomes
 `UNKNOWN` (so the outer row is filtered out) rather than silently ignoring
