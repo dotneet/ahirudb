@@ -133,7 +133,9 @@ fn between_on_json_is_type_mismatch() {
         Some(Code::TypeMismatch)
     );
     assert_eq!(
-        code_of(db.prepare("SELECT 1 FROM dual WHERE CAST('[1]' AS JSON) < CAST('[2]' AS JSON)", &[])),
+        code_of(
+            db.prepare("SELECT 1 FROM dual WHERE CAST('[1]' AS JSON) < CAST('[2]' AS JSON)", &[])
+        ),
         Some(Code::TypeMismatch)
     );
 }

@@ -268,7 +268,7 @@ fn resolve_format(path: &str, format: Option<&str>) -> Result<ExportFormat> {
 fn has_parquet_extension(path: &str) -> bool {
     let path = crate::format::strip_url_query(path);
     match path.rfind('.') {
-        Some(i) => eq_ascii_ci(path[i + 1..].as_bytes(), b"parquet"),
+        Some(i) => eq_ascii_ci(&path.as_bytes()[i + 1..], b"parquet"),
         None => false,
     }
 }

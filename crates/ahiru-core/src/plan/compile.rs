@@ -1482,7 +1482,8 @@ mod tests {
         let mut a = ExprArena::new();
         let i1 = interval_lit(&mut a, 1, 0, 0);
         let i2 = interval_lit(&mut a, 0, 30, 0);
-        for op in [BinaryOp::Lt, BinaryOp::Le, BinaryOp::Gt, BinaryOp::Ge, BinaryOp::Eq, BinaryOp::Ne]
+        for op in
+            [BinaryOp::Lt, BinaryOp::Le, BinaryOp::Gt, BinaryOp::Ge, BinaryOp::Eq, BinaryOp::Ne]
         {
             let e = a.push(Expr::Binary { op, lhs: i1, rhs: i2 });
             let p = compile(&a, &cols(), &[], e).unwrap();
