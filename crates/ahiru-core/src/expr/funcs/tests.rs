@@ -651,6 +651,169 @@ fn parse_and_format_roundtrip() {
 }
 
 #[test]
+fn century_millennium_isoyear_match_duckdb() {
+    let trunc = |p: &str, lit: &str| {
+        let v = run("date_trunc", &[&vs(&[Some(p)]), &ts(lit)]).unwrap();
+        let mut o = Vec::new();
+        fmt_timestamp(int_at(&v, 0).unwrap(), &mut o);
+        String::from_utf8(o).unwrap()
+    };
+    // duckdb -c "select date_trunc('century', DATE '2024-05-05'),
+    //                   date_trunc('century', DATE '1900-12-31')"
+    // -> 2000-01-01, 1900-01-01. DuckDB truncates to `year / 100 * 100`, *not* to the start of
+    // the 1-based century that date_part('century') numbers.
+    assert_eq!(trunc("century", "2024-05-05 12:00:00"), "2000-01-01 00:00:00");
+    assert_eq!(trunc("century", "1900-12-31 00:00:00"), "1900-01-01 00:00:00");
+    assert_eq!(trunc("century", "2000-01-01 00:00:00"), "2000-01-01 00:00:00");
+    // duckdb -c "select date_trunc('millennium', DATE '2024-05-05')" -> 2000-01-01
+    assert_eq!(trunc("millennium", "2024-05-05 00:00:00"), "2000-01-01 00:00:00");
+    // duckdb -c "select date_trunc('isoyear', DATE '2024-12-30')" -> 2024-12-30 (a Monday: the
+    // ISO year 2025 starts inside December 2024).
+    assert_eq!(trunc("isoyear", "2024-12-30 10:00:00"), "2024-12-30 00:00:00");
+    assert_eq!(trunc("isoyear", "2024-05-05 00:00:00"), "2024-01-01 00:00:00");
+
+    // date_part keeps the 1-based numbering DuckDB uses there.
+    // duckdb -c "select date_part('century', DATE '2024-05-05'),
+    //                   date_part('millennium', DATE '2024-05-05'),
+    //                   date_part('isoyear', DATE '2024-12-30')" -> 21, 3, 2025
+    assert_eq!(part("date_part", "century", "2024-05-05 00:00:00"), Some(21));
+    assert_eq!(part("date_part", "millennium", "2024-05-05 00:00:00"), Some(3));
+    assert_eq!(part("date_part", "isoyear", "2024-12-30 00:00:00"), Some(2025));
+    assert_eq!(part("date_part", "isoyear", "2024-05-05 00:00:00"), Some(2024));
+
+    let d = |p: &str, a: &str, b: &str| {
+        int_at(&run("date_diff", &[&vs(&[Some(p)]), &ts(a), &ts(b)]).unwrap(), 0)
+    };
+    // duckdb -c "select date_diff('century', DATE '1900-01-01', DATE '2024-01-01'),
+    //                   date_diff('millennium', DATE '1999-01-01', DATE '2024-01-01'),
+    //                   date_diff('isoyear', DATE '2024-12-30', DATE '2025-01-05')" -> 1, 1, 0
+    assert_eq!(d("century", "1900-01-01 00:00:00", "2024-01-01 00:00:00"), Some(1));
+    assert_eq!(d("century", "1999-01-01 00:00:00", "2000-01-01 00:00:00"), Some(1));
+    assert_eq!(d("millennium", "1999-01-01 00:00:00", "2024-01-01 00:00:00"), Some(1));
+    assert_eq!(d("isoyear", "2024-12-30 00:00:00", "2025-01-05 00:00:00"), Some(0));
+
+    // The shorthand functions exist too (duckdb has isoyear()/millennium()).
+    let sh = |name: &str, lit: &str| int_at(&run(name, &[&ts(lit)]).unwrap(), 0);
+    assert_eq!(sh("isoyear", "2024-12-30 00:00:00"), Some(2025));
+    assert_eq!(sh("millennium", "2024-05-05 00:00:00"), Some(3));
+}
+
+#[test]
+fn date_part_short_aliases_match_duckdb() {
+    // Every value here is from
+    // `duckdb -c "select date_part('<name>', TIMESTAMP '2024-05-05 01:02:03')"`.
+    let lit = "2024-05-05 01:02:03";
+    for (name, want) in [
+        ("y", 2024),
+        ("yr", 2024),
+        ("yrs", 2024),
+        ("mon", 5),
+        ("mons", 5),
+        ("d", 5),
+        ("dayofmonth", 5),
+        ("h", 1),
+        ("hr", 1),
+        ("hrs", 1),
+        ("m", 2),
+        ("min", 2),
+        ("mins", 2),
+        ("s", 3),
+        ("sec", 3),
+        ("secs", 3),
+        ("w", 18),
+        ("weekofyear", 18),
+        ("c", 21),
+        ("cent", 21),
+        ("centuries", 21),
+        ("dec", 202),
+        ("decs", 202),
+        ("mil", 3),
+        ("mils", 3),
+        ("millennia", 3),
+        ("weekday", 0),
+        ("dayofweek", 0),
+        ("isoweekday", 7),
+        ("dayofyear", 126),
+    ] {
+        assert_eq!(part("date_part", name, lit), Some(want), "date_part('{name}')");
+    }
+    // `m` is *minute* in DuckDB, not month, and `ms`/`us` must not be plural-stripped to `m`/`u`.
+    assert_eq!(part("date_part", "ms", "2024-05-05 01:02:03.5"), Some(3500));
+    assert_eq!(part("date_part", "us", "2024-05-05 01:02:03.5"), Some(3_500_000));
+    // A name DuckDB has but this engine does not implement stays an error rather than being
+    // silently misread (see docs/sql/limitations.md).
+    let bad = run("date_part", &[&vs(&[Some("era")]), &ts(lit)]);
+    assert_eq!(code_of(bad.map(|_| ())), Some(Code::TypeMismatch));
+}
+
+#[test]
+fn date_diff_microsecond_overflow_is_an_error() {
+    // duckdb -c "select date_diff('microsecond', TIMESTAMP '-290000-01-01',
+    //                             TIMESTAMP '290000-01-01')" -> Out of Range Error.
+    // It used to wrap around to a negative number here.
+    let a = ts("-290000-01-01 00:00:00");
+    let b = ts("290000-01-01 00:00:00");
+    let r = run("date_diff", &[&vs(&[Some("microsecond")]), &a, &b]);
+    assert_eq!(code_of(r.map(|_| ())), Some(Code::ValueOutOfRange));
+    // The coarser units divide before subtracting, so they stay in range.
+    let ms = run("date_diff", &[&vs(&[Some("millisecond")]), &a, &b]).unwrap();
+    assert!(int_at(&ms, 0).unwrap() > 0);
+}
+
+#[test]
+fn parse_accepts_the_shapes_duckdb_accepts() {
+    let fmt_ts = |us: i64| {
+        let mut o = Vec::new();
+        fmt_timestamp(us, &mut o);
+        String::from_utf8(o).unwrap()
+    };
+    let day = |s: &[u8]| parse_date(s).map(|d| d * 86_400_000_000);
+    // A DATE cast of a timestamp-shaped string keeps only the date part -- otherwise a whole
+    // ISO-timestamp column casts to NULL.
+    // duckdb -c "select '2024-01-01T00:00:00'::DATE, '2024-01-01 10:00:00'::DATE" -> both
+    // 2024-01-01.
+    assert_eq!(day(b"2024-01-01T00:00:00").map(fmt_ts).as_deref(), Some("2024-01-01 00:00:00"));
+    assert_eq!(day(b"2024-01-01 10:00:00").map(fmt_ts).as_deref(), Some("2024-01-01 00:00:00"));
+    assert_eq!(
+        day(b"2024-01-01T10:00:00.123Z").map(fmt_ts).as_deref(),
+        Some("2024-01-01 00:00:00")
+    );
+    // More than one space between the date and the time.
+    // duckdb -c "select cast('2024-01-01  10:00:00' as timestamp)" -> 2024-01-01 10:00:00
+    assert_eq!(
+        parse_timestamp(b"2024-01-01  10:00:00").map(fmt_ts).as_deref(),
+        Some("2024-01-01 10:00:00")
+    );
+    // A trailing `.` with no digits, and a trailing ` UTC` / `Z`.
+    assert_eq!(
+        parse_timestamp(b"2024-01-01 10:00:00.").map(fmt_ts).as_deref(),
+        Some("2024-01-01 10:00:00")
+    );
+    assert_eq!(
+        parse_timestamp(b"2024-01-01 10:00:00 UTC").map(fmt_ts).as_deref(),
+        Some("2024-01-01 10:00:00")
+    );
+    assert_eq!(
+        parse_timestamp(b"2024-01-01 10:00:00 utc").map(fmt_ts).as_deref(),
+        Some("2024-01-01 10:00:00")
+    );
+    assert_eq!(
+        parse_timestamp(b"2024-01-01 10:00:00Z").map(fmt_ts).as_deref(),
+        Some("2024-01-01 10:00:00")
+    );
+    assert_eq!(parse_time(b"10:00:00."), Some(36_000_000_000));
+    // Genuinely malformed input still becomes NULL.
+    assert_eq!(parse_date(b"2024-01-01 "), Some(19_723)); // trailing space is only trimmed
+    assert_eq!(parse_date(b"2024-01-01T"), None);
+    assert_eq!(parse_date(b"2024-01-01 x"), None);
+    assert_eq!(parse_date(b"2024-01-01 25:00:00"), None);
+    // duckdb rejects every named zone but UTC without the ICU extension.
+    assert_eq!(parse_timestamp(b"2024-01-01 10:00:00 GMT"), None);
+    assert_eq!(parse_timestamp(b"2024-01-01 10:00:00.x"), None);
+    assert_eq!(parse_timestamp(b"2024-01-01x10:00:00"), None);
+}
+
+#[test]
 fn parse_rejects_bad_input() {
     assert_eq!(parse_date(b"2024-13-01"), None);
     assert_eq!(parse_date(b"2024-02-30"), None);
@@ -1300,6 +1463,17 @@ fn regexp_full_match_backs_similar_to() {
         code_of(run("regexp_full_match", &[&vs(&[Some("a")]), &vs(&[Some(huge)])])),
         Some(Code::LimitExceeded)
     );
+    // An unbalanced pattern is an error, not a quietly repaired one. The anchoring used to be
+    // done by wrapping the pattern text in `^(?:...)$`, which turned `a)|(b` into the valid
+    // `^(?:a)|(b)$` -- so both `'a' SIMILAR TO 'a)|(b'` and `'b' SIMILAR TO 'a)|(b'` answered
+    // `true`, where duckdb raises `Invalid Input Error: missing ): a)|(b`.
+    assert_eq!(
+        code_of(run("regexp_full_match", &[&vs(&[Some("a")]), &vs(&[Some("a)|(b")])])),
+        Some(Code::SyntaxError)
+    );
+    // Alternation still anchors as a whole, exactly as the wrapping did.
+    assert_eq!(f("a", "a|b"), Some(true));
+    assert_eq!(f("ab", "a|b"), Some(false));
 }
 
 // --- printf / format ------------------------------------------------------

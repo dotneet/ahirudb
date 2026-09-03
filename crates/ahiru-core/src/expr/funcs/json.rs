@@ -477,23 +477,18 @@ pub(super) fn json_object_build(args: &[&Vector]) -> Result<Vector> {
 // SIMILAR TO (regexp_full_match)
 // =========================================================================
 
-/// Wraps the pattern in `^(?:...)$`. `SIMILAR TO` requires a full match rather than a partial one
-/// (confirmed with `duckdb -c "select 'abc' similar to 'a.c', 'Xabc' similar to 'a.c'"`: the
-/// former is true and the latter false), so it merely rides `expr::regex`'s existing anchors
-/// (`^`/`$`). No new regex engine is written.
-fn wrap_full_match(pattern: &[u8]) -> Vec<u8> {
-    let mut w = Vec::with_capacity(pattern.len() + 6);
-    w.extend_from_slice(b"^(?:");
-    w.extend_from_slice(pattern);
-    w.extend_from_slice(b")$");
-    w
-}
-
 /// `SIMILAR TO` (`regexp_full_match`). Almost the same shape as `regex::eval_matches` (compiling
-/// once per batch when the pattern column is constant), differing only in passing the wrapped
-/// pattern, so `expr::regex` is left entirely unchanged.
-/// The step cap (ReDoS protection) and pattern-length cap in `regex::compile`/`is_match` apply to
-/// the wrapped string just the same.
+/// once per batch when the pattern column is constant), differing only in compiling the pattern
+/// with `regex::compile_full` instead of `regex::compile`.
+///
+/// `SIMILAR TO` requires a full match rather than a partial one (confirmed with
+/// `duckdb -c "select 'abc' similar to 'a.c', 'Xabc' similar to 'a.c'"`: the former is true and
+/// the latter false). This used to be done by wrapping the pattern text in `^(?:...)$`, which
+/// silently repaired an unbalanced pattern into a valid one with a different meaning
+/// (`'a' SIMILAR TO 'a)|(b'` answered `true` where DuckDB raises an error). `compile_full`
+/// parses the pattern on its own and emits the anchors around the compiled program instead.
+/// The step cap (ReDoS protection) and pattern-length cap in `regex::compile`/`is_match` apply
+/// just the same.
 pub(super) fn regexp_full_match_build(args: &[&Vector]) -> Result<Vector> {
     ensure!(args.len() == 2, WrongArgCount);
     let (n, s) = strides(args)?;
@@ -502,7 +497,7 @@ pub(super) fn regexp_full_match_build(args: &[&Vector]) -> Result<Vector> {
     let (sv, pv) = (args[0], args[1]);
     let pat_const = s[1] == 0;
     let cached = if pat_const && n > 0 && pv.is_valid(0) {
-        Some(regex::compile(&wrap_full_match(pv.bytes().get(0)))?)
+        Some(regex::compile_full(pv.bytes().get(0))?)
     } else {
         None
     };
@@ -516,7 +511,7 @@ pub(super) fn regexp_full_match_build(args: &[&Vector]) -> Result<Vector> {
         let prog = match &cached {
             Some(p) => p,
             None => {
-                compiled = regex::compile(&wrap_full_match(pv.bytes().get(i * s[1])))?;
+                compiled = regex::compile_full(pv.bytes().get(i * s[1]))?;
                 &compiled
             }
         };

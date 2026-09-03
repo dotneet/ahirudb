@@ -368,6 +368,23 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                 None => Ok(false),
             };
         }
+        // The integer-path forms: the argument is a 0-based array subscript, not a path string
+        // (see `crate::json::extract_index`).
+        F_JSON_EXTRACT_IDX => {
+            return match crate::json::extract_index(a.bytes(0), a.int(1))? {
+                Some((span, _)) => {
+                    out.extend_from_slice(span);
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
+        F_JSON_EXTRACT_STRING_IDX => {
+            return match crate::json::extract_index(a.bytes(0), a.int(1))? {
+                Some((span, kind)) => crate::json::write_extracted_text(span, kind, out),
+                None => Ok(false),
+            };
+        }
         F_JSON_TYPE => {
             let found = json_extract_or_whole(a)?;
             return match found {

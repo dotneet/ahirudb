@@ -495,6 +495,49 @@ e2e!(
     ]
 );
 
+e2e!(
+    regex_escapes_and_stray_braces,
+    "tests/data/basic.parquet",
+    [
+        // A `{` that does not form a valid `{n,m}` is a literal, in RE2 and here.
+        "SELECT regexp_matches('a{x','a{x'), regexp_matches('ax','a{x'), regexp_replace('a{b','a{','Z'), regexp_matches('a{','a*{'), regexp_matches('a{','a+{'), regexp_matches('a{,2}','a{,2}') FROM t LIMIT 1",
+        // RE2 escapes: control characters, hex, text anchors, escaped punctuation.
+        // (`\t` itself is spelled `\x09` here: the harness substitutes the bare word `t`
+        // with the file path, which would corrupt the pattern. The unit tests cover `\t`.)
+        "SELECT regexp_matches(chr(9),'\\x09'), regexp_matches(chr(11),'\\v'), regexp_matches('a','\\x61'), regexp_matches('a','\\Aa\\z'), regexp_matches('/','\\/'), regexp_matches('-','\\-'), regexp_matches(chr(9),'[\\x09]') FROM t LIMIT 1",
+        // A repeated flag letter is accepted.
+        "SELECT regexp_replace('aXbXc','X','-','gg'), regexp_replace('aXbXc','X','-','g') FROM t LIMIT 1",
+        // SIMILAR TO / `~` anchor the whole alternation.
+        "SELECT 'abc' SIMILAR TO 'a.c', 'Xabc' SIMILAR TO 'a.c', 'a' ~ 'a|b', 'ab' ~ 'a|b' FROM t LIMIT 1",
+    ]
+);
+
+e2e!(
+    datetime_parts_and_text_casts,
+    "tests/data/basic.parquet",
+    [
+        // date_trunc/date_diff use `year / 100`, date_part uses the 1-based century.
+        // (the extra `AS DATE` hop only papers over date_trunc's documented return type:
+        // DuckDB gives DATE back for a DATE input, this engine always gives TIMESTAMP.)
+        "SELECT CAST(CAST(date_trunc('century', DATE '2024-05-05') AS DATE) AS VARCHAR), CAST(CAST(date_trunc('century', DATE '1900-12-31') AS DATE) AS VARCHAR), CAST(CAST(date_trunc('millennium', DATE '2024-05-05') AS DATE) AS VARCHAR), CAST(CAST(date_trunc('isoyear', DATE '2024-12-30') AS DATE) AS VARCHAR) FROM t LIMIT 1",
+        "SELECT date_part('century', DATE '2024-05-05'), date_part('millennium', DATE '2024-05-05'), date_part('isoyear', DATE '2024-12-30'), date_diff('century', DATE '1900-01-01', DATE '2024-01-01'), date_diff('millennium', DATE '1999-01-01', DATE '2024-01-01') FROM t LIMIT 1",
+        // DuckDB's short part-name aliases.
+        "SELECT date_part('y', DATE '2024-05-05'), date_part('mon', DATE '2024-05-05'), date_part('d', DATE '2024-05-05'), date_part('w', DATE '2024-05-05'), date_part('c', DATE '2024-05-05'), date_part('mil', DATE '2024-05-05'), date_part('weekday', DATE '2024-05-05'), date_part('centuries', DATE '2024-05-05') FROM t LIMIT 1",
+        "SELECT date_part('min', TIMESTAMP '2024-05-05 01:02:03'), date_part('sec', TIMESTAMP '2024-05-05 01:02:03'), date_part('hrs', TIMESTAMP '2024-05-05 01:02:03'), date_part('m', TIMESTAMP '2024-05-05 01:02:03') FROM t LIMIT 1",
+        // Text -> DATE/TIMESTAMP shapes DuckDB accepts.
+        "SELECT CAST('2024-01-01T00:00:00' AS DATE), CAST('2024-01-01 10:00:00' AS DATE), CAST('2024-01-01  10:00:00' AS TIMESTAMP), CAST('2024-01-01 10:00:00.' AS TIMESTAMP), CAST('2024-01-01 10:00:00 UTC' AS TIMESTAMP), CAST('2024-01-01 10:00:00Z' AS TIMESTAMP) FROM t LIMIT 1",
+    ]
+);
+
+e2e!(
+    json_integer_path_is_an_array_subscript,
+    "tests/data/basic.parquet",
+    [
+        "SELECT '[1,2]' -> 0, '[1,2]' -> 1, '[1,2]' ->> -1, json_extract('[1,2]', 1), '[1,2]' -> 2 FROM t LIMIT 1",
+        "SELECT '{\"0\":5}' -> 0, '{\"0\":5}' -> '0', '[1,2]' -> '$[0]' FROM t LIMIT 1",
+    ]
+);
+
 /// `DISTINCT ON` without `ORDER BY` keeps "the first row in arrival order".
 /// DuckDB follows the same rule, but which row counts as "first in arrival order"
 /// depends on the scan implementation (page read order and so on), so cross-checking

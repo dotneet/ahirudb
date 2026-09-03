@@ -96,7 +96,11 @@ fn fmt_scaled(v: i128, ty: Ty) -> String {
 /// Turns days since the epoch into `YYYY-MM-DD`. The civil_from_days algorithm.
 fn fmt_date(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
+    // Pad the *digits* to four, not the whole rendering: `{y:04}` counts the minus sign as one
+    // of the four, so year -1 came out as `-001` here while `CAST(... AS VARCHAR)` in the core
+    // (`expr::funcs::datetime::pad`) gives `-0001`.
+    let sign = if y < 0 { "-" } else { "" };
+    format!("{sign}{:04}-{m:02}-{d:02}", y.unsigned_abs())
 }
 
 /// Displays a TIME (microseconds since midnight) as `HH:MM:SS`. A simplification
@@ -164,5 +168,24 @@ mod tests {
     #[test]
     fn time_endpoint_does_not_wrap_to_midnight() {
         assert_eq!(render(&Value::I64(86_400_000_000), Ty::Time, "NULL"), "24:00:00");
+    }
+
+    #[test]
+    fn negative_years_pad_the_digits_not_the_sign() {
+        // `{y:04}` counted the `-` as one of the four, so this used to print `-001-01-01`
+        // while `CAST(DATE '-0001-01-01' AS VARCHAR)` in the core gave `-0001-01-01`.
+        let day = |y: i64, m: u32, d: u32| {
+            // The inverse of civil_from_days, inlined so the test needs nothing from the core.
+            let yy = y - if m <= 2 { 1 } else { 0 };
+            let era = yy.div_euclid(400);
+            let yoe = yy - era * 400;
+            let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+            let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+            era * 146_097 + (yoe * 365 + yoe / 4 - yoe / 100 + doy) - 719_468
+        };
+        assert_eq!(render(&Value::I32(day(-1, 1, 1) as i32), Ty::Date, "NULL"), "-0001-01-01");
+        assert_eq!(render(&Value::I32(day(-100, 3, 4) as i32), Ty::Date, "NULL"), "-0100-03-04");
+        assert_eq!(render(&Value::I32(day(2024, 5, 5) as i32), Ty::Date, "NULL"), "2024-05-05");
+        assert_eq!(render(&Value::I32(day(1, 1, 1) as i32), Ty::Date, "NULL"), "0001-01-01");
     }
 }

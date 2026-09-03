@@ -52,20 +52,42 @@ SELECT epoch_ms(ts), epoch_us(ts), epoch_ns(ts) FROM t LIMIT 1;
 
 `year`/`quarter`/`month`/`week`/`day`/`dayofmonth`/`hour`/`minute`/
 `second`/`millisecond`/`microsecond`/`dayofweek`/`isodow`/`dayofyear`/
-`century`/`decade`/`epoch` are all shorthand for the equivalent
-`date_part(...)` call. `week` uses ISO 8601 week numbering
+`century`/`decade`/`millennium`/`isoyear`/`epoch` are all shorthand for the
+equivalent `date_part(...)` call. `week` uses ISO 8601 week numbering
 (`date_trunc('week', ...)` treats Monday as the start of the week).
+
+Part names are case-insensitive, a trailing `s` is ignored (`years` =
+`year`), and DuckDB's abbreviations are accepted:
+`y`/`yr`/`yrs`, `mon`/`mons`, `d`/`dayofmonth`, `h`/`hr`/`hrs`,
+`m`/`min`/`mins` (`m` is **minute**, not month, as in DuckDB),
+`s`/`sec`/`secs`, `ms`/`msec`/`msecs`, `us`/`usec`/`usecs`,
+`w`/`weekofyear`, `c`/`cent`/`centuries`, `dec`/`decs`,
+`mil`/`mils`/`millennia`, `weekday`, `isoweekday`.
 
 | Part | Notes |
 |---|---|
 | `millisecond` (`ms`), `microsecond` (`us`) | Include the whole seconds field, matching DuckDB: `millisecond` of `11:59:44.123456` is `44123`, not `123` |
 | `dayofweek` (`dow`) | Sunday = 0 … Saturday = 6 |
 | `isodow` (`isoweekday`) | Monday = 1 … Sunday = 7 |
+| `isoyear` | The ISO 8601 week-numbering year, which can differ from `year` at a year boundary: `isoyear` of 2024-12-30 is 2025 |
 | `century` | Years 1–100 are century 1, so 2021 → 21 and 2000 → 20 |
+| `millennium` | Same 1-based counting, so 2024 → 3 |
 | `decade` | `year / 10`, so 2021 → 202 |
 
 The same part names work with `date_trunc`/`date_diff`/`date_add`
 (`isodow` excepted — there is nothing to truncate or add there).
+
+**`century`/`millennium` mean something different in `date_trunc` and
+`date_diff` than in `date_part`** — this is DuckDB's own inconsistency and
+is matched deliberately. `date_part` counts them 1-based (2024 is century
+21), while `date_trunc` and `date_diff` use a plain `year / 100`:
+`date_trunc('century', DATE '2024-05-05')` is `2000-01-01` (not
+`2001-01-01`) and `date_diff('century', DATE '1900-01-01', DATE
+'2024-01-01')` is 1.
+
+`date_diff('microsecond', a, b)` raises `value out of range` instead of
+wrapping when the difference does not fit in a `BIGINT` (only the
+microsecond unit can overflow; the others divide before subtracting).
 
 `epoch_ms`/`epoch_us`/`epoch_ns` are the sub-second counterparts of the
 `epoch` part: the same instant rescaled to milliseconds, microseconds, or
@@ -78,7 +100,7 @@ only — the engine carries no locale data.
 SELECT date_trunc('month', d) FROM t LIMIT 1;   -- always returns TIMESTAMP, even truncating a DATE
 SELECT strftime(d, '%Y-%m-%d') FROM t LIMIT 1;  -- only %Y %m %d %H %M %S %% are interpreted
 SELECT to_date('2024-05-01');                   -- strict YYYY-MM-DD
-SELECT to_timestamp('2024-05-01 10:00:00');     -- YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]]
+SELECT to_timestamp('2024-05-01 10:00:00');     -- YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]][zone]
 SELECT make_date(2024, 2, 29);                  -- 2024-02-29 (a DATE)
 SELECT make_timestamp(2024, 8, 14, 13, 45, 30); -- 2024-08-14 13:45:30
 ```
@@ -90,6 +112,19 @@ general "prefer `NULL` over erroring mid-scan" policy. DuckDB's
 single-argument `make_timestamp(microseconds)` overload and its `DOUBLE`
 seconds argument (fractional seconds) are not provided; use a `CAST` or add
 an `INTERVAL` for those.
+
+**Text → `DATE`/`TIMESTAMP` casts** accept the same shapes as DuckDB:
+`YYYY-MM-DD`, optionally followed by `T` or one or more spaces and a
+`HH:MM[:SS[.ffffff]]` time, optionally followed by a zone suffix (`Z`,
+`[+-]HH[[:]MM]`, or a separate ` UTC` word — the offset is only validated,
+never applied, because `TIMESTAMP` has no zone). A trailing `.` with no
+digits after the seconds is accepted and means zero. A cast to `DATE`
+accepts a timestamp-shaped string and keeps only the date part, so an ISO
+timestamp column casts to `DATE` cleanly:
+`'2024-01-01T10:00:00'::DATE` is `2024-01-01`. Anything else — including
+DuckDB's habit of ignoring arbitrary trailing text in a `DATE` cast
+(`'2024-01-01x'::DATE`) — becomes `NULL` here; see
+[limitations.md](limitations.md#partially-supported).
 
 `strftime` only understands `%Y`/`%m`/`%d`/`%H`/`%M`/`%S`/`%%` — it is not
 a full strftime implementation; unrecognized specifiers pass through as
