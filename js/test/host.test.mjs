@@ -1615,7 +1615,12 @@ test('a wrong-length cache hit is treated as a miss instead of spinning forever'
     db.registerParquet('t', source);
     const rows = await db.query('SELECT sum(id) AS s FROM t');
     assert.equal(rows.length, 1);
-    assert.equal(Number(rows[0].s), duck(`SELECT sum(id) AS s FROM '${BASIC}'`)[0].s);
+    // `Number()` on both sides, as the other duckdb cross-checks here do: `sum` of an
+    // INTEGER column is a HUGEINT, and `duckdb -json` renders one as a bare number on some
+    // builds and as a quoted string on others. `assert` is the strict flavour in this file,
+    // so comparing the raw values would pass or fail depending on the local duckdb.
+    const want = duck(`SELECT sum(id) AS s FROM '${BASIC}'`)[0].s;
+    assert.equal(Number(rows[0].s), Number(want));
     assert.ok(reads > 0, 'the source was never asked; the bogus cache hit was used as-is');
   } finally {
     db.close();
