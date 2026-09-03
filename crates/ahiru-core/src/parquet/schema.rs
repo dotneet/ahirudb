@@ -472,8 +472,10 @@ fn map_logical(l: LogicalType) -> Result<(Ty, Option<TimeUnit>)> {
         // subtree containing REPEATED", so reaching here means the annotation is
         // attached directly to a leaf (a corrupted schema).
         L::List | L::Map => err!(UnsupportedNested),
-        // FLOAT16 is FLBA(2) half precision. Not supported in v1.
-        L::Float16 => err!(UnsupportedType),
+        // FLOAT16 is FLBA(2) holding an IEEE binary16. Every binary16 value is
+        // representable in binary32, so it widens to `Ty::Float` losslessly
+        // (`reader::push_byte_values` does the conversion).
+        L::Float16 => (Ty::Float, None),
     })
 }
 
@@ -504,8 +506,10 @@ fn map_converted(c: ConvertedType, e: &SchemaElement) -> Result<(Ty, Option<Time
         C::Int64 => (Ty::BigInt, None),
         // LIST/MAP are handled at the build_nested_node entry point (see the comment above).
         C::List | C::Map | C::MapKeyValue => err!(UnsupportedNested),
-        // INTERVAL is FLBA(12). Not supported since there is no corresponding SQL type.
-        C::Interval => err!(UnsupportedType),
+        // INTERVAL is FLBA(12): months, days and milliseconds, each an unsigned
+        // 32-bit little-endian integer (`reader::push_byte_values` repacks it into
+        // the engine's months/days/micros layout).
+        C::Interval => (Ty::Interval, None),
     })
 }
 

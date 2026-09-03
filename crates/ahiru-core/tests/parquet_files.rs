@@ -201,3 +201,72 @@ fn corrupted_footer_bytes_never_panic() {
         let _ = open_bytes(&b);
     }
 }
+
+/// INTERVAL is FIXED_LEN_BYTE_ARRAY(12) carrying months / days / milliseconds as three
+/// unsigned 32-bit little-endian integers. It used to be rejected while the footer was
+/// still being parsed, which made the *whole file* unreadable even for queries that
+/// never touched the interval column.
+///
+/// Values transcribed from `duckdb -c "SELECT id, iv FROM 'interval.parquet'"`:
+/// `1 day` / `1 year 1 month 5 days 03:04:05.5` / `00:00:00` / `01:30:00`.
+#[test]
+fn interval_column_matches_duckdb() {
+    use ahiru_core::vector::pack_interval;
+
+    let bytes = data("interval.parquet");
+    let (names, cols) = read_all(&bytes);
+    assert_eq!(names, ["id", "iv"]);
+    assert_eq!(cols[1].ty(), Ty::Interval);
+
+    const DAY_US: i64 = 86_400_000_000;
+    let expected = [
+        pack_interval(0, 1, 0),
+        pack_interval(13, 5, 3 * 3_600_000_000 + 4 * 60_000_000 + 5_500_000),
+        pack_interval(0, 0, 0),
+        pack_interval(0, 0, 90 * 60_000_000),
+    ];
+    assert_eq!(cols[1].len(), expected.len());
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(cols[0].value_at(i), Value::I32(i as i32 + 1));
+        assert_eq!(cols[1].value_at(i), Value::I128(*want), "row {i}");
+    }
+    // A day is a calendar day, not 24 fixed hours, so it must not collapse into micros.
+    assert_ne!(cols[1].value_at(0), Value::I128(pack_interval(0, 0, DAY_US)));
+}
+
+/// FLOAT16 is FIXED_LEN_BYTE_ARRAY(2) holding an IEEE binary16, widened losslessly to
+/// FLOAT. It, too, used to make the whole file unreadable. Values transcribed from
+/// `duckdb -c "SELECT id, h FROM 'float16.parquet'"`.
+#[test]
+fn float16_column_widens_to_float_exactly() {
+    let bytes = data("float16.parquet");
+    let (names, cols) = read_all(&bytes);
+    assert_eq!(names, ["id", "h"]);
+    assert_eq!(cols[1].ty(), Ty::Float);
+
+    let expected = [
+        Some(1.5f64),
+        Some(-2.5),
+        Some(0.0),
+        Some(-0.0),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        None,
+        Some(6.103515625e-05),       // smallest normal
+        Some(5.960464477539063e-08), // smallest subnormal (a normal in binary32)
+        Some(65504.0),               // largest finite
+        Some(0.0999755859375),       // nearest binary16 to 0.1
+    ];
+    assert_eq!(cols[1].len(), expected.len());
+    for (i, want) in expected.iter().enumerate() {
+        match want {
+            None => assert_eq!(cols[1].value_at(i), Value::Null, "row {i}"),
+            Some(w) => {
+                let Value::F64(got) = cols[1].value_at(i) else { panic!("row {i}: not F64") };
+                assert_eq!(got, *w, "row {i}");
+                // -0.0 must stay negative zero rather than becoming +0.0.
+                assert_eq!(got.is_sign_negative(), w.is_sign_negative(), "row {i} sign");
+            }
+        }
+    }
+}
