@@ -50,6 +50,27 @@ db.close();
 
 `registerParquet` is an alias for `register` (it can register formats other than Parquet too).
 
+### Finishing a stream
+
+Only one query runs against an instance at a time, and a `stream()` iterator
+holds that slot for as long as it is alive. **A stream you stop consuming early
+must be finished**, or every later `query()`/`stream()` on the instance waits
+for it forever:
+
+```js
+for await (const batch of db.stream(sql)) { if (done) break; }  // fine: for-await
+                                                               // calls return()
+                                                               // on break/throw
+
+const it = db.stream(sql)[Symbol.asyncIterator]();
+await it.next();
+await it.return();  // required when driving the iterator by hand
+```
+
+`close()` is the other way out: it aborts whatever run is in flight, releases
+the slot, and closes that query. An abandoned iterator resumed after `close()`
+throws rather than stepping a handle that is no longer valid.
+
 Writing `FROM parquet('https://…/a.parquet')` automatically registers that path
 as a table of the same name (this is a contract of `resolve_from` in
 `plan/bind.rs`). That's the entry point for Parquet specifically; CSV / JSONL
@@ -215,6 +236,17 @@ try {
 `errors.js` mirrors `Code` and `message()` from
 `crates/ahiru-core/src/error.rs`, so **always update both together**. If they
 drift apart, the test (`errors.js matches the Code / message in error.rs`) fails.
+
+Two codes are raised by this host rather than by wasm and are worth calling out:
+
+- **E108** `invalid UTF-8 in string data` — a VARCHAR / JSON value in the source
+  file is not valid UTF-8. The engine passes those bytes through untouched, so
+  the decoder here is where it surfaces. It is a property of the data, not an
+  engine bug: E900 is reserved for a result buffer that is structurally wrong.
+- **E504** `io failed: no progress for ranges [...]` — a `ByteSource` returned
+  the same range twice without adding a byte. Empty reads are deliberately not
+  cached, so a source that returns an empty body once and then recovers works;
+  one that never returns bytes fails here instead of spinning.
 
 ## Security
 

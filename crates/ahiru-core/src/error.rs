@@ -20,6 +20,10 @@ pub enum Code {
     BadPageHeader = 105,
     BadCompressedData = 106,
     ChecksumMismatch = 107,
+    /// A value in a text column is not valid UTF-8. The engine hands VARCHAR /
+    /// JSON payloads through as the bytes the file holds, so the host decoder is
+    /// where this surfaces -- it is a property of the data, not an engine bug.
+    InvalidUtf8 = 108,
 
     // 2xx: unsupported Parquet features
     UnsupportedEncoding = 200,
@@ -146,6 +150,7 @@ impl Error {
             BadPageHeader => "malformed page header",
             BadCompressedData => "malformed compressed data",
             ChecksumMismatch => "page checksum mismatch",
+            InvalidUtf8 => "invalid UTF-8 in string data",
             UnsupportedEncoding => "unsupported parquet encoding",
             UnsupportedCodec => "unsupported compression codec",
             UnsupportedType => "unsupported parquet type",

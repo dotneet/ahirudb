@@ -222,6 +222,17 @@ export declare function coalesceRanges(
   totalLen?: number,
 ): { offset: number; len: number }[];
 
+/**
+ * Records a fetched byte range, merging it into the coverage already recorded
+ * for the same part. Mutates and returns `ranges`.
+ */
+export declare function recordFetched(
+  ranges: { part: number; offset: number; len: number }[],
+  part: number,
+  offset: number,
+  len: number,
+): { part: number; offset: number; len: number }[];
+
 /** Infers the format from the extension of a registered name (a mirror of `FormatKind::detect`). */
 export declare function detectFormat(name: string): DetectedFormatName;
 
