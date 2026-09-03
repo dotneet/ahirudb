@@ -83,10 +83,24 @@ fn replace_tables(sql: &str, files: &[&str]) -> String {
             i = j;
             continue;
         }
-        out.push(b[i] as char);
-        i += 1;
+        // Copy a whole UTF-8 sequence, not one byte cast to `char`: the byte
+        // cast would turn every non-ASCII character into mojibake before
+        // DuckDB saw the query.
+        let n = utf8_len(b[i]);
+        out.push_str(&sql[i..i + n]);
+        i += n;
     }
     out
+}
+
+/// Length in bytes of the UTF-8 sequence that starts with `lead`.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
 }
 
 fn parse(text: &str, sep: char) -> Vec<Vec<String>> {
