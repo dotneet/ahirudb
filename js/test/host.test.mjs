@@ -25,6 +25,7 @@ import {
   decodeSchema,
   detectFormat,
   encodeParams,
+  recordFetched,
   timestampToDate,
   timestamptzToDate,
   unpackInterval,
@@ -322,6 +323,7 @@ test('wire decoders reject truncated schemas and result columns as AhiruError', 
 });
 
 test('wire decoders reject invalid UTF-8 instead of silently replacing it', () => {
+  // A field *name* can only be malformed if the wire buffer is: still E900.
   const schema = new Uint8Array(4 + 20 + 1);
   const schemaDv = new DataView(schema.buffer);
   schemaDv.setUint32(0, 1, true);
@@ -349,7 +351,10 @@ test('wire decoders reject invalid UTF-8 instead of silently replacing it', () =
   result[p] = 0xff;
   assert.throws(
     () => decodeBatch(result, [{ name: 's', type: 'VARCHAR', typeCode: 14, physType: 5 }]),
-    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+    // A VARCHAR *value* is whatever bytes the source file holds, so this is a
+    // data error, not an engine bug. Reporting it as E900 sent users hunting
+    // for a bug in the engine over a file with a non-UTF-8 string in it.
+    (e) => e instanceof AhiruError && e.code === Code.INVALID_UTF8,
   );
 });
 
@@ -438,6 +443,45 @@ test('coalesceRanges fills gaps smaller than 1 MB into a single range', () => {
       `expected invalid coalescing gap ${String(gap)} to be rejected`,
     );
   }
+});
+
+test('recordFetched remembers coverage, not just where a fetch started', () => {
+  const ranges = [];
+  recordFetched(ranges, 0, 4, 1501);
+  assert.deepEqual(ranges, [{ part: 0, offset: 4, len: 1501 }]);
+  // The regression: a longer fetch starting at an offset already recorded. Keyed
+  // by (part, offset) alone this was dropped, and codec delegation then reported
+  // bytes we had in fact fetched as never fetched (E900).
+  recordFetched(ranges, 0, 4, 72927);
+  assert.deepEqual(ranges, [{ part: 0, offset: 4, len: 72927 }]);
+  const covers = (part, offset, len) =>
+    ranges.some((r) => r.part === part && r.offset <= offset && offset + len <= r.offset + r.len);
+  assert.ok(covers(0, 1525, 1473));
+
+  // A different part shares nothing: offsets live in their own space per file.
+  recordFetched(ranges, 1, 4, 10);
+  assert.equal(ranges.length, 2);
+  assert.ok(!covers(1, 4, 72927));
+
+  // Touching and abutting ranges merge; disjoint ones do not.
+  recordFetched(ranges, 0, 72931, 2025);
+  assert.deepEqual(
+    ranges.filter((r) => r.part === 0),
+    [{ part: 0, offset: 4, len: 74952 }],
+  );
+  recordFetched(ranges, 0, 200000, 10);
+  assert.equal(ranges.filter((r) => r.part === 0).length, 2);
+  // A bridging fetch collapses them back into one.
+  recordFetched(ranges, 0, 74956, 125044);
+  assert.deepEqual(
+    ranges.filter((r) => r.part === 0),
+    [{ part: 0, offset: 4, len: 200006 }],
+  );
+
+  // Empty fetches record nothing.
+  const before = ranges.length;
+  recordFetched(ranges, 0, 500000, 0);
+  assert.equal(ranges.length, before);
 });
 
 // --- Cache -------------------------------------------------------------------
@@ -1508,6 +1552,78 @@ test('an identical request with no byte progress is treated as a livelock and fa
   } finally {
     db.close();
   }
+});
+
+test('a transient empty read is not cached and the retry succeeds', async () => {
+  const file = new Uint8Array(await readFile(BASIC));
+  const cache = new MemoryCache();
+  let reads = 0;
+  const source = {
+    key: 'flaky-empty',
+    size: () => file.byteLength,
+    // The first read comes back empty, as a flaky origin might answer once.
+    read: async (offset, len) => (++reads === 1 ? new Uint8Array(0) : file.subarray(offset, offset + len)),
+  };
+  // Caching the empty body poisoned that range for good: every retry hit the
+  // cache, the source was never asked again, and the livelock detector failed
+  // this query -- and every later one, on every instance sharing the cache.
+  const db = await openDb({ cache });
+  try {
+    db.registerParquet('t', source);
+    assert.equal((await db.query('SELECT id FROM t LIMIT 1')).length, 1);
+    assert.ok(reads >= 2, `the source should have been asked again: ${reads}`);
+  } finally {
+    db.close();
+  }
+  const db2 = await openDb({ cache });
+  try {
+    db2.registerParquet('t', source);
+    assert.equal((await db2.query('SELECT id FROM t LIMIT 1')).length, 1);
+  } finally {
+    db2.close();
+  }
+});
+
+test('close() recovers an abandoned stream instead of deadlocking the instance', async () => {
+  const db = await openDb();
+  db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
+  const it = db.stream('SELECT id FROM t')[Symbol.asyncIterator]();
+  const first = await it.next();
+  assert.ok(first.value.numRows > 0);
+  // The iterator is now parked at a `yield` holding the session lock, and it is
+  // never resumed. Without close() taking the session back, everything queued
+  // behind it waits forever.
+  const queued = db.query('SELECT id FROM t LIMIT 1');
+  db.close();
+  await assert.rejects(
+    withTimeout(queued, 5000, 'a query queued behind an abandoned stream hung after close()'),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL,
+  );
+  // Resuming the abandoned iterator must fail loudly rather than step a handle
+  // close() already released.
+  await assert.rejects(
+    withTimeout(it.next(), 5000, 'the abandoned iterator hung'),
+    (e) => e instanceof AhiruError && e.code === Code.INTERNAL && /aborted by close/.test(e.message),
+  );
+});
+
+test('pointers and sizes are read as unsigned, so a heap above 2 GiB still works', async () => {
+  // wasm returns `usize` as a signed i32, so anything at or above 2 GiB arrives
+  // negative. Left signed, `#checkMemory` silently stops firing and the
+  // out-buffer view throws a bare RangeError.
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const fake = {
+    exports: {
+      memory,
+      ahiru_session_new: () => 0,
+      ahiru_session_free: () => {},
+      // The exact value the 2 GiB reproduction reported.
+      ahiru_heap_used: () => -2128680800,
+    },
+  };
+  const db = new AhiruDB(fake, {});
+  assert.equal(db.heapUsed, 2166286496);
+  db.close();
 });
 
 test('exceeding memoryLimit stops with E501', async () => {
