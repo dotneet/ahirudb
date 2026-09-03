@@ -24,7 +24,7 @@ use crate::vector::{
 };
 
 /// Microseconds in a day. DATE(I32, days) <-> TIMESTAMP(I64, microseconds).
-const MICROS_PER_DAY: i128 = 86_400_000_000;
+pub(crate) const MICROS_PER_DAY: i128 = 86_400_000_000;
 
 /// 2^127. Used for range checks on f64 -> i128 (converting i128::MAX to f64 rounds it up).
 const I128_LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
@@ -635,7 +635,7 @@ fn dec_scale(t: Ty) -> u8 {
     }
 }
 
-fn pow10_i128(k: u32) -> Option<i128> {
+pub(crate) fn pow10_i128(k: u32) -> Option<i128> {
     if k > 38 {
         return None;
     }

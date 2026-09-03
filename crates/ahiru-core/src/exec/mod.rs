@@ -19,6 +19,7 @@ use crate::catalog::Catalog;
 use crate::exec::rowkey::{encode_key, HashIndex};
 use crate::expr::vm::Vm;
 use crate::expr::Program;
+use crate::format::Pruner;
 use crate::plan::{Node, ScanSpec};
 use crate::prelude::*;
 use crate::vector::{Batch, Field, Vector, BATCH_SIZE};
@@ -195,6 +196,35 @@ impl Scan {
     }
 }
 
+/// The pruners usable against one part's statistics: either all of them or none.
+///
+/// A pruner's constant was converted into the **table's** column type while the query was
+/// bound (`plan::bind::pruning`), but statistics carry each part's **own** representation.
+/// For a multi-file table those can differ -- one file's `DECIMAL(5,1)` union'd with
+/// another's `DECIMAL(8,3)` reads back as `DECIMAL(9,3)`, so the constant is scaled by
+/// 10^3 while the first file's statistics are scaled by 10^1 -- and comparing across the
+/// two would silently drop matching rows. Such a part is simply read in full.
+fn usable_pruners<'a>(
+    pruners: &'a [Pruner],
+    projection: &[usize],
+    table_schema: &[Field],
+    part_schema: &[Field],
+) -> &'a [Pruner] {
+    let fits = pruners.iter().all(|p| {
+        let Some(&c) = projection.get(p.column) else { return true };
+        match (table_schema.get(c), part_schema.get(c)) {
+            (Some(t), Some(f)) => t.ty == f.ty,
+            // An unresolved or short part schema cannot be checked; err safe.
+            _ => false,
+        }
+    });
+    if fits {
+        pruners
+    } else {
+        &[]
+    }
+}
+
 impl Operator for Scan {
     fn next(&mut self, ctx: &mut ExecContext) -> Result<Step> {
         loop {
@@ -233,10 +263,16 @@ impl Operator for Scan {
             }
             let part = &table.parts[self.part];
             let fmt = &part.format;
+            let pruners = usable_pruners(
+                &self.spec.pruners,
+                &self.spec.columns,
+                table.schema(),
+                fmt.schema(),
+            );
 
             // If statistics can rule it out, move on without fetching a single byte.
             // Formats with no statistics always pass under the default implementation.
-            if !fmt.may_match(self.split, &self.spec.pruners, &self.spec.columns) {
+            if !fmt.may_match(self.split, pruners, &self.spec.columns) {
                 self.split += 1;
                 continue;
             }
@@ -245,7 +281,7 @@ impl Operator for Scan {
             // filter). With nothing to target, nothing is queued (the default implementation), so
             // formats without support add not one round trip here.
             let mut idx_ranges = Vec::with_capacity(self.spec.columns.len());
-            fmt.index_ranges(self.split, &self.spec.pruners, &self.spec.columns, &mut idx_ranges)?;
+            fmt.index_ranges(self.split, pruners, &self.spec.columns, &mut idx_ranges)?;
             let mut idx_missing = Vec::new();
             for (start, end) in &idx_ranges {
                 if let Some((o, l)) = part.source.missing(*start, end - start) {
@@ -271,7 +307,7 @@ impl Operator for Scan {
                     Some(p) => p.format.refine_with_index(
                         &p.source,
                         self.split,
-                        &self.spec.pruners,
+                        pruners,
                         &self.spec.columns,
                     )?,
                     None => err!(Internal),
@@ -831,5 +867,53 @@ mod limit_tests {
         };
         assert_eq!(batch.card(), 1);
         assert_eq!(op.seen, u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod usable_pruner_tests {
+    use super::*;
+    use crate::format::PruneOp;
+    use crate::vector::{Ty, Value};
+
+    fn pruner(column: usize) -> Pruner {
+        Pruner { column, op: PruneOp::Eq, value: Value::I64(1500), in_values: Vec::new() }
+    }
+
+    #[test]
+    fn a_part_matching_the_table_schema_keeps_its_pruners() {
+        let table = vec![Field::new("d", Ty::Decimal { precision: 5, scale: 1 }, true)];
+        let ps = [pruner(0)];
+        assert_eq!(usable_pruners(&ps, &[0], &table, &table).len(), 1);
+    }
+
+    #[test]
+    fn a_part_with_a_different_decimal_scale_loses_them() {
+        let table = vec![Field::new("d", Ty::Decimal { precision: 9, scale: 3 }, true)];
+        let part = vec![Field::new("d", Ty::Decimal { precision: 5, scale: 1 }, true)];
+        let ps = [pruner(0)];
+        assert!(usable_pruners(&ps, &[0], &table, &part).is_empty());
+    }
+
+    #[test]
+    fn an_unresolved_part_loses_them() {
+        let table = vec![Field::new("d", Ty::Decimal { precision: 5, scale: 1 }, true)];
+        let ps = [pruner(0)];
+        assert!(usable_pruners(&ps, &[0], &table, &[]).is_empty());
+    }
+
+    #[test]
+    fn only_the_pruned_columns_are_compared() {
+        // A column no pruner touches may differ freely.
+        let table = vec![
+            Field::new("a", Ty::Int, true),
+            Field::new("b", Ty::Decimal { precision: 9, scale: 3 }, true),
+        ];
+        let part = vec![
+            Field::new("a", Ty::Int, true),
+            Field::new("b", Ty::Decimal { precision: 5, scale: 1 }, true),
+        ];
+        assert_eq!(usable_pruners(&[pruner(0)], &[0, 1], &table, &part).len(), 1);
+        assert!(usable_pruners(&[pruner(1)], &[0, 1], &table, &part).is_empty());
     }
 }
