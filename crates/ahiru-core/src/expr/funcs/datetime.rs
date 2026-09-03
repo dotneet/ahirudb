@@ -68,15 +68,34 @@ fn weekday(days: i64) -> i64 {
     (days + 4).rem_euclid(7)
 }
 
-/// ISO 8601 week number: which week of the year the Thursday of the week containing this day falls in.
-fn iso_week(days: i64) -> i64 {
+/// The Thursday of the ISO week containing `days`. The ISO year and week number are both defined
+/// by which calendar year that Thursday falls in.
+fn iso_thursday(days: i64) -> i64 {
     let iso_dow = match weekday(days) {
         0 => 7,
         w => w,
     };
-    let thursday = days + (4 - iso_dow);
+    days + (4 - iso_dow)
+}
+
+/// ISO 8601 week number: which week of the year the Thursday of the week containing this day falls in.
+fn iso_week(days: i64) -> i64 {
+    let thursday = iso_thursday(days);
     let (y, _, _) = civil_from_days(thursday);
     (thursday - days_from_civil(y, 1, 1)) / 7 + 1
+}
+
+/// ISO 8601 week-numbering year (`date_part('isoyear', DATE '2024-12-30')` is 2025).
+fn iso_year(days: i64) -> i64 {
+    civil_from_days(iso_thursday(days)).0
+}
+
+/// The first day (a Monday) of the ISO week-numbering year containing `days`. `date_trunc`'s
+/// `isoyear` unit.
+fn iso_year_start(days: i64) -> i64 {
+    // ISO week 1 always contains January 4th, so the Thursday of *that* week minus 3 days is the
+    // Monday the ISO year starts on.
+    iso_thursday(days_from_civil(iso_year(days), 1, 4)) - 3
 }
 
 /// The body of `date_part` / `year()` and friends.
@@ -103,8 +122,13 @@ pub(super) fn date_part(p: u8, us: i64) -> Option<i64> {
             w => w,
         },
         // Year 1-100 is century 1, 2021 is century 21 (DuckDB's definition).
+        // Note `date_trunc`/`date_diff` deliberately do *not* share this 1-based definition;
+        // see their own comments.
         P_CENTURY => (c.y - 1).div_euclid(100) + 1,
         P_DECADE => c.y.div_euclid(10),
+        // Same 1-based definition as the century (`date_part('millennium', 2024)` is 3).
+        P_MILLENNIUM => (c.y - 1).div_euclid(1000) + 1,
+        P_ISOYEAR => iso_year(c.days),
         // DuckDB returns a DOUBLE including fractional seconds; here it is BIGINT seconds (floored).
         _ => us.div_euclid(US_PER_SEC),
     })
@@ -129,7 +153,14 @@ pub(super) fn date_trunc(p: u8, us: i64) -> Result<Option<i64>> {
         P_MILLISECOND => unit(1_000),
         P_MICROSECOND => Some(us),
         P_DECADE => day(days_from_civil(c.y.div_euclid(10) * 10, 1, 1)),
-        P_CENTURY => day(days_from_civil((c.y - 1).div_euclid(100) * 100 + 1, 1, 1)),
+        // DuckDB truncates to `year / 100 * 100`, not to the start of the 1-based century that
+        // `date_part('century')` counts: `date_trunc('century', DATE '2024-05-05')` is
+        // `2000-01-01` and `date_trunc('century', DATE '1900-12-31')` is `1900-01-01`.
+        // The division truncates toward zero rather than flooring, again matching DuckDB
+        // (`date_trunc('century', DATE '-0050-05-05')` is year 0, printed there as `0001-01-01 (BC)`).
+        P_CENTURY => day(days_from_civil(c.y / 100 * 100, 1, 1)),
+        P_MILLENNIUM => day(days_from_civil(c.y / 1000 * 1000, 1, 1)),
+        P_ISOYEAR => day(iso_year_start(c.days)),
         _ => err!(TypeMismatch),
     })
 }
@@ -151,9 +182,23 @@ pub(super) fn date_diff(p: u8, a: i64, b: i64) -> Result<Option<i64>> {
         P_SECOND => unit(US_PER_SEC),
         P_EPOCH => unit(US_PER_SEC),
         P_MILLISECOND => unit(1_000),
-        P_MICROSECOND => b - a,
+        // The only unit whose difference is not already divided down, so it is the only one that
+        // can overflow i64 (`date_diff('microsecond', TIMESTAMP '-290000-01-01', TIMESTAMP
+        // '290000-01-01')` used to wrap to a negative number). DuckDB raises an Out of Range
+        // error for the same call.
+        P_MICROSECOND => match b.checked_sub(a) {
+            Some(v) => v,
+            None => err!(ValueOutOfRange),
+        },
         P_DECADE => cb.y.div_euclid(10) - ca.y.div_euclid(10),
-        P_CENTURY => (cb.y - 1).div_euclid(100) - (ca.y - 1).div_euclid(100),
+        // Like `date_trunc`, DuckDB counts century and millennium boundaries with a plain
+        // `year / 100` (truncating toward zero), not with the 1-based numbering
+        // `date_part('century')` returns: `date_diff('century', DATE '1900-01-01',
+        // DATE '2024-01-01')` is 1, and `date_diff('century', DATE '-0150-01-01',
+        // DATE '0050-01-01')` is 1 as well.
+        P_CENTURY => cb.y / 100 - ca.y / 100,
+        P_MILLENNIUM => cb.y / 1000 - ca.y / 1000,
+        P_ISOYEAR => iso_year(cb.days) - iso_year(ca.days),
         _ => err!(TypeMismatch),
     }))
 }
@@ -185,6 +230,7 @@ pub(super) fn date_add(p: u8, k: i64, us: i64) -> Result<Option<i64>> {
         P_MICROSECOND => unit(1),
         P_DECADE => k.checked_mul(120).and_then(months),
         P_CENTURY => k.checked_mul(1_200).and_then(months),
+        P_MILLENNIUM => k.checked_mul(12_000).and_then(months),
         _ => err!(TypeMismatch),
     })
 }
@@ -373,9 +419,8 @@ fn scan_time(s: &[u8], i: usize) -> Option<(i64, usize)> {
             }
             i += 1;
         }
-        if k == 0 {
-            return None;
-        }
+        // A trailing `.` with no digits after it is accepted and means zero (measured:
+        // `'2024-01-01 10:00:00.'::TIMESTAMP` and `'10:00:00.'::TIME` are both valid in DuckDB).
         while k < 6 {
             frac *= 10;
             k += 1;
@@ -397,13 +442,24 @@ pub(crate) fn parse_date(s: &[u8]) -> Option<i64> {
     let s = trim_ws(s);
     let (d, i) = scan_date(s)?;
     if i == s.len() {
+        return Some(d);
+    }
+    // DuckDB's text -> DATE cast accepts a timestamp-shaped string and keeps only the date part
+    // (`'2024-01-01T00:00:00'::DATE` and `'2024-01-01 10:00:00'::DATE` are both `2024-01-01`).
+    // Rejecting those turned an entire ISO-timestamp column into NULLs.
+    //
+    // Only a well-formed time tail is accepted. DuckDB itself ignores *any* trailing text here
+    // (even `'2024-01-01x'::DATE` gives `2024-01-01`); this stays stricter on purpose, so that
+    // genuinely malformed input still becomes NULL -- see `docs/sql/limitations.md`.
+    let (_, j) = scan_time_tail(s, i)?;
+    if j == s.len() {
         Some(d)
     } else {
         None
     }
 }
 
-/// VARCHAR -> TIMESTAMP. `YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]]`.
+/// VARCHAR -> TIMESTAMP. `YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]][zone]`.
 /// A date alone counts as midnight.
 pub(crate) fn parse_timestamp(s: &[u8]) -> Option<i64> {
     let s = trim_ws(s);
@@ -412,35 +468,48 @@ pub(crate) fn parse_timestamp(s: &[u8]) -> Option<i64> {
     if i == s.len() {
         return Some(base);
     }
-    if s[i] != b' ' && s[i] != b'T' && s[i] != b't' {
-        return None;
-    }
-    let (t, j) = scan_time(s, i + 1)?;
+    let (t, j) = scan_time_tail(s, i)?;
     if j == s.len() {
-        return base.checked_add(t);
-    }
-    // DuckDB accepts an ISO-8601 zone suffix when converting text to the
-    // *without-time-zone* TIMESTAMP type, but deliberately keeps the wall
-    // clock fields unchanged (the offset is meaningful only for TIMESTAMPTZ).
-    // Validate the suffix so malformed text still becomes NULL; do not apply
-    // it here, since this type has no zone semantics.
-    let k = scan_ignored_timestamp_offset(s, j)?;
-    if k == s.len() {
         base.checked_add(t)
     } else {
         None
     }
 }
 
-/// Reads the suffix grammar DuckDB accepts when casting text to plain
-/// `TIMESTAMP`: `Z`, `[+-]HH`, `[+-]HHMM`, or `[+-]HH:MM`.
+/// Reads the `[ T]HH:MM[:SS[.ffffff]][zone]` tail that follows a date, with `i` at the separator.
+/// Returns the time of day in microseconds and the position just past the tail.
 ///
-/// The numeric fields are deliberately only lexical here. DuckDB ignores the
-/// offset for a without-time-zone value and accepts two-digit fields through
-/// `99`; requiring real clock ranges would reject text DuckDB accepts even
-/// though the fields are never applied.
+/// DuckDB allows more than one space between the date and the time
+/// (`'2024-01-01  10:00:00'::TIMESTAMP` is valid), so the run of spaces is consumed as one
+/// separator.
+fn scan_time_tail(s: &[u8], i: usize) -> Option<(i64, usize)> {
+    let mut j = i;
+    match s.get(j) {
+        Some(b'T' | b't') => j += 1,
+        Some(b' ') => {
+            while s.get(j) == Some(&b' ') {
+                j += 1;
+            }
+        }
+        _ => return None,
+    }
+    let (t, k) = scan_time(s, j)?;
+    Some((t, scan_ignored_timestamp_offset(s, k)?))
+}
+
+/// Reads the (possibly absent) zone suffix DuckDB accepts when casting text to plain
+/// `TIMESTAMP`: nothing at all, `Z`, `[+-]HH`, `[+-]HHMM`, `[+-]HH:MM`, or a separate ` UTC`
+/// word. Returns the position just past it.
+///
+/// The offset is deliberately only read lexically, never applied: DuckDB accepts an ISO-8601
+/// zone on a *without-time-zone* value but keeps the wall-clock fields unchanged (the offset is
+/// meaningful only for TIMESTAMPTZ). It also accepts two-digit fields through `99`, so requiring
+/// real clock ranges would reject text DuckDB accepts even though the fields are never used.
+/// `UTC` is the only zone *name* accepted, matching DuckDB, which rejects ` GMT` and every other
+/// named zone unless the ICU extension is loaded.
 fn scan_ignored_timestamp_offset(s: &[u8], i: usize) -> Option<usize> {
     match s.get(i) {
+        None => Some(i),
         Some(b'Z') => Some(i + 1),
         Some(b'+' | b'-') => {
             let (_, j) = scan(s, i + 1, 2, 2)?;
@@ -453,6 +522,7 @@ fn scan_ignored_timestamp_offset(s: &[u8], i: usize) -> Option<usize> {
                 Some(j)
             }
         }
+        Some(b' ') if s[i + 1..].eq_ignore_ascii_case(b"UTC") => Some(s.len()),
         _ => None,
     }
 }

@@ -202,6 +202,12 @@ const F_CONCAT_WS: FuncId = 96;
 const F_LEFT: FuncId = 97;
 const F_RIGHT: FuncId = 98;
 const F_CHR: FuncId = 99;
+// The integer-path forms of `json_extract` / `->` / `->>`: DuckDB reads an integer path
+// argument as a 0-based array subscript instead of an object key (see the `json_extract`
+// arm in `resolve`). 100/101 are free -- `F_PART_BASE` used to sit at 100 and was moved
+// to 200.
+const F_JSON_EXTRACT_IDX: FuncId = 100;
+const F_JSON_EXTRACT_STRING_IDX: FuncId = 101;
 const F_DAYNAME: FuncId = 110;
 const F_MONTHNAME: FuncId = 111;
 const F_HEX: FuncId = 112;
@@ -263,8 +269,10 @@ const P_MICROSECOND: u8 = 12;
 const P_ISODOW: u8 = 13;
 const P_CENTURY: u8 = 14;
 const P_DECADE: u8 = 15;
+const P_MILLENNIUM: u8 = 16;
+const P_ISOYEAR: u8 = 17;
 
-const PART_NAMES: [&[u8]; 16] = [
+const PART_NAMES: [&[u8]; 18] = [
     b"year",
     b"quarter",
     b"month",
@@ -281,30 +289,66 @@ const PART_NAMES: [&[u8]; 16] = [
     b"isodow",
     b"century",
     b"decade",
+    b"millennium",
+    b"isoyear",
 ];
 
-/// Maps a part name (case-insensitive) to a number. Plurals and `dayofweek` / `dayofyear` are
-/// accepted too.
+/// The alias spellings DuckDB accepts that dropping a trailing `s` from `PART_NAMES` cannot
+/// reach: the abbreviations (which share no stem with the full name), the irregular plurals
+/// `centuries` / `millennia`, and `ms` / `us`, which end in `s` and so must not go through the
+/// plural stripping (`ms` would become `m` = minute).
+///
+/// Taken from <https://duckdb.org/docs/sql/functions/datepart> and each one checked against
+/// `duckdb -c "select date_part('<name>', DATE '2024-05-05')"`. Note `m` is *minute* there, not
+/// month. `era`, `julian`, `timezone*` and `yearweek` are deliberately absent -- see
+/// `docs/sql/limitations.md`.
+const PART_ALIASES: [(&[u8], u8); 36] = [
+    (b"y", P_YEAR),
+    (b"yr", P_YEAR),
+    (b"yrs", P_YEAR),
+    (b"mon", P_MONTH),
+    (b"mons", P_MONTH),
+    (b"d", P_DAY),
+    (b"dayofmonth", P_DAY),
+    (b"h", P_HOUR),
+    (b"hr", P_HOUR),
+    (b"hrs", P_HOUR),
+    (b"m", P_MINUTE),
+    (b"min", P_MINUTE),
+    (b"mins", P_MINUTE),
+    (b"s", P_SECOND),
+    (b"sec", P_SECOND),
+    (b"secs", P_SECOND),
+    (b"ms", P_MILLISECOND),
+    (b"msec", P_MILLISECOND),
+    (b"msecs", P_MILLISECOND),
+    (b"us", P_MICROSECOND),
+    (b"usec", P_MICROSECOND),
+    (b"usecs", P_MICROSECOND),
+    (b"w", P_WEEK),
+    (b"weekofyear", P_WEEK),
+    (b"c", P_CENTURY),
+    (b"cent", P_CENTURY),
+    (b"centuries", P_CENTURY),
+    (b"dec", P_DECADE),
+    (b"decs", P_DECADE),
+    (b"mil", P_MILLENNIUM),
+    (b"mils", P_MILLENNIUM),
+    (b"millennia", P_MILLENNIUM),
+    (b"dayofweek", P_DOW),
+    (b"weekday", P_DOW),
+    (b"dayofyear", P_DOY),
+    (b"isoweekday", P_ISODOW),
+];
+
+/// Maps a part name (case-insensitive) to a number. `PART_ALIASES` is consulted first, then
+/// `PART_NAMES` with a trailing `s` dropped (`years` = `year`).
 fn part_id(s: &[u8]) -> Option<u8> {
     let eq = |w: &[u8], t: &[u8]| {
         w.len() == t.len() && w.iter().zip(t.iter()).all(|(a, b)| a.to_ascii_lowercase() == *b)
     };
-    if eq(s, b"dayofweek") {
-        return Some(P_DOW);
-    }
-    if eq(s, b"dayofyear") {
-        return Some(P_DOY);
-    }
-    // DuckDB's own short aliases. `ms`/`us` end in `s` but must not go through the
-    // plural stripping below, so they are matched first.
-    if eq(s, b"isoweekday") {
-        return Some(P_ISODOW);
-    }
-    if eq(s, b"ms") || eq(s, b"msec") || eq(s, b"msecs") {
-        return Some(P_MILLISECOND);
-    }
-    if eq(s, b"us") || eq(s, b"usec") || eq(s, b"usecs") {
-        return Some(P_MICROSECOND);
+    if let Some(&(_, p)) = PART_ALIASES.iter().find(|(nm, _)| eq(s, nm)) {
+        return Some(p);
     }
     // A trailing `s` is dropped (`years` = `year`).
     let t = if s.len() > 1 && (s[s.len() - 1] | 0x20) == b's' { &s[..s.len() - 1] } else { s };
@@ -512,8 +556,26 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         // See `crate::json`'s module docs for the path syntax and known limitations.
         // The `->`/`->>` operators are expanded by `sql::parser` as sugar for
         // `json_extract`/`json_extract_string`.
-        "json_extract" => fixed(F_JSON_EXTRACT, &[Json, Varchar], n, 2, Json),
-        "json_extract_string" => fixed(F_JSON_EXTRACT_STRING, &[Json, Varchar], n, 2, Varchar),
+        // An *integer* path argument is a 0-based array subscript in DuckDB (negative counts
+        // from the end), never an object key: `'[1,2]' -> 0` is `1`, `'[1,2]' ->> -1` is `2`,
+        // `json_extract('[1,2]', 1)` is `2`, and `'{"0":5}' -> 0` is NULL. Only the static type
+        // decides; a VARCHAR path keeps the JSONPath semantics (`'{"0":5}' -> '0'` is `5`).
+        "json_extract" => {
+            ensure!(n == 2, WrongArgCount);
+            if args[1].is_integer() {
+                Ok((F_JSON_EXTRACT_IDX, vec![Json, BigInt], Json))
+            } else {
+                Ok((F_JSON_EXTRACT, vec![Json, Varchar], Json))
+            }
+        }
+        "json_extract_string" => {
+            ensure!(n == 2, WrongArgCount);
+            if args[1].is_integer() {
+                Ok((F_JSON_EXTRACT_STRING_IDX, vec![Json, BigInt], Varchar))
+            } else {
+                Ok((F_JSON_EXTRACT_STRING, vec![Json, Varchar], Varchar))
+            }
+        }
         "json_type" => json_path_opt(F_JSON_TYPE, n, Varchar),
         // `array_length`/`list_length` are DuckDB's LIST spellings of the same thing. They ride
         // the existing ID: a LIST here *is* a JSON array (see the module docs).
@@ -660,6 +722,8 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         "isodow" => shorthand(P_ISODOW, n),
         "century" => shorthand(P_CENTURY, n),
         "decade" => shorthand(P_DECADE, n),
+        "millennium" => shorthand(P_MILLENNIUM, n),
+        "isoyear" => shorthand(P_ISOYEAR, n),
 
         // Not implemented, since there is no clock (see the comments at the top of the module).
         _ => err!(FunctionNotFound),

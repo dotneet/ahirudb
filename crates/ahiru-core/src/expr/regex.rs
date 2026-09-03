@@ -25,7 +25,13 @@
 //!   only its end)
 //! - Alternation `|`
 //! - Groups `(...)` (capturing) and `(?:...)` (non-capturing)
-//! - Escaped metacharacters `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\`
+//! - Escaped metacharacters `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\`. Escaping any other
+//!   ASCII punctuation character (or a space) also yields that literal character, as in RE2
+//!   (`\/ \- \_ \"` and so on)
+//! - The control-character escapes `\t \n \r \f \v \a` and the hex escape `\xHH`, both inside
+//!   and outside a character class
+//! - `\A` / `\z` (RE2's start/end-of-text anchors). With no multiline mode they mean exactly
+//!   what `^` / `$` mean here
 //!
 //! **Unsupported** (always an error at `resolve`/compile time; silently interpreting them
 //! differently would give the worst failure mode of all, "wrong search results"):
@@ -35,6 +41,8 @@
 //! - Named groups `(?P<name>...)` `(?<name>...)`
 //! - Lazy quantifiers `*?` `+?` `??` `{n,m}?`
 //! - Word boundaries `\b` `\B`
+//! - Unicode character classes `\pL` `\p{Greek}` (and the negated `\P...` forms), RE2's
+//!   `\x{...}` and octal `\123` escapes, and `\Q...\E` literal quoting
 //! - Case-insensitive matching (`(?i)` or a flags argument). DuckDB supports it, but it was
 //!   judged not frequent enough to be worth the implementation cost, so it is deferred in v1.
 //!   ASCII-only case folding alone could be added cheaply, but as with `LIKE`, nothing is added
@@ -438,7 +446,12 @@ impl<'a> Parser<'a> {
         // "wrong results", which is the one thing to avoid at all costs).
         match self.peek() {
             Some(b'?') => err!(UnsupportedFeature),
-            Some(b'*') | Some(b'+') | Some(b'{') => err!(SyntaxError),
+            Some(b'*') | Some(b'+') => err!(SyntaxError),
+            // A `{` right after a quantifier is only a second quantifier when it really forms a
+            // valid `{n,m}`; otherwise it is a literal character, so it is left for the next
+            // `parse_repeat` call (`regexp_matches('a{', 'a*{')` is true in DuckDB/RE2).
+            // `try_parse_bound` rewinds on failure, so nothing is consumed in that case.
+            Some(b'{') => ensure!(self.try_parse_bound().is_none(), SyntaxError),
             _ => {}
         }
         Ok(match q {
@@ -451,26 +464,39 @@ impl<'a> Parser<'a> {
     }
 
     /// Reads `{n}` / `{n,}` / `{n,m}`. On a different shape it rewinds `self.i` and gives `None`.
+    ///
+    /// The rewind has to happen on **every** failure, which is why the scan itself lives in a
+    /// separate function: `scan_bound`'s `?` early exits used to skip the rewind, so a pattern
+    /// like `a{x` silently lost its `{` (the position had already moved past it and nothing
+    /// re-read it as a literal).
     fn try_parse_bound(&mut self) -> Option<(u32, Option<u32>)> {
         let start = self.i;
+        let bound = self.scan_bound();
+        if bound.is_none() {
+            self.i = start;
+        }
+        bound
+    }
+
+    /// The scan itself. Any `None` return leaves `self.i` wherever it stopped; only
+    /// `try_parse_bound` is allowed to call this.
+    fn scan_bound(&mut self) -> Option<(u32, Option<u32>)> {
         self.i += 1; // '{'
         let n = self.scan_u32()?;
         let bound = if self.peek() == Some(b',') {
             self.i += 1;
             if self.peek() == Some(b'}') {
-                Some((n, None))
+                (n, None)
             } else {
-                let m = self.scan_u32()?;
-                Some((n, Some(m)))
+                (n, Some(self.scan_u32()?))
             }
         } else {
-            Some((n, Some(n)))
+            (n, Some(n))
         };
-        if self.peek() == Some(b'}') && bound.is_some() {
+        if self.peek() == Some(b'}') {
             self.i += 1;
-            bound
+            Some(bound)
         } else {
-            self.i = start;
             None
         }
     }
@@ -566,8 +592,6 @@ impl<'a> Parser<'a> {
         };
         self.i += 1;
         Ok(match c {
-            b'.' | b'*' | b'+' | b'?' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'|' | b'^'
-            | b'$' | b'\\' => Ast::Char(c as u32),
             b'd' => Ast::Class(digit_set()),
             b'D' => {
                 let mut s = digit_set();
@@ -588,8 +612,48 @@ impl<'a> Parser<'a> {
             }
             // In-pattern backreferences and word boundaries are unsupported (see the top of the module).
             b'1'..=b'9' | b'b' | b'B' => err!(UnsupportedFeature),
+            // RE2's C-style control-character escapes. `\b` is deliberately *not* one of them:
+            // outside a class it is the word boundary, which stays unsupported.
+            b't' => Ast::Char(0x09),
+            b'n' => Ast::Char(0x0a),
+            b'r' => Ast::Char(0x0d),
+            b'f' => Ast::Char(0x0c),
+            b'v' => Ast::Char(0x0b),
+            b'a' => Ast::Char(0x07),
+            // `\xHH`. RE2's `\x{...}` and octal `\123` forms stay unsupported.
+            b'x' => Ast::Char(self.scan_hex2()?),
+            // RE2's start/end-of-text anchors. This engine has no multiline mode, so they mean
+            // exactly what `^` / `$` already mean here. (`\Z` is Perl, not RE2: DuckDB rejects
+            // it with `invalid escape sequence`, and so does this, via the arm below.)
+            b'A' => Ast::Bol,
+            b'z' => Ast::Eol,
+            // Escaping any ASCII punctuation (or a space) gives that literal character, as in
+            // RE2 -- `\/ \- \" \_ \ ` are all accepted by DuckDB. Letters and digits are
+            // deliberately excluded so that an unknown class escape such as `\pL` stays an
+            // error instead of silently becoming the literal `p`.
+            _ if c < 0x80 && !c.is_ascii_alphanumeric() => Ast::Char(c as u32),
             _ => err!(SyntaxError),
         })
+    }
+
+    /// Reads the two hex digits of a `\xHH` escape (`self.i` points at the first one).
+    fn scan_hex2(&mut self) -> Result<u32> {
+        let mut v = 0u32;
+        for _ in 0..2 {
+            let d = match self.peek() {
+                Some(d) => d,
+                None => err!(SyntaxError),
+            };
+            let x = match d {
+                b'0'..=b'9' => d - b'0',
+                b'a'..=b'f' => d - b'a' + 10,
+                b'A'..=b'F' => d - b'A' + 10,
+                _ => err!(SyntaxError),
+            };
+            v = v * 16 + x as u32;
+            self.i += 1;
+        }
+        Ok(v)
     }
 
     /// Reads a POSIX bracket expression `[:name:]` (or the negated `[:^name:]`) at `self.i`,
@@ -687,6 +751,15 @@ impl<'a> Parser<'a> {
                             t.negate();
                             set.union(&t);
                         }
+                        // The control-character escapes mean the same thing inside a class as
+                        // outside it (`[\t]` is a tab, not the letter `t`).
+                        b't' => set.set(0x09),
+                        b'n' => set.set(0x0a),
+                        b'r' => set.set(0x0d),
+                        b'f' => set.set(0x0c),
+                        b'v' => set.set(0x0b),
+                        b'a' => set.set(0x07),
+                        b'x' => set.set(self.scan_hex2()?),
                         // Inside a class, escaping `]` `\` `^` `-` and so on is a practical need,
                         // so other characters are allowed as literals too (separate from the strict
                         // escape rules outside a class).
@@ -877,6 +950,23 @@ impl Compiler {
 /// Compiles a pattern string. The caller (`funcs.rs`) calls this once outside the row loop when
 /// the pattern column's stride is 0 (a constant column).
 pub fn compile(pattern: &[u8]) -> Result<Program> {
+    compile_inner(pattern, false)
+}
+
+/// Compiles a pattern that has to match the **whole** input (`SIMILAR TO` / `~` /
+/// `regexp_full_match`).
+///
+/// The anchors are added to the compiled program rather than by wrapping the pattern text in
+/// `^(?:...)$`. Text wrapping silently repairs an unbalanced pattern into a valid one with a
+/// different meaning -- `a)|(b` became `^(?:a)|(b)$`, so `'a' SIMILAR TO 'a)|(b'` answered
+/// `true` where DuckDB raises an error. Parsing the pattern on its own rejects it, exactly as
+/// DuckDB does, and the anchors are then emitted around the compiled program where no pattern
+/// text can escape them.
+pub fn compile_full(pattern: &[u8]) -> Result<Program> {
+    compile_inner(pattern, true)
+}
+
+fn compile_inner(pattern: &[u8], full: bool) -> Result<Program> {
     ensure!(pattern.len() <= MAX_PATTERN_LEN, LimitExceeded);
     let mut p = Parser { s: pattern, i: 0, depth: 0, n_groups: 0 };
     let ast = p.parse_alt()?;
@@ -884,7 +974,13 @@ pub fn compile(pattern: &[u8]) -> Result<Program> {
     ensure!(p.i == pattern.len(), SyntaxError);
     let mut c = Compiler { prog: Vec::new(), classes: Vec::new() };
     c.emit(Inst::Save(0))?;
+    if full {
+        c.emit(Inst::Bol)?;
+    }
     c.compile(&ast)?;
+    if full {
+        c.emit(Inst::Eol)?;
+    }
     c.emit(Inst::Save(1))?;
     c.emit(Inst::Match)?;
     Ok(Program { insts: c.prog, classes: c.classes, n_groups: p.n_groups })
@@ -1399,9 +1495,13 @@ pub fn eval_replace(args: &[&Vector]) -> Result<Vector> {
             }
         };
         let global = if args.len() == 4 {
+            // DuckDB (RE2) takes the flag argument as a *set* of letters, so a repeated or
+            // duplicated letter is accepted: `regexp_replace('aXbXc', 'X', '-', 'gg')` gives
+            // `a-b-c`. Only `g` is implemented here; any other letter (`i`, `s`, ...) is still
+            // an explicit UnsupportedFeature rather than a silent misreading.
             let f = args[3].bytes().get(i * s[3]);
-            ensure!(f.is_empty() || f == b"g", UnsupportedFeature);
-            f == b"g"
+            ensure!(f.iter().all(|&c| c == b'g'), UnsupportedFeature);
+            !f.is_empty()
         } else {
             false
         };
@@ -1607,6 +1707,101 @@ mod tests {
         assert_eq!(ext("abc", "a|ab", 0).as_deref(), Some("a"));
         // duckdb: regexp_extract('xabcx','ab|abc') = 'ab'
         assert_eq!(ext("xabcx", "ab|abc", 0).as_deref(), Some("ab"));
+    }
+
+    // --- `{` that does not form a valid `{n,m}` ------------------------------
+
+    #[test]
+    fn stray_brace_is_a_literal() {
+        // The rewind in `try_parse_bound` used to be skipped by `scan_u32`'s early exit, so the
+        // `{` vanished from the pattern entirely and `a{x` compiled as `ax`.
+        // duckdb -c "select regexp_matches('a{x','a{x'), regexp_matches('ax','a{x')"
+        // -> true, false
+        assert!(m("a{x", "a{x"));
+        assert!(!m("ax", "a{x"));
+        // duckdb -c "select regexp_matches('a{,2}','a{,2}')" -> true (`{,2}` is literal in RE2)
+        assert!(m("a{,2}", "a{,2}"));
+        assert!(m("a{", "a{"));
+        assert!(m("a{2", "a{2"));
+        assert!(m("a{2,", "a{2,"));
+        // A `{` right after a quantifier is a literal too, not a second quantifier.
+        // duckdb -c "select regexp_matches('a{','a*{'), regexp_matches('a{','a+{')" -> true, true
+        assert!(m("a{", "a*{"));
+        assert!(m("a{", "a+{"));
+        assert!(m("{", "a*{"));
+        // A real second quantifier is still a syntax error.
+        assert_eq!(code_of(compile(b"a*{2}").map(|_| ())), Some(Code::SyntaxError));
+        assert_eq!(code_of(compile(b"a{2}{3}").map(|_| ())), Some(Code::SyntaxError));
+        // ...and a well-formed bound still works.
+        assert!(m("aa", "^a{2}$"));
+    }
+
+    // --- RE2 escapes ---------------------------------------------------------
+
+    #[test]
+    fn control_and_hex_escapes() {
+        // duckdb -c "select regexp_matches(chr(9),'\t'), regexp_matches('a','\x61')" -> true, true
+        assert!(m("\t", "\\t"));
+        assert!(m("\n", "\\n"));
+        assert!(m("\r", "\\r"));
+        assert!(m("\u{0c}", "\\f"));
+        assert!(m("\u{0b}", "\\v"));
+        assert!(m("\u{07}", "\\a"));
+        assert!(m("a", "\\x61"));
+        assert!(m("\u{ff}", "\\xff"));
+        assert!(!m("x", "^\\x61$"));
+        // The same escapes inside a character class.
+        assert!(m("\t", "^[\\t]$"));
+        assert!(m("a", "^[\\x61]$"));
+        assert!(!m("t", "^[\\t]$"));
+        // A truncated or non-hex `\x` is a syntax error, never a silent literal `x`.
+        assert_eq!(code_of(compile(b"\\x6").map(|_| ())), Some(Code::SyntaxError));
+        assert_eq!(code_of(compile(b"\\xzz").map(|_| ())), Some(Code::SyntaxError));
+    }
+
+    #[test]
+    fn escaped_punctuation_is_a_literal() {
+        // duckdb accepts `\/`, `\-`, `\_`, `\"`, `\ ` and every other escaped ASCII punctuation.
+        assert!(m("/", "^\\/$"));
+        assert!(m("-", "^\\-$"));
+        assert!(m("_", "^\\_$"));
+        assert!(m("\"", "^\\\"$"));
+        assert!(m(" ", "^\\ $"));
+        assert!(m("#", "^\\#$"));
+        // Letters stay strict, so an unsupported class escape is an error rather than the bare
+        // letter (`\pL` must not silently become `p`).
+        assert_eq!(code_of(compile(b"\\pL").map(|_| ())), Some(Code::SyntaxError));
+        assert_eq!(code_of(compile(b"\\q").map(|_| ())), Some(Code::SyntaxError));
+    }
+
+    #[test]
+    fn text_anchors_are_bol_and_eol() {
+        // duckdb -c "select regexp_matches('a','\Aa\z'), regexp_matches('ba','\Aa')"
+        // -> true, false
+        assert!(m("a", "\\Aa\\z"));
+        assert!(!m("ba", "\\Aa"));
+        assert!(!m("ab", "a\\z"));
+        // `\Z` is Perl, not RE2: duckdb rejects it with `invalid escape sequence`.
+        assert_eq!(code_of(compile(b"a\\Z").map(|_| ())), Some(Code::SyntaxError));
+    }
+
+    // --- Full match (SIMILAR TO / `~`) ---------------------------------------
+
+    #[test]
+    fn compile_full_anchors_without_rewriting_the_pattern() {
+        let full = |s: &str, p: &str| {
+            is_match(&compile_full(p.as_bytes()).unwrap(), s.as_bytes()).unwrap()
+        };
+        assert!(full("abc", "a.c"));
+        assert!(!full("Xabc", "a.c"));
+        // Alternation must be anchored as a whole, exactly as `^(?:a|b)$` was.
+        assert!(full("a", "a|b"));
+        assert!(!full("ab", "a|b"));
+        // An unbalanced pattern used to be repaired into `^(?:a)|(b)$` by the old text wrapping,
+        // which answered `true` for both `'a'` and `'b'`. duckdb raises an error for it.
+        assert_eq!(code_of(compile_full(b"a)|(b").map(|_| ())), Some(Code::SyntaxError));
+        // Capture-group numbering is unaffected by the anchoring.
+        assert_eq!(compile_full(b"(a)(b)").unwrap().n_groups, 2);
     }
 
     // --- Compilation errors --------------------------------------------------
@@ -1847,6 +2042,24 @@ mod tests {
             code_of(eval_replace(&[&s, &p, &r, &bad]).map(|_| ())),
             Some(Code::UnsupportedFeature)
         );
+    }
+
+    #[test]
+    fn sql_replace_accepts_repeated_flag_letters() {
+        // duckdb -c "select regexp_replace('aXbXc','X','-','gg')" -> a-b-c (the flag argument is
+        // a set of letters, so repeating one changes nothing).
+        let s = vs(&[Some("aXbXc")]);
+        let p = vs(&[Some("X")]);
+        let r = vs(&[Some("-")]);
+        let out = |f: &str| {
+            let fv = vs(&[Some(f)]);
+            let v = eval_replace(&[&s, &p, &r, &fv]).unwrap();
+            String::from_utf8(v.bytes().get(0).to_vec()).unwrap()
+        };
+        assert_eq!(out("gg"), "a-b-c");
+        assert_eq!(out("ggg"), "a-b-c");
+        assert_eq!(out("g"), "a-b-c");
+        assert_eq!(out(""), "a-bXc");
     }
 
     #[test]

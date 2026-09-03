@@ -90,12 +90,31 @@ user-visible effect.
 - **Regular expressions**: the engine (a hand-written Thompson NFA, chosen
   to avoid backtracking blowups on adversarial input) does not support
   lookaround, backreferences *inside a pattern*, named capture groups,
-  non-greedy quantifiers, `\b`/`\B` word boundaries, or a case-insensitive
-  flag (neither `(?i)` nor the `'i'` flag argument). Matching itself is
+  non-greedy quantifiers, `\b`/`\B` word boundaries, Unicode character
+  classes (`\pL`, `\p{Greek}`, `\P...`), RE2's `\x{...}` and octal `\123`
+  escapes, `\Q...\E` quoting, or a case-insensitive flag (neither `(?i)`
+  nor the `'i'` flag argument). The `\t \n \r \f \v \a` control escapes,
+  `\xHH`, the `\A`/`\z` text anchors, and escaping any ASCII punctuation
+  character *are* supported. Matching itself is
   per UTF-8 character — `.`, character classes, and quantifiers each
   consume one whole scalar value — and POSIX bracket expressions
   (`[[:alpha:]]`, `[[:digit:]]`, ...) are supported but match ASCII only.
   See [functions-string.md](functions-string.md#regular-expressions).
+- **`date_part` accepts DuckDB's part names and abbreviations** (see
+  [functions-datetime.md](functions-datetime.md#extracting-fields)) with
+  four exceptions, which raise `type mismatch` rather than being guessed
+  at: `era`, `julian`, `yearweek`, and the `timezone`/`timezone_hour`/
+  `timezone_minute` group (there is no time-zone support at all here). Note
+  `century`/`millennium` are counted 1-based by `date_part` but with a
+  plain `year / 100` by `date_trunc`/`date_diff` — that inconsistency is
+  DuckDB's and is matched on purpose.
+- **Text → `DATE` casts reject trailing junk that DuckDB ignores.** A
+  timestamp-shaped string is accepted and the time part dropped
+  (`'2024-01-01T10:00:00'::DATE` is `2024-01-01`), but DuckDB also accepts
+  *any* trailing text after the date (`'2024-01-01x'::DATE` is
+  `2024-01-01` there); here that is `NULL`, so genuinely malformed input
+  is still visible. Named time zones other than `UTC` are rejected on a
+  `TIMESTAMP` cast, matching DuckDB without the ICU extension.
 - **`quantile`/`percentile_cont`** are the *continuous* (interpolated)
   quantile in all spellings. DuckDB's `quantile` is the discrete version,
   and its `quantile_disc` isn't implemented. A list-valued fraction

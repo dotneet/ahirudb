@@ -22,6 +22,18 @@ SELECT '{"a":"hi"}' ->> '$.a';   -- hi    (returns unquoted VARCHAR)
 SELECT '{"a":1}' ->> '$.a' = '1';  -- true (->> binds tighter than =, no parens needed)
 ```
 
+An **integer** path argument is a 0-based array subscript, not an object
+key (the same rule as DuckDB). A negative index counts from the end, and an
+object never matches, even one with a numeric key:
+
+```sql
+SELECT '[1,2]' -> 0;      -- 1
+SELECT '[1,2]' ->> -1;    -- 2
+SELECT json_extract('[1,2]', 1);  -- 2
+SELECT '{"0":5}' -> 0;    -- NULL   (an integer never means an object key)
+SELECT '{"0":5}' -> '0';  -- 5      (a string path still does)
+```
+
 ## Extraction
 
 ```sql

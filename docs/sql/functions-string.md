@@ -196,9 +196,25 @@ untrusted). As a result, it does **not** support: lookaround
 (`(?=...)`/`(?!...)`), backreferences inside the pattern itself
 (`\1` in the *pattern*, as opposed to the *replacement* — see below),
 named capture groups, non-greedy quantifiers (`*?`, `+?`), `\b`/`\B` word
-boundaries, or a case-insensitive flag — neither the inline `(?i)` form nor
+boundaries, Unicode character classes (`\pL`, `\p{Greek}` and their `\P`
+negations), RE2's `\x{...}` and octal `\123` escapes, `\Q...\E` literal
+quoting, or a case-insensitive flag — neither the inline `(?i)` form nor
 the `'i'` flag argument is accepted. `regexp_replace`'s replacement
 string does support `\1`/`\2`-style backreferences to captured groups.
+
+**Escapes that are supported**, in the pattern and inside a character class
+alike: the metacharacters `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\`, and in
+fact any escaped ASCII punctuation character or space (`\/`, `\-`, `\_`,
+`\"`, `\ ` …), which all stand for that literal character; the class
+shorthands `\d \D \w \W \s \S`; the control characters
+`\t \n \r \f \v \a`; and the hex escape `\xHH`. `\A` and `\z` are RE2's
+start/end-of-text anchors and, with no multiline mode here, mean exactly
+what `^` and `$` mean. A `{` that does not form a valid `{n,m}` is a
+literal `{`, as in RE2 (`regexp_matches('a{x', 'a{x')` is true).
+
+`regexp_replace`'s flag argument is a *set* of letters, so repeating one
+changes nothing (`regexp_replace('aXbXc', 'X', '-', 'gg')` is `'a-b-c'`).
+Only `g` is implemented; any other letter is an error.
 
 **Matching is per UTF-8 character, not per byte.** `.`, a character class,
 and a quantifier each consume one whole Unicode scalar value, so
