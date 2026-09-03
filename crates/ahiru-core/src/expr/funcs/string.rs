@@ -300,9 +300,16 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             if k == 0 {
                 return Ok(true);
             }
+            // An empty delimiter splits into characters, matching DuckDB
+            // (`split_part('abc', '', 2)` -> `b`); an empty string still has exactly one
+            // (empty) part. The parts are code points, not bytes, like every other
+            // position-taking string function here.
             if d.is_empty() {
-                if k == 1 || k == -1 {
-                    out.extend_from_slice(s);
+                let cnt = cp_count(s).max(1) as i64;
+                let idx = if k < 0 { cnt + k } else { k - 1 };
+                if (0..cnt).contains(&idx) {
+                    let lo = cp_byte(s, idx as usize);
+                    out.extend_from_slice(&s[lo..(lo + cp_width(s, lo)).min(s.len())]);
                 }
                 return Ok(true);
             }
@@ -464,12 +471,27 @@ fn hex_val(c: u8) -> Option<u8> {
 /// `string_split(s, sep)`. Writes a JSON array of strings, which is how this engine spells a
 /// LIST (see `expr::funcs`'s module docs).
 ///
-/// An empty separator gives a single-element list holding the whole string, matching duckdb
-/// (`select string_split('abc', '')` -> `[abc]`); splitting into characters is not what it does.
 fn string_split(s: &[u8], sep: &[u8], out: &mut Vec<u8>) {
     out.push(b'[');
+    // An empty separator splits into characters, matching DuckDB
+    // (`string_split('abc', '')` -> `[a, b, c]`); an empty string still yields a
+    // one-element list holding the empty string. Kept deliberately in step with
+    // `split_part`'s empty-delimiter rule above -- the two used to share the old
+    // "the whole string is one part" divergence, and letting only one of them move
+    // would leave `split_part(s, '', k)` disagreeing with `string_split(s, '')[k]`.
     if sep.is_empty() {
-        crate::json::write_json_string(s, out);
+        let mut i = 0usize;
+        while i < s.len() {
+            let w = cp_width(s, i);
+            crate::json::write_json_string(&s[i..i + w], out);
+            i += w;
+            if i < s.len() {
+                out.push(b',');
+            }
+        }
+        if s.is_empty() {
+            crate::json::write_json_string(s, out);
+        }
         out.push(b']');
         return;
     }

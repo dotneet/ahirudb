@@ -755,6 +755,70 @@ e2e!(
     ]
 );
 
+// FLOAT is held in the same `f64` register as DOUBLE, so it used to be rendered with
+// `f64`'s shortest round trip and printed every digit of the widened value
+// (`1.1::FLOAT` -> `1.100000023841858`). The results are wrapped in brackets so
+// `normalize_cell` compares them as text rather than re-parsing them as floats and
+// normalising the very difference under test away.
+e2e!(
+    float_renders_at_f32_precision,
+    "tests/data/basic.parquet",
+    [
+        "SELECT '[' || (1.1::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (0.1::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (1e16::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (1e-5::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (1e15::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (3.4028235e38::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || ('inf'::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || ('nan'::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        // The DOUBLE spelling of the same values is unchanged.
+        "SELECT '[' || (1.1::DOUBLE)::VARCHAR || ']' FROM t LIMIT 1",
+    ]
+);
+
+// Exact integer and decimal semantics for the numeric functions: these all used to be
+// computed in DOUBLE, which rounded everything above 2^53 and turned exact decimal
+// rounding into binary rounding.
+e2e!(
+    numeric_functions_stay_exact_on_hugeint_and_decimal,
+    "tests/data/basic.parquet",
+    [
+        "SELECT mod(170141183460469231731687303715884105727::HUGEINT, 10) FROM t LIMIT 1",
+        "SELECT abs(-170141183460469231731687303715884105727::HUGEINT) FROM t LIMIT 1",
+        "SELECT abs(18446744073709551615::UBIGINT) FROM t LIMIT 1",
+        "SELECT mod(-7::HUGEINT, 3), mod(7::HUGEINT, -3) FROM t LIMIT 1",
+        "SELECT '[' || round(1.005::DECIMAL(4,3), 2)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || round(-1.005::DECIMAL(4,3), 2)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || round(1.5::DECIMAL(4,3), 5)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || mod(123456789012.345::DECIMAL(15,3), 1)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || abs(-12.34::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || ceil(1.5::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || floor(-1.9::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || trunc(-1.9::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT sign(-1.5::DECIMAL(4,2)), sign(0.0::DECIMAL(4,2)) FROM t LIMIT 1",
+        "SELECT round(12345::BIGINT, -2), round(-12345::BIGINT, -2) FROM t LIMIT 1",
+    ]
+);
+
+// The remaining scalar-function and cast corrections in this group.
+e2e!(
+    scalar_function_corner_cases,
+    "tests/data/basic.parquet",
+    [
+        "SELECT ascii('') FROM t LIMIT 1",
+        "SELECT '[' || split_part('abc', '', 2) || ']' FROM t LIMIT 1",
+        "SELECT '[' || split_part('abc', '', -1) || ']' FROM t LIMIT 1",
+        "SELECT '[' || split_part('abc', '', 9) || ']' FROM t LIMIT 1",
+        "SELECT pow(-2, 1025), pow(-2, 2000), pow(2, 1025) FROM t LIMIT 1",
+        "SELECT pow(1, 'nan'::DOUBLE), pow(1.5, 0) FROM t LIMIT 1",
+        "SELECT CAST(2.5::DOUBLE AS DECIMAL(3,0)), CAST(-2.5::DOUBLE AS DECIMAL(3,0)) FROM t LIMIT 1",
+        "SELECT CAST(0.5::DOUBLE AS DECIMAL(3,0)), CAST(1.5::DOUBLE AS DECIMAL(3,0)) FROM t LIMIT 1",
+        // Integer casts keep round-half-to-even, which is what DuckDB does there.
+        "SELECT CAST(2.5::DOUBLE AS INTEGER), CAST(3.5::DOUBLE AS INTEGER) FROM t LIMIT 1",
+    ]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // Rewriting the t inside `t2` or `text` would break the SQL being compared.

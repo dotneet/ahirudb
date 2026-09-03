@@ -244,9 +244,12 @@ it needs to be explicit:
 
 - Casting a float to an integer type rounds to the **nearest even**
   (`CAST(1.5 AS INTEGER)` → `2`, `CAST(4.5 AS INTEGER)` → `4`).
-- Reducing a `DECIMAL`'s scale rounds **away from zero**
-  (`CAST(1.235 AS DECIMAL(10,2))` → `1.24`), so monetary rounding doesn't
-  systematically under-round.
+- Casting to a `DECIMAL` rounds **away from zero** at every scale, whether it
+  is reducing an existing `DECIMAL`'s scale (`CAST(1.235 AS DECIMAL(10,2))` →
+  `1.24`) or coming from a float (`CAST(2.5 AS DECIMAL(3,0))` → `3`, not the
+  `2` a float-to-*integer* cast gives). Monetary rounding therefore doesn't
+  systematically under-round, and `DECIMAL(p, 0)` follows the same rule as
+  every other scale of the same type. DuckDB draws the line in the same place.
 - Integer arithmetic overflow **wraps** (no error), except `SUM`, which
   accumulates in a 128-bit integer internally and only errors
   (`ValueOutOfRange`) if that itself overflows, and `factorial`/`!`, which
@@ -286,10 +289,17 @@ it needs to be explicit:
   SELECT CAST(CAST('inf'::DOUBLE AS VARCHAR) AS DOUBLE);    -- inf (infinite)
   ```
 
-  These are deliberately *not* the spellings the CSV/JSONL writers use.
-  Those write the values out longhand as `NaN`, `Infinity`, `-Infinity`
-  (quoted, in the JSONL case); see
-  [ddl-dml.md](ddl-dml.md#jsonl-output).
+  The CSV writer spells the infinities the same way (`inf`, `-inf`, matching
+  DuckDB's own CSV output) but writes `NaN` rather than `nan`. The JSONL
+  writer has to quote all three, and writes them longhand as `"NaN"`,
+  `"Infinity"`, `"-Infinity"`; see [ddl-dml.md](ddl-dml.md#jsonl-output).
+
+- A **`FLOAT`** casts to the shortest text that round-trips through `FLOAT`,
+  not through `DOUBLE`: `CAST(1.1::FLOAT AS VARCHAR)` is `'1.1'`, not the
+  `'1.100000023841858'` that spelling out the widened `DOUBLE` would give.
+  The same goes for how a `FLOAT` displays in the CLI and how it is written
+  by `COPY ... TO` in CSV and JSONL. (DuckDB agrees everywhere except its
+  own JSON writer, which prints the widened `DOUBLE` there.)
 
 ## Typed date/time literals
 

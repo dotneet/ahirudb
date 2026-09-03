@@ -41,7 +41,7 @@ SELECT string_split('a,b,c', ',');   -- ["a","b","c"]  (a LIST, i.e. JSON text)
 | Function | Aliases | Notes |
 |---|---|---|
 | `substring(s, start[, len])` | `substr` | 1-based; negative `start` counts from the end; negative `len` reverses the extracted range |
-| `split_part(s, delim, index)` | — | 1-based, negative index counts from the end; index `0` or out of range → empty string |
+| `split_part(s, delim, index)` | — | 1-based, negative index counts from the end; index `0` or out of range → empty string. An empty `delim` splits into characters, so `split_part('abc','',2)` → `b` (piece for piece the same as `string_split(s,'')`) |
 | `strpos(s, sub)` | `position`, `instr` | 1-based position, `0` if not found |
 | `starts_with(s, prefix)` | `prefix(s, p)` | boolean |
 | `ends_with(s, suffix)` | `suffix(s, s2)` | boolean |
@@ -49,7 +49,7 @@ SELECT string_split('a,b,c', ',');   -- ["a","b","c"]  (a LIST, i.e. JSON text)
 | `length(s)` | `len`, `char_length`, `character_length` | counts codepoints |
 | `left(s, n)` | — | First `n` codepoints; negative `n` drops the last `\|n\|` instead |
 | `right(s, n)` | — | Last `n` codepoints; negative `n` drops the first `\|n\|` instead |
-| `string_split(s, sep)` | `str_split`, `string_to_array`, `split` | Returns a LIST (JSON text — see [functions-json.md](functions-json.md)). An empty `sep` gives a one-element list holding the whole string (`string_split('abc','')` → `["abc"]`), where DuckDB 1.4 splits into characters (`[a, b, c]`) — a divergence |
+| `string_split(s, sep)` | `str_split`, `string_to_array`, `split` | Returns a LIST (JSON text — see [functions-json.md](functions-json.md)). An empty `sep` splits into characters (code points), matching DuckDB: `string_split('abc','')` → `["a","b","c"]`, and `string_split('','')` → `[""]` |
 
 `left` and `right` are reserved words (they introduce a join kind), but a
 `(` immediately after the keyword is unambiguous, so writing them as
@@ -109,6 +109,7 @@ SELECT concat('a', NULL, 'b');       -- 'ab'     (NULL args treated as empty str
 SELECT concat_ws('-', 'a', NULL, 'b'); -- 'a-b'  (a NULL value drops its separator too)
 SELECT concat_ws(NULL, 'a', 'b');    -- NULL     (a NULL *separator* does propagate)
 SELECT ascii('A');                   -- 65       (codepoint; aliases: unicode, ord)
+SELECT ascii('');                    -- 0        (the empty string has no first character)
 SELECT chr(9731);                    -- '☃'
 SELECT hex('AB');                    -- '4142'   (byte dump; an integer argument uses to_hex)
 SELECT to_hex(255);                  -- 'FF'     (negatives use the two's-complement pattern)

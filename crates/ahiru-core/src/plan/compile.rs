@@ -682,6 +682,20 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// The value of an argument that is written as an integer literal, `None` otherwise.
+    /// The parser keeps a negated literal as `-<literal>` rather than folding it, so that
+    /// shape is unwrapped here too (`round(x, -2)`).
+    fn const_int(&self, id: ExprId) -> Option<i64> {
+        match self.arena.get(id) {
+            Expr::Literal(v) => v.as_i64(),
+            Expr::Unary { op: UnaryOp::Neg, arg } => match self.arena.get(*arg) {
+                Expr::Literal(v) => v.as_i64().and_then(i64::checked_neg),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// A scalar function call. Type checking and argument conversion are finished here, so
     /// only already-converted vectors are passed at runtime.
     fn scalar_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
@@ -708,7 +722,11 @@ impl<'a> Compiler<'a> {
             let v = Value::Bytes(tys[0].name().as_bytes().to_vec());
             return Ok((self.konst(Ty::Varchar, v), Ty::Varchar));
         }
-        let (id, want, res) = crate::expr::funcs::resolve(name, &tys)?;
+        // A few signatures' *result type* depends on an argument's value, not just its type
+        // (`round(<decimal>, d)`'s result scale is `min(s, max(d, 0))`, as in DuckDB), so
+        // literal integer arguments are passed along.
+        let consts: Vec<Option<i64>> = args.iter().map(|a| self.const_int(*a)).collect();
+        let (id, want, res) = crate::expr::funcs::resolve_const(name, &tys, &consts)?;
         ensure!(want.len() == regs.len(), WrongArgCount);
         for i in 0..regs.len() {
             regs[i] = self.coerce(regs[i], tys[i], want[i])?;

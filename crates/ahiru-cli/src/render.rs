@@ -22,6 +22,7 @@ pub fn render(v: &Value, ty: Ty, null: &str) -> String {
         Value::I64(x) => fmt_scaled(*x as i128, ty),
         Value::I128(x) if ty == Ty::Interval => fmt_interval_value(*x),
         Value::I128(x) => fmt_scaled(*x, ty),
+        Value::F64(x) if ty == Ty::Float => fmt_float(*x),
         Value::F64(x) => fmt_double(*x),
         Value::Bytes(b) if ty == Ty::Uuid => fmt_uuid(b),
         Value::Bytes(b) if ty == Ty::Blob => escape_bytes(b),
@@ -99,6 +100,17 @@ pub fn is_numeric(ty: Ty) -> bool {
 fn fmt_double(x: f64) -> String {
     let mut out = Vec::new();
     ahiru_core::expr::kernels::fmt_f64(x, &mut out);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// A FLOAT, spelled exactly as `CAST(<float> AS VARCHAR)` spells it.
+///
+/// FLOAT shares DOUBLE's `f64` register, so rendering it as a DOUBLE printed all the
+/// digits of the widened `f64` (`1.1::FLOAT` came out as `1.100000023841858`) instead
+/// of the shortest string that round-trips through the `f32` the value really is.
+fn fmt_float(x: f64) -> String {
+    let mut out = Vec::new();
+    ahiru_core::expr::kernels::fmt_f32(x, &mut out);
     String::from_utf8(out).unwrap_or_default()
 }
 
@@ -224,5 +236,18 @@ mod tests {
         assert_eq!(render(&Value::I32(day(-100, 3, 4) as i32), Ty::Date, "NULL"), "-0100-03-04");
         assert_eq!(render(&Value::I32(day(2024, 5, 5) as i32), Ty::Date, "NULL"), "2024-05-05");
         assert_eq!(render(&Value::I32(day(1, 1, 1) as i32), Ty::Date, "NULL"), "0001-01-01");
+    }
+
+    /// FLOAT and DOUBLE share one physical `f64`, so a FLOAT used to be rendered with
+    /// every digit of the widened value (`1.1::FLOAT` as `1.100000023841858`). It now
+    /// renders exactly as `CAST(... AS VARCHAR)` renders it.
+    #[test]
+    fn float_renders_at_f32_precision() {
+        let v = Value::F64(1.1f32 as f64);
+        assert_eq!(render(&v, Ty::Float, "NULL"), "1.1");
+        assert_eq!(render(&v, Ty::Double, "NULL"), "1.100000023841858");
+        // Non-finite values are spelled the same either way.
+        assert_eq!(render(&Value::F64(f64::INFINITY), Ty::Float, "NULL"), "inf");
+        assert_eq!(render(&Value::F64(f64::NAN), Ty::Float, "NULL"), "nan");
     }
 }

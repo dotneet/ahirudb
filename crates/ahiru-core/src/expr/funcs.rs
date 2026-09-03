@@ -92,6 +92,12 @@ const F_DATE_ADD: FuncId = 29;
 const F_TO_DATE: FuncId = 30;
 const F_TO_TIMESTAMP: FuncId = 31;
 const F_LAST_DAY: FuncId = 32;
+/// `ceil` / `floor` / `trunc` on a DECIMAL. Integers use `F_IDENT` instead (the
+/// operation is the identity there); these drop the fractional digits of the scaled
+/// integer, so the result is a `DECIMAL(p, 0)`.
+const F_CEIL_I: FuncId = 33;
+const F_FLOOR_I: FuncId = 34;
+const F_TRUNC_I: FuncId = 35;
 
 // Bool output
 const F_STARTS_WITH: FuncId = 40;
@@ -376,6 +382,22 @@ const MAX_STR: i64 = 1 << 24;
 /// caller `Cast`s the arguments to the target types before passing them to `call`. Finishing type
 /// checking at compile time reduces runtime branching.
 pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
+    resolve_const(name, args, &[])
+}
+
+/// [`resolve`], additionally told which arguments are compile-time integer constants
+/// (`None` where an argument is not one, and a shorter slice than `args` is fine).
+///
+/// Exactly one signature needs this: `round(<decimal>, d)`. DuckDB's result scale
+/// there is `min(s, max(d, 0))` -- it depends on the *value* of `d`, not on its type --
+/// so `round(1.005::DECIMAL(4,3), 2)` is a `DECIMAL(4,2)` printing `1.01`. Without the
+/// constant the scale has to stay at the input's, which prints the same number with
+/// trailing zeros (`1.010`); that is the fallback for a non-constant `d`.
+pub fn resolve_const(
+    name: &str,
+    args: &[Ty],
+    consts: &[Option<i64>],
+) -> Result<(FuncId, Vec<Ty>, Ty)> {
     let lower = name.to_ascii_lowercase();
     let n = args.len();
     use Ty::*;
@@ -484,11 +506,21 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
         // --- Numbers -------------------------------------------------------
         // Integers and floating point get separate IDs, since logical types are not consulted at runtime.
         "abs" => num1(args, n, F_ABS_I, F_ABS_F),
-        "sign" => num1(args, n, F_SIGN_I, F_SIGN_F),
+        // The result is always a plain integer (-1/0/1), never the argument's own
+        // DECIMAL/HUGEINT type; DuckDB narrows it all the way to TINYINT.
+        "sign" => {
+            ensure!(n == 1, WrongArgCount);
+            let t = num_ty(args)?;
+            if t == Double {
+                Ok((F_SIGN_F, vec![Double], Double))
+            } else {
+                Ok((F_SIGN_I, vec![t], BigInt))
+            }
+        }
         // ceil / floor / trunc on integers are the identity. There is no dedicated kernel.
-        "ceil" | "ceiling" => num1(args, n, F_IDENT, F_CEIL_F),
-        "floor" => num1(args, n, F_IDENT, F_FLOOR_F),
-        "trunc" => num1(args, n, F_IDENT, F_TRUNC_F),
+        "ceil" | "ceiling" => num1_whole(args, n, F_CEIL_I, F_CEIL_F),
+        "floor" => num1_whole(args, n, F_FLOOR_I, F_FLOOR_F),
+        "trunc" => num1_whole(args, n, F_TRUNC_I, F_TRUNC_F),
         "round" => {
             ensure!((1..=2).contains(&n), WrongArgCount);
             let t = num_ty(&args[..1])?;
@@ -497,7 +529,20 @@ pub fn resolve(name: &str, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
             if n == 2 {
                 a.push(BigInt);
             }
-            Ok((id, a, t))
+            // On a DECIMAL the digits below the requested position are dropped from the
+            // result's scale too, the way DuckDB does it (`round(x::DECIMAL(4,3), 2)` is a
+            // `DECIMAL(4,2)`). That needs `d`'s value, so it only happens when `d` is a
+            // literal; otherwise the input's own scale is kept and the same number simply
+            // prints with trailing zeros.
+            let res = match t {
+                Decimal { precision, scale } if n == 2 => {
+                    let d = consts.get(1).copied().flatten().unwrap_or(scale as i64);
+                    Ty::decimal(precision, d.clamp(0, scale as i64) as u8)
+                }
+                Decimal { precision, .. } => Ty::decimal(precision, 0),
+                _ => t,
+            };
+            Ok((id, a, res))
         }
         "mod" => {
             ensure!(n == 2, WrongArgCount);
@@ -756,22 +801,53 @@ fn num1(args: &[Ty], n: usize, int_id: FuncId, flt_id: FuncId) -> Result<(FuncId
     Ok((if t == Ty::Double { flt_id } else { int_id }, vec![t], t))
 }
 
-/// The common type of numeric arguments. BIGINT if they are all integers, DOUBLE otherwise.
+/// The common type of numeric arguments.
 ///
-/// HUGEINT and DECIMAL settle on DOUBLE too. Giving every function branches for i128 and decimal
-/// scaling would roughly double the amount of code (a known precision limitation).
+/// Integers narrower than 64 bits all settle on BIGINT (one `i64` kernel covers them, and the
+/// result cannot overflow one). HUGEINT/UBIGINT keep their full 128-bit width and DECIMAL keeps
+/// its scale, so `mod`/`abs`/`round` stay exact there: they used to settle on DOUBLE as well,
+/// which silently rounded every value above 2^53 (`mod(<hugeint max>, 10)` answered `8` instead
+/// of `7`) and turned exact decimal rounding into binary rounding (`round(1.005::DECIMAL(4,3), 2)`
+/// answered `1.0` instead of `1.01`). FLOAT settles on DOUBLE, since the `f64` kernels are the
+/// only floating-point ones.
 fn num_ty(args: &[Ty]) -> Result<Ty> {
-    let mut int = true;
+    let mut acc = Ty::Null;
     for &t in args {
         if t == Ty::Null {
             continue;
         }
         ensure!(t.is_numeric(), TypeMismatch);
-        if !t.is_integer() || matches!(t, Ty::HugeInt | Ty::UBigInt) {
-            int = false;
-        }
+        let t = match t {
+            Ty::HugeInt | Ty::UBigInt | Ty::Decimal { .. } => t,
+            _ if t.is_integer() => Ty::BigInt,
+            _ => Ty::Double,
+        };
+        acc = match Ty::unify(acc, t) {
+            Some(u) => u,
+            None => err!(TypeMismatch),
+        };
     }
-    Ok(if int { Ty::BigInt } else { Ty::Double })
+    // All arguments were type-undetermined NULLs.
+    Ok(if acc == Ty::Null { Ty::BigInt } else { acc })
+}
+
+/// `ceil` / `floor` / `trunc`: the identity on integers, a scale-dropping kernel on DECIMAL
+/// (the result is a `DECIMAL(p, 0)`, as in DuckDB), and the `f64` kernel on floating point.
+fn num1_whole(
+    args: &[Ty],
+    n: usize,
+    int_id: FuncId,
+    flt_id: FuncId,
+) -> Result<(FuncId, Vec<Ty>, Ty)> {
+    ensure!(n == 1, WrongArgCount);
+    let t = num_ty(args)?;
+    Ok(match t {
+        Ty::Double => (flt_id, vec![Ty::Double], Ty::Double),
+        Ty::Decimal { precision, scale } if scale > 0 => {
+            (int_id, vec![t], Ty::decimal(precision, 0))
+        }
+        _ => (F_IDENT, vec![t], t),
+    })
 }
 
 /// Whether the type is writable as a value of `to_json`/`json_array`/`json_object`.
@@ -929,7 +1005,11 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
         }
         PhysType::I32 | PhysType::I64 => {
             for i in 0..n {
-                let v = if live(i) { eval_int(id, &A { v: args, s: &s, i })? } else { Some(0) };
+                let v = if live(i) {
+                    eval_int(id, &A { v: args, s: &s, i }, result_ty)?
+                } else {
+                    Some(0)
+                };
                 // For I32 output (DATE), out of range also makes just that row NULL.
                 let ok = match v {
                     Some(x) => push_int(&mut data, x, result_ty),
@@ -961,7 +1041,7 @@ pub fn call(id: FuncId, result_ty: Ty, args: &[&Vector]) -> Result<Vector> {
                         d.push(0);
                         continue;
                     }
-                    match eval_i128(id, &A { v: args, s: &s, i })? {
+                    match eval_i128(id, &A { v: args, s: &s, i }, result_ty)? {
                         Some(x) => d.push(x),
                         None => {
                             d.push(0);
@@ -1112,6 +1192,19 @@ impl<'b> A<'_, 'b> {
             Some((v, j)) => match v.data() {
                 Data::I64(d) => d.get(j).copied().unwrap_or(0),
                 Data::I32(d) => d.get(j).copied().unwrap_or(0) as i64,
+                _ => 0,
+            },
+            None => 0,
+        }
+    }
+
+    /// The DECIMAL scale of argument `k`'s logical type (0 for anything else). Read off the
+    /// argument vector rather than passed in: `resolve` has already aligned every argument to
+    /// one common type, so this is the scale the whole call works at.
+    fn dec_scale(&self, k: usize) -> u32 {
+        match self.at(k) {
+            Some((v, _)) => match v.ty() {
+                Ty::Decimal { scale, .. } => scale as u32,
                 _ => 0,
             },
             None => 0,

@@ -723,14 +723,22 @@ fn parse_special_f64(s: &[u8]) -> Option<f64> {
 /// `CAST(x AS DECIMAL(p,s))` and `CAST(CAST(x AS VARCHAR) AS DECIMAL(p,s))` now agree
 /// by construction.
 ///
-/// `scale == 0` (every integer target, and `DECIMAL(p,0)`) keeps the direct
-/// `f_round` path: it is already exact, and it is what carries this engine's
-/// documented round-half-to-even rule for float-to-integer casts.
-fn f64_to_scaled_i128(x: f64, scale: u8, buf: &mut Vec<u8>) -> Option<i128> {
+/// `half_away` selects the rounding rule for the digits that fall off the end:
+/// DECIMAL targets round half *away from zero* (`CAST(2.5 AS DECIMAL(3,0))` = 3,
+/// like DuckDB), while integer targets round half *to even*
+/// (`CAST(2.5 AS INTEGER)` = 2, also like DuckDB). It only makes a difference at
+/// `scale == 0`: above that, the text path below already rounds away from zero
+/// through `rescale_i128`, so `DECIMAL(3,0)` used to be the one scale that
+/// disagreed with every other scale of the same type.
+///
+/// An integer target at `scale == 0` keeps the direct `f_round` path: it is
+/// already exact, and it is what carries this engine's documented
+/// round-half-to-even rule for float-to-integer casts.
+fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> Option<i128> {
     if !x.is_finite() {
         return None;
     }
-    if scale == 0 {
+    if scale == 0 && !half_away {
         if !(-I128_LIMIT..I128_LIMIT).contains(&x) {
             return None;
         }
@@ -1055,6 +1063,24 @@ pub fn fmt_f64(x: f64, out: &mut Vec<u8>) {
         return;
     }
     crate::expr::float::write_f64_finite(out, x);
+}
+
+/// The decimal rendering of a `FLOAT`.
+///
+/// FLOAT shares `DOUBLE`'s physical `f64` register (there is no separate physical type
+/// for it), but every FLOAT value is exactly an `f32`, so the shortest round trip is
+/// measured against `f32`: `CAST(1.1::FLOAT AS VARCHAR)` is `'1.1'`, not the `f64`
+/// spelling `'1.100000023841858'` of the same bits. Non-finite values are spelled
+/// exactly as [`fmt_f64`] spells them.
+///
+/// Public for the same reason as [`fmt_f64`]: the CLI's cell renderer spells a FLOAT
+/// the way the cast does.
+pub fn fmt_f32(x: f64, out: &mut Vec<u8>) {
+    if x.is_nan() || x.is_infinite() {
+        fmt_f64(x, out);
+        return;
+    }
+    crate::expr::float::write_f32_finite(out, x);
 }
 
 /// Reads a decimal number as `mant * 10^exp`. `None` (= NULL) if it cannot be read.
@@ -1407,6 +1433,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         (Fam::Flt, Fam::Int) => {
             ensure!(!to.is_temporal(), InvalidCast);
             let s = dec_scale(to);
+            let is_dec = matches!(to, Ty::Decimal { .. });
             let sv = a.f64s();
             let mut buf = Vec::new();
             // The index is used not only to fetch the value but also to name the row for `set_null`.
@@ -1418,7 +1445,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     // true, and so is any NaN (it is not the value zero).
                     store_i128(&mut data, (f != 0.0) as i128)
                 } else {
-                    match f64_to_scaled_i128(f, s, &mut buf) {
+                    match f64_to_scaled_i128(f, s, is_dec, &mut buf) {
                         Some(y) => store_i128_typed(&mut data, to, y),
                         None => {
                             push_default(&mut data);
@@ -1473,12 +1500,20 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         }
         (Fam::Flt, Fam::Str) => {
             let sv = a.f64s();
+            // A FLOAT is rendered at `f32` precision: it is exactly an `f32`, so the
+            // `f64` shortest round trip would ask for digits it does not have
+            // (`1.1::FLOAT` printed as `1.100000023841858`).
+            let is_float = from == Ty::Float;
             let mut buf = Vec::new();
             if let Data::Bytes(d) = &mut data {
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..n {
                     buf.clear();
-                    fmt_f64(sv[i], &mut buf);
+                    if is_float {
+                        fmt_f32(sv[i], &mut buf);
+                    } else {
+                        fmt_f64(sv[i], &mut buf);
+                    }
                     d.push(&buf);
                 }
             }
@@ -2024,19 +2059,25 @@ mod tests {
         // 12345678901234567890.5 is not representable; the nearest double is
         // 12345678901234567168, whose shortest rendering is 1.2345678901234567e19.
         assert_eq!(
-            f64_to_scaled_i128(12345678901234567890.5, 1, &mut buf),
+            f64_to_scaled_i128(12345678901234567890.5, 1, true, &mut buf),
             Some(123456789012345670000)
         );
-        assert_eq!(f64_to_scaled_i128(1.5, 1, &mut buf), Some(15));
-        assert_eq!(f64_to_scaled_i128(0.1, 20, &mut buf), Some(10000000000000000000));
-        assert_eq!(f64_to_scaled_i128(1e-300, 37, &mut buf), Some(0));
-        assert_eq!(f64_to_scaled_i128(1e300, 1, &mut buf), None);
-        assert_eq!(f64_to_scaled_i128(f64::NAN, 1, &mut buf), None);
-        assert_eq!(f64_to_scaled_i128(f64::INFINITY, 0, &mut buf), None);
-        // scale 0 keeps the documented round-half-to-even rule.
-        assert_eq!(f64_to_scaled_i128(2.5, 0, &mut buf), Some(2));
-        assert_eq!(f64_to_scaled_i128(3.5, 0, &mut buf), Some(4));
-        assert_eq!(f64_to_scaled_i128(-2.5, 0, &mut buf), Some(-2));
+        assert_eq!(f64_to_scaled_i128(1.5, 1, true, &mut buf), Some(15));
+        assert_eq!(f64_to_scaled_i128(0.1, 20, true, &mut buf), Some(10000000000000000000));
+        assert_eq!(f64_to_scaled_i128(1e-300, 37, true, &mut buf), Some(0));
+        assert_eq!(f64_to_scaled_i128(1e300, 1, true, &mut buf), None);
+        assert_eq!(f64_to_scaled_i128(f64::NAN, 1, true, &mut buf), None);
+        assert_eq!(f64_to_scaled_i128(f64::INFINITY, 0, false, &mut buf), None);
+        // An integer target at scale 0 keeps the documented round-half-to-even rule.
+        assert_eq!(f64_to_scaled_i128(2.5, 0, false, &mut buf), Some(2));
+        assert_eq!(f64_to_scaled_i128(3.5, 0, false, &mut buf), Some(4));
+        assert_eq!(f64_to_scaled_i128(-2.5, 0, false, &mut buf), Some(-2));
+        // A DECIMAL(p,0) target rounds half away from zero instead, so it agrees with
+        // every other scale of the same type (and with DuckDB).
+        assert_eq!(f64_to_scaled_i128(2.5, 0, true, &mut buf), Some(3));
+        assert_eq!(f64_to_scaled_i128(3.5, 0, true, &mut buf), Some(4));
+        assert_eq!(f64_to_scaled_i128(-2.5, 0, true, &mut buf), Some(-3));
+        assert_eq!(f64_to_scaled_i128(0.5, 0, true, &mut buf), Some(1));
     }
 
     #[test]

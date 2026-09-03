@@ -210,6 +210,21 @@ worth knowing about:
   The cost is that such a column reads back as `VARCHAR` rather than
   `DOUBLE` — again in both engines, so the file round-trips through either.
 
+A **`FLOAT`** is written at `FLOAT` precision in both formats — `1.1`, not
+the `1.100000023841858` that spelling out the widened `DOUBLE` would give
+(see [types.md](types.md#cast-and-try_cast)). DuckDB's CSV writer does the
+same; its JSON writer does not, so a JSONL export of a `FLOAT` column is one
+of the few places these two deliberately differ.
+
+### CSV output
+
+Non-finite `DOUBLE`s are written bare as `NaN`, `inf` and `-inf`. The short
+spelling of the infinities is what DuckDB's CSV writer emits; the longhand
+`Infinity` this used to write is sniffed as a `DATE` column by DuckDB's CSV
+*reader*, which silently lost the values on re-import. This engine's reader
+accepts either spelling, so files written before the change still read back
+as `DOUBLE`.
+
 ```sql
 COPY (SELECT CAST('1.25' AS DECIMAL(5,2)) AS d, 'nan'::DOUBLE AS n FROM range(1))
   TO 'out.jsonl';
