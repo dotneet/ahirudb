@@ -126,6 +126,11 @@ impl Operator for Unnest {
 /// actual kind disagrees with the declared type (when `elem_ty`'s narrowing did not go through a
 /// static guarantee, or as a defense against a future caller's mistake) it becomes NULL -- with
 /// neither a panic nor an error.
+///
+/// A *number* that does not fit the declared type is a different matter and raises
+/// `ValueOutOfRange`: turning it into NULL would silently corrupt the data. The narrowing in
+/// `plan::bind::narrow_unnest_elem_ty` picks a type wide enough for every element's static type,
+/// so this is a backstop rather than something a normal query reaches.
 fn push_elem(
     out: &mut Vector,
     elem_ty: Ty,
@@ -140,10 +145,17 @@ fn push_elem(
     match elem_ty {
         Ty::BigInt => match (kind, json::parse_i64(span)) {
             (Kind::Num, Some(v)) => out.push_value(&Value::I64(v)),
+            (Kind::Num, None) => err!(ValueOutOfRange),
+            _ => out.push_null(),
+        },
+        Ty::HugeInt => match (kind, parse_i128(span)) {
+            (Kind::Num, Some(v)) => out.push_value(&Value::I128(v)),
+            (Kind::Num, None) => err!(ValueOutOfRange),
             _ => out.push_null(),
         },
         Ty::Double => match (kind, json::parse_f64(span)) {
             (Kind::Num, Some(v)) => out.push_value(&Value::F64(v)),
+            (Kind::Num, None) => err!(ValueOutOfRange),
             _ => out.push_null(),
         },
         Ty::Varchar => match kind {
@@ -164,6 +176,31 @@ fn push_elem(
         _ => out.push_value(&Value::Bytes(span.to_vec())),
     }
     Ok(())
+}
+
+/// A JSON integer token as `i128`. The same shape as `json::parse_i64` (digits only, no
+/// exponent or decimal point), one width up, for the HUGEINT element column.
+fn parse_i128(s: &[u8]) -> Option<i128> {
+    let (neg, ds) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    };
+    if ds.is_empty() {
+        return None;
+    }
+    // Accumulated on the negative side so that i128::MIN needs no special case.
+    let mut acc: i128 = 0;
+    for &c in ds {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i128)?;
+    }
+    if neg {
+        Some(acc)
+    } else {
+        acc.checked_neg()
+    }
 }
 
 #[cfg(test)]

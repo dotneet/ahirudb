@@ -293,6 +293,20 @@ int_cmp!(cmp_i32, i32);
 int_cmp!(cmp_i64, i64);
 int_cmp!(cmp_i128, i128);
 
+/// INTERVAL comparison. The packed months/days/microseconds triple is flattened by
+/// `exec::rowkey::interval_key` (DuckDB's 1 month = 30 days, 1 day = 24 hours) so that
+/// `INTERVAL 1 DAY = INTERVAL 24 HOUR`, and so that `=` agrees with the grouping, set-operation
+/// and equi-join keys, which normalize the same way.
+fn cmp_interval(a: &[i128], sa: usize, b: &[i128], sb: usize, n: usize, mask: u8) -> Bitmap {
+    let mut out = Bitmap::with_capacity(n);
+    for i in 0..n {
+        let x = crate::exec::rowkey::interval_key(a[i * sa]);
+        let y = crate::exec::rowkey::interval_key(b[i * sb]);
+        out.push(mask & ord_code(x.cmp(&y)) != 0);
+    }
+    out
+}
+
 /// Floating point compares under a **total** order, not IEEE's partial one: `NaN`
 /// sorts above every other value (`+inf` included) and equals itself, and `-0.0`
 /// equals `0.0`.
@@ -338,10 +352,15 @@ pub fn compare(op: OpCode, phys: PhysType, a: &Vector, b: &Vector) -> Result<Vec
     let mask = cmp_mask(op)?;
     ensure!(a.data().phys() == phys && b.data().phys() == phys, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
+    // INTERVAL packs months/days/microseconds into one i128, so the raw bit pattern says
+    // `INTERVAL 1 DAY <> INTERVAL 24 HOUR`. Comparing the normalized span instead keeps `=` in
+    // step with the equi-join and `GROUP BY` keys `exec::rowkey::interval_key` builds.
+    let interval = a.ty() == Ty::Interval && b.ty() == Ty::Interval;
     let bits = match phys {
         PhysType::Bool => cmp_bool(a.bools(), sa, b.bools(), sb, n, mask),
         PhysType::I32 => cmp_i32(a.i32s(), sa, b.i32s(), sb, n, mask),
         PhysType::I64 => cmp_i64(a.i64s(), sa, b.i64s(), sb, n, mask),
+        PhysType::I128 if interval => cmp_interval(a.i128s(), sa, b.i128s(), sb, n, mask),
         PhysType::I128 => cmp_i128(a.i128s(), sa, b.i128s(), sb, n, mask),
         PhysType::F64 => cmp_f64(a.f64s(), sa, b.f64s(), sb, n, mask),
         PhysType::Bytes => cmp_bytes(a.bytes(), sa, b.bytes(), sb, n, mask),

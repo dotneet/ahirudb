@@ -495,6 +495,41 @@ e2e!(
     ]
 );
 
+// INTERVAL is three components packed into one i128, and comparing that bit pattern made
+// `1 day` and `24 hours` different values in every place a key is built. DuckDB normalizes
+// with 1 month = 30 days and 1 day = 24 hours; these queries pin that down across the
+// equi-join, `ORDER BY`, `UNION` (DISTINCT) and `min`/`max` paths at once.
+e2e!(
+    interval_comparison_is_normalized,
+    "tests/data/basic.parquet",
+    [
+        "SELECT count(*) FROM (SELECT INTERVAL 1 DAY AS x FROM t WHERE id = 1) a \
+         JOIN (SELECT INTERVAL 24 HOUR AS x FROM t WHERE id = 1) b ON a.x = b.x",
+        "SELECT CAST(x AS VARCHAR) FROM (\
+           SELECT INTERVAL 25 HOUR AS x FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 1 DAY FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 23 HOUR FROM t WHERE id = 1) s ORDER BY x",
+        "SELECT count(*) FROM (SELECT INTERVAL 1 MONTH AS x FROM t WHERE id = 1 \
+         UNION SELECT INTERVAL 30 DAY FROM t WHERE id = 1) s",
+        "SELECT CAST(min(x) AS VARCHAR), CAST(max(x) AS VARCHAR) FROM (\
+           SELECT INTERVAL 25 HOUR AS x FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 1 DAY FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 23 HOUR FROM t WHERE id = 1) s",
+    ]
+);
+
+// The window `product()` used to multiply DECIMAL's raw scaled integers, and `unnest` pinned
+// its element type to BIGINT so an integer past i64 came back NULL.
+e2e!(
+    window_product_and_unnest_element_types,
+    "tests/data/basic.parquet",
+    [
+        "SELECT CAST(product(CAST(score AS DECIMAL(6,2))) OVER (ORDER BY id) AS VARCHAR) \
+         FROM t WHERE id BETWEEN 1 AND 4 ORDER BY id",
+        "SELECT CAST(unnest([1, 9223372036854775808]) AS VARCHAR) FROM t WHERE id = 1",
+    ]
+);
+
 /// `DISTINCT ON` without `ORDER BY` keeps "the first row in arrival order".
 /// DuckDB follows the same rule, but which row counts as "first in arrival order"
 /// depends on the scan implementation (page read order and so on), so cross-checking
