@@ -46,12 +46,23 @@ When two different numeric types meet in an expression (`a + b`, `a = b`,
 them in:
 
 - `NULL` unifies with anything, becoming the other side's type.
+- A **signed** integer combined with an **unsigned** one unifies to the
+  smallest *signed* type that holds both domains, regardless of which side
+  is written first (matching DuckDB): `TINYINT`+`UTINYINT` → `SMALLINT`,
+  `SMALLINT`+`USMALLINT` → `INTEGER`, `INTEGER`+`UINTEGER` → `BIGINT`,
+  `BIGINT`+`UBIGINT` → `HUGEINT`. When the signed side is already wide
+  enough it simply wins (`BIGINT`+`UTINYINT` → `BIGINT`). Neither operand's
+  own type could hold the other's whole range, so this is what keeps
+  `0::UTINYINT + (-1)::TINYINT` at `-1` and `1::UBIGINT > (-1)::BIGINT`
+  true.
 - Otherwise the narrower type widens to the wider one, in this order:
   `BOOLEAN < TINYINT/UTINYINT < SMALLINT/USMALLINT < INTEGER/UINTEGER <
   BIGINT/UBIGINT < DECIMAL < HUGEINT < FLOAT < DOUBLE < DATE < TIME <
   TIMESTAMP < TIMESTAMPTZ < VARCHAR < BLOB`. This ordering does **not**
   decide a `DECIMAL`-with-integer pair, even though `HUGEINT` outranks
-  `DECIMAL` in it: the `DECIMAL` rule below is checked first and wins.
+  `DECIMAL` in it: the `DECIMAL` rule below is checked first and wins. Nor
+  does it decide a signed/unsigned pair — the two share a rank there, and
+  the rule above is checked first.
 - A `DECIMAL` combined with another `DECIMAL` — or with an **integer**,
   which counts as a `DECIMAL` of scale 0 — unifies to a `DECIMAL` wide
   enough for both: the new precision is
@@ -85,6 +96,24 @@ them in:
   `CAST('...' AS UUID)` — ahirudb doesn't implicitly coerce a bare string
   literal the way DuckDB does (consistent with how `WHERE date_col =
   '2024-01-01'` already requires an explicit `CAST(... AS DATE)` here).
+
+`DECIMAL` **multiplication and division do not use the common type above**,
+because the scale changes:
+
+- `*` **adds** the scales and the precisions: `DECIMAL(4,1) * DECIMAL(3,2)`
+  is `DECIMAL(7,3)`, so `1.5 * 1.25` is `1.875` and not `1.88`. The
+  precision is capped at 38 (as in DuckDB: `DECIMAL(20,2) * DECIMAL(19,2)`
+  is `DECIMAL(38,4)`), but a product whose **scale** would exceed 38 is an
+  error (`ValueOutOfRange`) rather than a silently truncated type — again
+  matching DuckDB. Cast an operand to `DOUBLE`, or to a `DECIMAL` with a
+  smaller scale, when you hit it:
+
+  ```sql
+  SELECT 0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20);          -- error: scale 40 > 38
+  SELECT 0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20)::DOUBLE;  -- 0.0001
+  ```
+- `/` always falls to `DOUBLE` (as in DuckDB). Integer division of the raw
+  scaled values would subtract the scales and lose every fractional digit.
 
 A plain (unsuffixed) integer literal is `INTEGER` if it fits, else `BIGINT`,
 else `HUGEINT`.

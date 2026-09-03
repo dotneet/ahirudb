@@ -614,6 +614,55 @@ e2e!(
     ]
 );
 
+// `%` in a LIKE pattern used to be matched literally whenever the subject byte
+// at the same position was `%` too -- and, because the wildcard branch was then
+// skipped, no backtrack point was recorded either, so `'50% off' LIKE '50%'`
+// came back false.
+e2e!(
+    like_percent_against_percent_in_the_subject,
+    "tests/data/basic.parquet",
+    [
+        "SELECT '50% off' LIKE '50%', '%abc' LIKE '%bc', '%%' LIKE '%', '%ABC' ILIKE '%bc' FROM t LIMIT 1",
+        "SELECT '50% off' LIKE '50!%%' ESCAPE '!', '50% off' LIKE '50!%' ESCAPE '!', '%abc' LIKE '!%%' ESCAPE '!', 'xabc' LIKE '!%%' ESCAPE '!' FROM t LIMIT 1",
+        // `_` and an escaped `_` still behave, next to the reordered `%` branch.
+        // (Non-ASCII literals are avoided here: `replace_tables` rebuilds the SQL
+        // byte-by-byte as `char`, which mangles multibyte text before DuckDB sees
+        // it. The multibyte cases are covered by
+        // `ahiru-core/tests/kernel_type_fixes.rs` instead.)
+        "SELECT '%a' LIKE '%_', 'a_c' LIKE 'a_c', 'abc' LIKE 'a!_c' ESCAPE '!', 'a_c' LIKE 'a!_c' ESCAPE '!' FROM t LIMIT 1",
+    ]
+);
+
+// A signed and an unsigned integer type of the same width shared a rank in
+// `Ty::unify`, so the tie-break kept the left operand's type and cast the other
+// side's valid values to NULL. They now widen to the smallest signed type that
+// covers both, whichever order they are written in.
+e2e!(
+    signed_and_unsigned_integer_mixing,
+    "tests/data/basic.parquet",
+    [
+        "SELECT 0::UTINYINT + (-1)::TINYINT, 1::UBIGINT = (-1)::BIGINT, 1::UBIGINT > (-1)::BIGINT FROM t LIMIT 1",
+        "SELECT 100::TINYINT + 200::UTINYINT, 200::UTINYINT + 100::TINYINT FROM t LIMIT 1",
+        "SELECT 1::UBIGINT < (-1)::BIGINT, (-1)::BIGINT < 1::UBIGINT FROM t LIMIT 1",
+        "SELECT (-1)::TINYINT IN (255::UTINYINT, (-1)::TINYINT), 300::USMALLINT IN (300::SMALLINT) FROM t LIMIT 1",
+        "SELECT 18446744073709551615::UBIGINT + 0::BIGINT, (-1)::INTEGER + 1::UINTEGER FROM t LIMIT 1",
+    ]
+);
+
+// DECIMAL `*` adds the operands' scales, but the VM used to relabel the result
+// with `Ty::unify`'s `max(s1, s2)` -- rendering the raw product 10^min(s1,s2)
+// times too large everywhere the text form is produced.
+e2e!(
+    decimal_multiplication_scale,
+    "tests/data/basic.parquet",
+    [
+        "SELECT (1.5::DECIMAL(4,1) * 1.25::DECIMAL(3,2))::VARCHAR FROM t LIMIT 1",
+        "SELECT (1.5::DECIMAL(4,1) * 2)::VARCHAR, (2.5::DECIMAL(4,1) * 0.5::DECIMAL(3,2))::VARCHAR FROM t LIMIT 1",
+        // Precision past 38 still just clamps, as in DuckDB.
+        "SELECT (1.5::DECIMAL(20,2) * 2.5::DECIMAL(19,2))::VARCHAR FROM t LIMIT 1",
+    ]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // Rewriting the t inside `t2` or `text` would break the SQL being compared.

@@ -88,6 +88,20 @@ pub enum Ty {
 /// The maximum DECIMAL precision.
 pub const MAX_DECIMAL_PRECISION: u8 = 38;
 
+/// The common type of a signed and an unsigned integer type: the smallest signed type
+/// that holds both operands' whole domain. `None` unless exactly one side is an unsigned
+/// integer and the other a signed one. Used by [`Ty::unify`]; see the comment there.
+fn mixed_sign_int(a: Ty, b: Ty) -> Option<Ty> {
+    let signed = |t: Ty| t.is_integer() && t.signed_cover().is_none();
+    let (u, s) = match (a.signed_cover(), b.signed_cover()) {
+        (Some(u), None) if signed(b) => (u, b),
+        (None, Some(u)) if signed(a) => (u, a),
+        _ => return None,
+    };
+    // Both are signed here, so `rank` orders them by width.
+    Some(if u.rank() >= s.rank() { u } else { s })
+}
+
 impl Ty {
     /// Builds a DECIMAL with the precision clamped to the maximum.
     pub fn decimal(precision: u8, scale: u8) -> Ty {
@@ -196,6 +210,19 @@ impl Ty {
         }
     }
 
+    /// The smallest *signed* integer type that holds every value of `self`, for an
+    /// unsigned integer type. `None` for anything that is not an unsigned integer.
+    fn signed_cover(self) -> Option<Ty> {
+        use Ty::*;
+        Some(match self {
+            UTinyInt => SmallInt,
+            USmallInt => Int,
+            UInt => BigInt,
+            UBigInt => HugeInt,
+            _ => return None,
+        })
+    }
+
     /// `unify`'s result as a `Result`. Combinations that cannot be decided become a
     /// `TypeMismatch` error. This is the form used by the majority of call sites in
     /// `plan::bind`/`plan::compile`, where "a type mismatch is an immediate error".
@@ -243,6 +270,20 @@ impl Ty {
                     scale,
                 ));
             }
+        }
+        // A signed and an unsigned integer never fit in either operand's own type: the
+        // unsigned side's upper half does not fit the signed type, and the signed side's
+        // negative values do not fit the unsigned one. `rank` deliberately gives the two
+        // widths the same rank, so the tie-break below would have picked whichever operand
+        // came first and silently turned the other side's valid values into NULL
+        // (`0::UTINYINT + (-1)::TINYINT`). Widening to the smallest *signed* type that
+        // covers the unsigned side is what DuckDB does:
+        // TINYINT/UTINYINT -> SMALLINT, SMALLINT/USMALLINT -> INTEGER,
+        // INTEGER/UINTEGER -> BIGINT, BIGINT/UBIGINT -> HUGEINT -- and, when the signed
+        // side is already wider (`BIGINT` with `UTINYINT`), it simply stays.
+        // Order-independent by construction.
+        if let Some(t) = mixed_sign_int(a, b) {
+            return Some(t);
         }
         // Between numerics, widen. DECIMAL with floating point drops to DOUBLE.
         if a.is_numeric() && b.is_numeric() {
@@ -477,6 +518,38 @@ mod tests {
         assert_eq!(Ty::unify(Ty::Null, Ty::Varchar), Some(Ty::Varchar));
         assert_eq!(Ty::unify(Ty::Date, Ty::Timestamp), Some(Ty::Timestamp));
         assert_eq!(Ty::unify(Ty::Varchar, Ty::Int), None);
+    }
+
+    // Regression test: a signed and an unsigned type of the same width share a rank, so the
+    // tie-break used to hand back whichever operand came first -- casting the other side's
+    // valid values (a negative, or an unsigned value past the signed maximum) to NULL.
+    // The widths below are DuckDB's own (`typeof(CASE WHEN true THEN a ELSE b END)`).
+    #[test]
+    fn unify_signed_with_unsigned_widens_to_a_signed_type() {
+        let pairs = [
+            (Ty::TinyInt, Ty::UTinyInt, Ty::SmallInt),
+            (Ty::SmallInt, Ty::USmallInt, Ty::Int),
+            (Ty::Int, Ty::UInt, Ty::BigInt),
+            (Ty::BigInt, Ty::UBigInt, Ty::HugeInt),
+            // A signed side that is already wide enough simply wins.
+            (Ty::BigInt, Ty::UTinyInt, Ty::BigInt),
+            (Ty::SmallInt, Ty::UTinyInt, Ty::SmallInt),
+            // A narrow signed side still has to clear the unsigned side's top half.
+            (Ty::TinyInt, Ty::UBigInt, Ty::HugeInt),
+            (Ty::HugeInt, Ty::UBigInt, Ty::HugeInt),
+        ];
+        for (s, u, want) in pairs {
+            assert_eq!(Ty::unify(s, u), Some(want), "{:?} {:?}", s, u);
+            // Order must not matter.
+            assert_eq!(Ty::unify(u, s), Some(want), "{:?} {:?}", u, s);
+        }
+        // Same-sign pairs keep the plain widening rule.
+        assert_eq!(Ty::unify(Ty::UTinyInt, Ty::UBigInt), Some(Ty::UBigInt));
+        assert_eq!(Ty::unify(Ty::UTinyInt, Ty::UTinyInt), Some(Ty::UTinyInt));
+        assert_eq!(Ty::unify(Ty::TinyInt, Ty::BigInt), Some(Ty::BigInt));
+        // Unsigned with a non-integer keeps its existing behavior.
+        assert_eq!(Ty::unify(Ty::UBigInt, Ty::Double), Some(Ty::Double));
+        assert_eq!(Ty::unify(Ty::UTinyInt, Ty::Varchar), None);
     }
 
     #[test]

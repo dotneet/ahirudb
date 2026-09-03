@@ -518,15 +518,19 @@ fn like_match(s: &[u8], p: &[u8]) -> bool {
     // `star_p == usize::MAX` means "no `%` seen yet".
     let (mut star_p, mut star_s) = (usize::MAX, 0usize);
     while si < s.len() {
-        if pi < p.len() && p[pi] == b'_' {
+        // `%` is tested before the literal-byte branch: a `%` in the pattern is always
+        // the wildcard, even when the subject byte at the same position happens to be
+        // `%` too. Matching it literally would skip recording the backtrack point, so
+        // `'50% off' LIKE '50%'` used to be false.
+        if pi < p.len() && p[pi] == b'%' {
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == b'_' {
             si += utf8_len_at(s, si);
             pi += 1;
         } else if pi < p.len() && p[pi] == s[si] {
             si += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == b'%' {
-            star_p = pi;
-            star_s = si;
             pi += 1;
         } else if star_p != usize::MAX {
             // Feed the previous `%` one more character (not byte -- see doc comment) and retry.
@@ -578,6 +582,14 @@ pub(crate) fn like_escape_match(s: &[u8], p: &[u8], esc: u8) -> bool {
                 pi += 2;
                 continue;
             }
+        } else if pi < p.len() && p[pi] == b'%' {
+            // Ahead of the literal-byte branch: an unescaped `%` is always the
+            // wildcard, even when the subject byte at the same position is `%`.
+            // See the same ordering in `like_match`.
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+            continue;
         } else if pi < p.len() && p[pi] == b'_' {
             si += utf8_len_at(s, si);
             pi += 1;
@@ -586,11 +598,6 @@ pub(crate) fn like_escape_match(s: &[u8], p: &[u8], esc: u8) -> bool {
             // Literal byte. An escape character not followed by anything was
             // rejected by the caller, so reaching here means plain text.
             si += 1;
-            pi += 1;
-            continue;
-        } else if pi < p.len() && p[pi] == b'%' {
-            star_p = pi;
-            star_s = si;
             pi += 1;
             continue;
         }
@@ -1681,6 +1688,45 @@ mod tests {
         assert!(like_match("あいう".as_bytes(), b"%"));
         assert!(like_match("あいう".as_bytes(), "%う".as_bytes()));
         assert!(like_match("あいう".as_bytes(), "あ%".as_bytes()));
+    }
+
+    // Regression test: the literal-byte branch used to be tested before the `%` branch, so a
+    // `%` in the pattern was matched literally whenever the subject byte at the same position
+    // happened to be `%` -- and, worse, no backtrack point was recorded, making
+    // `'50% off' LIKE '50%'` false. All values cross-checked against DuckDB 1.4.4.
+    #[test]
+    fn like_percent_is_a_wildcard_even_against_a_literal_percent() {
+        assert!(like_match(b"50% off", b"50%"));
+        assert!(like_match(b"%abc", b"%bc"));
+        assert!(like_match(b"%%", b"%"));
+        assert!(like_match(b"%", b"%"));
+        assert!(like_match(b"%a%b%", b"%a%b%"));
+        // A literal `%` in the subject is still matched by a literal `%` in the pattern
+        // whenever the pattern's `%` can also act as the wildcard for zero characters.
+        assert!(like_match(b"100%", b"100%"));
+        // Without an ESCAPE clause `!` carries no special meaning, so it stays literal.
+        assert!(!like_match(b"100", b"100!%"));
+        // `_` against a multibyte character stays character-aligned next to a leading `%`.
+        assert!(like_match("%あ".as_bytes(), b"%_"));
+        assert!(!like_match("%あい".as_bytes(), b"%_x"));
+    }
+
+    #[test]
+    fn like_escape_percent_is_a_wildcard_unless_escaped() {
+        // Unescaped `%` is the wildcard even when the subject byte is `%`.
+        assert!(like_escape_match(b"50% off", b"50%", b'!'));
+        assert!(like_escape_match(b"%abc", b"%bc", b'!'));
+        assert!(like_escape_match(b"%%", b"%", b'!'));
+        // Escaped `%` is a literal, and then it has to match exactly.
+        assert!(like_escape_match(b"50% off", b"50!%%", b'!'));
+        assert!(!like_escape_match(b"50% off", b"50!%", b'!'));
+        assert!(like_escape_match(b"%abc", b"!%%", b'!'));
+        assert!(!like_escape_match(b"xabc", b"!%%", b'!'));
+        // Escaped `_` likewise, including against a multibyte character (which a
+        // wildcard `_` would have consumed whole).
+        assert!(like_escape_match(b"a_c", b"a!_c", b'!'));
+        assert!(!like_escape_match("aあc".as_bytes(), b"a!_c", b'!'));
+        assert!(like_escape_match("aあc".as_bytes(), b"a_c", b'!'));
     }
 
     #[test]

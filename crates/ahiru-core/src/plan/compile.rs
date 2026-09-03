@@ -145,28 +145,39 @@ fn date_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, bool)> {
 ///
 /// Division falls to DOUBLE, as in DuckDB. Left as integer division the scale would
 /// subtract, leaving too few digits and giving 0 in most cases.
-fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, Ty, Ty)> {
+///
+/// A product whose scale would exceed [`crate::vector::types::MAX_DECIMAL_PRECISION`] is
+/// rejected with `ValueOutOfRange` rather than silently clamped: clamping the type without
+/// rescaling the raw integer made `0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20)` report
+/// `0.01` instead of `0.0001`. DuckDB raises an out-of-range error naming the needed scale
+/// there too, and points at the same workarounds -- cast an operand to DOUBLE, or to a
+/// DECIMAL with a smaller scale. The result *precision* is still clamped to the maximum,
+/// which is also what DuckDB does (`DECIMAL(20,2) * DECIMAL(19,2)` -> `DECIMAL(38,4)`).
+fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Result<Option<(Ty, Ty, Ty)>> {
     if !matches!(op, BinaryOp::Mul | BinaryOp::Div) {
-        return None;
+        return Ok(None);
     }
     // If neither side is DECIMAL, take the ordinary path.
     if !matches!(lt, Ty::Decimal { .. }) && !matches!(rt, Ty::Decimal { .. }) {
-        return None;
+        return Ok(None);
     }
     // With floating point mixed in, fall to DOUBLE (as in DuckDB).
     if matches!(lt, Ty::Float | Ty::Double) || matches!(rt, Ty::Float | Ty::Double) {
-        return Some((Ty::Double, Ty::Double, Ty::Double));
+        return Ok(Some((Ty::Double, Ty::Double, Ty::Double)));
     }
-    let (p1, s1) = lt.as_decimal()?;
-    let (p2, s2) = rt.as_decimal()?;
+    let (Some((p1, s1)), Some((p2, s2))) = (lt.as_decimal(), rt.as_decimal()) else {
+        return Ok(None);
+    };
     if op == BinaryOp::Div {
-        return Some((Ty::Double, Ty::Double, Ty::Double));
+        return Ok(Some((Ty::Double, Ty::Double, Ty::Double)));
     }
     // Multiplication: precision adds, and so does scale.
-    let res = Ty::decimal(p1.saturating_add(p2), s1.saturating_add(s2));
-    let (rp, _) = res.as_decimal()?;
+    let scale = s1.saturating_add(s2);
+    ensure!(scale <= crate::vector::types::MAX_DECIMAL_PRECISION, ValueOutOfRange);
+    let res = Ty::decimal(p1.saturating_add(p2), scale);
+    let Some((rp, _)) = res.as_decimal() else { return Ok(None) };
     // Both operands keep their scale and widen to the result's physical width.
-    Some((Ty::decimal(rp, s1), Ty::decimal(rp, s2), res))
+    Ok(Some((Ty::decimal(rp, s1), Ty::decimal(rp, s2), res)))
 }
 
 /// Recognizes the shapes DATE/TIMESTAMP +- INTERVAL, INTERVAL +- INTERVAL, and
@@ -912,7 +923,7 @@ impl<'a> Compiler<'a> {
         }
 
         // DECIMAL multiplication and division change the scale, so they do not ride the common-type path.
-        if let Some((lcast, rcast, res)) = decimal_arith(op, lt, rt) {
+        if let Some((lcast, rcast, res)) = decimal_arith(op, lt, rt)? {
             let l = self.coerce(lr, lt, lcast)?;
             let r = self.coerce(rr, rt, rcast)?;
             let code = if op == BinaryOp::Mul { OpCode::Mul } else { OpCode::Div };
