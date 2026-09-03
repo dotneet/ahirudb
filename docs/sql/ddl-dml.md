@@ -157,7 +157,7 @@ readable anywhere (there are DuckDB cross-checks in
 `crates/ahiru-cli/tests/copy.rs`) — it is just larger and less prunable
 than what a full-featured writer would produce.
 
-SQL types map to their natural Parquet types, with two deliberate
+SQL types map to their natural Parquet types, with three deliberate
 exceptions:
 
 - **INTERVAL** is written as text (`1 year 2 months 3 days 01:02:03`, the
@@ -173,6 +173,14 @@ exceptions:
   `DOUBLE`, so this mapping is the more faithful of the two in range as
   well as in exactness — it just refuses the last fraction of the type's
   domain instead of silently rounding it.)
+- A **`VARCHAR` column whose values are not valid UTF-8** is written
+  without the `STRING`/`UTF8` annotation, as a plain `BYTE_ARRAY`, and
+  reads back as `BLOB`. This engine lets a `VARCHAR` hold arbitrary bytes
+  (a CSV field is read byte for byte, and `unhex`/`decode` return raw
+  bytes), but the annotation is a promise strict readers check — DuckDB
+  rejects the whole file over a single bad byte. Dropping it for that one
+  column keeps every byte exact and keeps the file readable. Columns whose
+  values *are* valid UTF-8 are unaffected, in the same file.
 
 The full table is in the module doc of
 `crates/ahiru-core/src/write/parquet/mod.rs`.
@@ -182,6 +190,12 @@ runs the query to completion in memory and hands the resulting bytes plus
 the destination path back to the host, which performs the actual file
 write. In the native CLI this happens automatically; a JS host would do
 the equivalent via its own file-write API.
+
+Writing over a file the same session has already read is safe in the CLI:
+after the write it re-reads every table backed by that path, so the next
+`SELECT` sees the new contents rather than the bytes cached at
+registration time. A host that does its own file writes has to invalidate
+its own registrations the same way.
 
 ### JSONL output
 
