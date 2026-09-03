@@ -9,7 +9,7 @@ use super::agg::{
     as_bare_aggregate, coalesce_count_column, collect_aggregates, drop_trailing_columns,
 };
 use super::cte::CteScope;
-use super::refs::{collect_refs, each_child, push_u32};
+use super::refs::{collect_refs, each_child_flat, push_u32};
 use super::*;
 
 /// Whether this subquery is guaranteed to produce **exactly one row**, whatever its input.
@@ -571,12 +571,24 @@ pub(super) fn split_conjuncts(
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
-    match arena.get(id) {
-        Expr::Binary { op: BinaryOp::And, lhs, rhs } => {
-            split_conjuncts(arena, *lhs, out, depth + 1)?;
-            split_conjuncts(arena, *rhs, out, depth + 1)?;
-        }
-        _ => out.push(id),
+    // `a AND b AND ... AND z` is a left-deep chain: recursing into `lhs` would cost one stack
+    // frame and one unit of the nesting budget per conjunct, so a flat 100-term WHERE would
+    // be rejected as "expression nesting too deep". Descend the spine in a loop instead and
+    // recurse only into the right operands, preserving the left-to-right output order.
+    let mut rights: Vec<ExprId> = Vec::new();
+    let mut cur = id;
+    while let Expr::Binary { op: BinaryOp::And, lhs, rhs } = arena.get(cur) {
+        rights.push(*rhs);
+        cur = *lhs;
+    }
+    if rights.is_empty() {
+        out.push(id);
+        return Ok(());
+    }
+    let d = depth + 1;
+    split_conjuncts(arena, cur, out, d)?;
+    for &r in rights.iter().rev() {
+        split_conjuncts(arena, r, out, d)?;
     }
     Ok(())
 }
@@ -612,7 +624,7 @@ pub(super) fn contains_subquery(arena: &ExprArena, id: ExprId, depth: u32) -> bo
         return true;
     }
     let mut found = false;
-    let _ = each_child(arena, id, &mut |c| {
+    let _ = each_child_flat(arena, id, &mut |c| {
         if contains_subquery(arena, c, depth + 1) {
             found = true;
         }
@@ -653,7 +665,7 @@ pub(super) fn collect_scalar_subqueries(
         return Ok(());
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| collect_scalar_subqueries(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_scalar_subqueries(arena, c, out, d))
 }
 
 /// Collects the "quantified comparisons via aggregation" inside an expression (`ANY`/`ALL` with
@@ -683,7 +695,7 @@ pub(super) fn collect_quantified_comparisons(
     // `(a > ANY (q1)) = (b < ANY (q2))`), so the children are always walked even after a match
     // (`each_child` passes only `arg` for a `QuantifiedComparison`).
     let d = depth + 1;
-    each_child(arena, id, &mut |c| collect_quantified_comparisons(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_quantified_comparisons(arena, c, out, d))
 }
 
 /// Collects every column reference, qualified or not, as
@@ -702,7 +714,7 @@ pub(super) fn collect_colrefs(
         return Ok(());
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| collect_colrefs(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_colrefs(arena, c, out, d))
 }
 
 /// If this predicate references exactly one relation, returns its index.
@@ -808,16 +820,15 @@ pub(super) fn classify_conjunct(
     id: ExprId,
 ) -> Result<ConjClass> {
     // First check whether it resolves locally (= an ordinary predicate with no correlation).
-    let mut tmp = Vec::new();
-    if collect_refs(arena, local, id, &mut tmp).is_ok() {
+    if resolves_in(arena, local, id)? {
         return Ok(ConjClass::Local);
     }
     if let Expr::Binary { op: BinaryOp::Eq, lhs, rhs } = arena.get(id) {
         let (l, r) = (*lhs, *rhs);
-        if is_pure_scope(arena, local, l) && is_pure_outer_only(arena, local, outer, r) {
+        if resolves_in(arena, local, l)? && is_pure_outer_only(arena, local, outer, r)? {
             return Ok(ConjClass::Correlated { inner: l, outer: r });
         }
-        if is_pure_scope(arena, local, r) && is_pure_outer_only(arena, local, outer, l) {
+        if resolves_in(arena, local, r)? && is_pure_outer_only(arena, local, outer, l)? {
             return Ok(ConjClass::Correlated { inner: r, outer: l });
         }
     }
@@ -831,19 +842,37 @@ pub(super) fn classify_conjunct(
     Ok(ConjClass::Local)
 }
 
+/// Whether a name lookup failed merely because this scope does not offer the name, as
+/// opposed to failing for a reason that must stay an error.
+///
+/// Only "this scope does not have it" may fall through to the outer scope. An
+/// `AmbiguousColumn` in particular means the name *is* here, more than once, and treating it
+/// like a missing name would silently re-bind it as a correlation key against the outer
+/// query — returning a plausible wrong answer where DuckDB raises "ambiguous reference".
+fn is_absent_here(e: Error) -> bool {
+    matches!(e.code, Code::ColumnNotFound | Code::TableNotFound)
+}
+
 /// Whether an expression resolves entirely within `scope`.
-fn is_pure_scope(arena: &ExprArena, scope: &Scope, id: ExprId) -> bool {
+///
+/// `Ok(false)` only for names this scope does not have; any other resolution error
+/// (`AmbiguousColumn`, `ExpressionTooDeep`, ...) is propagated.
+fn resolves_in(arena: &ExprArena, scope: &Scope, id: ExprId) -> Result<bool> {
     let mut tmp = Vec::new();
-    collect_refs(arena, scope, id, &mut tmp).is_ok()
+    match collect_refs(arena, scope, id, &mut tmp) {
+        Ok(()) => Ok(true),
+        Err(e) if is_absent_here(e) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether an expression "does not resolve locally but does resolve in the outer scope"
 /// (= it references purely the outer scope).
-fn is_pure_outer_only(arena: &ExprArena, local: &Scope, outer: &Scope, id: ExprId) -> bool {
-    if is_pure_scope(arena, local, id) {
-        return false;
+fn is_pure_outer_only(arena: &ExprArena, local: &Scope, outer: &Scope, id: ExprId) -> Result<bool> {
+    if resolves_in(arena, local, id)? {
+        return Ok(false);
     }
-    is_pure_scope(arena, outer, id)
+    resolves_in(arena, outer, id)
 }
 
 /// Whether the expression contains, anywhere, a column reference resolvable only in the outer
@@ -858,14 +887,16 @@ fn references_outer(
 ) -> Result<bool> {
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
     if let Expr::ColumnRef { qualifier, name } = arena.get(id) {
-        if local.resolve(qualifier.as_deref(), name).is_ok() {
-            return Ok(false);
+        match local.resolve(qualifier.as_deref(), name) {
+            Ok(_) => return Ok(false),
+            Err(e) if is_absent_here(e) => {}
+            Err(e) => return Err(e),
         }
         return Ok(outer.resolve(qualifier.as_deref(), name).is_ok());
     }
     let mut found = false;
     let d = depth + 1;
-    each_child(arena, id, &mut |c| {
+    each_child_flat(arena, id, &mut |c| {
         if references_outer(arena, local, outer, c, d)? {
             found = true;
         }
@@ -903,6 +934,10 @@ fn collect_refs_tolerant_at(
     if let Expr::ColumnRef { qualifier, name } = arena.get(id) {
         match scope.resolve(qualifier.as_deref(), name) {
             Ok(i) => out.push(i),
+            // Only a name this scope does not have may be re-read as a correlated
+            // reference; `AmbiguousColumn` stays an error even when the outer scope
+            // happens to offer the same name.
+            Err(e) if !is_absent_here(e) => return Err(e),
             Err(e) => {
                 if outer_scope.resolve(qualifier.as_deref(), name).is_err() {
                     return Err(e);
@@ -912,5 +947,7 @@ fn collect_refs_tolerant_at(
         return Ok(());
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| collect_refs_tolerant_at(arena, scope, outer_scope, c, out, d))
+    each_child_flat(arena, id, &mut |c| {
+        collect_refs_tolerant_at(arena, scope, outer_scope, c, out, d)
+    })
 }

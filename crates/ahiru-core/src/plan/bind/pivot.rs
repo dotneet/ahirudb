@@ -3,7 +3,7 @@
 //! why), so it lives alongside the rest of the binder but does not call into
 //! `bind_select_in` at all.
 
-use super::refs::each_child;
+use super::refs::each_child_flat;
 use super::*;
 use crate::sql::ast::{PivotStmt, SelectItem, UnpivotStmt};
 
@@ -81,7 +81,7 @@ fn collect_colref_names(
         return Ok(());
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| collect_colref_names(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_colref_names(arena, c, out, d))
 }
 
 /// Expands `PIVOT` into an ordinary `SELECT ... GROUP BY ...`.

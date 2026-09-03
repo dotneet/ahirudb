@@ -3,7 +3,7 @@
 //! NULL/zero coalescing used when decorrelating correlated `COUNT`
 //! aggregates.
 
-use super::refs::{const_program, default_name, each_child};
+use super::refs::{const_program, default_name, each_child_flat};
 use super::*;
 
 /// Drops the trailing `k` columns used as correlation keys by the most recent join.
@@ -84,7 +84,7 @@ pub(super) fn collect_aggregates(
             return Ok(());
         }
     }
-    each_child(arena, id, &mut |c| collect_aggregates(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_aggregates(arena, c, out, d))
 }
 
 /// `GROUPING(col, ...)` / `GROUPING_ID(col, ...)`.
@@ -92,7 +92,7 @@ pub(super) fn collect_aggregates(
 /// Unlike aggregate functions, these do not evaluate their arguments (they are simply
 /// replaced by a bitmask constant fixed per grouping set), so they are collected separately
 /// from `collect_aggregates`.
-fn is_grouping_fn(name: &str) -> bool {
+pub(super) fn is_grouping_fn(name: &str) -> bool {
     eq_ascii_ci(name.as_bytes(), b"grouping") || eq_ascii_ci(name.as_bytes(), b"grouping_id")
 }
 
@@ -115,7 +115,7 @@ pub(super) fn collect_grouping_calls(
             return Ok(());
         }
     }
-    each_child(arena, id, &mut |c| collect_grouping_calls(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_grouping_calls(arena, c, out, d))
 }
 
 /// Collects the window function calls inside an expression. Nesting is invalid.
@@ -144,7 +144,7 @@ pub(super) fn collect_windows(
         }
         return Ok(());
     }
-    each_child(arena, id, &mut |c| collect_windows(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_windows(arena, c, out, d))
 }
 
 /// Collects the `Expr::Unnest` calls inside an expression. Unlike aggregates and windows,
@@ -164,7 +164,7 @@ pub(super) fn collect_unnests(
         out.push(id);
         return Ok(());
     }
-    each_child(arena, id, &mut |c| collect_unnests(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_unnests(arena, c, out, d))
 }
 
 /// Recovers UNNEST's element type from `Ty::Json` to the actual scalar type where possible.
@@ -513,7 +513,7 @@ pub(super) fn check_grouped(
         _ => {}
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, const_subs, d))
+    each_child_flat(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, const_subs, d))
 }
 
 /// Whether any grouping expression is a column reference naming input column `col`.

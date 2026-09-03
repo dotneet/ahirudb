@@ -205,6 +205,20 @@ user-visible effect.
   works; `(VALUES (1,2)) AS x(a,b)` in a `FROM` clause, and a top-level
   `VALUES` statement, are both syntax errors. Use a real table, a
   `range(n)`-anchored `SELECT`, or a `UNION ALL` chain instead.
+- **Statement size caps.** Two separate limits keep a pathological statement
+  from exhausting the stack (on wasm a stack overflow is an unrecoverable
+  trap, so deep input is always turned into an error instead):
+  - *Expression nesting* is capped at 64 levels. This counts genuine
+    nesting — parentheses, function arguments, subqueries — not chain
+    length: `a AND b AND ... `, `1+1+...`, `'a'||'a'||...` are left-deep but
+    flat, and any number of terms is fine.
+  - *Left-deep `JOIN` and set-operation chains* are capped at 64 links per
+    statement, counted across the whole statement. `A UNION ALL B UNION ALL
+    ...` with more than 64 branches, or a chain of more than 64 `JOIN`s, is
+    rejected with `expression nesting too deep`. Unlike expressions, these
+    are `Box` chains whose *drop* alone recurses once per link, so the cap
+    stays low. Nest them differently (union in batches through a CTE) if you
+    generate SQL that hits it.
 - **`printf('%f', ...)` prints the value's full exact binary expansion**,
   as C's `printf` does. `printf('%f', 1e300)` therefore prints all 301
   integer digits of the `DOUBLE` nearest `1e300`, where DuckDB prints the

@@ -329,6 +329,18 @@ rejected, because `b` then appears in the select list without being
 grouped or aggregated. `SELECT b AS a FROM t ORDER BY a` sorts by `b`,
 because there `a` is the alias.
 
+**`HAVING`** follows the `GROUP BY` rule — an input column of the name wins —
+but a name the input doesn't have may be a select-list alias, as in DuckDB:
+
+```sql
+SELECT flag, sum(id) AS s FROM t GROUP BY flag HAVING s > 100 ORDER BY 1;
+```
+
+The alias has to name something the aggregate already produces: a grouping
+expression, an aggregate call, or a `GROUPING()` call. An alias on an
+expression *built out of* those (`SELECT sum(id) + 1 AS z ... HAVING z > 5`)
+has no column of its own and is rejected; repeat the expression in `HAVING`.
+
 An alias that shadows nothing is unambiguous either way:
 
 ```sql

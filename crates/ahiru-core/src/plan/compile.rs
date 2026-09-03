@@ -607,7 +607,7 @@ impl<'a> Compiler<'a> {
                 Ok((self.konst(ty, v), ty))
             }
             Expr::Unary { op, arg } => self.unary(*op, *arg),
-            Expr::Binary { op, lhs, rhs } => self.binary(*op, *lhs, *rhs),
+            Expr::Binary { .. } => self.binary_chain(id),
             Expr::Cast { arg, ty, try_ } => {
                 let (r, from) = self.expr(*arg)?;
                 if *try_ {
@@ -853,8 +853,49 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn binary(&mut self, op: BinaryOp, lhs: ExprId, rhs: ExprId) -> Result<(Reg, Ty)> {
-        let (lr, lt) = self.expr(lhs)?;
+    /// Whether [`Self::substitute`] would replace this node, without emitting anything.
+    fn is_substituted(&self, id: ExprId) -> bool {
+        self.subs.iter().any(|s| {
+            if s.structural {
+                expr_eq(self.arena, s.expr, id)
+            } else {
+                s.expr == id
+            }
+        })
+    }
+
+    /// Compiles a left-deep chain of binary operators without recursing per link.
+    ///
+    /// `1+1+...+1`, `'a'||'a'||...` and `p AND q AND ...` all parse into `Binary` nodes
+    /// nested through their **left** operand only. Recursing into `lhs` would spend one
+    /// stack frame and one unit of `MAX_DEPTH` per term, rejecting a perfectly flat
+    /// expression of a few dozen terms as "expression nesting too deep". The spine is
+    /// descended in a loop and then compiled bottom-up, which visits the operands in
+    /// exactly the same order as the recursive version and so emits identical bytecode.
+    ///
+    /// The descent stops at a node the substitution list replaces (an inner node of the
+    /// spine can itself be a GROUP BY expression that already exists as a column); that
+    /// node is then compiled by `expr`, which applies the substitution as usual.
+    fn binary_chain(&mut self, id: ExprId) -> Result<(Reg, Ty)> {
+        let mut spine: Vec<(BinaryOp, ExprId)> = Vec::new();
+        let mut cur = id;
+        while let Expr::Binary { op, lhs, rhs } = self.arena.get(cur) {
+            if cur != id && self.is_substituted(cur) {
+                break;
+            }
+            spine.push((*op, *rhs));
+            cur = *lhs;
+        }
+        let mut acc = self.expr(cur)?;
+        for &(op, rhs) in spine.iter().rev() {
+            acc = self.binary_rhs(op, acc, rhs)?;
+        }
+        Ok(acc)
+    }
+
+    /// Compiles one binary operator, with its left operand already compiled.
+    fn binary_rhs(&mut self, op: BinaryOp, lhs: (Reg, Ty), rhs: ExprId) -> Result<(Reg, Ty)> {
+        let (lr, lt) = lhs;
         let (rr, rt) = self.expr(rhs)?;
 
         if op.is_logical() {
@@ -1264,11 +1305,26 @@ mod tests {
     fn deep_nesting_is_rejected_without_overflowing_the_stack() {
         let mut a = ExprArena::new();
         let mut id = a.push(Expr::Literal(Value::I32(1)));
+        // Nested through the *right* operand: `1+(1+(1+...))` really is 500 levels deep.
+        for _ in 0..500 {
+            let l = a.push(Expr::Literal(Value::I32(1)));
+            id = a.push(Expr::Binary { op: BinaryOp::Add, lhs: l, rhs: id });
+        }
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::ExpressionTooDeep));
+    }
+
+    #[test]
+    fn a_flat_left_deep_chain_compiles_however_long_it_is() {
+        let mut a = ExprArena::new();
+        let mut id = a.push(Expr::Literal(Value::I32(1)));
+        // `1+1+...+1` is what a flat 500-term sum parses into: left-associative, so the
+        // tree grows down the left operand. It is not nested, so the nesting limit must
+        // not reject it (`Compiler::binary_chain` walks the spine iteratively).
         for _ in 0..500 {
             let r = a.push(Expr::Literal(Value::I32(1)));
             id = a.push(Expr::Binary { op: BinaryOp::Add, lhs: id, rhs: r });
         }
-        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::ExpressionTooDeep));
+        assert!(compile(&a, &cols(), &[], id).is_ok());
     }
 
     // --- ILIKE / TRY_CAST -------------------------------------------------------

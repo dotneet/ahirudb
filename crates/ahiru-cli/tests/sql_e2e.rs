@@ -736,3 +736,23 @@ fn cell_normalisation() {
     assert_ne!(normalize_cell("1.5"), normalize_cell("1.6"));
     assert_eq!(normalize_cell("\"abc\""), "abc");
 }
+
+e2e!(
+    binder_fixes,
+    "tests/data/basic.parquet",
+    [
+        // A qualified predicate on an implicit-LATERAL UNNEST column. The table needs an
+        // alias here because `check` rewrites the bare name `t` into a file path.
+        "SELECT u.x FROM t AS s, UNNEST([1,2,3]) AS u(x) WHERE u.x > 1 AND s.id = 0 ORDER BY 1",
+        "SELECT s.id, u.x FROM t AS s, UNNEST([10,20]) AS u(x) \
+         WHERE u.x = 20 AND s.id < 3 ORDER BY 1",
+        // GROUPING() naming a select-list alias.
+        "SELECT id % 2 AS m, count(*), grouping(m) FROM t \
+         GROUP BY GROUPING SETS ((m), ()) ORDER BY 1 NULLS FIRST",
+        // A select-list alias used in HAVING.
+        "SELECT id % 2 AS a, sum(id) AS s FROM t GROUP BY a HAVING s > 249600 ORDER BY 1",
+        "SELECT id % 3 AS m, count(*) AS c FROM t GROUP BY m HAVING m = 1",
+        "SELECT id % 2 AS m, count(*) AS c FROM t \
+         GROUP BY GROUPING SETS ((m), ()) HAVING c > 600 ORDER BY 1 NULLS FIRST",
+    ]
+);

@@ -3,7 +3,9 @@
 //! generic expression-tree walker (`each_child`), column-reference
 //! collection, and name synthesis for unnamed output columns.
 
+use super::agg::is_grouping_fn;
 use super::from::FromTree;
+use super::subquery::collect_refs_tolerant;
 use super::*;
 
 // --- Reference resolution for ORDER BY / GROUP BY ---------------------------
@@ -23,8 +25,14 @@ pub(super) fn resolve_group_ref(
     id: ExprId,
 ) -> Result<ExprId> {
     if let Expr::ColumnRef { qualifier: None, name } = arena.get(id) {
-        if scope.resolve(None, name).is_ok() {
-            return Ok(id);
+        match scope.resolve(None, name) {
+            Ok(_) => return Ok(id),
+            // Only a name the input does not have may fall through to a select-list alias.
+            // An ambiguous one *is* an input column, several times over, and DuckDB rejects
+            // it ("Ambiguous reference to column name"); silently grouping by an alias that
+            // happens to share the name would answer a different question.
+            Err(e) if e.code == Code::AmbiguousColumn => return Err(e),
+            Err(_) => {}
         }
     }
     resolve_select_ref(arena, sel, id)
@@ -54,6 +62,11 @@ pub(super) fn resolve_select_ref(
 }
 
 /// Returns the column number if an ORDER BY item points at an output column.
+///
+/// `schema` is the *projected* output schema only. Hidden columns appended after it
+/// (correlation keys, QUALIFY helpers, sort keys added for earlier ORDER BY terms) must not
+/// be addressable, or `ORDER BY <ordinal>` would silently sort by an internal column instead
+/// of reporting that the position is out of range.
 pub(super) fn order_output_column(
     arena: &ExprArena,
     sel: &SelectStmt,
@@ -246,6 +259,41 @@ pub(super) fn each_child(
     Ok(())
 }
 
+/// The tail of a recursive expression walker, with left-deep binary chains flattened.
+///
+/// `WHERE a AND b AND ... AND z`, `1+1+...+1` and `s||s||...||s` all parse into a chain of
+/// `Expr::Binary` nodes nested through their **left** operand only. A walker that recursed
+/// into `lhs` would spend one stack frame and one unit of the nesting budget per term, so a
+/// perfectly flat predicate of a few dozen terms would be rejected as "expression nesting too
+/// deep" (and a very long one could exhaust the stack, which is an unrecoverable trap on
+/// wasm). Here the left spine is descended in a loop instead: `f` is called once for the node
+/// at the bottom of the spine and once for every right operand, in the original left-to-right
+/// order, so the spine costs one stack frame however long it is.
+///
+/// `f` is the caller's walker at `depth + 1`. Genuine nesting (a right operand, a function
+/// argument, a parenthesised left operand of a *different* shape) still recurses and is still
+/// bounded by `MAX_EXPR_DEPTH`.
+pub(super) fn each_child_flat(
+    arena: &ExprArena,
+    id: ExprId,
+    f: &mut dyn FnMut(ExprId) -> Result<()>,
+) -> Result<()> {
+    let mut spine: Vec<ExprId> = Vec::new();
+    let mut cur = id;
+    while let Expr::Binary { lhs, rhs, .. } = arena.get(cur) {
+        spine.push(*rhs);
+        cur = *lhs;
+    }
+    if spine.is_empty() {
+        return each_child(arena, id, f);
+    }
+    f(cur)?;
+    for &r in spine.iter().rev() {
+        f(r)?;
+    }
+    Ok(())
+}
+
 /// Collects the scope column numbers an expression references. Nonexistent columns are detected here.
 pub(super) fn collect_refs(
     arena: &ExprArena,
@@ -269,7 +317,61 @@ fn collect_refs_at(
         return Ok(());
     }
     let d = depth + 1;
-    each_child(arena, id, &mut |c| collect_refs_at(arena, scope, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_refs_at(arena, scope, c, out, d))
+}
+
+/// Projection-pushdown collection for the places where a bare name may be a SELECT-list
+/// alias rather than an input column.
+///
+/// Two such places exist:
+/// * `HAVING` — `SELECT a, sum(x) AS s ... HAVING s > 5`, which DuckDB accepts. The caller
+///   passes `alias_ok = true` for it.
+/// * the arguments of `GROUPING()` / `GROUPING_ID()`, anywhere they appear —
+///   `SELECT id % 2 AS m, grouping(m) ... GROUP BY GROUPING SETS ((m), ())`. They are
+///   resolved by `resolve_group_ref` at actual bind time, so the alias is accepted here too.
+///
+/// An alias is redirected to the expression it names, whose own input columns are what the
+/// scan has to read. That expression is compiled against the input scope, so it can never
+/// contain another alias; it is collected without a second redirect, which also makes
+/// mutually-referencing aliases terminate instead of looping.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_refs_aliased(
+    arena: &ExprArena,
+    sel: &SelectStmt,
+    scope: &Scope,
+    outer_scope: Option<&Scope>,
+    id: ExprId,
+    alias_ok: bool,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    let d = depth + 1;
+    if let Expr::ColumnRef { qualifier: None, name } = arena.get(id) {
+        // Only a name the input does not have may be an alias; an ambiguous one is an
+        // error, the same rule `resolve_group_ref` applies to GROUP BY.
+        let absent = matches!(scope.resolve(None, name), Err(e) if e.code != Code::AmbiguousColumn);
+        if alias_ok && absent {
+            let e = resolve_select_ref(arena, sel, id)?;
+            if e != id {
+                return collect_refs_tolerant(arena, scope, outer_scope, e, out);
+            }
+        }
+    }
+    if matches!(arena.get(id), Expr::ColumnRef { .. }) {
+        return collect_refs_tolerant(arena, scope, outer_scope, id, out);
+    }
+    if let Expr::Function { name, args, .. } = arena.get(id) {
+        if is_grouping_fn(name) {
+            for &a in args {
+                collect_refs_aliased(arena, sel, scope, outer_scope, a, true, out, d)?;
+            }
+            return Ok(());
+        }
+    }
+    each_child_flat(arena, id, &mut |c| {
+        collect_refs_aliased(arena, sel, scope, outer_scope, c, alias_ok, out, d)
+    })
 }
 
 /// Collects, for projection pushdown only, every column reference in an expression **including
@@ -310,7 +412,7 @@ pub(super) fn collect_outer_refs(
         }
         _ => {}
     }
-    each_child(arena, id, &mut |c| collect_outer_refs(arena, scope, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_outer_refs(arena, scope, c, out, d))
 }
 
 fn query_outer_refs(
