@@ -22,6 +22,14 @@ pub type R<T> = Result<T, Box<dyn std::error::Error>>;
 /// to the core.
 pub const SUPPORTED_EXTS: &[&str] = &["parquet", "csv", "tsv", "jsonl", "ndjson", "json"];
 
+/// A path in a form two spellings of the same file agree on (`./x.parquet` and
+/// `x.parquet`, say). Falls back to the path as written when the file cannot be
+/// resolved — a name that no longer exists on disk can only be compared literally.
+fn normalize_path(p: impl AsRef<Path>) -> PathBuf {
+    let p = p.as_ref();
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 pub fn is_supported_path(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
@@ -46,6 +54,10 @@ pub struct Engine {
     registered: HashSet<String>,
     /// Table names in registration order, for `.tables`.
     names: Vec<String>,
+    /// `name -> (spec it was registered from, the files it resolved to)`.
+    /// Only used to spot registrations invalidated by a `COPY ... TO` that
+    /// overwrites one of those files.
+    backing: HashMap<String, (String, Vec<PathBuf>)>,
     /// Next auto-assigned short alias index (`t`, `t2`, `t3`, ...).
     next_alias: usize,
     pub readonly: bool,
@@ -71,6 +83,7 @@ impl Engine {
             sources: HashMap::new(),
             registered: HashSet::new(),
             names: Vec::new(),
+            backing: HashMap::new(),
             next_alias: 0,
             readonly: false,
         }
@@ -129,6 +142,13 @@ impl Engine {
         if paths.is_empty() {
             return Err(format!("no files matched: {spec}").into());
         }
+        // Remember which files back this name so that a later `COPY ... TO` onto
+        // one of them can refresh the registration (see `invalidate_path`)
+        // instead of keeping the bytes read here forever.
+        self.backing.insert(
+            name.to_string(),
+            (spec.to_string(), paths.iter().map(normalize_path).collect()),
+        );
         // Detect per file. A directory / glob can mix extensions; applying the
         // first path's format to every part would read CSV as Parquet (or vice versa).
         if paths.len() == 1 {
@@ -165,6 +185,35 @@ impl Engine {
     fn remember(&mut self, name: &str) {
         if self.registered.insert(name.to_string()) {
             self.names.push(name.to_string());
+        }
+    }
+
+    /// Re-reads every table backed by `path`.
+    ///
+    /// A registered file is read once and then held in memory forever, and
+    /// `autoregister` skips names it already knows. So `COPY ... TO 'x.parquet'`
+    /// onto a file the session had already read left the catalog serving the
+    /// bytes from before the write — the following `SELECT * FROM 'x.parquet'`
+    /// returned the old contents. Refreshing here keeps the catalog consistent
+    /// with the file the CLI just wrote, for the literal path spelling, for a
+    /// command-line alias of the same file, and for a glob/directory table that
+    /// happens to include it.
+    fn invalidate_path(&mut self, path: &Path) {
+        let target = normalize_path(path);
+        let stale: Vec<(String, String)> = self
+            .backing
+            .iter()
+            .filter(|(_, (_, paths))| paths.contains(&target))
+            .map(|(name, (spec, _))| (name.clone(), spec.clone()))
+            .collect();
+        for (name, spec) in stale {
+            // A failure here is not fatal: the statement itself succeeded, and the
+            // stale registration is no worse off than before. It is dropped from
+            // `registered` either way so `autoregister` gets another chance.
+            if self.register_as(&name, &spec).is_err() {
+                self.registered.remove(&name);
+                self.backing.remove(&name);
+            }
         }
     }
 
@@ -232,6 +281,8 @@ impl Engine {
         if let Some(c) = q.copy.take() {
             let n = c.data.len();
             std::fs::write(&c.path, &c.data)?;
+            // The file on disk changed underneath any table already reading it.
+            self.invalidate_path(Path::new(&c.path));
             return Ok(Outcome {
                 rows: 0,
                 copied: Some((c.path.clone(), n)),

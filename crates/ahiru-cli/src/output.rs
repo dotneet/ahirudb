@@ -236,7 +236,7 @@ impl<'a> Writer<'a> {
             .zip(&self.types)
             .map(|(v, ty)| {
                 let text = crate::render::render(v, *ty, &self.settings.null);
-                csv_quote(&text, &self.settings.separator)
+                csv_quote_field(&text, &self.settings.separator, !matches!(v, Value::Null))
             })
             .collect();
         writeln!(self.out, "{}", cells.join(&self.settings.separator))
@@ -638,10 +638,26 @@ fn insert_identifier_part(part: &str) -> String {
 }
 
 /// Quotes a cell per RFC 4180 if it contains the separator, a `"`, or a
-/// line-ending character; doubles any internal `"`.
+/// line-ending character, or if it is empty; doubles any internal `"`.
 fn csv_quote(s: &str, separator: &str) -> String {
-    let needs_quoting =
-        s.contains(separator) || s.contains('"') || s.contains('\r') || s.contains('\n');
+    csv_quote_field(s, separator, true)
+}
+
+/// The body of [`csv_quote`]. `quote_empty` forces `""` for the empty string.
+///
+/// The empty string has to be quoted, or it is written as zero bytes — exactly
+/// what a NULL rendered with `-nullvalue ''` writes, leaving the two
+/// indistinguishable on read-back. `duckdb`'s shell and this crate's own CSV
+/// writer (`ahiru_core::write::csv`) both emit `""` for it.
+///
+/// A NULL passes `quote_empty = false`: its spelling is whatever `-nullvalue`
+/// says, and turning an empty one into `""` would just move the ambiguity.
+fn csv_quote_field(s: &str, separator: &str, quote_empty: bool) -> String {
+    let needs_quoting = (quote_empty && s.is_empty())
+        || s.contains(separator)
+        || s.contains('"')
+        || s.contains('\r')
+        || s.contains('\n');
     if !needs_quoting {
         return s.to_string();
     }
@@ -894,6 +910,70 @@ mod tests {
         w.row(&[Value::I32(1)]).unwrap();
         w.finish().unwrap();
         assert_eq!(as_str(&buf), "1\n");
+    }
+
+    /// The empty string is quoted (`""`), a NULL never is, so the two stay
+    /// distinguishable even when `-nullvalue ''` spells NULL as nothing at all.
+    /// This matches `duckdb`'s shell and this workspace's own CSV writer.
+    #[test]
+    fn csv_distinguishes_empty_string_from_null() {
+        let schema = [field("a", Ty::Varchar), field("b", Ty::Varchar), field("c", Ty::Varchar)];
+        let row = [Value::Bytes(Vec::new()), Value::Null, Value::Bytes(b"x".to_vec())];
+
+        let mut buf = Vec::new();
+        let mut w = writer(
+            &mut buf,
+            Settings { mode: Mode::Csv, separator: ",".to_string(), ..Settings::default() },
+        );
+        w.begin(&schema).unwrap();
+        w.row(&row).unwrap();
+        w.finish().unwrap();
+        assert_eq!(as_str(&buf), "a,b,c\n\"\",NULL,x\n");
+
+        let mut buf = Vec::new();
+        let mut w = writer(
+            &mut buf,
+            Settings {
+                mode: Mode::Csv,
+                separator: ",".to_string(),
+                null: String::new(),
+                ..Settings::default()
+            },
+        );
+        w.begin(&schema).unwrap();
+        w.row(&row).unwrap();
+        w.finish().unwrap();
+        assert_eq!(as_str(&buf), "a,b,c\n\"\",,x\n");
+    }
+
+    /// BLOB and non-UTF-8 VARCHAR cells render as `duckdb`'s `\xHH` escapes in
+    /// every mode; they used to collapse to an unreadable `<N bytes>`. The JSON
+    /// mode must escape the backslashes it gets back.
+    #[test]
+    fn blob_cells_render_as_hex_escapes() {
+        let schema = [field("b", Ty::Blob), field("s", Ty::Varchar)];
+        let row = [Value::Bytes(vec![0x00, 0xff, b'A']), Value::Bytes(vec![b'a', 0xff, b'b'])];
+
+        let mut buf = Vec::new();
+        let mut w = writer(
+            &mut buf,
+            Settings { mode: Mode::Csv, separator: ",".to_string(), ..Settings::default() },
+        );
+        w.begin(&schema).unwrap();
+        w.row(&row).unwrap();
+        w.finish().unwrap();
+        assert_eq!(as_str(&buf), "b,s\n\\x00\\xFFA,a\\xFFb\n");
+
+        let mut buf = Vec::new();
+        let mut w = writer(&mut buf, Settings { mode: Mode::Json, ..Settings::default() });
+        w.begin(&schema).unwrap();
+        w.row(&row).unwrap();
+        w.finish().unwrap();
+        assert!(
+            as_str(&buf).contains(r#""b":"\\x00\\xFFA""#),
+            "backslashes must be JSON-escaped: {}",
+            as_str(&buf)
+        );
     }
 
     #[test]
