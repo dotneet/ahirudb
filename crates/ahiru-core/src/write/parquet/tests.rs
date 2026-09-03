@@ -121,6 +121,26 @@ fn strings_and_blobs_round_trip() {
     );
 }
 
+/// A VARCHAR holding bytes that are not UTF-8 must not be annotated `STRING`
+/// (`ConvertedType::Utf8`): a strict reader validates the annotation and rejects
+/// the whole file, so a single bad byte used to cost every row in it (duckdb:
+/// "Invalid string encoding found in Parquet file"). The column is written as a
+/// plain BYTE_ARRAY instead, which reads back as a BLOB with the bytes intact,
+/// and neighbouring valid columns keep their annotation.
+#[test]
+fn invalid_utf8_varchar_is_written_without_the_string_annotation() {
+    let bad = Value::Bytes(vec![0x00, 0xff]);
+    assert_eq!(round_trip_one(Ty::Varchar, bad.clone()), (Ty::Blob, bad.clone()));
+
+    let fields = [f("bad", Ty::Varchar), f("good", Ty::Varchar)];
+    let good = Value::Bytes(b"ok".to_vec());
+    let bytes = write_rows(&fields, &[vec![bad.clone(), good.clone()]]);
+    let (schema, rows) = read_back(bytes, "SELECT bad, good FROM p");
+    assert_eq!(schema[0].ty, Ty::Blob);
+    assert_eq!(schema[1].ty, Ty::Varchar, "a valid column keeps its STRING annotation");
+    assert_eq!(rows[0], vec![bad, good]);
+}
+
 #[test]
 fn temporal_types_round_trip_in_microseconds() {
     assert_eq!(round_trip_one(Ty::Date, Value::I32(19_000)), (Ty::Date, Value::I32(19_000)));
