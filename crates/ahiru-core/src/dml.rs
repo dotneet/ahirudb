@@ -19,15 +19,27 @@ use crate::session::{Prepared, Session};
 use crate::sql::ast::{ExprArena, ExprId, InsertSource};
 use crate::vector::{Field, Ty, Value, Vector, BATCH_SIZE};
 
-/// Casts an already-determined `Value` to the target type. Wrapping it as an
-/// `Expr::Literal` and running it through `eval_scalar` shares CAST semantics (DECIMAL
-/// scale adjustment, DATE/TIMESTAMP, and so on) fully with `SELECT`'s CAST.
-fn cast_value(session: &mut Session, v: Value, target_ty: Ty) -> Result<Value> {
+/// Casts an already-determined `Value` of type `src_ty` to `target_ty`. Wrapping it as
+/// an `Expr::TypedLiteral` and running it through `eval_scalar` shares CAST semantics
+/// (DECIMAL scale adjustment, DATE/TIMESTAMP, and so on) fully with `SELECT`'s CAST.
+///
+/// `src_ty` must be the type of the *source column* the value came from, not a type
+/// guessed from the `Value` variant. A plain `Expr::Literal` would do the latter, and
+/// several logical types are indistinguishable from their physical representation:
+/// `DECIMAL(10,2)` 12.50 is `I64(1250)`, which re-infers as `BIGINT 1250` and then
+/// rescales to `1250.00`; `UUID`/`INTERVAL`/`DATE`/`TIME`/`TIMESTAMP` likewise lose
+/// their identity and become NULL or a `TypeMismatch`.
+fn cast_value(session: &mut Session, v: Value, src_ty: Ty, target_ty: Ty) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
+    // Identical types need no conversion at all -- and skipping the VM here keeps the
+    // common `INSERT INTO t SELECT * FROM t` path free of per-value program compilation.
+    if src_ty == target_ty {
+        return Ok(v);
+    }
     let mut arena = ExprArena::new();
-    let id = arena.push(crate::sql::ast::Expr::Literal(v));
+    let id = arena.push(crate::sql::ast::Expr::TypedLiteral(v, src_ty));
     eval_scalar(session, &arena, id, &[], target_ty)
 }
 
@@ -112,8 +124,8 @@ pub(crate) fn insert(
             let mut out = Vec::with_capacity(src_rows.len());
             for r in src_rows {
                 let mut row = defaults.clone();
-                for (&slot, v) in col_idx.iter().zip(r) {
-                    row[slot] = cast_value(session, v, schema[slot].ty)?;
+                for ((&slot, v), sf) in col_idx.iter().zip(r).zip(&src_schema) {
+                    row[slot] = cast_value(session, v, sf.ty, schema[slot].ty)?;
                 }
                 check_not_null(&schema, &row)?;
                 out.push(row);

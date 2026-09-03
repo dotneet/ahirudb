@@ -24,10 +24,47 @@ pub fn render(v: &Value, ty: Ty, null: &str) -> String {
         Value::I128(x) => fmt_scaled(*x, ty),
         Value::F64(x) => fmt_double(*x),
         Value::Bytes(b) if ty == Ty::Uuid => fmt_uuid(b),
+        Value::Bytes(b) if ty == Ty::Blob => escape_bytes(b),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             Ok(s) => s.to_string(),
-            Err(_) => format!("<{} bytes>", b.len()),
+            Err(_) => escape_bytes(b),
         },
+    }
+}
+
+/// Renders arbitrary bytes the way `duckdb` renders a BLOB: printable ASCII as
+/// itself, everything else as an uppercase `\xHH` escape.
+///
+/// This replaces an older `<N bytes>` placeholder, which was lossy in every
+/// output mode (`-json` included) and made a BLOB column useless — the bytes
+/// could not be read, compared or piped anywhere. `"`, `'` and `\` are escaped
+/// as well, matching `duckdb` and keeping the result free of the characters the
+/// CSV/JSON quoting rules care most about.
+///
+/// Also used for a VARCHAR that is not valid UTF-8. This engine allows that
+/// (a CSV field is taken byte for byte), while `duckdb` does not, so there is
+/// no reference rendering to match; showing the offending bytes inline keeps
+/// the rest of the string readable.
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if (0x20..0x7f).contains(&b) && !matches!(b, b'"' | b'\'' | b'\\') {
+            out.push(b as char);
+        } else {
+            out.push('\\');
+            out.push('x');
+            out.push(hex_digit(b >> 4));
+            out.push(hex_digit(b & 0x0f));
+        }
+    }
+    out
+}
+
+fn hex_digit(n: u8) -> char {
+    if n < 10 {
+        (b'0' + n) as char
+    } else {
+        (b'A' + (n - 10)) as char
     }
 }
 

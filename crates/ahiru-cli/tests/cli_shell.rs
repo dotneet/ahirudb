@@ -815,3 +815,73 @@ fn maxrows_help_matches_its_behavior() {
     assert!(duck.ok, "{}", duck.stderr);
     assert!(duck.stdout.contains('\u{b7}'), "duckbox should elide: {}", duck.stdout);
 }
+
+/// A `COPY ... TO` onto a file the session has already read must invalidate the
+/// registration: a registered file is read once and cached forever, and
+/// `autoregister` skips names it already knows, so the second `SELECT` used to
+/// return the bytes from before the overwrite.
+#[test]
+fn copy_to_an_already_registered_path_invalidates_it() {
+    let p = tmp_file("copy_invalidate", "parquet");
+    let path = p.display().to_string();
+    let r = run(&[
+        "-csv",
+        "-c",
+        &format!("COPY (SELECT 1 AS a FROM range(1)) TO '{path}'"),
+        "-c",
+        &format!("SELECT a FROM '{path}'"),
+        "-c",
+        &format!("COPY (SELECT 2 AS a FROM range(1)) TO '{path}'"),
+        "-c",
+        &format!("SELECT a FROM '{path}'"),
+    ]);
+    let _ = std::fs::remove_file(&p);
+    assert!(r.ok, "{}", r.stderr);
+    let seen: Vec<&str> = r.stdout.lines().filter(|l| *l == "1" || *l == "2").collect();
+    assert_eq!(seen, vec!["1", "2"], "{}", r.stdout);
+}
+
+/// Same, reached through a command-line alias rather than the path literal:
+/// the alias is a second catalog entry backed by the same file.
+#[test]
+fn copy_to_a_path_registered_under_an_alias_invalidates_it() {
+    let p = tmp_file("copy_invalidate_alias", "csv");
+    std::fs::write(&p, "a\n1\n").unwrap();
+    let path = p.display().to_string();
+    let r = run(&[
+        "-csv",
+        &format!("src={path}"),
+        "-c",
+        "SELECT a FROM src",
+        "-c",
+        &format!("COPY (SELECT 2 AS a FROM range(1)) TO '{path}'"),
+        "-c",
+        "SELECT a FROM src",
+    ]);
+    let _ = std::fs::remove_file(&p);
+    assert!(r.ok, "{}", r.stderr);
+    let seen: Vec<&str> = r.stdout.lines().filter(|l| *l == "1" || *l == "2").collect();
+    assert_eq!(seen, vec!["1", "2"], "{}", r.stdout);
+}
+
+/// BLOB and non-UTF-8 VARCHAR values reach every output mode as `duckdb`'s
+/// `\xHH` escapes instead of the old `<N bytes>` placeholder.
+#[test]
+fn blob_values_render_as_hex_escapes() {
+    let r = run(&["-csv", "-c", "SELECT unhex('00ff') AS b, unhex('414243') AS c"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "b,c\n\\x00\\xFF,ABC\n");
+
+    let r = run(&["-json", "-c", "SELECT unhex('00ff') AS b"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains(r#""b":"\\x00\\xFF""#), "{}", r.stdout);
+}
+
+/// `-nullvalue ''` must still leave NULL and the empty string apart: the empty
+/// string is quoted in CSV mode, a NULL is written as its (here empty) spelling.
+#[test]
+fn csv_mode_keeps_empty_string_and_null_apart() {
+    let r = run(&["-csv", "-nullvalue", "", "-c", "SELECT '' AS a, NULL AS b, 'x' AS c"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "a,b,c\n\"\",,x\n");
+}

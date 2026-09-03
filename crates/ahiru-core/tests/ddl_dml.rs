@@ -261,6 +261,60 @@ fn alter_table_on_file_backed_table_is_rejected_as_read_only() {
     assert_eq!(run(&mut s, "SELECT count(*) FROM t")[0][0].as_i64(), Some(2));
 }
 
+/// `INSERT ... SELECT` must cast from the *source column's* type, not from a type
+/// guessed out of the `Value` variant.
+///
+/// Several logical types are physically indistinguishable from something else:
+/// `DECIMAL(10,2)` 12.50 is the integer 1250, `DATE`/`TIME`/`TIMESTAMP` are bare
+/// integers, and `UUID`/`INTERVAL` are 16 raw bytes / a packed i128. Re-inferring
+/// the type from the value made 12.50 arrive as 1250.00, NULLed UUIDs and rejected
+/// INTERVALs outright.
+#[test]
+fn insert_select_preserves_source_column_types() {
+    let mut s = Session::new();
+    s.prepare(
+        "CREATE TABLE dst (a DECIMAL(10,2), b DECIMAL(30,2), c UUID, d INTERVAL, e DATE, \
+         f TIME, g TIMESTAMP, h BLOB, i JSON, j HUGEINT, k FLOAT)",
+        &[],
+    )
+    .unwrap();
+    s.prepare(
+        "CREATE TABLE src AS SELECT CAST(12.5 AS DECIMAL(10,2)) AS a, \
+         CAST(12.5 AS DECIMAL(30,2)) AS b, \
+         CAST('123e4567-e89b-12d3-a456-426614174000' AS UUID) AS c, \
+         INTERVAL 3 DAY AS d, DATE '2020-01-02' AS e, TIME '01:02:03' AS f, \
+         TIMESTAMP '2020-01-02 03:04:05' AS g, unhex('00ff') AS h, \
+         CAST('{\"k\":1}' AS JSON) AS i, CAST(9223372036854775808 AS HUGEINT) AS j, \
+         CAST(1.5 AS FLOAT) AS k FROM range(1)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(affected(&mut s, "INSERT INTO dst SELECT * FROM src"), 1);
+
+    // Every column must come back identical to the source row.
+    let src = run(&mut s, "SELECT * FROM src");
+    let dst = run(&mut s, "SELECT * FROM dst");
+    assert_eq!(dst, src);
+    // Spot-check the value that used to be scaled by a further 10^scale.
+    assert_eq!(dst[0][0], Value::I64(1250));
+}
+
+/// The counterpart of the test above: a source column whose type differs from the
+/// target column must still be converted, with `SELECT`'s CAST semantics.
+#[test]
+fn insert_select_still_coerces_across_types() {
+    let mut s = Session::new();
+    s.prepare("CREATE TABLE dst (a DECIMAL(10,2), b DATE, c VARCHAR)", &[]).unwrap();
+    s.prepare("CREATE TABLE src AS SELECT 3 AS a, '2021-05-06' AS b, 7 AS c FROM range(1)", &[])
+        .unwrap();
+    assert_eq!(affected(&mut s, "INSERT INTO dst SELECT * FROM src"), 1);
+    let rows = run(&mut s, "SELECT a, b, c FROM dst");
+    // 3 -> DECIMAL(10,2) is the unscaled 300; '2021-05-06' -> DATE is day 18753.
+    assert_eq!(rows[0][0], Value::I64(300));
+    assert_eq!(rows[0][1], Value::I32(18753));
+    assert_eq!(rows[0][2], Value::Bytes(b"7".to_vec()));
+}
+
 #[test]
 fn alter_table_default_value_preserved_on_insert() {
     let mut s = Session::new();
