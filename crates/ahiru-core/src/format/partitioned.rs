@@ -344,6 +344,12 @@ impl TableFormat for PartitionedFormat {
     fn schema_is_inferred(&self) -> bool {
         self.inner.schema_is_inferred()
     }
+
+    /// The appended partition-key columns always have a value, so only the wrapped file's own
+    /// columns (which come first, at the same indexes) can be evidence-free.
+    fn column_has_no_evidence(&self, col: usize) -> bool {
+        col < self.inner.schema().len() && self.inner.column_has_no_evidence(col)
+    }
 }
 
 #[cfg(test)]

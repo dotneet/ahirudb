@@ -186,10 +186,13 @@ user-visible effect.
   the correlated/uncorrelated subquery that are missing.
 - **Text parts whose sniffed schemas disagree widen to `VARCHAR`; Parquet
   parts stay strict.** Registering `a.csv` (whose column `a` sniffs as
-  `BIGINT`) together with `b.csv` (whose `a` sniffs as `VARCHAR`) gives one
-  `VARCHAR` column rather than an error, because a sniffed type is a guess
-  about the file, not a declaration by it. Two Parquet parts whose column
-  `a` really is declared as different physical types still fail with
+  `BIGINT`) together with `b.csv` (whose `a` holds text and sniffs as
+  `VARCHAR`) gives one `VARCHAR` column rather than an error, because a
+  sniffed type is a guess about the file, not a declaration by it. A part
+  that saw *no value at all* for the column (a header-only file, an all-empty
+  column) is not counted as a disagreement — it has nothing to say, so the
+  other parts' type wins, as it does in DuckDB. Two Parquet parts whose
+  column `a` really is declared as different physical types still fail with
   `TypeMismatch` — there the schema is authoritative, and a silent widening
   would be hiding a mistake rather than tolerating one. See
   [data-sources.md](data-sources.md#text-format-type-inference).
@@ -342,11 +345,13 @@ that scenario — the session itself doesn't survive it either.
   late quote still forces a single split and is read correctly. Files that
   quote consistently from early on, or don't quote at all, are unaffected.
 
-  **A CR-only (classic Mac) CSV/TSV file is read as a single split for the
-  same reason**, and with the same memory consequence. Split-boundary
-  resynchronization scans for `\n`, which such a file never contains, so
-  there is no boundary to resynchronize on; the file is read whole instead
-  of guessing. CRLF files, and a `\r` inside a quoted field, are unaffected.
+  **A CSV/TSV file containing a lone `\r` — one that is not the first half of
+  a `\r\n` — is read as a single split for the same reason**, and with the
+  same memory consequence. That covers both a CR-only (classic Mac) file and
+  one that mixes terminators; a lone `\r` ends a record in either case, so
+  the `\n`-based split-boundary resynchronization has no boundary it can
+  trust. Pure-LF and pure-CRLF files, and a `\r` inside a quoted field, are
+  unaffected and still split normally.
 - **Low-selectivity `IN`-list pruning**: predicate pushdown for `WHERE x IN
   (...)` skips whole RowGroups/pages when the candidate values cluster
   together. If a list's values are scattered widely enough that nearly

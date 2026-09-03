@@ -183,18 +183,16 @@ fn header_only_csv_part_with_all_varchar_columns_unifies_with_a_typed_data_part(
 }
 
 #[test]
-fn header_only_csv_part_with_a_numeric_sibling_column_widens_to_varchar() {
-    // Companion to the case above. An empty part's columns always default to
-    // VARCHAR regardless of what the *other* parts' data looks like, so
-    // unioning a header-only CSV with a part holding actual numeric data in
-    // the same column position used to be rejected outright
-    // (`Ty::unify(Varchar, BigInt)` is `None`) even though the empty part
-    // contributes zero conflicting rows -- a placeholder or template file in
-    // a glob made the whole table unreadable.
+fn header_only_csv_part_does_not_drag_a_numeric_sibling_column_to_varchar() {
+    // A header-only part's columns default to VARCHAR because there is nothing
+    // to sniff, not because the file says they are text. Treating that default
+    // as a conflicting guess used to turn the whole table's `id` into VARCHAR
+    // (and, before the widening was added at all, to reject the table with
+    // `TypeMismatch`), so one placeholder or template file in a glob changed
+    // the type of every other part's column.
     //
-    // Both parts' types are *guesses* from a leading sample, so
-    // `catalog::unify_schema` now widens the disagreement to VARCHAR rather
-    // than failing, which is what DuckDB does when it unions text files.
+    // A column with no evidence behind it now simply defers to the parts that
+    // do have some: DuckDB reports `id BIGINT` for exactly this pair of files.
     // (Parquet, whose schema is declared rather than sniffed, still reports a
     // real type conflict -- see `multi_file_smoke.rs`.)
     let mut sess = Session::new();
@@ -208,15 +206,16 @@ fn header_only_csv_part_with_a_numeric_sibling_column_widens_to_varchar() {
     )
     .unwrap();
     let rows = run_all("SELECT id FROM t ORDER BY id", &mut sess);
-    assert_eq!(rows, [[s("1")], [s("2")]]);
+    assert_eq!(rows, [[Value::I64(1)], [Value::I64(2)]]);
+    assert_eq!(run_all("SELECT sum(id) FROM t", &mut sess), [[Value::I128(3)]]);
 }
 
 #[test]
-fn multi_part_csv_columns_that_sniff_differently_union_as_text() {
-    // The repro that motivated the widening above: one file's column holds a
-    // number and the next file's is empty, so the two parts sniff BIGINT and
-    // VARCHAR. DuckDB unions such files to VARCHAR; this used to be
-    // `TypeMismatch`.
+fn a_column_that_is_empty_in_one_part_keeps_the_other_parts_type() {
+    // One file's column holds a number and the next file's is empty. The empty
+    // one has no evidence for any type, so the column stays BIGINT rather than
+    // widening to VARCHAR -- `duckdb -c "SELECT * FROM read_csv(['a.csv','b.csv'])"`
+    // types it BIGINT and reads the empty cell as NULL.
     let mut sess = Session::new();
     sess.register_multi_bytes(
         "t",
@@ -225,7 +224,28 @@ fn multi_part_csv_columns_that_sniff_differently_union_as_text() {
     )
     .unwrap();
     let rows = run_all("SELECT id, v FROM t ORDER BY id", &mut sess);
-    assert_eq!(rows, [[Value::I64(1), s("10")], [Value::I64(2), Value::Null]]);
+    assert_eq!(rows, [[Value::I64(1), Value::I64(10)], [Value::I64(2), Value::Null]]);
+}
+
+#[test]
+fn text_parts_that_really_disagree_still_widen_to_varchar() {
+    // The evidence-free case above must not weaken the widening for parts that
+    // genuinely sniff differently: here both files have data in `v`, one
+    // numeric and one not, and `Ty::unify` has no common type. Two sniffed
+    // schemas are guesses rather than declarations, so the column widens to
+    // VARCHAR instead of failing -- as DuckDB does when it unions text files.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![
+            ("a.csv".into(), b"id,v\n1,10\n".to_vec()),
+            ("b.csv".into(), b"id,v\n2,abc\n".to_vec()),
+        ],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT id, v FROM t ORDER BY id", &mut sess);
+    assert_eq!(rows, [[Value::I64(1), s("10")], [Value::I64(2), s("abc")]]);
 }
 
 // --- JSONL / JSON: schema promotion through SQL ----------------------------
@@ -321,6 +341,127 @@ fn jsonl_z_suffix_is_a_timestamp() {
     let rows = run_all("SELECT t FROM t", &mut sess);
     assert_eq!(rows[0][0], Value::I64(1_577_836_800_000_000));
     assert_eq!(rows[1][0], Value::I64(1_577_836_800_000_000));
+}
+
+#[test]
+fn a_blank_line_in_a_one_column_csv_is_a_null_row() {
+    // duckdb reads `a\n1\n\n2\n` as three rows with a NULL in the middle. A
+    // one-column file has no other spelling for an empty record, so skipping
+    // the line dropped a row the file plainly contains -- `count(*)` said 2.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a\n1\n\n2\n".to_vec(), FormatKind::Csv).unwrap();
+    assert_eq!(run_all("SELECT count(*) FROM t", &mut sess), [[Value::I64(3)]]);
+    assert_eq!(
+        run_all("SELECT a FROM t", &mut sess),
+        [[Value::I64(1)], [Value::Null], [Value::I64(2)]]
+    );
+
+    // With more than one column a blank line is still not a record, matching
+    // duckdb and the trailing newline every well-formed file ends with.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a,b\n1,2\n\n3,4\n".to_vec(), FormatKind::Csv).unwrap();
+    assert_eq!(run_all("SELECT count(*) FROM t", &mut sess), [[Value::I64(2)]]);
+}
+
+#[test]
+fn a_lone_cr_among_newlines_never_merges_two_csv_records() {
+    // `a,b\n1,2\r\n3,4\r5,6\n` used to read as two rows, the second holding
+    // `b = "4\r5,6"` -- two records silently welded together. duckdb refuses
+    // to sniff such a file; with `strict_mode=false` it reads three rows,
+    // which is what treating the lone `\r` as a terminator gives.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a,b\n1,2\r\n3,4\r5,6\n".to_vec(), FormatKind::Csv).unwrap();
+    assert_eq!(
+        run_all("SELECT a, b FROM t ORDER BY a", &mut sess),
+        [
+            [Value::I64(1), Value::I64(2)],
+            [Value::I64(3), Value::I64(4)],
+            [Value::I64(5), Value::I64(6)],
+        ]
+    );
+}
+
+#[test]
+fn malformed_csv_records_are_rejected_rather_than_truncated() {
+    // A surplus field used to be discarded, so `a,b\n1,2,3\n` read as `(1, 2)`
+    // -- and the usual cause (an unquoted delimiter inside a value) shifts
+    // every later field, so the whole row was wrong. duckdb rejects the row.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a,b\n1,2,3\n".to_vec(), FormatKind::Csv).unwrap();
+    let mut q = match sess.prepare("SELECT a, b FROM t", &[]).unwrap() {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("in-memory bytes never need IO"),
+    };
+    assert_eq!(code_of(sess.step(&mut q)), Some(Code::SyntaxError));
+
+    // Bytes between a closing quote and the next terminator are rejected too:
+    // `"x"junk` used to read as `x`.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a,b\n\"x\"junk,1\n".to_vec(), FormatKind::Csv).unwrap();
+    let mut q = match sess.prepare("SELECT a, b FROM t", &[]).unwrap() {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("in-memory bytes never need IO"),
+    };
+    assert_eq!(code_of(sess.step(&mut q)), Some(Code::SyntaxError));
+
+    // A row with *fewer* fields is still NULL-padded (duckdb's `null_padding`):
+    // nothing the file contains is lost by doing so.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"a,b\n1,2\n3\n".to_vec(), FormatKind::Csv).unwrap();
+    assert_eq!(
+        run_all("SELECT a, b FROM t ORDER BY a", &mut sess),
+        [[Value::I64(1), Value::I64(2)], [Value::I64(3), Value::Null]]
+    );
+}
+
+#[test]
+fn json_and_jsonl_files_of_empty_objects_report_their_rows() {
+    // `{}\n{}\n` inferred zero columns, so `count(*)` read 0 (a batch with no
+    // columns has no row count to report) and `SELECT *` was a syntax error.
+    // duckdb gives such a file one column named `json` holding each record.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"{}\n{}\n".to_vec(), FormatKind::Jsonl).unwrap();
+    assert_eq!(run_all("SELECT count(*) FROM t", &mut sess), [[Value::I64(2)]]);
+    assert_eq!(run_all("SELECT json FROM t", &mut sess), [[s("{}")], [s("{}")]]);
+
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"[{},{}]".to_vec(), FormatKind::Json).unwrap();
+    assert_eq!(run_all("SELECT count(*) FROM t", &mut sess), [[Value::I64(2)]]);
+    assert_eq!(run_all("SELECT json FROM t", &mut sess), [[s("{}")], [s("{}")]]);
+}
+
+#[test]
+fn json_booleans_mixed_with_numbers_keep_both_values() {
+    // `[{"a":true},{"a":1}]` inferred BIGINT and nulled the boolean row, so
+    // `count(a)` was 1 for a file holding two values. duckdb types the column
+    // JSON and keeps both.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", b"[{\"a\":true},{\"a\":1}]".to_vec(), FormatKind::Json).unwrap();
+    assert_eq!(run_all("SELECT count(a) FROM t", &mut sess), [[Value::I64(2)]]);
+    assert_eq!(run_all("SELECT a FROM t", &mut sess), [[s("true")], [s("1")]]);
+}
+
+#[test]
+fn json_values_outside_the_sampled_type_are_a_conversion_error() {
+    // The `.json` reader silently nulled a value that did not fit the type
+    // inferred from the leading elements, dropping data the file plainly
+    // contains. `format::csv` / `format::jsonl` and duckdb all report a
+    // conversion error, and so does this now.
+    let mut text = String::from("[");
+    for i in 0..1001 {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str("{\"a\":1}");
+    }
+    text.push_str(",{\"a\":\"x\"}]");
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", text.into_bytes(), FormatKind::Json).unwrap();
+    let mut q = match sess.prepare("SELECT count(a) FROM t", &[]).unwrap() {
+        Prepared::Ready(q) => q,
+        Prepared::NeedIo(_) => panic!("in-memory bytes never need IO"),
+    };
+    assert_eq!(code_of(sess.step(&mut q)), Some(Code::InvalidCast));
 }
 
 #[test]
