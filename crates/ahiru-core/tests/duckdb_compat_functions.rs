@@ -269,7 +269,24 @@ fn make_date_and_make_timestamp_validate_their_components() {
     // convention for an out-of-range argument (see docs/sql/limitations.md).
     assert_eq!(one(&mut sess, "make_date(2023, 2, 29)"), Value::Null);
     assert_eq!(one(&mut sess, "make_date(2024, 13, 1)"), Value::Null);
-    assert_eq!(one(&mut sess, "make_timestamp(2024, 1, 1, 24, 0, 0)"), Value::Null);
+
+    // duckdb accepts a time of day anywhere in [00:00:00, 24:00:00] and normalizes what
+    // the components add up to; only what falls outside that is an error (NULL here).
+    // duckdb: 2024-01-02 00:00:00 / 2024-06-05 07:09:00.
+    assert_eq!(
+        one(&mut sess, "CAST(make_timestamp(2024, 1, 1, 24, 0, 0) AS VARCHAR)"),
+        s("2024-01-02 00:00:00")
+    );
+    assert_eq!(
+        one(&mut sess, "CAST(make_timestamp(2024, 6, 5, 7, 8, 60) AS VARCHAR)"),
+        s("2024-06-05 07:09:00")
+    );
+    // duckdb: "Time out of range" for each of these.
+    assert_eq!(one(&mut sess, "make_timestamp(2024, 1, 1, 24, 0, 1)"), Value::Null);
+    assert_eq!(one(&mut sess, "make_timestamp(2024, 1, 1, 25, 0, 0)"), Value::Null);
+    assert_eq!(one(&mut sess, "make_timestamp(2024, 1, 1, 0, 60, 0)"), Value::Null);
+    assert_eq!(one(&mut sess, "make_timestamp(2024, 1, 1, 0, 0, 61)"), Value::Null);
+    assert_eq!(one(&mut sess, "make_timestamp(2024, 1, 1, -1, 0, 0)"), Value::Null);
 }
 
 #[test]

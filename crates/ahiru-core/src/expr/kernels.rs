@@ -168,12 +168,24 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
         PhysType::I32 => {
             let values = arith_i32(op, a.i32s(), sa, b.i32s(), sb, n, &mut bad);
             if out_ty == Ty::Date {
-                // DuckDB reserves three physical i32 values for DATE special
-                // values. AhiruDB has no infinity literals, so a date
-                // arithmetic result reaching any of them is out of range,
-                // not a finite calendar date.
-                for (i, &value) in values.iter().enumerate() {
-                    if value <= i32::MIN + 1 || value == i32::MAX {
+                // A date is a day count, and `arith_i32` wraps like every other integer
+                // lane. A wrapped day count is not a wrapped integer, though -- it is a
+                // fictitious calendar date -- so the sum is recomputed at i64 width, where
+                // two i32 operands cannot overflow, and checked against DuckDB's DATE
+                // range (`-5877641-06-25` .. `5874897-12-31`). Out of range gives NULL,
+                // the same answer this kernel already gave for the reserved sentinels.
+                let (av, bv) = (a.i32s(), b.i32s());
+                for i in 0..n {
+                    let (x, y) = (av[i * sa] as i64, bv[i * sb] as i64);
+                    let wide = match op {
+                        OpCode::Add => x + y,
+                        OpCode::Sub => x - y,
+                        OpCode::Mul => x * y,
+                        OpCode::Neg => -x,
+                        // Div/Mod cannot leave the i32 range; their own guards already ran.
+                        _ => values[i] as i64,
+                    };
+                    if !(funcs::DATE_MIN_DAYS..=funcs::DATE_MAX_DAYS).contains(&wide) {
                         funcs::set_null(&mut bad, i, n);
                     }
                 }
@@ -182,7 +194,22 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
         }
         PhysType::I64 => Data::I64(arith_i64(op, a.i64s(), sa, b.i64s(), sb, n, &mut bad)),
         PhysType::I128 => Data::I128(arith_i128(op, a.i128s(), sa, b.i128s(), sb, n, &mut bad)),
-        PhysType::F64 => Data::F64(arith_f64(op, a.f64s(), sa, b.f64s(), sb, n)),
+        PhysType::F64 => {
+            let mut values = arith_f64(op, a.f64s(), sa, b.f64s(), sb, n);
+            if out_ty == Ty::Float {
+                // FLOAT shares DOUBLE's physical f64 register, and `FLOAT op FLOAT` is a
+                // FLOAT (`Ty::unify`'s `a == b` arm), so the f64 result has to be rounded
+                // back to f32 for the invariant "every FLOAT value is exactly an f32" --
+                // which `fmt_f32`, comparisons against narrowed literals and `isinf` all
+                // rely on -- to hold. Unlike `narrow_f64`, an overflow becomes infinity
+                // rather than NULL: that is what the f32 computation itself would produce,
+                // and what DuckDB returns.
+                for v in values.iter_mut() {
+                    *v = *v as f32 as f64;
+                }
+            }
+            Data::F64(values)
+        }
         _ => err!(TypeMismatch),
     };
     let mut data = data;
@@ -1304,6 +1331,61 @@ pub fn try_cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
     cast_impl(from, to, a, true)
 }
 
+/// Writes a BLOB's text form: printable ASCII stays as it is, everything else -- the
+/// backslash included, so the escape is unambiguous -- becomes an uppercase `\xHH`.
+/// This is the spelling DuckDB's `BLOB -> VARCHAR` cast produces.
+fn escape_blob(bytes: &[u8], out: &mut Vec<u8>) {
+    for &b in bytes {
+        if (0x20..0x7f).contains(&b) && b != b'\\' {
+            out.push(b);
+        } else {
+            out.extend_from_slice(b"\\x");
+            out.push(hex_digit(b >> 4));
+            out.push(hex_digit(b & 0x0f));
+        }
+    }
+}
+
+fn hex_digit(n: u8) -> u8 {
+    if n < 10 {
+        b'0' + n
+    } else {
+        b'A' + (n - 10)
+    }
+}
+
+/// Reads a BLOB's text form back. Returns false on a malformed escape -- a backslash not
+/// followed by `x` and two hex digits -- which makes that row NULL. DuckDB rejects the same
+/// inputs (it has no doubled-backslash escape either: `'a\\b'::BLOB` is an error there).
+fn unescape_blob(text: &[u8], out: &mut Vec<u8>) -> bool {
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] != b'\\' {
+            out.push(text[i]);
+            i += 1;
+            continue;
+        }
+        if i + 3 >= text.len() || text[i + 1] != b'x' {
+            return false;
+        }
+        match (hex_val(text[i + 2]), hex_val(text[i + 3])) {
+            (Some(h), Some(l)) => out.push((h << 4) | l),
+            _ => return false,
+        }
+        i += 4;
+    }
+    true
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
     ensure!(a.data().phys() == from.phys(), TypeMismatch);
     let n = a.len();
@@ -1416,11 +1498,24 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         (Fam::Int, Fam::Flt) => {
             ensure!(!from.is_temporal(), InvalidCast);
             let s = dec_scale(from);
+            let mut buf = Vec::new();
             for i in 0..n {
-                let mut f = load_i128(src, i) as f64;
-                if s > 0 {
-                    f /= pow10_f64(s);
-                }
+                let x = load_i128(src, i);
+                // `x as f64 / 10^s` rounds twice -- once narrowing the scaled integer to f64,
+                // once dividing -- and lands one ulp off DuckDB for a wide DECIMAL. Both steps
+                // are exact while the mantissa fits in 53 bits and `10^s` is itself exact
+                // (s <= 22), so only the wide case takes the slower route through the decimal
+                // text, which `parse_f64` rounds correctly in a single step. The DOUBLE ->
+                // DECIMAL direction already goes through text (`f64_to_scaled_i128`).
+                let f = if s == 0 {
+                    x as f64
+                } else if s <= 22 && x.unsigned_abs() < (1u128 << 53) {
+                    x as f64 / pow10_f64(s)
+                } else {
+                    buf.clear();
+                    fmt_int(x.unsigned_abs(), x < 0, s, &mut buf);
+                    parse_f64(&buf).unwrap_or(0.0)
+                };
                 match narrow_f64(f, to) {
                     Some(f) => push_f64(&mut data, f),
                     None => {
@@ -1519,10 +1614,31 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             }
         }
         (Fam::Str, Fam::Str) => {
-            // VARCHAR <-> BLOB. The representation is the same, so it is copied as is.
-            let mut out = a.clone();
-            out.retype(to);
-            return Ok(out);
+            // VARCHAR <-> BLOB. A BLOB's *text* form is not its bytes: DuckDB escapes every
+            // byte outside printable ASCII, and the backslash itself, as `\xHH`. Copying
+            // straight across in both directions left `'\x00ab'::BLOB` holding the six literal
+            // characters, and made a BLOB that this engine's own CSV/JSONL writers had spelled
+            // with `\xHH` escapes double up when read back through `::BLOB`. A malformed
+            // escape is NULL rather than an error, the same as every other unreadable cast
+            // source (DuckDB raises there).
+            let sv = a.bytes();
+            let mut buf = Vec::new();
+            if let Data::Bytes(d) = &mut data {
+                for i in 0..n {
+                    buf.clear();
+                    if to == Ty::Blob {
+                        if unescape_blob(sv.get(i), &mut buf) {
+                            d.push(&buf);
+                        } else {
+                            d.push(b"");
+                            funcs::set_null(&mut bad, i, n);
+                        }
+                    } else {
+                        escape_blob(sv.get(i), &mut buf);
+                        d.push(&buf);
+                    }
+                }
+            }
         }
         (Fam::Str, Fam::Flt) => {
             let sv = a.bytes();

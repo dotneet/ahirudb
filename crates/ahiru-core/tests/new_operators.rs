@@ -235,13 +235,22 @@ fn bit_not_round_trips() {
 
 #[test]
 fn shift_by_an_out_of_range_amount_is_null_not_an_error() {
-    // duckdb errors here ("Left-shift value 64 is out of range"); this
+    // duckdb errors on the *left* shift ("Left-shift value 64 is out of range"); this
     // engine instead returns NULL, consistent with its existing convention
     // for other undefined integer arithmetic (division by zero, etc. --
     // see docs/sql/types.md's rounding-conventions section).
     let mut db = session_with_dual();
-    let rows = run(&mut db, "SELECT 1 << 64, 1 << -1, 1 >> 64 FROM dual");
-    assert_eq!(rows, vec![vec![Value::Null, Value::Null, Value::Null]]);
+    let rows = run(&mut db, "SELECT 1 << 64, 1 << -1 FROM dual");
+    assert_eq!(rows, vec![vec![Value::Null, Value::Null]]);
+
+    // The *right* shift is not an error in duckdb, though: it saturates to 0
+    // (`select 8 >> 64, 8 >> -1` -> `0, 0`). There was no reason to diverge there,
+    // and NULL claimed the operation was undefined when duckdb defines it.
+    let rows = run(&mut db, "SELECT 8 >> 64, 8 >> -1, -8 >> 64, 8 >> 3, -8 >> 1 FROM dual");
+    assert_eq!(
+        rows,
+        vec![vec![Value::I64(0), Value::I64(0), Value::I64(0), Value::I64(1), Value::I64(-4)]]
+    );
 }
 
 #[test]

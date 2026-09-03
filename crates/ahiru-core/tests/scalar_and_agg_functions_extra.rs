@@ -125,6 +125,37 @@ fn median_handles_odd_and_even_counts() {
 }
 
 #[test]
+fn median_does_not_interpolate_when_the_position_lands_on_an_element() {
+    // The interpolation always read `vals[lo + 1]`, even at a weight of 0, so an inf or NaN
+    // parked just past the midpoint turned an exact answer into NaN via `(inf - 2.5) * 0.0`.
+    // `ord_f64` sorts NaN last, which is exactly where an odd-count median looks.
+    // duckdb: median([1, inf, 2.5]) = 2.5, quantile_cont(.., 0.5) = 2.5.
+    let mut sess = session_with_csv("t", "x\n1\ninf\n2.5\n");
+    let rows = run(&mut sess, "SELECT median(x), quantile_cont(x, 0.5) FROM t");
+    assert_eq!(rows[0][0], Value::F64(2.5));
+    assert_eq!(rows[0][1], Value::F64(2.5));
+
+    // duckdb: median([1, nan, 2.5]) = 2.5 (nan also sorts last).
+    let mut sess = session_with_csv("t", "x\n1\nnan\n2.5\n");
+    let rows = run(&mut sess, "SELECT median(x) FROM t");
+    assert_eq!(rows[0][0], Value::F64(2.5));
+
+    // A quantile landing exactly on an element, with a non-finite element above it.
+    // duckdb: quantile_cont([1, 2.5, inf], 0.5) = 2.5, and 0.75 really is inf (weight 0.5).
+    let mut sess = session_with_csv("t", "x\n1\ninf\n2.5\n");
+    let rows = run(&mut sess, "SELECT quantile_cont(x, 0.0), quantile_cont(x, 0.75) FROM t");
+    assert_eq!(rows[0][0], Value::F64(1.0));
+    assert_eq!(rows[0][1], Value::F64(f64::INFINITY));
+
+    // Unchanged: interpolation still happens when the weight is not 0.
+    // duckdb: quantile_cont([1, 2, 3, 4], 0.5) = 2.5.
+    let mut sess = session_with_csv("t", "x\n1\n2\n3\n4\n");
+    let rows = run(&mut sess, "SELECT median(x), quantile_cont(x, 0.25) FROM t");
+    assert_eq!(rows[0][0], Value::F64(2.5));
+    assert_eq!(rows[0][1], Value::F64(1.75));
+}
+
+#[test]
 fn mode_picks_the_most_frequent_value() {
     // duckdb: mode([1,2,2,3]) = 2.
     let mut sess = session_with_csv("t", "x\n1\n2\n2\n3\n");

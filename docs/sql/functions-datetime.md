@@ -108,7 +108,12 @@ SELECT make_timestamp(2024, 8, 14, 13, 45, 30); -- 2024-08-14 13:45:30
 `make_date(y, m, d)` and `make_timestamp(y, m, d, h, mi, s)` return `NULL`
 for an out-of-range component — `make_date(2023, 2, 29)` is `NULL` because
 2023 is not a leap year — where DuckDB raises. That follows this engine's
-general "prefer `NULL` over erroring mid-scan" policy. DuckDB's
+general "prefer `NULL` over erroring mid-scan" policy. `make_timestamp`
+accepts, and normalizes, any time of day in `[00:00:00, 24:00:00]` with
+minutes below 60 and seconds at or below 60, exactly as DuckDB does:
+`make_timestamp(2024, 6, 5, 24, 0, 0)` is the next day's midnight and
+`make_timestamp(2024, 6, 5, 7, 8, 60)` is `07:09:00`. Anything past
+`24:00:00` is out of range and `NULL`. DuckDB's
 single-argument `make_timestamp(microseconds)` overload and its `DOUBLE`
 seconds argument (fractional seconds) are not provided; use a `CAST` or add
 an `INTERVAL` for those.

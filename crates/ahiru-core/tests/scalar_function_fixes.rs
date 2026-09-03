@@ -256,3 +256,215 @@ fn hex_covers_the_full_width_of_its_argument() {
     assert_eq!(one(&mut sess, "hex('AB')"), s("4142"));
     assert_eq!(one(&mut sess, "hex(NULL::INT)"), Value::Null);
 }
+
+// --- FLOAT arithmetic ---------------------------------------------------------
+
+#[test]
+fn float_arithmetic_is_rounded_back_to_f32() {
+    let mut sess = session_with_basic();
+    // FLOAT shares DOUBLE's physical f64 register, and `FLOAT op FLOAT` stays FLOAT, so the
+    // f64 result has to be narrowed. Without that, every consumer that assumes a FLOAT value
+    // is exactly an f32 misbehaved.
+    // duckdb: 16777216.0 / true
+    assert_eq!(one(&mut sess, "CAST(16777216::FLOAT + 1::FLOAT AS VARCHAR)"), s("16777216.0"));
+    assert_eq!(one(&mut sess, "(16777216::FLOAT + 1::FLOAT) = 16777216::FLOAT"), Value::Bool(true));
+    // f32 overflow becomes infinity, exactly as the f32 computation would.
+    // duckdb: inf / true
+    assert_eq!(one(&mut sess, "CAST(3.4028235e38::FLOAT * 2::FLOAT AS VARCHAR)"), s("inf"));
+    assert_eq!(one(&mut sess, "isinf(3.4028235e38::FLOAT * 2::FLOAT)"), Value::Bool(true));
+    // duckdb: 0.33333334 (the f32 quotient), not the f64 0.33333333333333331's f32 spelling.
+    assert_eq!(one(&mut sess, "CAST(1::FLOAT / 3::FLOAT AS VARCHAR)"), s("0.33333334"));
+    // Unary negation runs through the same kernel.
+    assert_eq!(one(&mut sess, "CAST(-(0.1::FLOAT) AS VARCHAR)"), s("-0.1"));
+    // The result is still a FLOAT, and CAST(.. AS VARCHAR) -> CAST(.. AS FLOAT) round-trips.
+    assert_eq!(one(&mut sess, "typeof(1::FLOAT + 1::FLOAT)"), s("FLOAT"));
+    assert_eq!(
+        one(
+            &mut sess,
+            "CAST(CAST(0.1::FLOAT + 0.2::FLOAT AS VARCHAR) AS FLOAT) = 0.1::FLOAT + 0.2::FLOAT"
+        ),
+        Value::Bool(true)
+    );
+    // Mixing FLOAT with another numeric type still widens to DOUBLE and is left alone.
+    assert_eq!(one(&mut sess, "typeof(1::FLOAT + 1::DOUBLE)"), s("DOUBLE"));
+}
+
+// --- ln / log / pow on non-finite input ---------------------------------------
+
+#[test]
+fn the_log_family_handles_infinity_and_nan() {
+    let mut sess = session_with_basic();
+    // `f_ln` decodes the exponent field bitwise; for inf/NaN that field is 0x7ff, so it used
+    // to answer 1024 * ln 2 (709.78...) -- a plausible finite number -- for every one of these.
+    // duckdb: inf for all four.
+    for e in [
+        "ln('inf'::DOUBLE)",
+        "log10('inf'::DOUBLE)",
+        "log2('inf'::DOUBLE)",
+        "log(2, 'inf'::DOUBLE)",
+    ] {
+        assert_eq!(one(&mut sess, e), Value::F64(f64::INFINITY), "{e}");
+    }
+    // duckdb: nan for all three.
+    for e in ["ln('nan'::DOUBLE)", "log2('nan'::DOUBLE)", "log(2, 'nan'::DOUBLE)"] {
+        match one(&mut sess, e) {
+            Value::F64(v) => assert!(v.is_nan(), "{e}: {v}"),
+            other => panic!("{e}: {other:?}"),
+        }
+    }
+    // duckdb: log(inf, 2) -> 0.0 (a finite numerator over an infinite denominator).
+    assert_eq!(one(&mut sess, "log('inf'::DOUBLE, 2.0)"), Value::F64(0.0));
+    // `pow` uses exp(y * ln|x|) for a non-integer exponent and inherited the bug.
+    // duckdb: inf / 0.0 / inf / 0.0.
+    assert_eq!(one(&mut sess, "pow('inf'::DOUBLE, 0.5)"), Value::F64(f64::INFINITY));
+    assert_eq!(one(&mut sess, "pow('inf'::DOUBLE, -0.5)"), Value::F64(0.0));
+    // An infinite *negative* base with a non-integer exponent is IEEE's one exception to
+    // "a negative base needs an integer exponent". duckdb: inf / 0.0.
+    assert_eq!(one(&mut sess, "pow('-inf'::DOUBLE, 0.5)"), Value::F64(f64::INFINITY));
+    assert_eq!(one(&mut sess, "pow('-inf'::DOUBLE, -0.5)"), Value::F64(0.0));
+    // Unchanged: a finite negative base with a non-integer exponent is still NaN (duckdb: nan),
+    // a non-positive argument is still NULL (duckdb errors), and the ordinary values still work.
+    match one(&mut sess, "pow(-2.0, 0.5)") {
+        Value::F64(v) => assert!(v.is_nan()),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(one(&mut sess, "ln(0.0)"), Value::Null);
+    assert_eq!(one(&mut sess, "ln(-1.0)"), Value::Null);
+    assert_eq!(one(&mut sess, "ln(-1.0 / 0.0)"), Value::Null);
+    assert_eq!(one(&mut sess, "log2(8.0)"), Value::F64(3.0));
+    assert_eq!(one(&mut sess, "ln(1.0)"), Value::F64(0.0));
+}
+
+// --- DATE +- INTEGER overflow -------------------------------------------------
+
+#[test]
+fn date_arithmetic_that_wraps_i32_is_null_not_a_fictitious_date() {
+    let mut sess = session_with_basic();
+    // The i32 lane wraps, and the old guard only caught a sum landing *exactly* on one of
+    // DuckDB's three reserved sentinels. A sum that wrapped past one came back as an ordinary
+    // negative day count and printed as a date five million years in the past.
+    // duckdb: "Out of Range Error: Date out of range" for all three; NULL is this engine's
+    // convention for an out-of-range argument (see docs/sql/limitations.md).
+    assert_eq!(one(&mut sess, "DATE '2024-01-01' + 2147483647"), Value::Null);
+    assert_eq!(one(&mut sess, "DATE '2024-01-01' + 2147480000"), Value::Null);
+    assert_eq!(one(&mut sess, "DATE '2024-01-01' + 2147463924"), Value::Null);
+    assert_eq!(one(&mut sess, "make_date(2024, 1, 1) + 2147483000"), Value::Null);
+    // The same wrap in the other direction, from the smallest date duckdb has.
+    assert_eq!(one(&mut sess, "(DATE '1970-01-01' - 2147483646) - 100"), Value::Null);
+    // Unchanged: everything inside the range duckdb accepts is still a date.
+    assert_eq!(
+        one(&mut sess, "CAST(DATE '1970-01-01' + 2147483646 AS VARCHAR)"),
+        s("5881580-07-10")
+    );
+    assert_eq!(one(&mut sess, "CAST(DATE '2024-01-01' + 1 AS VARCHAR)"), s("2024-01-02"));
+    assert_eq!(one(&mut sess, "CAST(DATE '2024-01-01' - 1 AS VARCHAR)"), s("2023-12-31"));
+}
+
+// --- bit shifts ---------------------------------------------------------------
+
+#[test]
+fn the_right_shift_saturates_to_zero_instead_of_null() {
+    let mut sess = session_with_basic();
+    // duckdb: 0, 0, 0, 0 (the right shift is defined for every amount; only the *left*
+    // shift errors out of range, which this engine deliberately answers with NULL).
+    assert_eq!(one(&mut sess, "8 >> 64"), Value::I64(0));
+    assert_eq!(one(&mut sess, "8 >> -1"), Value::I64(0));
+    assert_eq!(one(&mut sess, "-8 >> 64"), Value::I64(0));
+    assert_eq!(one(&mut sess, "bit_shift_right(8, 1000000)"), Value::I64(0));
+    // Unchanged: an arithmetic (sign-extending) shift inside the range, and `<<`'s NULL.
+    assert_eq!(one(&mut sess, "-8 >> 1"), Value::I64(-4));
+    assert_eq!(one(&mut sess, "8 >> 3"), Value::I64(1));
+    assert_eq!(one(&mut sess, "1 << 64"), Value::Null);
+}
+
+// --- ascii / unicode / ord ----------------------------------------------------
+
+#[test]
+fn unicode_and_ord_answer_minus_one_for_the_empty_string() {
+    let mut sess = session_with_basic();
+    // duckdb: unicode('') and ord('') are -1, ascii('') is 0. All three used to share one
+    // kernel and answered 0.
+    assert_eq!(one(&mut sess, "unicode('')"), Value::I64(-1));
+    assert_eq!(one(&mut sess, "ord('')"), Value::I64(-1));
+    assert_eq!(one(&mut sess, "ascii('')"), Value::I64(0));
+    // Unchanged everywhere else: the code point of the first character, NULL for NULL.
+    assert_eq!(one(&mut sess, "unicode('abc')"), Value::I64(97));
+    assert_eq!(one(&mut sess, "ord('abc')"), Value::I64(97));
+    assert_eq!(one(&mut sess, "ascii('abc')"), Value::I64(97));
+    assert_eq!(one(&mut sess, "unicode('\u{00e9}')"), Value::I64(233));
+    assert_eq!(one(&mut sess, "unicode(NULL)"), Value::Null);
+}
+
+// --- floor / ceil / trunc / round on negative zero -----------------------------
+
+#[test]
+fn rounding_toward_zero_keeps_the_sign_of_zero() {
+    let mut sess = session_with_basic();
+    // These all go through `f_trunc`, which routed through i64 and dropped the sign bit.
+    // duckdb: -0.0 for each of these on a DOUBLE.
+    for e in [
+        "CAST(floor(-0.0::DOUBLE) AS VARCHAR)",
+        "CAST(ceil(-0.3::DOUBLE) AS VARCHAR)",
+        "CAST(trunc(-0.3::DOUBLE) AS VARCHAR)",
+        "CAST(round(-0.3::DOUBLE) AS VARCHAR)",
+    ] {
+        assert_eq!(one(&mut sess, e), s("-0.0"), "{e}");
+    }
+    // Unchanged: a non-zero result, a positive zero, and the integer cast of a negative zero.
+    assert_eq!(one(&mut sess, "floor(-0.3::DOUBLE)"), Value::F64(-1.0));
+    assert_eq!(one(&mut sess, "CAST(floor(0.3::DOUBLE) AS VARCHAR)"), s("0.0"));
+    assert_eq!(one(&mut sess, "CAST(-0.3::DOUBLE AS INTEGER)"), Value::I32(0));
+    assert_eq!(one(&mut sess, "trunc(2.7::DOUBLE)"), Value::F64(2.0));
+}
+
+// --- DECIMAL -> DOUBLE --------------------------------------------------------
+
+#[test]
+fn a_wide_decimal_converts_to_double_without_rounding_twice() {
+    let mut sess = session_with_basic();
+    // `scaled_i128 as f64 / 10^scale` rounds twice and landed one ulp low
+    // (12345678901234565120). duckdb: 12345678901234567168.0.
+    assert_eq!(
+        one(
+            &mut sess,
+            "printf('%.1f', CAST(12345678901234567890.123456789::DECIMAL(38,9) AS DOUBLE))"
+        ),
+        s("12345678901234567168.0")
+    );
+    // Unchanged: the narrow cases the fast path still handles.
+    assert_eq!(one(&mut sess, "CAST(1.5::DECIMAL(3,1) AS DOUBLE)"), Value::F64(1.5));
+    assert_eq!(one(&mut sess, "CAST(-0.25::DECIMAL(5,2) AS DOUBLE)"), Value::F64(-0.25));
+    assert_eq!(one(&mut sess, "CAST(0::DECIMAL(3,1) AS DOUBLE)"), Value::F64(0.0));
+    assert_eq!(one(&mut sess, "CAST(123::HUGEINT AS DOUBLE)"), Value::F64(123.0));
+}
+
+// --- VARCHAR <-> BLOB ---------------------------------------------------------
+
+#[test]
+fn the_blob_text_form_decodes_and_encodes_hex_escapes() {
+    let mut sess = session_with_basic();
+    // duckdb: '\x00ab'::BLOB is three bytes, and its VARCHAR form escapes the NUL again.
+    // Both directions used to be a straight copy, so the escapes stayed as six literal
+    // characters -- which also meant a BLOB written by this engine's own CSV/JSONL writers
+    // (they emit \xHH) doubled up when read back through ::BLOB.
+    assert_eq!(one(&mut sess, "CAST('\\x41\\x42'::BLOB AS VARCHAR)"), s("AB"));
+    assert_eq!(one(&mut sess, "length('\\x41\\x42'::BLOB)"), Value::I64(2));
+    assert_eq!(one(&mut sess, "CAST('A\\x00B'::BLOB AS VARCHAR)"), s("A\\x00B"));
+    // Printable ASCII passes through untouched in both directions.
+    assert_eq!(one(&mut sess, "CAST('abc'::BLOB AS VARCHAR)"), s("abc"));
+    assert_eq!(one(&mut sess, "length('abc'::BLOB)"), Value::I64(3));
+    // The round trip is the identity, which is what the straight copy used to buy and what
+    // escaping only one direction would have broken.
+    assert_eq!(
+        one(
+            &mut sess,
+            "CAST(CAST('A\\x00B\\x5CD'::BLOB AS VARCHAR) AS BLOB) = 'A\\x00B\\x5CD'::BLOB"
+        ),
+        Value::Bool(true)
+    );
+    // A malformed escape is NULL (duckdb raises "Invalid hex escape code" instead).
+    assert_eq!(one(&mut sess, "'\\xZZ'::BLOB"), Value::Null);
+    assert_eq!(one(&mut sess, "'\\x4'::BLOB"), Value::Null);
+    assert_eq!(one(&mut sess, "'a\\\\b'::BLOB"), Value::Null);
+    assert_eq!(one(&mut sess, "CAST(''::BLOB AS VARCHAR)"), s(""));
+}
