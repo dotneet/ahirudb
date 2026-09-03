@@ -1477,7 +1477,10 @@ fn resolve_coerces_argument_types() {
     );
     // So do HUGEINT and UBIGINT, which likewise used to settle on DOUBLE.
     assert_eq!(resolve("abs", &[Ty::HugeInt]).unwrap().2, Ty::HugeInt);
-    assert_eq!(resolve("mod", &[Ty::UBigInt, Ty::Int]).unwrap().2, Ty::UBigInt);
+    assert_eq!(resolve("mod", &[Ty::UBigInt, Ty::UBigInt]).unwrap().2, Ty::UBigInt);
+    // A signed/unsigned mix widens to the next signed type, as DuckDB does
+    // (`typeof(mod(1::UBIGINT, 1::INTEGER))` is HUGEINT there too).
+    assert_eq!(resolve("mod", &[Ty::UBigInt, Ty::Int]).unwrap().2, Ty::HugeInt);
     // `round`'s DECIMAL result scale follows the digit count when that is a literal
     // (DuckDB's `min(s, max(d, 0))`), and keeps the input's scale when it is not.
     let dec = Ty::Decimal { precision: 4, scale: 3 };
