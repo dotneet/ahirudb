@@ -223,6 +223,15 @@ user-visible effect.
   nulling the row destroyed data, and this engine would rather fail loudly.
   Cast the column explicitly (`CAST(... AS VARCHAR)` at the source, or a
   Parquet conversion) if the input really is mixed.
+- **A JSONL/NDJSON object key that first appears outside the inference
+  sample is an error, not a new column.** The file is read split by split
+  and the schema is fixed before the first split, so there is no column to
+  put the value in; the read fails with `column not found`, positioned at
+  the offending line, rather than dropping the key silently. DuckDB adds the
+  column. `.json` (a single document) has no such limit — it is fully
+  resident, so every element contributes its keys and the column set is
+  always complete. See
+  [data-sources.md](data-sources.md#text-format-type-inference).
 - **`VALUES` is only a source for `INSERT`.** `INSERT INTO t VALUES (...)`
   works; `(VALUES (1,2)) AS x(a,b)` in a `FROM` clause, and a top-level
   `VALUES` statement, are both syntax errors. Use a real table, a

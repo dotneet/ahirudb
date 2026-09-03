@@ -111,6 +111,36 @@ every `SET` expression is evaluated against the row's values *before* the
 update, so `UPDATE t SET a = b, b = a` swaps the two columns rather than
 collapsing them to the same value.
 
+### Type conversion is strict
+
+Values written by `INSERT` (both `VALUES` and `INSERT ... SELECT`) and
+`UPDATE` are implicitly converted to the target column's type. Unlike a
+`CAST` in a `SELECT` — where a row that cannot be converted becomes NULL
+(see [types.md](types.md)) — a conversion that fails in DML is an **error**
+(`ValueOutOfRange`), because the NULL would otherwise be stored and the
+statement would report success while silently losing the value. This
+matches DuckDB's Conversion Error.
+
+```sql
+CREATE TABLE t (a INTEGER, c TINYINT, e DECIMAL(5,2), f DATE);
+INSERT INTO t VALUES (3000000000, 1, 1.0, '2024-01-01');  -- error: ValueOutOfRange
+INSERT INTO t VALUES (1, 200, 1.0, '2024-01-01');         -- error: ValueOutOfRange
+INSERT INTO t VALUES (1, 1, 1234.567, '2024-01-01');      -- error: ValueOutOfRange
+INSERT INTO t VALUES (1, 1, 1.0, 'not a date');           -- error: ValueOutOfRange
+
+INSERT INTO t VALUES (1, 5, 1.0, '2024-01-01');
+UPDATE t SET c = c * 100;                                 -- error: ValueOutOfRange
+```
+
+An explicit `NULL` is unaffected — it is a value the statement asked to
+store, not a failed conversion — and is rejected only by a `NOT NULL`
+column (as `TypeMismatch`). A conversion that merely loses precision within
+range still succeeds, exactly as in DuckDB: `1.567` into `DECIMAL(5,2)`
+rounds to `1.57`.
+
+The statement stays all-or-nothing: a failure in any row aborts the whole
+`INSERT`/`UPDATE` and leaves the table unchanged.
+
 ## CREATE VIEW / DROP VIEW
 
 ```sql

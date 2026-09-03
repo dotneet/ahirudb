@@ -78,7 +78,9 @@
 //! The same policy as `format::jsonl`. Broken JSON gives `Err`. A value beyond `SAMPLE_ELEMENTS`
 //! whose type falls outside the inferred one is `InvalidCast`, not a quiet NULL -- dropping it
 //! would be the "silently wrong answer" `docs/DESIGN.md` §15 rules out, and it is what
-//! `format::csv`, `format::jsonl` and DuckDB all report for the same input.
+//! `format::csv`, `format::jsonl` and DuckDB all report for the same input. A *key* beyond the
+//! sample is not dropped either: the whole document is resident, so every element contributes its
+//! keys and the column set is complete no matter where a key first appears.
 //! Scanning does not recurse, and nesting is cut off at `MAX_DEPTH`.
 
 use crate::catalog::Source;
@@ -88,8 +90,9 @@ use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
 /// The maximum leading rows used for schema inference (how column types widen).
 /// The same idea as `format::jsonl::SAMPLE_LINES`. Elements beyond it are still syntax-checked
-/// (the design has `resolve` read the whole file through) and counted toward the row count, but
-/// they do not enter the widen computation.
+/// (the design has `resolve` read the whole file through) and counted toward the row count, and
+/// they still contribute their **keys**, so the column set is always complete. What they do not do
+/// is widen the type of a column the sample already settled on.
 pub const SAMPLE_ELEMENTS: usize = 1000;
 
 /// The nesting limit for values. The same reason and the same value as `format::jsonl::MAX_DEPTH`.
@@ -279,12 +282,20 @@ fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64, bool, Vec<bool>)> {
     let mut row_count: u64 = 0;
 
     if c == b'[' {
+        // The number of columns the sample settled on. `None` while still inside the
+        // sample. Past it, those columns' types are frozen, but *every* element still
+        // contributes its keys: the whole document is resident and already walked for
+        // the syntax check, and a key that first appears past the sample would
+        // otherwise vanish from the schema entirely -- an entire column of data
+        // dropped without a word, which `docs/DESIGN.md` §15 rules out.
+        let mut frozen: Option<usize> = None;
         let mut it = Elements::new(buf, i)?;
         while let Some((s, e)) = it.next()? {
             row_count += 1;
-            if row_count as usize <= SAMPLE_ELEMENTS {
-                accumulate_row(&buf[s..e], &mut names, &mut infs, &mut key)?;
+            if frozen.is_none() && row_count as usize > SAMPLE_ELEMENTS {
+                frozen = Some(names.len());
             }
+            accumulate_row(&buf[s..e], &mut names, &mut infs, &mut key, frozen.unwrap_or(0))?;
         }
         ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
     } else {
@@ -293,7 +304,7 @@ fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64, bool, Vec<bool>)> {
         let end = skip_value(buf, i)?;
         ensure!(skip_ws(buf, end) == buf.len(), SyntaxError, end);
         row_count = 1;
-        accumulate_row(&buf[i..end], &mut names, &mut infs, &mut key)?;
+        accumulate_row(&buf[i..end], &mut names, &mut infs, &mut key, 0)?;
     }
 
     // No column came out of the document at all: an empty array, or elements that are all `{}`.
@@ -317,25 +328,39 @@ fn accumulate_row(
     names: &mut Vec<String>,
     infs: &mut Vec<Inf>,
     key: &mut Vec<u8>,
+    frozen: usize,
 ) -> Result<()> {
     let c = byte_at(row, 0)?;
     if c == b'{' {
         let mut it = Members::new(row)?;
         while let Some(m) = it.next()? {
             let name = member_key(&m, key)?;
-            merge(names, infs, name, infer(&m))?;
+            merge(names, infs, name, infer(&m), frozen)?;
         }
     } else {
         // A non-object row puts the raw value into a single `"json"` column
         // (see the module docs).
         let m = Member { key: b"json", key_escaped: false, val: row, kind: kind_of(c) };
-        merge(names, infs, b"json", infer(&m))?;
+        merge(names, infs, b"json", infer(&m), frozen)?;
     }
     Ok(())
 }
 
 /// Widens column `name`'s inferred type with `inf`. Creates the column if it does not exist.
-fn merge(names: &mut Vec<String>, infs: &mut Vec<Inf>, name: &[u8], inf: Inf) -> Result<()> {
+///
+/// `frozen` is the number of leading columns whose type is already settled -- the column
+/// count at the end of the inference sample, or 0 while still inside it. A column below
+/// that index no longer widens, so an out-of-sample value that does not fit an
+/// established column stays an `InvalidCast` (see the module docs) instead of quietly
+/// reshaping the schema. Columns discovered *after* the sample have no sample evidence
+/// at all, so they keep widening across every element in which they appear.
+fn merge(
+    names: &mut Vec<String>,
+    infs: &mut Vec<Inf>,
+    name: &[u8],
+    inf: Inf,
+    frozen: usize,
+) -> Result<()> {
     let idx = match names.iter().position(|s| s.as_bytes() == name) {
         Some(i) => i,
         None => {
@@ -345,7 +370,9 @@ fn merge(names: &mut Vec<String>, infs: &mut Vec<Inf>, name: &[u8], inf: Inf) ->
             names.len() - 1
         }
     };
-    infs[idx] = widen(infs[idx], inf);
+    if idx >= frozen {
+        infs[idx] = widen(infs[idx], inf);
+    }
     Ok(())
 }
 
@@ -1449,6 +1476,33 @@ mod tests {
         let (f, src) = resolve(text.as_bytes());
         assert_eq!(f.schema()[0].ty, Ty::BigInt);
         assert_eq!(code_of(f.read_split(&src, 0, &[0])), Some(Code::InvalidCast));
+    }
+
+    // A key that first appears past the inference sample used to be dropped from the
+    // schema entirely: `SELECT *` returned only the sampled columns and referring to
+    // the missing one was a bind error, with nothing anywhere saying the file had it.
+    // The whole document is resident and already walked for the syntax check, so there
+    // was never a reason to stop collecting keys -- only the *types* of columns the
+    // sample settled on stay frozen (that is what keeps the InvalidCast above).
+    #[test]
+    fn a_key_first_seen_past_the_sample_still_becomes_a_column() {
+        let mut text = String::from("[");
+        for _ in 0..SAMPLE_ELEMENTS {
+            text.push_str("{\"a\":1},");
+        }
+        text.push_str("{\"a\":1,\"b\":2},{\"a\":1,\"b\":2.5}]");
+        let (f, _) = resolve(text.as_bytes());
+        let names: Vec<&str> = f.schema().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        // `b` has no sample evidence at all, so it keeps widening over every element it
+        // appears in -- 2 and 2.5 together give DOUBLE, not a BIGINT that then fails.
+        assert_eq!(f.schema()[1].ty, Ty::Double);
+
+        let cols = read_all(&text);
+        assert_eq!(cols[1].len(), SAMPLE_ELEMENTS + 2);
+        assert_eq!(cols[1][0], Value::Null);
+        assert_eq!(cols[1][SAMPLE_ELEMENTS], Value::F64(2.0));
+        assert_eq!(cols[1][SAMPLE_ELEMENTS + 1], Value::F64(2.5));
     }
 
     // --- Strings ----------------------------------------------------------

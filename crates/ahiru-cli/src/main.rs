@@ -24,7 +24,22 @@ use engine::R;
 use repl::Shell;
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `std::env::args()` *panics* on an argument that is not valid Unicode, which the
+    // OS happily allows in a path. The argument parser, the glob expander and the
+    // engine all work in `String`, so such an argument cannot be carried through
+    // faithfully -- but it has to be reported like any other bad argument (exit code 2)
+    // rather than aborting the process. DuckDB opens such a path; matching that would
+    // mean threading `OsString` through the whole CLI, which is not worth it here.
+    let mut argv: Vec<String> = Vec::new();
+    for a in std::env::args_os().skip(1) {
+        match a.into_string() {
+            Ok(s) => argv.push(s),
+            Err(bad) => {
+                eprintln!("error: argument is not valid UTF-8: {}", bad.to_string_lossy());
+                return ExitCode::from(2);
+            }
+        }
+    }
     let opts = match args::parse(&argv) {
         Parsed::Options(o) => *o,
         Parsed::Help => {
