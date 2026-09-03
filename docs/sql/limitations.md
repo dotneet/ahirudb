@@ -361,8 +361,8 @@ that scenario — the session itself doesn't survive it either.
 These match DuckDB's behavior deliberately, since the two diverge easily
 and query results can be surprising if you're expecting different rules.
 See [types.md](types.md#rounding-and-floating-point-conventions) for the
-full list — briefly: float→integer casts round to nearest-even, `DECIMAL`
-scale reduction rounds away from zero, integer arithmetic overflow wraps
+full list — briefly: float→integer casts round to nearest-even, casts to
+`DECIMAL` round away from zero at every scale, integer arithmetic overflow wraps
 rather than erroring (except `SUM` and `factorial`/`!`, see
 [functions-numeric.md](functions-numeric.md#factorial)), and division by
 zero returns `NULL` rather than raising an error.

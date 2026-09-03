@@ -30,8 +30,8 @@
 //! here makes divergence structurally impossible instead of merely policed.
 //!
 //! The two writers differ only in how they handle non-finite values (CSV
-//! writes `NaN` / `Infinity` / `-Infinity`; JSON has no such literal, so
-//! JSONL writes `null` instead) -- that part stays local to each writer.
+//! writes `NaN` / `inf` / `-inf`; JSON has no such literal, so JSONL quotes
+//! them instead) -- that part stays local to each writer.
 //! Everything else, starting from finite-value handling (including zero,
 //! sign, and the fixed-vs-exponential notation threshold), is byte-identical
 //! between the two formats and lives here as `write_f64_finite`.
@@ -91,6 +91,38 @@ const SCALE_F: f64 = 1e16;
 /// *shortest* decimal conversion (Ryū/Grisu/Dragon4-style, meaningfully more
 /// code and a lookup table) while still landing on the same output.
 pub(crate) fn write_f64_finite(out: &mut Vec<u8>, v: f64) {
+    write_finite(out, v, Prec::F64)
+}
+
+/// The same, for a value whose *logical* type is `FLOAT`.
+///
+/// FLOAT is held in an `f64` register like every other floating-point value (there
+/// is no separate physical type for it -- DESIGN.md's six-physical-type model), but
+/// every such value came from an `f32` and is exactly representable as one. Measuring
+/// the round-trip against `f64` therefore asks for far more digits than the value
+/// actually carries: `1.1::FLOAT` is the `f64` 1.100000023841858, and that is what
+/// `CAST(... AS VARCHAR)` and the CSV writer used to print, where DuckDB prints `1.1`.
+/// Measuring it against `f32` instead -- the only thing that changes, since the exact
+/// binary value the digits are chosen nearest to is the same number either way --
+/// gives the shortest string that round-trips through the type the value really has.
+///
+/// Callers handle non-finite values themselves, exactly as for [`write_f64_finite`].
+pub(crate) fn write_f32_finite(out: &mut Vec<u8>, v: f64) {
+    write_finite(out, v, Prec::F32)
+}
+
+/// Which floating-point width a candidate digit string has to round-trip through.
+/// It changes *only* the round-trip test; digit generation, the nearest-candidate
+/// choice and the fixed-vs-exponential rendering are identical (DuckDB likewise
+/// spells an `f32` and an `f64` of the same value the same way once the digits are
+/// chosen -- verified against the `duckdb` CLI for the notation thresholds).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prec {
+    F64,
+    F32,
+}
+
+fn write_finite(out: &mut Vec<u8>, v: f64, prec: Prec) {
     if v == 0.0 {
         out.extend_from_slice(if v.is_sign_negative() { b"-0.0" } else { b"0.0" });
         return;
@@ -102,8 +134,25 @@ pub(crate) fn write_f64_finite(out: &mut Vec<u8>, v: f64) {
     }
     let (d, e10) = normalize_and_correct(x);
     let (mantissa, exp2) = decompose(x);
-    let (digits, e10) = shortest_digits(d, e10, x, mantissa, exp2);
+    let (digits, e10) = shortest_digits(d, e10, x, mantissa, exp2, prec);
     write_decimal(out, &digits, e10);
+}
+
+/// Whether the decimal `val * 10^last_digit_exp` reads back as exactly `x` at `prec`'s
+/// width. For `Prec::F32` the text is parsed straight into an `f32` rather than parsed
+/// as an `f64` and then narrowed: those two disagree when the `f64` rounding lands
+/// exactly on an `f32` halfway point (classic double rounding), and this comparison is
+/// what the whole search hangs on.
+fn round_trips(val: u128, last_digit_exp: i32, x: f64, prec: Prec) -> bool {
+    let mut buf = [0u8; 48];
+    let n = decimal_text(val, last_digit_exp, &mut buf);
+    let Ok(s) = core::str::from_utf8(&buf[..n]) else {
+        return false;
+    };
+    match prec {
+        Prec::F64 => s.parse::<f64>() == Ok(x),
+        Prec::F32 => s.parse::<f32>() == Ok(x as f32),
+    }
 }
 
 /// Returns `(d, e10)` such that `x` (positive, finite, nonzero) is the
@@ -235,16 +284,23 @@ fn decompose(x: f64) -> (u64, i32) {
 ///    choice on ~14% of values, always in the same direction: the old code
 ///    was systematically biased toward the low end of the round-trip
 ///    window rather than picking the point nearest `x`).
-fn shortest_digits(d: u128, e10: i32, x: f64, mantissa: u64, exp2: i32) -> (Vec<u8>, i32) {
+fn shortest_digits(
+    d: u128,
+    e10: i32,
+    x: f64,
+    mantissa: u64,
+    exp2: i32,
+    prec: Prec,
+) -> (Vec<u8>, i32) {
     for len in 1..=SIG_DIGITS {
         let (primary, carry) = round_to_length(d, len);
         let cand_e10 = e10 + carry;
-        if !any_round_trips_at_length(primary, cand_e10, len, x) {
+        if !any_round_trips_at_length(primary, cand_e10, len, x, prec) {
             continue;
         }
         let (val, final_e10) = nearest_at_length(mantissa, exp2, primary, cand_e10, len);
         let last_digit_exp = final_e10 - (len as i32 - 1);
-        if redecode(val, last_digit_exp) == x {
+        if round_trips(val, last_digit_exp, x, prec) {
             return (unsigned_digits(val), final_e10);
         }
         // Defensive fallback, not expected to trigger: if *something* at
@@ -266,7 +322,7 @@ fn shortest_digits(d: u128, e10: i32, x: f64, mantissa: u64, exp2: i32) -> (Vec<
 /// which of them (if more than one matches) is actually nearest `x` -- that
 /// is `nearest_at_length`'s job, done separately once a length is confirmed
 /// to work at all.
-fn any_round_trips_at_length(primary: u128, cand_e10: i32, len: u32, x: f64) -> bool {
+fn any_round_trips_at_length(primary: u128, cand_e10: i32, len: u32, x: f64, prec: Prec) -> bool {
     let lower = if len == 1 { 0 } else { 10u128.pow(len - 1) };
     let upper = 10u128.pow(len);
     let mut candidates: [Option<u128>; 3] = [Some(primary), None, None];
@@ -277,7 +333,7 @@ fn any_round_trips_at_length(primary: u128, cand_e10: i32, len: u32, x: f64) -> 
         candidates[2] = Some(primary - 1);
     }
     let last_digit_exp = cand_e10 - (len as i32 - 1);
-    candidates.into_iter().flatten().any(|val| redecode(val, last_digit_exp) == x)
+    candidates.into_iter().flatten().any(|val| round_trips(val, last_digit_exp, x, prec))
 }
 
 /// Finds the `len`-digit decimal (leading digit at decimal exponent
@@ -488,12 +544,11 @@ fn round_to_length(d: u128, len: u32) -> (u128, i32) {
     }
 }
 
-/// Parses `digits(val) * 10^last_digit_exp` back into an `f64`, to check a
-/// candidate from `normalize_and_correct`/`shortest_digits` against the
-/// original value. `f64: FromStr`'s grammar accepts a bare `<digits>e<exp>`
-/// with no decimal point, so this does not need to place one.
-fn redecode(val: u128, last_digit_exp: i32) -> f64 {
-    let mut buf = [0u8; 48];
+/// Writes `digits(val) * 10^last_digit_exp` into `buf` and returns its length, so a
+/// candidate from `normalize_and_correct`/`shortest_digits` can be parsed back and
+/// checked against the original value (`round_trips`). `FromStr`'s grammar accepts a
+/// bare `<digits>e<exp>` with no decimal point, so this does not need to place one.
+fn decimal_text(val: u128, last_digit_exp: i32, buf: &mut [u8; 48]) -> usize {
     let mut n = 0usize;
     for &b in &unsigned_digits(val) {
         buf[n] = b;
@@ -509,6 +564,13 @@ fn redecode(val: u128, last_digit_exp: i32) -> f64 {
         buf[n] = b;
         n += 1;
     }
+    n
+}
+
+/// Parses `digits(val) * 10^last_digit_exp` back into an `f64`.
+fn redecode(val: u128, last_digit_exp: i32) -> f64 {
+    let mut buf = [0u8; 48];
+    let n = decimal_text(val, last_digit_exp, &mut buf);
     core::str::from_utf8(&buf[..n]).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN)
 }
 
@@ -623,6 +685,91 @@ mod tests {
         let mut out = Vec::new();
         write_f64_finite(&mut out, v);
         String::from_utf8(out).expect("write_f64_finite output must be valid UTF-8")
+    }
+
+    fn written32(v: f32) -> String {
+        let mut out = Vec::new();
+        write_f32_finite(&mut out, v as f64);
+        String::from_utf8(out).expect("write_f32_finite output must be valid UTF-8")
+    }
+
+    /// A FLOAT is held in an `f64` register, so measuring the round trip against `f64`
+    /// asked for digits the value never had: `1.1::FLOAT` printed as
+    /// `1.100000023841858`. The expected strings here were verified against the `duckdb`
+    /// CLI directly (`SELECT (<literal>::FLOAT)::VARCHAR`), including the
+    /// fixed-vs-exponential switchover, which FLOAT shares with DOUBLE.
+    #[test]
+    fn f32_precision_gives_the_shortest_f32_round_trip() {
+        let cases: &[(f32, &str)] = &[
+            (1.1, "1.1"),
+            (0.1, "0.1"),
+            (1.0, "1.0"),
+            (-2.5, "-2.5"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            // The fixed/exponential thresholds are the same as DOUBLE's.
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1e-4, "0.0001"),
+            (1e-5, "1e-05"),
+            // f32's extremes: the largest finite value and the smallest subnormal.
+            (f32::MAX, "3.4028235e+38"),
+            (1e-45, "1e-45"),
+            (f32::MIN_POSITIVE, "1.1754944e-38"),
+            // Not representable as an f32; it lands on the even neighbour.
+            (16777217.0, "16777216.0"),
+        ];
+        for (v, expect) in cases {
+            let got = written32(*v);
+            assert_eq!(got, *expect, "{v}: wrote {got:?}, expected {expect:?}");
+        }
+        // The DOUBLE formatter is unchanged and still spells the same bits the long way.
+        assert_eq!(written(1.1f32 as f64), "1.100000023841858");
+    }
+
+    /// The f32 form must be a genuine shortest round trip, not merely shorter: every
+    /// value has to reparse to the identical `f32`, and to the same significant digits
+    /// Rust `std`'s own (correctly rounded, shortest) `f32` Display produces. Same
+    /// sampling method and same `std`-as-oracle rationale as the `f64` property test
+    /// below; exact ties are the one case `std` is known to break the other way, and
+    /// this asserts adjacency there rather than waving the mismatch through.
+    #[test]
+    fn f32_matches_std_shortest_round_trip() {
+        fn digits_of(s: &str) -> Vec<u8> {
+            let mantissa = s.split(['e', 'E']).next().unwrap_or(s);
+            let mut d: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
+            while d.len() > 1 && d[0] == b'0' {
+                d.remove(0);
+            }
+            while d.len() > 1 && *d.last().unwrap() == b'0' {
+                d.pop();
+            }
+            d
+        }
+
+        let mut seed: u32 = 0x9E37_79B9;
+        for _ in 0..20000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = f32::from_bits(seed);
+            if !v.is_finite() || v == 0.0 {
+                continue;
+            }
+            let got = written32(v);
+            let back: f32 = got
+                .parse()
+                .unwrap_or_else(|e| panic!("{v}: wrote {got:?}, failed to reparse: {e}"));
+            assert_eq!(back.to_bits(), v.to_bits(), "{v}: wrote {got:?}, round-tripped to {back}");
+            let std_form = std::format!("{v}");
+            let (ours, theirs) = (digits_of(&got), digits_of(&std_form));
+            if ours == theirs {
+                continue;
+            }
+            let to_u128 = |d: &[u8]| d.iter().fold(0u128, |a, &b| a * 10 + (b - b'0') as u128);
+            assert!(
+                ours.len() == theirs.len() && to_u128(&ours).abs_diff(to_u128(&theirs)) == 1,
+                "{v}: wrote {got:?}, std wrote {std_form:?} -- not an exact-tie disagreement"
+            );
+        }
     }
 
     // Regression test for a real correctness bug found during review: the

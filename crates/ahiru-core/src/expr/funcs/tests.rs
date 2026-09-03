@@ -414,6 +414,102 @@ fn numeric_float_domain() {
     assert_eq!(p(5.0, 0.0), Some(1.0));
     // Non-integer exponents go through exp(y ln x) and differ by a few ulps.
     assert!((p(9.0, 0.5).unwrap() - 3.0).abs() < 1e-14);
+
+    // An integer exponent too large to square up still keeps the base's sign, taken from
+    // the exponent's parity: these three used to come out NaN.
+    assert_eq!(p(-2.0, 1025.0), Some(f64::NEG_INFINITY));
+    assert_eq!(p(-2.0, 2000.0), Some(f64::INFINITY));
+    assert_eq!(p(2.0, 1025.0), Some(f64::INFINITY));
+    assert_eq!(p(-0.5, 2000.0), Some(0.0));
+    assert_eq!(p(-0.5, 2001.0), Some(-0.0));
+    // A non-integer exponent on a negative base has no real value, at any magnitude.
+    assert!(p(-2.0, 1025.5).is_some_and(f64::is_nan));
+    // IEEE 754 / C `pow`: 1 to any power (NaN included) is 1, and anything to the zeroth
+    // power is 1. `pow(1, nan)` used to be NaN.
+    assert_eq!(p(1.0, f64::NAN), Some(1.0));
+    assert_eq!(p(1.0, f64::INFINITY), Some(1.0));
+    assert_eq!(p(f64::NAN, 0.0), Some(1.0));
+    // An infinite exponent has no parity, so a negative base behaves like its magnitude.
+    assert_eq!(p(-2.0, f64::INFINITY), Some(f64::INFINITY));
+    assert_eq!(p(-2.0, f64::NEG_INFINITY), Some(0.0));
+    assert_eq!(p(-1.0, f64::INFINITY), Some(1.0));
+    // Everything else stays NaN.
+    assert!(p(f64::NAN, 2.0).is_some_and(f64::is_nan));
+    assert!(p(2.0, f64::NAN).is_some_and(f64::is_nan));
+}
+
+/// Exact integer / decimal semantics for the numeric functions. These used to be
+/// evaluated in DOUBLE, which rounded anything above 2^53 and replaced exact decimal
+/// rounding with binary rounding. Every expected value was checked against `duckdb`.
+#[test]
+fn numeric_functions_stay_exact_on_wide_integers_and_decimals() {
+    let hugeint = |v: i128| {
+        let mut x = Vector::new(Ty::HugeInt);
+        x.push_value(&Value::I128(v));
+        x
+    };
+    // A DECIMAL is a scaled integer, held as I64 up to precision 18 and I128 above it.
+    let dec = |v: i128, precision: u8, scale: u8| {
+        let ty = Ty::Decimal { precision, scale };
+        let mut x = Vector::new(ty);
+        x.push_value(&if ty.phys() == PhysType::I128 {
+            Value::I128(v)
+        } else {
+            Value::I64(v as i64)
+        });
+        x
+    };
+    // `i128_at` covers the I128 case; a narrow DECIMAL comes back through `int_at`.
+    let scaled = |v: &Vector| match v.ty().phys() {
+        PhysType::I128 => i128_at(v, 0),
+        _ => int_at(v, 0).map(i128::from),
+    };
+
+    const MAX: i128 = i128::MAX;
+    // `mod` on a HUGEINT: the answer is 7, not the 8 the DOUBLE round-trip produced.
+    let m = run("mod", &[&hugeint(MAX), &hugeint(10)]).unwrap();
+    assert_eq!(m.ty(), Ty::HugeInt);
+    assert_eq!(scaled(&m), Some(7));
+    // `abs` keeps every digit too.
+    let a = run("abs", &[&hugeint(-MAX)]).unwrap();
+    assert_eq!(a.ty(), Ty::HugeInt);
+    assert_eq!(scaled(&a), Some(MAX));
+
+    // `round(1.005::DECIMAL(4,3), 2)` -> 1.01, exactly. As a DOUBLE, 1.005 is a hair
+    // below the decimal 1.005 and rounded down to 1.0.
+    let (id, want, res) = resolve_const(
+        "round",
+        &[Ty::Decimal { precision: 4, scale: 3 }, Ty::BigInt],
+        &[None, Some(2)],
+    )
+    .unwrap();
+    assert_eq!(want, vec![Ty::Decimal { precision: 4, scale: 3 }, Ty::BigInt]);
+    let r = call(id, res, &[&dec(1005, 4, 3), &vi(Ty::BigInt, &[Some(2)])]).unwrap();
+    assert_eq!(r.ty(), Ty::Decimal { precision: 4, scale: 2 });
+    assert_eq!(scaled(&r), Some(101));
+
+    // `mod` between DECIMALs stays exact at the aligned scale (`123456789012.345 % 1`).
+    let m = run("mod", &[&dec(123456789012345, 15, 3), &dec(1000, 15, 3)]).unwrap();
+    assert_eq!(scaled(&m), Some(345));
+
+    // `ceil` / `floor` / `trunc` drop the fractional digits and come back whole.
+    for (name, expect) in [("ceil", -1i128), ("floor", -2), ("trunc", -1)] {
+        let v = run(name, &[&dec(-190, 4, 2)]).unwrap();
+        assert_eq!(v.ty(), Ty::Decimal { precision: 4, scale: 0 }, "{name}");
+        assert_eq!(scaled(&v), Some(expect), "{name}");
+    }
+
+    // `sign` reads the full width (it used to see a HUGEINT as zero) and answers with a
+    // plain integer rather than the argument's own type.
+    let s = run("sign", &[&hugeint(-MAX)]).unwrap();
+    assert_eq!(s.ty(), Ty::BigInt);
+    assert_eq!(int_at(&s, 0), Some(-1));
+    assert_eq!(int_at(&run("sign", &[&dec(-150, 4, 2)]).unwrap(), 0), Some(-1));
+
+    // Rounding a plain integer to a power of ten is unchanged, and rounds away from zero.
+    let r =
+        run("round", &[&vi(Ty::BigInt, &[Some(-12345)]), &vi(Ty::BigInt, &[Some(-2)])]).unwrap();
+    assert_eq!(int_at(&r, 0), Some(-12300));
 }
 
 #[test]
@@ -1210,7 +1306,36 @@ fn resolve_coerces_argument_types() {
     // INT arguments settle on BIGINT, and a FLOAT mixed in settles on DOUBLE.
     assert_eq!(resolve("abs", &[Ty::Int]).unwrap().1, vec![Ty::BigInt]);
     assert_eq!(resolve("abs", &[Ty::Double]).unwrap().1, vec![Ty::Double]);
-    assert_eq!(resolve("abs", &[Ty::Decimal { precision: 9, scale: 2 }]).unwrap().2, Ty::Double);
+    // A DECIMAL stays a DECIMAL: `abs` is exact on the scaled integer, so there is no
+    // reason to drop to DOUBLE (which used to round every value above 2^53).
+    assert_eq!(
+        resolve("abs", &[Ty::Decimal { precision: 9, scale: 2 }]).unwrap().2,
+        Ty::Decimal { precision: 9, scale: 2 }
+    );
+    // So do HUGEINT and UBIGINT, which likewise used to settle on DOUBLE.
+    assert_eq!(resolve("abs", &[Ty::HugeInt]).unwrap().2, Ty::HugeInt);
+    assert_eq!(resolve("mod", &[Ty::UBigInt, Ty::Int]).unwrap().2, Ty::UBigInt);
+    // `round`'s DECIMAL result scale follows the digit count when that is a literal
+    // (DuckDB's `min(s, max(d, 0))`), and keeps the input's scale when it is not.
+    let dec = Ty::Decimal { precision: 4, scale: 3 };
+    assert_eq!(
+        resolve_const("round", &[dec, Ty::Int], &[None, Some(2)]).unwrap().2,
+        Ty::Decimal { precision: 4, scale: 2 }
+    );
+    assert_eq!(
+        resolve_const("round", &[dec, Ty::Int], &[None, Some(9)]).unwrap().2,
+        Ty::Decimal { precision: 4, scale: 3 }
+    );
+    assert_eq!(
+        resolve_const("round", &[dec, Ty::Int], &[None, Some(-1)]).unwrap().2,
+        Ty::Decimal { precision: 4, scale: 0 }
+    );
+    assert_eq!(resolve("round", &[dec, Ty::Int]).unwrap().2, dec);
+    // `ceil`/`floor`/`trunc` on a DECIMAL come back whole, as in DuckDB.
+    assert_eq!(resolve("ceil", &[dec]).unwrap().2, Ty::Decimal { precision: 4, scale: 0 });
+    // `sign` is always a plain integer, never the argument's own type.
+    assert_eq!(resolve("sign", &[dec]).unwrap().2, Ty::BigInt);
+    assert_eq!(resolve("sign", &[Ty::HugeInt]).unwrap().2, Ty::BigInt);
     assert_eq!(resolve("length", &[Ty::Varchar]).unwrap().2, Ty::BigInt);
     // Date-time functions settle on TIMESTAMP (DATE columns and VARCHARs both arrive via a Cast).
     assert_eq!(resolve("year", &[Ty::Date]).unwrap().1, vec![Ty::Timestamp]);

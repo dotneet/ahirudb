@@ -108,6 +108,48 @@ fn copy_csv_extension_matches_duckdb_byte_for_byte() {
     let _ = std::fs::remove_file(&duckdb_out);
 }
 
+/// A CSV export of a FLOAT column and of the infinities, byte for byte against DuckDB.
+///
+/// Both used to differ: a FLOAT was written with DOUBLE's shortest round trip
+/// (`1.100000023841858` where DuckDB writes `1.1`), and the infinities were spelled
+/// `Infinity` / `-Infinity`, which DuckDB's own CSV reader sniffs as a DATE column.
+#[test]
+fn copy_csv_float_and_infinities_match_duckdb_byte_for_byte() {
+    skip_without_duckdb!();
+    let ahiru_out = tmp_path("csv_float", "csv");
+    let duckdb_out = tmp_path("csv_float_duckdb", "csv");
+    // `d` is the same bit pattern as `f`, widened: the FLOAT prints as `1.1` and the
+    // DOUBLE keeps all of its digits, so one query covers both sides of the change.
+    let select = "SELECT 1.1::FLOAT AS f, 0.1::FLOAT AS g, (1.1::FLOAT)::DOUBLE AS d, \
+                  'inf'::DOUBLE AS pinf, '-inf'::DOUBLE AS ninf";
+
+    run_ahiru_copy(
+        &["tests/data/basic.csv"],
+        &format!("COPY ({select} FROM t LIMIT 1) TO '{}'", ahiru_out.display()),
+    );
+    run_duckdb_copy(&format!(
+        "COPY ({select} FROM {} LIMIT 1) TO '{}'",
+        duckdb_csv_source("tests/data/basic.csv"),
+        duckdb_out.display()
+    ));
+
+    let a = std::fs::read(&ahiru_out).expect("no output from ahiru");
+    let d = std::fs::read(&duckdb_out).expect("no output from duckdb");
+    assert_eq!(
+        String::from_utf8_lossy(&a),
+        String::from_utf8_lossy(&d),
+        "CSV output does not match byte for byte"
+    );
+    let text = String::from_utf8_lossy(&a);
+    assert!(text.contains("1.1,0.1,1.100000023841858,inf,-inf"), "unexpected row: {text}");
+    // Reading that back as DOUBLE is covered by `format::csv`'s own inference test:
+    // `classify(b"inf")` is `Cand::Double`. (DuckDB's reader still sniffs a column of
+    // infinities as DATE, whichever spelling wrote it -- including its own output --
+    // so it cannot be the oracle for the read side here.)
+    let _ = std::fs::remove_file(&ahiru_out);
+    let _ = std::fs::remove_file(&duckdb_out);
+}
+
 #[test]
 fn copy_jsonl_format_matches_duckdb_byte_for_byte() {
     skip_without_duckdb!();

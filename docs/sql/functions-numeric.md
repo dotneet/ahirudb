@@ -40,9 +40,9 @@ SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 | Function | Notes |
 |---|---|
 | `abs(x)` / `@x` (prefix) | Integer overflow case (`abs(i64::MIN)`) returns `NULL` rather than overflowing. Never returns a negative zero: `1 / abs(-0.0)` is positive infinity, not negative |
-| `sign(x)` | Returns -1/0/1; `NaN` passes through. Never returns a negative zero — `sign(-0.0)` is `+0.0` (DuckDB returns integer `0`) |
-| `ceil(x)` / `ceiling(x)`, `floor(x)`, `trunc(x)` | No-op (identity) on integer input; real work only happens on float input |
-| `round(x[, d])` | `d` > 0 rounds to `d` decimal places (half-away-from-zero); `d` < 0 rounds to a power of ten; `d` on an integer input with `d ≥ 0` is a no-op |
+| `sign(x)` | Returns -1/0/1; `NaN` passes through. Never returns a negative zero — `sign(-0.0)` is `+0.0` (DuckDB returns integer `0`). On a non-float argument the result is `BIGINT` (DuckDB narrows it to `TINYINT`) |
+| `ceil(x)` / `ceiling(x)`, `floor(x)`, `trunc(x)` | No-op (identity) on integer input. On `DECIMAL(p, s)` the result is a `DECIMAL(p, 0)`, as in DuckDB |
+| `round(x[, d])` | `d` > 0 rounds to `d` decimal places (half-away-from-zero); `d` < 0 rounds to a power of ten; `d` on an integer input with `d ≥ 0` is a no-op. On a `DECIMAL(p, s)` the result is a `DECIMAL(p, min(s, max(d, 0)))` when `d` is a literal, and a `DECIMAL(p, s)` when it is not (see the note below) |
 | `mod(a, b)` | Integer: `b = 0` or `MIN_VALUE % -1` returns `NULL` (no error/panic). Float: plain `%` |
 | `sqrt(x)` | Negative input returns `NULL` (DuckDB errors instead — an intentional divergence, matching this engine's general "prefer NULL over erroring mid-scan" policy) |
 | `exp(x)` | — |
@@ -51,7 +51,7 @@ SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 | `log(base, x)` | Logarithm to `base`; `base ≤ 0`, `base = 1`, or `x ≤ 0` → `NULL` |
 | `log2(x)` | `x ≤ 0` → `NULL` |
 | `cbrt(x)` | Cube root; defined for negative input (unlike `sqrt`) |
-| `pow(x, y)` / `power(x, y)` | — |
+| `pow(x, y)` / `power(x, y)` | IEEE 754's special cases apply: `pow(1, y)` and `pow(x, 0)` are `1` even when the other operand is `NaN`. A negative base with an integer exponent keeps its sign at any magnitude (`pow(-2, 1025)` is `-inf`, `pow(-2, 2000)` is `+inf`); with a non-integer exponent it is `NaN` |
 | `pi()` | Folded to a constant at plan time (there is no zero-argument call path at runtime) |
 | `radians(x)`, `degrees(x)` | Degree ↔ radian conversion |
 | `gcd(a, b)` / `greatest_common_divisor` | Always non-negative; `gcd(0, 0)` = 0 |
@@ -79,6 +79,33 @@ it's worth knowing which is which:
   computed directly. `SELECT log(1000)` returning `2.9999999999999996`
   instead of `3` is this, not a bug. Round the result if you are going to
   compare it for equality.
+
+## Working type of the numeric functions
+
+`abs`, `sign`, `ceil`/`floor`/`trunc`, `round` and `mod` keep the argument's
+own exactness rather than collapsing everything to `DOUBLE`:
+
+- integers narrower than 64 bits work in `BIGINT`;
+- `HUGEINT` and `UBIGINT` keep their full 128-bit width, so
+  `mod(170141183460469231731687303715884105727::HUGEINT, 10)` is `7` and
+  `abs(18446744073709551615::UBIGINT)` is that value unchanged (both used to
+  round through `DOUBLE` and answered `8.0` and `1.8446744073709552e19`);
+- `DECIMAL` stays decimal, so `round(1.005::DECIMAL(4,3), 2)` is `1.01` — as a
+  binary `DOUBLE`, 1.005 is a hair *below* the decimal 1.005 and used to round
+  down to `1.0`;
+- anything involving `FLOAT` or `DOUBLE` works in `DOUBLE` (so a `FLOAT`
+  argument comes back as a `DOUBLE`, where DuckDB keeps `FLOAT`).
+
+Two remaining differences from DuckDB, both cosmetic:
+
+- `sign` returns `BIGINT` rather than `TINYINT`.
+- `round(x, d)` on a `DECIMAL` can only shrink the result's *scale* when `d` is
+  written as a literal, which is the usual case. When `d` is an expression or a
+  column the result keeps the input's scale, so the same number just prints
+  with trailing zeros (`1.010` rather than `1.01`).
+
+The bitwise operators are the exception and still work in `BIGINT` only; see
+the [Bitwise](#bitwise-bigint-only) section.
 
 ## NULL-aware / multi-value helpers
 

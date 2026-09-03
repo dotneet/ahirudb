@@ -4,7 +4,10 @@ use super::json::json_extract_or_whole;
 use super::string::{cp_count, find};
 use super::*;
 
-pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
+/// `res` is the call's result type. Only the DECIMAL-aware arms consult it, for the scale the
+/// result has to come back at (`round` on a DECIMAL drops the digits below the requested
+/// position from the scale as well, matching DuckDB).
+pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
     // Shorthands such as year(). The part number is embedded in the ID.
     if id >= F_PART_BASE {
         return Ok(date_part((id - F_PART_BASE) as u8, a.int(0)));
@@ -20,18 +23,14 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
             })
         }
         F_ABS_I => a.int(0).checked_abs(),
-        F_SIGN_I => Some(a.int(0).signum()),
+        // Reads the argument at full width so that a HUGEINT/UBIGINT (physically I128) is not
+        // seen as zero; the answer is a plain -1/0/1 either way.
+        F_SIGN_I => Some(a.i128(0).signum() as i64),
         F_ROUND_I => {
-            let x = a.int(0);
             let d = if a.n() >= 2 { a.int(1) } else { 0 };
-            if d >= 0 {
-                Some(x)
-            } else if let Some(k) = d.checked_neg() {
-                round_int(x, k)
-            } else {
-                Some(0)
-            }
+            narrow(round_scaled(a.i128(0), a.dec_scale(0), scale_of(res), d))
         }
+        F_CEIL_I | F_FLOOR_I | F_TRUNC_I => narrow(whole_scaled(id, a.i128(0), a.dec_scale(0))),
         F_MOD_I => {
             let (x, y) = (a.int(0), a.int(1));
             // Division by zero and MIN % -1 give NULL (the same judgment as kernels' Mod).
@@ -49,11 +48,15 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
         F_BIT_SHR => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shr(n)),
         F_BIT_NOT => Some(!a.int(0)),
         // The **code point** of the first character, not its first byte, so `chr(ascii(s))`
-        // round-trips (DuckDB's `ascii`/`unicode` behave the same). An empty string gives NULL,
-        // matching `select ascii('')` in duckdb; invalid UTF-8 gives NULL too.
+        // round-trips (DuckDB's `ascii`/`unicode` behave the same). An empty string gives 0,
+        // matching `select ascii('')` in duckdb; invalid UTF-8 still gives NULL.
         F_ASCII => {
             let s = a.bytes(0);
-            core::str::from_utf8(s).ok().and_then(|t| t.chars().next()).map(|c| c as i64)
+            if s.is_empty() {
+                Some(0)
+            } else {
+                core::str::from_utf8(s).ok().and_then(|t| t.chars().next()).map(|c| c as i64)
+            }
         }
         F_BIT_XOR => Some(a.int(0) ^ a.int(1)),
         F_BIT_COUNT => Some(a.int(0).count_ones() as i64),
@@ -138,12 +141,113 @@ pub(super) fn eval_int(id: FuncId, a: &A) -> Result<Option<i64>> {
     })
 }
 
-/// HUGEINT (I128) output. Currently only `factorial`/postfix `!`
-/// (`F_FACTORIAL`, `sql::parser` desugars `!` to a call of this name).
-pub(super) fn eval_i128(id: FuncId, a: &A) -> Result<Option<i128>> {
+/// HUGEINT / UBIGINT / wide-DECIMAL (I128) output: `factorial`/postfix `!`
+/// (`F_FACTORIAL`, `sql::parser` desugars `!` to a call of this name), plus the
+/// exact-integer and exact-decimal arms of the numeric functions that `eval_int`
+/// serves at `i64` width. Those share their function IDs with `eval_int`; which of
+/// the two runs is decided purely by the result's physical type, exactly as for the
+/// `f64` split (`see funcs::num_ty`).
+///
+/// `res` carries the result type, for the same reason as in [`eval_int`].
+pub(super) fn eval_i128(id: FuncId, a: &A, res: Ty) -> Result<Option<i128>> {
     Ok(match id {
         F_FACTORIAL => Some(factorial(a.int(0))?),
+        F_ABS_I => a.i128(0).checked_abs(),
+        F_ROUND_I => {
+            let d = if a.n() >= 2 { a.int(1) } else { 0 };
+            round_scaled(a.i128(0), a.dec_scale(0), scale_of(res), d)
+        }
+        F_CEIL_I | F_FLOOR_I | F_TRUNC_I => whole_scaled(id, a.i128(0), a.dec_scale(0)),
+        F_MOD_I => {
+            let (x, y) = (a.i128(0), a.i128(1));
+            // Division by zero and MIN % -1 give NULL, as in the `i64` arm above.
+            if y == 0 || (y == -1 && x == i128::MIN) {
+                None
+            } else {
+                Some(x % y)
+            }
+        }
         _ => err!(Internal),
+    })
+}
+
+/// The DECIMAL scale of a type (0 for anything else).
+fn scale_of(t: Ty) -> u32 {
+    match t {
+        Ty::Decimal { scale, .. } => scale as u32,
+        _ => 0,
+    }
+}
+
+/// Narrows an `i128` result back to the `i64` the caller's physical type holds.
+/// Out of range gives NULL, the same as any other unrepresentable result.
+fn narrow(v: Option<i128>) -> Option<i64> {
+    v.and_then(|x| i64::try_from(x).ok())
+}
+
+/// `10^k` as an `i128`. `None` past `i128`'s range.
+fn pow10_i128(k: u32) -> Option<i128> {
+    let mut p: i128 = 1;
+    for _ in 0..k {
+        p = p.checked_mul(10)?;
+    }
+    Some(p)
+}
+
+/// `round(x, d)` on the scaled integer of a DECIMAL with scale `s_in`, returned at scale
+/// `s_out`. An integer is a DECIMAL with scale 0, so this covers `round(<bigint>, -2)` too.
+///
+/// Rounding is half away from zero, matching DuckDB's `round` (and unlike the
+/// round-half-to-even the float-to-integer *casts* use). `s_out` is never above `s_in`
+/// (`funcs::resolve` picks it), so the final rescaling only ever divides, and it divides
+/// exactly: the digits it drops were already zeroed by the rounding step.
+///
+/// `None` (= NULL) when the result does not fit, e.g. `round(<hugeint max>, -1)`.
+fn round_scaled(x: i128, s_in: u32, s_out: u32, d: i64) -> Option<i128> {
+    // How many of the scaled integer's digits fall below the requested position.
+    // Saturating, so `d = i64::MIN` does not overflow on the way to "round everything away".
+    let k = (s_in as i64).saturating_sub(d);
+    let y = if k <= 0 { x } else { round_pow10(x, k)? };
+    let drop = s_in.saturating_sub(s_out);
+    if drop == 0 {
+        Some(y)
+    } else {
+        Some(y / pow10_i128(drop)?)
+    }
+}
+
+/// Rounds `x` away from zero to a multiple of `10^k` (`round_pow10(12345, 2)` -> 12300).
+/// `k` is at least 1. `None` on overflow.
+fn round_pow10(x: i128, k: i64) -> Option<i128> {
+    // Every i128 is below 10^39 in magnitude, so at that point the answer is zero: even the
+    // largest value is under half of `10^k` and rounds to nothing. (10^39 does not fit an
+    // i128 either, so this also keeps `pow10_i128` in range.)
+    if k >= 39 {
+        return Some(0);
+    }
+    let p = pow10_i128(k as u32)?;
+    let (q, r) = (x / p, x % p);
+    let half = p / 2;
+    let q = if r >= half {
+        q.checked_add(1)?
+    } else if r <= -half {
+        q.checked_sub(1)?
+    } else {
+        q
+    };
+    q.checked_mul(p)
+}
+
+/// `ceil` / `floor` / `trunc` on the scaled integer of a DECIMAL with scale `s_in`. The
+/// result is a whole number at scale 0, as in DuckDB (`ceil(1.5::DECIMAL(4,2))` is the
+/// `DECIMAL(4,0)` `2`).
+fn whole_scaled(id: FuncId, x: i128, s_in: u32) -> Option<i128> {
+    let p = pow10_i128(s_in)?;
+    let (q, r) = (x / p, x % p);
+    Some(match id {
+        F_CEIL_I if r > 0 => q + 1,
+        F_FLOOR_I if r < 0 => q - 1,
+        _ => q,
     })
 }
 
@@ -196,27 +300,6 @@ fn make_date(y: i64, m: i64, d: i64) -> Option<i64> {
         return None;
     }
     Some(days_from_civil(y, m as u32, d as u32))
-}
-
-/// Rounds away from zero to a power of ten (`round(12345, -2)` -> 12300).
-fn round_int(x: i64, k: i64) -> Option<i64> {
-    if k > 18 {
-        return Some(0);
-    }
-    let mut p: i64 = 1;
-    for _ in 0..k {
-        p = p.checked_mul(10)?;
-    }
-    let (q, r) = (x / p, x % p);
-    let half = p / 2;
-    let q = if r >= half {
-        q.checked_add(1)?
-    } else if r <= -half {
-        q.checked_sub(1)?
-    } else {
-        q
-    };
-    q.checked_mul(p)
 }
 
 pub(super) fn eval_f64(id: FuncId, a: &A) -> Result<Option<f64>> {
@@ -541,17 +624,26 @@ pub(super) fn f_exp(x: f64) -> f64 {
     scale2(s2 + ((e1 + e2) - lo), k as i32)
 }
 
-/// Exponentiation. Integer exponents are computed exactly by repeated squaring (so `pow(2,3)` does
-/// not come out as 7.999...). Everything else uses `exp(y * ln x)`.
+/// Exponentiation. Integer exponents small enough to square up are computed exactly by repeated
+/// squaring (so `pow(2,3)` does not come out as 7.999...). Everything else uses
+/// `exp(y * ln |x|)`, with the sign restored from the exponent's parity when the base is
+/// negative.
+///
+/// The IEEE 754 / C `pow` special cases come first: `pow(x, ±0)` and `pow(1, y)` are 1 even
+/// when the other operand is NaN (`duckdb -c "select pow(1, 'nan'::DOUBLE)"` -> `1.0`).
 pub(super) fn f_pow(x: f64, y: f64) -> f64 {
-    if y == 0.0 {
+    if y == 0.0 || x == 1.0 {
         return 1.0;
     }
     if x.is_nan() || y.is_nan() {
         return f64::NAN;
     }
+    // `f_trunc` leaves an infinity alone, so `int_exp` is also true for `y = ±inf`. That is
+    // what the parity test below wants: an infinite exponent has no parity (`inf % 2` is NaN),
+    // and IEEE 754 gives `pow(negative, ±inf)` the same value as `pow(|negative|, ±inf)`.
     let n = f_trunc(y);
-    if n == y && f_abs(y) <= 1024.0 {
+    let int_exp = n == y;
+    if int_exp && f_abs(y) <= 1024.0 {
         let mut r = 1.0f64;
         let mut b = x;
         let mut k = f_abs(n) as u32;
@@ -567,12 +659,37 @@ pub(super) fn f_pow(x: f64, y: f64) -> f64 {
         // `pow(10, -2)` used to give `0.010000000000000002` rather than `0.01`.
         return if n < 0.0 { 1.0 / r } else { r };
     }
-    if x < 0.0 {
-        // A negative base with a non-integer exponent has no real solution.
-        return f64::NAN;
+    // A negative base is defined only for an integer exponent; its magnitude comes from `|x|`
+    // and its sign from whether that exponent is odd. `y % 2.0` is exact for every
+    // integer-valued double (everything at or above 2^53 is even), which is what makes this
+    // work for exponents far too large to square up: `pow(-2, 1025)` is `-inf`, `pow(-2, 2000)`
+    // is `+inf`. Before this, both came out NaN.
+    let negate = if x < 0.0 {
+        if !int_exp {
+            // A negative base with a non-integer exponent has no real solution.
+            return f64::NAN;
+        }
+        f_abs(y % 2.0) == 1.0
+    } else {
+        false
+    };
+    let a = f_abs(x);
+    let mag = if a == 0.0 {
+        if y < 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        }
+    } else if a == 1.0 {
+        // `x == -1.0` (the positive case returned at the top). `ln(1)` is 0, so the general
+        // form below would evaluate `inf * 0` = NaN for an infinite exponent.
+        1.0
+    } else {
+        f_exp(y * f_ln(a))
+    };
+    if negate {
+        -mag
+    } else {
+        mag
     }
-    if x == 0.0 {
-        return if y < 0.0 { f64::INFINITY } else { 0.0 };
-    }
-    f_exp(y * f_ln(x))
 }

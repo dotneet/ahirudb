@@ -823,7 +823,9 @@ fn parse_i64(v: &[u8]) -> Option<i64> {
 }
 
 fn parse_f64(v: &[u8]) -> Option<f64> {
-    // IEEE specials that the CSV writer itself emits (`NaN` / `Infinity` / `-Infinity`).
+    // IEEE specials. Both spellings of the infinities are accepted: the writer emits
+    // `inf` / `-inf` (matching DuckDB, whose reader sniffs `Infinity` as a DATE), but
+    // files written before that -- and by other tools -- use the long form.
     if eq_ascii_ci(v, b"nan") {
         return Some(f64::NAN);
     }
@@ -1406,9 +1408,18 @@ mod tests {
         assert_eq!(parse_f64(b"1.5"), Some(1.5));
         assert_eq!(parse_f64(b"-.5"), Some(-0.5));
         assert_eq!(parse_f64(b"1e3"), Some(1000.0));
+        // Both spellings of the infinities read back, whichever wrote the file: the CSV
+        // writer emits `inf` / `-inf`, older files and other tools the long form.
         assert!(parse_f64(b"inf").is_some_and(|f| f.is_infinite() && f > 0.0));
-        assert!(parse_f64(b"NaN").is_some_and(|f| f.is_nan()));
+        assert!(parse_f64(b"-inf").is_some_and(|f| f.is_infinite() && f < 0.0));
+        assert!(parse_f64(b"Infinity").is_some_and(|f| f.is_infinite() && f > 0.0));
         assert!(parse_f64(b"-Infinity").is_some_and(|f| f.is_infinite() && f < 0.0));
+        assert!(parse_f64(b"NaN").is_some_and(|f| f.is_nan()));
+        // ... and a column of them is inferred as DOUBLE either way, so a re-read of an
+        // exported file keeps its type.
+        assert_eq!(classify(b"inf"), Cand::Double);
+        assert_eq!(classify(b"-inf"), Cand::Double);
+        assert_eq!(classify(b"Infinity"), Cand::Double);
         assert_eq!(parse_f64(b"1e"), None);
         assert_eq!(parse_f64(b"0x10"), None);
         // duckdb: datediff('day', DATE '1970-01-01', DATE '2024-01-01') = 19723
