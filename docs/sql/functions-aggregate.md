@@ -42,7 +42,7 @@ SELECT arg_max(name, score), arg_min(name, score) FROM t;
 | `var_pop(x)` | — | Population variance; same one-row note |
 | `quantile_cont(x, frac)` | `quantile`, `percentile_cont` | Interpolated quantile; `frac` must be a constant literal in `[0, 1]`. DuckDB's `quantile` is the *discrete* version — here all three spellings are continuous, i.e. `quantile(x, 0.5)` equals `median(x)` |
 | `string_agg(x, sep)` | `group_concat(x, sep)`, `listagg` | `sep` must be a constant literal; defaults to `','` if omitted |
-| `array_agg(x)` | `list(x)` | Collects values into a `JSON`-array-shaped result (no separate LIST physical type — see [functions-json.md](functions-json.md)) |
+| `array_agg(x)` | `list(x)` | Collects values into a `JSON`-array-shaped result (no separate LIST physical type — see [functions-json.md](functions-json.md)). Elements are rendered from their **logical** type, exactly as `to_json` renders them: `DECIMAL` keeps its decimal point, `DOUBLE` uses the `CAST(x AS VARCHAR)` spelling, and `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`/`UUID` come out as quoted text |
 | `any_value(x)` | `first(x)`, `arbitrary(x)` | First non-`NULL` value seen. Input order is not guaranteed without `ORDER BY`, so treat it as "some value" |
 | `last(x)` | — | Last non-`NULL` value seen; same ordering caveat |
 | `bool_and(x)` / `bool_or(x)` | — | `BOOLEAN` input; `NULL`s are skipped, so an all-`NULL` group is `NULL` |

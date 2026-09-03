@@ -538,6 +538,24 @@ pub(crate) fn extract<'a>(doc: &'a [u8], path: &[u8]) -> Result<Option<(&'a [u8]
     Ok(Some((&doc[vs..end], kind)))
 }
 
+/// The body of the integer-path forms of `json_extract` / `->` / `->>`. DuckDB reads an integer
+/// path argument as a **0-based** array subscript, with a negative index counting from the end,
+/// and never as an object key: `'[1,2]' -> 0` is `1`, `'[1,2]' ->> -1` is `2`, and
+/// `'{"0":5}' -> 0` is NULL. A non-array document therefore gives `None` (SQL NULL).
+pub(crate) fn extract_index(doc: &[u8], idx: i64) -> Result<Option<(&[u8], Kind)>> {
+    let arr_start = skip_ws(doc, 0);
+    if byte_at(doc, arr_start)? != b'[' {
+        return Ok(None);
+    }
+    match nth_element(doc, arr_start, idx)? {
+        Some(vs) => {
+            let ve = skip_value(doc, vs)?;
+            Ok(Some((&doc[vs..ve], kind_of(byte_at(doc, vs)?))))
+        }
+        None => Ok(None),
+    }
+}
+
 /// The body of `list_extract`. 1-based, with negatives counting from the end.
 /// Out of range gives `None`.
 pub(crate) fn list_index(doc: &[u8], idx: i64) -> Result<Option<&[u8]>> {

@@ -329,6 +329,18 @@ rejected, because `b` then appears in the select list without being
 grouped or aggregated. `SELECT b AS a FROM t ORDER BY a` sorts by `b`,
 because there `a` is the alias.
 
+**`HAVING`** follows the `GROUP BY` rule — an input column of the name wins —
+but a name the input doesn't have may be a select-list alias, as in DuckDB:
+
+```sql
+SELECT flag, sum(id) AS s FROM t GROUP BY flag HAVING s > 100 ORDER BY 1;
+```
+
+The alias has to name something the aggregate already produces: a grouping
+expression, an aggregate call, or a `GROUPING()` call. An alias on an
+expression *built out of* those (`SELECT sum(id) + 1 AS z ... HAVING z > 5`)
+has no column of its own and is rejected; repeat the expression in `HAVING`.
+
 An alias that shadows nothing is unambiguous either way:
 
 ```sql
@@ -521,6 +533,14 @@ If every element of the array is the same scalar type, `UNNEST` restores
 that native type (`BIGINT`, `VARCHAR`, `BOOLEAN`, ...) rather than leaving
 the result as `JSON` text; a mixed-type array stays `JSON`. A `NULL` or
 empty array produces zero rows (not a row with a `NULL` value).
+
+The restored type is wide enough for every element, so an integer past
+`BIGINT` comes back as `HUGEINT` (`UNNEST([1, 9223372036854775808])` yields
+`1` and `9223372036854775808`, as in DuckDB) rather than turning into
+`NULL`. One known gap: arrays travel as JSON text, and JSON has no way to
+spell infinity or NaN, so a non-finite `DOUBLE` element written into an
+array literal (`UNNEST([1.5, 1e400])`) becomes `NULL` — DuckDB, which has a
+real `LIST` type, keeps `inf` there.
 
 ## Table functions: generate_series / range
 

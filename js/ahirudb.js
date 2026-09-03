@@ -136,12 +136,20 @@ function dateFromMillis(millis, label) {
   return new Date(Number(millis));
 }
 
-/** Decode ABI text strictly; replacement characters would hide a corrupt wire buffer. */
-function decodeUtf8(bytes, what) {
+/**
+ * Decode ABI text strictly; replacement characters would hide a corrupt wire buffer.
+ *
+ * `code` says whose fault a failure is. Structural text (schema field names) can
+ * only be malformed if the wire buffer itself is, which is an engine bug (E900).
+ * A VARCHAR/JSON *value*, though, is whatever bytes the source file holds -- a
+ * Parquet writer is free to put non-UTF-8 in a BYTE_ARRAY column -- so that is a
+ * data error (E108) and must not be reported as an internal one.
+ */
+function decodeUtf8(bytes, what, code = Code.INTERNAL) {
   try {
     return textDecoder.decode(bytes);
   } catch {
-    wireError(`invalid UTF-8 ${what}`);
+    throw new AhiruError(code, { detail: `invalid UTF-8 ${what}` });
   }
 }
 
@@ -682,6 +690,33 @@ export function coalesceRanges(ranges, gap = COALESCE_GAP, totalLen = Infinity) 
   return out.filter((r) => r.len > 0);
 }
 
+/**
+ * Records one fetched byte range, merged into the coverage already recorded for
+ * the same part. Mutates and returns `ranges`.
+ *
+ * Codec delegation asks "did we ever fetch [offset, offset+len)?", so what has to
+ * be remembered is *coverage*, not a list of individual requests. Remembering
+ * `(part, offset)` alone loses a later, longer fetch that happens to start where
+ * an earlier short one did -- which is exactly what a page-index-filtered query
+ * followed by a full scan produces. Merging also keeps the list from growing
+ * once per fetch for the lifetime of the session.
+ */
+export function recordFetched(ranges, part, offset, len) {
+  if (!(len > 0)) return ranges;
+  let start = offset;
+  let end = offset + len;
+  // Absorb every recorded range this one touches or abuts.
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    const r = ranges[i];
+    if (r.part !== part || r.offset > end || r.offset + r.len < start) continue;
+    if (r.offset < start) start = r.offset;
+    if (r.offset + r.len > end) end = r.offset + r.len;
+    ranges.splice(i, 1);
+  }
+  ranges.push({ part, offset: start, len: end - start });
+  return ranges;
+}
+
 // --- Wire format decoding ----------------------------------------------------
 
 /**
@@ -1100,7 +1135,7 @@ export function decodeBatch(u8, schema, copy = true) {
         // whether to `JSON.parse` is left to the caller); UUID is a hyphenated hex
         // string; everything else (BLOB) is returned as raw bytes.
         if (ty === TY_VARCHAR || ty === TY_JSON) {
-          values[i] = decodeUtf8(data.subarray(s, e), 'result text value');
+          values[i] = decodeUtf8(data.subarray(s, e), 'result text value', Code.INVALID_UTF8);
         } else if (ty === TY_UUID) {
           if (e - s !== 16) wireError('invalid UUID result width');
           values[i] = formatUuid(data.subarray(s, e));
@@ -1458,6 +1493,11 @@ export class AhiruDB {
   #sessionLock = new Mutex();
   /** Number of runs that have acquired the session lock and may still call wasm. */
   #activeRuns = 0;
+  /**
+   * The run currently holding the session lock, so `close()` can take the
+   * session back from an iterator that was abandoned mid-stream.
+   */
+  #currentRun = null;
   /** Prevents close() from freeing the session twice, including deferred close. */
   #sessionFreed = false;
 
@@ -1591,23 +1631,49 @@ export class AhiruDB {
     return this.#run(sql, params, true);
   }
 
-  /** Closes the session. Later calls are errors. */
+  /**
+   * Closes the session. Later calls are errors.
+   *
+   * A `stream()` iterator that is abandoned part-way through -- `break` without
+   * `return()`, or simply dropped -- is suspended at a `yield` and never resumed,
+   * so its `finally` never runs and it would hold the session lock for the
+   * lifetime of the process. `close()` is therefore the recovery point: it takes
+   * the run's query slot and lock back. If that iterator is ever resumed it
+   * throws instead of stepping a handle this call already closed.
+   */
   close() {
     if (this.#closed) return;
     this.#closed = true;
     this.#tables.clear();
     this.#byIndex.clear();
     if (this.#ownsCache) this.#cache.clear();
-    // A query may be suspended at a source/fetch await or a stream yield. Do not
-    // free the wasm session underneath it: the ABI state is shared by the whole
-    // instance, so a later session allocation could otherwise reuse this handle
-    // while the old run is still calling query_step/query_close.
+    this.#abortCurrentRun();
+    // A query may still be suspended at a source/fetch await. Do not free the
+    // wasm session underneath it: the ABI state is shared by the whole instance,
+    // so a later session allocation could otherwise reuse this handle while the
+    // old run is still calling query_step/query_close.
     if (this.#activeRuns === 0) this.#freeSession();
+  }
+
+  /** Ends the in-flight run, if any, on close()'s behalf. */
+  #abortCurrentRun() {
+    const run = this.#currentRun;
+    if (run === null || run.finished) return;
+    run.aborted = true;
+    // Close the query here rather than leaving it to a `finally` that may never
+    // run; after this the handle is stale and the run must not touch it again.
+    if (run.q >= 0) {
+      const q = run.q;
+      run.q = -1;
+      this.#exports.ahiru_query_close(q);
+    }
+    run.finish();
   }
 
   /** How many bytes the wasm heap currently holds. */
   get heapUsed() {
-    return this.#exports.ahiru_heap_used();
+    // Unsigned: see the note in #out().
+    return this.#exports.ahiru_heap_used() >>> 0;
   }
 
   // --- Execution loop -------------------------------------------------------
@@ -1622,6 +1688,18 @@ export class AhiruDB {
     // return/throw injected at the suspended yield, which still runs this `finally`
     // (standard (async) generator semantics), so the lock is always released.
     const release = await this.#sessionLock.acquire();
+    // Everything close() needs to unwind this run from the outside. `finish` is
+    // idempotent, so whichever of the two gets there first wins.
+    const run = { q: -1, aborted: false, finished: false, finish: () => {} };
+    run.finish = () => {
+      if (run.finished) return;
+      run.finished = true;
+      if (this.#currentRun === run) this.#currentRun = null;
+      this.#activeRuns--;
+      release();
+      if (this.#closed && this.#activeRuns === 0) this.#freeSession();
+    };
+    this.#currentRun = run;
     this.#activeRuns++;
     try {
       this.#assertOpen();
@@ -1629,12 +1707,15 @@ export class AhiruDB {
       this.#assertOpen();
 
       const q = await this.#start(sql, params);
+      run.q = q;
       this.#assertOpen();
       try {
         const schema = this.#readSchema(q, sql);
         let lastSignature = null;
         for (;;) {
-          this.#assertOpen();
+          // Re-checked after every suspension point, `yield` included: close()
+          // may have taken the session away while this generator was parked.
+          this.#assertRunning(run);
           const status = this.#exports.ahiru_query_step(q);
           this.#checkMemory(sql);
           if (status === STATUS_BATCH_READY) {
@@ -1644,24 +1725,26 @@ export class AhiruDB {
           }
           if (status === STATUS_NEED_IO) {
             lastSignature = await this.#pump(decodeIoRequests(this.#out()), lastSignature, sql);
-            this.#assertOpen();
+            this.#assertRunning(run);
             continue;
           }
           if (status === STATUS_NEED_CODEC) {
             await this.#decompress(decodeCodecRequests(this.#out()), sql);
-            this.#assertOpen();
+            this.#assertRunning(run);
             continue;
           }
           if (status === STATUS_DONE) return;
           throw this.#lastError(sql);
         }
       } finally {
-        this.#exports.ahiru_query_close(q);
+        // close() already closed it (and freed the session) if it aborted us.
+        if (!run.aborted && run.q >= 0) {
+          run.q = -1;
+          this.#exports.ahiru_query_close(q);
+        }
       }
     } finally {
-      this.#activeRuns--;
-      release();
-      if (this.#closed && this.#activeRuns === 0) this.#freeSession();
+      run.finish();
     }
   }
 
@@ -1681,9 +1764,9 @@ export class AhiruDB {
       let pptr = 0;
       let h;
       try {
-        ptr = e.ahiru_alloc(bytes.length);
+        ptr = e.ahiru_alloc(bytes.length) >>> 0;
         if (ptr === 0 && bytes.length > 0) throw new AhiruError(Code.OOM, { sql });
-        pptr = pbytes.length > 0 ? e.ahiru_alloc(pbytes.length) : 0;
+        pptr = pbytes.length > 0 ? e.ahiru_alloc(pbytes.length) >>> 0 : 0;
         if (pptr === 0 && pbytes.length > 0) throw new AhiruError(Code.OOM, { sql });
         // alloc may grow memory, so re-take the view right before writing.
         const mem = new Uint8Array(this.#memory.buffer);
@@ -1751,7 +1834,7 @@ export class AhiruDB {
   /** Returns decompressed blocks to wasm. */
   #provideCodec(req, bytes, sql) {
     const e = this.#exports;
-    const ptr = e.ahiru_alloc(bytes.length);
+    const ptr = e.ahiru_alloc(bytes.length) >>> 0;
     if (ptr === 0 && bytes.length > 0) throw new AhiruError(Code.OOM, { sql });
     let rc;
     try {
@@ -1841,14 +1924,25 @@ export class AhiruDB {
       provided += this.#provide(table, part, offset, buffers[i], sql);
       // Only remote sources keep a retained copy. When codec delegation asks for a
       // compressed block, slicing it out of here avoids a refetch (memory sources just slice).
-      if (rec.source.cacheable !== false && !rec.resident.some((c) => c.part === part && c.offset === offset)) {
-        rec.resident.push({ part, offset, bytes: buffers[i] });
-        rec.fetched.push({ part, offset, len: buffers[i].byteLength });
-        // Drop oldest first, so this does not grow without bound. If a dropped range
-        // is needed later it is refetched from the cache (`#bytesAt`).
-        let held = rec.resident.reduce((a, c) => a + c.bytes.byteLength, 0);
-        while (held > this.#residentLimit && rec.resident.length > 1) {
-          held -= rec.resident.shift().bytes.byteLength;
+      if (rec.source.cacheable !== false) {
+        const len = buffers[i].byteLength;
+        // Both records are keyed by coverage, not by the (part, offset) pair
+        // alone. A page-index-filtered query fetches a short range, and the next
+        // query's longer fetch starts at the same offset; deduplicating on the
+        // start alone drops it, and `#bytesAt` then reports bytes we did fetch as
+        // never fetched (E900).
+        recordFetched(rec.fetched, part, offset, len);
+        const covered = rec.resident.some(
+          (c) => c.part === part && c.offset <= offset && offset + len <= c.offset + c.bytes.length,
+        );
+        if (!covered && len > 0) {
+          rec.resident.push({ part, offset, bytes: buffers[i] });
+          // Drop oldest first, so this does not grow without bound. If a dropped range
+          // is needed later it is refetched from the cache (`#bytesAt`).
+          let held = rec.resident.reduce((a, c) => a + c.bytes.byteLength, 0);
+          while (held > this.#residentLimit && rec.resident.length > 1) {
+            held -= rec.resident.shift().bytes.byteLength;
+          }
         }
       }
     }
@@ -1889,7 +1983,11 @@ export class AhiruDB {
         detail: `short read at ${offset}: got ${u8.byteLength} bytes, wanted ${len}`,
       });
     }
-    if (cacheable) this.#cache.set(key, u8);
+    // Never cache a zero-length body. Caching it makes the range permanently
+    // unreadable: every retry hits the cache, the source is never asked again,
+    // and the livelock detector then fails the query (and every later one, and
+    // every other instance sharing the cache) with E504.
+    if (cacheable && u8.byteLength !== 0) this.#cache.set(key, u8);
     return u8;
   }
 
@@ -1897,7 +1995,7 @@ export class AhiruDB {
   #provide(table, part, offset, bytes, sql) {
     if (bytes.byteLength === 0) return 0;
     const e = this.#exports;
-    const ptr = e.ahiru_alloc(bytes.byteLength);
+    const ptr = e.ahiru_alloc(bytes.byteLength) >>> 0;
     if (ptr === 0) throw new AhiruError(Code.OOM, { sql });
     let rc;
     try {
@@ -1980,7 +2078,7 @@ export class AhiruDB {
       rec.size = await rec.source.size();
       const e = this.#exports;
       const name = textEncoder.encode(rec.name);
-      const ptr = e.ahiru_alloc(name.length);
+      const ptr = e.ahiru_alloc(name.length) >>> 0;
       if (ptr === 0 && name.length > 0) throw new AhiruError(Code.OOM);
       let idx;
       try {
@@ -2009,8 +2107,12 @@ export class AhiruDB {
 
   /** A view of the current out buffer. Valid only until the next wasm call. */
   #out() {
-    const ptr = this.#exports.ahiru_out_ptr();
-    const len = this.#exports.ahiru_out_len();
+    // wasm hands back `usize` as a signed i32, so anything at or above 2 GiB
+    // arrives negative. `>>> 0` puts it back in the unsigned range; without it a
+    // heap that has grown past 2 GiB fails with a bare RangeError from the
+    // TypedArray constructor.
+    const ptr = this.#exports.ahiru_out_ptr() >>> 0;
+    const len = this.#exports.ahiru_out_len() >>> 0;
     return new Uint8Array(this.#memory.buffer, ptr, len);
   }
 
@@ -2020,16 +2122,28 @@ export class AhiruDB {
   }
 
   #checkMemory(sql) {
-    if (this.#memoryLimit > 0 && this.#exports.ahiru_heap_used() > this.#memoryLimit) {
+    const used = this.#exports.ahiru_heap_used() >>> 0;
+    if (this.#memoryLimit > 0 && used > this.#memoryLimit) {
       throw new AhiruError(Code.LIMIT_EXCEEDED, {
         sql,
-        detail: `wasm heap ${this.#exports.ahiru_heap_used()} > memoryLimit ${this.#memoryLimit}`,
+        detail: `wasm heap ${used} > memoryLimit ${this.#memoryLimit}`,
       });
     }
   }
 
   #assertOpen() {
     if (this.#closed) throw new AhiruError(Code.INTERNAL, { detail: 'database is closed' });
+  }
+
+  /** Fails a run that close() unwound while it was suspended. */
+  #assertRunning(run) {
+    if (run.aborted) {
+      throw new AhiruError(Code.INTERNAL, {
+        detail: 'this query was aborted by close(); a partially consumed stream() must be ' +
+          'return()ed (for-await does this) before closing',
+      });
+    }
+    this.#assertOpen();
   }
 
   #freeSession() {

@@ -36,7 +36,7 @@
 // Shared with the blocking aggregate path so window SUM/AVG over DOUBLE cannot
 // drift from the grouped ones; see `Acc::comp`.
 use crate::exec::agg::{compensated, neumaier_add};
-use crate::exec::rowkey::{encode_key, ord_f64, pow10, HashIndex};
+use crate::exec::rowkey::{encode_key, interval_key, ord_f64, pow10, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
 use crate::plan::{AggKind, SortKey, WindowKind, WindowSpec};
 use crate::prelude::*;
@@ -592,7 +592,7 @@ impl Acc {
                 let take = match &self.acc {
                     Value::Null => true,
                     a => {
-                        let c = cmp_val(&v, a);
+                        let c = cmp_val(&v, a, col.ty());
                         if kind == AggKind::Min {
                             c.is_lt()
                         } else {
@@ -638,10 +638,17 @@ impl Acc {
                 self.acc = Value::I64(c + i64::from(hit));
             }
             AggKind::Product => {
+                // DECIMAL is physically an integer scaled by 10^scale, so it has to be divided
+                // back before multiplying -- the same rule `exec::agg::as_f64_generic` applies to
+                // the grouped `product()`. Without it every factor comes out 10^scale too large.
+                let div = match col.ty() {
+                    Ty::Decimal { scale, .. } => pow10(scale),
+                    _ => 1.0,
+                };
                 let x = match col.data() {
-                    Data::I32(v) => v[row] as f64,
-                    Data::I64(v) => v[row] as f64,
-                    Data::I128(v) => v[row] as f64,
+                    Data::I32(v) => v[row] as f64 / div,
+                    Data::I64(v) => v[row] as f64 / div,
+                    Data::I128(v) => v[row] as f64 / div,
                     Data::F64(v) => v[row],
                     _ => err!(TypeMismatch),
                 };
@@ -707,9 +714,14 @@ impl Acc {
 }
 
 /// Compares two values of the same physical type. NaN is "greater than everything" (as in `exec::agg`).
-fn cmp_val(a: &Value, b: &Value) -> Ordering {
+fn cmp_val(a: &Value, b: &Value, ty: Ty) -> Ordering {
     match (a, b) {
         (Value::F64(x), Value::F64(y)) => ord_f64(*x, *y),
+        // INTERVAL compares on its normalized microsecond span (`rowkey::interval_key`),
+        // matching `exec::agg::cmp_at` and the sort comparator.
+        (Value::I128(x), Value::I128(y)) if ty == Ty::Interval => {
+            interval_key(*x).cmp(&interval_key(*y))
+        }
         // A physical type mismatch is an upstream bug. No ordering is imposed; they count as equal.
         _ => a.partial_cmp_same(b).unwrap_or(Ordering::Equal),
     }
@@ -799,7 +811,7 @@ fn cmp_keys(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
                 Ordering::Less
             };
         }
-        let mut o = cmp_data(c.data(), ai, bi);
+        let mut o = cmp_data(c, ai, bi);
         if k.desc {
             o = o.reverse();
         }
@@ -810,11 +822,13 @@ fn cmp_keys(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
     Ordering::Equal
 }
 
-fn cmp_data(d: &Data, a: usize, b: usize) -> Ordering {
-    match d {
+fn cmp_data(c: &Vector, a: usize, b: usize) -> Ordering {
+    match c.data() {
         Data::Bool(v) => v.get(a).cmp(&v.get(b)),
         Data::I32(v) => v[a].cmp(&v[b]),
         Data::I64(v) => v[a].cmp(&v[b]),
+        // INTERVAL is normalized to microseconds first, like `exec::sort::cmp_data`.
+        Data::I128(v) if c.ty() == Ty::Interval => interval_key(v[a]).cmp(&interval_key(v[b])),
         Data::I128(v) => v[a].cmp(&v[b]),
         Data::F64(v) => f64_key(v[a]).cmp(&f64_key(v[b])),
         Data::Bytes(v) => v.get(a).cmp(v.get(b)),

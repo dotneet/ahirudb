@@ -11,8 +11,9 @@ use super::agg::{
 use super::cte::CteScope;
 use super::from::{build_tree, flatten_from, full_scope, narrow_scope, rel_ranges, Rel};
 use super::refs::{
-    collect_join_refs, collect_outer_refs, collect_refs, const_program, default_name,
-    distinct_on_output_column, group_name, order_output_column, push_u32, resolve_group_ref,
+    collect_join_refs, collect_outer_refs, collect_refs, collect_refs_aliased, const_program,
+    default_name, distinct_on_output_column, group_name, order_output_column, push_u32,
+    resolve_group_ref, resolve_select_ref,
 };
 use super::subquery::{
     and_all, build_quantified_comparison, build_semijoin, classify_conjunct, collect_colrefs,
@@ -162,6 +163,58 @@ fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprI
     Ok(out)
 }
 
+/// Makes a SELECT-list alias usable in `HAVING`, as DuckDB allows:
+/// `SELECT a, sum(x) AS s FROM t GROUP BY a HAVING s > 55`.
+///
+/// HAVING is compiled against the aggregate's output scope, whose columns are named after the
+/// grouping expressions and aggregate calls, so the alias resolves nowhere. It is bound the
+/// way ORDER BY binds an alias: the reference is pointed at the output column the aliased
+/// expression already occupies, which is exactly what `subs` records. Only an alias naming
+/// something that *is* such a column resolves; an alias on a compound expression built out of
+/// them (`SELECT a + sum(x) AS z ... HAVING z > 5`) has no column of its own and stays an
+/// error, as it was before.
+///
+/// An input column of the same name wins over the alias, the same precedence
+/// `resolve_group_ref` uses for GROUP BY.
+///
+/// Must run after every grouping / aggregate / `GROUPING()` substitution has been pushed.
+fn add_having_alias_subs(
+    arena: &ExprArena,
+    scope: &Scope,
+    sel: &SelectStmt,
+    subs: &mut Vec<Substitution>,
+) -> Result<()> {
+    let Some(h) = sel.having else { return Ok(()) };
+    let mut refs = Vec::new();
+    collect_colrefs(arena, h, &mut refs, 0)?;
+    let mut found: Vec<Substitution> = Vec::new();
+    for (rid, qual, name) in refs {
+        // An input column of the name wins, and an *ambiguous* one is an error rather than
+        // a fall-through to the alias (the rule `resolve_group_ref` uses for GROUP BY).
+        if qual.is_some()
+            || !matches!(scope.resolve(None, &name), Err(e) if e.code != Code::AmbiguousColumn)
+        {
+            continue;
+        }
+        let target = resolve_select_ref(arena, sel, rid)?;
+        if target == rid {
+            continue;
+        }
+        let hit = subs.iter().rev().find(|s| {
+            if s.structural {
+                expr_eq(arena, s.expr, target)
+            } else {
+                s.expr == target
+            }
+        });
+        if let Some(s) = hit {
+            found.push(Substitution { expr: rid, column: s.column, structural: false });
+        }
+    }
+    subs.extend(found);
+    Ok(())
+}
+
 /// Makes a column reference spelled differently from its grouping expression resolve to the
 /// aggregate's grouping column.
 ///
@@ -309,7 +362,13 @@ pub(super) fn bind_select_in(
                     collect_refs(arena, &scope_all, e, &mut refs)?;
                 }
             }
-            _ => collect_refs(arena, &scope_all, item.expr, &mut refs)?,
+            // `alias_ok = false`: a bare name in a select item is an input column, except
+            // inside `GROUPING()`, which `collect_refs_aliased` handles on its own.
+            // `None` for the outer scope keeps this as strict as the plain `collect_refs`
+            // it replaces.
+            _ => {
+                collect_refs_aliased(arena, sel, &scope_all, None, item.expr, false, &mut refs, 0)?
+            }
         }
     }
     // A named window (`OVER w`) keeps the substance of its `PARTITION BY`/`ORDER BY` outside
@@ -343,12 +402,16 @@ pub(super) fn bind_select_in(
             }
         }
     }
-    for e in [sel.filter, sel.having].into_iter().flatten() {
+    if let Some(e) = sel.filter {
         // In a correlated subquery, WHERE may contain outer-scope column references.
         // This is only collecting columns for projection pushdown, so references resolvable in
         // the outer scope are silently excluded from pushdown (extracting the correlated
         // equality predicates themselves happens in the later WHERE decomposition).
         collect_refs_tolerant(arena, &scope_all, outer_scope, e, &mut refs)?;
+    }
+    if let Some(e) = sel.having {
+        // Same as WHERE, except that a bare name in HAVING may also be a SELECT-list alias.
+        collect_refs_aliased(arena, sel, &scope_all, outer_scope, e, true, &mut refs, 0)?;
     }
     for e in &group_by {
         // Resolve `GROUP BY 1` / `GROUP BY alias` to the select-list expression
@@ -928,6 +991,7 @@ pub(super) fn bind_select_in(
             check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
         add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &mut subs)?;
+        add_having_alias_subs(arena, &scope, sel, &mut subs)?;
 
         let agg_scope = Scope::from_fields(out_fields.clone());
         let having = match sel.having {
@@ -1031,6 +1095,7 @@ pub(super) fn bind_select_in(
             out_fields.push(Field::new(default_name(arena, gc), Ty::BigInt, false));
             subs.push(Substitution { expr: gc, column: base_cols + k, structural: true });
         }
+        add_having_alias_subs(arena, &scope, sel, &mut subs)?;
 
         // HAVING is evaluated against the final schema, once the grouping columns, aggregate
         // results, and GROUPING() constants are all present. It is not embedded into each set's
@@ -1391,7 +1456,10 @@ pub(super) fn bind_select_in(
         }
     }
     for o in &sel.order_by {
-        let col = match order_output_column(arena, sel, o, &schema)? {
+        // Only the projected columns are addressable. Everything appended after them
+        // (correlation keys, QUALIFY helpers, earlier ORDER BY sort keys) is an
+        // implementation detail that `ORDER BY <ordinal>` must not be able to reach.
+        let col = match order_output_column(arena, sel, o, &schema[..projected])? {
             Some(c) => c,
             None => {
                 let p = compile_with_subs(arena, &item_scope, params, &subs, o.expr)?;
@@ -1410,7 +1478,7 @@ pub(super) fn bind_select_in(
     // the input's order (confirmed with DuckDB: without ORDER BY, arrival order is "the first row").
     let mut distinct_on_cols: Vec<usize> = Vec::with_capacity(sel.distinct_on.len());
     for &on_expr in &sel.distinct_on {
-        let col = match distinct_on_output_column(arena, sel, on_expr, &schema) {
+        let col = match distinct_on_output_column(arena, sel, on_expr, &schema[..projected]) {
             Some(c) => c,
             None => {
                 let p = compile_with_subs(arena, &item_scope, params, &subs, on_expr)?;

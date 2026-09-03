@@ -9,7 +9,7 @@ use super::agg::narrow_unnest_elem_ty;
 use super::cte::MAX_VIEW_DEPTH;
 use super::cte::{CteScope, ResolvedCte};
 use super::pruning::extract_pruners;
-use super::refs::each_child;
+use super::refs::each_child_flat;
 use super::subquery::{and_all, equi_key, split_conjuncts, unify_key_types};
 use super::*;
 
@@ -432,7 +432,13 @@ pub(super) fn build_tree(
                         schema: schema.clone(),
                     };
                     if !per_rel[*ri].is_empty() {
-                        let joined = Scope::from_fields(schema);
+                        // The predicate scope has to keep the qualifiers, or a pushed-down
+                        // `WHERE u.x > 1` would fail to resolve (`Scope::from_fields` drops
+                        // them, leaving `u` looking like an unknown table). It mirrors
+                        // `schema` exactly: the left sibling's columns, then the UNNEST
+                        // element column under the UNNEST relation's alias.
+                        let mut joined = lscope.clone();
+                        joined.push(qual_of(&rels[*ri]), schema[lscope.len()].clone());
                         let pred = and_all(arena, &joined, params, &[], &per_rel[*ri])?;
                         node = Node::Filter { input: Box::new(node), pred };
                     }
@@ -651,7 +657,7 @@ fn referenced_in_expr(
             Ok(())
         }
         Expr::Lambda { body, .. } => referenced_in_expr(catalog, arena, *body, out, d),
-        _ => each_child(arena, id, &mut |c| referenced_in_expr(catalog, arena, c, out, d)),
+        _ => each_child_flat(arena, id, &mut |c| referenced_in_expr(catalog, arena, c, out, d)),
     }
 }
 

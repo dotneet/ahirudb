@@ -157,7 +157,7 @@ readable anywhere (there are DuckDB cross-checks in
 `crates/ahiru-cli/tests/copy.rs`) — it is just larger and less prunable
 than what a full-featured writer would produce.
 
-SQL types map to their natural Parquet types, with two deliberate
+SQL types map to their natural Parquet types, with three deliberate
 exceptions:
 
 - **INTERVAL** is written as text (`1 year 2 months 3 days 01:02:03`, the
@@ -173,6 +173,14 @@ exceptions:
   `DOUBLE`, so this mapping is the more faithful of the two in range as
   well as in exactness — it just refuses the last fraction of the type's
   domain instead of silently rounding it.)
+- A **`VARCHAR` column whose values are not valid UTF-8** is written
+  without the `STRING`/`UTF8` annotation, as a plain `BYTE_ARRAY`, and
+  reads back as `BLOB`. This engine lets a `VARCHAR` hold arbitrary bytes
+  (a CSV field is read byte for byte, and `unhex`/`decode` return raw
+  bytes), but the annotation is a promise strict readers check — DuckDB
+  rejects the whole file over a single bad byte. Dropping it for that one
+  column keeps every byte exact and keeps the file readable. Columns whose
+  values *are* valid UTF-8 are unaffected, in the same file.
 
 The full table is in the module doc of
 `crates/ahiru-core/src/write/parquet/mod.rs`.
@@ -182,6 +190,12 @@ runs the query to completion in memory and hands the resulting bytes plus
 the destination path back to the host, which performs the actual file
 write. In the native CLI this happens automatically; a JS host would do
 the equivalent via its own file-write API.
+
+Writing over a file the same session has already read is safe in the CLI:
+after the write it re-reads every table backed by that path, so the next
+`SELECT` sees the new contents rather than the bytes cached at
+registration time. A host that does its own file writes has to invalidate
+its own registrations the same way.
 
 ### JSONL output
 
@@ -195,6 +209,21 @@ worth knowing about:
   a bare `NaN` token would make the file unparseable by any strict reader.
   The cost is that such a column reads back as `VARCHAR` rather than
   `DOUBLE` — again in both engines, so the file round-trips through either.
+
+A **`FLOAT`** is written at `FLOAT` precision in both formats — `1.1`, not
+the `1.100000023841858` that spelling out the widened `DOUBLE` would give
+(see [types.md](types.md#cast-and-try_cast)). DuckDB's CSV writer does the
+same; its JSON writer does not, so a JSONL export of a `FLOAT` column is one
+of the few places these two deliberately differ.
+
+### CSV output
+
+Non-finite `DOUBLE`s are written bare as `NaN`, `inf` and `-inf`. The short
+spelling of the infinities is what DuckDB's CSV writer emits; the longhand
+`Infinity` this used to write is sniffed as a `DATE` column by DuckDB's CSV
+*reader*, which silently lost the values on re-import. This engine's reader
+accepts either spelling, so files written before the change still read back
+as `DOUBLE`.
 
 ```sql
 COPY (SELECT CAST('1.25' AS DECIMAL(5,2)) AS d, 'nan'::DOUBLE AS n FROM range(1))

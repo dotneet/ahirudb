@@ -17,6 +17,7 @@ export const Code = Object.freeze({
   BAD_PAGE_HEADER: 105,
   BAD_COMPRESSED_DATA: 106,
   CHECKSUM_MISMATCH: 107,
+  INVALID_UTF8: 108,
 
   // 2xx: unsupported Parquet features
   UNSUPPORTED_ENCODING: 200,
@@ -71,6 +72,7 @@ const MESSAGES = Object.freeze({
   105: 'malformed page header',
   106: 'malformed compressed data',
   107: 'page checksum mismatch',
+  108: 'invalid UTF-8 in string data',
   200: 'unsupported parquet encoding',
   201: 'unsupported compression codec',
   202: 'unsupported parquet type',

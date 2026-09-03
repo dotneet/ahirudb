@@ -46,12 +46,23 @@ When two different numeric types meet in an expression (`a + b`, `a = b`,
 them in:
 
 - `NULL` unifies with anything, becoming the other side's type.
+- A **signed** integer combined with an **unsigned** one unifies to the
+  smallest *signed* type that holds both domains, regardless of which side
+  is written first (matching DuckDB): `TINYINT`+`UTINYINT` → `SMALLINT`,
+  `SMALLINT`+`USMALLINT` → `INTEGER`, `INTEGER`+`UINTEGER` → `BIGINT`,
+  `BIGINT`+`UBIGINT` → `HUGEINT`. When the signed side is already wide
+  enough it simply wins (`BIGINT`+`UTINYINT` → `BIGINT`). Neither operand's
+  own type could hold the other's whole range, so this is what keeps
+  `0::UTINYINT + (-1)::TINYINT` at `-1` and `1::UBIGINT > (-1)::BIGINT`
+  true.
 - Otherwise the narrower type widens to the wider one, in this order:
   `BOOLEAN < TINYINT/UTINYINT < SMALLINT/USMALLINT < INTEGER/UINTEGER <
   BIGINT/UBIGINT < DECIMAL < HUGEINT < FLOAT < DOUBLE < DATE < TIME <
   TIMESTAMP < TIMESTAMPTZ < VARCHAR < BLOB`. This ordering does **not**
   decide a `DECIMAL`-with-integer pair, even though `HUGEINT` outranks
-  `DECIMAL` in it: the `DECIMAL` rule below is checked first and wins.
+  `DECIMAL` in it: the `DECIMAL` rule below is checked first and wins. Nor
+  does it decide a signed/unsigned pair — the two share a rank there, and
+  the rule above is checked first.
 - A `DECIMAL` combined with another `DECIMAL` — or with an **integer**,
   which counts as a `DECIMAL` of scale 0 — unifies to a `DECIMAL` wide
   enough for both: the new precision is
@@ -85,6 +96,24 @@ them in:
   `CAST('...' AS UUID)` — ahirudb doesn't implicitly coerce a bare string
   literal the way DuckDB does (consistent with how `WHERE date_col =
   '2024-01-01'` already requires an explicit `CAST(... AS DATE)` here).
+
+`DECIMAL` **multiplication and division do not use the common type above**,
+because the scale changes:
+
+- `*` **adds** the scales and the precisions: `DECIMAL(4,1) * DECIMAL(3,2)`
+  is `DECIMAL(7,3)`, so `1.5 * 1.25` is `1.875` and not `1.88`. The
+  precision is capped at 38 (as in DuckDB: `DECIMAL(20,2) * DECIMAL(19,2)`
+  is `DECIMAL(38,4)`), but a product whose **scale** would exceed 38 is an
+  error (`ValueOutOfRange`) rather than a silently truncated type — again
+  matching DuckDB. Cast an operand to `DOUBLE`, or to a `DECIMAL` with a
+  smaller scale, when you hit it:
+
+  ```sql
+  SELECT 0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20);          -- error: scale 40 > 38
+  SELECT 0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20)::DOUBLE;  -- 0.0001
+  ```
+- `/` always falls to `DOUBLE` (as in DuckDB). Integer division of the raw
+  scaled values would subtract the scales and lose every fractional digit.
 
 A plain (unsuffixed) integer literal is `INTEGER` if it fits, else `BIGINT`,
 else `HUGEINT`.
@@ -215,9 +244,12 @@ it needs to be explicit:
 
 - Casting a float to an integer type rounds to the **nearest even**
   (`CAST(1.5 AS INTEGER)` → `2`, `CAST(4.5 AS INTEGER)` → `4`).
-- Reducing a `DECIMAL`'s scale rounds **away from zero**
-  (`CAST(1.235 AS DECIMAL(10,2))` → `1.24`), so monetary rounding doesn't
-  systematically under-round.
+- Casting to a `DECIMAL` rounds **away from zero** at every scale, whether it
+  is reducing an existing `DECIMAL`'s scale (`CAST(1.235 AS DECIMAL(10,2))` →
+  `1.24`) or coming from a float (`CAST(2.5 AS DECIMAL(3,0))` → `3`, not the
+  `2` a float-to-*integer* cast gives). Monetary rounding therefore doesn't
+  systematically under-round, and `DECIMAL(p, 0)` follows the same rule as
+  every other scale of the same type. DuckDB draws the line in the same place.
 - Integer arithmetic overflow **wraps** (no error), except `SUM`, which
   accumulates in a 128-bit integer internally and only errors
   (`ValueOutOfRange`) if that itself overflows, and `factorial`/`!`, which
@@ -257,10 +289,17 @@ it needs to be explicit:
   SELECT CAST(CAST('inf'::DOUBLE AS VARCHAR) AS DOUBLE);    -- inf (infinite)
   ```
 
-  These are deliberately *not* the spellings the CSV/JSONL writers use.
-  Those write the values out longhand as `NaN`, `Infinity`, `-Infinity`
-  (quoted, in the JSONL case); see
-  [ddl-dml.md](ddl-dml.md#jsonl-output).
+  The CSV writer spells the infinities the same way (`inf`, `-inf`, matching
+  DuckDB's own CSV output) but writes `NaN` rather than `nan`. The JSONL
+  writer has to quote all three, and writes them longhand as `"NaN"`,
+  `"Infinity"`, `"-Infinity"`; see [ddl-dml.md](ddl-dml.md#jsonl-output).
+
+- A **`FLOAT`** casts to the shortest text that round-trips through `FLOAT`,
+  not through `DOUBLE`: `CAST(1.1::FLOAT AS VARCHAR)` is `'1.1'`, not the
+  `'1.100000023841858'` that spelling out the widened `DOUBLE` would give.
+  The same goes for how a `FLOAT` displays in the CLI and how it is written
+  by `COPY ... TO` in CSV and JSONL. (DuckDB agrees everywhere except its
+  own JSON writer, which prints the widened `DOUBLE` there.)
 
 ## Typed date/time literals
 
@@ -319,6 +358,23 @@ moved). Displaying one back out looks like:
 ```
 1 year 2 months 3 days 01:02:03
 ```
+
+**Comparing** two intervals flattens those three components with DuckDB's
+fixed conversions — **1 month = 30 days** and **1 day = 24 hours** — and
+compares the resulting microsecond spans. There is no anchor date in a
+comparison, so there is nothing to ask how long "one month" really is; only
+adding an interval to a `DATE`/`TIMESTAMP` uses real calendar arithmetic.
+The normalization applies everywhere a value is compared or keyed:
+
+```sql
+SELECT INTERVAL 1 DAY = INTERVAL 24 HOUR;   -- true
+SELECT INTERVAL 1 MONTH = INTERVAL 30 DAY;  -- true
+-- ORDER BY, DISTINCT, GROUP BY, UNION, equi-joins and min/max agree:
+-- 23:00:00 < 1 day < 25:00:00
+```
+
+`<`, `<=`, `>` and `>=` between two intervals are not accepted yet
+(`ORDER BY` on an interval column works).
 
 ## UUID
 

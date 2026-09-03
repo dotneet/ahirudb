@@ -83,10 +83,24 @@ fn replace_tables(sql: &str, files: &[&str]) -> String {
             i = j;
             continue;
         }
-        out.push(b[i] as char);
-        i += 1;
+        // Copy a whole UTF-8 sequence, not one byte cast to `char`: the byte
+        // cast would turn every non-ASCII character into mojibake before
+        // DuckDB saw the query.
+        let n = utf8_len(b[i]);
+        out.push_str(&sql[i..i + n]);
+        i += n;
     }
     out
+}
+
+/// Length in bytes of the UTF-8 sequence that starts with `lead`.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
 }
 
 fn parse(text: &str, sep: char) -> Vec<Vec<String>> {
@@ -495,6 +509,84 @@ e2e!(
     ]
 );
 
+// INTERVAL is three components packed into one i128, and comparing that bit pattern made
+// `1 day` and `24 hours` different values in every place a key is built. DuckDB normalizes
+// with 1 month = 30 days and 1 day = 24 hours; these queries pin that down across the
+// equi-join, `ORDER BY`, `UNION` (DISTINCT) and `min`/`max` paths at once.
+e2e!(
+    interval_comparison_is_normalized,
+    "tests/data/basic.parquet",
+    [
+        "SELECT count(*) FROM (SELECT INTERVAL 1 DAY AS x FROM t WHERE id = 1) a \
+         JOIN (SELECT INTERVAL 24 HOUR AS x FROM t WHERE id = 1) b ON a.x = b.x",
+        "SELECT CAST(x AS VARCHAR) FROM (\
+           SELECT INTERVAL 25 HOUR AS x FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 1 DAY FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 23 HOUR FROM t WHERE id = 1) s ORDER BY x",
+        "SELECT count(*) FROM (SELECT INTERVAL 1 MONTH AS x FROM t WHERE id = 1 \
+         UNION SELECT INTERVAL 30 DAY FROM t WHERE id = 1) s",
+        "SELECT CAST(min(x) AS VARCHAR), CAST(max(x) AS VARCHAR) FROM (\
+           SELECT INTERVAL 25 HOUR AS x FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 1 DAY FROM t WHERE id = 1 \
+           UNION ALL SELECT INTERVAL 23 HOUR FROM t WHERE id = 1) s",
+    ]
+);
+
+// The window `product()` used to multiply DECIMAL's raw scaled integers, and `unnest` pinned
+// its element type to BIGINT so an integer past i64 came back NULL.
+e2e!(
+    window_product_and_unnest_element_types,
+    "tests/data/basic.parquet",
+    [
+        "SELECT CAST(product(CAST(score AS DECIMAL(6,2))) OVER (ORDER BY id) AS VARCHAR) \
+         FROM t WHERE id BETWEEN 1 AND 4 ORDER BY id",
+        "SELECT CAST(unnest([1, 9223372036854775808]) AS VARCHAR) FROM t WHERE id = 1",
+    ]
+);
+
+e2e!(
+    regex_escapes_and_stray_braces,
+    "tests/data/basic.parquet",
+    [
+        // A `{` that does not form a valid `{n,m}` is a literal, in RE2 and here.
+        "SELECT regexp_matches('a{x','a{x'), regexp_matches('ax','a{x'), regexp_replace('a{b','a{','Z'), regexp_matches('a{','a*{'), regexp_matches('a{','a+{'), regexp_matches('a{,2}','a{,2}') FROM t LIMIT 1",
+        // RE2 escapes: control characters, hex, text anchors, escaped punctuation.
+        // (`\t` itself is spelled `\x09` here: the harness substitutes the bare word `t`
+        // with the file path, which would corrupt the pattern. The unit tests cover `\t`.)
+        "SELECT regexp_matches(chr(9),'\\x09'), regexp_matches(chr(11),'\\v'), regexp_matches('a','\\x61'), regexp_matches('a','\\Aa\\z'), regexp_matches('/','\\/'), regexp_matches('-','\\-'), regexp_matches(chr(9),'[\\x09]') FROM t LIMIT 1",
+        // A repeated flag letter is accepted.
+        "SELECT regexp_replace('aXbXc','X','-','gg'), regexp_replace('aXbXc','X','-','g') FROM t LIMIT 1",
+        // SIMILAR TO / `~` anchor the whole alternation.
+        "SELECT 'abc' SIMILAR TO 'a.c', 'Xabc' SIMILAR TO 'a.c', 'a' ~ 'a|b', 'ab' ~ 'a|b' FROM t LIMIT 1",
+    ]
+);
+
+e2e!(
+    datetime_parts_and_text_casts,
+    "tests/data/basic.parquet",
+    [
+        // date_trunc/date_diff use `year / 100`, date_part uses the 1-based century.
+        // (the extra `AS DATE` hop only papers over date_trunc's documented return type:
+        // DuckDB gives DATE back for a DATE input, this engine always gives TIMESTAMP.)
+        "SELECT CAST(CAST(date_trunc('century', DATE '2024-05-05') AS DATE) AS VARCHAR), CAST(CAST(date_trunc('century', DATE '1900-12-31') AS DATE) AS VARCHAR), CAST(CAST(date_trunc('millennium', DATE '2024-05-05') AS DATE) AS VARCHAR), CAST(CAST(date_trunc('isoyear', DATE '2024-12-30') AS DATE) AS VARCHAR) FROM t LIMIT 1",
+        "SELECT date_part('century', DATE '2024-05-05'), date_part('millennium', DATE '2024-05-05'), date_part('isoyear', DATE '2024-12-30'), date_diff('century', DATE '1900-01-01', DATE '2024-01-01'), date_diff('millennium', DATE '1999-01-01', DATE '2024-01-01') FROM t LIMIT 1",
+        // DuckDB's short part-name aliases.
+        "SELECT date_part('y', DATE '2024-05-05'), date_part('mon', DATE '2024-05-05'), date_part('d', DATE '2024-05-05'), date_part('w', DATE '2024-05-05'), date_part('c', DATE '2024-05-05'), date_part('mil', DATE '2024-05-05'), date_part('weekday', DATE '2024-05-05'), date_part('centuries', DATE '2024-05-05') FROM t LIMIT 1",
+        "SELECT date_part('min', TIMESTAMP '2024-05-05 01:02:03'), date_part('sec', TIMESTAMP '2024-05-05 01:02:03'), date_part('hrs', TIMESTAMP '2024-05-05 01:02:03'), date_part('m', TIMESTAMP '2024-05-05 01:02:03') FROM t LIMIT 1",
+        // Text -> DATE/TIMESTAMP shapes DuckDB accepts.
+        "SELECT CAST('2024-01-01T00:00:00' AS DATE), CAST('2024-01-01 10:00:00' AS DATE), CAST('2024-01-01  10:00:00' AS TIMESTAMP), CAST('2024-01-01 10:00:00.' AS TIMESTAMP), CAST('2024-01-01 10:00:00 UTC' AS TIMESTAMP), CAST('2024-01-01 10:00:00Z' AS TIMESTAMP) FROM t LIMIT 1",
+    ]
+);
+
+e2e!(
+    json_integer_path_is_an_array_subscript,
+    "tests/data/basic.parquet",
+    [
+        "SELECT '[1,2]' -> 0, '[1,2]' -> 1, '[1,2]' ->> -1, json_extract('[1,2]', 1), '[1,2]' -> 2 FROM t LIMIT 1",
+        "SELECT '{\"0\":5}' -> 0, '{\"0\":5}' -> '0', '[1,2]' -> '$[0]' FROM t LIMIT 1",
+    ]
+);
+
 /// `DISTINCT ON` without `ORDER BY` keeps "the first row in arrival order".
 /// DuckDB follows the same rule, but which row counts as "first in arrival order"
 /// depends on the scan implementation (page read order and so on), so cross-checking
@@ -614,6 +706,119 @@ e2e!(
     ]
 );
 
+// `%` in a LIKE pattern used to be matched literally whenever the subject byte
+// at the same position was `%` too -- and, because the wildcard branch was then
+// skipped, no backtrack point was recorded either, so `'50% off' LIKE '50%'`
+// came back false.
+e2e!(
+    like_percent_against_percent_in_the_subject,
+    "tests/data/basic.parquet",
+    [
+        "SELECT '50% off' LIKE '50%', '%abc' LIKE '%bc', '%%' LIKE '%', '%ABC' ILIKE '%bc' FROM t LIMIT 1",
+        "SELECT '50% off' LIKE '50!%%' ESCAPE '!', '50% off' LIKE '50!%' ESCAPE '!', '%abc' LIKE '!%%' ESCAPE '!', 'xabc' LIKE '!%%' ESCAPE '!' FROM t LIMIT 1",
+        // `_` and an escaped `_` still behave, next to the reordered `%` branch.
+        // (Non-ASCII literals are avoided here: `replace_tables` rebuilds the SQL
+        // byte-by-byte as `char`, which mangles multibyte text before DuckDB sees
+        // it. The multibyte cases are covered by
+        // `ahiru-core/tests/kernel_type_fixes.rs` instead.)
+        "SELECT '%a' LIKE '%_', 'a_c' LIKE 'a_c', 'abc' LIKE 'a!_c' ESCAPE '!', 'a_c' LIKE 'a!_c' ESCAPE '!' FROM t LIMIT 1",
+    ]
+);
+
+// A signed and an unsigned integer type of the same width shared a rank in
+// `Ty::unify`, so the tie-break kept the left operand's type and cast the other
+// side's valid values to NULL. They now widen to the smallest signed type that
+// covers both, whichever order they are written in.
+e2e!(
+    signed_and_unsigned_integer_mixing,
+    "tests/data/basic.parquet",
+    [
+        "SELECT 0::UTINYINT + (-1)::TINYINT, 1::UBIGINT = (-1)::BIGINT, 1::UBIGINT > (-1)::BIGINT FROM t LIMIT 1",
+        "SELECT 100::TINYINT + 200::UTINYINT, 200::UTINYINT + 100::TINYINT FROM t LIMIT 1",
+        "SELECT 1::UBIGINT < (-1)::BIGINT, (-1)::BIGINT < 1::UBIGINT FROM t LIMIT 1",
+        "SELECT (-1)::TINYINT IN (255::UTINYINT, (-1)::TINYINT), 300::USMALLINT IN (300::SMALLINT) FROM t LIMIT 1",
+        "SELECT 18446744073709551615::UBIGINT + 0::BIGINT, (-1)::INTEGER + 1::UINTEGER FROM t LIMIT 1",
+    ]
+);
+
+// DECIMAL `*` adds the operands' scales, but the VM used to relabel the result
+// with `Ty::unify`'s `max(s1, s2)` -- rendering the raw product 10^min(s1,s2)
+// times too large everywhere the text form is produced.
+e2e!(
+    decimal_multiplication_scale,
+    "tests/data/basic.parquet",
+    [
+        "SELECT (1.5::DECIMAL(4,1) * 1.25::DECIMAL(3,2))::VARCHAR FROM t LIMIT 1",
+        "SELECT (1.5::DECIMAL(4,1) * 2)::VARCHAR, (2.5::DECIMAL(4,1) * 0.5::DECIMAL(3,2))::VARCHAR FROM t LIMIT 1",
+        // Precision past 38 still just clamps, as in DuckDB.
+        "SELECT (1.5::DECIMAL(20,2) * 2.5::DECIMAL(19,2))::VARCHAR FROM t LIMIT 1",
+    ]
+);
+
+// FLOAT is held in the same `f64` register as DOUBLE, so it used to be rendered with
+// `f64`'s shortest round trip and printed every digit of the widened value
+// (`1.1::FLOAT` -> `1.100000023841858`). The results are wrapped in brackets so
+// `normalize_cell` compares them as text rather than re-parsing them as floats and
+// normalising the very difference under test away.
+e2e!(
+    float_renders_at_f32_precision,
+    "tests/data/basic.parquet",
+    [
+        "SELECT '[' || (1.1::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (0.1::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (1e16::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (1e-5::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (1e15::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || (3.4028235e38::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || ('inf'::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || ('nan'::FLOAT)::VARCHAR || ']' FROM t LIMIT 1",
+        // The DOUBLE spelling of the same values is unchanged.
+        "SELECT '[' || (1.1::DOUBLE)::VARCHAR || ']' FROM t LIMIT 1",
+    ]
+);
+
+// Exact integer and decimal semantics for the numeric functions: these all used to be
+// computed in DOUBLE, which rounded everything above 2^53 and turned exact decimal
+// rounding into binary rounding.
+e2e!(
+    numeric_functions_stay_exact_on_hugeint_and_decimal,
+    "tests/data/basic.parquet",
+    [
+        "SELECT mod(170141183460469231731687303715884105727::HUGEINT, 10) FROM t LIMIT 1",
+        "SELECT abs(-170141183460469231731687303715884105727::HUGEINT) FROM t LIMIT 1",
+        "SELECT abs(18446744073709551615::UBIGINT) FROM t LIMIT 1",
+        "SELECT mod(-7::HUGEINT, 3), mod(7::HUGEINT, -3) FROM t LIMIT 1",
+        "SELECT '[' || round(1.005::DECIMAL(4,3), 2)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || round(-1.005::DECIMAL(4,3), 2)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || round(1.5::DECIMAL(4,3), 5)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || mod(123456789012.345::DECIMAL(15,3), 1)::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || abs(-12.34::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || ceil(1.5::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || floor(-1.9::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT '[' || trunc(-1.9::DECIMAL(4,2))::VARCHAR || ']' FROM t LIMIT 1",
+        "SELECT sign(-1.5::DECIMAL(4,2)), sign(0.0::DECIMAL(4,2)) FROM t LIMIT 1",
+        "SELECT round(12345::BIGINT, -2), round(-12345::BIGINT, -2) FROM t LIMIT 1",
+    ]
+);
+
+// The remaining scalar-function and cast corrections in this group.
+e2e!(
+    scalar_function_corner_cases,
+    "tests/data/basic.parquet",
+    [
+        "SELECT ascii('') FROM t LIMIT 1",
+        "SELECT '[' || split_part('abc', '', 2) || ']' FROM t LIMIT 1",
+        "SELECT '[' || split_part('abc', '', -1) || ']' FROM t LIMIT 1",
+        "SELECT '[' || split_part('abc', '', 9) || ']' FROM t LIMIT 1",
+        "SELECT pow(-2, 1025), pow(-2, 2000), pow(2, 1025) FROM t LIMIT 1",
+        "SELECT pow(1, 'nan'::DOUBLE), pow(1.5, 0) FROM t LIMIT 1",
+        "SELECT CAST(2.5::DOUBLE AS DECIMAL(3,0)), CAST(-2.5::DOUBLE AS DECIMAL(3,0)) FROM t LIMIT 1",
+        "SELECT CAST(0.5::DOUBLE AS DECIMAL(3,0)), CAST(1.5::DOUBLE AS DECIMAL(3,0)) FROM t LIMIT 1",
+        // Integer casts keep round-half-to-even, which is what DuckDB does there.
+        "SELECT CAST(2.5::DOUBLE AS INTEGER), CAST(3.5::DOUBLE AS INTEGER) FROM t LIMIT 1",
+    ]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // Rewriting the t inside `t2` or `text` would break the SQL being compared.
@@ -638,3 +843,23 @@ fn cell_normalisation() {
     assert_ne!(normalize_cell("1.5"), normalize_cell("1.6"));
     assert_eq!(normalize_cell("\"abc\""), "abc");
 }
+
+e2e!(
+    binder_fixes,
+    "tests/data/basic.parquet",
+    [
+        // A qualified predicate on an implicit-LATERAL UNNEST column. The table needs an
+        // alias here because `check` rewrites the bare name `t` into a file path.
+        "SELECT u.x FROM t AS s, UNNEST([1,2,3]) AS u(x) WHERE u.x > 1 AND s.id = 0 ORDER BY 1",
+        "SELECT s.id, u.x FROM t AS s, UNNEST([10,20]) AS u(x) \
+         WHERE u.x = 20 AND s.id < 3 ORDER BY 1",
+        // GROUPING() naming a select-list alias.
+        "SELECT id % 2 AS m, count(*), grouping(m) FROM t \
+         GROUP BY GROUPING SETS ((m), ()) ORDER BY 1 NULLS FIRST",
+        // A select-list alias used in HAVING.
+        "SELECT id % 2 AS a, sum(id) AS s FROM t GROUP BY a HAVING s > 249600 ORDER BY 1",
+        "SELECT id % 3 AS m, count(*) AS c FROM t GROUP BY m HAVING m = 1",
+        "SELECT id % 2 AS m, count(*) AS c FROM t \
+         GROUP BY GROUPING SETS ((m), ()) HAVING c > 600 ORDER BY 1 NULLS FIRST",
+    ]
+);

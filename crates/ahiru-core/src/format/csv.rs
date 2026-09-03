@@ -6,12 +6,18 @@
 //! 1. Split into fixed-length byte chunks, cutting I/O at split boundaries
 //! 2. Skip **converting** columns that are not projected (scanning is needed regardless)
 //!
-//! The schema is inferred from the leading `SAMPLE_BYTES`, so later rows can fall outside it.
+//! The schema is inferred from the leading `SAMPLE_BYTES` (grown up to `MAX_SAMPLE_BYTES` when
+//! that does not hold one complete record), so later rows can fall outside it.
 //! A value that falls outside is an error (`InvalidCast`), not a silent NULL: turning it into
 //! NULL would drop data the file plainly contains, which is exactly the "silently wrong answer"
 //! `docs/DESIGN.md` §15 says the engine never produces. DuckDB reports the same situation as a
 //! conversion error. An empty (unquoted) field keeps its NULL meaning, since that is the only way
 //! CSV can spell NULL at all.
+//!
+//! The same rule governs malformed records: a row with **more** fields than the header, and any
+//! byte between a closing quote and the next delimiter / line terminator, are `SyntaxError` rather
+//! than data silently thrown away. A row with **fewer** fields is NULL-padded (DuckDB's
+//! `null_padding`), since nothing is lost by doing so.
 //!
 //! Splitting a file that uses RFC 4180 quoting is unsafe in general: an embedded `\n` inside a
 //! quoted field is not a record boundary, but a fixed-size split cut has no way to know, from its
@@ -33,6 +39,14 @@ use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 ///
 /// The larger it is the better the inference, but the first query's wait grows accordingly.
 const SAMPLE_BYTES: u64 = 256 * 1024;
+
+/// The ceiling the inference sample may grow to when [`SAMPLE_BYTES`] holds no complete record.
+///
+/// A header (or a first data record) longer than the sample used to be either `LimitExceeded` or
+/// -- worse -- an inference that saw no row at all and made every column VARCHAR. Growing the
+/// request until one whole record fits fixes both. The ceiling is `TEXT_MAX_RECORD`, the longest
+/// record the reader accepts anyway, so nothing is gained by asking for more.
+const MAX_SAMPLE_BYTES: u64 = TEXT_MAX_RECORD;
 
 /// The maximum number of rows used for type inference. The sample bytes may run out first.
 const SAMPLE_ROWS: usize = 1000;
@@ -71,18 +85,28 @@ pub struct CsvFormat {
     /// to be read as a single split, which sidesteps the ambiguity entirely (at the cost of the
     /// per-split I/O parallelism, per `docs/sql/limitations.md`).
     quoted_sample: bool,
-    /// Set in `resolve` when the leading sample contains a `\r` but no `\n` at all: a file written
-    /// with classic Mac (CR-only) line endings.
+    /// Set in `resolve` when a **lone** `\r` (one not followed by `\n`) is found outside the
+    /// CRLF pairs: either a file written with classic Mac (CR-only) line endings, or one that
+    /// mixes terminators. When it is set, a lone `\r` terminates a record (see `Scanner::cr_term`).
     ///
-    /// Such a file used to be read as one giant record -- a garbage header and zero data rows, with
-    /// no error at all. When this is set, a lone `\r` terminates a record (see `Scanner::cr_term`).
+    /// A CR-only file used to be read as one giant record -- a garbage header and zero data rows,
+    /// with no error at all. A *mixed* file (`1,2\r\n3,4\r5,6\n`) was worse: the lone `\r` was
+    /// ordinary data, so two records silently merged into one. DuckDB refuses to sniff such a file
+    /// at all; treating the lone `\r` as a terminator is what its `strict_mode=false` reading does,
+    /// and it never merges records.
     ///
     /// Like `quoted_sample` it also forces the file to be read as a single split: `read_split`'s
-    /// boundary resynchronization scans for `\n`, which a CR-only file never contains, so every
-    /// split past the first would otherwise resolve to "no record starts here" and silently drop
-    /// its rows. A file that has any `\n` keeps the RFC 4180 reading exactly as before, so CRLF and
-    /// a `\r` inside a quoted field are unaffected.
-    cr_only: bool,
+    /// boundary resynchronization scans for `\n`, so a record that starts after a lone `\r` would
+    /// otherwise be missed (and a CR-only file, having no `\n` at all, would drop every split past
+    /// the first). A file whose only `\r` bytes are the CRLF halves keeps the RFC 4180 reading
+    /// exactly as before, so pure-CRLF files and a `\r` inside a quoted field are unaffected.
+    cr_term: bool,
+    /// How many leading bytes the schema inference has asked for so far. Starts at
+    /// [`SAMPLE_BYTES`] and grows toward [`MAX_SAMPLE_BYTES`] while no complete record fits.
+    sample_bytes: u64,
+    /// Per column: the inference sample held no non-empty value for it, so its `Ty::Varchar` is a
+    /// default rather than a reading of the data. See `TableFormat::column_has_no_evidence`.
+    no_evidence: Vec<bool>,
 }
 
 impl CsvFormat {
@@ -96,22 +120,43 @@ impl CsvFormat {
             split_bytes: TEXT_SPLIT_BYTES,
             max_record: TEXT_MAX_RECORD,
             quoted_sample: false,
-            cr_only: false,
+            cr_term: false,
+            sample_bytes: SAMPLE_BYTES,
+            no_evidence: Vec::new(),
         }
     }
 
-    /// The byte that ends a record for this file: `\r` for a CR-only file, `\n` otherwise.
-    fn term_byte(&self) -> u8 {
-        if self.cr_only {
-            b'\r'
-        } else {
-            b'\n'
-        }
+    /// Whether `c` ends a record for this file. `\r` only counts when `cr_term` is set.
+    fn is_term(&self, c: u8) -> bool {
+        c == b'\n' || (self.cr_term && c == b'\r')
     }
 
-    /// Whether the whole file must be read as one split. See `quoted_sample` and `cr_only`.
+    /// Whether a blank line is a record of its own rather than something to skip.
+    ///
+    /// A one-column file has no other way to spell an empty record, so DuckDB reads `a\n1\n\n2\n`
+    /// as three rows with a NULL in the middle. With two or more columns a blank line cannot be a
+    /// record (it holds no delimiter), and DuckDB skips it -- as does the trailing newline at the
+    /// end of every well-formed file.
+    fn blank_line_is_a_row(ncols: usize) -> bool {
+        ncols == 1
+    }
+
+    /// Whether the whole file must be read as one split. See `quoted_sample` and `cr_term`.
     fn single_split(&self) -> bool {
-        self.quoted_sample || self.cr_only
+        self.quoted_sample || self.cr_term
+    }
+
+    /// Enlarges the inference sample, returning whether there was any room left to do so.
+    ///
+    /// `false` once the ceiling (or the file's own length) is reached, which is the caller's cue to
+    /// give up and work with what it has. The sample strictly grows on every successful call, so
+    /// `resolve`'s retry loop always makes progress and cannot spin.
+    fn grow_sample(&mut self, total_len: u64) -> bool {
+        if self.sample_bytes >= MAX_SAMPLE_BYTES || self.sample_bytes >= total_len {
+            return false;
+        }
+        self.sample_bytes = self.sample_bytes.saturating_mul(4).min(MAX_SAMPLE_BYTES);
+        true
     }
 
     pub fn delimiter(&self) -> u8 {
@@ -125,8 +170,8 @@ impl CsvFormat {
 
     /// 0 would break the split-count computation, so it is always rounded up to at least 1.
     ///
-    /// When the leading sample looked quoted (`quoted_sample`) or used CR-only line endings
-    /// (`cr_only`), this returns the whole data region so `num_splits` collapses to (at most) 1 --
+    /// When the leading sample looked quoted (`quoted_sample`) or carried a lone `\r`
+    /// (`cr_term`), this returns the whole data region so `num_splits` collapses to (at most) 1 --
     /// see those fields' doc comments for why such a file cannot be safely resynchronized at an
     /// arbitrary split boundary.
     fn chunk_size(&self) -> u64 {
@@ -180,107 +225,131 @@ impl TableFormat for CsvFormat {
             return Ok(Ok(()));
         }
 
-        let n = SAMPLE_BYTES.min(src.total_len);
-        let sample = match src.get(0, n as usize) {
-            Some(b) => b,
-            None => return Ok(Err((0, n))),
-        };
+        // The loop only ever repeats after `grow_sample` has strictly increased `sample_bytes`
+        // (and only up to `MAX_SAMPLE_BYTES`), so it terminates.
+        loop {
+            let n = self.sample_bytes.min(src.total_len);
+            let sample = match src.get(0, n as usize) {
+                Some(b) => b,
+                None => return Ok(Err((0, n))),
+            };
+            let partial = n < src.total_len;
 
-        // A UTF-8 BOM is dropped. Leaving it would mix into the first column's name and break column references.
-        let bom = if sample.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
-        let body = &sample[bom..];
+            // A UTF-8 BOM is dropped. Leaving it would mix into the first column's name and break column references.
+            let bom = if sample.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+            let body = &sample[bom..];
 
-        // See `quoted_sample`'s doc comment: any `"` is treated as evidence the file may
-        // use RFC 4180 quoting, which forces reading it as a single split. The leading
-        // sample is checked first; when the whole file is already resident, the rest is
-        // scanned too so a quote that first appears after `SAMPLE_BYTES` is not missed.
-        self.quoted_sample = body.contains(&b'"');
-        if !self.quoted_sample && src.is_complete() && src.total_len > n {
-            if let Some(all) = src.get(0, src.total_len as usize) {
-                self.quoted_sample = all[n as usize..].contains(&b'"');
+            // See `quoted_sample`'s doc comment: any `"` is treated as evidence the file may
+            // use RFC 4180 quoting, which forces reading it as a single split. A lone `\r`
+            // (see `cr_term`) forces the same, for the same "a split boundary cannot be
+            // resynchronized" reason. The leading sample is checked first; when the whole file
+            // is already resident, the rest is scanned too so evidence that first appears after
+            // the sample is not missed.
+            self.quoted_sample = body.contains(&b'"');
+            self.cr_term = has_lone_cr(body, partial);
+            if partial && src.is_complete() && (!self.quoted_sample || !self.cr_term) {
+                if let Some(all) = src.get(0, src.total_len as usize) {
+                    // One byte of overlap, so a `\r\n` straddling the sample's end is still seen as a
+                    // pair rather than as a lone `\r`.
+                    let rest = &all[(n as usize).saturating_sub(1)..];
+                    self.quoted_sample |= rest.contains(&b'"');
+                    self.cr_term |= has_lone_cr(rest, false);
+                }
             }
-        }
 
-        // A file whose sample carries `\r` but not a single `\n` uses classic Mac (CR-only) line
-        // endings. Reading it under the RFC 4180 rules would swallow the whole file as one record,
-        // so a lone `\r` becomes the record terminator instead (see `cr_only`).
-        self.cr_only = !body.contains(&b'\n') && body.contains(&b'\r');
-
-        // --- The header row -------------------------------------------------
-        let mut sc = Scanner::new(body, self.delimiter).with_cr_term(self.cr_only);
-        let mut raw: Vec<Vec<u8>> = Vec::new();
-        let mut scratch = Vec::new();
-        let terminated = loop {
-            let f = sc.field()?;
-            raw.push(field_value(body, &f, &mut scratch).to_vec());
-            if f.term != Term::Field {
-                break f.term == Term::Record;
-            }
-        };
-        // A header not fitting the sample is anomalous input. Rejecting it as a limit is better
-        // than growing the requested range forever and creating a loop that never advances.
-        ensure!(terminated || n == src.total_len, LimitExceeded);
-        self.data_start = bom as u64 + sc.pos() as u64;
-
-        let names = column_names(&raw);
-
-        // `num_splits` returns a `usize` because the execution layer indexes
-        // splits with `usize`. Reject a remote file whose split count cannot
-        // be represented instead of truncating the u64 division on 32-bit
-        // WASM (or after a caller intentionally chooses a tiny test split).
-        let split_count = self.data_len().div_ceil(self.chunk_size());
-        ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
-
-        // --- Type inference ---------------------------------------------------
-        // Cut at the last line terminator so a truncated trailing record does not enter the inference.
-        // (It may cut at a newline inside quotes, but all that happens then is "that column widens
-        //  to VARCHAR", which errs safe.)
-        let rest = &body[sc.pos()..];
-        let term = self.term_byte();
-        let rest = if n < src.total_len {
-            match rest.iter().rposition(|&c| c == term) {
-                Some(i) => &rest[..i + 1],
-                None => &rest[..0],
-            }
-        } else {
-            rest
-        };
-
-        let mut cands = vec![Cand::Empty; names.len()];
-        let mut sc = Scanner::new(rest, self.delimiter).with_cr_term(self.cr_only);
-        let mut rows = 0;
-        'sample: while rows < SAMPLE_ROWS && !sc.at_end() {
-            if sc.skip_blank_line() {
+            // --- The header row -------------------------------------------------
+            let mut sc = Scanner::new(body, self.delimiter).with_cr_term(self.cr_term);
+            let mut raw: Vec<Vec<u8>> = Vec::new();
+            let mut scratch = Vec::new();
+            let terminated = loop {
+                let f = sc.field()?;
+                raw.push(field_value(body, &f, &mut scratch).to_vec());
+                if f.term != Term::Field {
+                    break f.term == Term::Record;
+                }
+            };
+            let header_end = sc.pos();
+            if !terminated && partial {
+                // The header did not fit. Ask for more before giving up -- a header longer than
+                // `SAMPLE_BYTES` is unusual but perfectly readable. Only once the sample has grown
+                // to `MAX_SAMPLE_BYTES` (the longest record the reader accepts at all) is it a
+                // limit.
+                ensure!(self.grow_sample(src.total_len), LimitExceeded);
                 continue;
             }
-            let mut fi = 0;
-            loop {
-                // A broken record merely stops the inference. When actually reading it later,
-                // it will fail at the same spot, so there's no need to bail out here.
-                let f = match sc.field() {
-                    Ok(f) => f,
-                    Err(_) => break 'sample,
-                };
-                if let Some(slot) = cands.get_mut(fi) {
-                    let v = field_value(rest, &f, &mut scratch);
-                    // An empty cell is treated as NULL, so it does not count as evidence for a type.
-                    if !v.is_empty() {
-                        *slot = widen(*slot, classify(v));
+            self.data_start = bom as u64 + header_end as u64;
+
+            let names = column_names(&raw);
+
+            // `num_splits` returns a `usize` because the execution layer indexes
+            // splits with `usize`. Reject a remote file whose split count cannot
+            // be represented instead of truncating the u64 division on 32-bit
+            // WASM (or after a caller intentionally chooses a tiny test split).
+            let split_count = self.data_len().div_ceil(self.chunk_size());
+            ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
+
+            // --- Type inference ---------------------------------------------------
+            // Cut at the last line terminator so a truncated trailing record does not enter the inference.
+            // (It may cut at a newline inside quotes, but all that happens then is "that column widens
+            //  to VARCHAR", which errs safe.)
+            let whole_rest = &body[header_end..];
+            let rest = if partial {
+                match whole_rest.iter().rposition(|&c| self.is_term(c)) {
+                    Some(i) => &whole_rest[..i + 1],
+                    None => &whole_rest[..0],
+                }
+            } else {
+                whole_rest
+            };
+            if rest.is_empty() && partial && self.data_len() > 0 && self.grow_sample(src.total_len)
+            {
+                // Not one complete data record fits the sample, so every column would come out
+                // VARCHAR for lack of any evidence at all. Ask for more first (the same growth the
+                // header uses); once the ceiling is reached, fall through and infer from nothing.
+                continue;
+            }
+
+            let mut cands = vec![Cand::Empty; names.len()];
+            let blank_is_row = Self::blank_line_is_a_row(cands.len());
+            let mut sc = Scanner::new(rest, self.delimiter).with_cr_term(self.cr_term);
+            let mut rows = 0;
+            'sample: while rows < SAMPLE_ROWS && !sc.at_end() {
+                if !blank_is_row && sc.skip_blank_line() {
+                    continue;
+                }
+                let mut fi = 0;
+                loop {
+                    // A broken record merely stops the inference. When actually reading it later,
+                    // it will fail at the same spot, so there's no need to bail out here.
+                    let f = match sc.field() {
+                        Ok(f) => f,
+                        Err(_) => break 'sample,
+                    };
+                    if let Some(slot) = cands.get_mut(fi) {
+                        let v = field_value(rest, &f, &mut scratch);
+                        // An empty cell is treated as NULL, so it does not count as evidence for a type.
+                        if !v.is_empty() {
+                            *slot = widen(*slot, classify(v));
+                        }
+                    }
+                    fi += 1;
+                    if f.term != Term::Field {
+                        break;
                     }
                 }
-                fi += 1;
-                if f.term != Term::Field {
-                    break;
-                }
+                rows += 1;
             }
-            rows += 1;
-        }
 
-        // CSV has no way to express NOT NULL, so every column is nullable.
-        self.schema =
-            names.into_iter().zip(cands).map(|(name, c)| Field::new(name, c.ty(), true)).collect();
-        self.resolved = true;
-        Ok(Ok(()))
+            // CSV has no way to express NOT NULL, so every column is nullable.
+            self.no_evidence = cands.iter().map(|c| *c == Cand::Empty).collect();
+            self.schema = names
+                .into_iter()
+                .zip(cands)
+                .map(|(name, c)| Field::new(name, c.ty(), true))
+                .collect();
+            self.resolved = true;
+            return Ok(Ok(()));
+        }
     }
 
     fn is_resolved(&self) -> bool {
@@ -348,13 +417,18 @@ impl TableFormat for CsvFormat {
             }
         }
 
-        // A quote past the leading sample on a remote (incomplete-at-resolve) file
-        // cannot be turned into a single-split plan after the fact. Refusing beats
-        // mis-resynchronizing a quoted newline at a later split boundary.
-        ensure!(self.single_split() || split == 0 || !buf.contains(&b'"'), UnsupportedFeature);
+        // A quote (or a lone `\r`) past the leading sample on a remote (incomplete-at-resolve)
+        // file cannot be turned into a single-split plan after the fact. Refusing beats
+        // mis-resynchronizing a quoted newline, or merging two records, at a later split boundary.
+        ensure!(
+            self.single_split()
+                || split == 0
+                || (!buf.contains(&b'"') && !has_lone_cr(buf, fetch_end < self.total_len)),
+            UnsupportedFeature
+        );
 
         let lead = (own_start - fetch_start) as usize;
-        let mut sc = Scanner::new(buf, self.delimiter).with_cr_term(self.cr_only);
+        let mut sc = Scanner::new(buf, self.delimiter).with_cr_term(self.cr_term);
         if lead > 0 {
             // If the byte just before the owned interval is a line terminator, a record starts at
             // the beginning. Otherwise it skips to just after the first line terminator (that
@@ -368,8 +442,9 @@ impl TableFormat for CsvFormat {
             // (i.e. `split > 0`) is unreachable for such a file, since there is only ever one
             // split. This byte scan is only ever live for files confirmed (by that sample) not to
             // use quoting, where an unquoted field can never contain the delimiter/`\n`/`\r`, so
-            // scanning for a raw `\n` here is exact, not a heuristic. A CR-only file (`cr_only`)
-            // likewise collapses to one split, so this `\n` scan never runs for one.
+            // scanning for a raw `\n` here is exact, not a heuristic. A file carrying a lone `\r`
+            // (`cr_term`, which covers both CR-only and mixed line endings) likewise collapses to
+            // one split, so this `\n` scan never runs for one.
             match buf.first() {
                 Some(&b'\n') => sc.seek(1),
                 _ => match buf.iter().skip(1).position(|&c| c == b'\n') {
@@ -383,10 +458,13 @@ impl TableFormat for CsvFormat {
 
         let limit = (own_end - fetch_start) as usize;
         let at_file_end = fetch_end >= self.total_len;
+        let blank_is_row = Self::blank_line_is_a_row(ncols);
         let mut scratch = Vec::new();
         while sc.pos() < limit && !sc.at_end() {
-            // Blank lines do not count as rows (the same treatment as a trailing newline not adding a row).
-            if sc.skip_blank_line() {
+            // With two or more columns a blank line does not count as a row (the same treatment as
+            // a trailing newline not adding a row). A one-column file has no other spelling for an
+            // empty record, so there a blank line is a NULL row -- see `blank_line_is_a_row`.
+            if !blank_is_row && sc.skip_blank_line() {
                 continue;
             }
             let mut fi = 0;
@@ -413,7 +491,12 @@ impl TableFormat for CsvFormat {
                     break;
                 }
             }
-            // A row with too few fields has the rest set to NULL (surplus fields are discarded).
+            // A row with **more** fields than the header is a broken record, not something to
+            // quietly truncate: dropping the surplus loses data the file plainly contains, and the
+            // usual cause (an unquoted delimiter inside a value) shifts every following field too.
+            // DuckDB rejects such a row as well, unless `ignore_errors` is asked for explicitly.
+            ensure!(fi <= ncols, SyntaxError, sc.pos());
+            // A row with too few fields has the rest set to NULL (DuckDB's `null_padding`).
             for c in fi..ncols {
                 if let Some(Some(slot)) = slot_of.get(c) {
                     if let Some(col) = cols.get_mut(*slot) {
@@ -429,6 +512,10 @@ impl TableFormat for CsvFormat {
     /// CSV carries no schema, so every column type here is a guess from the leading sample.
     fn schema_is_inferred(&self) -> bool {
         true
+    }
+
+    fn column_has_no_evidence(&self, col: usize) -> bool {
+        self.no_evidence.get(col).copied().unwrap_or(false)
     }
 }
 
@@ -525,7 +612,7 @@ struct Scanner<'a> {
     buf: &'a [u8],
     p: usize,
     delim: u8,
-    /// Whether a lone `\r` ends a record (a CR-only file -- see `CsvFormat::cr_only`).
+    /// Whether a lone `\r` ends a record (see `CsvFormat::cr_term`).
     /// Off by default, which is the RFC 4180 reading: only `\n` and `\r\n` end a record.
     cr_term: bool,
 }
@@ -593,7 +680,7 @@ impl<'a> Scanner<'a> {
                         } else {
                             let end = self.p;
                             self.p += 1;
-                            let term = self.skip_to_term();
+                            let term = self.skip_to_term()?;
                             return Ok(Span { start, end, quoted: true, escaped, term });
                         }
                     }
@@ -646,32 +733,53 @@ impl<'a> Scanner<'a> {
         Ok(Span { start, end: self.buf.len(), quoted: false, escaped: false, term: Term::Eof })
     }
 
-    /// Advances from after a closing quote to the delimiter or line terminator.
-    /// RFC 4180 forbids bytes after a closing quote, but they are discarded and it moves on.
-    fn skip_to_term(&mut self) -> Term {
-        while let Some(&c) = self.buf.get(self.p) {
-            if c == self.delim {
+    /// Reads the terminator that must follow a closing quote.
+    ///
+    /// RFC 4180 allows nothing between a closing quote and the delimiter / line terminator, and
+    /// such bytes used to be discarded: `"x"junk,1` read as `x`, silently losing `junk` (and, for
+    /// the far more common cause -- a quote in the middle of an unquoted value -- silently losing
+    /// the rest of the field). DuckDB rejects the row, and so does this.
+    fn skip_to_term(&mut self) -> Result<Term> {
+        match self.buf.get(self.p) {
+            None => Ok(Term::Eof),
+            Some(&c) if c == self.delim => {
                 self.p += 1;
-                return Term::Field;
+                Ok(Term::Field)
             }
-            if c == b'\n' {
+            Some(&b'\n') => {
                 self.p += 1;
-                return Term::Record;
+                Ok(Term::Record)
             }
-            if c == b'\r' {
-                if self.buf.get(self.p + 1) == Some(&b'\n') {
-                    self.p += 2;
-                    return Term::Record;
-                }
-                if self.cr_term {
-                    self.p += 1;
-                    return Term::Record;
-                }
+            Some(&b'\r') if self.buf.get(self.p + 1) == Some(&b'\n') => {
+                self.p += 2;
+                Ok(Term::Record)
             }
-            self.p += 1;
+            Some(&b'\r') if self.cr_term => {
+                self.p += 1;
+                Ok(Term::Record)
+            }
+            _ => err!(SyntaxError, self.p),
         }
-        Term::Eof
     }
+}
+
+/// Whether `b` contains a `\r` that is not the first half of a `\r\n` pair.
+///
+/// `partial` says `b` is a prefix of a longer buffer, in which case a `\r` at the very end is not
+/// yet known to be lone (the `\n` completing it may be the next byte) and is not reported.
+fn has_lone_cr(b: &[u8], partial: bool) -> bool {
+    let mut i = 0;
+    while i < b.len() {
+        if b.get(i) == Some(&b'\r') {
+            match b.get(i + 1) {
+                Some(&b'\n') => i += 1,
+                None if partial => return false,
+                _ => return true,
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// A field's value bytes. Folded into `scratch` and returned only when it contains `""`.
@@ -823,7 +931,9 @@ fn parse_i64(v: &[u8]) -> Option<i64> {
 }
 
 fn parse_f64(v: &[u8]) -> Option<f64> {
-    // IEEE specials that the CSV writer itself emits (`NaN` / `Infinity` / `-Infinity`).
+    // IEEE specials. Both spellings of the infinities are accepted: the writer emits
+    // `inf` / `-inf` (matching DuckDB, whose reader sniffs `Infinity` as a DATE), but
+    // files written before that -- and by other tools -- use the long form.
     if eq_ascii_ci(v, b"nan") {
         return Some(f64::NAN);
     }
@@ -1295,10 +1405,41 @@ mod tests {
     }
 
     #[test]
-    fn blank_lines_are_skipped() {
+    fn blank_lines_are_skipped_when_there_is_more_than_one_column() {
         let (f, src) = open(b"a,b\n1,x\n\n2,y\n\n", b',');
         let got = read_all(&f, &src, &[0]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+    }
+
+    #[test]
+    fn a_blank_line_in_a_one_column_file_is_a_null_row() {
+        // duckdb reads `a\n1\n\n2\n` as three rows, the middle one NULL. A one-column file has no
+        // other spelling for an empty record, so skipping the line dropped a row the file
+        // plainly contains.
+        let (f, src) = open(b"a\n1\n\n2\n", b',');
+        let got = read_all(&f, &src, &[0]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::Null, Value::I64(2)]);
+
+        // A CRLF blank line reads the same way, and the trailing newline still adds no row.
+        let (g, gsrc) = open(b"a\r\n1\r\n\r\n2\r\n", b',');
+        let got = read_all(&g, &gsrc, &[0]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::Null, Value::I64(2)]);
+
+        // Every split size must agree: a NULL row sitting on a split boundary is exactly the kind
+        // of record that goes missing (or gets counted twice) when ownership is mishandled.
+        let mut s = String::from("a\n");
+        for i in 0..64 {
+            s.push_str(&std::format!("{i}\n\n"));
+        }
+        for size in 1..=13u64 {
+            let (f, src) = open_split(s.as_bytes(), b',', size);
+            let got = read_all(&f, &src, &[0]);
+            assert_eq!(got[0].len(), 128, "split_bytes={size}");
+            for (i, v) in got[0].iter().enumerate() {
+                let want = if i % 2 == 0 { Value::I64((i / 2) as i64) } else { Value::Null };
+                assert_eq!(*v, want, "split_bytes={size} row {i}");
+            }
+        }
     }
 
     // --- Type inference -----------------------------------------------------
@@ -1406,9 +1547,18 @@ mod tests {
         assert_eq!(parse_f64(b"1.5"), Some(1.5));
         assert_eq!(parse_f64(b"-.5"), Some(-0.5));
         assert_eq!(parse_f64(b"1e3"), Some(1000.0));
+        // Both spellings of the infinities read back, whichever wrote the file: the CSV
+        // writer emits `inf` / `-inf`, older files and other tools the long form.
         assert!(parse_f64(b"inf").is_some_and(|f| f.is_infinite() && f > 0.0));
-        assert!(parse_f64(b"NaN").is_some_and(|f| f.is_nan()));
+        assert!(parse_f64(b"-inf").is_some_and(|f| f.is_infinite() && f < 0.0));
+        assert!(parse_f64(b"Infinity").is_some_and(|f| f.is_infinite() && f > 0.0));
         assert!(parse_f64(b"-Infinity").is_some_and(|f| f.is_infinite() && f < 0.0));
+        assert!(parse_f64(b"NaN").is_some_and(|f| f.is_nan()));
+        // ... and a column of them is inferred as DOUBLE either way, so a re-read of an
+        // exported file keeps its type.
+        assert_eq!(classify(b"inf"), Cand::Double);
+        assert_eq!(classify(b"-inf"), Cand::Double);
+        assert_eq!(classify(b"Infinity"), Cand::Double);
         assert_eq!(parse_f64(b"1e"), None);
         assert_eq!(parse_f64(b"0x10"), None);
         // duckdb: datediff('day', DATE '1970-01-01', DATE '2024-01-01') = 19723
@@ -1772,14 +1922,22 @@ mod tests {
     }
 
     #[test]
-    fn short_and_long_rows() {
-        // Missing fields are NULL and surplus ones are discarded.
-        let (f, src) = open(b"a,b,c\n1,x,2.5\n2\n3,y,4.5,extra\n", b',');
+    fn short_rows_are_null_padded() {
+        // Missing fields are NULL (duckdb's `null_padding`): nothing the file contains is lost.
+        let (f, src) = open(b"a,b,c\n1,x,2.5\n2\n3,y,4.5\n", b',');
         let got = read_all(&f, &src, &[0, 1, 2]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
         assert_eq!(got[1][1], Value::Null);
         assert_eq!(got[2][1], Value::Null);
         assert_eq!(got[2][2], Value::F64(4.5));
+    }
+
+    #[test]
+    fn a_row_with_surplus_fields_is_a_syntax_error() {
+        // The surplus field used to be discarded without a word, so `a,b\n1,2,3\n` read as
+        // `(1, 2)`. duckdb rejects such a row (its sniffer refuses the file outright).
+        let (f, src) = open(b"a,b\n1,2,3\n", b',');
+        assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
     }
 
     #[test]
@@ -1833,7 +1991,7 @@ mod tests {
         // A classic Mac (CR-only) file used to parse as one giant record: a garbage header and
         // zero rows, with no error at all. duckdb reads two rows here.
         let (f, src) = open(b"a,b\r1,2\r3,4\r", b',');
-        assert!(f.cr_only);
+        assert!(f.cr_term);
         assert_eq!(names(&f), vec!["a", "b"]);
         assert_eq!(types(&f), vec![Ty::BigInt, Ty::BigInt]);
         assert_eq!(f.num_splits(), 1, "a CR-only file is always a single split");
@@ -1843,24 +2001,17 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_cr_stays_data_when_the_file_has_newlines() {
-        // CRLF and a `\r` inside a quoted field must be untouched by the CR-only support.
+    fn a_pure_crlf_file_is_unaffected_by_the_lone_cr_support() {
+        // Every `\r` here is the first half of a CRLF, so nothing changes: the file still splits.
         let (crlf, csrc) = open(b"a,b\r\n1,x\r\n2,y\r\n", b',');
-        assert!(!crlf.cr_only);
+        assert!(!crlf.cr_term);
         let got = read_all(&crlf, &csrc, &[0, 1]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
         assert_eq!(text(&got[1][0]), "x");
 
-        // An unquoted `\r` in a `\n`-terminated file is still an ordinary byte.
-        let (f, src) = open(b"a,b\n1,x\ry\n", b',');
-        assert!(!f.cr_only);
-        let got = read_all(&f, &src, &[0, 1]);
-        assert_eq!(got[0], vec![Value::I64(1)]);
-        assert_eq!(text(&got[1][0]), "x\ry");
-
         // A quoted `\r` in a CR-only file belongs to the value, not to the record boundary.
         let (q, qsrc) = open(b"a,b\r1,\"x\ry\"\r2,z\r", b',');
-        assert!(q.cr_only);
+        assert!(q.cr_term);
         let got = read_all(&q, &qsrc, &[0, 1]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
         assert_eq!(text(&got[1][0]), "x\ry");
@@ -1868,9 +2019,34 @@ mod tests {
     }
 
     #[test]
-    fn garbage_after_a_closing_quote_is_dropped() {
-        let (f, src) = open(b"a,b\n\"x\"junk,1\n", b',');
+    fn mixed_line_endings_never_merge_two_records() {
+        // `a,b\n1,2\r\n3,4\r5,6\n` used to read as two rows with `b = "4\r5,6"` -- two records
+        // silently welded together. duckdb refuses to sniff such a file at all; with
+        // `strict_mode=false` it reads three rows, which is what a lone `\r` terminator gives.
+        let (f, src) = open(b"a,b\n1,2\r\n3,4\r5,6\n", b',');
+        assert!(f.cr_term);
+        assert_eq!(f.num_splits(), 1, "a file with a lone `\\r` is always a single split");
         let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(3), Value::I64(5)]);
+        assert_eq!(got[1], vec![Value::I64(2), Value::I64(4), Value::I64(6)]);
+
+        // A lone `\r` as the only terminator between two records reads the same way.
+        let (g, gsrc) = open(b"a,b\n1,x\r2,y\n", b',');
+        assert!(g.cr_term);
+        let got = read_all(&g, &gsrc, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+        assert_eq!(text(&got[1][0]), "x");
+        assert_eq!(text(&got[1][1]), "y");
+    }
+
+    #[test]
+    fn garbage_after_a_closing_quote_is_a_syntax_error() {
+        // `"x"junk` used to read as `x`, quietly losing `junk`. duckdb rejects the file.
+        let (f, src) = open(b"a,b\n\"x\"junk,1\n", b',');
+        assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
+        // A well-formed quoted field is of course still fine.
+        let (g, gsrc) = open(b"a,b\n\"x\",1\n", b',');
+        let got = read_all(&g, &gsrc, &[0, 1]);
         assert_eq!(text(&got[0][0]), "x");
         assert_eq!(got[1][0], Value::I64(1));
     }
@@ -1940,12 +2116,45 @@ mod tests {
     }
 
     #[test]
-    fn header_longer_than_the_sample_is_rejected() {
-        // A file exceeding SAMPLE_BYTES with no newline in the header.
-        let mut bytes = std::vec![b'a'; (SAMPLE_BYTES + 10) as usize];
-        bytes[SAMPLE_BYTES as usize + 5] = b'\n';
+    fn header_longer_than_the_grown_sample_is_rejected() {
+        // A header with no newline within MAX_SAMPLE_BYTES cannot be read at all.
+        let mut bytes = std::vec![b'a'; (MAX_SAMPLE_BYTES + 10) as usize];
+        bytes[MAX_SAMPLE_BYTES as usize + 5] = b'\n';
         let src = Source::from_bytes(bytes);
         let mut f = CsvFormat::new(b',');
         assert_eq!(code_of(f.resolve(&src)), Some(Code::LimitExceeded));
+    }
+
+    #[test]
+    fn the_sample_grows_until_one_whole_record_fits() {
+        // A header (or first record) longer than SAMPLE_BYTES used to be LimitExceeded, and a
+        // first *data* record longer than it left the inference with nothing to look at, making
+        // every column VARCHAR. Both now grow the request instead.
+        let pad = "x".repeat(SAMPLE_BYTES as usize);
+        let mut s = String::from("a,b\n1,");
+        s.push_str(&pad);
+        s.push_str("\n2,y\n");
+        let (f, src) = open(s.as_bytes(), b',');
+        assert!(f.sample_bytes > SAMPLE_BYTES);
+        // The first record is now inside the sample, so `a` is read as a number, not as text.
+        assert_eq!(types(&f), vec![Ty::BigInt, Ty::Varchar]);
+        let got = read_all(&f, &src, &[0]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+
+        // The growth also works over a remote source, one request at a time.
+        let bytes = s.as_bytes();
+        let mut rsrc = Source::remote(bytes.len() as u64);
+        let mut rf = CsvFormat::new(b',');
+        for _ in 0..8 {
+            match rf.resolve(&rsrc).expect("resolve") {
+                Ok(()) => break,
+                Err((off, len)) => {
+                    let end = (off + len).min(bytes.len() as u64) as usize;
+                    rsrc.insert(off, bytes[off as usize..end].to_vec());
+                }
+            }
+        }
+        assert!(rf.is_resolved());
+        assert_eq!(types(&rf), vec![Ty::BigInt, Ty::Varchar]);
     }
 }

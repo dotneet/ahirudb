@@ -111,7 +111,29 @@ fn default_ty(p: PhysType) -> Ty {
 
 /// The result logical type of a binary operation. The binder is assumed to have aligned both
 /// sides, but when they are not (= cannot be unified) it falls back to the physical type's default.
-fn binary_ty(phys: PhysType, a: Ty, b: Ty) -> Ty {
+fn binary_ty(op: OpCode, phys: PhysType, a: Ty, b: Ty) -> Ty {
+    // DECIMAL multiplication *adds* the operands' scales -- the kernel just multiplies the
+    // raw integers, so the product is already scaled by `s1 + s2`. `Ty::unify` cannot say
+    // that: it answers "the one type both sides align to", which for two DECIMALs is
+    // `max(s1, s2)`, and labelling the result with that scale renders it 10^min(s1,s2) times
+    // too large (`to_json`, `printf`, `CAST(... AS VARCHAR)`, the CSV writer).
+    //
+    // `plan::compile::decimal_arith` has already widened both operands to the *result's*
+    // precision, so that precision paired with the summed scale reconstructs exactly the
+    // type the compiler planned. The `phys` check below keeps the fallback honest if some
+    // other path ever emits a `Mul` over DECIMALs without that widening.
+    if op == OpCode::Mul {
+        if let (
+            Ty::Decimal { precision: p1, scale: s1 },
+            Ty::Decimal { precision: p2, scale: s2 },
+        ) = (a, b)
+        {
+            let t = Ty::decimal(p1.max(p2), s1.saturating_add(s2));
+            if t.phys() == phys {
+                return t;
+            }
+        }
+    }
     // DATE arithmetic is deliberately compiled on the shared I32 lane even
     // though DATE and INTEGER do not unify. Preserve the logical result here
     // so the arithmetic kernel can reject DuckDB's reserved DATE infinity
@@ -160,7 +182,7 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
             let a = reg(regs, ins.a)?;
             // Unary Neg does not use b. `a` is passed so an uninitialized register is never read.
             let b = if ins.op == Neg { a } else { reg(regs, ins.b)? };
-            kernels::arith(ins.op, binary_ty(ins.ty, a.ty(), b.ty()), a, b)?
+            kernels::arith(ins.op, binary_ty(ins.op, ins.ty, a.ty(), b.ty()), a, b)?
         }
         Eq | Ne | Lt | Le | Gt | Ge => {
             let a = reg(regs, ins.a)?;
@@ -233,18 +255,18 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
         Concat => {
             let a = reg(regs, ins.a)?;
             let b = reg(regs, ins.b)?;
-            kernels::concat(a, b, binary_ty(PhysType::Bytes, a.ty(), b.ty()))?
+            kernels::concat(a, b, binary_ty(ins.op, PhysType::Bytes, a.ty(), b.ty()))?
         }
         Select => {
             let c = reg(regs, ins.a)?;
             let t = reg(regs, ins.b)?;
             let e = reg(regs, ins.aux)?;
-            kernels::pick(Some(c), t, e, binary_ty(ins.ty, t.ty(), e.ty()))?
+            kernels::pick(Some(c), t, e, binary_ty(ins.op, ins.ty, t.ty(), e.ty()))?
         }
         Coalesce => {
             let a = reg(regs, ins.a)?;
             let b = reg(regs, ins.b)?;
-            kernels::pick(None, a, b, binary_ty(ins.ty, a.ty(), b.ty()))?
+            kernels::pick(None, a, b, binary_ty(ins.op, ins.ty, a.ty(), b.ty()))?
         }
     };
     let d = ins.dst as usize;

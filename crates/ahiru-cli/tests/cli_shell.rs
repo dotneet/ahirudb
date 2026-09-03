@@ -768,6 +768,93 @@ fn an_escaped_glob_metacharacter_names_a_literal_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `+` joins several files into one table, so a file whose *name* contains one
+/// used to be unreachable: the spec was split before the path was ever looked
+/// at, and `\+` did not escape it either.
+#[test]
+fn a_plus_in_a_file_name_is_not_a_multi_file_separator() {
+    let dir = tmp_file("plus_name", "d");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create dir");
+    std::fs::write(dir.join("a+b.csv"), b"v\n7\n").expect("write plus file");
+    std::fs::write(dir.join("one.csv"), b"v\n1\n").expect("write one");
+    std::fs::write(dir.join("two.csv"), b"v\n2\n").expect("write two");
+    let base = dir.display().to_string();
+
+    // Neither half of the split exists, but the whole spec does, so `+` was
+    // never a separator.
+    let r = run(&["-csv", "-c", "SELECT v FROM t", &format!("{base}/a+b.csv")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n7\n");
+
+    // `\+` says so explicitly, which is what the usage text documents.
+    let r = run(&["-csv", "-c", "SELECT v FROM t", &format!("{base}/a\\+b.csv")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n7\n");
+
+    // A genuine `+`-joined pair still becomes one table.
+    let r = run(&[
+        "-csv",
+        "-c",
+        "SELECT v FROM t ORDER BY v",
+        &format!("{base}/one.csv+{base}/two.csv"),
+    ]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n1\n2\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A glob whose last component matched a directory used to abort the whole
+/// registration with "Is a directory". The shell and DuckDB both leave
+/// directories out of a glob's results; `**` still descends into them.
+#[test]
+fn a_glob_matching_a_directory_skips_it_instead_of_failing() {
+    let dir = tmp_file("glob_dir", "d");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).expect("create dirs");
+    std::fs::write(dir.join("one.csv"), b"v\n1\n").expect("write one");
+    std::fs::write(dir.join("sub/two.csv"), b"v\n2\n").expect("write two");
+    let base = dir.display().to_string();
+
+    let r = run(&["-csv", "-c", "SELECT v FROM t ORDER BY v", &format!("{base}/*")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n1\n");
+
+    let r = run(&["-csv", "-c", "SELECT v FROM t ORDER BY v", &format!("{base}/**")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n1\n2\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Hive directory holding exactly one file took the single-file
+/// registration path, which never parsed `key=value` segments — so
+/// `year=2025` (one file) exposed no partition columns while its sibling
+/// `year=2024` (two files) exposed both.
+#[test]
+fn a_hive_directory_with_one_file_still_exposes_its_partition_columns() {
+    let one = run(&["-csv", "-c", "DESCRIBE t", "t=tests/data/hive/year=2025"]);
+    assert!(one.ok, "{}", one.stderr);
+    let two = run(&["-csv", "-c", "DESCRIBE t", "t=tests/data/hive/year=2024"]);
+    assert!(two.ok, "{}", two.stderr);
+    let cols = |s: &str| -> Vec<String> {
+        s.lines().skip(1).filter_map(|l| l.split(',').next()).map(String::from).collect()
+    };
+    assert_eq!(cols(&one.stdout), cols(&two.stdout), "{}", one.stdout);
+    assert!(cols(&one.stdout).contains(&"year".to_string()), "{}", one.stdout);
+
+    // DuckDB adds the partition columns for a single explicit file path too.
+    let file = run(&[
+        "-csv",
+        "-c",
+        "SELECT count(*) FROM t WHERE year = 2025",
+        "t=tests/data/hive/year=2025/month=01/part.parquet",
+    ]);
+    assert!(file.ok, "{}", file.stderr);
+    assert!(file.stdout.lines().nth(1).is_some_and(|l| l != "0"), "{}", file.stdout);
+}
+
 /// `std::io::Error` carries no path, so the failure used to read
 /// "No such file or directory (os error 2)" with no hint which file it meant.
 #[test]
@@ -814,4 +901,74 @@ fn maxrows_help_matches_its_behavior() {
     let duck = run(&["-duckbox", "-maxrows", "2", "-c", sql]);
     assert!(duck.ok, "{}", duck.stderr);
     assert!(duck.stdout.contains('\u{b7}'), "duckbox should elide: {}", duck.stdout);
+}
+
+/// A `COPY ... TO` onto a file the session has already read must invalidate the
+/// registration: a registered file is read once and cached forever, and
+/// `autoregister` skips names it already knows, so the second `SELECT` used to
+/// return the bytes from before the overwrite.
+#[test]
+fn copy_to_an_already_registered_path_invalidates_it() {
+    let p = tmp_file("copy_invalidate", "parquet");
+    let path = p.display().to_string();
+    let r = run(&[
+        "-csv",
+        "-c",
+        &format!("COPY (SELECT 1 AS a FROM range(1)) TO '{path}'"),
+        "-c",
+        &format!("SELECT a FROM '{path}'"),
+        "-c",
+        &format!("COPY (SELECT 2 AS a FROM range(1)) TO '{path}'"),
+        "-c",
+        &format!("SELECT a FROM '{path}'"),
+    ]);
+    let _ = std::fs::remove_file(&p);
+    assert!(r.ok, "{}", r.stderr);
+    let seen: Vec<&str> = r.stdout.lines().filter(|l| *l == "1" || *l == "2").collect();
+    assert_eq!(seen, vec!["1", "2"], "{}", r.stdout);
+}
+
+/// Same, reached through a command-line alias rather than the path literal:
+/// the alias is a second catalog entry backed by the same file.
+#[test]
+fn copy_to_a_path_registered_under_an_alias_invalidates_it() {
+    let p = tmp_file("copy_invalidate_alias", "csv");
+    std::fs::write(&p, "a\n1\n").unwrap();
+    let path = p.display().to_string();
+    let r = run(&[
+        "-csv",
+        &format!("src={path}"),
+        "-c",
+        "SELECT a FROM src",
+        "-c",
+        &format!("COPY (SELECT 2 AS a FROM range(1)) TO '{path}'"),
+        "-c",
+        "SELECT a FROM src",
+    ]);
+    let _ = std::fs::remove_file(&p);
+    assert!(r.ok, "{}", r.stderr);
+    let seen: Vec<&str> = r.stdout.lines().filter(|l| *l == "1" || *l == "2").collect();
+    assert_eq!(seen, vec!["1", "2"], "{}", r.stdout);
+}
+
+/// BLOB and non-UTF-8 VARCHAR values reach every output mode as `duckdb`'s
+/// `\xHH` escapes instead of the old `<N bytes>` placeholder.
+#[test]
+fn blob_values_render_as_hex_escapes() {
+    let r = run(&["-csv", "-c", "SELECT unhex('00ff') AS b, unhex('414243') AS c"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "b,c\n\\x00\\xFF,ABC\n");
+
+    let r = run(&["-json", "-c", "SELECT unhex('00ff') AS b"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains(r#""b":"\\x00\\xFF""#), "{}", r.stdout);
+}
+
+/// `-nullvalue ''` must still leave NULL and the empty string apart: the empty
+/// string is quoted in CSV mode, a NULL is written as its (here empty) spelling.
+#[test]
+fn csv_mode_keeps_empty_string_and_null_apart() {
+    let r = run(&["-csv", "-nullvalue", "", "-c", "SELECT '' AS a, NULL AS b, 'x' AS c"]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "a,b,c\n\"\",,x\n");
 }

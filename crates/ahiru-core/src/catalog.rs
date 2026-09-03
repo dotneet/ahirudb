@@ -251,6 +251,11 @@ impl Table {
 /// nothing is lost, and `exec::Scan` casts each part up to the unified type as it reads.
 /// A declared schema (Parquet) keeps the strict treatment: there, a type conflict is a real
 /// conflict rather than two guesses, and reporting it is the point.
+///
+/// A guess resting on **no evidence at all** (`TableFormat::column_has_no_evidence`: a header-only
+/// CSV part, a column whose every cell was empty) is not a disagreement to widen but an absence of
+/// opinion: the other parts' type simply wins. Without that, one placeholder or header-only file in
+/// a glob turned an integer column into VARCHAR for the whole table -- DuckDB keeps the `BIGINT`.
 fn unify_schema(parts: &[TablePart]) -> Result<Vec<Field>> {
     let mut iter = parts.iter();
     let first = match iter.next() {
@@ -259,17 +264,30 @@ fn unify_schema(parts: &[TablePart]) -> Result<Vec<Field>> {
     };
     let widen_to_text = parts.iter().all(|p| p.format.schema_is_inferred());
     let mut out: Vec<Field> = first.format.schema().to_vec();
+    // Per column: no part so far has said anything about it, so `out`'s type is only a fallback.
+    let mut blank: Vec<bool> =
+        (0..out.len()).map(|i| first.format.column_has_no_evidence(i)).collect();
     for part in iter {
         let s = part.format.schema();
         ensure!(s.len() == out.len(), TypeMismatch);
-        for (o, f) in out.iter_mut().zip(s) {
+        for (i, (o, f)) in out.iter_mut().zip(s).enumerate() {
             ensure!(eq_ascii_ci(o.name.as_bytes(), f.name.as_bytes()), TypeMismatch);
-            let ty = match (Ty::unify(o.ty, f.ty), widen_to_text) {
-                (Some(t), _) => t,
-                (None, true) => Ty::Varchar,
-                (None, false) => err!(TypeMismatch),
+            let f_blank = part.format.column_has_no_evidence(i);
+            let o_blank = blank.get(i).copied().unwrap_or(false);
+            o.ty = match (o_blank, f_blank) {
+                // Neither side has anything to say yet: keep the fallback and stay blank.
+                (true, true) => o.ty,
+                (true, false) => f.ty,
+                (false, true) => o.ty,
+                (false, false) => match (Ty::unify(o.ty, f.ty), widen_to_text) {
+                    (Some(t), _) => t,
+                    (None, true) => Ty::Varchar,
+                    (None, false) => err!(TypeMismatch),
+                },
             };
-            o.ty = ty;
+            if let Some(b) = blank.get_mut(i) {
+                *b = o_blank && f_blank;
+            }
             o.nullable = o.nullable || f.nullable;
         }
     }

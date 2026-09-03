@@ -62,6 +62,14 @@
 //!   VARCHAR.
 //! - **JSON** reads back as VARCHAR, because the reader maps the `JSON`
 //!   logical type to VARCHAR (its in-memory form is JSON text either way).
+//!
+//! A third case is decided per column rather than per type: a VARCHAR whose
+//! values are **not valid UTF-8** loses the `STRING`/`UTF8` annotation and is
+//! written as a plain BYTE_ARRAY, so it reads back as BLOB. This engine
+//! allows arbitrary bytes in a VARCHAR (a CSV field is taken byte for byte,
+//! and `unhex`/`decode` return raw bytes), while the annotation is a promise
+//! a strict reader checks: DuckDB refuses the entire file over one bad byte.
+//! Dropping the annotation keeps every byte and keeps the file readable.
 
 #[cfg(test)]
 mod tests;
@@ -491,6 +499,34 @@ impl TableSink for ParquetSink {
                         _ => true,
                     };
                     ensure!(fits, ValueOutOfRange);
+                }
+            }
+        }
+        // A column annotated `STRING`/`UTF8` must really hold UTF-8. This engine
+        // does not require that of a VARCHAR: a CSV or JSONL field is taken byte
+        // for byte, and `unhex`/`decode` hand back raw bytes as VARCHAR too. Such
+        // a value written under the annotation makes the whole file unreadable for
+        // a strict reader (duckdb rejects it outright, so not one row survives).
+        //
+        // Drop the annotation for that column instead and leave it a plain
+        // BYTE_ARRAY: every byte is preserved exactly, and the file still reads
+        // (as a BLOB rather than a VARCHAR). The schema lives in the footer, which
+        // `finish` serializes only after the last batch, so this can still be
+        // decided here — no second pass over the data, and nothing already
+        // buffered has to change (`Enc::Bytes` encodes the same either way).
+        for (col, plan) in batch.cols.iter().zip(&mut self.plans) {
+            // `Enc::Bytes` narrows this to the columns actually backed by a byte
+            // vector. INTERVAL is annotated `String` too, but it is an i128 column
+            // rendered to ASCII text on the way out -- always valid, never a
+            // `Vector::bytes()`.
+            if plan.enc != Enc::Bytes || !matches!(plan.logical, Some(Lg::String)) {
+                continue;
+            }
+            for r in 0..rows {
+                if col.is_valid(r) && core::str::from_utf8(bytes_at(col, r)).is_err() {
+                    plan.converted = None;
+                    plan.logical = None;
+                    break;
                 }
             }
         }

@@ -18,12 +18,14 @@
 //! Carrying a sorted-run merge as well within a 1 MiB binary budget does not pay, so this is
 //! accepted as a known limitation.
 
-use crate::exec::rowkey::{encode_key, ord_f64, pow10, HashIndex};
+use crate::exec::rowkey::{encode_key, interval_key, ord_f64, pow10, HashIndex};
 use crate::exec::{ExecContext, Operator, Step};
-use crate::expr::Program;
+use crate::expr::{funcs, kernels, Program};
 use crate::plan::{Agg, AggKind};
 use crate::prelude::*;
-use crate::vector::{Batch, Data, PhysType, Ty, Value, Vector, BATCH_SIZE};
+use crate::vector::{
+    fmt_interval, unpack_interval, Batch, Data, PhysType, Ty, Value, Vector, BATCH_SIZE,
+};
 
 /// The approximate byte budget allowed for the hash table and states. Exceeding it gives `Oom`.
 ///
@@ -112,6 +114,10 @@ struct State {
     median_vals: Vec<f64>,
     /// Mode's current highest vote count.
     mode_best: i64,
+    /// The `mode_freq` slot of the value `mode_best` belongs to. Slots are handed out in order
+    /// of first appearance, so a smaller slot means the value was seen earlier in the input,
+    /// which is how ties are broken. `u32::MAX` means "no value has qualified yet".
+    mode_slot: u32,
     /// ArgMin/ArgMax's current best ordering key (`acc` holds the value that goes with it).
     /// `Value::Null` means "no row has qualified yet".
     key: Value,
@@ -127,6 +133,7 @@ impl State {
             comp: 0.0,
             median_vals: Vec::new(),
             mode_best: 0,
+            mode_slot: u32::MAX,
             key: Value::Null,
         }
     }
@@ -604,10 +611,14 @@ impl HashAggregate {
                     self.mode_counts[ai][slot as usize] += 1;
                 }
                 let cnt = self.mode_counts[ai][slot as usize];
-                // Being `>`, on a tie the value found first stays the winner
-                // (the "first arrival wins" behavior observed in DuckDB).
-                if cnt > st.mode_best {
+                // On a tie the value that appeared **first in the input** wins (DuckDB's
+                // behavior, and what docs/sql/functions.md documents). `cnt > best` alone would
+                // instead crown whichever value *reached* the top count first: for `1,2,2,1`
+                // it would answer 2, because 2 got to two votes before 1 did. Slots are handed
+                // out in order of first appearance, so the smaller slot is the earlier value.
+                if cnt > st.mode_best || (cnt == st.mode_best && slot < st.mode_slot) {
                     st.mode_best = cnt;
+                    st.mode_slot = slot;
                     if let Value::Bytes(b) = &st.acc {
                         self.acc_bytes = self.acc_bytes.saturating_sub(b.len());
                     }
@@ -933,6 +944,11 @@ fn cmp_at(col: &Vector, row: usize, acc: &Value) -> core::cmp::Ordering {
         (Data::Bool(b), Value::Bool(x)) => b.get(row).cmp(x),
         (Data::I32(v), Value::I32(x)) => v[row].cmp(x),
         (Data::I64(v), Value::I64(x)) => v[row].cmp(x),
+        // INTERVAL compares on its normalized microsecond span, so `max` over
+        // `1 day` and `25 hours` answers `25 hours` (see `rowkey::interval_key`).
+        (Data::I128(v), Value::I128(x)) if col.ty() == Ty::Interval => {
+            interval_key(v[row]).cmp(&interval_key(*x))
+        }
         (Data::I128(v), Value::I128(x)) => v[row].cmp(x),
         (Data::F64(v), Value::F64(x)) => ord_f64(v[row], *x),
         (Data::Bytes(b), Value::Bytes(x)) => b.get(row).cmp(x.as_slice()),
@@ -986,157 +1002,58 @@ fn append_array_text(mut buf: Vec<u8>, text: &[u8]) -> Vec<u8> {
 /// `format::jsonl` keeping a nested value as VARCHAR text), the value is moved to a JSON-like
 /// string. Values reaching here are always non-NULL (for NULL the caller passes `b"null"`
 /// directly to `append_array_text`).
+///
+/// The rendering is **driven by the logical type**, not the physical one, and matches what
+/// `to_json` produces for the same value: DECIMAL gets its decimal point back, and DATE / TIME /
+/// TIMESTAMP / INTERVAL / UUID become quoted text instead of the integer or raw bytes they are
+/// stored as. Going by the physical type alone made `list(d)` over `DECIMAL(6,2)` print `150`
+/// for `1.50` and `list(ts)` print the raw microsecond count.
 fn push_json_scalar(col: &Vector, row: usize, out: &mut Vec<u8>) {
-    match col.data() {
-        Data::Bool(b) => out.extend_from_slice(if b.get(row) { b"true" } else { b"false" }),
-        Data::I32(v) => push_int_text(out, v[row] as i128, 0),
-        Data::I64(v) => push_int_text(out, v[row] as i128, 0),
-        Data::I128(v) => {
-            let scale = match col.ty() {
+    let ty = col.ty();
+    match ty {
+        // Physically an integer (or raw bytes for UUID); the storage form would be meaningless
+        // as output, so these go out as the quoted text `to_json` writes for them.
+        Ty::Date | Ty::Time | Ty::Timestamp | Ty::Timestamptz | Ty::Interval | Ty::Uuid => {
+            out.push(b'"');
+            match ty {
+                Ty::Date => funcs::fmt_date(col.i32s()[row] as i64, out),
+                Ty::Time => funcs::fmt_time(col.i64s()[row], out),
+                Ty::Timestamptz => funcs::fmt_timestamptz(col.i64s()[row], out),
+                Ty::Interval => {
+                    let (months, days, micros) = unpack_interval(col.i128s()[row]);
+                    fmt_interval(months, days, micros, out);
+                }
+                Ty::Uuid => {
+                    if let Ok(raw) = <[u8; 16]>::try_from(col.bytes().get(row)) {
+                        funcs::fmt_uuid(&raw, out);
+                    }
+                }
+                _ => funcs::fmt_timestamp(col.i64s()[row], out),
+            }
+            out.push(b'"');
+        }
+        // Already valid JSON text, so it is embedded as is and a nested array stays nested.
+        Ty::Json => out.extend_from_slice(col.bytes().get(row)),
+        _ => {
+            let scale = match ty {
                 Ty::Decimal { scale, .. } => scale,
                 _ => 0,
             };
-            push_int_text(out, v[row], scale);
-        }
-        Data::F64(v) => push_f64_text(out, v[row]),
-        Data::Bytes(b) => push_json_string(out, b.get(row)),
-    }
-}
-
-/// Renders `v` as decimal text (with a decimal point at `scale` digits for DECIMAL).
-/// `expr::kernels::fmt_int` is private and cannot be called from outside, so just as much as
-/// ArrayAgg needs is rewritten here on the same idea.
-fn push_int_text(out: &mut Vec<u8>, v: i128, scale: u8) {
-    let neg = v < 0;
-    let mut u = v.unsigned_abs();
-    let mut buf = [0u8; 48];
-    let mut k = 0usize;
-    if u == 0 {
-        buf[0] = b'0';
-        k = 1;
-    }
-    while u > 0 {
-        buf[k] = b'0' + (u % 10) as u8;
-        u /= 10;
-        k += 1;
-    }
-    // Supplies the leading 0 when there is no integer part, as with 0.05.
-    while k <= scale as usize {
-        buf[k] = b'0';
-        k += 1;
-    }
-    if neg {
-        out.push(b'-');
-    }
-    for i in (0..k).rev() {
-        out.push(buf[i]);
-        if scale > 0 && i == scale as usize {
-            out.push(b'.');
-        }
-    }
-}
-
-/// A simple decimal rendering of f64. Rounded to 15 significant digits with trailing zeros
-/// dropped. A full CAST-grade round-trippable representation is unnecessary (this is only for
-/// ArrayAgg's display), so it is not built as rigorously as `expr::kernels::fmt_f64`.
-fn push_f64_text(out: &mut Vec<u8>, x: f64) {
-    if x.is_nan() {
-        out.extend_from_slice(b"NaN");
-        return;
-    }
-    if x.is_infinite() {
-        out.extend_from_slice(if x < 0.0 { b"-Infinity" } else { b"Infinity" });
-        return;
-    }
-    if x == 0.0 {
-        out.extend_from_slice(if x.is_sign_negative() { b"-0" } else { b"0" });
-        return;
-    }
-    if x < 0.0 {
-        out.push(b'-');
-    }
-    let v = if x < 0.0 { -x } else { x };
-    // Normalizes m into [1e14, 1e15) while preserving v = m * 10^e10.
-    let mut m = v;
-    let mut e10: i32 = 0;
-    while m >= 1e15 {
-        m /= 10.0;
-        e10 += 1;
-    }
-    while m < 1e14 {
-        m *= 10.0;
-        e10 -= 1;
-    }
-    let mut mant = (m + 0.5) as u64;
-    if mant >= 1_000_000_000_000_000 {
-        mant /= 10;
-        e10 += 1;
-    }
-    let mut digits = [0u8; 15];
-    let mut t = mant;
-    for i in (0..15).rev() {
-        digits[i] = b'0' + (t % 10) as u8;
-        t /= 10;
-    }
-    let mut k = 15usize;
-    while k > 1 && digits[k - 1] == b'0' {
-        k -= 1;
-    }
-    // v = 0.d1..dk × 10^p
-    let p = e10 + 15;
-    if !(1..=17).contains(&p) {
-        // Exponential notation.
-        out.push(digits[0]);
-        if k > 1 {
-            out.push(b'.');
-            out.extend_from_slice(&digits[1..k]);
-        }
-        out.push(b'e');
-        let e = p - 1;
-        if e < 0 {
-            out.push(b'-');
-        }
-        push_int_text(out, if e < 0 { -(e as i128) } else { e as i128 }, 0);
-    } else if (p as usize) >= k {
-        out.extend_from_slice(&digits[..k]);
-        for _ in 0..(p as usize - k) {
-            out.push(b'0');
-        }
-    } else {
-        out.extend_from_slice(&digits[..p as usize]);
-        out.push(b'.');
-        out.extend_from_slice(&digits[p as usize..k]);
-    }
-}
-
-/// Writes a JSON-like string literal. A full JSON character codec is unnecessary, so only the
-/// characters that would break the round trip (quote, backslash, control characters) are
-/// escaped.
-fn push_json_string(out: &mut Vec<u8>, s: &[u8]) {
-    out.push(b'"');
-    for &b in s {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x00..=0x1f => {
-                out.extend_from_slice(b"\\u00");
-                out.push(hex_digit(b >> 4));
-                out.push(hex_digit(b & 0xf));
+            match col.data() {
+                Data::Bool(b) => out.extend_from_slice(if b.get(row) { b"true" } else { b"false" }),
+                Data::I32(v) => {
+                    kernels::fmt_int(v[row].unsigned_abs() as u128, v[row] < 0, scale, out)
+                }
+                Data::I64(v) => {
+                    kernels::fmt_int(v[row].unsigned_abs() as u128, v[row] < 0, scale, out)
+                }
+                Data::I128(v) => kernels::fmt_int(v[row].unsigned_abs(), v[row] < 0, scale, out),
+                // The same text `CAST(x AS VARCHAR)` gives. A private renderer here used to
+                // print 0.5 as `5e-1`.
+                Data::F64(v) => kernels::fmt_f64(v[row], out),
+                Data::Bytes(b) => crate::json::write_json_string(b.get(row), out),
             }
-            _ => out.push(b),
         }
-    }
-    out.push(b'"');
-}
-
-fn hex_digit(n: u8) -> u8 {
-    if n < 10 {
-        b'0' + n
-    } else {
-        b'a' + (n - 10)
     }
 }
 
@@ -2473,13 +2390,16 @@ mod tests {
 
     #[test]
     fn array_agg_of_f64_uses_shortest_decimal_or_exponential_form() {
-        // push_f64_text is never exercised by the INT/VARCHAR array_agg tests. The normal range,
-        // the boundary where it switches to exponential notation (p outside 1..=17), and
-        // NaN/Infinity are all checked together here. The format matches duckdb's to_json(x).
+        // The float path is never exercised by the INT/VARCHAR array_agg tests. The normal range,
+        // the boundary where it switches to exponential notation, and NaN/Infinity are all
+        // checked together here. Elements go through `kernels::fmt_f64`, the same renderer
+        // `CAST(x AS VARCHAR)` uses, so the text matches duckdb's `list(x)` exactly -- a private
+        // renderer here used to print 0.5 as `5e-1` and infinity as `Infinity`.
         let steps = batches(vec![vec![f64s(&[
+            Some(0.5),
             Some(1.5),
-            Some(1e20),  // p = 21 > 17 -> exponential notation
-            Some(1e-10), // p = -9 < 1 -> exponential notation
+            Some(1e20),
+            Some(1e-10),
             Some(f64::NAN),
             Some(f64::INFINITY),
         ])]]);
@@ -2489,7 +2409,7 @@ mod tests {
             Value::Bytes(b) => b.clone(),
             other => panic!("expected bytes but got {other:?}"),
         };
-        assert_eq!(s, b"[1.5, 1e20, 1e-10, NaN, Infinity]".to_vec());
+        assert_eq!(s, b"[0.5, 1.5, 1e+20, 1e-10, nan, inf]".to_vec());
     }
 
     #[test]

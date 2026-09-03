@@ -21,12 +21,15 @@
 //!
 //! NDJSON permits any JSON value per line, not just objects. When the inference sample holds such
 //! a line, the whole file reads as a single VARCHAR column named `json` carrying each line's raw
-//! JSON text -- the shape DuckDB gives the same file.
+//! JSON text -- the shape DuckDB gives the same file. A file whose objects are all empty (`{}`)
+//! takes the same shape, since a table with no columns at all cannot report a row count.
 //!
 //! ## Type inference
 //!
-//! Looking at up to `SAMPLE_LINES` rows within the leading `SAMPLE_BYTES`, each column widens
-//! along the lattice NULL -> BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR. The column set is the
+//! Looking at up to `SAMPLE_LINES` rows within the leading `SAMPLE_BYTES` (grown up to
+//! `MAX_SAMPLE_BYTES` when that does not hold one complete line), each column widens along the
+//! lattice NULL -> BIGINT -> DOUBLE -> VARCHAR, with BOOLEAN a sibling of the numbers rather than
+//! a step below them (`true` mixed with `1` gives VARCHAR -- see `widen`). The column set is the
 //! **union** of the per-row keys (in order of first appearance), and a key absent from a row is
 //! NULL for that row alone. Unlike CSV, columns can be missing per row -- that is this format's essence.
 //!
@@ -51,6 +54,13 @@ pub const SAMPLE_LINES: usize = 1000;
 /// pathological input whose keys differ per row.
 const MAX_COLUMNS: usize = 1024;
 
+/// The ceiling the inference sample may grow to when [`SAMPLE_BYTES`] holds no complete line.
+///
+/// A first line longer than 256 KiB used to fail the whole file with `LimitExceeded` -- reordering
+/// the very same lines made it readable. The ceiling is `TEXT_MAX_RECORD`, the longest line the
+/// reader accepts anyway, so asking for more would buy nothing.
+const MAX_SAMPLE_BYTES: u64 = TEXT_MAX_RECORD;
+
 pub struct JsonlFormat {
     schema: Vec<Field>,
     resolved: bool,
@@ -63,7 +73,18 @@ pub struct JsonlFormat {
     /// gives the whole file a single column named `json` holding each line's raw JSON text, and so
     /// does this: one non-object line anywhere in the sample switches the file into that shape
     /// (object lines then come back as their raw text too, exactly as DuckDB renders them).
+    ///
+    /// It is also switched on when the sample's objects contribute **no columns at all** (a file of
+    /// `{}` lines): a zero-column table reports `count(*)` as 0 and makes `SELECT *` a syntax
+    /// error, which is a silently wrong answer. DuckDB gives such a file one `json` column holding
+    /// each record, and so does this.
     raw_json: bool,
+    /// How many leading bytes the schema inference has asked for so far. Starts at
+    /// [`SAMPLE_BYTES`] and grows toward [`MAX_SAMPLE_BYTES`] while no complete line fits.
+    sample_bytes: u64,
+    /// Per column: the sample held only `null` for it, so its `Ty::Varchar` is a default rather
+    /// than a reading of the data. See `TableFormat::column_has_no_evidence`.
+    no_evidence: Vec<bool>,
 }
 
 impl JsonlFormat {
@@ -74,6 +95,8 @@ impl JsonlFormat {
             total_len: 0,
             split_bytes: TEXT_SPLIT_BYTES,
             raw_json: false,
+            sample_bytes: SAMPLE_BYTES,
+            no_evidence: Vec::new(),
         }
     }
 
@@ -87,6 +110,18 @@ impl JsonlFormat {
     /// 0 is rounded to 1.
     pub fn set_split_bytes(&mut self, n: u64) {
         self.split_bytes = n.max(1);
+    }
+
+    /// Enlarges the inference sample, returning whether there was any room left to do so.
+    ///
+    /// The sample strictly grows on every successful call, so `resolve`'s retry loop always makes
+    /// progress and cannot spin.
+    fn grow_sample(&mut self, total_len: u64) -> bool {
+        if self.sample_bytes >= MAX_SAMPLE_BYTES || self.sample_bytes >= total_len {
+            return false;
+        }
+        self.sample_bytes = self.sample_bytes.saturating_mul(4).min(MAX_SAMPLE_BYTES);
+        true
     }
 
     /// The byte range `[start, end)` split `split` is responsible for.
@@ -109,77 +144,91 @@ impl TableFormat for JsonlFormat {
             return Ok(Ok(()));
         }
         self.total_len = src.total_len;
-        let n = SAMPLE_BYTES.min(src.total_len);
-        if n == 0 {
+        if src.total_len == 0 {
             // An empty file. There are neither columns nor splits, but resolution itself succeeds.
             self.resolved = true;
             return Ok(Ok(()));
         }
-        let buf = match src.get(0, n as usize) {
-            Some(b) => b,
-            None => return Ok(Err((0, n))),
-        };
-        // If the sample is not the whole file, the last line may be cut off partway.
-        let partial = n < src.total_len;
+        // The loop only ever repeats after `grow_sample` has strictly increased `sample_bytes`
+        // (and only up to `MAX_SAMPLE_BYTES`), so it terminates.
+        loop {
+            let n = self.sample_bytes.min(src.total_len);
+            let buf = match src.get(0, n as usize) {
+                Some(b) => b,
+                None => return Ok(Err((0, n))),
+            };
+            // If the sample is not the whole file, the last line may be cut off partway.
+            let partial = n < src.total_len;
 
-        let mut names: Vec<String> = Vec::new();
-        let mut infs: Vec<Inf> = Vec::new();
-        let mut key = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            let mut infs: Vec<Inf> = Vec::new();
+            let mut key = Vec::new();
 
-        let mut pos = skip_bom(buf);
-        let mut lines = 0usize;
-        let mut truncated = false;
-        let mut raw = false;
-        while pos < buf.len() && lines < SAMPLE_LINES {
-            let (line, next, terminated) = next_line(buf, pos);
-            pos = next;
-            if !terminated && partial {
-                truncated = true;
-                break;
+            let mut pos = skip_bom(buf);
+            let mut lines = 0usize;
+            let mut truncated = false;
+            let mut raw = false;
+            while pos < buf.len() && lines < SAMPLE_LINES {
+                let (line, next, terminated) = next_line(buf, pos);
+                pos = next;
+                if !terminated && partial {
+                    truncated = true;
+                    break;
+                }
+                if is_blank(line) {
+                    continue;
+                }
+                lines += 1;
+                // A line that is not an object puts the whole file into raw-JSON mode (see `raw_json`).
+                if byte_at(line, skip_ws(line, 0))? != b'{' {
+                    raw = true;
+                    break;
+                }
+                let mut it = Members::new(line)?;
+                while let Some(m) = it.next()? {
+                    let name = member_key(&m, &mut key)?;
+                    let idx = match names.iter().position(|s| s.as_bytes() == name) {
+                        Some(i) => i,
+                        None => {
+                            ensure!(names.len() < MAX_COLUMNS, LimitExceeded);
+                            names.push(String::from_utf8_lossy(name).into_owned());
+                            infs.push(Inf::Null);
+                            names.len() - 1
+                        }
+                    };
+                    infs[idx] = widen(infs[idx], infer(&m));
+                }
             }
-            if is_blank(line) {
+            if truncated && lines == 0 {
+                // Not one line fit within the sample. Ask for more before giving up -- a first line
+                // longer than `SAMPLE_BYTES` used to fail the whole file even though moving it
+                // further down made the very same file readable.
+                ensure!(self.grow_sample(src.total_len), LimitExceeded);
                 continue;
             }
-            lines += 1;
-            // A line that is not an object puts the whole file into raw-JSON mode (see `raw_json`).
-            if byte_at(line, skip_ws(line, 0))? != b'{' {
-                raw = true;
-                break;
-            }
-            let mut it = Members::new(line)?;
-            while let Some(m) = it.next()? {
-                let name = member_key(&m, &mut key)?;
-                let idx = match names.iter().position(|s| s.as_bytes() == name) {
-                    Some(i) => i,
-                    None => {
-                        ensure!(names.len() < MAX_COLUMNS, LimitExceeded);
-                        names.push(String::from_utf8_lossy(name).into_owned());
-                        infs.push(Inf::Null);
-                        names.len() - 1
-                    }
-                };
-                infs[idx] = widen(infs[idx], infer(&m));
-            }
+
+            // Split indexes are `usize` throughout the execution layer. Do not
+            // silently truncate a huge remote file's u64 split count on 32-bit
+            // WASM (or for a deliberately tiny test split size).
+            let split_count = self.total_len.div_ceil(self.split_bytes.max(1));
+            ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
+
+            // Objects that contribute no columns at all (a file of `{}` lines) would give a
+            // zero-column table, whose `count(*)` reads 0 and whose `SELECT *` is a syntax error.
+            // Fall back to the same raw-JSON shape DuckDB uses (see `raw_json`).
+            self.raw_json = raw || names.is_empty();
+            self.schema = if self.raw_json {
+                // One VARCHAR column holding each line's raw JSON text, named as DuckDB names it.
+                self.no_evidence = vec![false];
+                vec![Field::new(String::from("json"), Ty::Varchar, true)]
+            } else {
+                self.no_evidence = infs.iter().map(|i| *i == Inf::Null).collect();
+                // A JSON value can be missing at any time, so every column is nullable.
+                names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect()
+            };
+            self.resolved = true;
+            return Ok(Ok(()));
         }
-        // Not one line fit within the sample = one record exceeds 256 KiB.
-        ensure!(!(truncated && lines == 0), LimitExceeded);
-
-        // Split indexes are `usize` throughout the execution layer. Do not
-        // silently truncate a huge remote file's u64 split count on 32-bit
-        // WASM (or for a deliberately tiny test split size).
-        let split_count = self.total_len.div_ceil(self.split_bytes.max(1));
-        ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
-
-        self.raw_json = raw;
-        self.schema = if raw {
-            // One VARCHAR column holding each line's raw JSON text, named as DuckDB names it.
-            vec![Field::new(String::from("json"), Ty::Varchar, true)]
-        } else {
-            // A JSON value can be missing at any time, so every column is nullable.
-            names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect()
-        };
-        self.resolved = true;
-        Ok(Ok(()))
     }
 
     fn is_resolved(&self) -> bool {
@@ -312,6 +361,10 @@ impl TableFormat for JsonlFormat {
     fn schema_is_inferred(&self) -> bool {
         true
     }
+
+    fn column_has_no_evidence(&self, col: usize) -> bool {
+        self.no_evidence.get(col).copied().unwrap_or(false)
+    }
 }
 
 // --- Type inference -----------------------------------------------------------
@@ -344,8 +397,14 @@ impl Inf {
     }
 }
 
-/// The lattice NULL -> BOOLEAN -> BIGINT -> DOUBLE -> VARCHAR.
-/// A mixture across families (numbers and dates, say) can only fall to text.
+/// The lattice NULL -> BIGINT -> DOUBLE -> VARCHAR, with BOOLEAN a sibling of the numbers rather
+/// than a step below them. A mixture across families (numbers and dates, say) can only fall to text.
+///
+/// BOOLEAN mixed with a number widens to **VARCHAR**, not to the numeric type: `true` has no
+/// numeric reading, so choosing BIGINT made the reader fail with `InvalidCast` on the very sample
+/// rows that produced the guess. `format::csv`'s `widen` resolves the same mixture the same way.
+/// (DuckDB gives the column its `JSON` type; this reader predates `Ty::Json` and carries raw JSON
+/// text in a VARCHAR, which is the closest thing it has -- see `docs/sql/data-sources.md`.)
 fn widen(a: Inf, b: Inf) -> Inf {
     use Inf::*;
     if a == b {
@@ -353,8 +412,6 @@ fn widen(a: Inf, b: Inf) -> Inf {
     }
     match (a, b) {
         (Null, x) | (x, Null) => x,
-        (Bool, Int) | (Int, Bool) => Int,
-        (Bool, Double) | (Double, Bool) => Double,
         (Int, Double) | (Double, Int) => Double,
         (Date, Timestamp) | (Timestamp, Date) => Timestamp,
         _ => Varchar,
@@ -952,9 +1009,13 @@ mod tests {
         assert_eq!(infer_ty(&["true"]), Ty::Boolean);
         assert_eq!(infer_ty(&["null", "true"]), Ty::Boolean);
         assert_eq!(infer_ty(&["1"]), Ty::BigInt);
-        assert_eq!(infer_ty(&["true", "1"]), Ty::BigInt);
+        // BOOLEAN mixed with a number is VARCHAR: choosing the numeric type used to make the
+        // reader fail with `InvalidCast` on the very sample rows the guess came from.
+        // (duckdb types the column JSON; VARCHAR carrying raw JSON text is this reader's
+        // equivalent -- `Ty::Json` postdates it.)
+        assert_eq!(infer_ty(&["true", "1"]), Ty::Varchar);
         assert_eq!(infer_ty(&["1", "1.5"]), Ty::Double);
-        assert_eq!(infer_ty(&["true", "1.5"]), Ty::Double);
+        assert_eq!(infer_ty(&["true", "1.5"]), Ty::Varchar);
         assert_eq!(infer_ty(&["1", "\"x\""]), Ty::Varchar);
         assert_eq!(infer_ty(&["1.5", "\"x\""]), Ty::Varchar);
         assert_eq!(infer_ty(&["true", "\"x\""]), Ty::Varchar);
@@ -1319,6 +1380,48 @@ mod tests {
             }
             text.push_str("}\n");
         }
+        let src = Source::from_bytes(text.into_bytes());
+        let mut f = JsonlFormat::new();
+        assert_eq!(code_of(f.resolve(&src)), Some(Code::LimitExceeded));
+    }
+
+    #[test]
+    fn a_file_of_empty_objects_is_one_json_column_rather_than_no_columns() {
+        // `{}\n{}\n` used to infer zero columns, so `count(*)` read 0 (a `Batch` with no columns
+        // has no row count to report) and `SELECT *` was a syntax error. duckdb gives the file one
+        // column named `json` holding each record.
+        let (f, _) = resolve(b"{}\n{}\n");
+        assert_eq!(schema_of("{}\n{}\n"), vec![(String::from("json"), Ty::Varchar)]);
+        assert_eq!(f.num_splits(), 1);
+        let cols = read_all("{}\n{}\n");
+        assert_eq!(cols[0], [s("{}"), s("{}")]);
+    }
+
+    #[test]
+    fn a_bool_and_number_mixture_widens_to_text_instead_of_failing_its_own_sample() {
+        // `true` has no numeric reading, so BIGINT made the reader fail with InvalidCast on the
+        // very sample lines that produced the guess. duckdb types the column JSON; raw JSON text
+        // in a VARCHAR is this reader's equivalent (see the module docs).
+        assert_eq!(schema_of("{\"a\":true}\n{\"a\":1}\n"), vec![(String::from("a"), Ty::Varchar)]);
+        let cols = read_all("{\"a\":true}\n{\"a\":1}\n");
+        assert_eq!(cols[0], [s("true"), s("1")]);
+    }
+
+    #[test]
+    fn a_first_line_longer_than_the_initial_sample_grows_it_instead_of_failing() {
+        // A first line over SAMPLE_BYTES used to fail the whole file with LimitExceeded -- moving
+        // the very same line further down made the file readable, which is no rule at all.
+        let pad = "x".repeat(SAMPLE_BYTES as usize);
+        let text = format!("{{\"a\":1,\"b\":\"{pad}\"}}\n{{\"a\":2,\"b\":\"y\"}}\n");
+        let (f, _) = resolve(text.as_bytes());
+        assert!(f.sample_bytes > SAMPLE_BYTES);
+        assert_eq!(f.schema()[0].ty, Ty::BigInt);
+        let cols = read_cols(text.as_bytes(), 0, Some(&[0]));
+        assert_eq!(cols[0], [Value::I64(1), Value::I64(2)]);
+
+        // A line longer than the ceiling is still a limit rather than an endless growth loop.
+        let huge = "x".repeat(MAX_SAMPLE_BYTES as usize);
+        let text = format!("{{\"a\":\"{huge}\"}}\n{{\"a\":\"y\"}}\n");
         let src = Source::from_bytes(text.into_bytes());
         let mut f = JsonlFormat::new();
         assert_eq!(code_of(f.resolve(&src)), Some(Code::LimitExceeded));

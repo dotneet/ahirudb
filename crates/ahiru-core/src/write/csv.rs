@@ -138,7 +138,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty, delimiter: u8) {
             }
             _ => push_int(out, *x),
         },
-        Value::F64(x) => push_f64(out, *x),
+        Value::F64(x) => push_f64(out, *x, ty == Ty::Float),
         Value::Bytes(b) if ty == Ty::Blob => push_blob(out, b, delimiter),
         Value::Bytes(b) if ty == Ty::Uuid => {
             // UUID's physical representation is 16 raw bytes, so convert to text
@@ -247,19 +247,35 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 /// per format.
 ///
 /// The only thing that differs between the two writers is how non-finite
-/// values are spelled: CSV writes `NaN` / `Infinity` / `-Infinity`, while
-/// JSON has no such literal (JSONL writes `null` instead) -- that split is
-/// why this function itself is not shared, only what it delegates to below.
-fn push_f64(out: &mut Vec<u8>, v: f64) {
+/// values are spelled: CSV writes `NaN` / `inf` / `-inf`, while JSON has no
+/// such literal (JSONL quotes them instead) -- that split is why this
+/// function itself is not shared, only what it delegates to below.
+///
+/// The infinities are spelled `inf` / `-inf` rather than the longer
+/// `Infinity` / `-Infinity` because that is what DuckDB's own CSV writer
+/// emits, and -- more importantly -- what its CSV *reader* recognizes as a
+/// DOUBLE: `Infinity` is sniffed as a DATE there, so re-reading an exported
+/// file turned the whole column into dates. This crate's reader accepts
+/// either spelling (`expr::kernels::parse_special_f64` is case-insensitive
+/// and takes both), so nothing that could already read these files stops
+/// being able to.
+///
+/// `is_float` selects `FLOAT`'s shortest round trip rather than `DOUBLE`'s,
+/// so a FLOAT column exports as `1.1`, not `1.100000023841858`.
+fn push_f64(out: &mut Vec<u8>, v: f64, is_float: bool) {
     if v.is_nan() {
         out.extend_from_slice(b"NaN");
         return;
     }
     if v.is_infinite() {
-        out.extend_from_slice(if v > 0.0 { b"Infinity" } else { b"-Infinity" });
+        out.extend_from_slice(if v > 0.0 { b"inf" } else { b"-inf" });
         return;
     }
-    super::float::write_f64_finite(out, v);
+    if is_float {
+        super::float::write_f32_finite(out, v);
+    } else {
+        super::float::write_f64_finite(out, v);
+    }
 }
 
 fn push_date(out: &mut Vec<u8>, days: i64) {
@@ -429,14 +445,34 @@ mod tests {
         // std-Display property test -- is covered once, for both writers,
         // in `expr/float.rs`'s own test module.
         let mut out = Vec::new();
-        push_f64(&mut out, f64::NAN);
+        push_f64(&mut out, f64::NAN, false);
         assert_eq!(out, b"NaN");
         out.clear();
-        push_f64(&mut out, f64::INFINITY);
-        assert_eq!(out, b"Infinity");
+        // `inf` / `-inf`, the spelling DuckDB's CSV writer uses and its reader
+        // recognizes as DOUBLE (it sniffs `Infinity` as a DATE instead).
+        push_f64(&mut out, f64::INFINITY, false);
+        assert_eq!(out, b"inf");
         out.clear();
-        push_f64(&mut out, f64::NEG_INFINITY);
-        assert_eq!(out, b"-Infinity");
+        push_f64(&mut out, f64::NEG_INFINITY, false);
+        assert_eq!(out, b"-inf");
+    }
+
+    /// A FLOAT column is written at `f32` precision, so `1.1::FLOAT` exports as
+    /// `1.1` rather than the `f64` spelling `1.100000023841858` of the same bits.
+    #[test]
+    fn float_columns_use_f32_shortest_round_trip() {
+        let mut out = Vec::new();
+        push_f64(&mut out, 1.1f32 as f64, true);
+        assert_eq!(out, b"1.1");
+        out.clear();
+        push_f64(&mut out, 1.1f32 as f64, false);
+        assert_eq!(out, b"1.100000023841858");
+        out.clear();
+        push_value(&mut out, &Value::F64(0.1f32 as f64), Ty::Float, b',');
+        assert_eq!(out, b"0.1");
+        out.clear();
+        push_value(&mut out, &Value::F64(0.1f32 as f64), Ty::Double, b',');
+        assert_eq!(out, b"0.10000000149011612");
     }
 
     #[test]

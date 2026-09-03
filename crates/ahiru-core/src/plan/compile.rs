@@ -145,28 +145,39 @@ fn date_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, bool)> {
 ///
 /// Division falls to DOUBLE, as in DuckDB. Left as integer division the scale would
 /// subtract, leaving too few digits and giving 0 in most cases.
-fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, Ty, Ty)> {
+///
+/// A product whose scale would exceed [`crate::vector::types::MAX_DECIMAL_PRECISION`] is
+/// rejected with `ValueOutOfRange` rather than silently clamped: clamping the type without
+/// rescaling the raw integer made `0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20)` report
+/// `0.01` instead of `0.0001`. DuckDB raises an out-of-range error naming the needed scale
+/// there too, and points at the same workarounds -- cast an operand to DOUBLE, or to a
+/// DECIMAL with a smaller scale. The result *precision* is still clamped to the maximum,
+/// which is also what DuckDB does (`DECIMAL(20,2) * DECIMAL(19,2)` -> `DECIMAL(38,4)`).
+fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Result<Option<(Ty, Ty, Ty)>> {
     if !matches!(op, BinaryOp::Mul | BinaryOp::Div) {
-        return None;
+        return Ok(None);
     }
     // If neither side is DECIMAL, take the ordinary path.
     if !matches!(lt, Ty::Decimal { .. }) && !matches!(rt, Ty::Decimal { .. }) {
-        return None;
+        return Ok(None);
     }
     // With floating point mixed in, fall to DOUBLE (as in DuckDB).
     if matches!(lt, Ty::Float | Ty::Double) || matches!(rt, Ty::Float | Ty::Double) {
-        return Some((Ty::Double, Ty::Double, Ty::Double));
+        return Ok(Some((Ty::Double, Ty::Double, Ty::Double)));
     }
-    let (p1, s1) = lt.as_decimal()?;
-    let (p2, s2) = rt.as_decimal()?;
+    let (Some((p1, s1)), Some((p2, s2))) = (lt.as_decimal(), rt.as_decimal()) else {
+        return Ok(None);
+    };
     if op == BinaryOp::Div {
-        return Some((Ty::Double, Ty::Double, Ty::Double));
+        return Ok(Some((Ty::Double, Ty::Double, Ty::Double)));
     }
     // Multiplication: precision adds, and so does scale.
-    let res = Ty::decimal(p1.saturating_add(p2), s1.saturating_add(s2));
-    let (rp, _) = res.as_decimal()?;
+    let scale = s1.saturating_add(s2);
+    ensure!(scale <= crate::vector::types::MAX_DECIMAL_PRECISION, ValueOutOfRange);
+    let res = Ty::decimal(p1.saturating_add(p2), scale);
+    let Some((rp, _)) = res.as_decimal() else { return Ok(None) };
     // Both operands keep their scale and widen to the result's physical width.
-    Some((Ty::decimal(rp, s1), Ty::decimal(rp, s2), res))
+    Ok(Some((Ty::decimal(rp, s1), Ty::decimal(rp, s2), res)))
 }
 
 /// Recognizes the shapes DATE/TIMESTAMP +- INTERVAL, INTERVAL +- INTERVAL, and
@@ -596,7 +607,7 @@ impl<'a> Compiler<'a> {
                 Ok((self.konst(ty, v), ty))
             }
             Expr::Unary { op, arg } => self.unary(*op, *arg),
-            Expr::Binary { op, lhs, rhs } => self.binary(*op, *lhs, *rhs),
+            Expr::Binary { .. } => self.binary_chain(id),
             Expr::Cast { arg, ty, try_ } => {
                 let (r, from) = self.expr(*arg)?;
                 if *try_ {
@@ -671,6 +682,20 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// The value of an argument that is written as an integer literal, `None` otherwise.
+    /// The parser keeps a negated literal as `-<literal>` rather than folding it, so that
+    /// shape is unwrapped here too (`round(x, -2)`).
+    fn const_int(&self, id: ExprId) -> Option<i64> {
+        match self.arena.get(id) {
+            Expr::Literal(v) => v.as_i64(),
+            Expr::Unary { op: UnaryOp::Neg, arg } => match self.arena.get(*arg) {
+                Expr::Literal(v) => v.as_i64().and_then(i64::checked_neg),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// A scalar function call. Type checking and argument conversion are finished here, so
     /// only already-converted vectors are passed at runtime.
     fn scalar_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
@@ -697,7 +722,11 @@ impl<'a> Compiler<'a> {
             let v = Value::Bytes(tys[0].name().as_bytes().to_vec());
             return Ok((self.konst(Ty::Varchar, v), Ty::Varchar));
         }
-        let (id, want, res) = crate::expr::funcs::resolve(name, &tys)?;
+        // A few signatures' *result type* depends on an argument's value, not just its type
+        // (`round(<decimal>, d)`'s result scale is `min(s, max(d, 0))`, as in DuckDB), so
+        // literal integer arguments are passed along.
+        let consts: Vec<Option<i64>> = args.iter().map(|a| self.const_int(*a)).collect();
+        let (id, want, res) = crate::expr::funcs::resolve_const(name, &tys, &consts)?;
         ensure!(want.len() == regs.len(), WrongArgCount);
         for i in 0..regs.len() {
             regs[i] = self.coerce(regs[i], tys[i], want[i])?;
@@ -842,8 +871,49 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn binary(&mut self, op: BinaryOp, lhs: ExprId, rhs: ExprId) -> Result<(Reg, Ty)> {
-        let (lr, lt) = self.expr(lhs)?;
+    /// Whether [`Self::substitute`] would replace this node, without emitting anything.
+    fn is_substituted(&self, id: ExprId) -> bool {
+        self.subs.iter().any(|s| {
+            if s.structural {
+                expr_eq(self.arena, s.expr, id)
+            } else {
+                s.expr == id
+            }
+        })
+    }
+
+    /// Compiles a left-deep chain of binary operators without recursing per link.
+    ///
+    /// `1+1+...+1`, `'a'||'a'||...` and `p AND q AND ...` all parse into `Binary` nodes
+    /// nested through their **left** operand only. Recursing into `lhs` would spend one
+    /// stack frame and one unit of `MAX_DEPTH` per term, rejecting a perfectly flat
+    /// expression of a few dozen terms as "expression nesting too deep". The spine is
+    /// descended in a loop and then compiled bottom-up, which visits the operands in
+    /// exactly the same order as the recursive version and so emits identical bytecode.
+    ///
+    /// The descent stops at a node the substitution list replaces (an inner node of the
+    /// spine can itself be a GROUP BY expression that already exists as a column); that
+    /// node is then compiled by `expr`, which applies the substitution as usual.
+    fn binary_chain(&mut self, id: ExprId) -> Result<(Reg, Ty)> {
+        let mut spine: Vec<(BinaryOp, ExprId)> = Vec::new();
+        let mut cur = id;
+        while let Expr::Binary { op, lhs, rhs } = self.arena.get(cur) {
+            if cur != id && self.is_substituted(cur) {
+                break;
+            }
+            spine.push((*op, *rhs));
+            cur = *lhs;
+        }
+        let mut acc = self.expr(cur)?;
+        for &(op, rhs) in spine.iter().rev() {
+            acc = self.binary_rhs(op, acc, rhs)?;
+        }
+        Ok(acc)
+    }
+
+    /// Compiles one binary operator, with its left operand already compiled.
+    fn binary_rhs(&mut self, op: BinaryOp, lhs: (Reg, Ty), rhs: ExprId) -> Result<(Reg, Ty)> {
+        let (lr, lt) = lhs;
         let (rr, rt) = self.expr(rhs)?;
 
         if op.is_logical() {
@@ -912,7 +982,7 @@ impl<'a> Compiler<'a> {
         }
 
         // DECIMAL multiplication and division change the scale, so they do not ride the common-type path.
-        if let Some((lcast, rcast, res)) = decimal_arith(op, lt, rt) {
+        if let Some((lcast, rcast, res)) = decimal_arith(op, lt, rt)? {
             let l = self.coerce(lr, lt, lcast)?;
             let r = self.coerce(rr, rt, rcast)?;
             let code = if op == BinaryOp::Mul { OpCode::Mul } else { OpCode::Div };
@@ -1253,11 +1323,26 @@ mod tests {
     fn deep_nesting_is_rejected_without_overflowing_the_stack() {
         let mut a = ExprArena::new();
         let mut id = a.push(Expr::Literal(Value::I32(1)));
+        // Nested through the *right* operand: `1+(1+(1+...))` really is 500 levels deep.
+        for _ in 0..500 {
+            let l = a.push(Expr::Literal(Value::I32(1)));
+            id = a.push(Expr::Binary { op: BinaryOp::Add, lhs: l, rhs: id });
+        }
+        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::ExpressionTooDeep));
+    }
+
+    #[test]
+    fn a_flat_left_deep_chain_compiles_however_long_it_is() {
+        let mut a = ExprArena::new();
+        let mut id = a.push(Expr::Literal(Value::I32(1)));
+        // `1+1+...+1` is what a flat 500-term sum parses into: left-associative, so the
+        // tree grows down the left operand. It is not nested, so the nesting limit must
+        // not reject it (`Compiler::binary_chain` walks the spine iteratively).
         for _ in 0..500 {
             let r = a.push(Expr::Literal(Value::I32(1)));
             id = a.push(Expr::Binary { op: BinaryOp::Add, lhs: id, rhs: r });
         }
-        assert_eq!(code_of(compile(&a, &cols(), &[], id)), Some(Code::ExpressionTooDeep));
+        assert!(compile(&a, &cols(), &[], id).is_ok());
     }
 
     // --- ILIKE / TRY_CAST -------------------------------------------------------

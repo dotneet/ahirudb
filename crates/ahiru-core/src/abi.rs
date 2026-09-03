@@ -556,9 +556,16 @@ pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
         Some(s) => s,
         None => return fail_code(crate::error::Code::Internal, STATUS_ERROR),
     };
-    let session = match st.sessions.get_mut(sidx).and_then(|s| s.as_mut()) {
-        Some(s) => s,
-        None => return fail_code(crate::error::Code::Internal, STATUS_ERROR),
+    // The query is out of its slot at this point, so every path from here on has
+    // to put it back. Dropping it would leave a live handle pointing at an empty
+    // slot, and the host's `ahiru_query_close` could then no longer release it.
+    if !matches!(st.sessions.get(sidx), Some(Some(_))) {
+        st.queries[index] = Some(query);
+        return fail_code(crate::error::Code::Internal, STATUS_ERROR);
+    }
+    let Some(session) = st.sessions.get_mut(sidx).and_then(|s| s.as_mut()) else {
+        // Unreachable: the slot was just checked, and nothing ran in between.
+        return fail_code(crate::error::Code::Internal, STATUS_ERROR);
     };
     let r = session.step(&mut query.query);
     let status = match r {

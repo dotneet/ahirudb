@@ -118,7 +118,7 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
             }
             _ => push_int(out, *x),
         },
-        Value::F64(x) => push_f64(out, *x),
+        Value::F64(x) => push_f64(out, *x, ty == Ty::Float),
         Value::Bytes(b) if ty == Ty::Blob => push_blob_string(out, b),
         // `Ty::Json` values are already-valid UTF-8 JSON text (`vector::Ty::Json`
         // doc; Parquet LIST/MAP/nested-STRUCT columns are exposed this way,
@@ -256,10 +256,16 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 /// being duplicated per format.
 ///
 /// The only thing that differs between the two writers is how non-finite
-/// values are spelled: CSV writes the bare words `NaN` / `Infinity` /
-/// `-Infinity`, while JSON has to quote them -- that split is why this
-/// function itself is not shared, only what it delegates to below.
-fn push_f64(out: &mut Vec<u8>, v: f64) {
+/// values are spelled: CSV writes the bare words `NaN` / `inf` / `-inf`,
+/// while JSON has to quote them -- that split is why this function itself is
+/// not shared, only what it delegates to below.
+///
+/// `is_float` selects `FLOAT`'s shortest round trip rather than `DOUBLE`'s,
+/// so a FLOAT column exports as `1.1`, not `1.100000023841858`. That is a
+/// deliberate divergence from `duckdb`, whose JSON writer prints the `f64`
+/// spelling of a FLOAT even though its CSV writer prints `1.1`; see
+/// `docs/sql/copy.md`.
+fn push_f64(out: &mut Vec<u8>, v: f64, is_float: bool) {
     if v.is_nan() {
         out.extend_from_slice(b"\"NaN\"");
         return;
@@ -272,7 +278,11 @@ fn push_f64(out: &mut Vec<u8>, v: f64) {
         out.extend_from_slice(b"\"-Infinity\"");
         return;
     }
-    super::float::write_f64_finite(out, v);
+    if is_float {
+        super::float::write_f32_finite(out, v);
+    } else {
+        super::float::write_f64_finite(out, v);
+    }
 }
 
 fn push_date_string(out: &mut Vec<u8>, days: i64) {
@@ -480,17 +490,31 @@ mod tests {
         // std-Display property test -- is covered once, for both writers, in
         // `expr/float.rs`'s own test module.
         let mut out = Vec::new();
-        push_f64(&mut out, f64::NAN);
+        push_f64(&mut out, f64::NAN, false);
         assert_eq!(out, br#""NaN""#);
         out.clear();
-        push_f64(&mut out, -f64::NAN);
+        push_f64(&mut out, -f64::NAN, false);
         assert_eq!(out, br#""NaN""#);
         out.clear();
-        push_f64(&mut out, f64::INFINITY);
+        push_f64(&mut out, f64::INFINITY, false);
         assert_eq!(out, br#""Infinity""#);
         out.clear();
-        push_f64(&mut out, f64::NEG_INFINITY);
+        push_f64(&mut out, f64::NEG_INFINITY, false);
         assert_eq!(out, br#""-Infinity""#);
+    }
+
+    /// A FLOAT column is written at `f32` precision, so `1.1::FLOAT` exports as `1.1`
+    /// rather than the `f64` spelling of the same bits. This is one of the few places
+    /// this writer deliberately parts company with `duckdb`, whose JSON writer prints
+    /// the widened `f64` here even though its own CSV writer prints `1.1`.
+    #[test]
+    fn float_columns_use_f32_shortest_round_trip() {
+        let mut out = Vec::new();
+        push_value(&mut out, &Value::F64(1.1f32 as f64), Ty::Float);
+        assert_eq!(out, b"1.1");
+        out.clear();
+        push_value(&mut out, &Value::F64(1.1f32 as f64), Ty::Double);
+        assert_eq!(out, b"1.100000023841858");
     }
 
     // A SQL NULL must stay distinguishable from a NaN. Before, both wrote

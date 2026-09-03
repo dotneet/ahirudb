@@ -41,7 +41,7 @@ SELECT string_split('a,b,c', ',');   -- ["a","b","c"]  (a LIST, i.e. JSON text)
 | Function | Aliases | Notes |
 |---|---|---|
 | `substring(s, start[, len])` | `substr` | 1-based; negative `start` counts from the end; negative `len` reverses the extracted range |
-| `split_part(s, delim, index)` | — | 1-based, negative index counts from the end; index `0` or out of range → empty string |
+| `split_part(s, delim, index)` | — | 1-based, negative index counts from the end; index `0` or out of range → empty string. An empty `delim` splits into characters, so `split_part('abc','',2)` → `b` (piece for piece the same as `string_split(s,'')`) |
 | `strpos(s, sub)` | `position`, `instr` | 1-based position, `0` if not found |
 | `starts_with(s, prefix)` | `prefix(s, p)` | boolean |
 | `ends_with(s, suffix)` | `suffix(s, s2)` | boolean |
@@ -49,7 +49,7 @@ SELECT string_split('a,b,c', ',');   -- ["a","b","c"]  (a LIST, i.e. JSON text)
 | `length(s)` | `len`, `char_length`, `character_length` | counts codepoints |
 | `left(s, n)` | — | First `n` codepoints; negative `n` drops the last `\|n\|` instead |
 | `right(s, n)` | — | Last `n` codepoints; negative `n` drops the first `\|n\|` instead |
-| `string_split(s, sep)` | `str_split`, `string_to_array`, `split` | Returns a LIST (JSON text — see [functions-json.md](functions-json.md)). An empty `sep` gives a one-element list holding the whole string (`string_split('abc','')` → `["abc"]`), where DuckDB 1.4 splits into characters (`[a, b, c]`) — a divergence |
+| `string_split(s, sep)` | `str_split`, `string_to_array`, `split` | Returns a LIST (JSON text — see [functions-json.md](functions-json.md)). An empty `sep` splits into characters (code points), matching DuckDB: `string_split('abc','')` → `["a","b","c"]`, and `string_split('','')` → `[""]` |
 
 `left` and `right` are reserved words (they introduce a join kind), but a
 `(` immediately after the keyword is unambiguous, so writing them as
@@ -109,6 +109,7 @@ SELECT concat('a', NULL, 'b');       -- 'ab'     (NULL args treated as empty str
 SELECT concat_ws('-', 'a', NULL, 'b'); -- 'a-b'  (a NULL value drops its separator too)
 SELECT concat_ws(NULL, 'a', 'b');    -- NULL     (a NULL *separator* does propagate)
 SELECT ascii('A');                   -- 65       (codepoint; aliases: unicode, ord)
+SELECT ascii('');                    -- 0        (the empty string has no first character)
 SELECT chr(9731);                    -- '☃'
 SELECT hex('AB');                    -- '4142'   (byte dump; an integer argument uses to_hex)
 SELECT to_hex(255);                  -- 'FF'     (negatives use the two's-complement pattern)
@@ -196,9 +197,25 @@ untrusted). As a result, it does **not** support: lookaround
 (`(?=...)`/`(?!...)`), backreferences inside the pattern itself
 (`\1` in the *pattern*, as opposed to the *replacement* — see below),
 named capture groups, non-greedy quantifiers (`*?`, `+?`), `\b`/`\B` word
-boundaries, or a case-insensitive flag — neither the inline `(?i)` form nor
+boundaries, Unicode character classes (`\pL`, `\p{Greek}` and their `\P`
+negations), RE2's `\x{...}` and octal `\123` escapes, `\Q...\E` literal
+quoting, or a case-insensitive flag — neither the inline `(?i)` form nor
 the `'i'` flag argument is accepted. `regexp_replace`'s replacement
 string does support `\1`/`\2`-style backreferences to captured groups.
+
+**Escapes that are supported**, in the pattern and inside a character class
+alike: the metacharacters `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\`, and in
+fact any escaped ASCII punctuation character or space (`\/`, `\-`, `\_`,
+`\"`, `\ ` …), which all stand for that literal character; the class
+shorthands `\d \D \w \W \s \S`; the control characters
+`\t \n \r \f \v \a`; and the hex escape `\xHH`. `\A` and `\z` are RE2's
+start/end-of-text anchors and, with no multiline mode here, mean exactly
+what `^` and `$` mean. A `{` that does not form a valid `{n,m}` is a
+literal `{`, as in RE2 (`regexp_matches('a{x', 'a{x')` is true).
+
+`regexp_replace`'s flag argument is a *set* of letters, so repeating one
+changes nothing (`regexp_replace('aXbXc', 'X', '-', 'gg')` is `'a-b-c'`).
+Only `g` is implemented; any other letter is an error.
 
 **Matching is per UTF-8 character, not per byte.** `.`, a character class,
 and a quantifier each consume one whole Unicode scalar value, so

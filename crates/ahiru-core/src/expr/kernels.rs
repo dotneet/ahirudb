@@ -24,7 +24,7 @@ use crate::vector::{
 };
 
 /// Microseconds in a day. DATE(I32, days) <-> TIMESTAMP(I64, microseconds).
-const MICROS_PER_DAY: i128 = 86_400_000_000;
+pub(crate) const MICROS_PER_DAY: i128 = 86_400_000_000;
 
 /// 2^127. Used for range checks on f64 -> i128 (converting i128::MAX to f64 rounds it up).
 const I128_LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
@@ -293,6 +293,20 @@ int_cmp!(cmp_i32, i32);
 int_cmp!(cmp_i64, i64);
 int_cmp!(cmp_i128, i128);
 
+/// INTERVAL comparison. The packed months/days/microseconds triple is flattened by
+/// `exec::rowkey::interval_key` (DuckDB's 1 month = 30 days, 1 day = 24 hours) so that
+/// `INTERVAL 1 DAY = INTERVAL 24 HOUR`, and so that `=` agrees with the grouping, set-operation
+/// and equi-join keys, which normalize the same way.
+fn cmp_interval(a: &[i128], sa: usize, b: &[i128], sb: usize, n: usize, mask: u8) -> Bitmap {
+    let mut out = Bitmap::with_capacity(n);
+    for i in 0..n {
+        let x = crate::exec::rowkey::interval_key(a[i * sa]);
+        let y = crate::exec::rowkey::interval_key(b[i * sb]);
+        out.push(mask & ord_code(x.cmp(&y)) != 0);
+    }
+    out
+}
+
 /// Floating point compares under a **total** order, not IEEE's partial one: `NaN`
 /// sorts above every other value (`+inf` included) and equals itself, and `-0.0`
 /// equals `0.0`.
@@ -338,10 +352,15 @@ pub fn compare(op: OpCode, phys: PhysType, a: &Vector, b: &Vector) -> Result<Vec
     let mask = cmp_mask(op)?;
     ensure!(a.data().phys() == phys && b.data().phys() == phys, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
+    // INTERVAL packs months/days/microseconds into one i128, so the raw bit pattern says
+    // `INTERVAL 1 DAY <> INTERVAL 24 HOUR`. Comparing the normalized span instead keeps `=` in
+    // step with the equi-join and `GROUP BY` keys `exec::rowkey::interval_key` builds.
+    let interval = a.ty() == Ty::Interval && b.ty() == Ty::Interval;
     let bits = match phys {
         PhysType::Bool => cmp_bool(a.bools(), sa, b.bools(), sb, n, mask),
         PhysType::I32 => cmp_i32(a.i32s(), sa, b.i32s(), sb, n, mask),
         PhysType::I64 => cmp_i64(a.i64s(), sa, b.i64s(), sb, n, mask),
+        PhysType::I128 if interval => cmp_interval(a.i128s(), sa, b.i128s(), sb, n, mask),
         PhysType::I128 => cmp_i128(a.i128s(), sa, b.i128s(), sb, n, mask),
         PhysType::F64 => cmp_f64(a.f64s(), sa, b.f64s(), sb, n, mask),
         PhysType::Bytes => cmp_bytes(a.bytes(), sa, b.bytes(), sb, n, mask),
@@ -518,15 +537,19 @@ fn like_match(s: &[u8], p: &[u8]) -> bool {
     // `star_p == usize::MAX` means "no `%` seen yet".
     let (mut star_p, mut star_s) = (usize::MAX, 0usize);
     while si < s.len() {
-        if pi < p.len() && p[pi] == b'_' {
+        // `%` is tested before the literal-byte branch: a `%` in the pattern is always
+        // the wildcard, even when the subject byte at the same position happens to be
+        // `%` too. Matching it literally would skip recording the backtrack point, so
+        // `'50% off' LIKE '50%'` used to be false.
+        if pi < p.len() && p[pi] == b'%' {
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == b'_' {
             si += utf8_len_at(s, si);
             pi += 1;
         } else if pi < p.len() && p[pi] == s[si] {
             si += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == b'%' {
-            star_p = pi;
-            star_s = si;
             pi += 1;
         } else if star_p != usize::MAX {
             // Feed the previous `%` one more character (not byte -- see doc comment) and retry.
@@ -578,6 +601,14 @@ pub(crate) fn like_escape_match(s: &[u8], p: &[u8], esc: u8) -> bool {
                 pi += 2;
                 continue;
             }
+        } else if pi < p.len() && p[pi] == b'%' {
+            // Ahead of the literal-byte branch: an unescaped `%` is always the
+            // wildcard, even when the subject byte at the same position is `%`.
+            // See the same ordering in `like_match`.
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+            continue;
         } else if pi < p.len() && p[pi] == b'_' {
             si += utf8_len_at(s, si);
             pi += 1;
@@ -586,11 +617,6 @@ pub(crate) fn like_escape_match(s: &[u8], p: &[u8], esc: u8) -> bool {
             // Literal byte. An escape character not followed by anything was
             // rejected by the caller, so reaching here means plain text.
             si += 1;
-            pi += 1;
-            continue;
-        } else if pi < p.len() && p[pi] == b'%' {
-            star_p = pi;
-            star_s = si;
             pi += 1;
             continue;
         }
@@ -635,7 +661,7 @@ fn dec_scale(t: Ty) -> u8 {
     }
 }
 
-fn pow10_i128(k: u32) -> Option<i128> {
+pub(crate) fn pow10_i128(k: u32) -> Option<i128> {
     if k > 38 {
         return None;
     }
@@ -697,14 +723,22 @@ fn parse_special_f64(s: &[u8]) -> Option<f64> {
 /// `CAST(x AS DECIMAL(p,s))` and `CAST(CAST(x AS VARCHAR) AS DECIMAL(p,s))` now agree
 /// by construction.
 ///
-/// `scale == 0` (every integer target, and `DECIMAL(p,0)`) keeps the direct
-/// `f_round` path: it is already exact, and it is what carries this engine's
-/// documented round-half-to-even rule for float-to-integer casts.
-fn f64_to_scaled_i128(x: f64, scale: u8, buf: &mut Vec<u8>) -> Option<i128> {
+/// `half_away` selects the rounding rule for the digits that fall off the end:
+/// DECIMAL targets round half *away from zero* (`CAST(2.5 AS DECIMAL(3,0))` = 3,
+/// like DuckDB), while integer targets round half *to even*
+/// (`CAST(2.5 AS INTEGER)` = 2, also like DuckDB). It only makes a difference at
+/// `scale == 0`: above that, the text path below already rounds away from zero
+/// through `rescale_i128`, so `DECIMAL(3,0)` used to be the one scale that
+/// disagreed with every other scale of the same type.
+///
+/// An integer target at `scale == 0` keeps the direct `f_round` path: it is
+/// already exact, and it is what carries this engine's documented
+/// round-half-to-even rule for float-to-integer casts.
+fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> Option<i128> {
     if !x.is_finite() {
         return None;
     }
-    if scale == 0 {
+    if scale == 0 && !half_away {
         if !(-I128_LIMIT..I128_LIMIT).contains(&x) {
             return None;
         }
@@ -1029,6 +1063,24 @@ pub fn fmt_f64(x: f64, out: &mut Vec<u8>) {
         return;
     }
     crate::expr::float::write_f64_finite(out, x);
+}
+
+/// The decimal rendering of a `FLOAT`.
+///
+/// FLOAT shares `DOUBLE`'s physical `f64` register (there is no separate physical type
+/// for it), but every FLOAT value is exactly an `f32`, so the shortest round trip is
+/// measured against `f32`: `CAST(1.1::FLOAT AS VARCHAR)` is `'1.1'`, not the `f64`
+/// spelling `'1.100000023841858'` of the same bits. Non-finite values are spelled
+/// exactly as [`fmt_f64`] spells them.
+///
+/// Public for the same reason as [`fmt_f64`]: the CLI's cell renderer spells a FLOAT
+/// the way the cast does.
+pub fn fmt_f32(x: f64, out: &mut Vec<u8>) {
+    if x.is_nan() || x.is_infinite() {
+        fmt_f64(x, out);
+        return;
+    }
+    crate::expr::float::write_f32_finite(out, x);
 }
 
 /// Reads a decimal number as `mant * 10^exp`. `None` (= NULL) if it cannot be read.
@@ -1381,6 +1433,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         (Fam::Flt, Fam::Int) => {
             ensure!(!to.is_temporal(), InvalidCast);
             let s = dec_scale(to);
+            let is_dec = matches!(to, Ty::Decimal { .. });
             let sv = a.f64s();
             let mut buf = Vec::new();
             // The index is used not only to fetch the value but also to name the row for `set_null`.
@@ -1392,7 +1445,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                     // true, and so is any NaN (it is not the value zero).
                     store_i128(&mut data, (f != 0.0) as i128)
                 } else {
-                    match f64_to_scaled_i128(f, s, &mut buf) {
+                    match f64_to_scaled_i128(f, s, is_dec, &mut buf) {
                         Some(y) => store_i128_typed(&mut data, to, y),
                         None => {
                             push_default(&mut data);
@@ -1447,12 +1500,20 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         }
         (Fam::Flt, Fam::Str) => {
             let sv = a.f64s();
+            // A FLOAT is rendered at `f32` precision: it is exactly an `f32`, so the
+            // `f64` shortest round trip would ask for digits it does not have
+            // (`1.1::FLOAT` printed as `1.100000023841858`).
+            let is_float = from == Ty::Float;
             let mut buf = Vec::new();
             if let Data::Bytes(d) = &mut data {
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..n {
                     buf.clear();
-                    fmt_f64(sv[i], &mut buf);
+                    if is_float {
+                        fmt_f32(sv[i], &mut buf);
+                    } else {
+                        fmt_f64(sv[i], &mut buf);
+                    }
                     d.push(&buf);
                 }
             }
@@ -1681,6 +1742,45 @@ mod tests {
         assert!(like_match("あいう".as_bytes(), b"%"));
         assert!(like_match("あいう".as_bytes(), "%う".as_bytes()));
         assert!(like_match("あいう".as_bytes(), "あ%".as_bytes()));
+    }
+
+    // Regression test: the literal-byte branch used to be tested before the `%` branch, so a
+    // `%` in the pattern was matched literally whenever the subject byte at the same position
+    // happened to be `%` -- and, worse, no backtrack point was recorded, making
+    // `'50% off' LIKE '50%'` false. All values cross-checked against DuckDB 1.4.4.
+    #[test]
+    fn like_percent_is_a_wildcard_even_against_a_literal_percent() {
+        assert!(like_match(b"50% off", b"50%"));
+        assert!(like_match(b"%abc", b"%bc"));
+        assert!(like_match(b"%%", b"%"));
+        assert!(like_match(b"%", b"%"));
+        assert!(like_match(b"%a%b%", b"%a%b%"));
+        // A literal `%` in the subject is still matched by a literal `%` in the pattern
+        // whenever the pattern's `%` can also act as the wildcard for zero characters.
+        assert!(like_match(b"100%", b"100%"));
+        // Without an ESCAPE clause `!` carries no special meaning, so it stays literal.
+        assert!(!like_match(b"100", b"100!%"));
+        // `_` against a multibyte character stays character-aligned next to a leading `%`.
+        assert!(like_match("%あ".as_bytes(), b"%_"));
+        assert!(!like_match("%あい".as_bytes(), b"%_x"));
+    }
+
+    #[test]
+    fn like_escape_percent_is_a_wildcard_unless_escaped() {
+        // Unescaped `%` is the wildcard even when the subject byte is `%`.
+        assert!(like_escape_match(b"50% off", b"50%", b'!'));
+        assert!(like_escape_match(b"%abc", b"%bc", b'!'));
+        assert!(like_escape_match(b"%%", b"%", b'!'));
+        // Escaped `%` is a literal, and then it has to match exactly.
+        assert!(like_escape_match(b"50% off", b"50!%%", b'!'));
+        assert!(!like_escape_match(b"50% off", b"50!%", b'!'));
+        assert!(like_escape_match(b"%abc", b"!%%", b'!'));
+        assert!(!like_escape_match(b"xabc", b"!%%", b'!'));
+        // Escaped `_` likewise, including against a multibyte character (which a
+        // wildcard `_` would have consumed whole).
+        assert!(like_escape_match(b"a_c", b"a!_c", b'!'));
+        assert!(!like_escape_match("aあc".as_bytes(), b"a!_c", b'!'));
+        assert!(like_escape_match("aあc".as_bytes(), b"a_c", b'!'));
     }
 
     #[test]
@@ -1959,19 +2059,25 @@ mod tests {
         // 12345678901234567890.5 is not representable; the nearest double is
         // 12345678901234567168, whose shortest rendering is 1.2345678901234567e19.
         assert_eq!(
-            f64_to_scaled_i128(12345678901234567890.5, 1, &mut buf),
+            f64_to_scaled_i128(12345678901234567890.5, 1, true, &mut buf),
             Some(123456789012345670000)
         );
-        assert_eq!(f64_to_scaled_i128(1.5, 1, &mut buf), Some(15));
-        assert_eq!(f64_to_scaled_i128(0.1, 20, &mut buf), Some(10000000000000000000));
-        assert_eq!(f64_to_scaled_i128(1e-300, 37, &mut buf), Some(0));
-        assert_eq!(f64_to_scaled_i128(1e300, 1, &mut buf), None);
-        assert_eq!(f64_to_scaled_i128(f64::NAN, 1, &mut buf), None);
-        assert_eq!(f64_to_scaled_i128(f64::INFINITY, 0, &mut buf), None);
-        // scale 0 keeps the documented round-half-to-even rule.
-        assert_eq!(f64_to_scaled_i128(2.5, 0, &mut buf), Some(2));
-        assert_eq!(f64_to_scaled_i128(3.5, 0, &mut buf), Some(4));
-        assert_eq!(f64_to_scaled_i128(-2.5, 0, &mut buf), Some(-2));
+        assert_eq!(f64_to_scaled_i128(1.5, 1, true, &mut buf), Some(15));
+        assert_eq!(f64_to_scaled_i128(0.1, 20, true, &mut buf), Some(10000000000000000000));
+        assert_eq!(f64_to_scaled_i128(1e-300, 37, true, &mut buf), Some(0));
+        assert_eq!(f64_to_scaled_i128(1e300, 1, true, &mut buf), None);
+        assert_eq!(f64_to_scaled_i128(f64::NAN, 1, true, &mut buf), None);
+        assert_eq!(f64_to_scaled_i128(f64::INFINITY, 0, false, &mut buf), None);
+        // An integer target at scale 0 keeps the documented round-half-to-even rule.
+        assert_eq!(f64_to_scaled_i128(2.5, 0, false, &mut buf), Some(2));
+        assert_eq!(f64_to_scaled_i128(3.5, 0, false, &mut buf), Some(4));
+        assert_eq!(f64_to_scaled_i128(-2.5, 0, false, &mut buf), Some(-2));
+        // A DECIMAL(p,0) target rounds half away from zero instead, so it agrees with
+        // every other scale of the same type (and with DuckDB).
+        assert_eq!(f64_to_scaled_i128(2.5, 0, true, &mut buf), Some(3));
+        assert_eq!(f64_to_scaled_i128(3.5, 0, true, &mut buf), Some(4));
+        assert_eq!(f64_to_scaled_i128(-2.5, 0, true, &mut buf), Some(-3));
+        assert_eq!(f64_to_scaled_i128(0.5, 0, true, &mut buf), Some(1));
     }
 
     #[test]

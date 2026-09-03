@@ -206,16 +206,24 @@ the `zstd` feature.
 
 ### Allocator
 
-A **custom bump-pointer arena** (`rt::alloc::AhiruAlloc`) replaces a general
-allocator like `dlmalloc`, and is installed as the `#[global_allocator]` only
-for `wasm32` + `no_std` builds (native/`std` builds — `ahiru-cli`, tests —
-use the system allocator instead).
+A **custom size-class allocator over a bump arena** (`rt::alloc::AhiruAlloc`)
+replaces a general allocator like `dlmalloc`, and is installed as the
+`#[global_allocator]` only for `wasm32` + `no_std` builds (native/`std`
+builds — `ahiru-cli`, tests — use the system allocator instead).
 
-- Allocation is a bump pointer; nothing is freed individually. Most
-  intermediate buffers live for the duration of a query, so bulk release at
-  query end is sufficient.
-- A side effect: no fragmentation bookkeeping and no per-object destructor
-  bookkeeping, which also makes execution faster, not just smaller.
+- Fresh memory always comes from a bump pointer; linear memory is reserved
+  1 MiB at a time and never returned (wasm cannot shrink it).
+- 16 B – 32 KiB are rounded into 12 size classes, each with its own free list.
+  No header is needed: `dealloc` recovers the class from the `Layout`.
+- Anything larger is rounded to 16 B and served **best-fit** from an
+  **address-ordered** free list, and freeing **coalesces** a block with the
+  neighbours it touches; a block that ends at the bump pointer rewinds it.
+  Reuse across queries is the whole point: a LIFO first-fit list without
+  coalescing carves every new request out of the previous query's peak block
+  and never reassembles the pieces, so a browser tab running the same query
+  repeatedly grows linear memory without bound.
+- Still no per-object destructor bookkeeping and no headers, which is what
+  keeps this at roughly 1 KB against dlmalloc's ~10 KB.
 
 ---
 
@@ -669,6 +677,14 @@ per `next()`) makes Volcano's per-call overhead comparatively irrelevant.
   option (§10, error code 501) that caps the wasm heap as a whole — a query
   can hit an operator's own cap and fail cleanly with `Oom` well before the
   overall heap limit would ever be reached.
+
+  The operator caps are the *only* budget checked while a step runs.
+  `memoryLimit` is sampled by the host between `ahiru_query_step` calls, so a
+  single blocking step (a full sort, say) can allocate far past it before the
+  next sample sees it: treat it as a backstop that ends a runaway query, not a
+  hard ceiling on peak usage. A genuine `memory.grow` failure is a wasm trap,
+  not `Oom` — `GlobalAlloc` has no error channel, so only a budget the engine
+  checks *before* allocating (i.e. the operator caps) can produce a clean error.
 
 ### Expression evaluation: a small vectorized VM
 

@@ -112,8 +112,9 @@ fn ascii_and_chr_round_trip_through_code_points() {
     assert_eq!(one(&mut sess, "ascii('あ')"), Value::I64(12354));
     assert_eq!(one(&mut sess, "chr(12354)"), s("あ"));
     assert_eq!(one(&mut sess, "chr(ascii('☃'))"), s("☃"));
-    // Empty input and an unencodable code point both give NULL rather than raising.
-    assert_eq!(one(&mut sess, "ascii('')"), Value::Null);
+    // The empty string has no first character, and duckdb answers 0 there rather than NULL.
+    assert_eq!(one(&mut sess, "ascii('')"), Value::I64(0));
+    // An unencodable code point gives NULL rather than raising.
     assert_eq!(one(&mut sess, "chr(-1)"), Value::Null);
 }
 
@@ -136,8 +137,16 @@ fn string_split_produces_a_json_list() {
     assert_eq!(one(&mut sess, "str_split('a', ',')"), s(r#"["a"]"#));
     // Adjacent separators keep the empty pieces (duckdb: `[a, , b]`).
     assert_eq!(one(&mut sess, "string_split('a,,b', ',')"), s(r#"["a","","b"]"#));
-    // An empty separator does not split into characters.
-    assert_eq!(one(&mut sess, "string_split('abc', '')"), s(r#"["abc"]"#));
+    // An empty separator splits into characters (code points), as duckdb does. The empty
+    // string still yields one (empty) piece.
+    assert_eq!(one(&mut sess, "string_split('abc', '')"), s(r#"["a","b","c"]"#));
+    assert_eq!(one(&mut sess, "string_split('あい', '')"), s(r#"["あ","い"]"#));
+    assert_eq!(one(&mut sess, "string_split('', '')"), s(r#"[""]"#));
+    // `split_part` agrees with it piece for piece.
+    assert_eq!(one(&mut sess, "split_part('abc', '', 2)"), s("b"));
+    assert_eq!(one(&mut sess, "split_part('abc', '', -1)"), s("c"));
+    assert_eq!(one(&mut sess, "split_part('あい', '', 1)"), s("あ"));
+    assert_eq!(one(&mut sess, "split_part('abc', '', 4)"), s(""));
     // It really is a list: the existing LIST functions accept the result.
     assert_eq!(one(&mut sess, "array_length(string_split('a,b,c', ','))"), Value::I64(3));
 }

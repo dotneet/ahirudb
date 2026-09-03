@@ -80,6 +80,28 @@ fn arrow_operators_are_sugar_for_json_extract_functions() {
 }
 
 #[test]
+fn integer_path_is_a_zero_based_array_subscript() {
+    let mut sess = session_with_basic();
+    // duckdb: '[1,2]' -> 0 -> 1; '[1,2]' ->> -1 -> '2'; json_extract('[1,2]', 1) -> 2;
+    //         '{"0":5}' -> 0 -> NULL.
+    // An integer path used to be stringified and looked up as an object key, so array
+    // subscripting silently returned NULL and `{"0":...}` silently matched.
+    assert_eq!(one(&mut sess, "'[1,2]' -> 0"), s("1"));
+    assert_eq!(one(&mut sess, "'[1,2]' -> 1"), s("2"));
+    assert_eq!(one(&mut sess, "'[1,2]' ->> -1"), s("2"));
+    assert_eq!(one(&mut sess, "json_extract('[1,2]', 1)"), s("2"));
+    assert_eq!(one(&mut sess, "json_extract_string('[\"a\",\"b\"]', 0)"), s("a"));
+    assert_eq!(one(&mut sess, "'[1,2]' -> 2"), Value::Null);
+    assert_eq!(one(&mut sess, "'[1,2]' -> -3"), Value::Null);
+    // An object is never subscripted by an integer, even when it has a numeric key.
+    assert_eq!(one(&mut sess, r#"'{"0":5}' -> 0"#), Value::Null);
+    // ...while the same key as a *string* still resolves, as before.
+    assert_eq!(one(&mut sess, r#"'{"0":5}' -> '0'"#), s("5"));
+    // A string path keeps the JSONPath semantics.
+    assert_eq!(one(&mut sess, "'[1,2]' -> '$[0]'"), s("1"));
+}
+
+#[test]
 fn json_extract_string_unquotes_strings_and_nulls_json_null() {
     let mut sess = session_with_basic();
     assert_eq!(one(&mut sess, r#"json_extract_string('{"a":"hi"}', '$.a')"#), s("hi"));

@@ -16,7 +16,10 @@
 //!   object rows and scalar rows (input `duckdb` does not normally anticipate) does not crash.
 //!   A non-object row has a value only in the `"json"` column, and the other columns are NULL.
 //! - An empty array `[]` becomes, following `duckdb`, a one-column (type JSON), zero-row table
-//!   named `"json"` (easier to handle than a degenerate table with no columns at all).
+//!   named `"json"` (easier to handle than a degenerate table with no columns at all). A document
+//!   whose objects carry **no keys at all** (`[{}, {}]`) takes the same shape, with each object
+//!   itself as that column's value: a table with no columns cannot report a row count, so
+//!   `count(*)` used to read 0 and `SELECT *` used to be a syntax error.
 //! - An empty file (0 bytes) has no top-level value and gives `UnexpectedEof`. Unlike JSONL's
 //!   "an empty file is an empty table", this premises reading one JSON document, so empty is a
 //!   syntax violation to begin with.
@@ -72,8 +75,10 @@
 //!
 //! ## The input is untrusted
 //!
-//! The same policy as `format::jsonl`. Broken JSON gives `Err` (reinterpreting as a NULL cell
-//! applies only after the schema is settled, and only to values whose type falls outside the sample).
+//! The same policy as `format::jsonl`. Broken JSON gives `Err`. A value beyond `SAMPLE_ELEMENTS`
+//! whose type falls outside the inferred one is `InvalidCast`, not a quiet NULL -- dropping it
+//! would be the "silently wrong answer" `docs/DESIGN.md` §15 rules out, and it is what
+//! `format::csv`, `format::jsonl` and DuckDB all report for the same input.
 //! Scanning does not recurse, and nesting is cut off at `MAX_DEPTH`.
 
 use crate::catalog::Source;
@@ -102,11 +107,29 @@ pub struct JsonFormat {
     resolved: bool,
     total_len: u64,
     row_count: u64,
+    /// Set when the objects in the document contribute **no columns at all** (a document of `{}`
+    /// elements, or an empty array).
+    ///
+    /// A zero-column table reports `count(*)` as 0 and makes `SELECT *` a syntax error, which is a
+    /// silently wrong answer for a file that plainly holds rows. DuckDB gives such a document one
+    /// column named `json` holding each record whole, and so does this: every row goes into that
+    /// column as raw JSON text, objects included.
+    raw_json: bool,
+    /// Per column: the sample held only `null` for it, so its `Ty::Varchar` is a default rather
+    /// than a reading of the data. See `TableFormat::column_has_no_evidence`.
+    no_evidence: Vec<bool>,
 }
 
 impl JsonFormat {
     pub fn new() -> Self {
-        JsonFormat { schema: Vec::new(), resolved: false, total_len: 0, row_count: 0 }
+        JsonFormat {
+            schema: Vec::new(),
+            resolved: false,
+            total_len: 0,
+            row_count: 0,
+            raw_json: false,
+            no_evidence: Vec::new(),
+        }
     }
 }
 
@@ -131,9 +154,11 @@ impl TableFormat for JsonFormat {
             // It requests "the whole file" rather than a split boundary barrier (see the module docs).
             None => return Ok(Err((0, src.total_len))),
         };
-        let (schema, row_count) = parse_schema(buf)?;
+        let (schema, row_count, raw_json, no_evidence) = parse_schema(buf)?;
         self.schema = schema;
         self.row_count = row_count;
+        self.raw_json = raw_json;
+        self.no_evidence = no_evidence;
         self.resolved = true;
         Ok(Ok(()))
     }
@@ -199,14 +224,30 @@ impl TableFormat for JsonFormat {
         if byte_at(buf, i0)? == b'[' {
             let mut it = Elements::new(buf, i0)?;
             while let Some((s, e)) = it.next()? {
-                process_row(&buf[s..e], &names, &mut slots, &mut builders, &mut key, &mut val)?;
+                process_row(
+                    &buf[s..e],
+                    &names,
+                    self.raw_json,
+                    &mut slots,
+                    &mut builders,
+                    &mut key,
+                    &mut val,
+                )?;
             }
             // Only whitespace may remain after the array's closing bracket.
             ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
         } else {
             let end = skip_value(buf, i0)?;
             ensure!(skip_ws(buf, end) == buf.len(), SyntaxError, end);
-            process_row(&buf[i0..end], &names, &mut slots, &mut builders, &mut key, &mut val)?;
+            process_row(
+                &buf[i0..end],
+                &names,
+                self.raw_json,
+                &mut slots,
+                &mut builders,
+                &mut key,
+                &mut val,
+            )?;
         }
 
         Ok(builders.into_iter().map(|b| b.finish()).collect())
@@ -216,14 +257,19 @@ impl TableFormat for JsonFormat {
     fn schema_is_inferred(&self) -> bool {
         true
     }
+
+    fn column_has_no_evidence(&self, col: usize) -> bool {
+        self.no_evidence.get(col).copied().unwrap_or(false)
+    }
 }
 
 // --- Schema inference ----------------------------------------------------------
 
-/// Resolves all of `buf` as one JSON document and returns `(schema, row count)`.
+/// Resolves all of `buf` as one JSON document and returns
+/// `(schema, row count, raw-JSON mode, per-column "no evidence" flags)`.
 /// The row count is exact even beyond `SAMPLE_ELEMENTS` (every element is walked for the syntax
 /// check anyway, so there is no extra cost). Only the widen computation is limited to the sample.
-fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64)> {
+fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64, bool, Vec<bool>)> {
     let i = skip_ws(buf, skip_bom(buf));
     let c = byte_at(buf, i)?;
 
@@ -241,12 +287,6 @@ fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64)> {
             }
         }
         ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
-        if row_count == 0 {
-            // An empty array. Matching duckdb is easier to handle than a degenerate table with no
-            // columns at all, so it becomes a JSON-typed column named `"json"`.
-            names.push(String::from("json"));
-            infs.push(Inf::Json);
-        }
     } else {
         // The top level is not an array: a single object, or a bare scalar.
         // Both are treated as "one row" (see the module docs).
@@ -256,8 +296,18 @@ fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64)> {
         accumulate_row(&buf[i..end], &mut names, &mut infs, &mut key)?;
     }
 
+    // No column came out of the document at all: an empty array, or elements that are all `{}`.
+    // Matching duckdb's one JSON-typed column named `"json"` is both easier to handle than a
+    // degenerate table with no columns and the only way `count(*)` can report the real row count.
+    let raw_json = names.is_empty();
+    if raw_json {
+        names.push(String::from("json"));
+        infs.push(Inf::Json);
+    }
+
+    let no_evidence = infs.iter().map(|i| *i == Inf::Null).collect();
     let schema = names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect();
-    Ok((schema, row_count))
+    Ok((schema, row_count, raw_json, no_evidence))
 }
 
 /// Folds one row's worth (one array element, or a single top-level value) into the column set.
@@ -333,9 +383,14 @@ impl Inf {
     }
 }
 
-/// The lattice NULL -> BOOLEAN -> BIGINT -> DOUBLE; the string family (Str/Date/Timestamp) falls to
+/// The lattice NULL -> BIGINT -> DOUBLE; the string family (Str/Date/Timestamp) falls to
 /// VARCHAR among themselves, and any other incompatible pair falls to JSON
 /// (see the duckdb measurements in the module docs).
+///
+/// BOOLEAN is a sibling of the numbers, not a step below them: `true` has no numeric reading, so
+/// widening a `true`/`1` column to BIGINT dropped the boolean rows the sample itself had just
+/// seen. `duckdb -c "SELECT * FROM read_json_auto('[{\"a\":true},{\"a\":1}]')"` types that column
+/// `JSON`, and so does this.
 fn widen(a: Inf, b: Inf) -> Inf {
     use Inf::*;
     if a == b {
@@ -343,8 +398,6 @@ fn widen(a: Inf, b: Inf) -> Inf {
     }
     match (a, b) {
         (Null, x) | (x, Null) => x,
-        (Bool, Int) | (Int, Bool) => Int,
-        (Bool, Double) | (Double, Bool) => Double,
         (Int, Double) | (Double, Int) => Double,
         (Date, Timestamp) | (Timestamp, Date) => Timestamp,
         // The remaining pairs within the string family (Str/Date/Timestamp) can all be expressed as
@@ -418,9 +471,9 @@ impl Builder {
         }
     }
 
-    /// Both `None` and a physical type mismatch give NULL. Discarding a value of the wrong type is
-    /// because inference comes from a sample and later rows can fall outside (it is not an error).
-    fn push(&mut self, cell: Option<Cell<'_>>) {
+    /// `None` is NULL. A physical type mismatch also lands as NULL here, but the caller
+    /// (`push_member`) turns it into `InvalidCast` -- see there for why.
+    fn push(&mut self, cell: Option<Cell<'_>>) -> bool {
         let ok = match (&mut self.data, &cell) {
             (Data::Bool(d), Some(Cell::Bool(v))) => {
                 d.push(*v);
@@ -456,6 +509,7 @@ impl Builder {
             self.any_null = true;
         }
         self.valid.push(ok);
+        ok
     }
 
     fn finish(self) -> Vector {
@@ -465,9 +519,13 @@ impl Builder {
 }
 
 /// Distributes one row's values to their positions among the projected columns (`names`).
+///
+/// `raw_json` puts the whole row into the `json` column even when it *is* an object, which is the
+/// shape a file whose objects carry no keys at all takes (see `JsonFormat::raw_json`).
 fn process_row<'a>(
     row: &'a [u8],
     names: &[&[u8]],
+    raw_json: bool,
     slots: &mut [Option<Member<'a>>],
     builders: &mut [Builder],
     key: &mut Vec<u8>,
@@ -477,7 +535,7 @@ fn process_row<'a>(
         *s = None;
     }
     let c = byte_at(row, 0)?;
-    if c == b'{' {
+    if c == b'{' && !raw_json {
         let mut it = Members::new(row)?;
         while let Some(m) = it.next()? {
             let name = member_key(&m, key)?;
@@ -495,6 +553,13 @@ fn process_row<'a>(
 }
 
 /// Pushes one member according to the column's type. A missing key (`None`) and `null` are both NULL.
+///
+/// A value that is *present* but does not fit the column's type is `InvalidCast`. The schema comes
+/// from a bounded leading sample (`SAMPLE_ELEMENTS`), so a later element can genuinely hold a
+/// string where the sample only ever showed integers -- but silently turning that cell into NULL
+/// loses data the file plainly contains, which is the "silently wrong answer" `docs/DESIGN.md` §15
+/// says the engine never produces. `format::csv` and `format::jsonl` report the same situation the
+/// same way, and so does DuckDB.
 fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -> Result<()> {
     let m = match m {
         Some(m) if m.kind != Kind::Null => m,
@@ -503,7 +568,7 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
             return Ok(());
         }
     };
-    match b.ty {
+    let ok = match b.ty {
         Ty::Boolean => b.push(match m.kind {
             Kind::Bool => Some(Cell::Bool(m.val.first() == Some(&b't'))),
             _ => None,
@@ -533,11 +598,12 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
             Kind::Str => {
                 scratch.clear();
                 decode_string(m.str_body(), scratch)?;
-                b.push(Some(Cell::Bytes(scratch)));
+                b.push(Some(Cell::Bytes(scratch)))
             }
             _ => b.push(Some(Cell::Bytes(m.val))),
         },
-    }
+    };
+    ensure!(ok, InvalidCast);
     Ok(())
 }
 
@@ -1240,6 +1306,34 @@ mod tests {
     }
 
     #[test]
+    fn a_document_of_empty_objects_is_one_json_column_rather_than_no_columns() {
+        // `[{},{}]` used to infer zero columns, so `count(*)` read 0 (a `Batch` with no columns
+        // has no row count to report) and `SELECT *` was a syntax error. duckdb gives the document
+        // one column named `json` holding each record whole.
+        let (f, _) = resolve(b"[{},{}]");
+        assert_eq!(f.schema().len(), 1);
+        assert_eq!(f.schema()[0].name, "json");
+        assert_eq!(f.schema()[0].ty, Ty::Json);
+        assert_eq!(f.split_rows(0), Some(2));
+        let cols = read_all("[{},{}]");
+        assert_eq!(cols[0], [s("{}"), s("{}")]);
+
+        // A single top-level `{}` is a one-row table for the same reason.
+        let cols = read_all("{}");
+        assert_eq!(cols[0], [s("{}")]);
+    }
+
+    #[test]
+    fn a_bool_and_number_mixture_becomes_a_json_column_instead_of_nulling_rows() {
+        // `[{"a":true},{"a":1}]` inferred BIGINT and then turned the `true` row into NULL, so
+        // `count(a)` was 1 for a file with two values. duckdb types the column JSON.
+        let (f, _) = resolve(b"[{\"a\":true},{\"a\":1}]");
+        assert_eq!(f.schema()[0].ty, Ty::Json);
+        let cols = read_all("[{\"a\":true},{\"a\":1}]");
+        assert_eq!(cols[0], [s("true"), s("1")]);
+    }
+
+    #[test]
     fn mixed_object_and_scalar_rows_do_not_crash() {
         // duckdb does not normally anticipate this input, but this confirms it is handled without breaking.
         // A non-object row goes only into the "json" column, and the other columns are NULL.
@@ -1280,9 +1374,11 @@ mod tests {
         assert_eq!(infer_ty(&["true"]), Ty::Boolean);
         assert_eq!(infer_ty(&["null", "true"]), Ty::Boolean);
         assert_eq!(infer_ty(&["1"]), Ty::BigInt);
-        assert_eq!(infer_ty(&["true", "1"]), Ty::BigInt);
+        // BOOLEAN mixed with a number falls to JSON too: `true` has no numeric reading, so BIGINT
+        // dropped the boolean rows the sample itself had seen. duckdb types the column JSON.
+        assert_eq!(infer_ty(&["true", "1"]), Ty::Json);
         assert_eq!(infer_ty(&["1", "1.5"]), Ty::Double);
-        assert_eq!(infer_ty(&["true", "1.5"]), Ty::Double);
+        assert_eq!(infer_ty(&["true", "1.5"]), Ty::Json);
         // A number or boolean mixed with a string falls to JSON, matching duckdb
         // (`format::jsonl` falls to VARCHAR, a difference stemming from the constraints of the time
         // when `Ty::Json` did not exist -- see the module docs).
@@ -1338,8 +1434,10 @@ mod tests {
         let cols = read_all("[{\"a\":1e3},{\"a\":-1.5E-2},{\"a\":7}]");
         assert_eq!(cols[0], [Value::F64(1000.0), Value::F64(-0.015), Value::F64(7.0)]);
 
-        // Inference sees only the sample (SAMPLE_ELEMENTS of them). When a row outside it carries a
-        // value of the wrong type, that row alone becomes NULL rather than an error.
+        // Inference sees only the sample (SAMPLE_ELEMENTS of them). An element outside it whose
+        // value does not fit the inferred type used to become NULL, silently dropping data the
+        // file plainly contains -- exactly the "silently wrong answer" DESIGN.md §15 rules out.
+        // It is now `InvalidCast`, as `format::csv` / `format::jsonl` and duckdb all report.
         let mut text = String::from("[");
         for i in 0..SAMPLE_ELEMENTS {
             if i > 0 {
@@ -1347,12 +1445,10 @@ mod tests {
             }
             text.push_str("{\"a\":1}");
         }
-        text.push_str(",{\"a\":1.5},{\"a\":\"x\"},{\"a\":2}]");
-        let cols = read_all(&text);
-        assert_eq!(cols[0].len(), SAMPLE_ELEMENTS + 3);
-        assert_eq!(cols[0][SAMPLE_ELEMENTS], Value::Null);
-        assert_eq!(cols[0][SAMPLE_ELEMENTS + 1], Value::Null);
-        assert_eq!(cols[0][SAMPLE_ELEMENTS + 2], Value::I64(2));
+        text.push_str(",{\"a\":\"x\"},{\"a\":2}]");
+        let (f, src) = resolve(text.as_bytes());
+        assert_eq!(f.schema()[0].ty, Ty::BigInt);
+        assert_eq!(code_of(f.read_split(&src, 0, &[0])), Some(Code::InvalidCast));
     }
 
     // --- Strings ----------------------------------------------------------
