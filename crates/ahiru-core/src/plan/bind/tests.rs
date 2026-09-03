@@ -168,6 +168,96 @@ fn in_list_on_string_column_is_not_pruned() {
     assert!(out.is_empty());
 }
 
+/// A scope shaped like a Parquet file with a scaled DECIMAL column and a DATE column,
+/// for the pruner-literal normalization below.
+fn typed_scope() -> Scope {
+    Scope::from_fields(vec![
+        Field::new("d1", Ty::Decimal { precision: 5, scale: 1 }, true),
+        Field::new("dt", Ty::Date, true),
+        Field::new("f", Ty::Double, true),
+    ])
+}
+
+#[test]
+fn decimal_pruner_holds_the_literal_scaled_to_the_column() {
+    // `d1 = 150` on a DECIMAL(5,1) column: statistics and the Bloom filter both speak in
+    // the stored unscaled integer, so the pruner has to carry 1500, not 150.
+    let mut a = ExprArena::new();
+    let l = col(&mut a, "d1");
+    let r = a.push(Expr::Literal(Value::I32(150)));
+    let e = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: l, rhs: r });
+    let mut out = Vec::new();
+    extract_pruners(&a, e, &typed_scope(), &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].value, Value::I64(1500));
+}
+
+#[test]
+fn decimal_in_list_pruner_scales_every_candidate() {
+    let mut a = ExprArena::new();
+    let arg = col(&mut a, "d1");
+    let v1 = a.push(Expr::Literal(Value::I32(150)));
+    let v2 = a.push(Expr::Literal(Value::I32(160)));
+    let e = a.push(Expr::InList { arg, list: vec![v1, v2], negated: false });
+    let mut out = Vec::new();
+    extract_pruners(&a, e, &typed_scope(), &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].value, Value::I64(1500));
+    assert_eq!(out[0].in_values, vec![Value::I64(1600)]);
+}
+
+#[test]
+fn decimal_pruner_is_dropped_when_the_literal_has_no_exact_scaled_form() {
+    // A fractional literal makes the comparison a DOUBLE one, which the column's integer
+    // statistics cannot answer, so there must be no pruner rather than a wrong one.
+    let mut a = ExprArena::new();
+    let l = col(&mut a, "d1");
+    let r = a.push(Expr::Literal(Value::F64(150.5)));
+    let e = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: l, rhs: r });
+    let mut out = Vec::new();
+    extract_pruners(&a, e, &typed_scope(), &mut out);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn typed_date_literal_produces_a_pruner() {
+    // `DATE '...'` is folded to `Expr::TypedLiteral` at parse time; matching only
+    // `Expr::Literal` used to give up pruning on every date column.
+    let mut a = ExprArena::new();
+    let l = col(&mut a, "dt");
+    let r = a.push(Expr::TypedLiteral(Value::I32(19783), Ty::Date));
+    let e = a.push(Expr::Binary { op: BinaryOp::Gt, lhs: l, rhs: r });
+    let mut out = Vec::new();
+    extract_pruners(&a, e, &typed_scope(), &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].op, PruneOp::Gt);
+    assert_eq!(out[0].value, Value::I32(19783));
+
+    // ... and through BETWEEN, which becomes two pruners.
+    let mut a = ExprArena::new();
+    let arg = col(&mut a, "dt");
+    let low = a.push(Expr::TypedLiteral(Value::I32(19783), Ty::Date));
+    let high = a.push(Expr::TypedLiteral(Value::I32(19790), Ty::Date));
+    let e = a.push(Expr::Between { arg, low, high, negated: false });
+    let mut out = Vec::new();
+    extract_pruners(&a, e, &typed_scope(), &mut out);
+    assert_eq!(out.len(), 2);
+}
+
+#[test]
+fn integer_literal_on_a_double_column_becomes_a_float_pruner() {
+    // `Value::partial_cmp_same` only compares like variants, so an unconverted `I32` would
+    // silently disable pruning on FLOAT/DOUBLE columns.
+    let mut a = ExprArena::new();
+    let l = col(&mut a, "f");
+    let r = a.push(Expr::Literal(Value::I32(5)));
+    let e = a.push(Expr::Binary { op: BinaryOp::Lt, lhs: l, rhs: r });
+    let mut out = Vec::new();
+    extract_pruners(&a, e, &typed_scope(), &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].value, Value::F64(5.0));
+}
+
 #[test]
 fn conjuncts_are_split_on_and_only() {
     let mut a = ExprArena::new();

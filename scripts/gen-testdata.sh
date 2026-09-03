@@ -216,6 +216,34 @@ COPY (SELECT * FROM (VALUES
 ) AS t(region, category, amount))
 TO 'pivot_small.parquet' (FORMAT PARQUET);"
 
+# --- Pruning a DECIMAL column ---------------------------------------------
+# The literal in `d1 = 150` carries no scale, but the column stores 1500, so the
+# pruner has to rescale it before comparing against statistics or hashing it into
+# the Bloom filter. d1 is a DECIMAL(5,1) (physically INT32) and d2 a DECIMAL(15,2)
+# (INT64), so both integer widths are covered; `d` adds a DATE column for the
+# `DATE '...'` typed-literal pruners. Several RowGroups so pruning actually has
+# something to drop, and the columns are dictionary-encoded, which is when DuckDB
+# writes a Bloom filter.
+duckdb -c "
+COPY (SELECT i::INTEGER                                AS id,
+             (100 + (i % 101))::DECIMAL(5,1)           AS d1,
+             (3000000000 + (i % 101))::DECIMAL(15,2)   AS d2,
+             DATE '2024-01-01' + ((i % 400)::INTEGER)  AS d
+      FROM range(0, 800) t(i))
+TO 'decimal_pruning.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 200);"
+
+# The same columns with d1 at a different scale. Unioned with the file above as one
+# multi-file table it reads back as DECIMAL(9,3), so a pruner scaled into the table's
+# type no longer lines up with the first file's statistics -- `exec::pruners_fit_part`
+# has to notice and read that part in full.
+duckdb -c "
+COPY (SELECT i::INTEGER                                AS id,
+             (100 + (i % 101))::DECIMAL(8,3)           AS d1,
+             (3000000000 + (i % 101))::DECIMAL(15,2)   AS d2,
+             DATE '2024-01-01' + ((i % 400)::INTEGER)  AS d
+      FROM range(0, 200) t(i))
+TO 'decimal_scale3.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 100);"
+
 # --- Page-level pruning (ColumnIndex/OffsetIndex/Bloom filter) -------------
 # `pagetest.parquet` is generated with pyarrow (parquet-cpp), not DuckDB.
 # The DuckDB in this environment (v1.4.4) writes ColumnIndex/OffsetIndex but has
@@ -277,8 +305,33 @@ pq.write_table(
     compression="SNAPPY",
 )
 PY
+
+  # A DOUBLE column with NaN rows. Writers (pyarrow here, and parquet-cpp/parquet-mr
+  # generally) leave NaN out of min/max, while this engine orders NaN above every
+  # other value -- so `d > 100.0` is true for the NaN rows even though they sit
+  # outside `max`, and `format::range_may_match` must not prune on `max` for a
+  # floating-point column. DuckDB writes NaN *into* max, which makes the statistics
+  # incomparable and hides the bug, so pyarrow is used here too.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+n = 800
+vals = [float('nan') if i % 200 == 100 else float(i % 10) for i in range(n)]
+table = pa.table({
+    "id": pa.array(range(n), type=pa.int32()),
+    "d": pa.array(vals, type=pa.float64()),
+})
+pq.write_table(
+    table, "nan_stats.parquet",
+    row_group_size=200,         # 4 RowGroups, one NaN in each
+    write_statistics=True,
+    use_dictionary=False,
+    compression="SNAPPY",
+)
+PY
 else
-  echo "!! pyarrow not found; skipping regeneration of pagetest.parquet / list_pagetest.parquet" >&2
+  echo "!! pyarrow not found; skipping regeneration of pagetest.parquet / list_pagetest.parquet / nan_stats.parquet" >&2
 fi
 
 # --- For the browser demo (the cross-format JOIN sample in demo/app.js) ----

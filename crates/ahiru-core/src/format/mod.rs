@@ -108,12 +108,18 @@ pub fn range_may_match(p: &Pruner, min: &Value, max: &Value) -> bool {
         // If it cannot be compared (different types, NULL) there is no pruning.
         _ => return true,
     };
+    // Parquet writers leave NaN out of min/max, while this engine (like DuckDB) orders NaN
+    // above every other floating-point value, so a NaN row satisfies `> x` and `>= x` for
+    // every non-NaN `x` while sitting outside `max`. `max` alone therefore cannot rule a
+    // floating-point split out. The other operators are unaffected: NaN is never `< x`,
+    // `<= x` or equal to a non-NaN `x`, and `<>` never produces a pruner at all.
+    let float = matches!(p.value, Value::F64(_));
     match p.op {
         PruneOp::Eq => cmp_min != Greater && cmp_max != Less,
         PruneOp::Lt => cmp_min == Less,
         PruneOp::Le => cmp_min != Greater,
-        PruneOp::Gt => cmp_max == Greater,
-        PruneOp::Ge => cmp_max != Less,
+        PruneOp::Gt => float || cmp_max == Greater,
+        PruneOp::Ge => float || cmp_max != Less,
         PruneOp::In => unreachable!(),
     }
 }
@@ -501,6 +507,34 @@ mod tests {
     fn invalid_source_range_returns_internal_without_panicking() {
         let src = crate::catalog::Source::from_bytes(vec![1, 2, 3]);
         assert_eq!(crate::error::code_of(get_or_internal(&src, 2, 1)), Some(Code::Internal));
+    }
+
+    #[test]
+    fn float_gt_and_ge_never_prune_because_of_nan_rows() {
+        // Parquet writers leave NaN out of min/max, so a RowGroup of [0.0, 3.0] may still
+        // hold NaN rows -- and this engine orders NaN above everything, making them match
+        // `> 100.0`. `max` alone must therefore never rule the split out.
+        let gt = Pruner { column: 0, op: PruneOp::Gt, value: Value::F64(100.0), in_values: vec![] };
+        assert!(range_may_match(&gt, &Value::F64(0.0), &Value::F64(3.0)));
+        let ge = Pruner { column: 0, op: PruneOp::Ge, value: Value::F64(100.0), in_values: vec![] };
+        assert!(range_may_match(&ge, &Value::F64(0.0), &Value::F64(3.0)));
+
+        // The other operators are unaffected: NaN is never `<`, `<=` or `=` a real number.
+        let lt = Pruner { column: 0, op: PruneOp::Lt, value: Value::F64(0.0), in_values: vec![] };
+        assert!(!range_may_match(&lt, &Value::F64(0.0), &Value::F64(3.0)));
+        let eq = Pruner { column: 0, op: PruneOp::Eq, value: Value::F64(100.0), in_values: vec![] };
+        assert!(!range_may_match(&eq, &Value::F64(0.0), &Value::F64(3.0)));
+        let in_ = Pruner {
+            column: 0,
+            op: PruneOp::In,
+            value: Value::F64(100.0),
+            in_values: vec![Value::F64(200.0)],
+        };
+        assert!(!range_may_match(&in_, &Value::F64(0.0), &Value::F64(3.0)));
+
+        // Integer columns keep the tighter rule; only floating point has a NaN.
+        let gt = Pruner { column: 0, op: PruneOp::Gt, value: Value::I64(100), in_values: vec![] };
+        assert!(!range_may_match(&gt, &Value::I64(0), &Value::I64(3)));
     }
 
     #[test]

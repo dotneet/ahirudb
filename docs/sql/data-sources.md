@@ -258,3 +258,23 @@ Projection pushdown, RowGroup statistics pruning, page-level pruning
 automatic — the engine only fetches the byte ranges a query actually needs.
 Predicates that benefit from this: equality, `BETWEEN`/range comparisons,
 and `IN (...)` lists of literals.
+
+Pruning never changes a query's answer, only how many bytes are read, so
+the engine gives it up wherever it cannot compare exactly:
+
+- A literal is rescaled into the column's own representation first — `150`
+  becomes the `1500` a `DECIMAL(5,1)` column actually stores, `DATE
+  '2024-01-01'` becomes microseconds against a `TIMESTAMP` column. When no
+  exact form exists (a fractional literal against a `DECIMAL`, a value too
+  wide for the column), that predicate simply does not prune.
+- `>` and `>=` on a `FLOAT`/`DOUBLE` column never prune on `max`. Writers
+  leave `NaN` out of the statistics, but this engine (like DuckDB) orders
+  `NaN` above every other value, so those rows can match a bound that lies
+  beyond `max`.
+- `DECIMAL` columns stored as `FIXED_LEN_BYTE_ARRAY`/`BYTE_ARRAY`
+  (precision 19 and above), `INT96` columns, and string columns (whose
+  statistics the writer may truncate) are not pruned at all.
+- In a multi-file table, a file whose own column type differs from the
+  table's unified type (one file's `DECIMAL(5,1)` next to another's
+  `DECIMAL(8,3)`) is read in full — its statistics are in a different
+  domain from the predicate's constant.

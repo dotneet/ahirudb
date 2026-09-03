@@ -21,9 +21,25 @@ fn data(name: &str) -> Vec<u8> {
 }
 
 fn session_with_pagetest() -> Session {
+    session_with("pagetest.parquet")
+}
+
+fn session_with(file: &str) -> Session {
     let mut s = Session::new();
-    s.register_bytes_as("t", data("pagetest.parquet"), FormatKind::Parquet).unwrap();
+    s.register_bytes_as("t", data(file), FormatKind::Parquet).unwrap();
     s
+}
+
+/// `count(*)` for one `WHERE` predicate.
+fn count(file: &str, predicate: &str) -> i64 {
+    let sql = format!("SELECT count(*) FROM t WHERE {predicate}");
+    match run(&mut session_with(file), &sql).as_slice() {
+        [row] => match row.as_slice() {
+            [Value::I64(n)] => *n,
+            v => panic!("{sql}: unexpected row {v:?}"),
+        },
+        v => panic!("{sql}: unexpected result {v:?}"),
+    }
 }
 
 fn run(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
@@ -159,4 +175,120 @@ fn in_list_on_a_non_literal_candidate_still_returns_correct_rows_without_pruning
     let mut s = session_with_pagetest();
     let rows = run(&mut s, "SELECT id FROM t WHERE id IN (12345, id) ORDER BY id LIMIT 3");
     assert_eq!(rows, vec![vec![Value::I32(0)], vec![Value::I32(1)], vec![Value::I32(2)]]);
+}
+
+// --- DECIMAL columns: the literal has to be rescaled before it can be pruned with ---------
+//
+// `tests/data/decimal_pruning.parquet` is 800 rows in 4 RowGroups, written by DuckDB, with
+// `d1 DECIMAL(5,1)` (physically INT32), `d2 DECIMAL(15,2)` (INT64) and `d DATE`. DuckDB
+// writes a Bloom filter for the dictionary-encoded columns, so both the statistics path and
+// the Bloom path are exercised. Expected values come from
+// `duckdb -c "SELECT count(*) FROM 'decimal_pruning.parquet' WHERE ..."`.
+
+const DEC: &str = "decimal_pruning.parquet";
+
+#[test]
+fn decimal_equality_against_an_integer_literal_keeps_its_rows() {
+    // The column stores 1500 for 150.0; comparing the raw literal 150 against the statistics
+    // (or hashing it into the Bloom filter) used to drop every RowGroup.
+    assert_eq!(count(DEC, "d1 = 150"), 8);
+    assert_eq!(count(DEC, "d1 + 0 = 150"), 8, "the answer must not depend on pruning");
+    assert_eq!(count(DEC, "d2 = 3000000050"), 8);
+    assert_eq!(count(DEC, "d2 + 0 = 3000000050"), 8);
+}
+
+#[test]
+fn decimal_range_and_in_predicates_keep_their_rows() {
+    assert_eq!(count(DEC, "d2 < 3000000050"), 400);
+    assert_eq!(count(DEC, "d2 + 0 < 3000000050"), 400);
+    assert_eq!(count(DEC, "d1 IN (150, 160)"), 16);
+    assert_eq!(count(DEC, "d1 + 0 IN (150, 160)"), 16);
+    assert_eq!(count(DEC, "d1 BETWEEN 150 AND 160"), 88);
+    assert_eq!(count(DEC, "d1 + 0 BETWEEN 150 AND 160"), 88);
+    assert_eq!(count(DEC, "d1 >= 195"), 42);
+    assert_eq!(count(DEC, "d1 + 0 >= 195"), 42);
+}
+
+#[test]
+fn decimal_against_a_fractional_literal_is_still_correct_without_a_pruner() {
+    // No exact representation at the column's scale, so the pruner is dropped; the result
+    // still has to be right.
+    assert_eq!(count(DEC, "d1 > 150.5"), 392);
+    assert_eq!(count(DEC, "d1 + 0 > 150.5"), 392);
+    assert_eq!(count(DEC, "d1 = 150.5"), 0);
+}
+
+#[test]
+fn typed_date_literals_prune_without_changing_the_answer() {
+    // `DATE '...'` parses to `Expr::TypedLiteral`, which used to produce no pruner at all
+    // (`plan::bind::tests::typed_date_literal_produces_a_pruner` covers that half).
+    assert_eq!(count(DEC, "d > DATE '2024-06-01'"), 494);
+    assert_eq!(count(DEC, "d = DATE '2024-06-01'"), 2);
+    assert_eq!(count(DEC, "d BETWEEN DATE '2024-02-01' AND DATE '2024-02-10'"), 20);
+    assert_eq!(count(DEC, "d IN (DATE '2024-02-01', DATE '2024-02-02')"), 4);
+}
+
+// --- FLOAT/DOUBLE columns: NaN sits outside the writer's min/max --------------------------
+//
+// `tests/data/nan_stats.parquet` is 800 rows in 4 RowGroups written by pyarrow, with one NaN
+// per RowGroup among values 0.0..9.0. pyarrow (like most writers) leaves NaN out of the
+// statistics, while this engine orders NaN above every other value, so `> x`/`>= x` must not
+// prune on `max`. Expected values come from `duckdb -c "... WHERE d + 0 ..."`; DuckDB's own
+// pruned answers on this file differ from its unpruned ones, so the pruned form is not a
+// usable reference here.
+
+const NANF: &str = "nan_stats.parquet";
+
+#[test]
+fn nan_rows_survive_greater_than_pruning() {
+    assert_eq!(count(NANF, "d > 100.0"), 4);
+    assert_eq!(count(NANF, "d + 0 > 100.0"), 4);
+    assert_eq!(count(NANF, "d >= 100.0"), 4);
+    assert_eq!(count(NANF, "d + 0 >= 100.0"), 4);
+    assert_eq!(count(NANF, "d > 5.0"), 324);
+    assert_eq!(count(NANF, "d + 0 > 5.0"), 324);
+    assert_eq!(count(NANF, "d >= 5.0"), 404);
+    assert_eq!(count(NANF, "d + 0 >= 5.0"), 404);
+}
+
+#[test]
+fn a_part_whose_decimal_scale_differs_from_the_table_is_not_pruned() {
+    // `decimal_scale3.parquet` holds the same columns as `decimal_pruning.parquet` but with
+    // `d1` at DECIMAL(8,3); the union reads back as DECIMAL(9,3). A pruner's constant is
+    // scaled into the *table's* type, so against the DECIMAL(5,1) part it would be 1000x
+    // too large -- that part has to be read in full rather than pruned.
+    let mut s = Session::new();
+    s.register_multi_bytes(
+        "t",
+        vec![
+            ("decimal_pruning.parquet".into(), data("decimal_pruning.parquet")),
+            ("decimal_scale3.parquet".into(), data("decimal_scale3.parquet")),
+        ],
+        FormatKind::Parquet,
+    )
+    .unwrap();
+    // duckdb: SELECT count(*) FROM read_parquet(['decimal_pruning.parquet',
+    //         'decimal_scale3.parquet']) WHERE d1 = 150  ->  8 + 2
+    let counts: Vec<i64> = ["d1 = 150", "d1 > 195", "d1 IN (150, 160)", "d1 BETWEEN 150 AND 160"]
+        .iter()
+        .map(|p| match run(&mut s, &format!("SELECT count(*) FROM t WHERE {p}")).as_slice() {
+            [row] => match row.as_slice() {
+                [Value::I64(n)] => *n,
+                v => panic!("unexpected row {v:?}"),
+            },
+            v => panic!("unexpected result {v:?}"),
+        })
+        .collect();
+    assert_eq!(counts, vec![10, 43, 20, 110]);
+}
+
+#[test]
+fn nan_does_not_disable_the_other_float_pruners() {
+    // NaN is never `<`, `<=` or `=` a real number, so those keep pruning normally.
+    assert_eq!(count(NANF, "d < 5.0"), 396);
+    assert_eq!(count(NANF, "d + 0 < 5.0"), 396);
+    assert_eq!(count(NANF, "d = 5.0"), 80);
+    assert_eq!(count(NANF, "d + 0 = 5.0"), 80);
+    assert_eq!(count(NANF, "d IN (5.0, 6.0)"), 160);
+    assert_eq!(count(NANF, "d + 0 IN (5.0, 6.0)"), 160);
 }
