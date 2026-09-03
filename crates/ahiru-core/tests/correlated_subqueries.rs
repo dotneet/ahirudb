@@ -316,3 +316,97 @@ fn uncorrelated_subqueries_are_unaffected() {
     );
     assert_eq!(rows, vec![vec![i32(1)], vec![i32(2)]]);
 }
+
+// --- Correlated subqueries in an aggregating query ----------------------------
+
+/// A correlated scalar subquery whose only outer reference is a `GROUP BY` key.
+///
+/// It used to be rejected with `NotGrouped`: the subquery was attached as a
+/// pre-aggregate column, which is neither a grouping key nor an aggregate, so
+/// `check_grouped` refused it. Its value is in fact constant within a group, so
+/// it is now held back and attached after the aggregate the way an uncorrelated
+/// one already was — keyed on the grouping column.
+///
+/// duckdb:
+/// ```text
+/// SELECT c.region, count(*), (SELECT count(*) FROM orders o WHERE o.region = c.region)
+///   FROM customers c GROUP BY c.region ORDER BY c.region
+/// east|2|2   west|1|1   NULL|1|0
+/// ```
+/// The NULL-region group gets 0, not NULL: `o.region = NULL` matches nothing and
+/// a `count` over no rows is 0.
+#[test]
+fn a_correlated_subquery_on_a_group_by_key_is_allowed() {
+    let mut db = session_with_customers_orders();
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT c.region, count(*), \
+             (SELECT count(*) FROM orders o WHERE o.region = c.region) \
+             FROM customers c GROUP BY c.region ORDER BY c.region",
+        ),
+        vec![
+            vec![s("east"), i64(2), i64(2)],
+            vec![s("west"), i64(1), i64(1)],
+            vec![NULL, i64(1), i64(0)],
+        ]
+    );
+    // The GROUP BY item and the correlation may be spelled differently; both
+    // still name the same input column.
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT region, count(*), \
+             (SELECT count(*) FROM orders o WHERE o.region = c.region) \
+             FROM customers c GROUP BY region ORDER BY region",
+        ),
+        vec![
+            vec![s("east"), i64(2), i64(2)],
+            vec![s("west"), i64(1), i64(1)],
+            vec![NULL, i64(1), i64(0)],
+        ]
+    );
+    // A non-COUNT aggregate keeps the LEFT JOIN's NULL for a group with no
+    // matching inner row. duckdb: east|2|100.0 west|1|200.0 NULL|1|NULL
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT c.region, count(*), \
+             (SELECT max(o.amount) FROM orders o WHERE o.region = c.region) \
+             FROM customers c GROUP BY c.region ORDER BY c.region",
+        ),
+        vec![
+            vec![s("east"), i64(2), f64(100.0)],
+            vec![s("west"), i64(1), f64(200.0)],
+            vec![NULL, i64(1), NULL],
+        ]
+    );
+    // HAVING reads it too, as a filter applied after the attachment.
+    // duckdb: east|2
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT c.region, count(*) FROM customers c GROUP BY c.region \
+             HAVING (SELECT count(*) FROM orders o WHERE o.region = c.region) > 1 \
+             ORDER BY c.region",
+        ),
+        vec![vec![s("east"), i64(2)]]
+    );
+}
+
+/// Correlating on a column that is *not* a grouping key stays an error: that
+/// subquery really does vary within a group, and duckdb rejects it too
+/// ("column \"id\" must appear in the GROUP BY clause").
+#[test]
+fn a_correlated_subquery_on_a_non_grouped_column_is_still_rejected() {
+    let mut db = session_with_customers_orders();
+    assert_eq!(
+        code_of(db.prepare(
+            "SELECT c.region, count(*), \
+             (SELECT count(*) FROM orders o WHERE o.customer_id = c.id) \
+             FROM customers c GROUP BY c.region",
+            &[],
+        )),
+        Some(Code::NotGrouped)
+    );
+}

@@ -702,19 +702,30 @@ pub(super) fn collect_quantified_comparisons(
 /// `(ExprId, qualifier, name)`. Used when compiling QUALIFY after projection:
 /// unqualified names that match an output column stay on the projected
 /// schema; everything else is added as a hidden input column.
+///
+/// `covered` lists nodes that are already replaced by a substitution (QUALIFY's
+/// window calls and aggregates, which become hidden columns of their own). They
+/// are opaque: their arguments are consumed by the window/aggregate operator
+/// below, so a column that appears only inside one — the `x` of `max(x)` — does
+/// not exist in the post-aggregate scope this list is compiled against, and
+/// collecting it would fail with `ColumnNotFound`.
 pub(super) fn collect_colrefs(
     arena: &ExprArena,
     id: ExprId,
+    covered: &[ExprId],
     out: &mut Vec<(ExprId, Option<String>, String)>,
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    if covered.contains(&id) {
+        return Ok(());
+    }
     if let Expr::ColumnRef { qualifier, name } = arena.get(id) {
         out.push((id, qualifier.clone(), name.clone()));
         return Ok(());
     }
     let d = depth + 1;
-    each_child_flat(arena, id, &mut |c| collect_colrefs(arena, c, out, d))
+    each_child_flat(arena, id, &mut |c| collect_colrefs(arena, c, covered, out, d))
 }
 
 /// If this predicate references exactly one relation, returns its index.

@@ -6,7 +6,7 @@
 use super::agg::{
     as_bare_aggregate, build_agg, build_window, check_grouped, coalesce_count_column,
     collect_aggregates, collect_grouping_calls, collect_unnests, collect_windows,
-    drop_trailing_columns, narrow_unnest_elem_ty,
+    drop_trailing_columns, grouped_column, narrow_unnest_elem_ty,
 };
 use super::cte::CteScope;
 use super::from::{build_tree, flatten_from, full_scope, narrow_scope, rel_ranges, Rel};
@@ -23,6 +23,135 @@ use super::subquery::{
 use super::*;
 use crate::expr::regex;
 use crate::sql::ast::ColumnsSpec;
+
+// --- Correlated scalar subqueries ---------------------------------------------
+
+/// LEFT-joins a correlated scalar subquery's plan onto `node`, keyed on the
+/// correlation columns, and returns the node with the subquery's value column
+/// appended at index `scope.len()`.
+///
+/// Each outer row has a different correlation key value, so a single
+/// `AssertMaxOneRow` over the whole right side (what the uncorrelated case
+/// uses) would wrongly reject as soon as any two *different* outer rows'
+/// subqueries each produced one row. The check is instead per correlation key
+/// value, then LEFT joined on that key: two or more rows for the *same* key is
+/// the cardinality error, since it means one outer row's scalar subquery
+/// produced more than one row. For correlation via an aggregate the caller has
+/// already grouped, so there is one row per key and this never triggers.
+///
+/// `scope`/`subs` are what the *outer* correlation expressions compile against:
+/// the pre-aggregate scope (with no substitutions) for an ordinary correlated
+/// subquery, and the aggregate's output scope for one held back past the
+/// aggregate because it only correlates on grouping columns. `is_count` marks a
+/// bare `count`/`count(*)` subquery, whose "no matching inner row" answer is 0
+/// rather than the NULL the LEFT JOIN produces (confirmed with DuckDB).
+fn attach_correlated_scalar(
+    arena: &ExprArena,
+    params: &[Value],
+    node: Node,
+    scope: &Scope,
+    subs: &[Substitution],
+    plan: Plan,
+    is_count: bool,
+) -> Result<Node> {
+    let k = plan.correlated.len();
+    let corr_scope = Scope::from_fields(plan.root.schema().to_vec());
+    let mut dkeys = Vec::with_capacity(k);
+    for i in 0..k {
+        dkeys.push(column_program(&corr_scope, 1 + i)?);
+    }
+    let right = Node::AssertMaxOneRow { input: Box::new(plan.root), keys: dkeys };
+    let mut left_keys = Vec::with_capacity(k);
+    let mut right_keys = Vec::with_capacity(k);
+    for (i, &outer_e) in plan.correlated.iter().enumerate() {
+        let lp = compile_with_subs(arena, scope, params, subs, outer_e)?;
+        let rp = column_program(&corr_scope, 1 + i)?;
+        let want = Ty::unify_or_mismatch(lp.result_ty, rp.result_ty)?;
+        left_keys.push(cast_program(lp, want)?);
+        right_keys.push(cast_program(rp, want)?);
+    }
+    let col = scope.len();
+    let mut full_schema = node.schema().to_vec();
+    full_schema.extend_from_slice(right.schema());
+    let mut node = Node::Join {
+        left: Box::new(node),
+        right: Box::new(right),
+        kind: JoinKind::Left,
+        left_keys,
+        right_keys,
+        residual: None,
+        schema: full_schema,
+    };
+    // The correlation key columns, having served as join keys, are dropped.
+    node = drop_trailing_columns(node, k)?;
+    if is_count {
+        node = coalesce_count_column(node, col)?;
+    }
+    Ok(node)
+}
+
+/// Records which grouping column each correlation key of a deferred correlated
+/// scalar subquery names, as a substitution onto the aggregate's output column.
+///
+/// `correlates_only_on_group_columns` has already established that they all name
+/// one; this pins down *which*, keyed on the exact expression node, so
+/// `attach_correlated_scalar` can compile the key against the aggregate output
+/// even when the two spellings differ (`GROUP BY id` correlated on `t.id`). It
+/// is pushed after the grouping expressions' own substitutions, so for a key
+/// spelled exactly like its GROUP BY item it simply wins with the same column.
+fn add_corr_key_subs(
+    arena: &ExprArena,
+    scope: &Scope,
+    group_exprs: &[ExprId],
+    deferred_corr: &[(ExprId, Plan, String, bool)],
+    subs: &mut Vec<Substitution>,
+) {
+    let resolves_to = |g: ExprId, col: usize| match arena.get(g) {
+        Expr::ColumnRef { qualifier, name } => {
+            scope.resolve(qualifier.as_deref(), name).is_ok_and(|c| c == col)
+        }
+        _ => false,
+    };
+    for (_, plan, _, _) in deferred_corr {
+        for &e in &plan.correlated {
+            let col = match arena.get(e) {
+                Expr::ColumnRef { qualifier, name } => scope.resolve(qualifier.as_deref(), name),
+                _ => continue,
+            };
+            let col = match col {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Some(i) = group_exprs.iter().position(|&g| resolves_to(g, col)) {
+                subs.push(Substitution { expr: e, column: i, structural: false });
+            }
+        }
+    }
+}
+
+/// Whether a correlated subquery reads *only* grouping columns from the outer
+/// query, which makes its value constant within a group.
+///
+/// Deliberately narrow: every outer reference must be a bare column reference
+/// resolving to a column that some `GROUP BY` item names. A grouping expression
+/// (`GROUP BY g + 1`), an ordinal, or an alias does not count even when it
+/// would in fact be constant per group — those keep the old `NotGrouped`
+/// rejection rather than risk attaching a subquery whose value varies within a
+/// group.
+fn correlates_only_on_group_columns(
+    arena: &ExprArena,
+    scope: &Scope,
+    group_by: &[ExprId],
+    correlated: &[ExprId],
+) -> bool {
+    !correlated.is_empty()
+        && correlated.iter().all(|&e| match arena.get(e) {
+            Expr::ColumnRef { qualifier, name } => scope
+                .resolve(qualifier.as_deref(), name)
+                .is_ok_and(|c| grouped_column(arena, scope, group_by, c)),
+            _ => false,
+        })
+}
 
 // --- SAMPLE ------------------------------------------------------------------
 
@@ -186,7 +315,7 @@ fn add_having_alias_subs(
 ) -> Result<()> {
     let Some(h) = sel.having else { return Ok(()) };
     let mut refs = Vec::new();
-    collect_colrefs(arena, h, &mut refs, 0)?;
+    collect_colrefs(arena, h, &[], &mut refs, 0)?;
     let mut found: Vec<Substitution> = Vec::new();
     for (rid, qual, name) in refs {
         // An input column of the name wins, and an *ambiguous* one is an error rather than
@@ -245,13 +374,13 @@ fn add_equivalent_group_subs(
     }
     let mut refs = Vec::new();
     for item in &sel.items {
-        collect_colrefs(arena, item.expr, &mut refs, 0)?;
+        collect_colrefs(arena, item.expr, &[], &mut refs, 0)?;
     }
     for e in [sel.having, sel.qualify].into_iter().flatten() {
-        collect_colrefs(arena, e, &mut refs, 0)?;
+        collect_colrefs(arena, e, &[], &mut refs, 0)?;
     }
     for o in &sel.order_by {
-        collect_colrefs(arena, o.expr, &mut refs, 0)?;
+        collect_colrefs(arena, o.expr, &[], &mut refs, 0)?;
     }
     for (rid, qual, name) in refs {
         if group_exprs.contains(&rid) {
@@ -651,6 +780,9 @@ pub(super) fn bind_select_in(
     }
     // Uncorrelated scalar subqueries held back until after the aggregate: `(expr, plan, label)`.
     let mut deferred: Vec<(ExprId, Node, String)> = Vec::new();
+    // Correlated ones held back the same way because every outer reference they
+    // make is a grouping column: `(expr, plan, label, is_count)`.
+    let mut deferred_corr: Vec<(ExprId, Plan, String, bool)> = Vec::new();
     for (n, id) in scalars.iter().enumerate() {
         let q = match arena.get(*id) {
             Expr::ScalarSubquery(q) => q,
@@ -667,11 +799,29 @@ pub(super) fn bind_select_in(
             deferred.push((*id, plan.root, label));
             continue;
         }
+        // A correlated subquery that only ever reads grouping columns has one
+        // value per group, exactly like an uncorrelated one has a single value
+        // for the whole query. Attached *before* the aggregate its column is
+        // neither a grouping key nor an aggregate and the query is rejected
+        // with `NotGrouped`, so it is held back and attached after the
+        // aggregate instead, keyed on those same grouping columns.
+        if will_aggregate
+            // Under GROUPING SETS/ROLLUP/CUBE a grouping column is NULL-filled in
+            // the sets that omit it, so "constant within a group" no longer
+            // follows from "is a grouping column". Left rejected as before.
+            && sel.grouping_sets.is_none()
+            && !pre_only.contains(id)
+            && correlates_only_on_group_columns(arena, &scope, &group_by, &plan.correlated)
+        {
+            push_u32(&mut label, n as u32);
+            let is_count =
+                matches!(as_bare_aggregate(arena, q), Some(AggKind::Count | AggKind::CountStar));
+            deferred_corr.push((*id, plan, label, is_count));
+            continue;
+        }
         push_u32(&mut label, n as u32);
 
-        let mut right = plan.root;
-        let mut left_keys = Vec::new();
-        let mut right_keys = Vec::new();
+        let col = scope.len();
         if k == 0 {
             // Uncorrelated: zero rows still gives NULL via the LEFT JOIN below. Two or more
             // rows is a cardinality error (matching the SQL standard and DuckDB), not silently
@@ -679,55 +829,25 @@ pub(super) fn bind_select_in(
             // than truncating. `Limit(2)` first bounds the cost of proving that to "one row
             // beyond the first", instead of `AssertMaxOneRow` alone potentially having to drain
             // the whole subquery to prove there is no second row.
-            right = Node::Limit { input: Box::new(right), limit: Some(2), offset: 0 };
+            let mut right = Node::Limit { input: Box::new(plan.root), limit: Some(2), offset: 0 };
             right = Node::AssertMaxOneRow { input: Box::new(right), keys: Vec::new() };
+            let mut full_schema = node.schema().to_vec();
+            full_schema.extend_from_slice(right.schema());
+            node = Node::Join {
+                left: Box::new(node),
+                right: Box::new(right),
+                kind: JoinKind::Left,
+                left_keys: Vec::new(),
+                right_keys: Vec::new(),
+                residual: None,
+                schema: full_schema,
+            };
         } else {
-            // Correlated: each outer row has a different correlation key value, so a single
-            // `AssertMaxOneRow` over the whole right side (as in the uncorrelated case above)
-            // would wrongly reject as soon as any two *different* outer rows' subqueries each
-            // produced one row. The check is instead per correlation key value, then LEFT joined
-            // on that key: two-or-more rows for the *same* key is the cardinality error: it
-            // means that one outer row's scalar subquery produced more than one row, which is
-            // still a `MultipleRowsSubquery` error, just scoped per key instead of globally. For
-            // correlation via an aggregate, the caller has already grouped so there is one row
-            // per key, and this is effectively a no-op (never triggers).
-            let corr_scope = Scope::from_fields(right.schema().to_vec());
-            let mut dkeys = Vec::with_capacity(k);
-            for i in 0..k {
-                dkeys.push(column_program(&corr_scope, 1 + i)?);
-            }
-            right = Node::AssertMaxOneRow { input: Box::new(right), keys: dkeys };
-            for (i, &outer_e) in plan.correlated.iter().enumerate() {
-                let lp = compile(arena, &scope, params, outer_e)?;
-                let rp = column_program(&corr_scope, 1 + i)?;
-                let want = Ty::unify_or_mismatch(lp.result_ty, rp.result_ty)?;
-                left_keys.push(cast_program(lp, want)?);
-                right_keys.push(cast_program(rp, want)?);
-            }
-        }
-
-        let col = scope.len();
-        let mut full_schema = node.schema().to_vec();
-        full_schema.extend_from_slice(right.schema());
-        node = Node::Join {
-            left: Box::new(node),
-            right: Box::new(right),
-            kind: JoinKind::Left,
-            left_keys,
-            right_keys,
-            residual: None,
-            schema: full_schema,
-        };
-        if k > 0 {
-            // The correlation key columns, having served as join keys, are dropped.
-            node = drop_trailing_columns(node, k)?;
-            // An outer row with no matching inner row for its correlation key gets a NULL value
-            // column from this LEFT JOIN. Only for a `count`/`count(*)` correlated scalar
-            // subquery should it be "aggregate over 0 rows -> 0" (confirmed with DuckDB), so the
-            // NULL is corrected to 0 here.
-            if matches!(as_bare_aggregate(arena, q), Some(AggKind::Count | AggKind::CountStar)) {
-                node = coalesce_count_column(node, col)?;
-            }
+            let is_count =
+                matches!(as_bare_aggregate(arena, q), Some(AggKind::Count | AggKind::CountStar));
+            // The outer correlation expressions are plain input columns here, so
+            // they need no substitutions.
+            node = attach_correlated_scalar(arena, params, node, &scope, &[], plan, is_count)?;
         }
         scope.push(None, Field::new(label.clone(), ty, true));
         subs.push(Substitution { expr: *id, column: col, structural: false });
@@ -808,7 +928,8 @@ pub(super) fn bind_select_in(
                     && !sel.distinct
                     && sel.distinct_on.is_empty()
                     // This path returns early, before deferred scalar subqueries are attached.
-                    && deferred.is_empty(),
+                    && deferred.is_empty()
+                    && deferred_corr.is_empty(),
                 UnsupportedFeature
             );
             let k = correlated_eq.len();
@@ -942,10 +1063,15 @@ pub(super) fn bind_select_in(
     // GROUPING() is meaningless outside aggregation.
     ensure!(aggregating || grouping_calls.is_empty(), NotAggregate);
     let mut item_scope = scope.clone();
-    // The expressions of the deferred (uncorrelated, hence grouping-invariant) scalar
-    // subqueries, which `check_grouped` must let through and which are attached to the plan
-    // right after the aggregate below.
-    let const_subs: Vec<ExprId> = deferred.iter().map(|&(id, _, _)| id).collect();
+    // The expressions of the deferred scalar subqueries, which `check_grouped` must let through
+    // and which are attached to the plan right after the aggregate below. Both kinds are
+    // constant within a group: the uncorrelated ones because they read nothing from the outer
+    // query at all, the correlated ones because everything they read is a grouping column.
+    let const_subs: Vec<ExprId> = deferred
+        .iter()
+        .map(|&(id, _, _)| id)
+        .chain(deferred_corr.iter().map(|&(id, _, _, _)| id))
+        .collect();
     // A HAVING reading one of them cannot be embedded into `Node::Aggregate` (the column does
     // not exist yet at that point); it becomes a Filter applied after the attachment instead.
     let having_deferred = match sel.having {
@@ -973,6 +1099,7 @@ pub(super) fn bind_select_in(
             subs.push(Substitution { expr: g, column: i, structural: true });
             groups.push(p);
         }
+        add_corr_key_subs(arena, &scope, &group_exprs, &deferred_corr, &mut subs);
 
         let ngroups = groups.len();
         let mut aggs = Vec::new();
@@ -1043,6 +1170,7 @@ pub(super) fn bind_select_in(
         for (i, &g) in group_exprs.iter().enumerate() {
             subs.push(Substitution { expr: g, column: i, structural: true });
         }
+        add_corr_key_subs(arena, &scope, &group_exprs, &deferred_corr, &mut subs);
 
         let mut out_fields: Vec<Field> = Vec::with_capacity(ngroups + agg_calls.len());
         for (i, &g) in group_exprs.iter().enumerate() {
@@ -1224,6 +1352,20 @@ pub(super) fn bind_select_in(
             residual: None,
             schema: full_schema,
         };
+        item_scope.push(None, Field::new(label, ty, true));
+        subs.push(Substitution { expr: id, column: col, structural: false });
+    }
+
+    // --- Correlated scalar subqueries on grouping columns -------------------
+    // Held back for the same reason as the uncorrelated ones above: their value
+    // is constant within a group, but attached before the aggregate the column
+    // would survive neither the grouping nor `check_grouped`. The join key is a
+    // grouping column, which the aggregate emits, so it is still available here
+    // (through `subs`, which maps each grouping expression to its output column).
+    for (id, plan, label, is_count) in deferred_corr {
+        let ty = plan.root.schema()[0].ty;
+        let col = item_scope.len();
+        node = attach_correlated_scalar(arena, params, node, &item_scope, &subs, plan, is_count)?;
         item_scope.push(None, Field::new(label, ty, true));
         subs.push(Substitution { expr: id, column: col, structural: false });
     }
@@ -1417,8 +1559,13 @@ pub(super) fn bind_select_in(
             exprs.push(p);
             qualify_subs.push(Substitution { expr: a, column: exprs.len() - 1, structural: true });
         }
+        // The windows and aggregates substituted just above are opaque to the
+        // reference walk: `max(x)`'s `x` is consumed by the aggregate operator
+        // and is gone from `item_scope`, so descending into them would collect
+        // a column that can no longer be compiled (`ColumnNotFound`).
+        let covered: Vec<ExprId> = qualify_subs.iter().map(|s| s.expr).collect();
         let mut q_refs = Vec::new();
-        collect_colrefs(arena, q, &mut q_refs, 0)?;
+        collect_colrefs(arena, q, &covered, &mut q_refs, 0)?;
         for (rid, qual, rname) in q_refs {
             let out_hit = if qual.is_none() {
                 schema.iter().rposition(|f| {

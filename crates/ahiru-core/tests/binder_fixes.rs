@@ -124,6 +124,55 @@ fn order_by_ordinals_within_the_projection_still_work() {
     assert_eq!(rows, vec![vec![Value::I32(997)], vec![Value::I32(998)], vec![Value::I32(999)]]);
 }
 
+/// An aggregate inside QUALIFY over a column that is not a grouping key.
+///
+/// QUALIFY's windows and aggregates become hidden columns, but the reference
+/// walk that follows kept descending into them and collected the bare `score`
+/// inside `max(score)`. That column is consumed by the aggregate operator, so
+/// compiling it against the post-aggregate scope failed with `ColumnNotFound`
+/// — while `count(*)` or a grouping column in the same position worked.
+///
+/// duckdb (on `tests/data/basic.parquet`):
+/// ```text
+/// SELECT flag, max(score) m FROM t GROUP BY flag
+///   QUALIFY row_number() OVER (ORDER BY max(score)) = 1     -> false|1497.0
+/// SELECT flag FROM t GROUP BY flag
+///   QUALIFY row_number() OVER (ORDER BY max(score)) = 1     -> false
+/// SELECT flag, sum(id) s FROM t GROUP BY flag HAVING sum(id) > 0
+///   QUALIFY row_number() OVER (ORDER BY sum(id)) > 1 ORDER BY flag
+///                                                           -> false|332667
+/// ```
+#[test]
+fn an_aggregate_over_a_non_grouped_column_works_inside_qualify() {
+    let mut s = session_with_basic();
+    assert_eq!(
+        run(
+            &mut s,
+            "SELECT flag, max(score) m FROM t GROUP BY flag \
+             QUALIFY row_number() OVER (ORDER BY max(score)) = 1",
+        ),
+        vec![vec![Value::Bool(false), Value::F64(1497.0)]]
+    );
+    // The aggregate appears only in QUALIFY, so it is not already substituted
+    // by a SELECT-list item.
+    assert_eq!(
+        run(
+            &mut s,
+            "SELECT flag FROM t GROUP BY flag \
+             QUALIFY row_number() OVER (ORDER BY max(score)) = 1",
+        ),
+        vec![vec![Value::Bool(false)]]
+    );
+    assert_eq!(
+        run(
+            &mut s,
+            "SELECT flag, sum(id) s FROM t GROUP BY flag HAVING sum(id) > 0 \
+             QUALIFY row_number() OVER (ORDER BY sum(id)) > 1 ORDER BY flag",
+        ),
+        vec![vec![Value::Bool(false), Value::I128(332_667)]]
+    );
+}
+
 // --- Flat left-deep operator chains -------------------------------------------
 
 /// `WHERE a AND b AND ... ` is left-deep but not nested. A 200-term predicate

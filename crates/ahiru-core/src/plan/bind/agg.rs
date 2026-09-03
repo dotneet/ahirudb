@@ -295,6 +295,19 @@ pub(super) fn build_window(
     } else {
         ensure!(!arg_progs.is_empty(), WrongArgCount);
     }
+    // LAG/LEAD's third argument is the value emitted outside the partition, and
+    // the function's result type is the *first* argument's. `exec::window`
+    // pushes that default into the output column by physical type alone
+    // (`push_as`), so an unconverted default lands wrong -- an INTEGER `1` in a
+    // DECIMAL(x, 2) column becomes 0.01, a DATE in a TIMESTAMP column becomes a
+    // microsecond count -- or fails outright when the two physical types differ.
+    // Casting here (as DuckDB does) hands `exec::window` a value that is
+    // already in the result type.
+    if matches!(kind, WindowKind::Lag | WindowKind::Lead) && arg_progs.len() >= 3 {
+        let want = arg_progs[0].result_ty;
+        let default = arg_progs.remove(2);
+        arg_progs.insert(2, cast_program(default, want)?);
+    }
 
     let mut parts = Vec::with_capacity(partition_by.len());
     for p in partition_by {
