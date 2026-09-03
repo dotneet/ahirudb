@@ -255,6 +255,19 @@ pub trait TableFormat {
     fn schema_is_inferred(&self) -> bool {
         false
     }
+
+    /// Whether column `col`'s inferred type rests on **no evidence at all**: the sample held not a
+    /// single value for it (a header-only CSV part, a JSONL key that was always `null`), so the
+    /// type is a fallback rather than a reading of the data.
+    ///
+    /// `catalog::unify_schema` lets a sibling part's type win outright for such a column instead of
+    /// treating the fallback VARCHAR as a conflicting guess -- otherwise one placeholder or
+    /// header-only file in a glob turns an integer column into text for the whole table, which is
+    /// not what DuckDB does. Always false for a declared schema (Parquet), where every column type
+    /// is stated by the file.
+    fn column_has_no_evidence(&self, _col: usize) -> bool {
+        false
+    }
 }
 
 /// Extracts `[start, end)` from `src`. The caller is contracted to have the ranges (named by

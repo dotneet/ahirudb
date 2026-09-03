@@ -61,9 +61,14 @@ does with an ambiguous or mixed column:
 | Input | Inferred | Why |
 |---|---|---|
 | `007`, `042` | `VARCHAR` | A leading zero is significant — reading these as `7`/`42` would destroy the padding |
-| `true`, `1` | `VARCHAR` | `BOOLEAN` mixed with a number widens rather than picking one |
+| `true`, `1` | `VARCHAR` (CSV, JSONL) / `JSON` (`.json`) | `BOOLEAN` mixed with a number widens rather than picking one — `true` has no numeric reading. DuckDB gives all three a `JSON` column; the CSV/JSONL readers predate this engine's `JSON` type and carry the raw text in a `VARCHAR` instead |
 | `2020-01-02 03:04:05`, `2020-01-03` | `TIMESTAMP` | A bare date in a `TIMESTAMP` column reads as midnight (`2020-01-03 00:00:00`) |
 | NDJSON lines that aren't objects (`1`, `"two"`) | one `VARCHAR` column named `json` | There are no object keys to make columns out of; the raw line is the value |
+| JSON/NDJSON records that are all `{}` | one column named `json` | Same reason: the records carry no keys, so each record itself is the value. A table with no columns at all could not report a row count |
+
+The sample is the leading 256 KiB, grown (up to 1 MiB, the longest record
+the readers accept) when that does not contain one complete record — so a
+CSV header, or a first JSONL line, longer than 256 KiB still reads.
 
 A value **outside** the sample that doesn't fit the inferred type raises a
 conversion error rather than becoming `NULL` — see
@@ -71,10 +76,35 @@ conversion error rather than becoming `NULL` — see
 from DuckDB (which re-sniffs and widens) is spelled out.
 
 When several **text** parts are registered as one multi-part table and
-their sniffed schemas disagree, the column widens to `VARCHAR`. Parquet
-parts stay strict: a declared type mismatch between two Parquet parts is a
-`TypeMismatch` error, since a Parquet schema is a declaration rather than a
-guess.
+their sniffed schemas disagree, the column widens to `VARCHAR`. A part that
+saw **no value at all** for a column (a header-only CSV, a column whose
+every cell was empty, a JSON key that was always `null`) is not a
+disagreement, though — it has nothing to say, so the other parts' type
+wins. `a.csv` (`id,v` / `1,10`) plus a header-only `c.csv` keeps
+`id BIGINT`, as DuckDB does. Parquet parts stay strict: a declared type
+mismatch between two Parquet parts is a `TypeMismatch` error, since a
+Parquet schema is a declaration rather than a guess.
+
+### Malformed CSV records
+
+The reader never silently discards part of a record:
+
+- A row with **more** fields than the header is a parse error, as it is in
+  DuckDB. Dropping the surplus hid the usual cause — an unquoted delimiter
+  inside a value, which shifts every following field.
+- Any byte between a **closing quote** and the next delimiter or line
+  terminator is a parse error too (`"x"junk,1`), again matching DuckDB.
+- A row with **fewer** fields is `NULL`-padded (DuckDB's `null_padding`),
+  since nothing the file contains is lost that way.
+- A **blank line** is skipped, except in a one-column file, where it is the
+  only way to spell an empty record and so reads as one `NULL` row —
+  `a\n1\n\n2\n` is three rows, as in DuckDB.
+- A file that mixes line terminators, so that a lone `\r` appears among
+  `\n`/`\r\n` records, treats that `\r` as a record terminator rather than
+  merging the two records into one. (DuckDB refuses to sniff such a file at
+  all; this is what its `strict_mode=false` reading gives.) Such a file is
+  read as a single split, like a quoted or CR-only one — see
+  [limitations.md](limitations.md#performance-adjacent-notes-not-correctness-bugs).
 
 ### JSON / JSONL shapes
 
@@ -107,7 +137,14 @@ cargo run -p ahiru-cli -- query tests/data/small_a.parquet tests/data/small_b.pa
 
 `ahiru query`'s `+`-joined syntax (`a.parquet+b.parquet+c.parquet`) is a
 CLI-only convenience for binding several files as **one** logical
-multi-part table — see below.
+multi-part table — see below. A file whose *name* contains a `+` still
+opens: `\+` escapes the separator explicitly (`a\+b.csv`), and a spec whose
+`+`-separated parts don't all exist while the whole spec names a real file
+is treated as that one file anyway.
+
+A glob's results never include directories (`dir/*` yields the files
+directly inside `dir`, not its subdirectories), matching the shell and
+DuckDB. Use `dir/**` — or just `dir/` — to descend.
 
 ## Multi-file tables and Hive partitions
 
@@ -137,6 +174,11 @@ on top of whatever the file itself contains:
 SELECT count(*) FROM t;                                  -- all partitions, 1000 rows
 SELECT count(*) FROM t WHERE year = 2024 AND month = 1;   -- 300 rows, one partition pruned in
 ```
+
+Partition columns come from the file *path*, so they appear however the
+table was registered — a directory, a glob, a `+`-joined list, or a single
+explicit file path (`t=sales/year=2024/month=01/part.parquet` exposes
+`year` and `month` too, as DuckDB does).
 
 A partition key's **type is decided once for the whole table**, not per
 partition: `k=1`/`k=2` gives an `INTEGER` virtual column, and `k=1`/`k=abc`
