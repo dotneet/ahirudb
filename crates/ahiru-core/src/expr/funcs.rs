@@ -242,6 +242,7 @@ const F_ISNAN: FuncId = 140;
 const F_ISINF: FuncId = 141;
 const F_ISFINITE: FuncId = 142;
 const F_LIST_CONTAINS: FuncId = 143;
+const F_UNICODE: FuncId = 144;
 
 // Floating-point output
 const F_LOG2: FuncId = 150;
@@ -431,7 +432,10 @@ pub fn resolve_const(
         "left" => fixed(F_LEFT, &[Varchar, BigInt], n, 2, Varchar),
         "right" => fixed(F_RIGHT, &[Varchar, BigInt], n, 2, Varchar),
         // Code-point in / code-point out, so `chr(ascii(s))` round-trips a single character.
-        "ascii" | "unicode" | "ord" => fixed(F_ASCII, &[Varchar], n, 1, BigInt),
+        // `ascii` and `unicode`/`ord` only differ on the empty string, where DuckDB
+        // answers 0 and -1 respectively, so they get separate IDs and share a body.
+        "ascii" => fixed(F_ASCII, &[Varchar], n, 1, BigInt),
+        "unicode" | "ord" => fixed(F_UNICODE, &[Varchar], n, 1, BigInt),
         "chr" => fixed(F_CHR, &[BigInt], n, 1, Varchar),
         // Splits into a LIST, which this engine represents as JSON text (see the module docs).
         "string_split" | "str_split" | "string_to_array" | "split" => {
@@ -1127,17 +1131,21 @@ fn merge(a: Option<Bitmap>, b: Option<Bitmap>) -> Option<Bitmap> {
     }
 }
 
+/// The day counts a DATE may hold. DuckDB reserves three physical i32 values for DATE
+/// special values (the two infinities and the adjacent lower sentinel) and lets date
+/// arithmetic use the rest of the i32 range, erroring when a result leaves it -- so
+/// `DATE '1970-01-01' + 2147483646` is a real (if absurd) date there and `+ 2147483647`
+/// is not. AhiruDB has no infinity literals, so a result outside this range becomes NULL
+/// (its convention for an undefined value) instead of erroring.
+pub(crate) const DATE_MIN_DAYS: i64 = i32::MIN as i64 + 2;
+pub(crate) const DATE_MAX_DAYS: i64 = i32::MAX as i64 - 1;
+
 /// Writes an i64 into an integer output. Out of range for DATE (I32) gives `false` (= NULL).
-///
-/// DuckDB reserves three physical i32 values for DATE special values (the two
-/// infinities and the adjacent lower sentinel). AhiruDB does not expose
-/// infinity literals, so allowing any sentinel to escape from date arithmetic
-/// would turn an out-of-range result into a fictitious finite calendar date.
 fn push_int(d: &mut Data, x: i64, ty: Ty) -> bool {
     match d {
         Data::I32(v) => match i32::try_from(x) {
             Ok(z) => {
-                if ty == Ty::Date && (z <= i32::MIN + 1 || z == i32::MAX) {
+                if ty == Ty::Date && !(DATE_MIN_DAYS..=DATE_MAX_DAYS).contains(&x) {
                     v.push(0);
                     return false;
                 }

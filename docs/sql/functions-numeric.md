@@ -41,17 +41,17 @@ SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 |---|---|
 | `abs(x)` / `@x` (prefix) | Integer overflow case (`abs(i64::MIN)`) returns `NULL` rather than overflowing. Never returns a negative zero: `1 / abs(-0.0)` is positive infinity, not negative |
 | `sign(x)` | Returns -1/0/1; `NaN` passes through. Never returns a negative zero — `sign(-0.0)` is `+0.0` (DuckDB returns integer `0`). On a non-float argument the result is `BIGINT` (DuckDB narrows it to `TINYINT`) |
-| `ceil(x)` / `ceiling(x)`, `floor(x)`, `trunc(x)` | No-op (identity) on integer input. On `DECIMAL(p, s)` the result is a `DECIMAL(p, 0)`, as in DuckDB |
+| `ceil(x)` / `ceiling(x)`, `floor(x)`, `trunc(x)` | No-op (identity) on integer input. On `DECIMAL(p, s)` the result is a `DECIMAL(p, 0)`, as in DuckDB. On a float they keep the sign of a zero result, so `ceil(-0.3::DOUBLE)` is `-0.0` (DuckDB likewise) |
 | `round(x[, d])` | `d` > 0 rounds to `d` decimal places (half-away-from-zero); `d` < 0 rounds to a power of ten; `d` on an integer input with `d ≥ 0` is a no-op. On a `DECIMAL(p, s)` the result is a `DECIMAL(p, min(s, max(d, 0)))` when `d` is a literal, and a `DECIMAL(p, s)` when it is not (see the note below) |
 | `mod(a, b)` | Integer: `b = 0` or `MIN_VALUE % -1` returns `NULL` (no error/panic). Float: plain `%` |
 | `sqrt(x)` | Negative input returns `NULL` (DuckDB errors instead — an intentional divergence, matching this engine's general "prefer NULL over erroring mid-scan" policy) |
 | `exp(x)` | — |
-| `ln(x)` | `x ≤ 0` → `NULL` |
-| `log10(x)` / `log(x)` | Base-10; `x ≤ 0` → `NULL` |
-| `log(base, x)` | Logarithm to `base`; `base ≤ 0`, `base = 1`, or `x ≤ 0` → `NULL` |
-| `log2(x)` | `x ≤ 0` → `NULL` |
+| `ln(x)` | `x ≤ 0` → `NULL`. `ln(inf)` is `inf` and `ln(NaN)` is `NaN`, as in DuckDB |
+| `log10(x)` / `log(x)` | Base-10; `x ≤ 0` → `NULL`; non-finite input as for `ln` |
+| `log(base, x)` | Logarithm to `base`; `base ≤ 0`, `base = 1`, or `x ≤ 0` → `NULL`; non-finite input as for `ln` |
+| `log2(x)` | `x ≤ 0` → `NULL`; non-finite input as for `ln` |
 | `cbrt(x)` | Cube root; defined for negative input (unlike `sqrt`) |
-| `pow(x, y)` / `power(x, y)` | IEEE 754's special cases apply: `pow(1, y)` and `pow(x, 0)` are `1` even when the other operand is `NaN`. A negative base with an integer exponent keeps its sign at any magnitude (`pow(-2, 1025)` is `-inf`, `pow(-2, 2000)` is `+inf`); with a non-integer exponent it is `NaN` |
+| `pow(x, y)` / `power(x, y)` | IEEE 754's special cases apply: `pow(1, y)` and `pow(x, 0)` are `1` even when the other operand is `NaN`. A negative base with an integer exponent keeps its sign at any magnitude (`pow(-2, 1025)` is `-inf`, `pow(-2, 2000)` is `+inf`); with a non-integer exponent it is `NaN`, except for an infinite base, where IEEE gives `pow(-inf, y)` the value of `pow(inf, y)` (`pow(-inf, 0.5)` is `inf`) |
 | `pi()` | Folded to a constant at plan time (there is no zero-argument call path at runtime) |
 | `radians(x)`, `degrees(x)` | Degree ↔ radian conversion |
 | `gcd(a, b)` / `greatest_common_divisor` | Always non-negative; `gcd(0, 0)` = 0 |
@@ -216,9 +216,11 @@ The operators are sugar over the named functions (`bit_and(a,b)`,
 which can also be called directly. All operate on `BIGINT` (64-bit); other
 numeric input is cast to `BIGINT` first, matching this engine's usual
 "collapse to one working width" simplification for math functions (see the
-`log`/`sqrt` notes above). A shift amount that's negative or ≥ 64 returns
-`NULL` rather than erroring (DuckDB raises an error there instead — the
-same "prefer NULL over erroring mid-scan" divergence as `sqrt` above).
+`log`/`sqrt` notes above). A left-shift amount that's negative or ≥ 64
+returns `NULL` rather than erroring (DuckDB raises an error there instead —
+the same "prefer NULL over erroring mid-scan" divergence as `sqrt` above).
+The right shift is *not* undefined in DuckDB and is not here either: shifting
+by a negative amount or by ≥ 64 yields `0` (`8 >> 64` → `0`).
 
 Operator precedence: `&`/`|`/`<<`/`>>` bind tighter than comparison
 operators but looser than `+`/`-` (so `1 + 2 & 3` is `(1 + 2) & 3`, and

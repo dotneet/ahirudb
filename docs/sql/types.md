@@ -86,10 +86,23 @@ them in:
 - A `DECIMAL` combined with `FLOAT`/`DOUBLE` always becomes `DOUBLE` (never a
   wider `DECIMAL`); `FLOAT` combined with any other numeric type always
   becomes `DOUBLE` (never stays `FLOAT`).
+- `FLOAT` combined with `FLOAT` stays `FLOAT`, and the result is a genuine
+  32-bit value: arithmetic is evaluated in the engine's `f64` registers and
+  then **rounded back to `f32`**, so `16777216::FLOAT + 1::FLOAT` is
+  `16777216.0` (not the `f64` answer `16777217.0`) and an overflow becomes
+  `inf` rather than a finite double no `FLOAT` could hold. Every `FLOAT`
+  value is therefore exactly an `f32`, which is what makes
+  `CAST(x AS VARCHAR)` → `CAST(... AS FLOAT)` round-trip and `isinf` agree.
+  This matches DuckDB.
 - `DATE` combined with `TIMESTAMP` becomes `TIMESTAMP`.
 - `DATE` or `TIMESTAMP` combined with `TIMESTAMPTZ` becomes `TIMESTAMPTZ`
   (the more specific type wins, matching DuckDB).
-- `VARCHAR` combined with `BLOB` becomes `BLOB`.
+- `VARCHAR` combined with `BLOB` becomes `BLOB`. The conversion is not a
+  reinterpretation of the same bytes: a `BLOB`'s text form escapes every byte
+  outside printable ASCII, and the backslash itself, as `\xHH`
+  (`CAST('\x41\x42' AS BLOB)` is the two bytes `AB`), so the two `CAST`
+  directions decode and encode those escapes the way DuckDB's do. A string
+  holding a malformed escape becomes `NULL` (DuckDB raises there instead).
 - `INTERVAL`, `JSON`, and `UUID` only unify with themselves (or `NULL`) —
   mixing any of them with an unrelated type, including `VARCHAR`, is a type
   error. This means `WHERE uuid_col = '...'` needs an explicit
@@ -256,6 +269,11 @@ it needs to be explicit:
   errors on the same code the moment its `HUGEINT` result itself overflows
   (`factorial(34)` and above — see
   [functions-numeric.md](functions-numeric.md#factorial)).
+- `DATE ± INTEGER` is the exception to that wrap: a day count that leaves the
+  range a `DATE` can hold would be a fictitious calendar date rather than a
+  wrapped integer, so the result is `NULL` (`DATE '2024-01-01' + 2147480000`
+  → `NULL`). DuckDB raises `Date out of range` for the same inputs; `NULL` is
+  this engine's usual answer for an undefined value.
 - `-0.0` and `0.0` are treated as identical for grouping/join keys; all
   `NaN` values collapse to one representative for grouping purposes.
 - **`NaN` compares under a total order, not under IEEE rules** (matching

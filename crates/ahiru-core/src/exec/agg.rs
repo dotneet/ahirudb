@@ -791,7 +791,16 @@ impl HashAggregate {
                     let lo = (h as usize).min(m - 1);
                     let hi = (lo + 1).min(m - 1);
                     let w = h - lo as f64;
-                    let v = st.median_vals[lo] + (st.median_vals[hi] - st.median_vals[lo]) * w;
+                    // A weight of 0 lands exactly on `vals[lo]`, so there is nothing to
+                    // interpolate. Evaluating the general form anyway would still read
+                    // `vals[hi]`, and `(inf - lo) * 0.0` -- or a NaN upper element, which
+                    // `ord_f64` sorts last and so parks just past an odd-count midpoint --
+                    // turns an exact answer into NaN.
+                    let v = if w == 0.0 {
+                        st.median_vals[lo]
+                    } else {
+                        st.median_vals[lo] + (st.median_vals[hi] - st.median_vals[lo]) * w
+                    };
                     out.push_value(&Value::F64(v));
                 }
             }
