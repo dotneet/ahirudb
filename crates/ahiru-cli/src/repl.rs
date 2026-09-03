@@ -34,6 +34,10 @@ impl Sink {
     }
 }
 
+/// How deeply `.read` may nest. Deep enough that no real script hits it, small
+/// enough that the recursion cannot exhaust the stack.
+const MAX_READ_DEPTH: usize = 32;
+
 pub struct Shell {
     pub engine: Engine,
     settings: Settings,
@@ -61,6 +65,11 @@ pub struct Shell {
     /// Set once `-separator` or `.separator` has been used, after which
     /// `.mode` stops imposing the mode's own default separator.
     sep_explicit: bool,
+    /// How many `.read` files are currently open, one frame per nested `.read`.
+    /// A script that reads itself would otherwise recurse until the stack
+    /// overflows, which on a native binary is an unrecoverable abort (SIGABRT),
+    /// not an error the shell can report.
+    read_depth: usize,
 }
 
 impl Shell {
@@ -84,6 +93,7 @@ impl Shell {
             prompt_cont: "   ...> ".to_string(),
             excel_calls: 0,
             sep_explicit: opts.sep_explicit,
+            read_depth: 0,
         }
     }
 
@@ -469,8 +479,18 @@ impl Shell {
             }
             "read" => {
                 let p = arg(0).ok_or(".read needs a file name")?;
+                if self.read_depth >= MAX_READ_DEPTH {
+                    return Err(format!(
+                        ".read nested more than {MAX_READ_DEPTH} deep ({p}) \u{2014} \
+                         a script that reads itself?"
+                    )
+                    .into());
+                }
                 let text = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
-                self.run_script(&text)
+                self.read_depth += 1;
+                let r = self.run_script(&text);
+                self.read_depth -= 1;
+                r
             }
             "tables" => {
                 let pat = arg(0);
@@ -730,37 +750,115 @@ enum Piece {
     Sql(String),
 }
 
-/// Splits a script into dot commands and SQL statements.
+/// Where a scan of script text currently sits, between two characters.
 ///
-/// A dot command is a line whose first non-blank character is `.` *and* which
-fn is_only_trivia(s: &str) -> bool {
-    let mut chars = s.char_indices().peekable();
-    while let Some((_, c)) = chars.next() {
-        if c.is_whitespace() {
-            continue;
+/// Carrying this from one line to the next is what makes `split_script` linear: the
+/// state is everything the scanner needs to resume, so no line is ever read twice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// Ordinary SQL text.
+    Sql,
+    /// Inside `-- ...`, which ends at the next newline.
+    LineComment,
+    /// Inside `/* ... */`.
+    BlockComment,
+    /// Inside a `'`- or `"`-delimited literal or quoted identifier (the byte is the
+    /// delimiter). A doubled delimiter is an escape and does not end it.
+    Quoted(u8),
+}
+
+/// Advances `at` through `text` until it reaches an unquoted, uncommented `;` (whose
+/// byte offset it returns, leaving `at` just past it) or the end of the buffer.
+///
+/// `content` is set as soon as anything other than whitespace and comments is seen; it
+/// is the resumable form of "is this buffer only trivia?", which decides whether a
+/// leading `.` starts a dot command or is just SQL.
+///
+/// When the buffer ends in the middle of a decision that needs one more byte -- a `*`
+/// that might begin `*/`, a quote that might be doubled -- `at` is left *on* that byte
+/// rather than past it, so appending the next line and calling again sees the pair.
+fn scan(text: &str, at: &mut usize, st: &mut Scan, content: &mut bool) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut i = *at;
+    let found = loop {
+        if i >= b.len() {
+            break None;
         }
-        if c == '-' && chars.peek().map(|&(_, c2)| c2) == Some('-') {
-            for (_, c2) in chars.by_ref() {
-                if c2 == '\n' {
-                    break;
+        match *st {
+            Scan::LineComment => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                    *st = Scan::Sql;
                 }
             }
-            continue;
-        }
-        if c == '/' && chars.peek().map(|&(_, c2)| c2) == Some('*') {
-            chars.next();
-            let mut prev = ' ';
-            for (_, c2) in chars.by_ref() {
-                if prev == '*' && c2 == '/' {
-                    break;
+            Scan::BlockComment => {
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
                 }
-                prev = c2;
+                if i + 1 < b.len() {
+                    i += 2;
+                    *st = Scan::Sql;
+                } else {
+                    break None;
+                }
             }
-            continue;
+            Scan::Quoted(q) => {
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                if i + 1 >= b.len() {
+                    break None;
+                }
+                if b[i + 1] == q {
+                    i += 2;
+                } else {
+                    i += 1;
+                    *st = Scan::Sql;
+                }
+            }
+            Scan::Sql => match b[i] {
+                b';' => {
+                    i += 1;
+                    *at = i;
+                    return Some(i - 1);
+                }
+                b'-' if b.get(i + 1) == Some(&b'-') => {
+                    *st = Scan::LineComment;
+                    i += 2;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    *st = Scan::BlockComment;
+                    i += 2;
+                }
+                b'-' | b'/' if i + 1 >= b.len() => break None,
+                c @ (b'\'' | b'"') => {
+                    *content = true;
+                    *st = Scan::Quoted(c);
+                    i += 1;
+                }
+                c if c < 0x80 => {
+                    if !(c as char).is_whitespace() {
+                        *content = true;
+                    }
+                    i += 1;
+                }
+                // A multi-byte character is decided as a `char`, so Unicode whitespace
+                // counts as trivia exactly as the old char-by-char scanner had it.
+                _ => {
+                    let ch = text[i..].chars().next().unwrap_or(' ');
+                    if !ch.is_whitespace() {
+                        *content = true;
+                    }
+                    i += ch.len_utf8();
+                }
+            },
         }
-        return false;
-    }
-    true
+    };
+    *at = i;
+    found
 }
 
 /// Splits a multi-statement script into sequential pieces (`Piece::Sql` /
@@ -773,27 +871,51 @@ fn is_only_trivia(s: &str) -> bool {
 /// line, say).
 fn split_script(text: &str) -> Vec<Piece> {
     let mut out = Vec::new();
+    // The text accumulated so far, with every line terminator normalized to `\n` (what
+    // `str::lines` yields). `start` is where the statement being built begins in it and
+    // `scanned` how far `scan` has read; both only ever move forward. The previous
+    // version re-scanned the whole buffer for every line and rebuilt the remainder
+    // through `chars()`, which made one long multi-line statement O(N * len) and many
+    // statements on a single line O(N^2) -- tens of seconds on input a user can easily
+    // write (a 50,000-element `IN (...)` list, one element per line).
     let mut cur = String::new();
+    let mut start = 0usize;
+    let mut scanned = 0usize;
+    let mut st = Scan::Sql;
+    let mut content = false;
+
     for line in text.lines() {
-        if is_only_trivia(&cur) && line.trim_start().starts_with('.') {
+        if !content && line.trim_start().starts_with('.') {
             cur.clear();
+            start = 0;
+            scanned = 0;
+            st = Scan::Sql;
             out.push(Piece::Dot(line.trim().to_string()));
             continue;
         }
         cur.push_str(line);
         cur.push('\n');
         // A line may hold several statements: peel them off one `;` at a time.
-        while let Some(end) = statement_end(&cur) {
-            let stmt: String = cur.chars().take(end).collect();
-            let rest: String = cur.chars().skip(end + 1).collect();
-            if !stmt.trim().is_empty() {
-                out.push(Piece::Sql(stmt));
+        while let Some(end) = scan(&cur, &mut scanned, &mut st, &mut content) {
+            // `;` is one byte, so `end + 1` is a character boundary.
+            if !cur[start..end].trim().is_empty() {
+                out.push(Piece::Sql(cur[start..end].to_string()));
             }
-            cur = rest;
+            start = end + 1;
+            scanned = start;
+            st = Scan::Sql;
+            content = false;
+        }
+        if start == cur.len() {
+            // Everything so far has been emitted. Reclaim the buffer rather than let it
+            // grow to hold the whole script.
+            cur.clear();
+            start = 0;
+            scanned = 0;
         }
     }
-    if !cur.trim().is_empty() && !is_only_trivia(&cur) {
-        out.push(Piece::Sql(cur));
+    if content && !cur[start..].trim().is_empty() {
+        out.push(Piece::Sql(cur[start..].to_string()));
     }
     out
 }
@@ -945,45 +1067,14 @@ fn ends_statement(text: &str) -> bool {
     statement_end(text).is_some()
 }
 
-/// Character index of the first `;` that is not inside a string literal,
-/// quoted identifier or comment.
+/// Byte offset of the first `;` that is not inside a string literal, quoted identifier
+/// or comment. Reached only through [`ends_statement`], on the interactive REPL's line
+/// buffer; scripts go through [`split_script`], which resumes instead of rescanning.
 fn statement_end(text: &str) -> Option<usize> {
-    let cs: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < cs.len() {
-        match cs[i] {
-            '-' if cs.get(i + 1) == Some(&'-') => {
-                while i < cs.len() && cs[i] != '\n' {
-                    i += 1;
-                }
-            }
-            '/' if cs.get(i + 1) == Some(&'*') => {
-                i += 2;
-                while i < cs.len() && !(cs[i] == '*' && cs.get(i + 1) == Some(&'/')) {
-                    i += 1;
-                }
-                i += 2;
-            }
-            '\'' | '"' => {
-                let q = cs[i];
-                i += 1;
-                while i < cs.len() {
-                    if cs[i] == q {
-                        if cs.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            ';' => return Some(i),
-            _ => i += 1,
-        }
-    }
-    None
+    let mut at = 0;
+    let mut st = Scan::Sql;
+    let mut content = false;
+    scan(text, &mut at, &mut st, &mut content)
 }
 
 /// Hands `path` to the system's file opener (`.excel`). Best effort: a
@@ -1096,6 +1187,55 @@ mod tests {
     #[test]
     fn multiline_statement_is_one_piece() {
         assert_eq!(pieces("SELECT 1,\n  2\nFROM t;"), vec!["sql:SELECT 1,\n  2\nFROM t"]);
+    }
+
+    // The scanner state is carried from line to line instead of the buffer being
+    // rescanned, so the constructs that span a newline have to keep working.
+    #[test]
+    fn scanner_state_survives_a_line_break() {
+        assert_eq!(pieces("SELECT 'a\n;b' AS x;"), vec!["sql:SELECT 'a\n;b' AS x"]);
+        assert_eq!(pieces("/* a\n; b */ SELECT 1;"), vec!["sql:/* a\n; b */ SELECT 1"]);
+        assert_eq!(pieces("SELECT \"c\n;d\" FROM t;"), vec!["sql:SELECT \"c\n;d\" FROM t"]);
+        // A doubled quote right at a line break is still an escape, not a terminator.
+        assert_eq!(pieces("SELECT 'a\n''b;c' AS x;"), vec!["sql:SELECT 'a\n''b;c' AS x"]);
+        // CRLF: `str::lines` strips the `\r`, so the emitted SQL is `\n`-separated.
+        assert_eq!(pieces("SELECT 1,\r\n 2\r\nFROM t;\r\n"), vec!["sql:SELECT 1,\n 2\nFROM t"]);
+        // A leading `.` inside an unterminated statement is SQL, not a dot command.
+        assert_eq!(pieces("SELECT\n.5 AS x;"), vec!["sql:SELECT\n.5 AS x"]);
+    }
+
+    // `split_script` used to re-run its whole scan over the accumulated buffer for
+    // every line, and rebuild the remainder through `chars().take/skip()` for every
+    // statement: O(N * len) for one long multi-line statement and O(N^2) for many
+    // statements on one line. The release binary took ~6 s on the first input here at
+    // 50,000 lines and ~34 s on the second at 50,000 statements; in a debug test build
+    // the sizes below took minutes. The bound is deliberately generous -- the point is
+    // that it is finite, not that it measures anything.
+    #[test]
+    fn splitting_a_large_script_is_not_quadratic() {
+        let start = std::time::Instant::now();
+
+        // One statement spanning 20,000 lines.
+        let mut long = String::from("SELECT count(*) FROM t WHERE id IN (\n");
+        for i in 0..20_000 {
+            long.push_str(&format!("{},\n", i % 1000));
+        }
+        long.push_str("0\n);");
+        assert_eq!(split_script(&long).len(), 1);
+
+        // 20,000 statements on a single line.
+        let many = "SELECT 1 FROM t LIMIT 1;".repeat(20_000);
+        assert_eq!(split_script(&many).len(), 20_000);
+
+        // 100,000 comment lines trailing one statement.
+        let mut comments = String::from("SELECT 1 FROM t LIMIT 1 ");
+        for _ in 0..100_000 {
+            comments.push_str("-- x\n");
+        }
+        assert_eq!(split_script(&comments).len(), 1);
+
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(20), "split_script took {elapsed:?}");
     }
 
     #[test]

@@ -252,6 +252,21 @@ fn dot_read_runs_a_script_file() {
     assert_eq!(r.stdout, "answer\n42\n");
 }
 
+/// A script that `.read`s itself used to recurse until the native stack overflowed
+/// (`fatal runtime error: stack overflow`, SIGABRT) — an abort the shell could not
+/// report, catch, or return an exit code for. A depth cap turns it into an ordinary
+/// error.
+#[test]
+fn dot_read_of_a_self_including_script_is_an_error_not_a_stack_overflow() {
+    let p = tmp_file("read_self", "sql");
+    std::fs::write(&p, format!(".read {}\n", p.display())).unwrap();
+    let r = run(&["-csv", "-c", &format!(".read {}", p.display())]);
+    let _ = std::fs::remove_file(&p);
+    assert!(!r.ok, "expected a failure, got: {}", r.stdout);
+    assert!(r.stderr.contains(".read nested more than"), "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("stack overflow"), "stderr: {}", r.stderr);
+}
+
 // ---- file arguments ------------------------------------------------------
 
 #[test]
@@ -971,4 +986,29 @@ fn csv_mode_keeps_empty_string_and_null_apart() {
     let r = run(&["-csv", "-nullvalue", "", "-c", "SELECT '' AS a, NULL AS b, 'x' AS c"]);
     assert!(r.ok, "{}", r.stderr);
     assert_eq!(r.stdout, "a,b,c\n\"\",,x\n");
+}
+
+/// A non-UTF-8 command-line argument used to abort the process: `std::env::args()`
+/// panics on non-Unicode argv, so `ahiru ... $'x=\xff.parquet'` exited 101 with a
+/// `Result::unwrap()` panic from `std::env` before any of the CLI's own code ran.
+/// The OS accepts such a path, so it has to be reported as an argument error
+/// (exit code 2, like every other bad argument) rather than crashing.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_is_an_argument_error_not_a_panic() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ahiru"))
+        .arg("-no-init")
+        .arg("-c")
+        .arg("SELECT 1")
+        .arg(OsStr::from_bytes(b"x=\xff.parquet"))
+        .current_dir(repo_root())
+        .output()
+        .expect("failed to run ahiru");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("not valid UTF-8"), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
 }

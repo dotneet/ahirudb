@@ -1584,6 +1584,93 @@ test('a transient empty read is not cached and the retry succeeds', async () => 
   }
 });
 
+test('a wrong-length cache hit is treated as a miss instead of spinning forever', async () => {
+  const file = new Uint8Array(await readFile(BASIC));
+  let reads = 0;
+  let gets = 0;
+  const source = {
+    key: 'short-cache-hit',
+    size: () => file.byteLength,
+    read: async (offset, len) => {
+      reads++;
+      return file.subarray(offset, offset + len);
+    },
+  };
+  // What a truncated Cache API body, or a stale entry left by an older build, looks
+  // like: a hit of the wrong length for every key. Handed to wasm it became the
+  // prefix of the range, the engine asked for the identical range again, and query()
+  // looped on microtasks alone -- never yielding, so not even a timer could stop it
+  // (which is why this cache throws after a generous number of gets: a regression has
+  // to fail the test rather than hang the whole run).
+  const cache = {
+    get() {
+      if (++gets > 500) throw new Error(`livelock: cache.get called ${gets} times`);
+      return new Uint8Array(3);
+    },
+    set() {},
+    clear() {},
+  };
+  const db = await openDb({ cache });
+  try {
+    db.registerParquet('t', source);
+    const rows = await db.query('SELECT sum(id) AS s FROM t');
+    assert.equal(rows.length, 1);
+    assert.equal(Number(rows[0].s), duck(`SELECT sum(id) AS s FROM '${BASIC}'`)[0].s);
+    assert.ok(reads > 0, 'the source was never asked; the bogus cache hit was used as-is');
+  } finally {
+    db.close();
+  }
+});
+
+test('output columns that share a name keep distinct row-object keys', async () => {
+  const db = await openDb();
+  try {
+    db.registerParquet('t', new Uint8Array(await readFile(BASIC)));
+    // Three columns all called `id`. Assigning each to `o[c.name]` let the last one
+    // win, so the row collapsed to a single `id` holding `name AS id` and the two
+    // real `id` values were lost with no error anywhere.
+    const rows = await db.query('SELECT id, id, name AS id FROM t WHERE id = 1');
+    assert.equal(rows.length, 1);
+    assert.deepEqual(Object.keys(rows[0]), ['id', 'id_1', 'id_2']);
+    assert.equal(Number(rows[0].id), 1);
+    assert.equal(Number(rows[0].id_1), 1);
+    assert.equal(rows[0].id_2, 'name_1');
+
+    // A generated key that collides with a real column name keeps counting.
+    const rows2 = await db.query('SELECT id, id AS id_1, id AS id FROM t WHERE id = 2');
+    assert.deepEqual(Object.keys(rows2[0]), ['id', 'id_1', 'id_2']);
+
+    // The schema still reports the real names, unchanged.
+    for await (const b of db.stream('SELECT id, id FROM t LIMIT 1')) {
+      assert.deepEqual(
+        b.schema.map((c) => c.name),
+        ['id', 'id'],
+      );
+      assert.deepEqual(Object.keys(b.toRows()[0]), ['id', 'id_1']);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test('close() while a source size() is in flight reports that the database is closed', async () => {
+  const file = new Uint8Array(await readFile(BASIC));
+  const db = await openDb();
+  db.registerParquet('t', {
+    // A user callback, so it can take arbitrarily long; close() lands while it runs.
+    size: () => new Promise((r) => setTimeout(() => r(file.byteLength), 50)),
+    read: async (offset, len) => file.subarray(offset, offset + len),
+  });
+  const pending = db.query('SELECT count(*) AS c FROM t');
+  setTimeout(() => db.close(), 10);
+  // Table binding used to carry on into the freed session and surface a bare E900
+  // with no explanation, unlike every other close race.
+  await assert.rejects(
+    withTimeout(pending, 5000, 'the query hung after close()'),
+    (e) => e instanceof AhiruError && /database is closed/.test(e.message),
+  );
+});
+
 test('close() recovers an abandoned stream instead of deadlocking the instance', async () => {
   const db = await openDb();
   db.registerParquet('t', new Uint8Array(await readFile(BASIC)));

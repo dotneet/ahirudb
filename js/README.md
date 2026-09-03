@@ -50,6 +50,13 @@ db.close();
 
 `registerParquet` is an alias for `register` (it can register formats other than Parquet too).
 
+Row objects need one key per column, so **output columns that share a name are
+disambiguated**: the first keeps the name and the rest get `_1`, `_2`, ...
+appended, as DuckDB's own clients do. `SELECT id, id, name AS id FROM t` yields
+`{ id, id_1, id_2 }`. `batch.column(k)` and `batch.get(k, row)` still resolve a
+name to the *first* column with it — index them by position to reach the others.
+`batch.schema` always reports the real column names, unchanged.
+
 ### Finishing a stream
 
 Only one query runs against an instance at a time, and a `stream()` iterator

@@ -75,6 +75,25 @@ conversion error rather than becoming `NULL` — see
 [limitations.md](limitations.md#partially-supported), where the divergence
 from DuckDB (which re-sniffs and widens) is spelled out.
 
+An object **key** outside the sample is never silently dropped either, but
+the two JSON readers handle it differently, because of how much of the file
+each one has in hand:
+
+- **`.json`** (one document) has the whole document resident and walks
+  every element anyway, so *every* element contributes its keys: the column
+  set is always complete, no matter how late a key first appears. Only the
+  types of the columns the sample settled on stay frozen (which is what
+  produces the conversion error above). A column discovered past the sample
+  has no sample evidence at all, so its type widens over every element it
+  appears in.
+- **JSONL/NDJSON** is read split by split, and the schema has to be fixed
+  before the first split is read, so a complete key set is not knowable up
+  front. A key with no column is reported as a `ColumnNotFound` error
+  positioned at the offending line, rather than being skipped. DuckDB, which
+  can re-sniff, would add the column instead; erroring is the honest answer
+  for a streaming reader — the alternative is losing a whole column of data
+  without a word.
+
 When several **text** parts are registered as one multi-part table and
 their sniffed schemas disagree, the column widens to `VARCHAR`. A part that
 saw **no value at all** for a column (a header-only CSV, a column whose

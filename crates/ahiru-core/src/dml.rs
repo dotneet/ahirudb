@@ -17,7 +17,7 @@ use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::session::{Prepared, Session};
 use crate::sql::ast::{ExprArena, ExprId, InsertSource};
-use crate::vector::{Field, Ty, Value, Vector, BATCH_SIZE};
+use crate::vector::{Batch, Field, Ty, Value, Vector, BATCH_SIZE};
 
 /// Casts an already-determined `Value` of type `src_ty` to `target_ty`. Wrapping it as
 /// an `Expr::TypedLiteral` and running it through `eval_scalar` shares CAST semantics
@@ -29,6 +29,14 @@ use crate::vector::{Field, Ty, Value, Vector, BATCH_SIZE};
 /// `DECIMAL(10,2)` 12.50 is `I64(1250)`, which re-infers as `BIGINT 1250` and then
 /// rescales to `1250.00`; `UUID`/`INTERVAL`/`DATE`/`TIME`/`TIMESTAMP` likewise lose
 /// their identity and become NULL or a `TypeMismatch`.
+///
+/// The conversion is **strict**: the `Cast` opcode's documented per-row behaviour is
+/// "a row that fails to convert becomes NULL" (`expr::kernels`), which is right for
+/// `SELECT` but wrong here, where the NULL would be *stored*. DuckDB raises a
+/// Conversion Error and stores nothing; a non-NULL value that casts to NULL is
+/// therefore rejected with `ValueOutOfRange` rather than silently written. Because
+/// both `insert` and `update` validate the entire statement before touching any row,
+/// the failing statement mutates nothing.
 fn cast_value(session: &mut Session, v: Value, src_ty: Ty, target_ty: Ty) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
@@ -40,7 +48,30 @@ fn cast_value(session: &mut Session, v: Value, src_ty: Ty, target_ty: Ty) -> Res
     }
     let mut arena = ExprArena::new();
     let id = arena.push(crate::sql::ast::Expr::TypedLiteral(v, src_ty));
-    eval_scalar(session, &arena, id, &[], target_ty)
+    let out = eval_scalar(session, &arena, id, &[], target_ty)?;
+    // `v` was not NULL, so a NULL here can only mean the conversion failed.
+    ensure!(!out.is_null(), ValueOutOfRange);
+    Ok(out)
+}
+
+/// Evaluates a single `INSERT ... VALUES` expression and coerces it to the target
+/// column type, strictly (see [`cast_value`]).
+///
+/// The expression is compiled and evaluated at its *natural* type first, so the
+/// pre-cast value is known; [`cast_value`] then performs the conversion itself.
+/// `eval_scalar` cannot be used directly because it folds the cast into the same
+/// program and so cannot tell "the expression was NULL" from "the cast failed".
+fn eval_insert_value(
+    session: &mut Session,
+    arena: &ExprArena,
+    expr_id: ExprId,
+    params: &[Value],
+    target_ty: Ty,
+) -> Result<Value> {
+    let prog = compile(arena, &Scope::new(), params, expr_id)?;
+    let src_ty = prog.result_ty;
+    let v = session.vm.eval(&prog, &Batch::rows_only(1))?.value_at(0);
+    cast_value(session, v, src_ty, target_ty)
 }
 
 /// The name-resolution scope for `UPDATE`/`DELETE` against `table`.
@@ -111,7 +142,8 @@ pub(crate) fn insert(
                 ensure!(row_exprs.len() == col_idx.len(), ColumnCountMismatch);
                 let mut row = defaults.clone();
                 for (&slot, &expr_id) in col_idx.iter().zip(row_exprs) {
-                    row[slot] = eval_scalar(session, arena, expr_id, params, schema[slot].ty)?;
+                    row[slot] =
+                        eval_insert_value(session, arena, expr_id, params, schema[slot].ty)?;
                 }
                 check_not_null(&schema, &row)?;
                 out.push(row);
@@ -152,6 +184,11 @@ pub(crate) fn update(
 
     let mut set_cols = Vec::with_capacity(assignments.len());
     let mut set_progs = Vec::with_capacity(assignments.len());
+    // For every SET that needed a cast, the same expression compiled *without* it. The
+    // cast turns an unconvertible row into NULL, so the pre-cast column is what tells a
+    // genuine NULL apart from a failed conversion (see `cast_value`). Only evaluated
+    // when a cast actually produced a NULL, so the ordinary path pays nothing.
+    let mut set_raw_progs = Vec::with_capacity(assignments.len());
     for (col, expr_id) in assignments {
         let ci = match schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), col.as_bytes())) {
             Some(i) => i,
@@ -162,10 +199,17 @@ pub(crate) fn update(
         // cannot be bypassed with quoted/unquoted variants of the same name.
         ensure!(!set_cols.contains(&ci), DuplicateColumn);
         let prog = compile(arena, &scope, params, *expr_id)?;
-        let prog =
-            if prog.result_ty != schema[ci].ty { cast_program(prog, schema[ci].ty)? } else { prog };
+        let (prog, raw) = if prog.result_ty != schema[ci].ty {
+            // Compiled a second time rather than cloned: this happens once per
+            // statement, and `Program` is not `Clone`.
+            let raw = compile(arena, &scope, params, *expr_id)?;
+            (cast_program(prog, schema[ci].ty)?, Some(raw))
+        } else {
+            (prog, None)
+        };
         set_cols.push(ci);
         set_progs.push(prog);
+        set_raw_progs.push(raw);
     }
     // `compile_predicate`, not `compile`: it is what `SELECT`'s WHERE uses, so
     // `WHERE NULL` becomes a BOOLEAN NULL (matching nothing) instead of a
@@ -210,6 +254,7 @@ pub(crate) fn update(
         for p in &set_progs {
             new_cols.push(session.vm.eval(p, &batch)?);
         }
+        let mut raw_cols: Vec<Option<Vector>> = set_progs.iter().map(|_| None).collect();
 
         for (local, &matched) in mask.iter().enumerate() {
             if !matched {
@@ -218,7 +263,18 @@ pub(crate) fn update(
             let mut row_values = Vec::with_capacity(set_cols.len());
             for (k, &ci) in set_cols.iter().enumerate() {
                 let v = new_cols[k].value_at(local);
-                ensure!(schema[ci].nullable || !v.is_null(), TypeMismatch);
+                if v.is_null() {
+                    // A NULL that the cast invented (the pre-cast value was not NULL)
+                    // is a failed conversion, not an assignment of NULL.
+                    if let Some(rp) = &set_raw_progs[k] {
+                        if raw_cols[k].is_none() {
+                            raw_cols[k] = Some(session.vm.eval(rp, &batch)?);
+                        }
+                        let raw = raw_cols[k].as_ref().unwrap().value_at(local);
+                        ensure!(raw.is_null(), ValueOutOfRange);
+                    }
+                    ensure!(schema[ci].nullable, TypeMismatch);
+                }
                 row_values.push(v);
             }
             planned.push((pos + local, row_values));
@@ -372,6 +428,85 @@ mod tests {
         s.prepare("INSERT INTO src VALUES (1)", &[]).unwrap();
         s.prepare("CREATE TABLE t (a INTEGER, b INTEGER NOT NULL)", &[]).unwrap();
         let r = s.prepare("INSERT INTO t (a) SELECT x FROM src", &[]);
+        assert_eq!(crate::error::code_of(r), Some(Code::TypeMismatch));
+    }
+
+    // A value that does not fit the target column used to be coerced through the same
+    // `Cast` opcode as SELECT, whose per-row rule is "unconvertible becomes NULL". In
+    // DML that NULL was *persisted* and the statement reported success. Every case
+    // below must now fail with ValueOutOfRange and leave the table untouched.
+    #[test]
+    fn insert_values_rejects_values_that_do_not_fit_the_column_type() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (a INTEGER, c TINYINT, e DECIMAL(5,2), f DATE)", &[]).unwrap();
+        for sql in [
+            "INSERT INTO t VALUES (3000000000, 1, 1.0, '2024-01-01')", // INTEGER overflow
+            "INSERT INTO t VALUES (1, 200, 1.0, '2024-01-01')",        // TINYINT overflow
+            "INSERT INTO t VALUES (1, 1, 1234.567, '2024-01-01')",     // DECIMAL precision
+            "INSERT INTO t VALUES (1, 1, 1.0, 'not a date')",          // unparsable DATE
+            "INSERT INTO t VALUES ('abc', 1, 1.0, '2024-01-01')",      // unparsable INTEGER
+        ] {
+            assert_eq!(
+                crate::error::code_of(s.prepare(sql, &[])),
+                Some(Code::ValueOutOfRange),
+                "{sql}"
+            );
+        }
+        assert_eq!(ready_rows(&mut s, "SELECT count(*) FROM t"), vec![vec![Value::I64(0)]]);
+    }
+
+    #[test]
+    fn insert_values_still_stores_an_explicit_null_and_a_convertible_value() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (a INTEGER, b DECIMAL(5,2))", &[]).unwrap();
+        s.prepare("INSERT INTO t VALUES (NULL, 1.567), (7, NULL)", &[]).unwrap();
+        let rows = ready_rows(&mut s, "SELECT a FROM t");
+        assert_eq!(rows, vec![vec![Value::Null], vec![Value::I32(7)]]);
+    }
+
+    #[test]
+    fn insert_select_rejects_values_that_do_not_fit_the_column_type() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE src (s VARCHAR)", &[]).unwrap();
+        s.prepare("INSERT INTO src VALUES ('x')", &[]).unwrap();
+        s.prepare("CREATE TABLE dst (a INTEGER)", &[]).unwrap();
+        let r = s.prepare("INSERT INTO dst SELECT s FROM src", &[]);
+        assert_eq!(crate::error::code_of(r), Some(Code::ValueOutOfRange));
+        assert_eq!(ready_rows(&mut s, "SELECT count(*) FROM dst"), vec![vec![Value::I64(0)]]);
+    }
+
+    #[test]
+    fn update_rejects_a_value_that_does_not_fit_the_column_type_and_changes_nothing() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (a TINYINT)", &[]).unwrap();
+        s.prepare("INSERT INTO t VALUES (5), (1)", &[]).unwrap();
+        // 5 * 100 = 500 overflows TINYINT; row 1 (1 * 100 = 100) would fit, so this also
+        // pins down that a single bad row aborts the whole statement.
+        let r = s.prepare("UPDATE t SET a = a * 100", &[]);
+        assert_eq!(crate::error::code_of(r), Some(Code::ValueOutOfRange));
+        assert_eq!(
+            ready_rows(&mut s, "SELECT a FROM t"),
+            vec![vec![Value::I32(5)], vec![Value::I32(1)]]
+        );
+
+        let r = s.prepare("UPDATE t SET a = 'notint'", &[]);
+        assert_eq!(crate::error::code_of(r), Some(Code::ValueOutOfRange));
+    }
+
+    // The strict check must not fire for a SET that legitimately assigns NULL, and a
+    // NOT NULL column still reports TypeMismatch for a genuine NULL (not
+    // ValueOutOfRange), so the two failure modes stay distinguishable.
+    #[test]
+    fn update_still_allows_assigning_null_and_reports_not_null_separately() {
+        let mut s = Session::new();
+        s.prepare("CREATE TABLE t (a INTEGER, b BIGINT NOT NULL)", &[]).unwrap();
+        s.prepare("INSERT INTO t VALUES (1, 2)", &[]).unwrap();
+        s.prepare("UPDATE t SET a = NULL", &[]).unwrap();
+        assert_eq!(ready_rows(&mut s, "SELECT a FROM t"), vec![vec![Value::Null]]);
+
+        // `a` is NULL now, so `b = a` is a real NULL assignment through a cast
+        // (INTEGER -> BIGINT), not a failed conversion.
+        let r = s.prepare("UPDATE t SET b = a", &[]);
         assert_eq!(crate::error::code_of(r), Some(Code::TypeMismatch));
     }
 
