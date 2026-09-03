@@ -741,6 +741,20 @@ fn push_i64_values(desc: &ColumnDesc, vals: &[i64], out: &mut Vector) -> Result<
 /// Repacking from BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY.
 /// DECIMAL is converted to an integer as a big-endian two's complement value.
 fn push_byte_values(desc: &ColumnDesc, items: &[&[u8]], out: &mut Vector) -> Result<()> {
+    // INTERVAL shares PhysType::I128 with DECIMAL but is encoded completely
+    // differently -- FLBA(12) holding months, days and milliseconds as three
+    // unsigned 32-bit little-endian integers -- so it is matched on the logical
+    // type ahead of the physical dispatch below.
+    if desc.ty == Ty::Interval {
+        let d = as_i128_vec(out, items.len())?;
+        for it in items {
+            ensure!(it.len() == 12, BadCompressedData);
+            let le = |i: usize| u32::from_le_bytes([it[i], it[i + 1], it[i + 2], it[i + 3]]);
+            let micros = (le(8) as i64).saturating_mul(1000);
+            d.push(crate::vector::pack_interval(le(0) as i32, le(4) as i32, micros));
+        }
+        return Ok(());
+    }
     match desc.ty.phys() {
         PhysType::Bytes => {
             match out.data_mut() {
@@ -774,8 +788,46 @@ fn push_byte_values(desc: &ColumnDesc, items: &[&[u8]], out: &mut Vector) -> Res
             }
             Ok(())
         }
+        // The only byte-array column with a floating-point logical type is FLOAT16,
+        // which is FLBA(2) holding an IEEE binary16.
+        PhysType::F64 => {
+            let d = as_f64_vec(out, items.len())?;
+            for it in items {
+                ensure!(it.len() == 2, BadCompressedData);
+                d.push(f16_to_f64(u16::from_le_bytes([it[0], it[1]])));
+            }
+            Ok(())
+        }
         _ => err!(UnsupportedType),
     }
+}
+
+/// Widen an IEEE binary16 bit pattern to `f64`. Every binary16 value (including the
+/// subnormals, which binary32 represents as normals) converts exactly.
+fn f16_to_f64(bits: u16) -> f64 {
+    let sign = (bits as u32) >> 15;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x03ff) as u32;
+    let f32_bits = match exp {
+        // Infinity / NaN: binary32 keeps the payload in the top mantissa bits.
+        0x1f => (sign << 31) | 0x7f80_0000 | (frac << 13),
+        0 if frac == 0 => sign << 31,
+        // Subnormal: shift the mantissa up until its implicit leading 1 appears.
+        // `frac << e` then has bit 10 set, and the value is `1.m * 2^(-14 - e)`,
+        // so the binary32 exponent field is `127 - 14 - e`.
+        0 => {
+            let mut f = frac;
+            let mut e = 0u32;
+            while f & 0x0400 == 0 {
+                f <<= 1;
+                e += 1;
+            }
+            (sign << 31) | ((113 - e) << 23) | ((f & 0x03ff) << 13)
+        }
+        // Normal: rebias the exponent from 15 to 127.
+        _ => (sign << 31) | ((exp + 112) << 23) | (frac << 13),
+    };
+    f32::from_bits(f32_bits) as f64
 }
 
 /// Convert a big-endian two's complement representation into an i128.
@@ -1037,6 +1089,30 @@ fn push_codec_page_for(
 mod tests {
     use super::*;
     use crate::parquet::meta::DataPageHeaderV2;
+
+    #[test]
+    fn binary16_widens_to_f64_exactly() {
+        // Bit patterns straight from the IEEE 754 binary16 definition.
+        assert_eq!(f16_to_f64(0x0000), 0.0);
+        assert!(f16_to_f64(0x8000) == 0.0 && f16_to_f64(0x8000).is_sign_negative());
+        assert_eq!(f16_to_f64(0x3C00), 1.0);
+        assert_eq!(f16_to_f64(0x3E00), 1.5);
+        assert_eq!(f16_to_f64(0xC100), -2.5);
+        assert_eq!(f16_to_f64(0x7BFF), 65504.0); // largest finite
+        assert_eq!(f16_to_f64(0x0400), 6.103515625e-05); // smallest normal
+        assert_eq!(f16_to_f64(0x0001), 5.960464477539063e-08); // smallest subnormal
+        assert_eq!(f16_to_f64(0x03FF), 6.097555160522461e-05); // largest subnormal
+        assert_eq!(f16_to_f64(0x2E66), 0.0999755859375); // nearest binary16 to 0.1
+        assert_eq!(f16_to_f64(0x7C00), f64::INFINITY);
+        assert_eq!(f16_to_f64(0xFC00), f64::NEG_INFINITY);
+        assert!(f16_to_f64(0x7E00).is_nan());
+        // Every one of the 65536 bit patterns must round-trip through binary32, whose
+        // range and precision both strictly contain binary16's.
+        for bits in 0..=u16::MAX {
+            let v = f16_to_f64(bits);
+            assert!(v.is_nan() || v as f32 as f64 == v, "bits {bits:#06x}");
+        }
+    }
 
     #[test]
     fn uncompressed_pages_must_match_the_declared_size() {

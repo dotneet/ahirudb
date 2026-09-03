@@ -330,9 +330,245 @@ pq.write_table(
     compression="SNAPPY",
 )
 PY
+
+  # A footer that does not fit the 64 KiB speculative tail fetch
+  # (`parquet::file::FOOTER_PROBE`). `format::parquet::resolve` has to notice and
+  # refetch the exact footer range instead of probing the same tail again.
+  #
+  # The two files bracket the boundary exactly: the probe covers the last 65536
+  # bytes and the trailer is 8 of them, so a footer of 65528 bytes is the largest
+  # that still fits, and 65529 is the first that does not. Padding the footer to
+  # a precise byte count is done by appending an unknown Thrift field (id 9999,
+  # binary) to FileMetaData just before its stop byte -- valid Parquet that every
+  # reader skips, and far smaller on disk than the hundreds of columns x row
+  # groups it would otherwise take to grow a footer past 64 KiB.
+  python3 - <<'PY'
+import io, struct
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+NCOL, ROWS, NRG = 12, 24, 6
+cols = {f"c{c}": pa.array([i * (c + 1) for i in range(ROWS)], type=pa.int32())
+        for c in range(NCOL)}
+buf = io.BytesIO()
+pq.write_table(pa.table(cols), buf, row_group_size=ROWS // NRG,
+               compression="SNAPPY", use_dictionary=False, store_schema=False)
+src = buf.getvalue()
+
+
+def uvarint(v):
+    out = bytearray()
+    while True:
+        x = v & 0x7F
+        v >>= 7
+        out.append(x | 0x80 if v else x)
+        if not v:
+            return bytes(out)
+
+
+def zigzag(v):
+    return uvarint((v << 1) ^ (v >> 63))
+
+
+def pad_to(src, target):
+    n = struct.unpack("<I", src[-8:-4])[0]
+    meta = src[-8 - n:-8]
+    assert meta[-1] == 0, "FileMetaData must end with the Thrift stop byte"
+    # 0x08 = (field-id delta 0, type BINARY) -> a long-form field id follows.
+    fixed = len(meta) - 1 + 1 + len(zigzag(9999)) + 1
+    for lenwidth in range(1, 6):
+        pad = target - fixed - lenwidth
+        if pad >= 0 and len(uvarint(pad)) == lenwidth:
+            new = meta[:-1] + b"\x08" + zigzag(9999) + uvarint(pad) + b"\0" * pad + b"\0"
+            assert len(new) == target
+            return src[:-8 - n] + new + struct.pack("<I", target) + b"PAR1"
+    raise SystemExit("no padding length reaches the target")
+
+
+for target, name in ((65528, "footer_fit.parquet"), (65529, "footer_big.parquet")):
+    open(name, "wb").write(pad_to(src, target))
+PY
+
+  # The parquet-mr (Spark/Hive) column-chunk layout: `data_page_offset` records
+  # the chunk start, which is written *before* the dictionary page, so it equals
+  # `dictionary_page_offset` instead of pointing past it. Page-selected reads must
+  # still find the dictionary page. No writer available here produces that layout,
+  # so a normal pyarrow file (dictionary-encoded, page index written) is rewritten
+  # afterwards: every ColumnMetaData's `data_page_offset` (field 9) is set to its
+  # `dictionary_page_offset` (field 11).
+  python3 - <<'PY'
+import struct
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+n = 4000
+pq.write_table(
+    pa.table({
+        "id": pa.array(range(n), type=pa.int32()),
+        "k": pa.array([i % 100 for i in range(n)], type=pa.int32()),
+        "s": pa.array([f"v{i % 50}" for i in range(n)], type=pa.string()),
+    }),
+    "dict_mr.parquet",
+    row_group_size=n, data_page_size=2 * 1024,
+    write_page_index=True, use_dictionary=True, compression="SNAPPY",
+)
+
+
+def uvarint(b, p):
+    r = s = 0
+    while True:
+        x = b[p]; p += 1
+        r |= (x & 0x7F) << s
+        if not x & 0x80:
+            return r, p
+        s += 7
+
+
+def zz(b, p):
+    u, p = uvarint(b, p)
+    return (u >> 1) ^ -(u & 1), p
+
+
+def enc_zz(v):
+    v = (v << 1) ^ (v >> 63)
+    out = bytearray()
+    while True:
+        x = v & 0x7F; v >>= 7
+        out.append(x | 0x80 if v else x)
+        if not v:
+            return bytes(out)
+
+
+patches = []
+
+
+def walk(b, p, path):
+    """Minimal Thrift compact-protocol struct walk; records where each
+    ColumnMetaData's data_page_offset varint sits."""
+    fields, last = {}, 0
+    while True:
+        h = b[p]; p += 1
+        if h == 0:
+            return fields, p
+        ty, delta = h & 0xF, h >> 4
+        fid, p = (last + delta, p) if delta else zz(b, p)
+        last = fid
+        vpos = p
+        if ty in (1, 2):
+            v = ty == 1
+        elif ty == 3:
+            v = b[p]; p += 1
+        elif ty in (4, 5, 6):
+            v, p = zz(b, p)
+        elif ty == 7:
+            v = None; p += 8
+        elif ty == 8:
+            ln, p = uvarint(b, p); v = b[p:p + ln]; p += ln
+        elif ty in (9, 10):
+            hh = b[p]; p += 1
+            et, cnt = hh & 0xF, hh >> 4
+            if cnt == 15:
+                cnt, p = uvarint(b, p)
+            v = []
+            for _ in range(cnt):
+                if et == 12:
+                    fv, p = walk(b, p, path + [fid]); v.append(fv)
+                elif et in (1, 2, 3):
+                    p += 1
+                elif et == 8:
+                    ln, p = uvarint(b, p); p += ln
+                elif et in (4, 5, 6):
+                    _, p = zz(b, p)
+                elif et == 7:
+                    p += 8
+                else:
+                    raise SystemExit(f"unhandled list element type {et}")
+        elif ty == 12:
+            v, p = walk(b, p, path + [fid])
+        else:
+            raise SystemExit(f"unhandled field type {ty}")
+        fields[fid] = (ty, v, vpos)
+        # FileMetaData.row_groups(4) -> RowGroup.columns(1) -> ColumnChunk.meta_data(3)
+        if path == [4, 1] and fid == 3 and 9 in v and 11 in v:
+            patches.append((v[9][2], enc_zz(v[9][1]), enc_zz(v[11][1])))
+
+
+src = open("dict_mr.parquet", "rb").read()
+n = struct.unpack("<I", src[-8:-4])[0]
+foot = bytearray(src[-8 - n:-8])
+walk(foot, 0, [])
+# Splice from the end so earlier positions stay valid when a varint changes width.
+for pos, old, new in sorted(patches, key=lambda p: -p[0]):
+    assert foot[pos:pos + len(old)] == old
+    foot[pos:pos + len(old)] = new
+open("dict_mr.parquet", "wb").write(
+    src[:-8 - n] + bytes(foot) + struct.pack("<I", len(foot)) + b"PAR1")
+print(f"dict_mr.parquet: rewrote {len(patches)} column chunks to the parquet-mr layout")
+PY
+
+  # A 0-row RowGroup either side of the data, alongside nested (LIST/STRUCT)
+  # columns. pyarrow writes such a RowGroup for an empty table or an empty batch,
+  # and its column metadata is `dictionary_page_offset=<real>, data_page_offset=0,
+  # num_values=0` -- so the chunk's byte range has to start at the dictionary page,
+  # and the nested read path (which walks the buffer to exhaustion rather than to a
+  # row count) must not be entered for it at all.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+st = pa.struct([("a", pa.int32()), ("t", pa.list_(pa.string()))])
+schema = pa.schema([("id", pa.int32()), ("l", pa.list_(pa.int32())), ("s", st)])
+empty = pa.table({"id": pa.array([], type=pa.int32()),
+                  "l": pa.array([], type=pa.list_(pa.int32())),
+                  "s": pa.array([], type=st)}, schema=schema)
+rows = 30
+data = pa.table({
+    "id": pa.array(range(rows), type=pa.int32()),
+    "l": pa.array([[i, i + 1] if i % 3 else [] for i in range(rows)],
+                  type=pa.list_(pa.int32())),
+    "s": pa.array([{"a": i, "t": [f"t{i}"]} for i in range(rows)], type=st),
+}, schema=schema)
+with pq.ParquetWriter("empty_rg_nested.parquet", schema, compression="SNAPPY") as w:
+    w.write_table(empty)
+    w.write_table(data)
+    w.write_table(empty)
+PY
+
+  # FLOAT16: FIXED_LEN_BYTE_ARRAY(2) annotated with the FLOAT16 logical type, which
+  # ahirudb widens to FLOAT. DuckDB's COPY has no half-precision type, so pyarrow
+  # writes it. Covers zero/-zero, both infinities, NULL, the smallest normal, the
+  # smallest subnormal, the largest finite value, and a value that is not exact in
+  # binary16.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+vals = [1.5, -2.5, 0.0, -0.0, float("inf"), float("-inf"), None,
+        6.103515625e-05, 5.960464477539063e-08, 65504.0, 0.0999755859375]
+pq.write_table(
+    pa.table({
+        "id": pa.array(range(len(vals)), type=pa.int32()),
+        "h": pa.array(vals, type=pa.float32()).cast(pa.float16()),
+    }),
+    "float16.parquet", compression="SNAPPY",
+)
+PY
 else
-  echo "!! pyarrow not found; skipping regeneration of pagetest.parquet / list_pagetest.parquet / nan_stats.parquet" >&2
+  echo "!! pyarrow not found; skipping regeneration of pagetest.parquet / list_pagetest.parquet / nan_stats.parquet / footer_fit.parquet / footer_big.parquet / dict_mr.parquet / empty_rg_nested.parquet / float16.parquet" >&2
 fi
+
+# --- INTERVAL (FIXED_LEN_BYTE_ARRAY(12)) ----------------------------------
+# Months/days/milliseconds as three unsigned 32-bit little-endian integers.
+# A plain INTEGER column sits next to it so "one unsupported column must not make
+# the whole file unreadable" stays testable if the mapping is ever dropped.
+duckdb -c "
+COPY (SELECT * FROM (VALUES
+  (1, INTERVAL '1 day'),
+  (2, INTERVAL '13 months 5 days 3 hours 4 minutes 5.5 seconds'),
+  (3, INTERVAL '0 days'),
+  (4, INTERVAL '90 minutes')
+) AS t(id, iv))
+TO 'interval.parquet' (FORMAT PARQUET);"
 
 # --- For the browser demo (the cross-format JOIN sample in demo/app.js) ----
 # customers is Parquet; orders.csv/regions.jsonl are hand-written plain text

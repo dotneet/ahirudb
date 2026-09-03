@@ -1,8 +1,9 @@
 //! QA pass, continued: Hive partition + multi-file glob edge cases exercised
 //! through `Session`/SQL, building on `format::partitioned.rs`'s own unit
 //! tests and the existing `crates/ahiru-core/tests/multi_file_smoke.rs`
-//! (which this file does not edit — see `partition_column_colliding_with_a_
-//! real_file_column_is_rejected` there for the base case this file deepens).
+//! (which this file does not edit — see
+//! `partition_column_colliding_with_a_real_file_column_keeps_the_file_column`
+//! in `format::partitioned` for the base case this file deepens).
 
 use ahiru_core::error::{code_of, Code};
 use ahiru_core::format::FormatKind;
@@ -33,12 +34,13 @@ fn run_all(sql: &str, sess: &mut Session) -> Vec<Vec<Value>> {
 #[test]
 fn same_directory_repeating_a_partition_key_is_rejected_not_last_value_wins() {
     // `PartitionedFormat::resolve` folds every `(name, value)` pair into a
-    // single schema by checking each new name against the ones already
-    // added, so a path with the same key twice (`year=2024/year=2025/f.csv`)
-    // collides with itself the same way a partition key colliding with a
-    // real file column does (`partition_column_colliding_with_a_real_file_
-    // column_is_rejected` in `multi_file_smoke.rs`). Confirm it's rejected
-    // rather than silently keeping the last (or first) value.
+    // single schema by checking each new name against the ones already added,
+    // so a path with the same key twice (`year=2024/year=2025/f.csv`) collides
+    // with itself. Unlike a key that collides with a real column of the file
+    // (where the data column wins -- see
+    // `a_partition_key_that_is_also_a_real_column_keeps_the_files_own_column`
+    // below), there is nothing here to prefer, so confirm it's rejected rather
+    // than silently keeping the last (or first) value.
     let mut sess = Session::new();
     let r = sess.register_multi_bytes(
         "t",
@@ -256,4 +258,43 @@ fn a_glob_containing_a_hash_in_a_file_name_still_detects_the_format() {
     .unwrap();
     let rows = run_all("SELECT id FROM t ORDER BY id", &mut sess);
     assert_eq!(rows, vec![vec![Value::I64(7)], vec![Value::I64(8)]]);
+}
+
+#[test]
+fn a_partition_key_that_is_also_a_real_column_keeps_the_files_own_column() {
+    // Hive, and DuckDB's `WRITE_PARTITION_COLUMNS`, write the partition key into the
+    // data as well -- and only into some parts of the dataset, typically. Rejecting
+    // the whole table with `column already exists` made such datasets unreadable.
+    // DuckDB (`hive_partitioning=true, union_by_name=true`) returns v,year,month with
+    // the file's own `year` for the part that has one.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![
+            ("h/year=2024/month=01/p.csv".into(), b"v,year\n1,2024\n".to_vec()),
+            ("h/year=2025/month=02/p.csv".into(), b"v\n2\n".to_vec()),
+        ],
+        FormatKind::Csv,
+    )
+    .unwrap();
+
+    let rows = run_all("SELECT v, year, month FROM t ORDER BY v", &mut sess);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::I64(1), Value::I64(2024), Value::Bytes(b"01".to_vec())],
+            vec![Value::I64(2), Value::I64(2025), Value::Bytes(b"02".to_vec())],
+        ]
+    );
+
+    // `SELECT *` must expose each name exactly once, in file-then-partition order.
+    let rows = run_all("SELECT * FROM t ORDER BY v", &mut sess);
+    assert_eq!(rows[0].len(), 3);
+
+    // A predicate on the shared name has to reach the file's column in the part that
+    // has one, and the synthesized constant in the part that does not.
+    let rows = run_all("SELECT count(*) FROM t WHERE year = 2024", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(1)]]);
+    let rows = run_all("SELECT count(*) FROM t WHERE month = '02'", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(1)]]);
 }

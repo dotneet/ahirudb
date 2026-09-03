@@ -284,3 +284,39 @@ fn struct_dotted_names_are_bindable_in_sql() {
     let rows = run_sql(&mut sess, "SELECT nested.a.b.c FROM t WHERE id = 3");
     assert_eq!(rows, vec![vec![Value::I32(3)]]);
 }
+
+/// pyarrow writes a 0-row RowGroup for an empty table or an empty batch, and its
+/// column metadata is `dictionary_page_offset=<real>, data_page_offset=0,
+/// num_values=0`. The flat read path stops at the row count and never touches the
+/// chunk, but the nested path walks the chunk buffer to exhaustion -- so with the
+/// byte range starting at 0 it used to decode the file's `PAR1` magic as a page
+/// header and fail with `unsupported parquet encoding`, making every LIST/MAP/STRUCT
+/// column in the file unreadable.
+///
+/// `tests/data/empty_rg_nested.parquet` has an empty RowGroup on either side of 30
+/// real rows. duckdb: `SELECT count(*), count(l), count(s)` -> 30, 30, 30.
+#[test]
+fn zero_row_row_groups_do_not_break_nested_columns() {
+    let (schema, cols) = read_all(data("empty_rg_nested.parquet"), &[0, 1, 2]);
+    assert_eq!(schema[1].name, "l");
+    assert_eq!(schema[2].name, "s");
+    assert_eq!(cols[0].len(), 30);
+    assert_eq!(cols[1].len(), 30);
+    assert_eq!(cols[2].len(), 30);
+    for i in 0..30usize {
+        assert_eq!(cols[0].value_at(i), Value::I32(i as i32));
+        let expected = if i % 3 == 0 { "[]".to_string() } else { format!("[{i},{}]", i + 1) };
+        assert_eq!(json_str(&cols[1].value_at(i)).unwrap(), expected, "row {i}");
+        assert_eq!(
+            json_str(&cols[2].value_at(i)).unwrap(),
+            format!("{{\"a\":{i},\"t\":[\"t{i}\"]}}"),
+            "row {i}"
+        );
+    }
+
+    // The same file through SQL, where the empty RowGroups become their own splits.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", data("empty_rg_nested.parquet"), FormatKind::Parquet).unwrap();
+    let rows = run_sql(&mut sess, "SELECT count(*), count(l), count(s) FROM t");
+    assert_eq!(rows, vec![vec![Value::I64(30), Value::I64(30), Value::I64(30)]]);
+}

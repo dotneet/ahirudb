@@ -26,12 +26,17 @@ pub struct PartitionedFormat {
     types: Vec<Ty>,
     /// `inner`'s schema plus the partition columns. Empty until `resolve` completes.
     schema: Vec<Field>,
+    /// Indexes into `keys` of the partition columns actually appended to `schema`, in
+    /// schema order. A key whose name also names a real column of the file is dropped
+    /// here (the file's column wins), so this is shorter than `keys` in that case.
+    /// Settled by `resolve`.
+    visible: Vec<usize>,
 }
 
 impl PartitionedFormat {
     pub fn new(inner: Box<dyn TableFormat>, keys: Vec<(String, String)>) -> Self {
         let types = keys.iter().map(|(_, v)| hive_value_ty(v)).collect();
-        PartitionedFormat { inner, keys, types, schema: Vec::new() }
+        PartitionedFormat { inner, keys, types, schema: Vec::new(), visible: Vec::new() }
     }
 
     /// Extracts `key=value` from the path's directory part (each segment except the file name).
@@ -59,10 +64,13 @@ impl PartitionedFormat {
         out
     }
 
-    /// The constant value of partition key `i`, built to match its settled column type.
+    /// The constant value of the `i`-th *appended* partition column (an index into
+    /// `visible`, i.e. `column index - inner column count`), built to match its
+    /// settled column type.
     fn value_of(&self, i: usize) -> Value {
-        let Some((_, raw)) = self.keys.get(i) else { return Value::Null };
-        typed_value(raw, self.types.get(i).copied().unwrap_or(Ty::Varchar))
+        let Some(&k) = self.visible.get(i) else { return Value::Null };
+        let Some((_, raw)) = self.keys.get(k) else { return Value::Null };
+        typed_value(raw, self.types.get(k).copied().unwrap_or(Ty::Varchar))
     }
 
     /// A projection keeping only `inner`'s columns. Partition columns (indices at or beyond
@@ -211,22 +219,29 @@ impl TableFormat for PartitionedFormat {
         let step = self.inner.resolve(src)?;
         if step.is_ok() && self.schema.is_empty() {
             let mut schema = self.inner.schema().to_vec();
+            let inner_n = schema.len();
+            let mut visible = Vec::with_capacity(self.keys.len());
             for (i, (name, _)) in self.keys.iter().enumerate() {
-                // If a partition column collides with one of the file's own column names, the schema
-                // ends up with two columns of the same name. Which one is looked up would depend on
-                // column-resolution implementation details, and the unintended value could silently
-                // come back, so it is clearly rejected -- the same policy as `catalog::unify_schema`
-                // rejecting misaligned joins.
-                ensure!(
-                    !schema
-                        .iter()
-                        .any(|f| crate::rt::hash::eq_ascii_ci(f.name.as_bytes(), name.as_bytes())),
-                    DuplicateColumn
-                );
+                let same =
+                    |f: &Field| crate::rt::hash::eq_ascii_ci(f.name.as_bytes(), name.as_bytes());
+                // A partition key that also names a real column of the file is dropped:
+                // the file's own column wins and no partition column is synthesized for
+                // it. Hive writers and DuckDB's `WRITE_PARTITION_COLUMNS` both produce
+                // such datasets, and DuckDB reads them by taking the data column.
+                if schema[..inner_n].iter().any(same) {
+                    continue;
+                }
+                // Two partition keys of the same name in one path is a different matter:
+                // there is no data column to prefer, so which value is looked up would
+                // depend on column-resolution implementation details. Rejected, as
+                // before.
+                ensure!(!schema[inner_n..].iter().any(same), DuplicateColumn);
                 let ty = self.types.get(i).copied().unwrap_or(Ty::Varchar);
                 schema.push(Field::new(name.clone(), ty, false));
+                visible.push(i);
             }
             self.schema = schema;
+            self.visible = visible;
         }
         Ok(step)
     }
@@ -323,7 +338,12 @@ impl TableFormat for PartitionedFormat {
                 out.push(inner_cols[pos].clone());
             } else {
                 let i = col - inner_n;
-                let ty = self.types.get(i).copied().unwrap_or(Ty::Varchar);
+                let ty = self
+                    .visible
+                    .get(i)
+                    .and_then(|&k| self.types.get(k))
+                    .copied()
+                    .unwrap_or(Ty::Varchar);
                 out.push(constant_vector(ty, &self.value_of(i), rows));
             }
         }
@@ -527,15 +547,41 @@ mod tests {
     }
 
     #[test]
-    fn partition_column_colliding_with_a_real_file_column_is_rejected() {
-        // If the file itself has a "year" column and the path also has `year=...`, the schema ends
-        // up with two columns of the same name. Rather than leaving which one is looked up
-        // undefined, it should be rejected with a clear error.
+    fn partition_column_colliding_with_a_real_file_column_keeps_the_file_column() {
+        // If the file itself has a "year" column and the path also has `year=...`, the
+        // file's column wins and no partition column is synthesized -- Hive and DuckDB's
+        // `WRITE_PARTITION_COLUMNS` both write the key into the file as well, and DuckDB
+        // reads such a dataset by taking the data column.
         let inner = Box::new(FakeFormat {
-            schema: vec![Field::new("id", Ty::Int, false), Field::new("year", Ty::Int, false)],
+            schema: vec![Field::new("v", Ty::Int, false), Field::new("year", Ty::Int, false)],
             rows: 3,
         });
-        let mut f = PartitionedFormat::new(inner, vec![("year".to_string(), "2024".to_string())]);
+        let mut f = PartitionedFormat::new(
+            inner,
+            vec![("year".to_string(), "2024".to_string()), ("month".to_string(), "01".to_string())],
+        );
+        f.resolve(&fake_source()).unwrap().unwrap();
+        let names: Vec<&str> = f.schema().iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["v", "year", "month"]);
+
+        // Column 1 must come from the file (FakeFormat yields the row index), not the
+        // constant 2024, and the surviving partition column must still line up with its
+        // own key rather than with `keys[1]`'s position.
+        let cols = f.read_split(&fake_source(), 0, &[0, 1, 2]).unwrap();
+        assert!(matches!(cols[1].value_at(0), Value::I32(0)));
+        assert!(matches!(cols[1].value_at(2), Value::I32(2)));
+        assert_eq!(cols[2].value_at(0), Value::Bytes(b"01".to_vec()));
+    }
+
+    #[test]
+    fn two_partition_keys_of_the_same_name_are_rejected() {
+        // No data column to prefer here, so which value wins would be undefined.
+        let inner =
+            Box::new(FakeFormat { schema: vec![Field::new("id", Ty::Int, false)], rows: 3 });
+        let mut f = PartitionedFormat::new(
+            inner,
+            vec![("k".to_string(), "1".to_string()), ("k".to_string(), "2".to_string())],
+        );
         assert!(f.resolve(&fake_source()).is_err());
     }
 
