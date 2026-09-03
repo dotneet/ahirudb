@@ -220,7 +220,17 @@ pub(super) fn narrow_unnest_elem_ty(
         });
     }
     match common {
-        Some(t) if t.is_integer() => Ty::BigInt,
+        // The unified integer type has to survive: collapsing everything to BIGINT made
+        // `unnest([1, 9223372036854775808])` produce NULL for the second element, because the
+        // value does not fit i64. HUGEINT and UBIGINT both need the 128-bit column
+        // (duckdb answers HUGEINT here too).
+        Some(t) if t.is_integer() => {
+            if matches!(t, Ty::HugeInt | Ty::UBigInt) {
+                Ty::HugeInt
+            } else {
+                Ty::BigInt
+            }
+        }
         Some(Ty::Float) | Some(Ty::Double) => Ty::Double,
         Some(Ty::Varchar) => Ty::Varchar,
         Some(Ty::Boolean) => Ty::Boolean,

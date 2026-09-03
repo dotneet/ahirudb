@@ -349,6 +349,23 @@ moved). Displaying one back out looks like:
 1 year 2 months 3 days 01:02:03
 ```
 
+**Comparing** two intervals flattens those three components with DuckDB's
+fixed conversions — **1 month = 30 days** and **1 day = 24 hours** — and
+compares the resulting microsecond spans. There is no anchor date in a
+comparison, so there is nothing to ask how long "one month" really is; only
+adding an interval to a `DATE`/`TIMESTAMP` uses real calendar arithmetic.
+The normalization applies everywhere a value is compared or keyed:
+
+```sql
+SELECT INTERVAL 1 DAY = INTERVAL 24 HOUR;   -- true
+SELECT INTERVAL 1 MONTH = INTERVAL 30 DAY;  -- true
+-- ORDER BY, DISTINCT, GROUP BY, UNION, equi-joins and min/max agree:
+-- 23:00:00 < 1 day < 25:00:00
+```
+
+`<`, `<=`, `>` and `>=` between two intervals are not accepted yet
+(`ORDER BY` on an interval column works).
+
 ## UUID
 
 ```sql

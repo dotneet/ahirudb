@@ -9,7 +9,7 @@
 
 use crate::prelude::*;
 use crate::rt::hash::hash_u64;
-use crate::vector::{Data, Vector};
+use crate::vector::{Data, Ty, Vector};
 
 /// Writes one row's key into `out`.
 ///
@@ -29,6 +29,11 @@ pub fn encode_key(cols: &[&Vector], row: usize, out: &mut Vec<u8>) {
             Data::Bool(b) => out.push(b.get(row) as u8),
             Data::I32(v) => out.extend_from_slice(&v[row].to_le_bytes()),
             Data::I64(v) => out.extend_from_slice(&v[row].to_le_bytes()),
+            // INTERVAL's three packed components are flattened first: `1 day` and `24 hours`
+            // are the same value and must land in the same group / join bucket.
+            Data::I128(v) if c.ty() == Ty::Interval => {
+                out.extend_from_slice(&interval_key(v[row]).to_le_bytes())
+            }
             Data::I128(v) => out.extend_from_slice(&v[row].to_le_bytes()),
             Data::F64(v) => out.extend_from_slice(&canonical_f64(v[row]).to_le_bytes()),
             Data::Bytes(b) => {
@@ -58,6 +63,30 @@ pub fn canonical_f64(v: f64) -> u64 {
     } else {
         v.to_bits()
     }
+}
+
+/// Normalizes an INTERVAL into a single comparable/hashable microsecond count.
+///
+/// INTERVAL is stored as three independent components packed into one i128
+/// (`vector::pack_interval`: months, days, microseconds). Comparing that bit pattern directly
+/// makes `INTERVAL 1 DAY` and `INTERVAL 24 HOUR` different keys even though they denote the same
+/// span, so an equi-join on them found nothing, `UNION` kept both, and `ORDER BY` ranked
+/// `1 day` above `25 hours` (the months field dominates the high bits).
+///
+/// DuckDB (and PostgreSQL) compare intervals by flattening them with the fixed conversions
+/// **1 month = 30 days** and **1 day = 24 hours**, and that is what this reproduces. The
+/// conversions are deliberately calendar-independent: interval comparison has no anchor date, so
+/// there is nothing to ask how long "one month" really is. Adding an interval to a timestamp
+/// still uses real calendar arithmetic (`expr::funcs::add_interval_to_ts`) -- only comparison
+/// normalizes.
+///
+/// The result cannot overflow: the widest input (`i32::MAX` months + `i32::MAX` days +
+/// `i64::MIN` microseconds) stays below 6e24, far inside i128.
+#[inline]
+pub fn interval_key(v: i128) -> i128 {
+    const US_PER_DAY: i128 = 86_400_000_000;
+    let (months, days, micros) = crate::vector::unpack_interval(v);
+    (months as i128) * 30 * US_PER_DAY + (days as i128) * US_PER_DAY + micros as i128
 }
 
 /// Whether the key contains even one NULL. In an equi-join a NULL key never matches, so this is
@@ -433,5 +462,37 @@ mod tests {
         let mut h = HashIndex::new();
         assert_eq!(h.get_or_insert(b""), (0, true));
         assert_eq!(h.get_or_insert(b""), (0, false));
+    }
+
+    #[test]
+    fn intervals_of_equal_span_share_a_key() {
+        // The packed representation differs (days vs microseconds), the normalized span does
+        // not: duckdb treats 1 day and 24 hours -- and 1 month and 30 days -- as equal.
+        let day = crate::vector::pack_interval(0, 1, 0);
+        let hours24 = crate::vector::pack_interval(0, 0, 24 * 3_600_000_000);
+        assert_ne!(day, hours24, "the packed forms are genuinely different");
+        assert_eq!(interval_key(day), interval_key(hours24));
+        assert_eq!(
+            interval_key(crate::vector::pack_interval(1, 0, 0)),
+            interval_key(crate::vector::pack_interval(0, 30, 0))
+        );
+        // 23 hours < 1 day < 25 hours, which the raw bit pattern gets wrong.
+        let h23 = interval_key(crate::vector::pack_interval(0, 0, 23 * 3_600_000_000));
+        let h25 = interval_key(crate::vector::pack_interval(0, 0, 25 * 3_600_000_000));
+        assert!(h23 < interval_key(day) && interval_key(day) < h25);
+        // Negative components stay ordered, and the extremes do not overflow i128.
+        assert!(interval_key(crate::vector::pack_interval(0, -1, 0)) < 0);
+        let _ = interval_key(crate::vector::pack_interval(i32::MAX, i32::MAX, i64::MAX));
+        let _ = interval_key(crate::vector::pack_interval(i32::MIN, i32::MIN, i64::MIN));
+    }
+
+    #[test]
+    fn interval_columns_encode_the_normalized_span() {
+        let mut v = Vector::new(Ty::Interval);
+        v.push_value(&Value::I128(crate::vector::pack_interval(0, 1, 0)));
+        v.push_value(&Value::I128(crate::vector::pack_interval(0, 0, 24 * 3_600_000_000)));
+        v.push_value(&Value::I128(crate::vector::pack_interval(0, 0, 25 * 3_600_000_000)));
+        assert_eq!(key(&[&v], 0), key(&[&v], 1));
+        assert_ne!(key(&[&v], 0), key(&[&v], 2));
     }
 }

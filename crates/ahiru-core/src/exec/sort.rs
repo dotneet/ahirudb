@@ -27,10 +27,11 @@
 //! quietly ballooning. With a `limit` only the top n are held in the first place, so
 //! `ORDER BY ... LIMIT 10` over 50M rows never touches the cap.
 
+use crate::exec::rowkey::interval_key;
 use crate::exec::{ExecContext, Operator, Step};
 use crate::plan::SortKey;
 use crate::prelude::*;
-use crate::vector::{Batch, Bitmap, Data, Vector, BATCH_SIZE};
+use crate::vector::{Batch, Bitmap, Data, Ty, Vector, BATCH_SIZE};
 
 use core::cmp::Ordering;
 
@@ -243,7 +244,7 @@ fn cmp_row(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
                 Ordering::Less
             };
         }
-        let mut o = cmp_data(c.data(), ai, bi);
+        let mut o = cmp_data(c, ai, bi);
         if k.desc {
             o = o.reverse();
         }
@@ -255,12 +256,15 @@ fn cmp_row(keys: &[SortKey], cols: &[Vector], a: u32, b: u32) -> Ordering {
 }
 
 /// Value comparison per physical type. NULL checks are already done by the caller.
-fn cmp_data(d: &Data, a: usize, b: usize) -> Ordering {
-    match d {
+fn cmp_data(c: &Vector, a: usize, b: usize) -> Ordering {
+    match c.data() {
         // false < true.
         Data::Bool(v) => v.get(a).cmp(&v.get(b)),
         Data::I32(v) => v[a].cmp(&v[b]),
         Data::I64(v) => v[a].cmp(&v[b]),
+        // INTERVAL's three packed components are normalized to microseconds first (see
+        // `rowkey::interval_key`); the raw bit pattern would rank `1 day` above `25 hours`.
+        Data::I128(v) if c.ty() == Ty::Interval => interval_key(v[a]).cmp(&interval_key(v[b])),
         Data::I128(v) => v[a].cmp(&v[b]),
         Data::F64(v) => f64_key(v[a]).cmp(&f64_key(v[b])),
         // Lexicographic. On a common prefix the shorter one is smaller.

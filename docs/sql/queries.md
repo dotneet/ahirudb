@@ -522,6 +522,14 @@ that native type (`BIGINT`, `VARCHAR`, `BOOLEAN`, ...) rather than leaving
 the result as `JSON` text; a mixed-type array stays `JSON`. A `NULL` or
 empty array produces zero rows (not a row with a `NULL` value).
 
+The restored type is wide enough for every element, so an integer past
+`BIGINT` comes back as `HUGEINT` (`UNNEST([1, 9223372036854775808])` yields
+`1` and `9223372036854775808`, as in DuckDB) rather than turning into
+`NULL`. One known gap: arrays travel as JSON text, and JSON has no way to
+spell infinity or NaN, so a non-finite `DOUBLE` element written into an
+array literal (`UNNEST([1.5, 1e400])`) becomes `NULL` — DuckDB, which has a
+real `LIST` type, keeps `inf` there.
+
 ## Table functions: generate_series / range
 
 ```sql
