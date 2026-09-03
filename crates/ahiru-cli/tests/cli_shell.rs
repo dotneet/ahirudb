@@ -768,6 +768,93 @@ fn an_escaped_glob_metacharacter_names_a_literal_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `+` joins several files into one table, so a file whose *name* contains one
+/// used to be unreachable: the spec was split before the path was ever looked
+/// at, and `\+` did not escape it either.
+#[test]
+fn a_plus_in_a_file_name_is_not_a_multi_file_separator() {
+    let dir = tmp_file("plus_name", "d");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create dir");
+    std::fs::write(dir.join("a+b.csv"), b"v\n7\n").expect("write plus file");
+    std::fs::write(dir.join("one.csv"), b"v\n1\n").expect("write one");
+    std::fs::write(dir.join("two.csv"), b"v\n2\n").expect("write two");
+    let base = dir.display().to_string();
+
+    // Neither half of the split exists, but the whole spec does, so `+` was
+    // never a separator.
+    let r = run(&["-csv", "-c", "SELECT v FROM t", &format!("{base}/a+b.csv")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n7\n");
+
+    // `\+` says so explicitly, which is what the usage text documents.
+    let r = run(&["-csv", "-c", "SELECT v FROM t", &format!("{base}/a\\+b.csv")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n7\n");
+
+    // A genuine `+`-joined pair still becomes one table.
+    let r = run(&[
+        "-csv",
+        "-c",
+        "SELECT v FROM t ORDER BY v",
+        &format!("{base}/one.csv+{base}/two.csv"),
+    ]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n1\n2\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A glob whose last component matched a directory used to abort the whole
+/// registration with "Is a directory". The shell and DuckDB both leave
+/// directories out of a glob's results; `**` still descends into them.
+#[test]
+fn a_glob_matching_a_directory_skips_it_instead_of_failing() {
+    let dir = tmp_file("glob_dir", "d");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).expect("create dirs");
+    std::fs::write(dir.join("one.csv"), b"v\n1\n").expect("write one");
+    std::fs::write(dir.join("sub/two.csv"), b"v\n2\n").expect("write two");
+    let base = dir.display().to_string();
+
+    let r = run(&["-csv", "-c", "SELECT v FROM t ORDER BY v", &format!("{base}/*")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n1\n");
+
+    let r = run(&["-csv", "-c", "SELECT v FROM t ORDER BY v", &format!("{base}/**")]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "v\n1\n2\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Hive directory holding exactly one file took the single-file
+/// registration path, which never parsed `key=value` segments — so
+/// `year=2025` (one file) exposed no partition columns while its sibling
+/// `year=2024` (two files) exposed both.
+#[test]
+fn a_hive_directory_with_one_file_still_exposes_its_partition_columns() {
+    let one = run(&["-csv", "-c", "DESCRIBE t", "t=tests/data/hive/year=2025"]);
+    assert!(one.ok, "{}", one.stderr);
+    let two = run(&["-csv", "-c", "DESCRIBE t", "t=tests/data/hive/year=2024"]);
+    assert!(two.ok, "{}", two.stderr);
+    let cols = |s: &str| -> Vec<String> {
+        s.lines().skip(1).filter_map(|l| l.split(',').next()).map(String::from).collect()
+    };
+    assert_eq!(cols(&one.stdout), cols(&two.stdout), "{}", one.stdout);
+    assert!(cols(&one.stdout).contains(&"year".to_string()), "{}", one.stdout);
+
+    // DuckDB adds the partition columns for a single explicit file path too.
+    let file = run(&[
+        "-csv",
+        "-c",
+        "SELECT count(*) FROM t WHERE year = 2025",
+        "t=tests/data/hive/year=2025/month=01/part.parquet",
+    ]);
+    assert!(file.ok, "{}", file.stderr);
+    assert!(file.stdout.lines().nth(1).is_some_and(|l| l != "0"), "{}", file.stdout);
+}
+
 /// `std::io::Error` carries no path, so the failure used to read
 /// "No such file or directory (os error 2)" with no hint which file it meant.
 #[test]

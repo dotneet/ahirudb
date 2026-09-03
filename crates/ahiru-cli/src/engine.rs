@@ -131,29 +131,33 @@ impl Engine {
         }
         // Detect per file. A directory / glob can mix extensions; applying the
         // first path's format to every part would read CSV as Parquet (or vice versa).
-        if paths.len() == 1 {
-            let kind = FormatKind::detect(&paths[0].to_string_lossy());
-            let bytes = read_file(&paths[0])?;
-            let a = self.s.register_bytes_as(name, bytes.clone(), kind)?;
-            self.sources.insert((a, 0), bytes.clone());
-            self.remember(name);
-            // Also reachable under its own path text (`parquet('...')`).
-            let lit = paths[0].to_string_lossy().into_owned();
+        //
+        // Every registration goes through the multi-part call, even for a single file: that is the
+        // only path that parses `key=value` directories into Hive partition columns. Routing one
+        // file around it used to make `t=data/year=2025` (a directory holding exactly one file)
+        // expose only the file's own columns, while the sibling `year=2024` -- with two files --
+        // exposed `year` and `month`. DuckDB adds the partition columns for a single explicit file
+        // path too.
+        let mut files = Vec::with_capacity(paths.len());
+        for p in &paths {
+            files.push((p.to_string_lossy().into_owned(), read_file(p)?));
+        }
+        let a = self.s.register_multi_bytes(name, files.clone(), FormatKind::Auto)?;
+        for (p, (_, bytes)) in files.iter().enumerate() {
+            self.sources.insert((a, p), bytes.clone());
+        }
+        self.remember(name);
+        if let [(lit, bytes)] = files.as_slice() {
+            // A single file is also reachable under its own path text (`parquet('...')`).
             if lit != name {
-                let b = self.s.register_bytes(&lit, bytes.clone())?;
-                self.sources.insert((b, 0), bytes);
-                self.registered.insert(lit);
+                let b = self.s.register_multi_bytes(
+                    lit,
+                    vec![(lit.clone(), bytes.clone())],
+                    FormatKind::Auto,
+                )?;
+                self.sources.insert((b, 0), bytes.clone());
+                self.registered.insert(lit.clone());
             }
-        } else {
-            let mut files = Vec::with_capacity(paths.len());
-            for p in &paths {
-                files.push((p.to_string_lossy().into_owned(), read_file(p)?));
-            }
-            let a = self.s.register_multi_bytes(name, files.clone(), FormatKind::Auto)?;
-            for (p, (_, bytes)) in files.into_iter().enumerate() {
-                self.sources.insert((a, p), bytes);
-            }
-            self.remember(name);
         }
         // A multi-file table is deliberately *not* also registered under the
         // spec text: that would hold every byte twice, and the only way to
@@ -378,16 +382,47 @@ fn literal_path(part: &str) -> PathBuf {
     }
 }
 
+/// Splits a spec on the `+` that joins several files into one logical table.
+///
+/// A `+` preceded by a backslash is part of the file name, not a separator, so
+/// `a\+b.csv` names the single file `a+b.csv`. And when the parts of a split do
+/// not all exist while the whole spec does, the `+` was never a separator at
+/// all: a file simply called `a+b.csv` still opens with no escaping needed.
+fn split_spec(spec: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let bytes = spec.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b'+' || (i > 0 && bytes[i - 1] == b'\\') {
+            continue;
+        }
+        parts.push(&spec[start..i]);
+        start = i + 1;
+    }
+    parts.push(&spec[start..]);
+    if parts.len() > 1 && !parts.iter().all(|p| p.is_empty() || spec_exists(p)) && spec_exists(spec)
+    {
+        return vec![spec];
+    }
+    parts
+}
+
 /// Expands one file spec into the concrete files that make up the table.
 fn resolve_spec(spec: &str) -> R<Vec<PathBuf>> {
     let mut out = Vec::new();
     // Arguments joined with `+` are bundled into one logical table (see usage).
-    for part in spec.split('+') {
+    for part in split_spec(spec) {
         if part.is_empty() {
             continue;
         }
         if glob::is_pattern(part) {
             let mut m = glob::expand(part);
+            // A pattern's last component can match a directory (`g/*` where `g`
+            // holds a subdirectory). Reading one as a table part fails with
+            // "Is a directory" and used to abort the whole registration; the
+            // shell and DuckDB both leave directories out of a glob's results.
+            // `g/**` still reaches the files inside them, since `**` descends.
+            m.retain(|p| !p.is_dir());
             m.sort();
             if m.is_empty() {
                 return Err(format!("no files matched: {part}").into());

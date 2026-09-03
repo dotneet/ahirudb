@@ -90,7 +90,7 @@ file arguments:
   name=path            registered under `name`
   'dir/'               every supported file below it, as one table
   'data/*.parquet'     glob, as one table (quote it to keep the shell out)
-  a.parquet+b.parquet  several files as one table
+  a.parquet+b.parquet  several files as one table (`\\+` for a literal `+`)
 
 options:
   -c, --command SQL    run SQL (repeatable)
