@@ -997,15 +997,18 @@ impl<'a> Compiler<'a> {
         let (l, r, t) = self.unify_operands(lr, lt, rr, rt)?;
 
         if op.is_comparison() {
-            // Ordering comparison cannot define the relative weight of months, days, and
-            // microseconds (one month could compare as anywhere from 28 to 31 days), so it
-            // stays unsupported and is explicitly an error. Equality is decided correctly by
-            // bit-pattern equality, so it is allowed.
-            // JSON allows equality only for the same reason as INTERVAL (no definable
-            // ordering). Equality is decided by byte equality, so a difference in key order or
-            // whitespace alone can make it unequal (no normalizing comparison as in DuckDB --
-            // a known v1 limitation).
-            if t == Ty::Interval || t == Ty::Json {
+            // JSON has no ordering: comparison is byte equality, so a difference in key order
+            // or whitespace alone can make two equal documents unequal (no normalizing
+            // comparison as in DuckDB -- a known v1 limitation). Ordering those bytes would
+            // read as a value order it is not, so only equality is allowed.
+            //
+            // INTERVAL *does* order: `kernels::compare` routes it to `cmp_interval`, which
+            // flattens months/days/microseconds through `exec::rowkey::interval_key` with
+            // DuckDB's fixed 1 month = 30 days and 1 day = 24 hours. That is the same key
+            // ORDER BY, DISTINCT, GROUP BY and equi-joins already use, so allowing `<`/`<=`/
+            // `>`/`>=` here keeps the operators consistent with the rest of the engine
+            // instead of contradicting it.
+            if t == Ty::Json {
                 ensure!(matches!(op, BinaryOp::Eq | BinaryOp::Ne), TypeMismatch);
             }
             let code = match op {
@@ -1047,14 +1050,15 @@ impl<'a> Compiler<'a> {
         let (hr, ht) = self.expr(high)?;
 
         let (a1, l, t1) = self.unify_operands(ar, at, lr, lt)?;
-        // INTERVAL/JSON have no ordering (`<`/`>` are TypeMismatch); BETWEEN
-        // must not silently fall through to a physical byte compare.
-        ensure!(t1 != Ty::Interval && t1 != Ty::Json, TypeMismatch);
+        // JSON has no ordering (`<`/`>` are TypeMismatch); BETWEEN must not silently fall
+        // through to a physical byte compare. INTERVAL orders through `cmp_interval`, the same
+        // as `<`/`>` above.
+        ensure!(t1 != Ty::Json, TypeMismatch);
         let ge = self.prog.alloc_reg();
         self.prog.push(Instr::new(OpCode::Ge, t1.phys(), ge, a1, l));
 
         let (a2, h, t2) = self.unify_operands(ar, at, hr, ht)?;
-        ensure!(t2 != Ty::Interval && t2 != Ty::Json, TypeMismatch);
+        ensure!(t2 != Ty::Json, TypeMismatch);
         let le = self.prog.alloc_reg();
         self.prog.push(Instr::new(OpCode::Le, t2.phys(), le, a2, h));
 
@@ -1221,14 +1225,16 @@ mod tests {
     }
 
     #[test]
-    fn between_rejects_interval_and_json() {
+    fn between_accepts_interval_and_rejects_json() {
+        // BETWEEN expands to `>= AND <=`, so it follows the operators: INTERVAL orders
+        // (`interval_compares_by_order_not_just_equality`), JSON does not.
         let mut a = ExprArena::new();
         let col = a.push(Expr::ColumnRef { qualifier: None, name: "iv".into() });
         let lo = a.push(Expr::IntervalLiteral(0));
         let hi = a.push(Expr::IntervalLiteral(1));
         let id = a.push(Expr::Between { arg: col, low: lo, high: hi, negated: false });
         let scope = Scope::from_fields(vec![Field::new("iv", Ty::Interval, true)]);
-        assert_eq!(code_of(compile(&a, &scope, &[], id)), Some(crate::error::Code::TypeMismatch));
+        assert_eq!(compile(&a, &scope, &[], id).unwrap().result_ty, Ty::Boolean);
 
         let mut a = ExprArena::new();
         let col = a.push(Expr::ColumnRef { qualifier: None, name: "j".into() });
@@ -1468,16 +1474,21 @@ mod tests {
     }
 
     #[test]
-    fn interval_ordering_comparison_is_rejected_but_equality_is_not() {
+    fn interval_compares_by_order_not_just_equality() {
+        // `kernels::compare` routes INTERVAL to `cmp_interval`, which flattens
+        // months/days/microseconds through `exec::rowkey::interval_key` for *every* mask, so
+        // ordering is as well-defined here as equality and as ORDER BY on an interval column.
+        // Ordering used to be rejected even though that kernel already existed.
         let mut a = ExprArena::new();
         let i1 = interval_lit(&mut a, 1, 0, 0);
         let i2 = interval_lit(&mut a, 0, 30, 0);
-        let lt = a.push(Expr::Binary { op: BinaryOp::Lt, lhs: i1, rhs: i2 });
-        assert_eq!(code_of(compile(&a, &cols(), &[], lt)), Some(Code::TypeMismatch));
-
-        let eq = a.push(Expr::Binary { op: BinaryOp::Eq, lhs: i1, rhs: i2 });
-        let p = compile(&a, &cols(), &[], eq).unwrap();
-        assert_eq!(p.result_ty, Ty::Boolean);
+        for op in
+            [BinaryOp::Lt, BinaryOp::Le, BinaryOp::Gt, BinaryOp::Ge, BinaryOp::Eq, BinaryOp::Ne]
+        {
+            let e = a.push(Expr::Binary { op, lhs: i1, rhs: i2 });
+            let p = compile(&a, &cols(), &[], e).unwrap();
+            assert_eq!(p.result_ty, Ty::Boolean, "{op:?} should compile to a BOOLEAN");
+        }
     }
 
     #[test]

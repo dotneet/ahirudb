@@ -86,7 +86,7 @@ SELECT id, nth_value(score, 2) OVER (ORDER BY id) FROM t LIMIT 3;
 | `percent_rank()` | No arguments; `(rank - 1) / (rows - 1)`, so it spans 0..1. A single-row partition is `0` |
 | `cume_dist()` | No arguments; the fraction of the partition at or before this row's peer group |
 | `ntile(n)` | Splits the partition into `n` buckets, the first `rows % n` of them one row larger. `n < 1` gives `NULL` (DuckDB errors) |
-| `lag(x[, offset[, default]])` | Up to 3 arguments; `offset` defaults to 1, `default` defaults to `NULL` |
+| `lag(x[, offset[, default]])` | Up to 3 arguments; `offset` defaults to 1, `default` defaults to `NULL` and is cast to `x`'s type |
 | `lead(x[, offset[, default]])` | Same shape as `lag`, looking forward instead of back |
 | `first_value(x)` | First value in the current window frame |
 | `last_value(x)` | Last value in the current window frame |

@@ -546,7 +546,21 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let mut i = start;
         while i < b.len() && is_ident_cont(b[i]) {
-            i += 1;
+            if b[i] < 0x80 {
+                i += 1;
+                continue;
+            }
+            // A non-ASCII character belongs to the identifier unless it is whitespace.
+            // `is_ident_cont` accepts every byte >= 0x80 so that a multi-byte character stays
+            // within one identifier, but `skip_trivia` treats *every* Unicode space as trivia.
+            // Without this check the two disagree, and an ideographic space (U+3000, common in
+            // SQL pasted from Japanese text) or a non-breaking space gets swallowed along with
+            // the word after it: `SELECT id\u{3000}FROM t` lexes as one identifier.
+            let c = match self.src[i..].chars().next() {
+                Some(c) if !c.is_whitespace() => c,
+                _ => break,
+            };
+            i += c.len_utf8();
         }
         self.pos = i;
         let text = &self.src[start..i];

@@ -124,15 +124,49 @@ fn cast_string_fraction_rounds_like_numeric_cast() {
 }
 
 #[test]
-fn between_on_interval_or_json_is_type_mismatch() {
+fn between_on_json_is_type_mismatch() {
+    // JSON compares by raw bytes, so an ordering comparison would read as a value order it is
+    // not. INTERVAL is the opposite case and is covered by `interval_ordering_comparisons`.
     let mut db = session_with_dual();
-    assert_eq!(
-        code_of(db.prepare("SELECT 1 FROM dual WHERE INTERVAL '1' DAY BETWEEN INTERVAL '0' DAY AND INTERVAL '2' DAY", &[])),
-        Some(Code::TypeMismatch)
-    );
     assert_eq!(
         code_of(db.prepare("SELECT 1 FROM dual WHERE CAST('[1]' AS JSON) BETWEEN CAST('[0]' AS JSON) AND CAST('[2]' AS JSON)", &[])),
         Some(Code::TypeMismatch)
+    );
+    assert_eq!(
+        code_of(
+            db.prepare("SELECT 1 FROM dual WHERE CAST('[1]' AS JSON) < CAST('[2]' AS JSON)", &[])
+        ),
+        Some(Code::TypeMismatch)
+    );
+}
+
+#[test]
+fn interval_ordering_comparisons() {
+    // `<`/`<=`/`>`/`>=`/BETWEEN flatten months/days/microseconds the same way `=`, ORDER BY,
+    // GROUP BY and equi-joins do (1 month = 30 days, 1 day = 24 hours), so they agree with the
+    // rest of the engine. Every expected value below is DuckDB's:
+    //   duckdb -c "SELECT INTERVAL '1 month' > INTERVAL '29 days', INTERVAL '1 month' >
+    //   INTERVAL '31 days', INTERVAL '23 hours' < INTERVAL '1 day', INTERVAL '90 minutes'
+    //   BETWEEN INTERVAL '1 hour' AND INTERVAL '2 hours'"  ->  true, false, true, true
+    let mut db = session_with_dual();
+    let rows = run(
+        &mut db,
+        "SELECT INTERVAL '1' MONTH > INTERVAL '29' DAY, \
+                INTERVAL '1' MONTH > INTERVAL '31' DAY, \
+                INTERVAL '23' HOUR < INTERVAL '1' DAY, \
+                INTERVAL '1' DAY >= INTERVAL '24' HOUR, \
+                INTERVAL '90' MINUTE BETWEEN INTERVAL '1' HOUR AND INTERVAL '2' HOUR \
+         FROM dual",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]]
     );
 }
 
@@ -203,13 +237,22 @@ fn bit_not_round_trips() {
 
 #[test]
 fn shift_by_an_out_of_range_amount_is_null_not_an_error() {
-    // duckdb errors here ("Left-shift value 64 is out of range"); this
+    // duckdb errors on the *left* shift ("Left-shift value 64 is out of range"); this
     // engine instead returns NULL, consistent with its existing convention
     // for other undefined integer arithmetic (division by zero, etc. --
     // see docs/sql/types.md's rounding-conventions section).
     let mut db = session_with_dual();
-    let rows = run(&mut db, "SELECT 1 << 64, 1 << -1, 1 >> 64 FROM dual");
-    assert_eq!(rows, vec![vec![Value::Null, Value::Null, Value::Null]]);
+    let rows = run(&mut db, "SELECT 1 << 64, 1 << -1 FROM dual");
+    assert_eq!(rows, vec![vec![Value::Null, Value::Null]]);
+
+    // The *right* shift is not an error in duckdb, though: it saturates to 0
+    // (`select 8 >> 64, 8 >> -1` -> `0, 0`). There was no reason to diverge there,
+    // and NULL claimed the operation was undefined when duckdb defines it.
+    let rows = run(&mut db, "SELECT 8 >> 64, 8 >> -1, -8 >> 64, 8 >> 3, -8 >> 1 FROM dual");
+    assert_eq!(
+        rows,
+        vec![vec![Value::I64(0), Value::I64(0), Value::I64(0), Value::I64(1), Value::I64(-4)]]
+    );
 }
 
 #[test]

@@ -33,6 +33,12 @@
 //! **union** of the per-row keys (in order of first appearance), and a key absent from a row is
 //! NULL for that row alone. Unlike CSV, columns can be missing per row -- that is this format's essence.
 //!
+//! The schema is fixed before any split is read (the file is consumed split by split, so the
+//! complete key set is not knowable up front), which means a key that first appears past the
+//! sample has no column to go into. That is an error (`ColumnNotFound`, positioned at the line
+//! carrying it), not a silent drop -- see `read_split`. `format::json` has the whole document
+//! resident and so has no such limit: there, every element contributes its keys.
+//!
 //! ## The input is untrusted
 //!
 //! Broken JSON gives `Err` or a NULL cell. It never panics, reads out of range, or recurses
@@ -331,8 +337,13 @@ impl TableFormat for JsonlFormat {
                 let end = skip_value(line, start)?;
                 ensure!(skip_ws(line, end) == line.len(), SyntaxError, end);
                 let body = &line[start..end];
+                // A bare `null` line is SQL NULL, not the four-character text "null".
+                // `format::json`'s reader already gives NULL for a `null` element, and so
+                // does DuckDB; pushing the raw span for every kind made this the one place
+                // JSON's own NULL could not be spelled.
+                let is_null = kind_of(byte_at(line, start)?) == Kind::Null;
                 for b in builders.iter_mut() {
-                    b.push(Some(Cell::Bytes(body)));
+                    b.push(if is_null { None } else { Some(Cell::Bytes(body)) });
                 }
                 continue;
             }
@@ -347,6 +358,16 @@ impl TableFormat for JsonlFormat {
                 // decoded (Members merely skips their value spans).
                 if let Some(j) = names.iter().position(|n| *n == name) {
                     slots[j] = Some(m);
+                } else if !self.schema.iter().any(|f| f.name.as_bytes() == name) {
+                    // A key the schema has never heard of. The schema comes from a bounded
+                    // leading sample (`SAMPLE_BYTES` / `SAMPLE_LINES`) and, unlike `format::json`,
+                    // is fixed before any split is read -- the file is consumed split by split, so
+                    // a complete key set is not available up front. Skipping the key would drop a
+                    // whole column the file plainly contains, which is the "silently wrong answer"
+                    // `docs/DESIGN.md` §15 rules out (and it is exactly what a later *value* of an
+                    // unexpected type is already refused for, above). `pos` is the offset of the
+                    // line carrying the key, so the offending record can be found.
+                    err!(ColumnNotFound, abs as usize);
                 }
             }
             for (j, b) in builders.iter_mut().enumerate() {
@@ -1099,6 +1120,42 @@ mod tests {
         assert_eq!(cols[0][SAMPLE_LINES + 2], Value::I64(2));
     }
 
+    // A key that first appears past the inference sample has no column to go into. It
+    // used to be skipped without a word, so a whole column of data the file plainly
+    // contains simply vanished: `SELECT *` showed only the sampled columns and no error
+    // was raised anywhere. The schema is fixed before the splits are read, so it cannot
+    // be repaired here -- but it must be loud (`ColumnNotFound`, positioned at the
+    // offending line) rather than silent.
+    #[test]
+    fn a_key_first_seen_past_the_sample_is_an_error_not_a_silent_drop() {
+        let mut text = String::new();
+        for _ in 0..SAMPLE_LINES {
+            text.push_str("{\"a\":1}\n");
+        }
+        let tail_at = text.len();
+        text.push_str("{\"a\":1,\"b\":2}\n");
+        let (f, src) = resolve(text.as_bytes());
+        assert_eq!(f.schema().len(), 1, "only `a` was sampled");
+        let e = match f.read_split(&src, 0, &[0]) {
+            Ok(_) => panic!("the late key `b` was silently dropped"),
+            Err(e) => e,
+        };
+        assert_eq!(e.code, Code::ColumnNotFound);
+        assert_eq!(e.pos as usize, tail_at, "the position should locate the offending line");
+    }
+
+    // The check must not fire for a key that *is* in the schema but is simply not part
+    // of this query's projection -- `read_split` only remembers the projected columns'
+    // positions, so an unprojected key looks identical there without the schema lookup.
+    #[test]
+    fn an_unprojected_but_known_key_is_not_reported_as_unknown() {
+        let text = "{\"a\":1,\"b\":2}\n{\"a\":3,\"b\":4}\n";
+        let (f, src) = resolve(text.as_bytes());
+        assert_eq!(f.schema().len(), 2);
+        let cols = f.read_split(&src, 0, &[1]).unwrap();
+        assert_eq!(cols[0].len(), 2);
+    }
+
     // --- Strings ------------------------------------------------------------
 
     #[test]
@@ -1306,6 +1363,13 @@ mod tests {
         // The raw text is still validated as one complete JSON value per line.
         assert_eq!(read_err("[1,2\n"), Some(Code::UnexpectedEof));
         assert_eq!(read_err("1 2\n"), Some(Code::SyntaxError));
+
+        // A bare `null` line is SQL NULL, not the four-character text "null". Pushing the
+        // raw span for every kind made this the only place JSON's own NULL could not be
+        // spelled: `SELECT json IS NULL` came back false. `format::json` and duckdb both
+        // give NULL here.
+        let cols = read_all("1\nnull\n\"s\"\n");
+        assert_eq!(cols[0], [s("1"), Value::Null, s("\"s\"")]);
     }
 
     #[test]

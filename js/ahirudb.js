@@ -1220,10 +1220,38 @@ export function decodeBatch(u8, schema, copy = true) {
 
 /** One batch (columnar). What `stream()` hands over. */
 export class Batch {
+  /** Lazily built row-object keys; see `#rowKeys`. */
+  #keys;
+
   constructor(numRows, columns) {
     this.numRows = numRows;
     this.columns = columns;
     this.schema = columns.map((c) => ({ name: c.name, type: c.type }));
+  }
+
+  /**
+   * The property name each column gets in a row object, made unique.
+   *
+   * Two output columns can legitimately share a name -- `SELECT id, id, name AS id
+   * FROM t` gives three columns all called `id`. Assigning each to `o[c.name]` let
+   * the last one win, so `query()` and `toRows()` returned a single `id` holding the
+   * final column's value and silently dropped the other two. Duplicates now get
+   * `_1`, `_2`, ... appended, the way DuckDB's own clients disambiguate them.
+   * `columns` is fixed for the life of a batch, so this is computed once.
+   */
+  #rowKeys() {
+    if (this.#keys === undefined) {
+      const seen = new Set();
+      this.#keys = this.columns.map((c) => {
+        let k = c.name;
+        // A generated name can itself collide (a real column literally called
+        // `id_1`), so keep counting until the name is free.
+        for (let n = 1; seen.has(k); n++) k = `${c.name}_${n}`;
+        seen.add(k);
+        return k;
+      });
+    }
+    return this.#keys;
   }
 
   #index(k) {
@@ -1264,13 +1292,18 @@ export class Batch {
     return c.physType === PHYS_BOOL ? c.values[i] === 1 : c.values[i];
   }
 
-  /** Turns the batch into an array of plain objects. */
+  /**
+   * Turns the batch into an array of plain objects. Columns that share a name are
+   * given distinct keys (`id`, `id_1`, `id_2`); see `#rowKeys`.
+   */
   toRows() {
+    const keys = this.#rowKeys();
     const rows = new Array(this.numRows);
     for (let r = 0; r < this.numRows; r++) {
       const o = {};
-      for (const c of this.columns) {
-        o[c.name] =
+      for (let j = 0; j < this.columns.length; j++) {
+        const c = this.columns[j];
+        o[keys[j]] =
           c.valid !== null && c.valid[r] === 0
             ? null
             : c.physType === PHYS_BOOL
@@ -1918,10 +1951,14 @@ export class AhiruDB {
     const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.part, j.offset, j.len, sql)));
     this.#assertOpen();
 
-    let provided = 0;
+    // How many of the requested ranges were handed over *in full*. Counting bytes alone
+    // cannot tell progress from a livelock: a partially satisfied range provides a
+    // non-zero count while `Source::insert` keeps only that prefix, so the engine asks
+    // for the identical range on the next round, forever.
+    let satisfied = 0;
     for (let i = 0; i < jobs.length; i++) {
-      const { rec, table, part, offset } = jobs[i];
-      provided += this.#provide(table, part, offset, buffers[i], sql);
+      const { rec, table, part, offset, len } = jobs[i];
+      if (this.#provide(table, part, offset, buffers[i], sql) === len) satisfied++;
       // Only remote sources keep a retained copy. When codec delegation asks for a
       // compressed block, slicing it out of here avoids a refetch (memory sources just slice).
       if (rec.source.cacheable !== false) {
@@ -1948,8 +1985,10 @@ export class AhiruDB {
     }
     this.#checkMemory(sql);
 
-    // Livelock detection: the same request repeats and not one byte has been added.
-    if (provided === 0 && signature === lastSignature) {
+    // Livelock detection, keyed on the request signature: the engine asked for exactly
+    // the same set of ranges as last round and not one of them was satisfied in full,
+    // so another round would ask the same thing again.
+    if (satisfied === 0 && signature === lastSignature) {
       throw new AhiruError(Code.IO_FAILED, {
         sql,
         detail: `no progress for ranges [${signature}]`,
@@ -1964,7 +2003,15 @@ export class AhiruDB {
     const cacheable = rec.source.cacheable !== false;
     if (cacheable) {
       const hit = this.#cache.get(key);
-      if (hit !== undefined) return hit;
+      // A hit is only usable if it is a Uint8Array of exactly the requested length.
+      // A cache wrapper (the Cache API, a shared store, a persisted entry from an
+      // older build) can hand back a truncated or otherwise wrong-length body; that
+      // body would go straight to `ahiru_provide`, where `Source::insert` keeps it as
+      // the prefix of the range, the engine would ask for the very same range again,
+      // and `query()` would spin forever on a pure microtask loop that never yields
+      // to the event loop. Anything else is treated as a miss, so the source is asked
+      // directly; a genuinely short `ByteSource.read()` still throws IO_FAILED below.
+      if (hit instanceof Uint8Array && hit.byteLength === len) return hit;
     }
     const bytes = await rec.source.read(offset, len);
     let u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -2076,6 +2123,11 @@ export class AhiruDB {
     for (const [key, rec] of this.#tables) {
       if (rec.index >= 0 || !mentioned.has(key)) continue;
       rec.size = await rec.source.size();
+      // `size()` is a user callback and may take arbitrarily long; close() can land
+      // while it is in flight. Without this check the loop went on calling into a
+      // freed session and surfaced a bare INTERNAL error instead of saying the
+      // database was closed, as every other close race does.
+      this.#assertOpen();
       const e = this.#exports;
       const name = textEncoder.encode(rec.name);
       const ptr = e.ahiru_alloc(name.length) >>> 0;

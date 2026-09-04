@@ -91,9 +91,21 @@ pub struct ColumnMetaData {
 impl ColumnMetaData {
     /// The byte range `[start, end)` this column chunk occupies in the file.
     /// If a dictionary page exists, the range starts there.
+    ///
+    /// `data_page_offset` cannot be assumed to be greater than
+    /// `dictionary_page_offset`: parquet-mr (Spark/Hive) records the chunk start as
+    /// `data_page_offset` before writing the dictionary page, so the two are equal
+    /// there, and pyarrow writes `data_page_offset = 0` for a 0-row row group. In
+    /// both cases the chunk still begins at the dictionary page.
     pub fn byte_range(&self) -> (u64, u64) {
         let start = match self.dictionary_page_offset {
-            Some(d) if d > 0 && d < self.data_page_offset => d.max(0),
+            Some(d) if d > 0 => {
+                if self.data_page_offset > 0 {
+                    d.min(self.data_page_offset)
+                } else {
+                    d
+                }
+            }
             _ => self.data_page_offset.max(0),
         };
         let len = self.total_compressed_size.max(0);
@@ -101,16 +113,26 @@ impl ColumnMetaData {
         (start as u64, end)
     }
 
-    /// The byte range `[dictionary_page_offset, data_page_offset)` of the dictionary
-    /// page, if any. Fetched separately from the data page when page selection needs
-    /// to read a dictionary-encoded column.
-    pub fn dictionary_page_range(&self) -> Option<(u64, u64)> {
-        match self.dictionary_page_offset {
-            Some(d) if d > 0 && d < self.data_page_offset => {
-                Some((d as u64, (self.data_page_offset.max(0)) as u64))
-            }
-            _ => None,
+    /// Whether this chunk carries a dictionary page. Such a chunk must never have its
+    /// data pages decoded without the dictionary page alongside them.
+    pub fn has_dictionary(&self) -> bool {
+        self.dictionary_page_offset.is_some() || self.encodings.iter().any(|e| e.is_dictionary())
+    }
+
+    /// The byte range `[dictionary_page_offset, first_page_offset)` of the dictionary
+    /// page, where `first_page_offset` is the file offset of the chunk's first data
+    /// page as recorded in the OffsetIndex. Fetched separately from the data pages when
+    /// page selection needs to read a dictionary-encoded column.
+    ///
+    /// `data_page_offset` cannot stand in for the first data page's offset (see
+    /// `byte_range`). `None` means the range could not be determined; the caller must
+    /// then fall back to reading the whole column chunk.
+    pub fn dictionary_page_range(&self, first_page_offset: i64) -> Option<(u64, u64)> {
+        let d = self.dictionary_page_offset.filter(|&d| d > 0)?;
+        if first_page_offset <= d {
+            return None;
         }
+        Some((d as u64, first_page_offset as u64))
     }
 
     /// The speculative fetch range for the Bloom filter. If `bloom_filter_length`
@@ -875,6 +897,62 @@ fn decode_dict_page_header(t: &mut Thrift) -> Result<DictionaryPageHeader> {
 mod tests {
     use super::*;
     use crate::error::code_of;
+
+    fn chunk_meta(data_page_offset: i64, dictionary_page_offset: Option<i64>) -> ColumnMetaData {
+        ColumnMetaData {
+            ptype: PType::Int32,
+            encodings: Vec::new(),
+            path_in_schema: Vec::new(),
+            codec: Compression::Uncompressed,
+            num_values: 0,
+            total_uncompressed_size: 100,
+            total_compressed_size: 100,
+            data_page_offset,
+            index_page_offset: None,
+            dictionary_page_offset,
+            statistics: None,
+            bloom_filter_offset: None,
+            bloom_filter_length: None,
+        }
+    }
+
+    #[test]
+    fn byte_range_starts_at_the_dictionary_page_in_every_writer_layout() {
+        // The usual layout: the dictionary page precedes the data pages.
+        assert_eq!(chunk_meta(500, Some(400)).byte_range(), (400, 500));
+        // parquet-mr (Spark/Hive) records the chunk start -- i.e. the dictionary page --
+        // as `data_page_offset`, so the two are equal.
+        assert_eq!(chunk_meta(400, Some(400)).byte_range(), (400, 500));
+        // pyarrow writes `data_page_offset = 0` for a 0-row RowGroup. Starting there
+        // would hand the reader the file's `PAR1` magic instead of the column chunk.
+        assert_eq!(chunk_meta(0, Some(400)).byte_range(), (400, 500));
+        // No dictionary page at all.
+        assert_eq!(chunk_meta(400, None).byte_range(), (400, 500));
+        // A negative offset never turns into a huge unsigned range.
+        assert_eq!(chunk_meta(-1, None).byte_range(), (0, 100));
+    }
+
+    #[test]
+    fn dictionary_page_range_comes_from_the_first_data_page() {
+        // `first_page_offset` is the OffsetIndex's first entry, which is where the data
+        // pages really begin -- `data_page_offset` is not usable for this (see above).
+        assert_eq!(chunk_meta(400, Some(400)).dictionary_page_range(500), Some((400, 500)));
+        assert_eq!(chunk_meta(500, Some(400)).dictionary_page_range(500), Some((400, 500)));
+        // Undeterminable cases must say so, so the caller falls back to the whole chunk
+        // rather than decoding dictionary-encoded pages with no dictionary.
+        assert_eq!(chunk_meta(400, None).dictionary_page_range(500), None);
+        assert_eq!(chunk_meta(400, Some(400)).dictionary_page_range(400), None);
+        assert_eq!(chunk_meta(400, Some(400)).dictionary_page_range(0), None);
+    }
+
+    #[test]
+    fn has_dictionary_also_believes_the_encoding_list() {
+        assert!(chunk_meta(400, Some(400)).has_dictionary());
+        assert!(!chunk_meta(400, None).has_dictionary());
+        let mut m = chunk_meta(400, None);
+        m.encodings.push(Encoding::RleDictionary);
+        assert!(m.has_dictionary());
+    }
 
     // --- A handwritten Thrift Compact encoder (test-only) ----------------------
     // Assembles byte streams independently of the production decoder and round-trips

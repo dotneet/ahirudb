@@ -42,18 +42,27 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
         }
         F_BIT_AND => Some(a.int(0) & a.int(1)),
         F_BIT_OR => Some(a.int(0) | a.int(1)),
-        // A negative shift amount, or one at or above the word width (64), is undefined. It gives
-        // NULL (the same "undefined operations are NULL" policy as division by zero).
+        // A negative left-shift amount, or one at or above the word width (64), is undefined.
+        // It gives NULL (the same "undefined operations are NULL" policy as division by zero);
+        // DuckDB raises an error there instead, and this engine prefers NULL to failing a whole
+        // scan (docs/sql/functions-numeric.md).
         F_BIT_SHL => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shl(n)),
-        F_BIT_SHR => u32::try_from(a.int(1)).ok().and_then(|n| a.int(0).checked_shr(n)),
+        // The right shift is *not* an error in DuckDB: shifting by 64 or more, or by a negative
+        // amount, simply yields 0 (`select 8 >> 64` -> `0`, `select 8 >> -1` -> `0`), so there
+        // is no reason to diverge here.
+        F_BIT_SHR => Some(match u32::try_from(a.int(1)) {
+            Ok(k) if k < 64 => a.int(0) >> k,
+            _ => 0,
+        }),
         F_BIT_NOT => Some(!a.int(0)),
         // The **code point** of the first character, not its first byte, so `chr(ascii(s))`
-        // round-trips (DuckDB's `ascii`/`unicode` behave the same). An empty string gives 0,
-        // matching `select ascii('')` in duckdb; invalid UTF-8 still gives NULL.
-        F_ASCII => {
+        // round-trips (DuckDB's `ascii`/`unicode` behave the same). The empty string is the one
+        // place the two names part company: `ascii('')` is 0 and `unicode('')`/`ord('')` is -1,
+        // as in DuckDB. Invalid UTF-8 still gives NULL.
+        F_ASCII | F_UNICODE => {
             let s = a.bytes(0);
             if s.is_empty() {
-                Some(0)
+                Some(if id == F_ASCII { 0 } else { -1 })
             } else {
                 core::str::from_utf8(s).ok().and_then(|t| t.chars().next()).map(|c| c as i64)
             }
@@ -85,12 +94,20 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
         // (`make_date(2024, 13, 1)` is an error in DuckDB; NULL is this engine's convention
         // for an undefined argument, the same as `sqrt(-1)`).
         F_MAKE_DATE => make_date(a.int(0), a.int(1), a.int(2)),
+        // DuckDB accepts a time of day anywhere in `[00:00:00, 24:00:00]` with minutes below 60
+        // and seconds at or below 60, and normalizes what that adds up to -- `24:00:00` is the
+        // next day's midnight and `07:08:60` is `07:09:00`. Anything past 24:00:00, and any
+        // negative or over-60 component, stays NULL (DuckDB errors there).
         F_MAKE_TIMESTAMP => {
             let (h, mi, s) = (a.int(3), a.int(4), a.int(5));
-            if !(0..24).contains(&h) || !(0..60).contains(&mi) || !(0..60).contains(&s) {
+            let tod = h * US_PER_HOUR + mi * US_PER_MIN + s * US_PER_SEC;
+            if !(0..=24).contains(&h)
+                || !(0..60).contains(&mi)
+                || !(0..=60).contains(&s)
+                || tod > US_PER_DAY
+            {
                 None
             } else {
-                let tod = h * US_PER_HOUR + mi * US_PER_MIN + s * US_PER_SEC;
                 make_date(a.int(0), a.int(1), a.int(2))
                     .and_then(|d| d.checked_mul(US_PER_DAY))
                     .and_then(|us| us.checked_add(tod))
@@ -387,7 +404,15 @@ pub(crate) fn f_abs(x: f64) -> f64 {
 /// An implementation shared with `expr::kernels`.
 pub(crate) fn f_trunc(x: f64) -> f64 {
     if f_abs(x) < 9_223_372_036_854_775_808.0 {
-        (x as i64) as f64
+        let t = (x as i64) as f64;
+        // The trip through `i64` loses the sign of zero, so `trunc(-0.3)` came back as `+0.0`
+        // and `floor`/`ceil`/`round`, which are all built on this, printed `0` where DuckDB
+        // prints `-0.0`. Restoring the sign bit is enough (there is no `copysign` in `core`).
+        if t == 0.0 {
+            f64::from_bits(x.to_bits() & (1u64 << 63))
+        } else {
+            t
+        }
     } else {
         // An f64 at or above 2^63 is already an integer.
         x
@@ -541,6 +566,13 @@ pub(super) fn f_cbrt(x: f64) -> f64 {
 /// The previous straight Horner form was one ulp off for about a quarter of all inputs
 /// (`ln(10)` among them); this form is one ulp off for about 0.1% and never more than that.
 pub(super) fn f_ln(x: f64) -> f64 {
+    // The exponent decoding below reads `0x7ff` for an infinity or a NaN and would answer
+    // `1024 * ln 2` -- a plausible-looking finite number -- for both. `ln(inf)` is `inf`
+    // and `ln(NaN)` is NaN, as in DuckDB. (Negative input, `-inf` included, never reaches
+    // here: the callers turn `x <= 0` into NULL first.)
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
     let mut bits = x.to_bits();
     let mut k = 0i32;
     // Subnormals are scaled by 2^64 before being handled.
@@ -666,10 +698,17 @@ pub(super) fn f_pow(x: f64, y: f64) -> f64 {
     // is `+inf`. Before this, both came out NaN.
     let negate = if x < 0.0 {
         if !int_exp {
-            // A negative base with a non-integer exponent has no real solution.
-            return f64::NAN;
+            // A negative *finite* base with a non-integer exponent has no real solution.
+            // `-inf` is the exception: IEEE 754 gives `pow(-inf, y)` the same value as
+            // `pow(+inf, y)` whenever `y` is not an odd integer, and DuckDB agrees
+            // (`pow(-inf, 0.5)` -> `inf`, `pow(-inf, -0.5)` -> `0`).
+            if x != f64::NEG_INFINITY {
+                return f64::NAN;
+            }
+            false
+        } else {
+            f_abs(y % 2.0) == 1.0
         }
-        f_abs(y % 2.0) == 1.0
     } else {
         false
     };

@@ -563,14 +563,37 @@ pub fn referenced_in_query(
     out: &mut Vec<usize>,
     depth: u32,
 ) -> Result<()> {
-    ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    ensure!(depth < MAX_REF_DEPTH, ExpressionTooDeep);
     for c in &q.ctes {
         referenced_in_query(catalog, arena, &c.query, out, depth + 1)?;
     }
     for o in &q.order_by {
         referenced_in_expr(catalog, arena, o.expr, out, depth + 1)?;
     }
-    referenced_in_set_expr(catalog, arena, &q.body, out, depth + 1)
+    // The body is the same query level, so it does not consume depth of its
+    // own; only descending into a nested query/FROM item/expression does.
+    referenced_in_set_expr(catalog, arena, &q.body, out, depth)
+}
+
+/// Runs the FROM-item walk, ignoring only "no such table".
+///
+/// A CTE name is not in the catalog, so the walk cannot tell a CTE reference
+/// from a typo: both come back as `TableNotFound`, and binding reports the real
+/// error later. Every *other* error must reach the caller — swallowing an
+/// `ExpressionTooDeep` here would leave a file table unresolved and turn
+/// `push_table_rel`'s `ensure!(t.is_resolved(), Internal)` into a bare
+/// "internal error" for a query the binder itself accepts.
+fn referenced_tables_opt(
+    catalog: &Catalog,
+    arena: &ExprArena,
+    from: &FromItem,
+    out: &mut Vec<usize>,
+    depth: u32,
+) -> Result<()> {
+    match referenced_tables_at(catalog, arena, from, out, depth) {
+        Err(e) if e.code == crate::error::Code::TableNotFound => Ok(()),
+        r => r,
+    }
 }
 
 fn referenced_in_set_expr(
@@ -580,13 +603,13 @@ fn referenced_in_set_expr(
     out: &mut Vec<usize>,
     depth: u32,
 ) -> Result<()> {
-    ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    ensure!(depth < MAX_REF_DEPTH, ExpressionTooDeep);
     let d = depth + 1;
     match e {
         SetExpr::Select(s) => {
             if let Some(f) = &s.from {
                 // CTE names are not in the catalog, so not finding one is left to the later binding.
-                let _ = referenced_tables_at(catalog, arena, f, out, d);
+                referenced_tables_opt(catalog, arena, f, out, d)?;
             }
             // Every expression position of the SELECT can host a subquery.
             for item in &s.items {
@@ -641,7 +664,7 @@ fn referenced_in_expr(
     out: &mut Vec<usize>,
     depth: u32,
 ) -> Result<()> {
-    ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    ensure!(depth < MAX_REF_DEPTH, ExpressionTooDeep);
     let d = depth + 1;
     match arena.get(id) {
         Expr::ScalarSubquery(q) => referenced_in_query(catalog, arena, q, out, d),
@@ -678,7 +701,7 @@ fn referenced_tables_at(
     out: &mut Vec<usize>,
     depth: u32,
 ) -> Result<()> {
-    ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    ensure!(depth < MAX_REF_DEPTH, ExpressionTooDeep);
     let mut push = |i: usize| {
         if !out.contains(&i) {
             out.push(i);
@@ -712,8 +735,12 @@ fn referenced_tables_at(
             None => err!(TableNotFound),
         },
         FromItem::Join { left, right, on, .. } => {
-            referenced_tables_at(catalog, arena, left, out, depth + 1)?;
-            referenced_tables_at(catalog, arena, right, out, depth + 1)?;
+            // Each side is walked independently: one side naming a CTE (not in
+            // the catalog, so `TableNotFound`) must not stop the other side's
+            // file tables from being collected, or they never get their schema
+            // resolved and `push_table_rel` fails with `Internal`.
+            referenced_tables_opt(catalog, arena, left, out, depth + 1)?;
+            referenced_tables_opt(catalog, arena, right, out, depth + 1)?;
             // `ON` can hold a subquery too (`JOIN u ON u.c = (SELECT ...)`).
             match on {
                 Some(e) => referenced_in_expr(catalog, arena, *e, out, depth + 1),
@@ -739,7 +766,7 @@ fn referenced_tables_at(
 /// on those tables and binding fails with `Internal`.
 #[cfg(feature = "ddl")]
 fn referenced_in_view(catalog: &Catalog, i: usize, out: &mut Vec<usize>, depth: u32) -> Result<()> {
-    ensure!(depth < MAX_FROM_DEPTH, ExpressionTooDeep);
+    ensure!(depth < MAX_REF_DEPTH, ExpressionTooDeep);
     let parsed = crate::sql::parse(match catalog.view_get(i) {
         Some(s) => s,
         None => err!(TableNotFound),

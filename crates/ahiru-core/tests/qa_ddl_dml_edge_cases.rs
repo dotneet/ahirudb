@@ -84,33 +84,32 @@ fn create_or_replace_table_as_select_replaces_schema_and_data() {
 // --- INSERT: type mismatches --------------------------------------------
 
 #[test]
-fn insert_values_with_a_value_that_cannot_cast_to_the_column_type_becomes_null() {
-    // Not a hard error: `expr::kernels`'s doc on `cast`/`try_cast` says a
-    // per-row conversion failure (out of range / unparsable) always becomes
-    // NULL, for ordinary CAST just as much as TRY_CAST, everywhere in the
-    // engine — including the implicit CAST `dml::insert`'s `eval_scalar`
-    // applies to each VALUES expression. This differs from `duckdb`, which
-    // raises a hard Conversion Error for the same input (verified with the
-    // `duckdb` CLI): a deliberate, engine-wide behavior difference, not a
-    // DML-specific bug. The column stays nullable here, so nothing rejects
-    // the resulting NULL.
+fn insert_values_with_a_value_that_cannot_cast_to_the_column_type_is_rejected() {
+    // `expr::kernels`'s `cast` turns a per-row conversion failure (out of
+    // range / unparsable) into NULL. That rule is right for SELECT, where the
+    // NULL is only displayed, and wrong for DML, where it would be *stored*:
+    // the statement reported success while the row silently lost its value.
+    // `dml`'s coercion is therefore strict — a non-NULL value that casts to
+    // NULL fails the statement with ValueOutOfRange, matching `duckdb`'s
+    // Conversion Error (verified with the `duckdb` CLI). The column being
+    // nullable makes no difference; nothing is inserted.
     let mut sess = Session::new();
     sess.prepare("CREATE TABLE t (id INTEGER)", &[]).unwrap();
-    sess.prepare("INSERT INTO t VALUES ('not_a_number')", &[]).unwrap();
-    assert_eq!(run(&mut sess, "SELECT id FROM t"), vec![vec![Value::Null]]);
+    let r = sess.prepare("INSERT INTO t VALUES ('not_a_number')", &[]);
+    assert_eq!(code_of(r), Some(Code::ValueOutOfRange));
+    assert_eq!(run(&mut sess, "SELECT id FROM t"), Vec::<Vec<Value>>::new());
 }
 
 #[test]
 fn insert_values_with_an_unconvertable_value_into_a_not_null_column_is_rejected() {
-    // Same CAST-failure-becomes-NULL rule as above, but the column is NOT
-    // NULL, so the resulting NULL must still be caught by `dml::insert`'s
-    // `check_not_null` — the cast leniency and the NOT NULL check are two
-    // independent layers, and both need to be exercised together to confirm
-    // neither one silently swallows the other's job.
+    // Same input as above against a NOT NULL column. The failed conversion is
+    // caught first, so this reports ValueOutOfRange rather than the misleading
+    // TypeMismatch a NOT NULL violation would give — the value was never a
+    // NULL the user asked to store.
     let mut sess = Session::new();
     sess.prepare("CREATE TABLE t (id INTEGER NOT NULL)", &[]).unwrap();
     let r = sess.prepare("INSERT INTO t VALUES ('not_a_number')", &[]);
-    assert_eq!(code_of(r), Some(Code::TypeMismatch));
+    assert_eq!(code_of(r), Some(Code::ValueOutOfRange));
 }
 
 #[test]

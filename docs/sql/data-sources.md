@@ -75,6 +75,25 @@ conversion error rather than becoming `NULL` — see
 [limitations.md](limitations.md#partially-supported), where the divergence
 from DuckDB (which re-sniffs and widens) is spelled out.
 
+An object **key** outside the sample is never silently dropped either, but
+the two JSON readers handle it differently, because of how much of the file
+each one has in hand:
+
+- **`.json`** (one document) has the whole document resident and walks
+  every element anyway, so *every* element contributes its keys: the column
+  set is always complete, no matter how late a key first appears. Only the
+  types of the columns the sample settled on stay frozen (which is what
+  produces the conversion error above). A column discovered past the sample
+  has no sample evidence at all, so its type widens over every element it
+  appears in.
+- **JSONL/NDJSON** is read split by split, and the schema has to be fixed
+  before the first split is read, so a complete key set is not knowable up
+  front. A key with no column is reported as a `ColumnNotFound` error
+  positioned at the offending line, rather than being skipped. DuckDB, which
+  can re-sniff, would add the column instead; erroring is the honest answer
+  for a streaming reader — the alternative is losing a whole column of data
+  without a word.
+
 When several **text** parts are registered as one multi-part table and
 their sniffed schemas disagree, the column widens to `VARCHAR`. A part that
 saw **no value at all** for a column (a header-only CSV, a column whose
@@ -188,6 +207,13 @@ column holding `007` and `42`), the same rule the CSV sniffer uses — so
 `007` keeps its padding rather than being flattened to `7`. Typing the key
 once means a predicate on it compares the same way in every partition.
 
+If a partition key **also names a real column inside the file**, the file's
+column wins and no virtual column is synthesized for that part — Hive and
+DuckDB's `WRITE_PARTITION_COLUMNS` both write the key into the data as
+well, and this matches what DuckDB reads back. (Two partition keys of the
+same name in one path are still an error: there is no data column to
+prefer.)
+
 Registering a glob pattern or a directory of partitions is a host-side (JS
 API / CLI-glue) concern — the engine core itself has no filesystem access
 (it's `no_std`); the host resolves the file list and passes it to the
@@ -251,6 +277,7 @@ JSON-path/`list_*`/`map_*`/lambda function surface documented in
 | Encodings | PLAIN, RLE, RLE_DICTIONARY, PLAIN_DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY |
 | Compression | UNCOMPRESSED, SNAPPY, LZ4_RAW, ZSTD (built into the engine); GZIP (delegated to the host — `DecompressionStream` in the browser/Node, or a `gzip` subprocess in the native CLI) |
 | Physical types | BOOLEAN, INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY, INT96 (timestamp-compatible) |
+| Fixed-width annotations | `DECIMAL` and `UUID` as usual, plus `INTERVAL` (FLBA(12), read as `INTERVAL`) and `FLOAT16` (FLBA(2), widened to `FLOAT`) |
 | Not supported | `BYTE_STREAM_SPLIT` encoding, encryption, `LZO`/`BROTLI` codecs |
 
 Projection pushdown, RowGroup statistics pruning, page-level pruning

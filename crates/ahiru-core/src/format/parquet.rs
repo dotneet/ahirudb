@@ -207,6 +207,13 @@ impl ParquetFormat {
         desc: &ColumnDesc,
         num_rows: usize,
     ) -> Result<Vector> {
+        // A 0-row row group (pyarrow writes one for an empty table or an empty batch)
+        // has no pages to assemble, and its column chunk metadata need not describe a
+        // usable byte range at all. The nested read path walks the chunk buffer to
+        // exhaustion rather than to a row count, so it must not be entered here.
+        if num_rows == 0 {
+            return Ok(Vector::with_capacity(desc.ty, 0));
+        }
         let mut metas = Vec::with_capacity(desc.phys_cols.len());
         for &p in &desc.phys_cols {
             metas.push(self.chunk_phys(split, p)?);
@@ -240,20 +247,30 @@ impl TableFormat for ParquetFormat {
             Some(t) => t,
             None => return Ok(Err((off, len))),
         };
-        match parse_footer(tail, off, src.total_len)? {
-            Ok(f) => {
-                self.schema = f
-                    .schema
-                    .columns
-                    .iter()
-                    .map(|c| Field::new(c.name.clone(), c.ty, c.nullable))
-                    .collect();
-                self.file = Some(f);
-                Ok(Ok(()))
+        let f = match parse_footer(tail, off, src.total_len)? {
+            Ok(f) => f,
+            // The footer did not fit the speculative fetch. If the exact range has
+            // already been satisfied, parse it; otherwise request it. Re-probing the
+            // same 64 KiB tail here would return the same request forever and break
+            // the `TableFormat::resolve` contract ("called again with the same ranges
+            // satisfied, it must make progress"). Mirrors `parquet::file::open_bytes`.
+            Err((start, flen)) => {
+                let buf = match src.get(start, flen as usize) {
+                    Some(b) => b,
+                    None => return Ok(Err((start, flen))),
+                };
+                match parse_footer(buf, start, src.total_len)? {
+                    Ok(f) => f,
+                    // The refetched range spans the whole footer, so a second miss
+                    // means the declared length is inconsistent.
+                    Err(_) => err!(BadMagic),
+                }
             }
-            // It did not fit the speculative fetch. The exact range is requested again.
-            Err(range) => Ok(Err(range)),
-        }
+        };
+        self.schema =
+            f.schema.columns.iter().map(|c| Field::new(c.name.clone(), c.ty, c.nullable)).collect();
+        self.file = Some(f);
+        Ok(Ok(()))
     }
 
     fn is_resolved(&self) -> bool {
@@ -560,7 +577,19 @@ impl TableFormat for ParquetFormat {
                     // It does not fall back, though, so an empty vector can still be built.
                     return Some(ColumnPagePlan { dict_range: None, pages });
                 }
-                Some(ColumnPagePlan { dict_range: meta.dictionary_page_range(), pages })
+                // A dictionary-encoded chunk must never be read page-by-page without its
+                // dictionary page. The OffsetIndex's first entry is where the data pages
+                // really start, which `data_page_offset` does not give under the
+                // parquet-mr layout. When the range cannot be worked out, give up on page
+                // selection (`None`) so the whole chunk -- dictionary page included -- is
+                // read instead.
+                let dict_range = if meta.has_dictionary() {
+                    let first = oi.page_locations.first()?.offset;
+                    Some(meta.dictionary_page_range(first)?)
+                } else {
+                    None
+                };
+                Some(ColumnPagePlan { dict_range, pages })
             })();
             columns.push(plan);
         }
@@ -1112,6 +1141,19 @@ mod tests {
         std::fs::read(p).unwrap_or_else(|e| panic!("tests/data/pagetest.parquet: {e}"))
     }
 
+    fn testdata(name: &str) -> Vec<u8> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/");
+        std::fs::read(format!("{dir}{name}")).unwrap_or_else(|e| panic!("tests/data/{name}: {e}"))
+    }
+
+    /// One `resolve` step that is expected to still need bytes.
+    fn resolve_step(fmt: &mut ParquetFormat, src: &Source) -> (u64, u64) {
+        match fmt.resolve(src).unwrap() {
+            Err(range) => range,
+            Ok(()) => panic!("expected a byte request, not a completed resolve"),
+        }
+    }
+
     /// For a `Source::remote`, registers the not-yet-fetched parts of `ranges` as though they had
     /// been fetched from the host. Returns the total bytes actually transferred
     /// (equivalent to the bytes requested via `NEED_IO`).
@@ -1138,6 +1180,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_footer_larger_than_the_probe_resolves_after_refetching_it() {
+        // `tests/data/footer_big.parquet` has a 65529-byte footer: one byte more than
+        // the 64 KiB probe can hold once the 8-byte trailer is subtracted. `resolve`
+        // used to answer the "did not fit" result by asking for the *same* tail again,
+        // so no host could ever open such a file -- it violated the
+        // `TableFormat::resolve` contract that a re-entry with the requested ranges
+        // satisfied must make progress.
+        let bytes = testdata("footer_big.parquet");
+        let mut fmt = ParquetFormat::new();
+        let mut src = Source::remote(bytes.len() as u64);
+
+        let probe = resolve_step(&mut fmt, &src);
+        assert_eq!(probe.1, crate::parquet::file::FOOTER_PROBE);
+        fetch_missing(&mut src, &bytes, &[(probe.0, probe.0 + probe.1)]);
+
+        // The second request must differ from the first, and must span footer + trailer.
+        let exact = resolve_step(&mut fmt, &src);
+        assert_ne!(exact, probe, "re-requesting the same range makes no progress");
+        assert_eq!(exact.1, 65529 + 8);
+        assert_eq!(exact.0 + exact.1, bytes.len() as u64);
+        fetch_missing(&mut src, &bytes, &[(exact.0, exact.0 + exact.1)]);
+
+        assert!(fmt.resolve(&src).unwrap().is_ok());
+        assert_eq!(fmt.schema().len(), 12);
+        assert_eq!(fmt.num_splits(), 6);
+    }
+
+    #[test]
+    fn a_footer_exactly_filling_the_probe_still_resolves_in_one_round_trip() {
+        // The boundary from the other side: 65528 bytes of footer plus the 8-byte
+        // trailer is exactly the 64 KiB probe, the largest footer that still fits.
+        // Refetching here would be a wasted round trip.
+        let bytes = testdata("footer_fit.parquet");
+        let mut fmt = ParquetFormat::new();
+        let mut src = Source::remote(bytes.len() as u64);
+
+        let probe = resolve_step(&mut fmt, &src);
+        fetch_missing(&mut src, &bytes, &[(probe.0, probe.0 + probe.1)]);
+        assert!(fmt.resolve(&src).unwrap().is_ok());
+        assert_eq!(fmt.num_splits(), 6);
+    }
+
+    #[test]
+    fn parquet_mr_dictionary_layout_keeps_the_dictionary_page_when_pages_are_selected() {
+        // `tests/data/dict_mr.parquet` is a dictionary-encoded, page-indexed file whose
+        // ColumnMetaData was rewritten to the parquet-mr (Spark/Hive) layout, where the
+        // chunk start is recorded as `data_page_offset` before the dictionary page is
+        // written -- so `dictionary_page_offset == data_page_offset`. Deriving the
+        // dictionary page's range from `data_page_offset` yields an empty range, and the
+        // selected RLE_DICTIONARY pages then fail to decode, even though reading the
+        // whole chunk (which starts at the dictionary page) works.
+        let bytes = testdata("dict_mr.parquet");
+        let mut fmt = ParquetFormat::new();
+        let src = Source::from_bytes(bytes);
+        fmt.resolve(&src).unwrap().unwrap();
+
+        let meta = fmt.chunk(0, 2).unwrap();
+        assert_eq!(meta.dictionary_page_offset, Some(meta.data_page_offset));
+
+        // id, s -- `s` is the dictionary-encoded string column.
+        let projection = vec![0usize, 2];
+        let pruners = vec![Pruner {
+            column: 0,
+            op: PruneOp::Gt,
+            value: Value::I32(3900),
+            in_values: Vec::new(),
+        }];
+        assert!(fmt.refine_with_index(&src, 0, &pruners, &projection).unwrap());
+        let plan = fmt.matching_plan(0, &projection).expect("page plan should be active");
+        let s_plan = plan.columns[1].as_ref().expect("`s` must still be page-selected");
+        assert!(
+            s_plan.dict_range.is_some(),
+            "the dictionary page's range must be recovered from the OffsetIndex"
+        );
+
+        let cols = fmt.read_split(&src, 0, &projection).unwrap();
+        // duckdb: SELECT count(*), min(s) FROM dict_mr.parquet WHERE id > 3900 -> 99, 'v0'
+        let mut n = 0usize;
+        let mut min: Option<Vec<u8>> = None;
+        for i in 0..cols[0].len() {
+            let Value::I32(id) = cols[0].value_at(i) else { panic!("id is INTEGER") };
+            if id <= 3900 {
+                continue;
+            }
+            n += 1;
+            let Value::Bytes(s) = cols[1].value_at(i) else { panic!("s is VARCHAR") };
+            // The dictionary is what turns an index back into text; without the
+            // dictionary page these cannot be produced at all.
+            assert_eq!(s, format!("v{}", id % 50).into_bytes());
+            if min.as_ref().is_none_or(|m| s < *m) {
+                min = Some(s);
+            }
+        }
+        assert_eq!(n, 99);
+        assert_eq!(min.as_deref(), Some(&b"v0"[..]));
     }
 
     #[test]
