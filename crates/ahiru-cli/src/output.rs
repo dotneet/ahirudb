@@ -289,17 +289,14 @@ impl<'a> Writer<'a> {
                 if matches!(v, Value::Null) {
                     "NULL".to_string()
                 } else if *ty == Ty::Blob {
-                    if let Value::Bytes(b) = v {
-                        const HEX: &[u8; 16] = b"0123456789abcdef";
-                        let mut hex = String::with_capacity(b.len() * 2);
-                        for byte in b {
-                            hex.push(HEX[(byte >> 4) as usize] as char);
-                            hex.push(HEX[(byte & 0xf) as usize] as char);
-                        }
-                        format!("X'{hex}'")
-                    } else {
-                        "NULL".to_string()
-                    }
+                    // `'\x00\xFF'::BLOB`: the cell's own `\xHH` rendering as a
+                    // string literal, cast to BLOB. Both this engine and DuckDB
+                    // parse that back to the same bytes; the `X'00ff'` form this
+                    // used to write is accepted by neither. The rendering escapes
+                    // `'` and `\` (as `\x27`/`\x5C`), so the literal needs no
+                    // further quoting.
+                    let text = crate::render::render(v, *ty, "NULL");
+                    format!("'{text}'::BLOB")
                 } else if matches!(ty, Ty::Float | Ty::Double)
                     && matches!(v, Value::F64(f) if !f.is_finite())
                 {
