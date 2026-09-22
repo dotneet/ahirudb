@@ -621,11 +621,35 @@ fn ddl_tables_visible_in_dot_commands() {
     assert!(r.stdout.contains("\"name\" VARCHAR"), "{}", r.stdout);
 }
 
+/// `-insert` used to write a BLOB as `X'deadbeef'`, which neither this engine nor
+/// DuckDB can parse, so the script it produced could not be replayed. It now writes
+/// `'\xDE\xAD\xBE\xEF'::BLOB`; this replays the script into a fresh table and checks
+/// that every byte -- including NUL, 0xFF, `'` and `\` -- comes back unchanged.
 #[test]
-fn insert_mode_blob_hex() {
-    let r = run(&["-mode", "insert", "-c", "SELECT unhex('deadbeef') AS b"]);
+fn insert_mode_blob_round_trips_through_replay() {
+    let select = "SELECT unhex('deadbeef') AS b FROM range(1) \
+                  UNION ALL SELECT unhex('00ff275c41') FROM range(1)";
+    let r = run(&["-c", ".mode insert t", "-c", select]);
     assert!(r.ok, "{}", r.stderr);
-    assert!(r.stdout.contains("X'deadbeef'"), "{}", r.stdout);
+    assert_eq!(
+        r.stdout,
+        "INSERT INTO t VALUES ('\\xDE\\xAD\\xBE\\xEF'::BLOB);\n\
+         INSERT INTO t VALUES ('\\x00\\xFF\\x27\\x5CA'::BLOB);\n"
+    );
+
+    // Compared with `=` against the original bytes rather than through `hex()`, so
+    // the check depends only on the stored value.
+    let check = "SELECT count(*) FROM t WHERE b = unhex('deadbeef') OR b = unhex('00ff275c41');\n";
+    let script = format!("CREATE TABLE t (b BLOB);\n{}{check}", r.stdout);
+    let replay = run_with_stdin(&["-csv", "-noheader"], Some(&script));
+    assert!(replay.ok, "{}", replay.stderr);
+    assert!(replay.stdout.contains("\n2\n"), "{}", replay.stdout);
+
+    // DuckDB parses the same script (skipped where it is not installed).
+    if let Ok(out) = Command::new("duckdb").args(["-csv", "-noheader", "-c", &script]).output() {
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+    }
 }
 
 // ---- regressions ---------------------------------------------------------

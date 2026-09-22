@@ -10,69 +10,14 @@
 //! `Vm::eval`/`eval_filter`; no dedicated scalar evaluator is written -- that keeps type
 //! conversion, NULLs, and three-valued logic exactly the same as in `SELECT`, and adds no code size.
 
-use crate::ddl::{count_result, eval_scalar, run_query_to_rows};
+use crate::ddl::{cast_value, count_result, eval_value_strict, run_query_to_rows};
 use crate::plan::compile::{cast_program, compile, compile_predicate};
 use crate::plan::Scope;
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::session::{Prepared, Session};
 use crate::sql::ast::{ExprArena, ExprId, InsertSource};
-use crate::vector::{Batch, Field, Ty, Value, Vector, BATCH_SIZE};
-
-/// Casts an already-determined `Value` of type `src_ty` to `target_ty`. Wrapping it as
-/// an `Expr::TypedLiteral` and running it through `eval_scalar` shares CAST semantics
-/// (DECIMAL scale adjustment, DATE/TIMESTAMP, and so on) fully with `SELECT`'s CAST.
-///
-/// `src_ty` must be the type of the *source column* the value came from, not a type
-/// guessed from the `Value` variant. A plain `Expr::Literal` would do the latter, and
-/// several logical types are indistinguishable from their physical representation:
-/// `DECIMAL(10,2)` 12.50 is `I64(1250)`, which re-infers as `BIGINT 1250` and then
-/// rescales to `1250.00`; `UUID`/`INTERVAL`/`DATE`/`TIME`/`TIMESTAMP` likewise lose
-/// their identity and become NULL or a `TypeMismatch`.
-///
-/// The conversion is **strict**: the `Cast` opcode's documented per-row behaviour is
-/// "a row that fails to convert becomes NULL" (`expr::kernels`), which is right for
-/// `SELECT` but wrong here, where the NULL would be *stored*. DuckDB raises a
-/// Conversion Error and stores nothing; a non-NULL value that casts to NULL is
-/// therefore rejected with `ValueOutOfRange` rather than silently written. Because
-/// both `insert` and `update` validate the entire statement before touching any row,
-/// the failing statement mutates nothing.
-fn cast_value(session: &mut Session, v: Value, src_ty: Ty, target_ty: Ty) -> Result<Value> {
-    if v.is_null() {
-        return Ok(Value::Null);
-    }
-    // Identical types need no conversion at all -- and skipping the VM here keeps the
-    // common `INSERT INTO t SELECT * FROM t` path free of per-value program compilation.
-    if src_ty == target_ty {
-        return Ok(v);
-    }
-    let mut arena = ExprArena::new();
-    let id = arena.push(crate::sql::ast::Expr::TypedLiteral(v, src_ty));
-    let out = eval_scalar(session, &arena, id, &[], target_ty)?;
-    // `v` was not NULL, so a NULL here can only mean the conversion failed.
-    ensure!(!out.is_null(), ValueOutOfRange);
-    Ok(out)
-}
-
-/// Evaluates a single `INSERT ... VALUES` expression and coerces it to the target
-/// column type, strictly (see [`cast_value`]).
-///
-/// The expression is compiled and evaluated at its *natural* type first, so the
-/// pre-cast value is known; [`cast_value`] then performs the conversion itself.
-/// `eval_scalar` cannot be used directly because it folds the cast into the same
-/// program and so cannot tell "the expression was NULL" from "the cast failed".
-fn eval_insert_value(
-    session: &mut Session,
-    arena: &ExprArena,
-    expr_id: ExprId,
-    params: &[Value],
-    target_ty: Ty,
-) -> Result<Value> {
-    let prog = compile(arena, &Scope::new(), params, expr_id)?;
-    let src_ty = prog.result_ty;
-    let v = session.vm.eval(&prog, &Batch::rows_only(1))?.value_at(0);
-    cast_value(session, v, src_ty, target_ty)
-}
+use crate::vector::{Field, Value, Vector, BATCH_SIZE};
 
 /// The name-resolution scope for `UPDATE`/`DELETE` against `table`.
 ///
@@ -143,7 +88,7 @@ pub(crate) fn insert(
                 let mut row = defaults.clone();
                 for (&slot, &expr_id) in col_idx.iter().zip(row_exprs) {
                     row[slot] =
-                        eval_insert_value(session, arena, expr_id, params, schema[slot].ty)?;
+                        eval_value_strict(session, arena, expr_id, params, schema[slot].ty)?;
                 }
                 check_not_null(&schema, &row)?;
                 out.push(row);

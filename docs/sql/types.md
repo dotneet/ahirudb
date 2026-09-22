@@ -309,8 +309,8 @@ it needs to be explicit:
 
   The CSV writer spells the infinities the same way (`inf`, `-inf`, matching
   DuckDB's own CSV output) but writes `NaN` rather than `nan`. The JSONL
-  writer has to quote all three, and writes them longhand as `"NaN"`,
-  `"Infinity"`, `"-Infinity"`; see [ddl-dml.md](ddl-dml.md#jsonl-output).
+  writer has to quote all three, and writes them in this cast spelling as
+  `"nan"`, `"inf"`, `"-inf"`; see [ddl-dml.md](ddl-dml.md#jsonl-output).
 
 - A **`FLOAT`** casts to the shortest text that round-trips through `FLOAT`,
   not through `DOUBLE`: `CAST(1.1::FLOAT AS VARCHAR)` is `'1.1'`, not the

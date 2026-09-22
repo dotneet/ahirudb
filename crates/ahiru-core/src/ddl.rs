@@ -39,7 +39,21 @@ pub(crate) fn create_table(
         return Ok(Prepared::Ready(count_result(0)));
     }
     let (schema, rows) = match as_select {
-        Some(q) => run_query_to_rows(session, arena, q, params)?,
+        Some(q) => {
+            let (mut schema, rows) = run_query_to_rows(session, arena, q, params)?;
+            // A column whose expression is an untyped `NULL` (`SELECT NULL AS n`) has
+            // the internal type `Ty::Null`, which is not a storable column type:
+            // later INSERTs would keep the raw value while casts, comparisons and
+            // COPY treated the column as always-NULL. DuckDB types such a column
+            // INTEGER; do the same. Every existing row holds `Value::Null` there, so
+            // no data needs converting.
+            for f in &mut schema {
+                if f.ty == Ty::Null {
+                    f.ty = Ty::Int;
+                }
+            }
+            (schema, rows)
+        }
         None => {
             let schema =
                 columns.iter().map(|c| Field::new(c.name.clone(), c.ty, c.nullable)).collect();
@@ -129,7 +143,10 @@ fn add_column(
     params: &[Value],
 ) -> Result<()> {
     let value = match default {
-        Some(expr_id) => eval_scalar(session, arena, expr_id, params, ty)?,
+        // Strict, like `INSERT`: a DEFAULT that does not fit the column type (e.g.
+        // `TINYINT DEFAULT 1000`, `DATE DEFAULT 'x'`) is a conversion error at DDL time,
+        // as in DuckDB, rather than a NULL silently stored into every existing row.
+        Some(expr_id) => eval_value_strict(session, arena, expr_id, params, ty)?,
         None => Value::Null,
     };
     let has_rows = !session.catalog.mem_get(idx).unwrap().rows.is_empty();
@@ -138,9 +155,11 @@ fn add_column(
 }
 
 /// Compiles a single expression in an empty scope (no column references), casts it to
-/// `target_ty`, and evaluates it against a one-row batch. Shared with `dml` (value
-/// evaluation for `INSERT ... VALUES`, and value-level type conversion).
-pub(crate) fn eval_scalar(
+/// `target_ty`, and evaluates it against a one-row batch. The cast is the lenient
+/// `SELECT` one (an unconvertible value becomes NULL), so anything that *stores* the
+/// result must go through [`eval_value_strict`]/[`cast_value`] instead; this is only
+/// their building block.
+fn eval_scalar(
     session: &mut Session,
     arena: &ExprArena,
     expr_id: ExprId,
@@ -153,6 +172,70 @@ pub(crate) fn eval_scalar(
     let batch = Batch::rows_only(1);
     let v = session.vm.eval(&prog, &batch)?;
     Ok(v.value_at(0))
+}
+
+/// Casts an already-determined `Value` of type `src_ty` to `target_ty`. Wrapping it as
+/// an `Expr::TypedLiteral` and running it through `eval_scalar` shares CAST semantics
+/// (DECIMAL scale adjustment, DATE/TIMESTAMP, and so on) fully with `SELECT`'s CAST.
+///
+/// `src_ty` must be the type of the *source column* the value came from, not a type
+/// guessed from the `Value` variant. A plain `Expr::Literal` would do the latter, and
+/// several logical types are indistinguishable from their physical representation:
+/// `DECIMAL(10,2)` 12.50 is `I64(1250)`, which re-infers as `BIGINT 1250` and then
+/// rescales to `1250.00`; `UUID`/`INTERVAL`/`DATE`/`TIME`/`TIMESTAMP` likewise lose
+/// their identity and become NULL or a `TypeMismatch`.
+///
+/// The conversion is **strict**: the `Cast` opcode's documented per-row behaviour is
+/// "a row that fails to convert becomes NULL" (`expr::kernels`), which is right for
+/// `SELECT` but wrong here, where the NULL would be *stored*. DuckDB raises a
+/// Conversion Error and stores nothing; a non-NULL value that casts to NULL is
+/// therefore rejected with `ValueOutOfRange` rather than silently written. Because
+/// both `insert` and `update` validate the entire statement before touching any row,
+/// the failing statement mutates nothing.
+pub(crate) fn cast_value(
+    session: &mut Session,
+    v: Value,
+    src_ty: Ty,
+    target_ty: Ty,
+) -> Result<Value> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    // No stored column has type `Ty::Null` (`create_table` maps it to INTEGER), and a
+    // non-NULL value cannot be represented in it; refuse rather than store it.
+    ensure!(target_ty != Ty::Null, TypeMismatch);
+    // Identical types need no conversion at all -- and skipping the VM here keeps the
+    // common `INSERT INTO t SELECT * FROM t` path free of per-value program compilation.
+    if src_ty == target_ty {
+        return Ok(v);
+    }
+    let mut arena = ExprArena::new();
+    let id = arena.push(crate::sql::ast::Expr::TypedLiteral(v, src_ty));
+    let out = eval_scalar(session, &arena, id, &[], target_ty)?;
+    // `v` was not NULL, so a NULL here can only mean the conversion failed.
+    ensure!(!out.is_null(), ValueOutOfRange);
+    Ok(out)
+}
+
+/// Evaluates a single constant expression (an `INSERT ... VALUES` item or an
+/// `ADD COLUMN ... DEFAULT`) and coerces it to the target column type, strictly
+/// (see [`cast_value`]).
+///
+/// The expression is compiled and evaluated at its *natural* type first, so the
+/// pre-cast value is known; [`cast_value`] then performs the conversion itself.
+/// `eval_scalar` cannot be used directly because it folds the cast into the same
+/// program and so cannot tell "the expression was NULL" from "the cast failed".
+pub(crate) fn eval_value_strict(
+    session: &mut Session,
+    arena: &ExprArena,
+    expr_id: ExprId,
+    params: &[Value],
+    target_ty: Ty,
+) -> Result<Value> {
+    let prog = compile(arena, &Scope::new(), params, expr_id)?;
+    let src_ty = prog.result_ty;
+    let v = session.vm.eval(&prog, &Batch::rows_only(1))?.value_at(0);
+    cast_value(session, v, src_ty, target_ty)
 }
 
 pub(crate) fn create_view(
