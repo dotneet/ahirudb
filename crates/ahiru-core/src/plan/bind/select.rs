@@ -264,7 +264,8 @@ pub(super) fn expand_columns(
 /// ```
 ///
 /// Note the second line: `sum(x)+1` is excluded even though the item itself
-/// is not an aggregate call — containing one anywhere is what counts.
+/// is not an aggregate call — containing one anywhere is what counts. An item
+/// that references no column at all (`42`, `'x'`, `1+1`) is excluded as well.
 ///
 /// `SELECT *` combined with `GROUP BY ALL` is rejected rather than expanded.
 /// duckdb supports it (it groups by every column of the star expansion), but
@@ -285,9 +286,20 @@ fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprI
         ensure!(!matches!(arena.get(item.expr), Expr::Star { .. }), UnsupportedFeature);
         let mut aggs = Vec::new();
         collect_aggregates(arena, item.expr, &mut aggs, 0)?;
-        if aggs.is_empty() {
-            out.push(item.expr);
+        if !aggs.is_empty() {
+            continue;
         }
+        // An item that reads no column is constant per group, and DuckDB leaves it out of
+        // the grouping (`select 1, count(*) from empty group by all` -> one row `1, 0`).
+        // Keeping it would also be wrong here: a bare integer literal in the grouping list is
+        // read as an ordinal downstream, so `SELECT b, 42, count(*) ... GROUP BY ALL` failed
+        // with "column not found" and `SELECT 3, b, count(*)` grouped by the aggregate.
+        let mut refs = Vec::new();
+        collect_colrefs(arena, item.expr, &[], &mut refs, 0)?;
+        if refs.is_empty() && !contains_subquery(arena, item.expr, 0) {
+            continue;
+        }
+        out.push(item.expr);
     }
     Ok(out)
 }

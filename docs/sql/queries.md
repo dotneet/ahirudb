@@ -385,6 +385,9 @@ SELECT flag, name, count(*) c FROM t GROUP BY ALL ORDER BY ALL;
 - "Contains an aggregate" is about the whole expression, not just its top
   level: in `SELECT id % 3, sum(id) + 1 FROM t GROUP BY ALL`, the grouping
   key is `id % 3` alone — `sum(id) + 1` is excluded.
+- An item that references no column (`42`, `'x'`, `1 + 1`) is constant and
+  is left out of the grouping, as in DuckDB: `SELECT b, 42, count(*) FROM t
+  GROUP BY ALL` groups by `b` alone.
 - With no aggregate anywhere in the select list it behaves like
   `SELECT DISTINCT`.
 - With nothing *but* aggregates there are no grouping columns, i.e. one

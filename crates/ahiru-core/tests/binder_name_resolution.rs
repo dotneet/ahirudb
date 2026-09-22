@@ -111,3 +111,31 @@ fn a_negative_literal_whose_magnitude_overflows_integer_is_bigint() {
         vec![Value::I32(-2147483648)]
     );
 }
+
+// --- GROUP BY ALL leaves constant items out of the grouping -------------------
+
+#[test]
+fn group_by_all_ignores_constant_select_items() {
+    let mut s = session();
+    let n = Value::Null;
+    // duckdb: 1,42,2 / 5,42,2 / 7,42,1 / NULL,42,1
+    let rows = run(&mut s, "SELECT b, 42, count(*) FROM v GROUP BY ALL ORDER BY ALL");
+    let k = Value::I32(42);
+    assert_eq!(
+        rows,
+        vec![
+            vec![i(1), k.clone(), i(2)],
+            vec![i(5), k.clone(), i(2)],
+            vec![i(7), k.clone(), i(1)],
+            vec![n.clone(), k, i(1)],
+        ]
+    );
+    // duckdb: 3,1,2 / 3,5,2 / 3,7,1 / 3,NULL,1 (`3` is not an ordinal here)
+    let rows = run(&mut s, "SELECT 3, b, count(*) FROM v GROUP BY ALL ORDER BY 2");
+    let bs: Vec<Value> = rows.iter().map(|r| r[1].clone()).collect();
+    assert_eq!(bs, vec![i(1), i(5), i(7), n]);
+    assert!(rows.iter().all(|r| r[0] == Value::I32(3)));
+    // Only constants and aggregates: one row for the whole input (duckdb: 1,6).
+    let rows = run(&mut s, "SELECT 1, count(*) FROM v GROUP BY ALL");
+    assert_eq!(rows, vec![vec![Value::I32(1), i(6)]]);
+}
