@@ -299,3 +299,77 @@ fn grouping_sets_empty_input_emits_the_grand_total() {
     );
     assert_eq!(rows, vec![vec![Value::Null, Value::I64(0)]]);
 }
+
+// --- CTAS of an untyped NULL column ----------------------------------------
+
+#[test]
+fn ctas_types_an_untyped_null_column_as_integer() {
+    // `SELECT NULL AS n` has the internal "undecided" type. It used to be stored
+    // as the column type, so a later INSERT kept the raw 5 while casts,
+    // arithmetic and comparisons all saw NULL. DuckDB types the column INTEGER.
+    let mut sess = Session::new();
+    sess.prepare("CREATE TABLE x AS SELECT NULL AS n FROM range(1)", &[]).unwrap();
+    let desc = run(&mut sess, "DESCRIBE x");
+    assert_eq!(desc[0][1], Value::Bytes(b"INTEGER".to_vec()));
+
+    sess.prepare("INSERT INTO x VALUES (5)", &[]).unwrap();
+    assert_eq!(
+        run(&mut sess, "SELECT n::VARCHAR, n + 1 FROM x WHERE n = 5"),
+        vec![vec![Value::Bytes(b"5".to_vec()), Value::I32(6)]]
+    );
+    // A value that does not fit INTEGER is now a conversion error, not a silent store.
+    assert_eq!(
+        code_of(sess.prepare("INSERT INTO x VALUES ('abc')", &[])),
+        Some(Code::ValueOutOfRange)
+    );
+}
+
+// --- ALTER TABLE ADD COLUMN ... DEFAULT: strict conversion -----------------
+
+#[test]
+fn add_column_default_that_does_not_fit_the_type_is_rejected() {
+    // DuckDB: "Conversion Error" for each of these. They used to go through the
+    // lenient SELECT cast, so every existing row (and every later INSERT that
+    // omitted the column) silently received NULL.
+    for def in [
+        "TINYINT DEFAULT 1000",
+        "DATE DEFAULT 'notadate'",
+        "INTEGER DEFAULT 'abc'",
+        "DECIMAL(3,1) DEFAULT 123.45",
+    ] {
+        for with_rows in [true, false] {
+            let mut sess = Session::new();
+            sess.prepare("CREATE TABLE t (a INTEGER)", &[]).unwrap();
+            if with_rows {
+                sess.prepare("INSERT INTO t VALUES (1)", &[]).unwrap();
+            }
+            let sql = format!("ALTER TABLE t ADD COLUMN b {def}");
+            assert_eq!(code_of(sess.prepare(&sql, &[])), Some(Code::ValueOutOfRange), "{sql}");
+            // The failed statement must not have added the column.
+            assert_eq!(code_of(sess.prepare("SELECT b FROM t", &[])), Some(Code::ColumnNotFound));
+        }
+    }
+}
+
+#[test]
+fn add_column_default_that_fits_is_still_applied() {
+    let mut sess = Session::new();
+    sess.prepare("CREATE TABLE t (a INTEGER)", &[]).unwrap();
+    sess.prepare("INSERT INTO t VALUES (1)", &[]).unwrap();
+    sess.prepare("ALTER TABLE t ADD COLUMN b DATE DEFAULT '2024-01-02'", &[]).unwrap();
+    sess.prepare("ALTER TABLE t ADD COLUMN c DECIMAL(3,1) DEFAULT 12.345", &[]).unwrap();
+    sess.prepare("ALTER TABLE t ADD COLUMN d INTEGER DEFAULT NULL", &[]).unwrap();
+    sess.prepare("INSERT INTO t (a) VALUES (2)", &[]).unwrap();
+    let expected = |a: i32| {
+        vec![
+            Value::I32(a),
+            Value::Bytes(b"2024-01-02".to_vec()),
+            Value::Bytes(b"12.3".to_vec()),
+            Value::Null,
+        ]
+    };
+    assert_eq!(
+        run(&mut sess, "SELECT a, b::VARCHAR, c::VARCHAR, d FROM t ORDER BY a"),
+        vec![expected(1), expected(2)]
+    );
+}

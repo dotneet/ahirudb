@@ -63,6 +63,9 @@ CREATE TABLE dst (id INTEGER, val INTEGER);
 INSERT INTO dst SELECT id, val FROM snap;
 ```
 
+A CTAS column whose expression is an untyped `NULL` (`SELECT NULL AS n`)
+is created as `INTEGER`, as in DuckDB.
+
 `IF NOT EXISTS` and `OR REPLACE` are both supported. A `CREATE TABLE` whose
 name collides with an existing **file-backed** table always fails
 (`DuplicateTable`), regardless of `OR REPLACE` — `OR REPLACE` only ever
@@ -92,6 +95,13 @@ ALTER TABLE t DROP COLUMN b;
 ALTER TABLE accounts RENAME COLUMN balance TO bal;
 ALTER TABLE accounts RENAME TO ledger;
 ```
+
+A `DEFAULT` is converted to the column type with the same strict rules as
+`INSERT`: a value that does not fit (`TINYINT DEFAULT 1000`,
+`DATE DEFAULT 'notadate'`, `DECIMAL(3,1) DEFAULT 123.45`) fails the
+`ALTER TABLE` with `ValueOutOfRange` rather than filling the column with
+NULL. (DuckDB raises the same conversion error; it only defers it to the
+first row that needs the default when the table is empty.)
 
 Like `CREATE`/`DROP TABLE`, `ALTER TABLE` on a file-backed table fails with
 `ReadOnlyTable`.
