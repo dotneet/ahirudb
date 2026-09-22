@@ -977,25 +977,33 @@ fn group_by_select_list_alias_is_resolved() {
     assert_eq!(rows, vec![vec![i64v(11), i64v(2)], vec![i64v(21), i64v(1)]]);
 }
 
-/// QUALIFY sees the SELECT output, including `* REPLACE`, a trailing alias
-/// that shadows a star column, and `RENAME`.
+/// QUALIFY resolves a name like WHERE/HAVING do: an input column first, and an output name
+/// (an alias, a `RENAME`d column) only when the input has no column of that name. duckdb:
+/// `SELECT * REPLACE (score * 2 AS score), row_number() OVER (ORDER BY id) rn FROM t QUALIFY
+/// score > 15 ORDER BY id` -> `2,40,2`; `SELECT *, id + 10 AS id, row_number() OVER (ORDER
+/// BY id) rn FROM t QUALIFY id > 1` -> `2,20,12,2`; the RENAME form -> `2,20,2`.
 #[test]
-fn qualify_uses_post_projection_names() {
+fn qualify_prefers_input_columns_over_output_names() {
     let mut db = Session::new();
     db.register_bytes_as("t", b"id,score\n1,10\n2,20\n".to_vec(), FormatKind::Csv).unwrap();
 
-    // REPLACE: filter on the replaced `score` (20, 40), not the input (10, 20).
-    let rows =
-        run(&mut db, "SELECT * REPLACE (score * 2 AS score) FROM t QUALIFY score > 15 ORDER BY id");
-    assert_eq!(rows, vec![vec![i64v(1), i64v(20)], vec![i64v(2), i64v(40)]]);
+    // REPLACE: filter on the input `score` (10, 20), not the replaced one (20, 40).
+    let rows = run(
+        &mut db,
+        "SELECT * REPLACE (score * 2 AS score), row_number() OVER (ORDER BY id) rn FROM t \
+         QUALIFY score > 15 ORDER BY id",
+    );
+    assert_eq!(rows, vec![vec![i64v(2), i64v(40), i64v(2)]]);
 
-    // Shadowed alias: last `id` wins (`id+10` → 11, 12).
-    let rows = run(&mut db, "SELECT *, id + 10 AS id FROM t QUALIFY id > 5 ORDER BY id");
-    assert_eq!(rows.len(), 2, "got {rows:?}");
-    assert_eq!(rows[0][0], i64v(1));
-    assert_eq!(rows[0][2], i64v(11));
+    // A trailing alias shadowing a star column: QUALIFY still reads the input `id`.
+    let rows = run(
+        &mut db,
+        "SELECT *, id + 10 AS id, row_number() OVER (ORDER BY id) rn FROM t \
+         QUALIFY id > 1 ORDER BY 1",
+    );
+    assert_eq!(rows, vec![vec![i64v(2), i64v(20), i64v(12), i64v(2)]]);
 
-    // RENAME: QUALIFY can use the new name.
+    // RENAME: the new name is not an input column, so QUALIFY finds the output one.
     let rows = run(&mut db, "SELECT * RENAME (id AS pk) FROM t QUALIFY pk > 1 ORDER BY pk");
     assert_eq!(rows, vec![vec![i64v(2), i64v(20)]]);
 }

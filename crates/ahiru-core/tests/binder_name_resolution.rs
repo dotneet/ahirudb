@@ -1,7 +1,8 @@
-//! Regression tests for binder name-resolution and grouping fixes:
-//! intermediate sub-expressions of a flattened operator chain matching a
-//! `GROUP BY` expression, the width of a negative integer literal, and the
-//! other items listed per section below.
+//! Regression tests for binder name-resolution and grouping fixes: a
+//! `GROUP BY` expression nested in a flattened operator chain, the width of a
+//! negative integer literal, constant items under `GROUP BY ALL`, grouping
+//! keys spelled two ways (`b` / `v.b`), plain keys mixed with `ROLLUP`, and
+//! how bare names resolve in `ORDER BY` and `QUALIFY`.
 //!
 //! Every expected value was measured with the `duckdb` CLI against the same
 //! data (`tests/data/orders.csv`, and the small inline table `v`).
@@ -217,4 +218,65 @@ fn plain_keys_and_rollup_combine_as_a_cross_product() {
     // (duckdb).
     let sql = "SELECT b, a, count(*) FROM v GROUP BY ROLLUP(b), ROLLUP(a)";
     assert_eq!(run(&mut s, sql).len(), 17);
+}
+
+// --- ORDER BY: an explicit alias beats a same-named output column ---------------
+
+#[test]
+fn order_by_prefers_an_explicit_alias_over_a_bare_column_of_the_name() {
+    let mut s = session();
+    // duckdb: 101 102 103 (sorted by order_id, not by the `amount` column)
+    let sql = "SELECT order_id AS amount, amount FROM o ORDER BY amount LIMIT 3";
+    assert_eq!(col0(&mut s, sql), vec![i(101), i(102), i(103)]);
+    // duckdb: 110 109
+    let sql = "SELECT order_id AS amount, * FROM o ORDER BY amount DESC LIMIT 2";
+    assert_eq!(col0(&mut s, sql), vec![i(110), i(109)]);
+    // Among several aliases the last wins. duckdb: 101 102 110 (by customer_id, then 1)
+    let sql = "SELECT order_id AS amount, customer_id AS amount, amount FROM o \
+               ORDER BY amount, 1 LIMIT 3";
+    assert_eq!(col0(&mut s, sql), vec![i(101), i(102), i(110)]);
+}
+
+// --- QUALIFY: an input column beats a select-list alias -------------------------
+
+#[test]
+fn qualify_resolves_input_columns_before_aliases() {
+    let mut s = session();
+    // duckdb: no rows -- `amount` is the input column (no order has amount 3).
+    let sql = "SELECT customer_id*1 AS amount, rank() OVER (ORDER BY amount) r FROM o \
+               QUALIFY amount = 3";
+    assert!(run(&mut s, sql).is_empty());
+    let sql = "SELECT customer_id AS order_id, row_number() OVER (ORDER BY order_id) rn FROM o \
+               QUALIFY order_id = 3";
+    assert!(run(&mut s, sql).is_empty());
+    // A name the input does not have is still an alias. duckdb: 5 6 7
+    let sql = "SELECT customer_id AS k, row_number() OVER (ORDER BY order_id) rn FROM o \
+               QUALIFY k = 3 ORDER BY rn";
+    let rn: Vec<Value> = run(&mut s, sql).into_iter().map(|r| r[1].clone()).collect();
+    assert_eq!(rn, vec![i(5), i(6), i(7)]);
+}
+
+// --- ORDER BY expressions that mix an alias with other terms --------------------
+
+#[test]
+fn order_by_expressions_can_mix_aliases_with_columns_and_aggregates() {
+    let mut s = session();
+    let st = |v: &str| Value::Bytes(v.as_bytes().to_vec());
+    // duckdb: pending cancelled paid (length(status) + sum(order_id) = 110, 116, 849)
+    let sql = "SELECT status AS x, sum(order_id) FROM o GROUP BY status \
+               ORDER BY length(x) + sum(order_id)";
+    assert_eq!(col0(&mut s, sql), vec![st("pending"), st("cancelled"), st("paid")]);
+    // duckdb: pending,103 / paid,110 / paid,109
+    let sql = "SELECT status AS x, order_id FROM o ORDER BY x || order_id DESC LIMIT 3";
+    let got: Vec<Value> = run(&mut s, sql).into_iter().map(|r| r[1].clone()).collect();
+    assert_eq!(got, vec![i(103), i(110), i(109)]);
+    // Two aliases, one of them an aggregate. duckdb: 5 3 1 2 4
+    let sql = "SELECT customer_id AS k, sum(amount) s FROM o GROUP BY 1 ORDER BY s * k";
+    assert_eq!(col0(&mut s, sql), vec![i(5), i(3), i(1), i(2), i(4)]);
+    // A compound aliased expression. duckdb: 102 105 108 111
+    let sql = "SELECT order_id + 1 AS k FROM o ORDER BY k % 3, k LIMIT 4";
+    assert_eq!(col0(&mut s, sql), vec![i(102), i(105), i(108), i(111)]);
+    // An input column of the name still wins inside an expression (duckdb: 107 109 105).
+    let sql = "SELECT order_id AS amount FROM o ORDER BY amount + 0 LIMIT 3";
+    assert_eq!(col0(&mut s, sql), vec![i(107), i(109), i(105)]);
 }

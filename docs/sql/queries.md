@@ -349,7 +349,15 @@ The two clauses deliberately resolve a bare name differently, matching
 DuckDB and PostgreSQL:
 
 - **`GROUP BY` prefers an input column** over a select-list alias.
-- **`ORDER BY` prefers the select-list alias** over an input column.
+- **`ORDER BY` prefers the select-list alias** over an input column — for a
+  bare name. An explicit `AS` alias wins over an output column that merely
+  carries the name (`SELECT id AS v, v FROM t ORDER BY v` sorts by `id`),
+  and among several aliases of one name the last wins.
+- **Inside an `ORDER BY` expression** (`ORDER BY x || id`,
+  `ORDER BY length(x) + sum(id)`) a name is an input column when the input
+  has it, and a select-list alias otherwise — so an alias can be combined
+  with columns, aggregates and other aliases, while
+  `SELECT id AS v FROM t ORDER BY v + 0` sorts by the input `v`.
 
 So in `SELECT b AS a, count(*) FROM t GROUP BY a`, the `a` in `GROUP BY`
 is the table's own column `a` — not the alias for `b` — and the query is
@@ -473,11 +481,14 @@ result. If you need a specific frame, restructure the query with a subquery
 or `LIMIT`/aggregation instead of relying on `OVER (... ROWS BETWEEN ...)`.
 
 `QUALIFY` filters on the *result* of a window function without needing to
-wrap the query in a subquery. It is evaluated **after** the select list, so
-it sees output names: `* REPLACE`, `* RENAME`, and a trailing alias that
-shadows a star column (the last column of that name wins). A window
-function written only in `QUALIFY` is computed and then dropped from the
-output.
+wrap the query in a subquery. It is evaluated **after** the select list, but
+a bare name resolves the way it does in `WHERE`/`HAVING`, as in DuckDB: an
+input column of that name wins, and only a name the input doesn't have
+falls back to an output name (a select-list alias such as `rn` below, or a
+`* RENAME`d column). So in `SELECT a * 1 AS b, rank() OVER (...) FROM t
+QUALIFY b = 3` the `b` is the table's own column, and `* REPLACE (x * 2 AS
+x) ... QUALIFY x > 1` filters on the input `x`. A window function written
+only in `QUALIFY` is computed and then dropped from the output.
 
 ```sql
 SELECT id, row_number() OVER (ORDER BY id) AS rn

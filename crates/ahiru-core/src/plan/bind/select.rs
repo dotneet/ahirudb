@@ -12,8 +12,8 @@ use super::cte::CteScope;
 use super::from::{build_tree, flatten_from, full_scope, narrow_scope, rel_ranges, Rel};
 use super::refs::{
     collect_join_refs, collect_outer_refs, collect_refs, collect_refs_aliased, const_program,
-    default_name, distinct_on_output_column, group_name, order_output_column, push_u32,
-    resolve_group_ref, resolve_select_ref, walk_pruned,
+    default_name, distinct_on_output_column, group_name, order_output_column, output_alias_column,
+    push_u32, resolve_group_ref, resolve_select_ref, walk_pruned,
 };
 use super::subquery::{
     and_all, build_quantified_comparison, build_semijoin, classify_conjunct, collect_colrefs,
@@ -396,6 +396,13 @@ fn add_equivalent_group_subs(
         walk_pruned(arena, e, &mut visit, 0)?;
     }
     Ok(())
+}
+
+/// Whether a bare name in ORDER BY/QUALIFY may be read as a SELECT-list alias: only when the
+/// input scope does not have it. An ambiguous name *is* an input column, several times over,
+/// and is left to input resolution to report (the rule `resolve_group_ref` uses too).
+fn is_alias_candidate(scope: &Scope, name: &str) -> bool {
+    matches!(scope.resolve(None, name), Err(e) if e.code != Code::AmbiguousColumn)
 }
 
 /// The name of an unaliased output column, at output position `pos`.
@@ -1427,6 +1434,9 @@ pub(super) fn bind_select_in(
     // --- Projection ---------------------------------------------------------
     let mut exprs = Vec::new();
     let mut schema = Vec::new();
+    // Per output column: whether its name comes from an explicit `AS` alias (see
+    // `output_alias_column`). Filled lazily; star columns are `false`.
+    let mut aliased: Vec<bool> = Vec::new();
     for item in &sel.items {
         match arena.get(item.expr) {
             Expr::Star { qualifier, columns, exclude, replace, rename } => {
@@ -1518,6 +1528,8 @@ pub(super) fn bind_select_in(
                     Some(a) => a.clone(),
                     None => output_name(arena, item.expr, schema.len()),
                 };
+                aliased.resize(schema.len(), false);
+                aliased.push(item.alias.is_some());
                 schema.push(Field::new(name, p.result_ty, true));
                 exprs.push(p);
             }
@@ -1527,6 +1539,7 @@ pub(super) fn bind_select_in(
     // How many columns `ORDER BY ALL` sorts by. It is settled here so the correlation key
     // columns (implementation hidden columns appended below) are not included.
     let projected = exprs.len();
+    aliased.resize(projected, false);
     // The correlation key columns are appended at the end of the output (in the non-aggregate
     // case; correlation with aggregation is completed on the early-return path above and never
     // reaches here). The caller (binding of a correlated scalar subquery / `EXISTS` / `IN`) uses
@@ -1573,10 +1586,12 @@ pub(super) fn bind_select_in(
         let mut q_refs = Vec::new();
         collect_colrefs(arena, q, &covered, &mut q_refs, 0)?;
         for (rid, qual, rname) in q_refs {
-            let out_hit = if qual.is_none() {
-                schema.iter().rposition(|f| {
-                    !f.name.is_empty() && eq_ascii_ci(f.name.as_bytes(), rname.as_bytes())
-                })
+            // A name resolves the way WHERE/HAVING resolve it: an input column first, and a
+            // SELECT-list alias only for a name the input does not have (DuckDB:
+            // `SELECT a*1 AS b, rank() OVER (...) FROM t QUALIFY b = 3` filters on the input
+            // `b`). An ambiguous input name is left to the input path, which reports it.
+            let out_hit = if qual.is_none() && is_alias_candidate(&scope, &rname) {
+                output_alias_column(&rname, &schema[..projected], &aliased)
             } else {
                 None
             };
@@ -1608,17 +1623,68 @@ pub(super) fn bind_select_in(
             keys.push((col, oa.desc, oa.nulls_first));
         }
     }
+    // ORDER BY terms that mix a SELECT-list alias with anything else (`ORDER BY x || id`,
+    // `length(x) + sum(id)`). Such a term cannot be compiled into the projection like other
+    // sort keys, because the alias names an *output* column; instead its alias-free parts are
+    // added to the projection as hidden columns and the term itself is compiled against the
+    // projection's output, straight into the sort key: `(key index, expr, substitutions)`.
+    let mut output_keys: Vec<(usize, ExprId, Vec<Substitution>)> = Vec::new();
     for o in &sel.order_by {
         // Only the projected columns are addressable. Everything appended after them
         // (correlation keys, QUALIFY helpers, earlier ORDER BY sort keys) is an
         // implementation detail that `ORDER BY <ordinal>` must not be able to reach.
-        let col = match order_output_column(arena, sel, o, &schema[..projected])? {
+        let col = match order_output_column(arena, sel, o, &schema[..projected], &aliased)? {
             Some(c) => c,
             None => {
-                let p = compile_with_subs(arena, &item_scope, params, &subs, o.expr)?;
-                schema.push(Field::new(String::new(), p.result_ty, true));
-                exprs.push(p);
-                exprs.len() - 1
+                // As in DuckDB, a name inside an ORDER BY expression is an input column when
+                // the input has it, and a SELECT-list alias only otherwise.
+                let mut refs = Vec::new();
+                collect_colrefs(arena, o.expr, &[], &mut refs, 0)?;
+                let mut ksubs: Vec<Substitution> = Vec::new();
+                for (rid, qual, name) in refs {
+                    if qual.is_some() || !is_alias_candidate(&scope, &name) {
+                        continue;
+                    }
+                    if let Some(c) = output_alias_column(&name, &schema[..projected], &aliased) {
+                        ksubs.push(Substitution { expr: rid, column: c, structural: false });
+                    }
+                }
+                if ksubs.is_empty() {
+                    let p = compile_with_subs(arena, &item_scope, params, &subs, o.expr)?;
+                    schema.push(Field::new(String::new(), p.result_ty, true));
+                    exprs.push(p);
+                    exprs.len() - 1
+                } else {
+                    let alias_ids: Vec<ExprId> = ksubs.iter().map(|k| k.expr).collect();
+                    walk_pruned(
+                        arena,
+                        o.expr,
+                        &mut |e| {
+                            if alias_ids.contains(&e) {
+                                return Ok(true);
+                            }
+                            let mut inner = Vec::new();
+                            collect_colrefs(arena, e, &[], &mut inner, 0)?;
+                            if inner.iter().any(|(r, _, _)| alias_ids.contains(r)) {
+                                return Ok(false);
+                            }
+                            // Reads no column: compiles against the output as it is.
+                            if inner.is_empty() && !contains_subquery(arena, e, 0) {
+                                return Ok(true);
+                            }
+                            let p = compile_with_subs(arena, &item_scope, params, &subs, e)?;
+                            schema.push(Field::new(String::new(), p.result_ty, true));
+                            exprs.push(p);
+                            let column = exprs.len() - 1;
+                            ksubs.push(Substitution { expr: e, column, structural: false });
+                            Ok(true)
+                        },
+                        0,
+                    )?;
+                    output_keys.push((keys.len(), o.expr, ksubs));
+                    // Not a projection column; always past `visible`.
+                    usize::MAX
+                }
             }
         };
         keys.push((col, o.desc, o.nulls_first));
@@ -1647,9 +1713,8 @@ pub(super) fn bind_select_in(
     node = Node::Project { input: Box::new(node), exprs, schema: project_schema.clone() };
     let project_scope = Scope::from_fields(project_schema);
 
-    // QUALIFY filters the projected rows. Unqualified names resolve to the
-    // last output column of that name (`* REPLACE`, a trailing `AS` that
-    // shadows a star column, `RENAME`), matching DuckDB.
+    // QUALIFY filters the projected rows. An unqualified name that the input does not have
+    // resolves to an output column (an alias, or a `RENAME`d star column), matching DuckDB.
     if let Some(q) = sel.qualify {
         let pred = compile_predicate_with_subs(arena, &project_scope, params, &qualify_subs, q)?;
         node = Node::Filter { input: Box::new(node), pred };
@@ -1684,12 +1749,12 @@ pub(super) fn bind_select_in(
     // --- Sorting ------------------------------------------------------------
     if !keys.is_empty() {
         let mut sort_keys = Vec::with_capacity(keys.len());
-        for (col, desc, nulls_first) in keys {
-            sort_keys.push(SortKey {
-                expr: column_program(&project_scope, col)?,
-                desc,
-                nulls_first,
-            });
+        for (k, (col, desc, nulls_first)) in keys.into_iter().enumerate() {
+            let expr = match output_keys.iter().find(|(i, _, _)| *i == k) {
+                Some((_, e, ksubs)) => compile_with_subs(arena, &project_scope, params, ksubs, *e)?,
+                None => column_program(&project_scope, col)?,
+            };
+            sort_keys.push(SortKey { expr, desc, nulls_first });
         }
         // `ORDER BY ... LIMIT n OFFSET k` only needs to hold the top n+k. Lowering to a Top-N
         // avoids buffering everything. With DISTINCT ON (or DISTINCT that must wait until
