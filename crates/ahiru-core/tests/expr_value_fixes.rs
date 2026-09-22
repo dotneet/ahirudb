@@ -181,3 +181,45 @@ fn printf_precision() {
     assert_eq!(text(&mut s, "printf('%.0s|', 'abc')"), "|");
     assert_eq!(text(&mut s, "printf('%.3d|', 5)"), "005|");
 }
+
+#[test]
+fn bit_count_counts_within_the_declared_width() {
+    let mut s = session_with_basic();
+    for (expr, want) in [
+        ("bit_count((-1)::TINYINT)", "8"),
+        ("bit_count((-1)::SMALLINT)", "16"),
+        ("bit_count((-1)::INTEGER)", "32"),
+        ("bit_count((-1)::BIGINT)", "64"),
+        ("bit_count(255::UTINYINT)", "8"),
+        ("bit_count(18446744073709551615::UBIGINT)", "64"),
+        ("bit_count(7)", "3"),
+        // DuckDB returns this in a TINYINT, where 128 wraps to -128; the count itself is 128.
+        ("bit_count((-1)::HUGEINT)", "128"),
+    ] {
+        assert_eq!(text(&mut s, expr), want, "{expr}");
+    }
+}
+
+#[test]
+fn hex_of_a_blob_dumps_its_raw_bytes() {
+    let mut s = session_with_basic();
+    assert_eq!(text(&mut s, r"hex('\xDE\xAD'::BLOB)"), "DEAD");
+    assert_eq!(text(&mut s, r"hex('\x00A'::BLOB)"), "0041");
+    assert_eq!(text(&mut s, "hex('ab')"), "6162");
+}
+
+#[test]
+fn integer_division_under_a_guard_stays_inline() {
+    // `//` returns NULL on a zero divisor instead of raising, so it needs no lazy sub-program.
+    let mut s = session_with_basic();
+    let rows = run(&mut s, "SELECT sum(CASE WHEN i > 0 THEN 10 // i END) FROM range(3) t(i)");
+    assert_eq!(text_of(&rows[0][0]), "15");
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::I64(x) => x.to_string(),
+        Value::I128(x) => x.to_string(),
+        other => panic!("not an integer: {other:?}"),
+    }
+}

@@ -68,7 +68,19 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
             }
         }
         F_BIT_XOR => Some(a.int(0) ^ a.int(1)),
-        F_BIT_COUNT => Some(a.int(0).count_ones() as i64),
+        F_BIT_COUNT => {
+            // Count within the argument's declared width, so a negative narrow integer
+            // doesn't pick up the sign-extension bits of its I32/I64 lane.
+            let x = a.i128(0) as u128;
+            let bits = match a.at(0).map(|(v, _)| v.ty()) {
+                Some(Ty::TinyInt | Ty::UTinyInt) => x & 0xff,
+                Some(Ty::SmallInt | Ty::USmallInt) => x & 0xffff,
+                Some(Ty::Int | Ty::UInt) => x & 0xffff_ffff,
+                Some(Ty::HugeInt) => x,
+                _ => x & u64::MAX as u128,
+            };
+            Some(bits.count_ones() as i64)
+        }
         // Always non-negative, matching DuckDB (`select gcd(-4, 6)` -> `2`).
         F_GCD => gcd(a.int(0), a.int(1)),
         F_LCM => {

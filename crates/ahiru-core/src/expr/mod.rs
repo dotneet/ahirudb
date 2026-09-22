@@ -351,9 +351,9 @@ impl Program {
     pub fn may_raise(&self) -> bool {
         use OpCode::*;
         self.instrs.iter().any(|i| match i.op {
-            LoadCol | LoadConst | Add | Sub | Mul | Div | Mod | Neg | Eq | Ne | Lt | Le | Gt
-            | Ge | And | Or | Not | IsNull | IsNotNull | TryCast | Like | Concat | Select
-            | Coalesce | TsAddInterval | IntervalAdd | IntervalNeg | IntervalMul => false,
+            LoadCol | LoadConst | Add | Sub | Mul | Div | IntDiv | Mod | Neg | Eq | Ne | Lt
+            | Le | Gt | Ge | And | Or | Not | IsNull | IsNotNull | TryCast | Like | Concat
+            | Select | Coalesce | TsAddInterval | IntervalAdd | IntervalNeg | IntervalMul => false,
             Cast => self.casts.get(i.aux as usize).is_none_or(|c| {
                 !(c.to == Ty::Varchar
                     || c.from == Ty::Null

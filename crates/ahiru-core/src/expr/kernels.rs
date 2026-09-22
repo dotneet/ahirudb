@@ -1151,9 +1151,9 @@ pub(crate) fn fmt_int(mut u: u128, neg: bool, scale: u8, out: &mut Vec<u8>) {
 ///
 /// Non-finite values are spelled `nan` / `inf` / `-inf`, matching DuckDB
 /// (`duckdb -csv -c "SELECT 'inf'::DOUBLE"` prints `inf`). They are deliberately *not*
-/// the writers' spellings: CSV writes `NaN` / `Infinity` / `-Infinity` and JSONL writes
-/// those as quoted JSON strings, because each of those formats has its own reader to
-/// satisfy. `parse_special_f64` is case-insensitive and accepts every one of these
+/// always the writers' spellings: CSV writes `NaN` / `inf` / `-inf` and JSONL writes
+/// `"nan"` / `"inf"` / `"-inf"` as quoted JSON strings, because each of those formats has
+/// its own reader to satisfy. `parse_special_f64` is case-insensitive and accepts every one of these
 /// spellings, so `CAST(CAST(x AS VARCHAR) AS DOUBLE)` round-trips whichever is used.
 ///
 /// Public so a host can spell a DOUBLE exactly the way `CAST(x AS VARCHAR)` does. The

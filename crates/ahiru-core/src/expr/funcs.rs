@@ -453,6 +453,10 @@ pub fn resolve_const(
             ensure!(n == 1, WrongArgCount);
             if args[0].is_integer() {
                 Ok((F_TO_HEX, vec![args[0]], Varchar))
+            } else if args[0] == Blob {
+                // A BLOB is dumped as its raw bytes. Coercing it to VARCHAR first would dump
+                // its escaped text form (`\xDE\xAD` -> `5C7844...` instead of `DEAD`).
+                Ok((F_HEX, vec![Blob], Varchar))
             } else {
                 Ok((F_HEX, vec![Varchar], Varchar))
             }
@@ -580,7 +584,13 @@ pub fn resolve_const(
         "isfinite" => fixed(F_ISFINITE, &[Double], n, 1, Boolean),
         "gcd" | "greatest_common_divisor" => fixed(F_GCD, &[BigInt, BigInt], n, 2, BigInt),
         "lcm" | "least_common_multiple" => fixed(F_LCM, &[BigInt, BigInt], n, 2, BigInt),
-        "bit_count" => fixed(F_BIT_COUNT, &[BigInt], n, 1, BigInt),
+        // An integer argument keeps its own type so the bits are counted at its declared
+        // width (`bit_count(-1::TINYINT)` is 8, as in DuckDB, not 64).
+        "bit_count" => {
+            ensure!(n == 1, WrongArgCount);
+            let t = if args[0].is_integer() { args[0] } else { BigInt };
+            Ok((F_BIT_COUNT, vec![t], BigInt))
+        }
         "xor" => fixed(F_BIT_XOR, &[BigInt, BigInt], n, 2, BigInt),
         // The desugaring target of `&`/`|`/`<<`/`>>`/prefix `~` (see `sql::parser`).
         "bit_and" => fixed(F_BIT_AND, &[BigInt, BigInt], n, 2, BigInt),
