@@ -14,6 +14,11 @@
 //! conversion error. An empty (unquoted) field keeps its NULL meaning, since that is the only way
 //! CSV can spell NULL at all.
 //!
+//! Whether the first record is a header is detected from the same sample, the way DuckDB's
+//! sniffer does it (`has_header`): a first record whose values all fit the types the rest of the
+//! sample infers is data, and the columns get generated names. Blank lines before it are skipped.
+//! The decision fixes `data_start` once, in `resolve`, so every split agrees on it.
+//!
 //! The same rule governs malformed records: a row with **more** fields than the header, and any
 //! byte between a closing quote and the next delimiter / line terminator, are `SyntaxError` rather
 //! than data silently thrown away. A row with **fewer** fields is NULL-padded (DuckDB's
@@ -257,8 +262,13 @@ impl TableFormat for CsvFormat {
                 }
             }
 
-            // --- The header row -------------------------------------------------
+            // --- The first record (a header, or the first data row) --------------
             let mut sc = Scanner::new(body, self.delimiter).with_cr_term(self.cr_term);
+            // Blank (or all-space) lines before the first record are skipped, as DuckDB does:
+            // taking an empty line as the header turned `\nid\n1\n` into a one-column table
+            // named `column0` whose first "row" was the real header.
+            sc.skip_leading_blank_lines();
+            let first_start = sc.pos();
             let mut raw: Vec<Vec<u8>> = Vec::new();
             let mut scratch = Vec::new();
             let terminated = loop {
@@ -277,16 +287,6 @@ impl TableFormat for CsvFormat {
                 ensure!(self.grow_sample(src.total_len), LimitExceeded);
                 continue;
             }
-            self.data_start = bom as u64 + header_end as u64;
-
-            let names = column_names(&raw);
-
-            // `num_splits` returns a `usize` because the execution layer indexes
-            // splits with `usize`. Reject a remote file whose split count cannot
-            // be represented instead of truncating the u64 division on 32-bit
-            // WASM (or after a caller intentionally chooses a tiny test split).
-            let split_count = self.data_len().div_ceil(self.chunk_size());
-            ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
 
             // --- Type inference ---------------------------------------------------
             // Cut at the last line terminator so a truncated trailing record does not enter the inference.
@@ -301,15 +301,14 @@ impl TableFormat for CsvFormat {
             } else {
                 whole_rest
             };
-            if rest.is_empty() && partial && self.data_len() > 0 && self.grow_sample(src.total_len)
-            {
+            if rest.is_empty() && partial && self.grow_sample(src.total_len) {
                 // Not one complete data record fits the sample, so every column would come out
                 // VARCHAR for lack of any evidence at all. Ask for more first (the same growth the
                 // header uses); once the ceiling is reached, fall through and infer from nothing.
                 continue;
             }
 
-            let mut cands = vec![Cand::Empty; names.len()];
+            let mut cands = vec![Cand::Empty; raw.len()];
             let blank_is_row = Self::blank_line_is_a_row(cands.len());
             let mut sc = Scanner::new(rest, self.delimiter).with_cr_term(self.cr_term);
             let mut rows = 0;
@@ -326,11 +325,7 @@ impl TableFormat for CsvFormat {
                         Err(_) => break 'sample,
                     };
                     if let Some(slot) = cands.get_mut(fi) {
-                        let v = field_value(rest, &f, &mut scratch);
-                        // An empty cell is treated as NULL, so it does not count as evidence for a type.
-                        if !v.is_empty() {
-                            *slot = widen(*slot, classify(v));
-                        }
+                        *slot = widen(*slot, classify_cell(field_value(rest, &f, &mut scratch)));
                     }
                     fi += 1;
                     if f.term != Term::Field {
@@ -339,6 +334,29 @@ impl TableFormat for CsvFormat {
                 }
                 rows += 1;
             }
+
+            // --- Header detection -------------------------------------------------
+            let first: Vec<Cand> = raw.iter().map(|v| classify_cell(v)).collect();
+            let header = has_header(&first, &cands, rows);
+            let names = if header {
+                column_names(&raw)
+            } else {
+                // The first record is data: it joins the inference, and the columns get the
+                // generated names DuckDB gives a headerless file.
+                for (c, f) in cands.iter_mut().zip(&first) {
+                    *c = widen(*c, *f);
+                }
+                (0..raw.len()).map(generated_name).collect()
+            };
+            let data_start = if header { header_end } else { first_start };
+            self.data_start = (bom + data_start) as u64;
+
+            // `num_splits` returns a `usize` because the execution layer indexes
+            // splits with `usize`. Reject a remote file whose split count cannot
+            // be represented instead of truncating the u64 division on 32-bit
+            // WASM (or after a caller intentionally chooses a tiny test split).
+            let split_count = self.data_len().div_ceil(self.chunk_size());
+            ensure!(usize::try_from(split_count).is_ok(), LimitExceeded);
 
             // CSV has no way to express NOT NULL, so every column is nullable.
             self.no_evidence = cands.iter().map(|c| *c == Cand::Empty).collect();
@@ -562,6 +580,37 @@ fn column_names(raw: &[Vec<u8>]) -> Vec<String> {
     out
 }
 
+/// Decides whether the first record is a header, the way DuckDB's sniffer does.
+///
+/// `first` is the first record's own classification, `rest` the types inferred from the `rows`
+/// sampled records after it. The first record is **data** when it is type-consistent with the
+/// rest -- every non-empty first-row value fits its column's sampled type (anything fits VARCHAR;
+/// nothing but an empty value fits a column whose sampled values are all empty, so `1,2\n,\n`
+/// has a header, as in DuckDB) -- and at least one column actually has a non-VARCHAR type to be
+/// consistent with. With every column VARCHAR there is no evidence either way, and the first line
+/// stays the header (the common `name,city` case). An all-empty first record is a header too
+/// (DuckDB reads `,\n1,2\n` as two rows under generated names).
+///
+/// A file of one record (`rows == 0`) has nothing to compare against, so its own values decide:
+/// `1,2` is a data row (DuckDB reads it as one row), `a,b` a header-only file.
+///
+/// There is no `header=` option to override the guess: the SQL reader functions take a path only
+/// (see `FromItem::File`). A file whose header looks like data -- every name a number, say -- is
+/// read as headerless here exactly as it is in DuckDB.
+fn has_header(first: &[Cand], rest: &[Cand], rows: usize) -> bool {
+    let typed = |c: &Cand| !matches!(c, Cand::Empty | Cand::Text);
+    if first.iter().all(|c| *c == Cand::Empty) {
+        return true;
+    }
+    if rows == 0 {
+        return !first.iter().any(typed);
+    }
+    // `widen` leaves VARCHAR as it is and turns an all-empty column into the first row's own
+    // type, so "fits" is exactly "does not change the sampled type".
+    let consistent = rest.iter().zip(first).all(|(r, f)| *f == Cand::Empty || widen(*r, *f) == *r);
+    !(consistent && rest.iter().any(typed))
+}
+
 /// Builds `column0`, `column1`, and so on. `format!` is unavailable, so the digits are written by hand.
 fn generated_name(i: usize) -> String {
     let mut s = String::from("column");
@@ -658,38 +707,85 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Skips blank lines -- empty, or holding nothing but spaces -- at the current position.
+    ///
+    /// Used only before the first record, where DuckDB skips them too. Between records a blank
+    /// line keeps its meaning (see `CsvFormat::blank_line_is_a_row`).
+    fn skip_leading_blank_lines(&mut self) {
+        loop {
+            let at = self.p;
+            while self.buf.get(self.p).is_some_and(|&c| is_pad(c, self.delim)) {
+                self.p += 1;
+            }
+            if !self.skip_blank_line() {
+                self.p = at;
+                return;
+            }
+        }
+    }
+
     /// Scans one field.
     ///
     /// RFC 4180: a field starting with `"` is quoted, an inner `""` is one `"`, and the delimiter,
     /// `\n`, and `\r` become part of the value. **A newline inside quotes is not a line
     /// terminator**.
+    ///
+    /// Spaces before the opening quote and after the closing one are padding, as DuckDB reads
+    /// them (`1, "x" ,2` is `1`, `x`, `2`). Two fallbacks keep that from turning readable input
+    /// into an error, reading the field literally (as an unquoted field) instead:
+    ///
+    /// - When padding preceded the quote and the quoted reading fails, since such a field was
+    ///   always read literally before (`1, "x"y`).
+    /// - In a TSV file, when any quoted reading fails. A tab-separated file rarely quotes at all,
+    ///   so a `"` opening a field that never closes properly (`"hello<TAB>1`) is a literal
+    ///   character, as it is in DuckDB -- not a syntax error. A properly quoted TSV field
+    ///   (`"x<TAB>y"<TAB>1`) is still unquoted as usual. A CSV field keeps the strict reading, so
+    ///   `"x"junk,1` stays an error there (see `skip_to_term`).
     fn field(&mut self) -> Result<Span> {
-        if self.buf.get(self.p) == Some(&b'"') {
-            self.p += 1;
-            let start = self.p;
-            let mut escaped = false;
-            loop {
-                match self.buf.get(self.p) {
-                    // An unclosed quote. Without cutting off here the whole remainder would be held
-                    // as one cell, so it is a syntax error.
-                    None => err!(SyntaxError, self.p),
-                    Some(&b'"') => {
-                        if self.buf.get(self.p + 1) == Some(&b'"') {
-                            escaped = true;
-                            self.p += 2;
-                        } else {
-                            let end = self.p;
-                            self.p += 1;
-                            let term = self.skip_to_term()?;
-                            return Ok(Span { start, end, quoted: true, escaped, term });
-                        }
-                    }
-                    Some(_) => self.p += 1,
-                }
+        let start = self.p;
+        let mut q = start;
+        while self.buf.get(q) == Some(&b' ') {
+            q += 1;
+        }
+        if self.buf.get(q) == Some(&b'"') {
+            match self.quoted(q) {
+                Ok(span) => return Ok(span),
+                Err(e) if q == start && self.delim != b'\t' => return Err(e),
+                Err(_) => self.p = start,
             }
         }
+        self.unquoted(start)
+    }
 
+    /// Scans a quoted field whose opening quote is at `q`.
+    fn quoted(&mut self, q: usize) -> Result<Span> {
+        self.p = q + 1;
         let start = self.p;
+        let mut escaped = false;
+        loop {
+            match self.buf.get(self.p) {
+                // An unclosed quote. Without cutting off here the whole remainder would be held
+                // as one cell, so it is a syntax error.
+                None => err!(SyntaxError, self.p),
+                Some(&b'"') => {
+                    if self.buf.get(self.p + 1) == Some(&b'"') {
+                        escaped = true;
+                        self.p += 2;
+                    } else {
+                        let end = self.p;
+                        self.p += 1;
+                        let term = self.skip_to_term()?;
+                        return Ok(Span { start, end, quoted: true, escaped, term });
+                    }
+                }
+                Some(_) => self.p += 1,
+            }
+        }
+    }
+
+    /// Scans an unquoted field starting at `start`.
+    fn unquoted(&mut self, start: usize) -> Result<Span> {
+        self.p = start;
         while let Some(&c) = self.buf.get(self.p) {
             if c == self.delim {
                 let end = self.p;
@@ -739,7 +835,14 @@ impl<'a> Scanner<'a> {
     /// such bytes used to be discarded: `"x"junk,1` read as `x`, silently losing `junk` (and, for
     /// the far more common cause -- a quote in the middle of an unquoted value -- silently losing
     /// the rest of the field). DuckDB rejects the row, and so does this.
+    ///
+    /// Spaces and tabs (other than the delimiter) are the one exception: `1,"x" ` is a common
+    /// artifact of hand-edited or column-aligned files, carries no data, and DuckDB reads it as
+    /// `1,x`, so the padding is skipped.
     fn skip_to_term(&mut self) -> Result<Term> {
+        while self.buf.get(self.p).is_some_and(|&c| is_pad(c, self.delim)) {
+            self.p += 1;
+        }
         match self.buf.get(self.p) {
             None => Ok(Term::Eof),
             Some(&c) if c == self.delim => {
@@ -761,6 +864,22 @@ impl<'a> Scanner<'a> {
             _ => err!(SyntaxError, self.p),
         }
     }
+}
+
+/// Whether `c` is padding around a value: a space, or a tab that is not the delimiter.
+fn is_pad(c: u8, delim: u8) -> bool {
+    (c == b' ' || c == b'\t') && c != delim
+}
+
+/// `v` without its leading and trailing spaces and tabs.
+///
+/// Only a non-VARCHAR reading trims: DuckDB types `1, 2` as BIGINT, while a VARCHAR column keeps
+/// its value byte for byte.
+fn trim_pad(v: &[u8]) -> &[u8] {
+    let pad = |c: &u8| *c == b' ' || *c == b'\t';
+    let s = v.iter().position(|c| !pad(c)).unwrap_or(v.len());
+    let e = v.iter().rposition(|c| !pad(c)).map_or(s, |i| i + 1);
+    &v[s..e]
 }
 
 /// Whether `b` contains a `\r` that is not the first half of a `\r\n` pair.
@@ -853,6 +972,17 @@ fn is_zero_padded(v: &[u8]) -> bool {
         _ => v,
     };
     matches!((ds.first(), ds.get(1)), (Some(b'0'), Some(d)) if d.is_ascii_digit())
+}
+
+/// Classifies one cell for inference. Padding is ignored (see `trim_pad`), and an empty cell is
+/// NULL, so it is no evidence for any type.
+fn classify_cell(v: &[u8]) -> Cand {
+    let v = trim_pad(v);
+    if v.is_empty() {
+        Cand::Empty
+    } else {
+        classify(v)
+    }
 }
 
 fn classify(v: &[u8]) -> Cand {
@@ -1170,8 +1300,13 @@ impl ColBuf {
     /// from a bounded leading sample, so a later row can genuinely fall outside it -- but turning
     /// that cell into NULL loses data the file plainly contains, without a word to the caller.
     /// DuckDB reports the same situation as a conversion error, and suggests widening the sample.
+    ///
+    /// A non-VARCHAR value is read without its padding (`trim_pad`), matching the inference; a
+    /// padding-only cell there is NULL like an empty one.
     fn push(&mut self, v: &[u8], quoted: bool) -> Result<()> {
-        if v.is_empty() && (!quoted || !matches!(self.data, Data::Bytes(_))) {
+        let text = matches!(self.data, Data::Bytes(_));
+        let v = if text { v } else { trim_pad(v) };
+        if v.is_empty() && (!quoted || !text) {
             self.push_null();
             return Ok(());
         }
@@ -1344,6 +1479,86 @@ mod tests {
         let (f, _) = open(b"a,b", b',');
         assert_eq!(names(&f), vec!["a", "b"]);
         assert_eq!(f.num_splits(), 0);
+    }
+
+    #[test]
+    fn a_first_row_that_fits_the_data_types_is_data_not_a_header() {
+        // `1,2\n3,4\n5,6\n` used to lose its first row to the header. DuckDB's sniffer reads it
+        // as three rows under generated names, since `1`/`2` fit the BIGINT the rest infers.
+        let text = b"1,2\n3,4\n5,6\n";
+        let (f, src) = open(text, b',');
+        assert_eq!(names(&f), vec!["column0", "column1"]);
+        assert_eq!(types(&f), vec![Ty::BigInt, Ty::BigInt]);
+        let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(3), Value::I64(5)]);
+        assert_eq!(got[1], vec![Value::I64(2), Value::I64(4), Value::I64(6)]);
+        // The first record belongs to split 0 however the data is cut.
+        for size in 1..=7u64 {
+            let (f, src) = open_split(text, b',', size);
+            assert_eq!(read_all(&f, &src, &[0])[0].len(), 3, "split_bytes={size}");
+        }
+
+        // One consistent VARCHAR column does not spoil it (`a,1` fits VARCHAR, BIGINT) ...
+        let (f, _) = open(b"a,1\nb,2\n", b',');
+        assert_eq!(names(&f), vec!["column0", "column1"]);
+        // ... and the first row joins the inference like any other.
+        let (f, src) = open(b"1\n2.5\n3\n", b',');
+        assert_eq!(names(&f), vec!["column0"]);
+        assert_eq!(types(&f), vec![Ty::Double]);
+        assert_eq!(read_all(&f, &src, &[0])[0][0], Value::F64(1.0));
+        // An empty first-row value fits anything.
+        let (f, src) = open(b"1,\n2,\n", b',');
+        assert_eq!(names(&f), vec!["column0", "column1"]);
+        assert_eq!(read_all(&f, &src, &[0])[0], vec![Value::I64(1), Value::I64(2)]);
+        // A one-record file decides from its own values: a number means data.
+        let (f, src) = open(b"1,x\n", b',');
+        assert_eq!(names(&f), vec!["column0", "column1"]);
+        assert_eq!(read_all(&f, &src, &[1])[0], vec![Value::Bytes(b"x".to_vec())]);
+        // A BOM, and blank lines before the first record, stay out of the data.
+        let (f, src) = open("\u{feff}\n7\n8\n".as_bytes(), b',');
+        assert_eq!(read_all(&f, &src, &[0])[0], vec![Value::I64(7), Value::I64(8)]);
+    }
+
+    #[test]
+    fn a_first_row_that_does_not_fit_is_the_header() {
+        // A name that does not fit its column's type.
+        let (f, _) = open(b"id,v\n1,2\n", b',');
+        assert_eq!(names(&f), vec!["id", "v"]);
+        let (f, _) = open(b"1.5,2\n3,4\n", b',');
+        assert_eq!(names(&f), vec!["1.5", "2"]);
+        // Every column VARCHAR: no evidence either way, so the first line stays the header.
+        let (f, src) = open(b"a,b\nx,y\nz,w\n", b',');
+        assert_eq!(names(&f), vec!["a", "b"]);
+        assert_eq!(read_all(&f, &src, &[0])[0].len(), 2);
+        // A column whose sampled data is all empty fits only an empty first-row value (DuckDB
+        // reads `1,2\n,\n` with `1`/`2` as the names, and `x,1\n,2\n` with `x`/`1`).
+        let (f, _) = open(b"1,2\n,\n", b',');
+        assert_eq!(names(&f), vec!["1", "2"]);
+        let (f, _) = open(b"x,1\n,2\n", b',');
+        assert_eq!(names(&f), vec!["x", "1"]);
+        // An all-empty first record is a header, whose names are generated.
+        let (f, src) = open(b",\n1,2\n3,4\n", b',');
+        assert_eq!(names(&f), vec!["column0", "column1"]);
+        assert_eq!(read_all(&f, &src, &[0])[0], vec![Value::I64(1), Value::I64(3)]);
+        // A header-only file with no numbers in it.
+        let (f, _) = open(b"x,y\n", b',');
+        assert_eq!(names(&f), vec!["x", "y"]);
+        assert_eq!(f.num_splits(), 0);
+    }
+
+    #[test]
+    fn blank_lines_before_the_header_are_skipped() {
+        // DuckDB skips them; the empty first line used to become the (one-column) header.
+        for text in [&b"\nid\n1\n2\n"[..], b"\n\n id\n1\n2\n", b"  \r\n\r\nid\r\n1\r\n2\r\n"] {
+            let (f, src) = open(text, b',');
+            assert_eq!(types(&f), vec![Ty::BigInt]);
+            assert_eq!(read_all(&f, &src, &[0])[0], vec![Value::I64(1), Value::I64(2)]);
+        }
+        let (f, _) = open(b"\nid\n1\n", b',');
+        assert_eq!(names(&f), vec!["id"]);
+        let (f, src) = open(b"\n\na,b\n1,2\n", b',');
+        assert_eq!(names(&f), vec!["a", "b"]);
+        assert_eq!(read_all(&f, &src, &[1])[0], vec![Value::I64(2)]);
     }
 
     #[test]
@@ -2049,6 +2264,63 @@ mod tests {
         let got = read_all(&g, &gsrc, &[0, 1]);
         assert_eq!(text(&got[0][0]), "x");
         assert_eq!(got[1][0], Value::I64(1));
+    }
+
+    #[test]
+    fn padding_around_a_quoted_field_is_not_data() {
+        // DuckDB reads `1,"x" ` and `1, "x"` as `1,x`; the first used to be a syntax error and
+        // the second kept the quotes as data.
+        for body in
+            [&b"1,\"x\" \n2,\"y\"\t\n"[..], b"1, \"x\"\n2,  \"y\"  \n", b"1,\"x\"\r\n2,\"y\" \r\n"]
+        {
+            let mut csv = b"a,b\n".to_vec();
+            csv.extend_from_slice(body);
+            let (f, src) = open(&csv, b',');
+            let got = read_all(&f, &src, &[0, 1]);
+            assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+            assert_eq!(text(&got[1][0]), "x");
+            assert_eq!(text(&got[1][1]), "y");
+        }
+        // Padding before a quote whose field then does not close properly is read literally, as
+        // it always was, rather than turned into an error.
+        let (f, src) = open(b"a,b\n1, \"x\"y\n", b',');
+        assert_eq!(text(&read_all(&f, &src, &[1])[0][0]), " \"x\"y");
+    }
+
+    #[test]
+    fn padded_numbers_are_numbers() {
+        // DuckDB types `1, 2` as BIGINT (sum 6 here); the space used to make the column VARCHAR.
+        let (f, src) = open(b"a,b,c\n1, 2, 2020-01-02 \n3 ,4,\n", b',');
+        assert_eq!(types(&f), vec![Ty::BigInt, Ty::BigInt, Ty::Date]);
+        let got = read_all(&f, &src, &[0, 1, 2]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(3)]);
+        assert_eq!(got[1], vec![Value::I64(2), Value::I64(4)]);
+        assert_eq!(got[2][1], Value::Null);
+        // A VARCHAR column keeps its value byte for byte.
+        let (f, src) = open(b"a,b\n x ,1\n", b',');
+        assert_eq!(text(&read_all(&f, &src, &[0])[0][0]), " x ");
+        // A padding-only cell in a typed column is NULL, like an empty one.
+        let (f, src) = open(b"a\n1\n  \n", b',');
+        assert_eq!(read_all(&f, &src, &[0])[0], vec![Value::I64(1), Value::Null]);
+    }
+
+    #[test]
+    fn a_stray_quote_in_tsv_is_literal() {
+        // TSV rarely quotes, and DuckDB reads `"hello<TAB>1` as the text `"hello`; it used to be a
+        // syntax error (an unclosed quote).
+        let (f, src) = open(b"a\tb\n\"hello\t1\nx\t2\n\"y\t3\n", b'\t');
+        assert_eq!(types(&f), vec![Ty::Varchar, Ty::BigInt]);
+        let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(text(&got[0][0]), "\"hello");
+        assert_eq!(text(&got[0][1]), "x");
+        assert_eq!(text(&got[0][2]), "\"y");
+        assert_eq!(got[1], vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
+        // A properly quoted TSV field is still unquoted, delimiter and all.
+        let (f, src) = open(b"a\tb\n\"x\ty\"\t1\n", b'\t');
+        assert_eq!(text(&read_all(&f, &src, &[0])[0][0]), "x\ty");
+        // CSV keeps the strict reading.
+        let (f, src) = open(b"a,b\n\"hello,1\n", b',');
+        assert!(f.read_split(&src, 0, &[0, 1]).is_err());
     }
 
     #[test]

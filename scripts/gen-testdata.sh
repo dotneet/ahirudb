@@ -570,6 +570,16 @@ COPY (SELECT * FROM (VALUES
 ) AS t(id, iv))
 TO 'interval.parquet' (FORMAT PARQUET);"
 
+# INTERVAL and JSON leaves inside LIST / list-carrying STRUCT, plus a top-level
+# JSON column (the JSON logical type), to check how nested leaves render.
+duckdb -c "
+COPY (SELECT 1::INTEGER AS id,
+             [INTERVAL 2 HOUR, INTERVAL '13 months 5 days'] AS ivs,
+             {'d': [INTERVAL 1 DAY]} AS s,
+             '{\"a\":1}'::JSON AS j,
+             ['{\"b\":[2]}'::JSON, NULL] AS js)
+TO 'interval_json.parquet' (FORMAT PARQUET);"
+
 # --- For the browser demo (the cross-format JOIN sample in demo/app.js) ----
 # customers is Parquet; orders.csv/regions.jsonl are hand-written plain text
 # (no reason to build them with duckdb, so they are not included here).
