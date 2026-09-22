@@ -160,25 +160,27 @@ fn fmt_time(micros: i64) -> String {
     }
     let rem = micros.rem_euclid(86_400_000_000);
     let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
-    let subsec = rem % 1_000_000;
-    if subsec != 0 {
-        format!("{h:02}:{mi:02}:{s:02}.{subsec:06}")
-    } else {
-        format!("{h:02}:{mi:02}:{s:02}")
+    format!("{h:02}:{mi:02}:{s:02}{}", fmt_fraction(rem % 1_000_000))
+}
+
+/// `.ffffff` with trailing zeros dropped (`.5`, not `.500000`), the same as
+/// `CAST(... AS VARCHAR)` in the core and DuckDB's display. Empty for a whole second.
+fn fmt_fraction(subsec: i64) -> String {
+    if subsec == 0 {
+        return String::new();
     }
+    let digits = format!("{subsec:06}");
+    format!(".{}", digits.trim_end_matches('0'))
 }
 
 fn fmt_timestamp(micros: i64) -> String {
     let days = micros.div_euclid(86_400_000_000);
     let rem = micros.rem_euclid(86_400_000_000);
-    let (y, m, d) = civil_from_days(days);
+    // The date part goes through `fmt_date` so a negative year pads its digits, not the
+    // sign (`-0015-01-01 ...`, as `CAST(... AS VARCHAR)` and the COPY writers give).
+    let date = fmt_date(days);
     let (h, mi, s) = (rem / 3_600_000_000, rem / 60_000_000 % 60, rem / 1_000_000 % 60);
-    let subsec = rem % 1_000_000;
-    if subsec != 0 {
-        format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}.{subsec:06}")
-    } else {
-        format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
-    }
+    format!("{date} {h:02}:{mi:02}:{s:02}{}", fmt_fraction(rem % 1_000_000))
 }
 
 /// Turns a 16-byte UUID into `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
@@ -236,6 +238,27 @@ mod tests {
         assert_eq!(render(&Value::I32(day(-100, 3, 4) as i32), Ty::Date, "NULL"), "-0100-03-04");
         assert_eq!(render(&Value::I32(day(2024, 5, 5) as i32), Ty::Date, "NULL"), "2024-05-05");
         assert_eq!(render(&Value::I32(day(1, 1, 1) as i32), Ty::Date, "NULL"), "0001-01-01");
+
+        // TIMESTAMP and TIMESTAMPTZ had the same `{y:04}` bug: `-015-01-01 00:00:00`.
+        let micros = |y, m, d| day(y, m, d) * 86_400_000_000;
+        assert_eq!(
+            render(&Value::I64(micros(-15, 1, 1)), Ty::Timestamp, "NULL"),
+            "-0015-01-01 00:00:00"
+        );
+        assert_eq!(
+            render(&Value::I64(micros(-15, 1, 1) + 500_000), Ty::Timestamptz, "NULL"),
+            "-0015-01-01 00:00:00.5+00"
+        );
+        assert_eq!(
+            render(&Value::I64(micros(2024, 5, 5)), Ty::Timestamp, "NULL"),
+            "2024-05-05 00:00:00"
+        );
+        assert_eq!(
+            render(&Value::I64(micros(2024, 5, 5) + 123_000), Ty::Timestamp, "NULL"),
+            "2024-05-05 00:00:00.123"
+        );
+        assert_eq!(render(&Value::I64(250_000), Ty::Time, "NULL"), "00:00:00.25");
+        assert_eq!(render(&Value::I64(1), Ty::Time, "NULL"), "00:00:00.000001");
     }
 
     /// FLOAT and DOUBLE share one physical `f64`, so a FLOAT used to be rendered with

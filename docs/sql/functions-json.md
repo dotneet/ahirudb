@@ -117,7 +117,7 @@ SELECT list_reverse([1, 2, 3]);              -- '[3,2,1]'
 `list_contains`/`list_position` serialize the search value to JSON text and
 compare it byte-wise against each element — the same equality `JSON` values
 already use here (see
-[limitations.md](limitations.md#json-equality-is-byte-comparison)). Both
+[limitations.md](limitations.md#partially-supported)). Both
 return `NULL` when the first argument is not an array at all.
 
 `list_sort` has to impose an order on an untyped representation, so it

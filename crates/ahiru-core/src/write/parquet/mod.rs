@@ -51,19 +51,17 @@
 //! | INTERVAL | BYTE_ARRAY + `STRING` (see below) |
 //! | NULL | INT32 + `UNKNOWN`, all values NULL |
 //!
-//! Two of those are not round-trip exact, and both are deliberate:
+//! One of those is not round-trip exact, deliberately (JSON is: the reader
+//! maps the `JSON` logical type back to JSON):
 //!
 //! - **INTERVAL** is written as its text rendering (`fmt_interval`, the
 //!   same form the CSV/JSONL sinks use) rather than the FLBA(12) legacy
-//!   `INTERVAL` converted type. The legacy encoding cannot represent the
-//!   month/day/micros triple's signs, and this crate's own reader rejects
-//!   it outright (`parquet::schema::map_converted`), so writing it would
-//!   produce files we could not read back. Reading the export back gives
-//!   VARCHAR.
-//! - **JSON** reads back as VARCHAR, because the reader maps the `JSON`
-//!   logical type to VARCHAR (its in-memory form is JSON text either way).
+//!   `INTERVAL` converted type. The legacy encoding holds unsigned
+//!   months/days/milliseconds, so it cannot represent the month/day/micros
+//!   triple's signs or sub-millisecond precision, and writing it would
+//!   silently lose data. Reading the export back gives VARCHAR.
 //!
-//! A third case is decided per column rather than per type: a VARCHAR whose
+//! A second case is decided per column rather than per type: a VARCHAR whose
 //! values are **not valid UTF-8** loses the `STRING`/`UTF8` annotation and is
 //! written as a plain BYTE_ARRAY, so it reads back as BLOB. This engine
 //! allows arbitrary bytes in a VARCHAR (a CSV field is taken byte for byte,

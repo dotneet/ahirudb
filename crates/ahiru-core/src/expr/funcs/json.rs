@@ -292,7 +292,12 @@ pub(super) fn write_json_scalar(v: &Vector, row: usize, out: &mut Vec<u8>) {
         }
         Ty::Float | Ty::Double => {
             let x = v.f64s()[row];
-            if x.is_finite() {
+            if x.is_finite() && v.ty() == Ty::Float {
+                // Every FLOAT is exactly an `f32`, so its shortest text is measured against
+                // `f32`, as `CAST(x AS VARCHAR)` does: `[0.1::FLOAT]` is `[0.1]` (as in DuckDB),
+                // not the widened double's `[0.10000000149011612]`.
+                kernels::fmt_f32(x, out);
+            } else if x.is_finite() {
                 kernels::fmt_f64(x, out);
             } else {
                 // NaN/Infinity have no JSON representation, so they become null.

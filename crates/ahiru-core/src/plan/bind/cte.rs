@@ -198,6 +198,22 @@ fn split_recursive_cte<'a>(
     query: &'a QueryStmt,
     name: &str,
 ) -> Result<Option<(&'a SetExpr, bool, &'a SelectStmt)>> {
+    // A trailing `ORDER BY`/`LIMIT`/`OFFSET` applies to the whole `anchor UNION recursive`
+    // body, which the fixpoint iteration has no place for. DuckDB rejects it ("LIMIT or
+    // OFFSET in a recursive query is not allowed", likewise for ORDER BY) rather than
+    // ignoring it, and so does this binder; before, it was silently dropped. DuckDB decides
+    // this syntactically -- any `UNION` body of a `WITH RECURSIVE` CTE, self-referencing or
+    // not -- so the check comes before the self-reference test. A clause inside a
+    // parenthesised term (`... UNION ALL (SELECT ... LIMIT 3)`) is not affected.
+    if matches!(query.body, SetExpr::SetOp { op: SetOp::Union, .. }) {
+        ensure!(
+            query.order_by.is_empty()
+                && query.order_by_all.is_none()
+                && query.limit.is_none()
+                && query.offset.is_none(),
+            SyntaxError
+        );
+    }
     if !set_expr_references(&query.body, name) {
         return Ok(None);
     }

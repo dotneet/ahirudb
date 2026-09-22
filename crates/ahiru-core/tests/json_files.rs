@@ -106,3 +106,14 @@ fn top_level_object_and_scalar_array_round_trip_through_sql() {
     // SUM(INT) always widens to HUGEINT (I128) in this engine (same convention as the other SUM tests).
     assert_eq!(rows, [[Value::I128(6)]]);
 }
+
+#[test]
+fn newline_delimited_dot_json_reads_like_jsonl() {
+    // `COPY ... TO 'x.json'` writes one object per line (as DuckDB does). Reading such a file
+    // back as `.json` used to fail with a syntax error; DuckDB auto-detects the layout.
+    let mut sess = Session::new();
+    let text = b"{\"a\":1,\"b\":\"x\"}\n{\"a\":2,\"b\":\"y\"}\n".to_vec();
+    sess.register_bytes_as("t", text, FormatKind::Json).unwrap();
+    let rows = run_all("SELECT count(*), sum(a), max(b) FROM t", &mut sess);
+    assert_eq!(rows, [[Value::I64(2), Value::I128(3), s("y")]]);
+}

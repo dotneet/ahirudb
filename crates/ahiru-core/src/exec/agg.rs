@@ -174,9 +174,13 @@ pub struct HashAggregate {
     mode_freq: Vec<Option<HashIndex>>,
     /// The occurrence count per `mode_freq` index.
     mode_counts: Vec<Vec<i64>>,
+    /// The first-seen value per `mode_freq` index: the representative a winning slot reports.
+    /// Values that are equal as keys can still render differently (`1 month`, `30 days` and
+    /// `720 hours` are one INTERVAL key), and DuckDB answers with the first one seen.
+    mode_reps: Vec<Vec<Value>>,
 
     /// The total bytes of variable-length growing state: MIN/MAX's winning byte sequence,
-    /// Mode's winning byte sequence, StringAgg/ArrayAgg's accumulated text, Median's temporary
+    /// Mode's per-value representatives, StringAgg/ArrayAgg's accumulated text, Median's temporary
     /// values, and so on. Included in the memory check.
     acc_bytes: usize,
     /// The approximate byte count of the group key columns themselves.
@@ -201,6 +205,7 @@ impl HashAggregate {
         let mut distinct = Vec::with_capacity(aggs.len());
         let mut mode_freq = Vec::with_capacity(aggs.len());
         let mut mode_counts = Vec::with_capacity(aggs.len());
+        let mut mode_reps = Vec::with_capacity(aggs.len());
         for a in &aggs {
             let ity = a.input_ty();
             // Type checking is finished here. The output type always comes from the same function as the binder's.
@@ -265,6 +270,7 @@ impl HashAggregate {
             );
             mode_freq.push(if a.kind == AggKind::Mode { Some(HashIndex::new()) } else { None });
             mode_counts.push(Vec::new());
+            mode_reps.push(Vec::new());
         }
         let key_cols = groups.iter().map(|g| Vector::new(g.result_ty)).collect();
         Ok(HashAggregate {
@@ -281,6 +287,7 @@ impl HashAggregate {
             distinct,
             mode_freq,
             mode_counts,
+            mode_reps,
             acc_bytes: 0,
             key_bytes: 0,
             phase: Phase::Building,
@@ -606,7 +613,9 @@ impl HashAggregate {
                 let (slot, is_new) = freq.get_or_insert(&fkey);
                 if is_new {
                     self.mode_counts[ai].push(1);
-                    self.acc_bytes += 8;
+                    let v = col.value_at(row);
+                    self.acc_bytes += 8 + v.as_bytes().map_or(0, <[u8]>::len);
+                    self.mode_reps[ai].push(v);
                 } else {
                     self.mode_counts[ai][slot as usize] += 1;
                 }
@@ -616,17 +625,11 @@ impl HashAggregate {
                 // instead crown whichever value *reached* the top count first: for `1,2,2,1`
                 // it would answer 2, because 2 got to two votes before 1 did. Slots are handed
                 // out in order of first appearance, so the smaller slot is the earlier value.
+                // Only the slot is recorded; the value reported is the slot's first-seen
+                // representative (`mode_reps`), not this row's.
                 if cnt > st.mode_best || (cnt == st.mode_best && slot < st.mode_slot) {
                     st.mode_best = cnt;
                     st.mode_slot = slot;
-                    if let Value::Bytes(b) = &st.acc {
-                        self.acc_bytes = self.acc_bytes.saturating_sub(b.len());
-                    }
-                    let v = col.value_at(row);
-                    if let Value::Bytes(b) = &v {
-                        self.acc_bytes += b.len();
-                    }
-                    st.acc = v;
                 }
             }
             Op::StringAgg => {
@@ -703,13 +706,10 @@ impl HashAggregate {
             Op::CountStar | Op::Count => out.push_value(&Value::I64(self.states[ai][g].n)),
             // A group with not a single non-NULL input is NULL. StringAgg follows the same rule
             // (with no non-NULL value ever added, acc stays Null).
-            // Mode's winner is in acc directly too.
-            // CountIf's tally also lives in acc, but a group with no true row must be 0 rather
-            // than NULL, so it takes the zero-default branch instead.
-            Op::CountIf => match &self.states[ai][g].acc {
-                Value::I64(c) => out.push_value(&Value::I64(*c)),
-                _ => out.push_value(&Value::I64(0)),
-            },
+            // CountIf's tally lives in acc too, and follows the same rule: `count_if` is a SUM
+            // over booleans in DuckDB, so a group whose every argument is NULL (or an empty
+            // input) is NULL, while a group of only false rows counts 0 (`update` stores the
+            // tally on the first non-NULL row).
             // The compensation term is folded back in exactly once, here.
             Op::SumF64 => {
                 let st = &self.states[ai][g];
@@ -723,7 +723,7 @@ impl HashAggregate {
             | Op::Min
             | Op::Max
             | Op::StringAgg
-            | Op::Mode
+            | Op::CountIf
             | Op::AnyValue
             | Op::Last
             | Op::BoolAnd
@@ -733,11 +733,14 @@ impl HashAggregate {
             | Op::ArgMax => out.push_value(&self.states[ai][g].acc),
             Op::AvgInt => {
                 // Integers are summed exactly in i128 and divided exactly once. Summing in f64
-                // would accumulate rounding error.
+                // would accumulate rounding error. For DECIMAL the divisor is `n * 10^scale`,
+                // formed first and applied in one division (as DuckDB does): dividing by
+                // `10^scale` and then by `n` rounds twice, so `avg` over three `0.1`s came out
+                // as 0.09999999999999999.
                 let st = &self.states[ai][g];
                 match &st.acc {
                     Value::I128(s) if st.n > 0 => {
-                        out.push_value(&Value::F64(*s as f64 / self.avg_div[ai] / st.n as f64))
+                        out.push_value(&Value::F64(*s as f64 / (self.avg_div[ai] * st.n as f64)))
                     }
                     _ => out.push_null(),
                 }
@@ -763,8 +766,14 @@ impl HashAggregate {
                     // Floating-point rounding can make M2 slightly negative, so it is clamped at
                     // 0 (preventing a group of identical values from producing a variance that is
                     // not exactly 0 and yielding the square root of NaN).
+                    //
+                    // The clamp is an explicit `< 0.0` test rather than `f64::max`: `max` drops a
+                    // NaN operand, so an input containing NaN or +-inf (which drives M2 to NaN)
+                    // used to come out as a confident 0.0. It stays NaN here -- floats are IEEE
+                    // throughout (DESIGN.md §15), where DuckDB raises "out of range" instead.
                     let denom = if pop { st.n as f64 } else { st.n as f64 - 1.0 };
-                    let var = (st.m2 / denom).max(0.0);
+                    let var = st.m2 / denom;
+                    let var = if var < 0.0 { 0.0 } else { var };
                     let v = if matches!(self.ops[ai], Op::StdDev | Op::StdDevPop) {
                         f_sqrt(var)
                     } else {
@@ -796,14 +805,24 @@ impl HashAggregate {
                     // `vals[hi]`, and `(inf - lo) * 0.0` -- or a NaN upper element, which
                     // `ord_f64` sorts last and so parks just past an odd-count midpoint --
                     // turns an exact answer into NaN.
-                    let v = if w == 0.0 {
-                        st.median_vals[lo]
-                    } else {
-                        st.median_vals[lo] + (st.median_vals[hi] - st.median_vals[lo]) * w
-                    };
+                    //
+                    // Otherwise the two neighbours are weighted as `lo*(1-w) + hi*w`, the form
+                    // DuckDB uses (it reproduces DuckDB's last-bit rounding on finite input; an
+                    // arm64 DuckDB build contracts it into a fused multiply-add and can differ
+                    // in the last bit, and `core` has no portable FMA to follow it with).
+                    // `lo + (hi-lo)*w` is not equivalent at the edges: with `lo = -inf` the
+                    // difference is `+inf` and the sum `-inf + inf` is NaN where DuckDB answers
+                    // `-inf`, and `hi - lo` overflows to `inf` for `-1e308` and `1e308`.
+                    let (a, b) = (st.median_vals[lo], st.median_vals[hi]);
+                    let v = if w == 0.0 { a } else { a * (1.0 - w) + b * w };
                     out.push_value(&Value::F64(v));
                 }
             }
+            // No qualifying value leaves `mode_slot` at `u32::MAX`, which misses and gives NULL.
+            Op::Mode => match self.mode_reps[ai].get(self.states[ai][g].mode_slot as usize) {
+                Some(v) => out.push_value(v),
+                None => out.push_null(),
+            },
             Op::ArrayAgg => match &self.states[ai][g].acc {
                 // While accumulating there is no closing bracket (see `append_array_text`), so
                 // `]` is added here for the first time.
@@ -960,6 +979,11 @@ fn cmp_at(col: &Vector, row: usize, acc: &Value) -> core::cmp::Ordering {
         }
         (Data::I128(v), Value::I128(x)) => v[row].cmp(x),
         (Data::F64(v), Value::F64(x)) => ord_f64(v[row], *x),
+        // A LIST (JSON array text) compares element-wise, so `max` over `[9]` and `[10]` is
+        // `[10]` -- the same order `ORDER BY` uses (`json::cmp_json`).
+        (Data::Bytes(b), Value::Bytes(x)) if col.ty() == Ty::Json => {
+            crate::json::cmp_json(b.get(row), x)
+        }
         (Data::Bytes(b), Value::Bytes(x)) => b.get(row).cmp(x.as_slice()),
         _ => Ordering::Equal,
     }
@@ -1058,7 +1082,9 @@ fn push_json_scalar(col: &Vector, row: usize, out: &mut Vec<u8>) {
                 }
                 Data::I128(v) => kernels::fmt_int(v[row].unsigned_abs(), v[row] < 0, scale, out),
                 // The same text `CAST(x AS VARCHAR)` gives. A private renderer here used to
-                // print 0.5 as `5e-1`.
+                // print 0.5 as `5e-1`. A FLOAT is spelled at `f32` precision (`0.1`, not
+                // `0.10000000149011612`), again as the cast spells it.
+                Data::F64(v) if ty == Ty::Float => kernels::fmt_f32(v[row], out),
                 Data::F64(v) => kernels::fmt_f64(v[row], out),
                 Data::Bytes(b) => crate::json::write_json_string(b.get(row), out),
             }

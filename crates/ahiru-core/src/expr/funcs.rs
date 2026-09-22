@@ -236,6 +236,8 @@ const F_EPOCH_MS: FuncId = 127;
 const F_EPOCH_US: FuncId = 128;
 const F_EPOCH_NS: FuncId = 129;
 const F_LIST_POSITION: FuncId = 130;
+/// `to_timestamp(<number>)`: epoch seconds to a TIMESTAMPTZ.
+const F_EPOCH_SEC_TO_TS: FuncId = 131;
 
 // Bool output
 const F_ISNAN: FuncId = 140;
@@ -451,6 +453,10 @@ pub fn resolve_const(
             ensure!(n == 1, WrongArgCount);
             if args[0].is_integer() {
                 Ok((F_TO_HEX, vec![args[0]], Varchar))
+            } else if args[0] == Blob {
+                // A BLOB is dumped as its raw bytes. Coercing it to VARCHAR first would dump
+                // its escaped text form (`\xDE\xAD` -> `5C7844...` instead of `DEAD`).
+                Ok((F_HEX, vec![Blob], Varchar))
             } else {
                 Ok((F_HEX, vec![Varchar], Varchar))
             }
@@ -578,7 +584,13 @@ pub fn resolve_const(
         "isfinite" => fixed(F_ISFINITE, &[Double], n, 1, Boolean),
         "gcd" | "greatest_common_divisor" => fixed(F_GCD, &[BigInt, BigInt], n, 2, BigInt),
         "lcm" | "least_common_multiple" => fixed(F_LCM, &[BigInt, BigInt], n, 2, BigInt),
-        "bit_count" => fixed(F_BIT_COUNT, &[BigInt], n, 1, BigInt),
+        // An integer argument keeps its own type so the bits are counted at its declared
+        // width (`bit_count(-1::TINYINT)` is 8, as in DuckDB, not 64).
+        "bit_count" => {
+            ensure!(n == 1, WrongArgCount);
+            let t = if args[0].is_integer() { args[0] } else { BigInt };
+            Ok((F_BIT_COUNT, vec![t], BigInt))
+        }
         "xor" => fixed(F_BIT_XOR, &[BigInt, BigInt], n, 2, BigInt),
         // The desugaring target of `&`/`|`/`<<`/`>>`/prefix `~` (see `sql::parser`).
         "bit_and" => fixed(F_BIT_AND, &[BigInt, BigInt], n, 2, BigInt),
@@ -736,8 +748,15 @@ pub fn resolve_const(
         "dayname" => fixed(F_DAYNAME, &[Timestamp], n, 1, Varchar),
         "monthname" => fixed(F_MONTHNAME, &[Timestamp], n, 1, Varchar),
         "make_date" => fixed(F_MAKE_DATE, &[BigInt, BigInt, BigInt], n, 3, Date),
-        // `make_timestamp(y, mo, d, h, mi, s)`. DuckDB's single-argument
-        // `make_timestamp(microseconds)` overload is not provided (`CAST` covers it).
+        // `make_timestamp(microseconds)`: the count since the epoch *is* the TIMESTAMP's
+        // physical value, so it is `epoch_us`'s identity body with a TIMESTAMP result.
+        // (A number does not cast to a TIMESTAMP, so this is the way to build one from a
+        // microsecond count.)
+        "make_timestamp" if n == 1 => {
+            ensure!(args[0].is_integer() || args[0] == Null, TypeMismatch);
+            Ok((F_EPOCH_US, vec![BigInt], Timestamp))
+        }
+        // `make_timestamp(y, mo, d, h, mi, s)`.
         // The seconds argument is DOUBLE in DuckDB; here it is BIGINT, so fractional seconds
         // have to be written with `make_timestamp(...) + INTERVAL ... ` instead.
         "make_timestamp" => fixed(
@@ -748,11 +767,20 @@ pub fn resolve_const(
             Timestamp,
         ),
         // The `epoch` shorthand is whole seconds; these are the finer-grained spellings.
+        // `epoch_ms(<integer>)` goes the other way, as in DuckDB: milliseconds since the
+        // epoch to a TIMESTAMP. Scaling milliseconds to microseconds is the same checked
+        // `* 1000` that `epoch_ns` applies to microseconds, so it shares that body.
+        "epoch_ms" if n == 1 && args[0].is_integer() => Ok((F_EPOCH_NS, vec![BigInt], Timestamp)),
         "epoch_ms" => fixed(F_EPOCH_MS, &[Timestamp], n, 1, BigInt),
         "epoch_us" => fixed(F_EPOCH_US, &[Timestamp], n, 1, BigInt),
         "epoch_ns" => fixed(F_EPOCH_NS, &[Timestamp], n, 1, BigInt),
-        // DuckDB's `to_timestamp` takes epoch seconds (DOUBLE), but here it is defined as a string
-        // parser (the equivalent of `strptime`). A deliberate incompatibility.
+        // DuckDB's `to_timestamp` takes epoch seconds (DOUBLE) only. Here a numeric argument
+        // does the same (a TIMESTAMPTZ, microseconds rounded half to even as DuckDB's
+        // double-to-integer conversion does), and a string argument is additionally read
+        // as a timestamp (the equivalent of `strptime`) -- a deliberate extension.
+        "to_timestamp" if n == 1 && args[0].is_numeric() => {
+            Ok((F_EPOCH_SEC_TO_TS, vec![Double], Timestamptz))
+        }
         "to_date" => fixed(F_TO_DATE, &[Varchar], n, 1, Date),
         "to_timestamp" => fixed(F_TO_TIMESTAMP, &[Varchar], n, 1, Timestamp),
         "year" => shorthand(P_YEAR, n),

@@ -445,7 +445,10 @@ fn map_type(e: &SchemaElement, ptype: PType) -> Result<(Ty, Option<TimeUnit>)> {
 fn map_logical(l: LogicalType) -> Result<(Ty, Option<TimeUnit>)> {
     use LogicalType as L;
     Ok(match l {
-        L::String | L::Enum | L::Json => (Ty::Varchar, None),
+        L::String | L::Enum => (Ty::Varchar, None),
+        // A JSON column is `Ty::Json`, so its documents keep their structure (the JSON functions
+        // apply directly, and `COPY ... TO 'x.jsonl'` nests them instead of quoting them as text).
+        L::Json => (Ty::Json, None),
         L::Bson => (Ty::Blob, None),
         // UUID's physical representation is the raw bytes of FLBA(16) -- the same
         // `Bytes` family as `Ty::Blob` -- but differs only in that text
@@ -482,7 +485,8 @@ fn map_logical(l: LogicalType) -> Result<(Ty, Option<TimeUnit>)> {
 fn map_converted(c: ConvertedType, e: &SchemaElement) -> Result<(Ty, Option<TimeUnit>)> {
     use ConvertedType as C;
     Ok(match c {
-        C::Utf8 | C::Json | C::Enum => (Ty::Varchar, None),
+        C::Utf8 | C::Enum => (Ty::Varchar, None),
+        C::Json => (Ty::Json, None),
         C::Bson => (Ty::Blob, None),
         C::Decimal => {
             let precision = e.precision.unwrap_or(18);

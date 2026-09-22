@@ -693,15 +693,14 @@ impl Acc {
             | AggKind::Last
             | AggKind::BoolAnd
             | AggKind::BoolOr
-            | AggKind::Product => self.acc.clone(),
-            // A frame with no true row is 0, not NULL (the same rule as the grouped version).
-            AggKind::CountIf => match &self.acc {
-                Value::I64(c) => Value::I64(*c),
-                _ => Value::I64(0),
-            },
+            | AggKind::Product
+            // A frame with no non-NULL input is NULL, one with only false rows is 0 (the
+            // same rule as the grouped version).
+            | AggKind::CountIf => self.acc.clone(),
             AggKind::Avg => match &self.acc {
-                // Integers are summed exactly in i128 and divided exactly once.
-                Value::I128(s) if self.n > 0 => Value::F64(*s as f64 / div / self.n as f64),
+                // Integers are summed exactly in i128 and divided exactly once, by
+                // `n * 10^scale` (see `exec::agg`'s `AvgInt`: two divisions round twice).
+                Value::I128(s) if self.n > 0 => Value::F64(*s as f64 / (div * self.n as f64)),
                 Value::F64(s) if self.n > 0 => {
                     Value::F64(compensated(*s, self.comp) / self.n as f64)
                 }
@@ -722,6 +721,8 @@ fn cmp_val(a: &Value, b: &Value, ty: Ty) -> Ordering {
         (Value::I128(x), Value::I128(y)) if ty == Ty::Interval => {
             interval_key(*x).cmp(&interval_key(*y))
         }
+        // A LIST compares element-wise (`json::cmp_json`), matching the sort comparator.
+        (Value::Bytes(x), Value::Bytes(y)) if ty == Ty::Json => crate::json::cmp_json(x, y),
         // A physical type mismatch is an upstream bug. No ordering is imposed; they count as equal.
         _ => a.partial_cmp_same(b).unwrap_or(Ordering::Equal),
     }
@@ -831,6 +832,8 @@ fn cmp_data(c: &Vector, a: usize, b: usize) -> Ordering {
         Data::I128(v) if c.ty() == Ty::Interval => interval_key(v[a]).cmp(&interval_key(v[b])),
         Data::I128(v) => v[a].cmp(&v[b]),
         Data::F64(v) => f64_key(v[a]).cmp(&f64_key(v[b])),
+        // A LIST compares element-wise, like `exec::sort::cmp_data`.
+        Data::Bytes(v) if c.ty() == Ty::Json => crate::json::cmp_json(v.get(a), v.get(b)),
         Data::Bytes(v) => v.get(a).cmp(v.get(b)),
     }
 }

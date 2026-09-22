@@ -3,7 +3,7 @@
 //! NULL/zero coalescing used when decorrelating correlated `COUNT`
 //! aggregates.
 
-use super::refs::{const_program, default_name, each_child_flat};
+use super::refs::{const_program, default_name, each_child_flat, walk_pruned};
 use super::*;
 
 /// Drops the trailing `k` columns used as correlation keys by the most recent join.
@@ -308,6 +308,19 @@ pub(super) fn build_window(
         let default = arg_progs.remove(2);
         arg_progs.insert(2, cast_program(default, want)?);
     }
+    // The count/offset arguments -- `ntile(n)`, `nth_value(x, n)`, `lag/lead(x, offset)` -- are
+    // BIGINT in DuckDB, and any other numeric type is cast to it. `exec::window` reads them
+    // with `Value::as_i64`, which sees a DECIMAL's raw scaled integer (`2::DECIMAL(4,1)` as 20)
+    // and nothing at all for a DOUBLE, so they are converted here once.
+    let count_arg = match kind {
+        WindowKind::NTile => Some(0),
+        WindowKind::NthValue | WindowKind::Lag | WindowKind::Lead => Some(1),
+        _ => None,
+    };
+    if let Some(i) = count_arg.filter(|&i| i < arg_progs.len()) {
+        let p = arg_progs.remove(i);
+        arg_progs.insert(i, cast_program(p, Ty::BigInt)?);
+    }
 
     let mut parts = Vec::with_capacity(partition_by.len());
     for p in partition_by {
@@ -443,9 +456,19 @@ pub(super) fn build_agg(
             };
         }
         SecondArg::Fraction => {
-            let f = match args.get(1).map(|&id| arena.get(id)) {
-                Some(Expr::Literal(Value::F64(f))) => *f,
-                Some(Expr::Literal(Value::I64(i))) => *i as f64,
+            // Any constant expression is accepted -- `0` and `1` (INTEGER literals, not just
+            // BIGINT ones), `-0.0`, `0.5::DECIMAL(2,1)` -- by casting it to DOUBLE and folding
+            // it here, once. Matching literal shapes instead used to reject `quantile_cont(x, 0)`.
+            let id2 = match args.get(1) {
+                Some(&id) => id,
+                None => err!(WrongArgCount),
+            };
+            let p = cast_program(compile(arena, scope, params, id2)?, Ty::Double)?;
+            ensure!(p.is_constant(), UnsupportedFeature);
+            let v = crate::expr::vm::Vm::new().eval(&p, &crate::vector::Batch::rows_only(1))?;
+            let f = match v.value_at(0) {
+                Value::F64(f) => f,
+                // A NULL fraction.
                 _ => err!(UnsupportedFeature),
             };
             // DuckDB rejects a fraction outside [0, 1] outright; so does this.
@@ -486,6 +509,11 @@ fn agg_name(fname: &str, arena: &ExprArena, arg: ExprId) -> String {
 
 /// Detects a bare column reference that is not in GROUP BY.
 ///
+/// A sub-expression matching a grouping expression is grouped as a whole, however its column
+/// references are spelled: `SELECT b + 1 ... GROUP BY v.b + 1` and `SELECT a*2 + 1 ... GROUP
+/// BY a*2` both pass (the comparison resolves references against `scope`, and
+/// [`walk_pruned`] offers the inner nodes of an operator chain too).
+///
 /// `const_subs` lists the scalar subqueries that are constant with respect to
 /// the grouping (uncorrelated ones, which `bind_select_in` attaches *after* the
 /// aggregate). Any other scalar subquery varies per input row and is rejected.
@@ -498,35 +526,32 @@ pub(super) fn check_grouped(
     const_subs: &[ExprId],
     depth: u32,
 ) -> Result<()> {
-    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
-    if groups.iter().any(|&g| expr_eq(arena, g, id)) {
-        return Ok(());
-    }
-    if aggs.iter().any(|&a| expr_eq(arena, a, id)) {
-        return Ok(());
-    }
-    match arena.get(id) {
-        Expr::ColumnRef { qualifier, name } => {
-            // A column that exists in the input reaching here = it is in neither GROUP BY nor an aggregate.
-            if let Ok(col) = scope.resolve(qualifier.as_deref(), name) {
-                // `GROUP BY emp.dept` and `SELECT dept` name the same column in
-                // two spellings, which `expr_eq` (raw syntax) does not match.
-                // Resolve both sides against the input scope before deciding.
-                if grouped_column(arena, scope, groups, col) {
-                    return Ok(());
-                }
-                err!(NotGrouped);
+    walk_pruned(
+        arena,
+        id,
+        &mut |e| {
+            if groups.iter().any(|&g| expr_eq_in(arena, scope, g, e))
+                || aggs.iter().any(|&a| expr_eq(arena, a, e))
+            {
+                return Ok(true);
             }
-        }
-        // An uncorrelated scalar subquery is a constant, and so is legal anywhere in an
-        // aggregating query. A correlated one is attached as a pre-aggregation column whose
-        // value varies per input row, so referencing it above the aggregate is rejected like
-        // a bare column reference.
-        Expr::ScalarSubquery(_) if !const_subs.contains(&id) => err!(NotGrouped),
-        _ => {}
-    }
-    let d = depth + 1;
-    each_child_flat(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, const_subs, d))
+            match arena.get(e) {
+                // A column that exists in the input reaching here = it is in neither GROUP BY
+                // nor an aggregate.
+                Expr::ColumnRef { qualifier, name } => {
+                    ensure!(scope.resolve(qualifier.as_deref(), name).is_err(), NotGrouped);
+                    Ok(true)
+                }
+                // An uncorrelated scalar subquery is a constant, and so is legal anywhere in
+                // an aggregating query. A correlated one is attached as a pre-aggregation
+                // column whose value varies per input row, so referencing it above the
+                // aggregate is rejected like a bare column reference.
+                Expr::ScalarSubquery(_) if !const_subs.contains(&e) => err!(NotGrouped),
+                _ => Ok(false),
+            }
+        },
+        depth,
+    )
 }
 
 /// Whether any grouping expression is a column reference naming input column `col`.

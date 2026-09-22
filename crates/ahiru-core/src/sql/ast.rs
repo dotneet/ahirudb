@@ -23,6 +23,9 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    /// `//`. The same as `Div` on integers and DECIMALs, but a floating-point division
+    /// by zero is `NULL` rather than IEEE `inf`/`NaN` (DuckDB's `//`).
+    IntDiv,
     Mod,
     Eq,
     Ne,

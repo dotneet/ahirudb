@@ -70,9 +70,9 @@ Part names are case-insensitive, a trailing `s` is ignored (`years` =
 | `dayofweek` (`dow`) | Sunday = 0 … Saturday = 6 |
 | `isodow` (`isoweekday`) | Monday = 1 … Sunday = 7 |
 | `isoyear` | The ISO 8601 week-numbering year, which can differ from `year` at a year boundary: `isoyear` of 2024-12-30 is 2025 |
-| `century` | Years 1–100 are century 1, so 2021 → 21 and 2000 → 20 |
-| `millennium` | Same 1-based counting, so 2024 → 3 |
-| `decade` | `year / 10`, so 2021 → 202 |
+| `century` | Years 1–100 are century 1, so 2021 → 21 and 2000 → 20. There is no century 0: years 0 to -99 are century -1, -100 to -199 century -2 (as in DuckDB) |
+| `millennium` | Same 1-based counting, so 2024 → 3 and year 0 → -1 |
+| `decade` | `year / 10`, truncating toward zero: 2021 → 202, -84 → -8, -9 → 0 |
 
 The same part names work with `date_trunc`/`date_diff`/`date_add`
 (`isodow` excepted — there is nothing to truncate or add there).
@@ -83,7 +83,10 @@ is matched deliberately. `date_part` counts them 1-based (2024 is century
 21), while `date_trunc` and `date_diff` use a plain `year / 100`:
 `date_trunc('century', DATE '2024-05-05')` is `2000-01-01` (not
 `2001-01-01`) and `date_diff('century', DATE '1900-01-01', DATE
-'2024-01-01')` is 1.
+'2024-01-01')` is 1. That division — and the decade's `year / 10` in all
+three functions — truncates toward zero, also as DuckDB does, so
+`date_trunc('decade', DATE '-0084-07-27')` is year -80 and
+`date_diff('decade', DATE '-0005-06-01', DATE '0005-06-01')` is 0.
 
 `date_diff('microsecond', a, b)` raises `value out of range` instead of
 wrapping when the difference does not fit in a `BIGINT` (only the
@@ -91,7 +94,15 @@ microsecond unit can overflow; the others divide before subtracting).
 
 `epoch_ms`/`epoch_us`/`epoch_ns` are the sub-second counterparts of the
 `epoch` part: the same instant rescaled to milliseconds, microseconds, or
-nanoseconds since 1970-01-01. `dayname`/`monthname` return English names
+nanoseconds since 1970-01-01. Given an integer instead, `epoch_ms` goes the
+other way, as in DuckDB: `epoch_ms(1500)` is the `TIMESTAMP`
+`1970-01-01 00:00:01.5`.
+
+A number is never accepted where a `DATE`/`TIMESTAMP` is expected —
+`year(1500)`, `dayname(3)`, `CAST(5 AS DATE)` and `CAST(1500 AS TIMESTAMP)`
+are errors, as in DuckDB. To build a timestamp from an epoch count use
+`epoch_ms(<milliseconds>)`, `make_timestamp(<microseconds>)` or
+`to_timestamp(<seconds>)`. `dayname`/`monthname` return English names
 only — the engine carries no locale data.
 
 ## Truncating, formatting, parsing
@@ -103,6 +114,8 @@ SELECT to_date('2024-05-01');                   -- strict YYYY-MM-DD
 SELECT to_timestamp('2024-05-01 10:00:00');     -- YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]][zone]
 SELECT make_date(2024, 2, 29);                  -- 2024-02-29 (a DATE)
 SELECT make_timestamp(2024, 8, 14, 13, 45, 30); -- 2024-08-14 13:45:30
+SELECT make_timestamp(1500);                    -- 1970-01-01 00:00:00.0015 (microseconds)
+SELECT to_timestamp(1.5);                       -- 1970-01-01 00:00:01.5+00 (epoch seconds, TIMESTAMPTZ)
 ```
 
 `make_date(y, m, d)` and `make_timestamp(y, m, d, h, mi, s)` return `NULL`
@@ -113,10 +126,11 @@ accepts, and normalizes, any time of day in `[00:00:00, 24:00:00]` with
 minutes below 60 and seconds at or below 60, exactly as DuckDB does:
 `make_timestamp(2024, 6, 5, 24, 0, 0)` is the next day's midnight and
 `make_timestamp(2024, 6, 5, 7, 8, 60)` is `07:09:00`. Anything past
-`24:00:00` is out of range and `NULL`. DuckDB's
-single-argument `make_timestamp(microseconds)` overload and its `DOUBLE`
-seconds argument (fractional seconds) are not provided; use a `CAST` or add
-an `INTERVAL` for those.
+`24:00:00` is out of range and `NULL`. The single-argument
+`make_timestamp(microseconds)` overload builds a `TIMESTAMP` from a
+microsecond count since the epoch, as in DuckDB. DuckDB's `DOUBLE` seconds
+argument (fractional seconds) for the six-argument form is not provided;
+add an `INTERVAL` for those.
 
 **Text → `DATE`/`TIMESTAMP` casts** accept the same shapes as DuckDB:
 `YYYY-MM-DD`, optionally followed by `T` or one or more spaces and a
@@ -133,10 +147,12 @@ DuckDB's habit of ignoring arbitrary trailing text in a `DATE` cast
 
 `strftime` only understands `%Y`/`%m`/`%d`/`%H`/`%M`/`%S`/`%%` — it is not
 a full strftime implementation; unrecognized specifiers pass through as
-literal text rather than erroring. `to_timestamp` here is a **string
-parser** (`YYYY-MM-DD` optionally followed by a time), unlike DuckDB's
-`to_timestamp`, which takes epoch-seconds as a `DOUBLE` — an intentional,
-documented incompatibility with that one DuckDB function name.
+literal text rather than erroring. `to_timestamp` of a number is DuckDB's:
+epoch seconds to a `TIMESTAMPTZ`, rounded half to even to whole
+microseconds (`NULL` for `NaN`/infinity or out of range, where DuckDB
+raises). `to_timestamp` of a string is additionally a **string parser**
+(`YYYY-MM-DD` optionally followed by a time) — an extension; DuckDB rejects
+a string argument.
 
 ## Arithmetic
 

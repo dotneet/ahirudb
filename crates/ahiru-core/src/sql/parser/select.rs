@@ -1,6 +1,8 @@
 //! SELECT/FROM/JOIN/WHERE/GROUP BY/HAVING/ORDER BY/LIMIT, window definitions,
 //! CTEs, set operations (UNION/INTERSECT/EXCEPT), and PIVOT/UNPIVOT parsing.
-use super::types::{cube_sets, float_literal, int_literal, rollup_sets, sample_method_from_ident};
+use super::types::{
+    cross_sets, cube_sets, float_literal, int_literal, rollup_sets, sample_method_from_ident,
+};
 use super::*;
 
 impl<'a> Parser<'a> {
@@ -260,25 +262,37 @@ impl<'a> Parser<'a> {
             // is read, so the following `,` becomes an `UnexpectedToken`.
             if self.eat_kw(Kw::All)? {
                 st.group_by_all = true;
-            } else if self.is_soft_kw(b"grouping") && self.peek_is_soft_kw(b"sets")? {
-                self.bump()?; // grouping
-                self.bump()?; // sets
-                st.grouping_sets = Some(self.grouping_sets_body()?);
-            } else if self.is_soft_kw(b"rollup") && self.peek()? == Tok::LParen {
-                self.bump()?; // rollup
-                let cols = self.paren_expr_list()?;
-                st.grouping_sets = Some(rollup_sets(cols));
-            } else if self.is_soft_kw(b"cube") && self.peek()? == Tok::LParen {
-                self.bump()?; // cube
-                let cols = self.paren_expr_list()?;
-                st.grouping_sets = Some(cube_sets(cols, self.pos)?);
             } else {
+                // A list whose elements are plain expressions and/or `GROUPING SETS`/
+                // `ROLLUP`/`CUBE`. Each element stands for a list of grouping sets (a plain
+                // expression for the single set `(e)`), and the whole clause is their cross
+                // product, as in DuckDB and PostgreSQL: `GROUP BY b, ROLLUP (a)` is
+                // `GROUPING SETS ((b, a), (b))`. Without any such construct the list stays
+                // an ordinary `group_by`.
+                let mut plain = Vec::new();
+                let mut sets: Vec<Vec<ExprId>> = vec![Vec::new()];
+                let mut has_sets = false;
                 loop {
-                    let e = self.expr()?;
-                    st.group_by.push(e);
+                    let elem = match self.grouping_construct()? {
+                        Some(elem) => {
+                            has_sets = true;
+                            elem
+                        }
+                        None => {
+                            let e = self.expr()?;
+                            plain.push(e);
+                            vec![vec![e]]
+                        }
+                    };
+                    sets = cross_sets(&sets, &elem, self.pos)?;
                     if !self.eat(Tok::Comma)? {
                         break;
                     }
+                }
+                if has_sets {
+                    st.grouping_sets = Some(sets);
+                } else {
+                    st.group_by = plain;
                 }
             }
         }
@@ -331,6 +345,32 @@ impl<'a> Parser<'a> {
         // ORDER BY / LIMIT / OFFSET are not read here. The right term of a set operation
         // would swallow the outer ORDER BY, so `query_body` handles them all together.
         Ok(st)
+    }
+
+    /// `GROUPING SETS (...)`, `ROLLUP (...)` or `CUBE (...)` at the current position,
+    /// expanded into its list of grouping sets; `None` (nothing consumed) for anything else.
+    ///
+    /// `GROUPING SETS`/`ROLLUP`/`CUBE` are common words usable as column names too (the same
+    /// class as the incidents around `ROWS`/`RANGE`/`QUALIFY`), so they are not reserved and
+    /// are treated as keywords only in a `GROUP BY` element position, followed by `(` (the
+    /// two-word `GROUPING SETS` is distinguished with two tokens of lookahead).
+    fn grouping_construct(&mut self) -> Result<Option<Vec<Vec<ExprId>>>> {
+        if self.is_soft_kw(b"grouping") && self.peek_is_soft_kw(b"sets")? {
+            self.bump()?; // grouping
+            self.bump()?; // sets
+            return Ok(Some(self.grouping_sets_body()?));
+        }
+        if self.is_soft_kw(b"rollup") && self.peek()? == Tok::LParen {
+            self.bump()?; // rollup
+            let cols = self.paren_expr_list()?;
+            return Ok(Some(rollup_sets(cols)));
+        }
+        if self.is_soft_kw(b"cube") && self.peek()? == Tok::LParen {
+            self.bump()?; // cube
+            let cols = self.paren_expr_list()?;
+            return Ok(Some(cube_sets(cols, self.pos)?));
+        }
+        Ok(None)
     }
 
     /// The body of `GROUPING SETS`, `( (expr, ...), (expr, ...), () )`.

@@ -380,9 +380,9 @@ pub enum Tok<'a> {
     NotTildeTilde,
     /// `!~~*`. Negated `~~*`.
     NotTildeTildeStar,
-    /// `//`. Integer division: sugar for `BinaryOp::Div` (see the
-    /// desugaring site in `sql::parser::expr_body` for why this is a
-    /// correct alias for `/` specifically in this engine).
+    /// `//`. Integer division: `BinaryOp::IntDiv`, which is `/` on integers
+    /// (already truncating in this engine) but gives NULL, not `inf`/`NaN`,
+    /// for a floating-point division by zero.
     SlashSlash,
     /// `@` (prefix only). Absolute value, sugar for `abs(x)`
     /// (`sql::parser::Parser::prefix`).

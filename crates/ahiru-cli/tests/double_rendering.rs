@@ -65,9 +65,9 @@ fn ordinary_magnitudes_keep_fixed_notation() {
 /// `NaN` while `CAST(x AS VARCHAR)` printed `Inf` / `-Inf` / `NaN`, and neither matched
 /// `duckdb -csv -c "SELECT 'inf'::DOUBLE"`, which prints `inf`.
 ///
-/// The CSV and JSONL writers keep their own spellings (`NaN` / `Infinity` / `-Infinity`)
-/// on purpose -- each has its own reader to satisfy -- so this is not a crate-wide
-/// rename, only the display/cast path.
+/// The CSV writer keeps its own spelling of NaN (`NaN`) and the JSONL writer quotes
+/// these values (`"nan"` / `"inf"` / `"-inf"`) -- each has its own reader to satisfy --
+/// so this is not a crate-wide rename, only the display/cast path.
 #[test]
 fn non_finite_doubles_match_the_cast_spelling() {
     // duckdb: nan / inf / -inf

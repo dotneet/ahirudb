@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
             // `SELECT 1 AS isnull` reads the alias via a separate `ident()`
             // call in `opt_alias` after `expr()` has already returned.
             if self.is_soft_kw(b"isnull") {
-                if BP_CMP < min_bp {
+                if BP_IS < min_bp {
                     break;
                 }
                 self.bump()?;
@@ -100,7 +100,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.is_soft_kw(b"notnull") {
-                if BP_CMP < min_bp {
+                if BP_IS < min_bp {
                     break;
                 }
                 self.bump()?;
@@ -121,18 +121,15 @@ impl<'a> Parser<'a> {
                 Tok::Minus => (BinaryOp::Sub, BP_ADD),
                 Tok::Star => (BinaryOp::Mul, BP_MUL),
                 Tok::Slash => (BinaryOp::Div, BP_MUL),
-                // `//` (integer division). Sugar for plain `/`, not a new
-                // `BinaryOp` variant: this engine's `/` is *already*
-                // truncating integer division when both operands are
-                // integers (`7/2` = 3, `-7/2` = -3, matching DuckDB's `//`
-                // exactly), and stays real-valued division when either
-                // operand is a float (`5.0/2` = 2.5). That's the same
-                // behavior DuckDB gives `//` specifically (its plain `/`
-                // instead always returns a float, e.g. `7/2` = 3.5 — a
-                // pre-existing, out-of-scope divergence from DuckDB noted
-                // in docs/sql/functions-numeric.md). If `/`'s semantics
-                // ever change, this alias must be revisited.
-                Tok::SlashSlash => (BinaryOp::Div, BP_MUL),
+                // `//` (integer division). On integers this is exactly `/`,
+                // which is *already* truncating integer division in this
+                // engine (`7/2` = 3, `-7/2` = -3, matching DuckDB's `//`);
+                // DuckDB's plain `/` always returns a float instead -- a
+                // pre-existing divergence noted in
+                // docs/sql/functions-numeric.md. It is still its own
+                // `BinaryOp` because the two differ on floating point: `5.0/0`
+                // is `inf` but `5.0 // 0` is NULL, as in DuckDB.
+                Tok::SlashSlash => (BinaryOp::IntDiv, BP_MUL),
                 Tok::Percent => (BinaryOp::Mod, BP_MUL),
                 // Like `->`/`->>`, `&`/`|`/`<<`/`>>`/`^`/`**` add no new `BinaryOp` and
                 // are expanded as sugar for existing scalar function calls
@@ -321,12 +318,11 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 // The `IS` family (`IS [NOT] NULL`/`TRUE`/`FALSE`/`UNKNOWN`,
-                // `IS [NOT] DISTINCT FROM`) is postfix/infix at the same
-                // binding power as comparison — see `BP_CMP`'s doc for the
-                // `duckdb` measurements that pin it there rather than one
-                // notch below, where PostgreSQL puts it.
+                // `IS [NOT] DISTINCT FROM`) is postfix/infix one notch looser
+                // than comparison — see `BP_IS`'s doc for the `duckdb`
+                // measurements.
                 Tok::Kw(Kw::Is) => {
-                    if BP_CMP < min_bp {
+                    if BP_IS < min_bp {
                         break;
                     }
                     lhs = self.predicate(lhs)?;
@@ -451,7 +447,7 @@ impl<'a> Parser<'a> {
                 if self.is(Tok::Kw(Kw::Distinct)) && self.peek()? == Tok::Kw(Kw::From) {
                     self.bump()?; // distinct
                     self.bump()?; // from
-                    let rhs = self.expr_bp(BP_CMP + 1)?;
+                    let rhs = self.expr_bp(BP_IS + 1)?;
                     return Ok(self.distinct_from(arg, rhs, neg));
                 }
                 // `IS [NOT] TRUE`/`IS [NOT] FALSE`. `Kw::True`/`Kw::False`

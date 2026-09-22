@@ -229,8 +229,9 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
     }
 }
 
-/// Non-finite doubles are written as the JSON *strings* `"NaN"`, `"Infinity"`
-/// and `"-Infinity"`.
+/// Non-finite doubles are written as the JSON *strings* `"nan"`, `"inf"`
+/// and `"-inf"` -- the spelling `CAST(x AS VARCHAR)` produces and the one
+/// DuckDB prints for these values.
 ///
 /// RFC 8259 has no literal for these, so a writer has to pick one of three
 /// stances:
@@ -245,9 +246,16 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 ///    `crate::json`, shared with `json_valid()` and the JSON functions)
 ///    rejects it outright -- so we would be writing files we cannot read.
 /// 3. Quoted strings, chosen here. The output stays strict JSON, the value
-///    survives, and reading it back gives the text `NaN` / `Infinity` /
-///    `-Infinity`, which `CAST(... AS DOUBLE)` turns back into the original
-///    value. Both this engine and `duckdb` read the file the same way.
+///    survives, and reading it back gives the text `nan` / `inf` / `-inf`,
+///    which `CAST(... AS DOUBLE)` turns back into the original value, in this
+///    engine and in `duckdb` alike.
+///
+/// The spelling matters for the third option. The longhand `"Infinity"` /
+/// `"-Infinity"` this used to write is sniffed by DuckDB's JSON reader as a
+/// `DATE` column and silently read back as `1900-01-01` (the same trap the
+/// CSV writer fell into, see `write/csv.rs`); `"inf"` / `"-inf"` / `"nan"`
+/// stay `VARCHAR` there. This crate's reader and `CAST` accept both
+/// spellings, so files written before the change still read back.
 ///
 /// The cost is that the column comes back as VARCHAR rather than DOUBLE, and
 /// that the file differs from `duckdb`'s byte-for-byte. Matching `duckdb`
@@ -276,15 +284,15 @@ fn push_decimal(out: &mut Vec<u8>, v: i128, scale: u8) {
 /// `docs/sql/copy.md`.
 fn push_f64(out: &mut Vec<u8>, v: f64, is_float: bool) {
     if v.is_nan() {
-        out.extend_from_slice(b"\"NaN\"");
+        out.extend_from_slice(b"\"nan\"");
         return;
     }
     if v == f64::INFINITY {
-        out.extend_from_slice(b"\"Infinity\"");
+        out.extend_from_slice(b"\"inf\"");
         return;
     }
     if v == f64::NEG_INFINITY {
-        out.extend_from_slice(b"\"-Infinity\"");
+        out.extend_from_slice(b"\"-inf\"");
         return;
     }
     if is_float {
@@ -321,10 +329,15 @@ fn push_timestamp_string(out: &mut Vec<u8>, micros: i64) {
     push_padded(out, rem / 60_000_000 % 60, 2);
     out.push(b':');
     push_padded(out, rem / 1_000_000 % 60, 2);
+    // Trailing zeros are dropped from the fraction (`.5`, not `.500000`), the same as
+    // `CAST(... AS VARCHAR)` (`expr::funcs::fmt_time`) and DuckDB's JSON writer.
     let sub = rem % 1_000_000;
     if sub != 0 {
         out.push(b'.');
         push_padded(out, sub, 6);
+        while out.last() == Some(&b'0') {
+            out.pop();
+        }
     }
     out.push(b'"');
 }
@@ -388,6 +401,26 @@ mod tests {
             crate::format::FormatKind::Csv,
         );
         assert_eq!(lines, vec![r#"{"id":1,"name":"alice"}"#, r#"{"id":2,"name":"bob"}"#]);
+    }
+
+    /// A negative year pads its digits to four, not the sign, matching
+    /// `CAST(... AS VARCHAR)` (the CLI's own renderer used to get this wrong).
+    #[test]
+    fn timestamps_pad_negative_years_and_trim_the_fraction() {
+        let lines = run(
+            "SELECT TIMESTAMP '-0015-01-01 00:00:00' AS a, \
+             TIMESTAMP '-0015-01-01 00:00:00'::TIMESTAMPTZ AS b FROM t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"a":"-0015-01-01 00:00:00","b":"-0015-01-01 00:00:00+00"}"#]);
+        // The fraction drops trailing zeros, as `CAST(... AS VARCHAR)` and DuckDB do.
+        let lines = run(
+            "SELECT TIMESTAMP '2020-01-01 00:00:00.5'::TIMESTAMPTZ AS a FROM t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"a":"2020-01-01 00:00:00.5+00"}"#]);
     }
 
     #[test]
@@ -500,16 +533,17 @@ mod tests {
         // `expr/float.rs`'s own test module.
         let mut out = Vec::new();
         push_f64(&mut out, f64::NAN, false);
-        assert_eq!(out, br#""NaN""#);
+        assert_eq!(out, br#""nan""#);
         out.clear();
         push_f64(&mut out, -f64::NAN, false);
-        assert_eq!(out, br#""NaN""#);
+        assert_eq!(out, br#""nan""#);
         out.clear();
+        // Not `"Infinity"`: DuckDB's JSON reader sniffs that as a DATE.
         push_f64(&mut out, f64::INFINITY, false);
-        assert_eq!(out, br#""Infinity""#);
+        assert_eq!(out, br#""inf""#);
         out.clear();
         push_f64(&mut out, f64::NEG_INFINITY, false);
-        assert_eq!(out, br#""-Infinity""#);
+        assert_eq!(out, br#""-inf""#);
     }
 
     /// A FLOAT column is written at `f32` precision, so `1.1::FLOAT` exports as `1.1`
@@ -535,7 +569,7 @@ mod tests {
             b"id\n1\n".to_vec(),
             crate::format::FormatKind::Csv,
         );
-        assert_eq!(lines, vec![r#"{"a":null,"b":"NaN"}"#]);
+        assert_eq!(lines, vec![r#"{"a":null,"b":"nan"}"#]);
     }
 
     // Regression test for a real bug found during QA: a `Ty::Json` column

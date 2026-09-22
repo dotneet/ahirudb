@@ -212,3 +212,19 @@ fn select_of(expr: &str) -> String {
     s.push_str(" FROM t");
     s
 }
+
+// --- The IS family binds one notch below comparison --------------------------
+
+#[test]
+fn is_distinct_from_takes_a_whole_comparison_as_its_operand() {
+    let mut db = session_with_id3();
+    // duckdb (t.id = 3): false, false, true, true, false, true, true.
+    let rows = run(
+        &mut db,
+        "SELECT (id = 3) IS DISTINCT FROM id < 5, null IS DISTINCT FROM true = null, \
+         false IS DISTINCT FROM id = 3, false IS NOT DISTINCT FROM id = 4, \
+         id = 4 IS DISTINCT FROM false, null = id IS NULL, id IS NULL = false FROM t",
+    );
+    let b = Value::Bool;
+    assert_eq!(rows, vec![vec![b(false), b(false), b(true), b(true), b(false), b(true), b(true)]]);
+}

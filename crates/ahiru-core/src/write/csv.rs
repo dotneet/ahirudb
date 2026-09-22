@@ -297,10 +297,19 @@ fn push_timestamp(out: &mut Vec<u8>, micros: i64) {
     push_padded(out, rem / 60_000_000 % 60, 2);
     out.push(b':');
     push_padded(out, rem / 1_000_000 % 60, 2);
-    let sub = rem % 1_000_000;
+    push_fraction(out, rem % 1_000_000);
+}
+
+/// `.ffffff` with trailing zeros dropped (`.5`, not `.500000`), the same as
+/// `CAST(... AS VARCHAR)` (`expr::funcs::fmt_time`) and DuckDB's writers. Nothing
+/// is written for a whole second.
+fn push_fraction(out: &mut Vec<u8>, sub: i64) {
     if sub != 0 {
         out.push(b'.');
         push_padded(out, sub, 6);
+        while out.last() == Some(&b'0') {
+            out.pop();
+        }
     }
 }
 
@@ -356,6 +365,29 @@ mod tests {
             crate::format::FormatKind::Csv,
         );
         assert_eq!(out, "id,name\n1,alice\n2,bob\n");
+    }
+
+    /// A negative year pads its digits to four, not the sign, matching
+    /// `CAST(... AS VARCHAR)` (the CLI's own renderer used to get this wrong).
+    #[test]
+    fn timestamps_pad_negative_years_and_trim_the_fraction() {
+        let out = run_csv(
+            "SELECT TIMESTAMP '-0015-01-01 00:00:00' AS a, \
+             TIMESTAMP '-0015-01-01 00:00:00.5'::TIMESTAMPTZ AS b FROM t",
+            "t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "a,b\n-0015-01-01 00:00:00,-0015-01-01 00:00:00.5+00\n");
+        // The fraction drops trailing zeros, as `CAST(... AS VARCHAR)` and DuckDB do.
+        let out = run_csv(
+            "SELECT TIMESTAMP '2020-01-01 00:00:00.123' AS a, \
+             TIMESTAMP '2020-01-01 00:00:00.000001' AS b FROM t",
+            "t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(out, "a,b\n2020-01-01 00:00:00.123,2020-01-01 00:00:00.000001\n");
     }
 
     #[test]
@@ -439,7 +471,7 @@ mod tests {
     fn non_finite_values_render_as_nan_and_infinity() {
         // CSV's own share of `push_f64`: non-finite handling is the one
         // thing that is not shared with the JSONL writer (JSON has no
-        // NaN/Infinity literal, so `write/jsonl.rs` writes `null` instead --
+        // NaN/Infinity literal, so `write/jsonl.rs` quotes them instead --
         // see that file's equivalent test). Everything else -- shortest
         // round-trip digit generation, exact-tie regression cases, and the
         // std-Display property test -- is covered once, for both writers,

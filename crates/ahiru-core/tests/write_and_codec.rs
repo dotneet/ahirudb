@@ -212,7 +212,8 @@ fn jsonl(session: &mut Session, sql: &str) -> String {
 // from a real SQL NULL -- a silent value change. RFC 8259 has no literal for
 // them, and `duckdb`'s unquoted `NaN` is not JSON and is rejected by this
 // crate's own reader, so they are written as quoted strings instead (see
-// `write::jsonl::push_f64`).
+// `write::jsonl::push_f64`). They are spelled as `CAST(x AS VARCHAR)` spells
+// them: the longhand `"Infinity"` is sniffed as a DATE by DuckDB's JSON reader.
 #[test]
 #[cfg(all(feature = "export", feature = "jsonl", feature = "csv"))]
 fn jsonl_export_writes_non_finite_doubles_as_quoted_strings() {
@@ -223,7 +224,7 @@ fn jsonl_export_writes_non_finite_doubles_as_quoted_strings() {
         "SELECT 'nan'::DOUBLE AS n, 'inf'::DOUBLE AS p, '-inf'::DOUBLE AS m, \
          CAST(NULL AS DOUBLE) AS z FROM t",
     );
-    assert_eq!(out, "{\"n\":\"NaN\",\"p\":\"Infinity\",\"m\":\"-Infinity\",\"z\":null}\n");
+    assert_eq!(out, "{\"n\":\"nan\",\"p\":\"inf\",\"m\":\"-inf\",\"z\":null}\n");
 }
 
 // `duckdb -csv -c "COPY (SELECT CAST(12.345 AS DECIMAL(10,3)) d) TO 'x.jsonl'"`

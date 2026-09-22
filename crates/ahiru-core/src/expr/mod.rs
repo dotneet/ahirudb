@@ -13,6 +13,19 @@
 //! instruction pointer, growing the VM. The one case that would need short-circuiting is division
 //! by zero, and that is resolved, as in DuckDB, by **returning NULL rather than an error**.
 //!
+//! ## Guarded operands: `Lazy`
+//!
+//! Evaluating both sides is only unobservable while neither side can fail. A guarded operand that
+//! *can* raise a per-row error (`CASE WHEN i < 30 THEN factorial(i) END`, `i < 30 AND
+//! factorial(i) > 0`, `coalesce(1, factorial(i))`) must not raise it for rows that never reach
+//! it. For those operands only, the compiler moves the operand into a separate sub-program
+//! (`Program::subs`) and emits one [`OpCode::Lazy`] instruction: the VM evaluates the
+//! sub-program over just the rows a mask register selects (as a narrower selection vector on
+//! the same input batch) and scatters the result back, NULL everywhere else. The ordinary
+//! combining instruction (`Select`/`And`/`Or`/`Coalesce`) then runs as before. The instruction
+//! stream stays a linear walk; an operand that cannot fail ([`Program::may_raise`]) is still
+//! inlined and evaluated over every row, so the common case costs nothing extra.
+//!
 //! ## Handling NULLs
 //!
 //! Kernels separate "computing the value" from "computing the validity". For most operations the
@@ -79,6 +92,9 @@ pub enum OpCode {
     Mul,
     /// Division by zero returns NULL (rather than an error).
     Div,
+    /// `//`. Identical to `Div` on the integer lanes; on `F64` a zero divisor gives NULL
+    /// instead of IEEE `inf`/`NaN`, as DuckDB's `//` does.
+    IntDiv,
     Mod,
     Neg,
 
@@ -139,7 +155,23 @@ pub enum OpCode {
     IntervalNeg,
     /// dst(I128) = a(INTERVAL) * b(BIGINT). Field-wise multiplication.
     IntervalMul,
+
+    /// dst = `Program::subs[aux]` evaluated over only the rows where register `a` satisfies the
+    /// mask mode `b` (one of the `MASK_*` constants), NULL for every other row. This is how a
+    /// guarded operand that may raise an error is kept from ever seeing the rows that do not
+    /// reach it (see "Guarded operands" in the module docs). Unlike every other instruction,
+    /// `b` is a mode, not a register.
+    Lazy,
 }
+
+/// `Lazy` mask mode: rows where `a` (BOOLEAN) is TRUE. A THEN value.
+pub const MASK_TRUE: u16 = 0;
+/// `Lazy` mask mode: rows where `a` (BOOLEAN) is FALSE or NULL. The rhs of `OR`, a later WHEN.
+pub const MASK_NOT_TRUE: u16 = 1;
+/// `Lazy` mask mode: rows where `a` (BOOLEAN) is TRUE or NULL. The rhs of `AND`.
+pub const MASK_NOT_FALSE: u16 = 2;
+/// `Lazy` mask mode: rows where `a` (any type) is NULL. A later `COALESCE` argument.
+pub const MASK_NULL: u16 = 3;
 
 /// The arguments of a scalar function call.
 #[derive(Clone)]
@@ -179,6 +211,9 @@ pub struct Program {
     /// can reference only its own parameters (columns of the enclosing scope are unreachable; see
     /// `plan::compile::Compiler::lambda_call`).
     pub lambdas: Vec<Program>,
+    /// The guarded sub-programs `OpCode::Lazy` evaluates over a subset of the rows. Each one is
+    /// compiled against the same input scope as its parent, with its own register space.
+    pub subs: Vec<Program>,
     pub num_regs: u16,
     /// Set when one of the `u16`-wide counters below (registers, constants,
     /// calls, casts, lambdas) ran out of room while this program was being
@@ -208,6 +243,7 @@ impl Program {
             consts: Vec::new(),
             casts: Vec::new(),
             lambdas: Vec::new(),
+            subs: Vec::new(),
             num_regs: 0,
             overflow: false,
             result: 0,
@@ -293,6 +329,41 @@ impl Program {
         i
     }
 
+    /// Embeds a guarded sub-program and returns the index for `OpCode::Lazy`'s `aux`.
+    /// Overflow poisons the parent, as with [`Program::add_lambda`].
+    pub fn add_sub(&mut self, sub: Program) -> u16 {
+        if sub.overflow {
+            self.overflow = true;
+        }
+        let Some(i) = self.next_index(self.subs.len()) else { return 0 };
+        self.subs.push(sub);
+        i
+    }
+
+    /// Whether evaluating this program can raise an error that depends on the row data.
+    ///
+    /// The compiler inlines a guarded operand (a THEN value, the rhs of `AND`, ...) that cannot
+    /// raise, and wraps one that can in `OpCode::Lazy`. The answer errs toward `true`: every
+    /// scalar function call counts, and so does every cast that is not a plain widening or a
+    /// conversion to text. The instructions listed as safe return NULL (division by zero, a
+    /// failed narrowing) or wrap (integer overflow) instead of raising. An instruction added
+    /// later is treated as fallible until it is listed here.
+    pub fn may_raise(&self) -> bool {
+        use OpCode::*;
+        self.instrs.iter().any(|i| match i.op {
+            LoadCol | LoadConst | Add | Sub | Mul | Div | IntDiv | Mod | Neg | Eq | Ne | Lt
+            | Le | Gt | Ge | And | Or | Not | IsNull | IsNotNull | TryCast | Like | Concat
+            | Select | Coalesce | TsAddInterval | IntervalAdd | IntervalNeg | IntervalMul => false,
+            Cast => self.casts.get(i.aux as usize).is_none_or(|c| {
+                !(c.to == Ty::Varchar
+                    || c.from == Ty::Null
+                    || (c.to != Ty::Json && Ty::unify(c.from, c.to) == Some(c.to)))
+            }),
+            Lazy => self.subs.get(i.aux as usize).is_none_or(Program::may_raise),
+            Call => true,
+        })
+    }
+
     pub fn add_cast(&mut self, from: Ty, to: Ty) -> u16 {
         let Some(i) = self.next_index(self.casts.len()) else { return 0 };
         self.casts.push(CastSpec { from, to });
@@ -306,6 +377,7 @@ impl Program {
     /// Whether it consists only of constants (for the constant-folding check).
     pub fn is_constant(&self) -> bool {
         !self.instrs.iter().any(|i| i.op == OpCode::LoadCol)
+            && self.subs.iter().all(|s| s.is_constant())
     }
 }
 

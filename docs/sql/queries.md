@@ -17,7 +17,7 @@ FROM <table | parquet('url') | read_json[_auto]('url') | generate_series(...) | 
   [, LATERAL? UNNEST(<expr>) ...]
   [TABLESAMPLE|USING SAMPLE <n>% | <n> ROWS | (bernoulli|system|reservoir)(...)]
 [WHERE <expr>]
-[GROUP BY <expr>, ... | ALL | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
+[GROUP BY ALL | <expr | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)>, ...]
 [HAVING <expr>]
 [WINDOW name AS (...), ...]
 [QUALIFY <expr>]
@@ -111,7 +111,9 @@ SELECT 3 IS TRUE, NULL IS TRUE, NULL IS NOT TRUE;   -- true, false, true
 
 -- IS [NOT] DISTINCT FROM: NULL-safe equality/inequality (never UNKNOWN,
 -- always TRUE/FALSE -- NULL is treated as equal to NULL and unequal to
--- anything else)
+-- anything else). As in PostgreSQL/DuckDB, the IS family binds one notch
+-- looser than comparison: `a IS DISTINCT FROM b = c` is
+-- `a IS DISTINCT FROM (b = c)`, and `a = b IS NULL` is `(a = b) IS NULL`.
 -- (`VALUES` is only an INSERT source here, not a table -- see
 -- limitations.md; use a real table for a scratch example.)
 SELECT a, b FROM t WHERE a IS DISTINCT FROM b;
@@ -140,6 +142,46 @@ A shift by a negative amount or by more than 63 bits returns `NULL` rather
 than erroring (DuckDB itself raises an error there) — consistent with how
 this engine already treats other undefined integer arithmetic (division by
 zero, etc.; see [types.md](types.md#null-and-three-valued-logic)).
+
+### Guarded evaluation: CASE, AND, OR, COALESCE
+
+An operand that a row never reaches is never evaluated for that row, so an
+error it would raise (`factorial` overflowing, `repeat` exceeding the size
+limit, an invalid `CAST(... AS JSON)`, ...) is not raised either:
+
+| Construct | The operand ... | ... is evaluated only for rows where |
+|---|---|---|
+| `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ... ELSE e END` | `c2`, `c3`, ... | every earlier WHEN condition was FALSE or NULL |
+| | `v1`, `v2`, ... | its own WHEN condition is TRUE (and no earlier one was) |
+| | `e` | every WHEN condition was FALSE or NULL |
+| `CASE x WHEN a1 THEN ...` | same as above, with `x = ak` as the conditions (`x` itself is evaluated for every row) | |
+| `IIF(c, a, b)` / `IF(c, a, b)` | same as `CASE WHEN c THEN a ELSE b END` | |
+| `l AND r` | `r` | `l` is TRUE or NULL |
+| `l OR r` | `r` | `l` is FALSE or NULL |
+| `COALESCE(a1, a2, ...)` / `IFNULL(a1, a2)` | `a2`, `a3`, ... | every earlier argument was NULL |
+
+```sql
+SELECT sum(CASE WHEN i < 30 THEN factorial(i::INTEGER) ELSE 0 END) FROM range(40) t(i);
+SELECT count(coalesce(1, factorial(i::INTEGER))) FROM range(40) t(i);        -- 40
+SELECT count(*) FROM range(40) t(i) WHERE i < 30 AND factorial(i::INTEGER) > 0; -- 30
+```
+
+`WHERE`, `HAVING`, `QUALIFY` and join `ON` conditions keep the guarantee
+when the planner splits them at their top-level `AND`s: a conjunct is still
+evaluated only for the rows every conjunct written before it (and pushed to
+the same place) left not FALSE, including when they are pushed into a scan.
+Conjuncts that reference different tables of a join can be pushed to
+different sides of it, and then run in plan order rather than written
+order — the same freedom DuckDB's optimizer takes.
+
+The first WHEN condition, the left-hand side of `AND`/`OR`, the first
+`COALESCE` argument and a simple-`CASE` operand are reached by every row
+and always evaluated. The guarantee is only about errors: which value comes
+out is the same either way. `NULLIF`, `GREATEST`/`LEAST`, `IN (...)` and
+`BETWEEN` evaluate all of their operands. DuckDB gives the same answers for
+the examples above; it does not promise it in every shape (it can, for
+example, evaluate an `AND` nested inside an `OR` eagerly and raise where
+this engine does not).
 
 ## Joins
 
@@ -269,6 +311,12 @@ WITH RECURSIVE
 SELECT a.n, b.n FROM a, b WHERE a.n = b.n - 99 ORDER BY a.n;
 ```
 
+As in DuckDB, a trailing `ORDER BY`/`LIMIT`/`OFFSET` on the body of a
+recursive CTE (`... UNION ALL SELECT n + 1 FROM r WHERE n < 10 LIMIT 3`) is
+rejected with a syntax error rather than ignored; put the clause on the
+outer query instead. A parenthesised recursive member
+(`UNION ALL (SELECT ... LIMIT 3)`) is accepted.
+
 The recursive working set and its deduplication ("seen") set each have a
 fixed in-memory cap — see [limitations.md](limitations.md#no-spilling).
 
@@ -302,7 +350,9 @@ SELECT DISTINCT ON (region) region, amount FROM orders ORDER BY region, amount D
 
 `GROUPING SETS`/`ROLLUP`/`CUBE` compute several grouping granularities in
 one pass, unioning the results together (rows from a coarser grouping have
-`NULL` in the columns that grouping doesn't group by):
+`NULL` in the columns that grouping doesn't group by). A column spelled two
+ways (`b` and `v.b`) is one grouping key, and a clause may expand to at most
+256 grouping sets:
 
 ```sql
 -- two granularities at once: grouped by flag, and the grand total
@@ -322,6 +372,11 @@ SELECT flag, id % 3 AS m, count(*) c,
        grouping(flag) gf, grouping(id % 3) gm, grouping(flag, id % 3) gid
 FROM t GROUP BY CUBE (flag, id % 3) ORDER BY 1, 2;
 
+-- plain keys and several constructs mix in one GROUP BY; the elements
+-- combine as a cross product, as in DuckDB/PostgreSQL:
+-- GROUP BY flag, ROLLUP (id % 3) = GROUPING SETS ((flag, id % 3), (flag))
+SELECT flag, id % 3 AS m, count(*) c FROM t GROUP BY flag, ROLLUP (id % 3) ORDER BY 1, 2;
+
 -- HAVING can reference GROUPING() to pick out just one granularity
 SELECT flag, id % 3 AS m, count(*) c
 FROM t GROUP BY GROUPING SETS ((flag, id % 3), (flag), ())
@@ -334,7 +389,15 @@ The two clauses deliberately resolve a bare name differently, matching
 DuckDB and PostgreSQL:
 
 - **`GROUP BY` prefers an input column** over a select-list alias.
-- **`ORDER BY` prefers the select-list alias** over an input column.
+- **`ORDER BY` prefers the select-list alias** over an input column — for a
+  bare name. An explicit `AS` alias wins over an output column that merely
+  carries the name (`SELECT id AS v, v FROM t ORDER BY v` sorts by `id`),
+  and among several aliases of one name the last wins.
+- **Inside an `ORDER BY` expression** (`ORDER BY x || id`,
+  `ORDER BY length(x) + sum(id)`) a name is an input column when the input
+  has it, and a select-list alias otherwise — so an alias can be combined
+  with columns, aggregates and other aliases, while
+  `SELECT id AS v FROM t ORDER BY v + 0` sorts by the input `v`.
 
 So in `SELECT b AS a, count(*) FROM t GROUP BY a`, the `a` in `GROUP BY`
 is the table's own column `a` — not the alias for `b` — and the query is
@@ -377,6 +440,9 @@ SELECT flag, name, count(*) c FROM t GROUP BY ALL ORDER BY ALL;
 - "Contains an aggregate" is about the whole expression, not just its top
   level: in `SELECT id % 3, sum(id) + 1 FROM t GROUP BY ALL`, the grouping
   key is `id % 3` alone — `sum(id) + 1` is excluded.
+- An item that references no column (`42`, `'x'`, `1 + 1`) is constant and
+  is left out of the grouping, as in DuckDB: `SELECT b, 42, count(*) FROM t
+  GROUP BY ALL` groups by `b` alone.
 - With no aggregate anywhere in the select list it behaves like
   `SELECT DISTINCT`.
 - With nothing *but* aggregates there are no grouping columns, i.e. one
@@ -455,11 +521,14 @@ result. If you need a specific frame, restructure the query with a subquery
 or `LIMIT`/aggregation instead of relying on `OVER (... ROWS BETWEEN ...)`.
 
 `QUALIFY` filters on the *result* of a window function without needing to
-wrap the query in a subquery. It is evaluated **after** the select list, so
-it sees output names: `* REPLACE`, `* RENAME`, and a trailing alias that
-shadows a star column (the last column of that name wins). A window
-function written only in `QUALIFY` is computed and then dropped from the
-output.
+wrap the query in a subquery. It is evaluated **after** the select list, but
+a bare name resolves the way it does in `WHERE`/`HAVING`, as in DuckDB: an
+input column of that name wins, and only a name the input doesn't have
+falls back to an output name (a select-list alias such as `rn` below, or a
+`* RENAME`d column). So in `SELECT a * 1 AS b, rank() OVER (...) FROM t
+QUALIFY b = 3` the `b` is the table's own column, and `* REPLACE (x * 2 AS
+x) ... QUALIFY x > 1` filters on the input `x`. A window function written
+only in `QUALIFY` is computed and then dropped from the output.
 
 ```sql
 SELECT id, row_number() OVER (ORDER BY id) AS rn

@@ -68,7 +68,19 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
             }
         }
         F_BIT_XOR => Some(a.int(0) ^ a.int(1)),
-        F_BIT_COUNT => Some(a.int(0).count_ones() as i64),
+        F_BIT_COUNT => {
+            // Count within the argument's declared width, so a negative narrow integer
+            // doesn't pick up the sign-extension bits of its I32/I64 lane.
+            let x = a.i128(0) as u128;
+            let bits = match a.at(0).map(|(v, _)| v.ty()) {
+                Some(Ty::TinyInt | Ty::UTinyInt) => x & 0xff,
+                Some(Ty::SmallInt | Ty::USmallInt) => x & 0xffff,
+                Some(Ty::Int | Ty::UInt) => x & 0xffff_ffff,
+                Some(Ty::HugeInt) => x,
+                _ => x & u64::MAX as u128,
+            };
+            Some(bits.count_ones() as i64)
+        }
         // Always non-negative, matching DuckDB (`select gcd(-4, 6)` -> `2`).
         F_GCD => gcd(a.int(0), a.int(1)),
         F_LCM => {
@@ -120,6 +132,17 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
         F_EPOCH_MS => Some(a.int(0) / 1_000),
         F_EPOCH_US => Some(a.int(0)),
         F_EPOCH_NS => a.int(0).checked_mul(1_000),
+        // `to_timestamp(<seconds>)`. Rounded half to even to whole microseconds, as DuckDB's
+        // double-to-integer conversion rounds; NaN, infinity and anything past the `i64`
+        // microsecond range are NULL (DuckDB raises an out-of-range error).
+        F_EPOCH_SEC_TO_TS => {
+            let us = crate::expr::kernels::f_round(a.flt(0) * 1e6);
+            if (-9.223_372_036_854_775e18..9.223_372_036_854_775e18).contains(&us) {
+                Some(us as i64)
+            } else {
+                None
+            }
+        }
         F_LIST_POSITION => match super::json::list_find(a)? {
             // DuckDB gives NULL rather than 0 when the element is absent.
             Some(0) | None => None,
@@ -656,10 +679,18 @@ pub(super) fn f_exp(x: f64) -> f64 {
     scale2(s2 + ((e1 + e2) - lo), k as i32)
 }
 
-/// Exponentiation. Integer exponents small enough to square up are computed exactly by repeated
-/// squaring (so `pow(2,3)` does not come out as 7.999...). Everything else uses
-/// `exp(y * ln |x|)`, with the sign restored from the exponent's parity when the base is
-/// negative.
+/// Exponentiation, correctly rounded but for the rarest near-halfway cases.
+///
+/// `|x|^y` is `exp(y * ln|x|)` evaluated in double-double arithmetic ([`ln_dd`],
+/// [`exp_dd`]): about 80 good bits reach the final rounding, so the answer is the double
+/// nearest the true power -- and every exactly representable power (`pow(2, 3)`,
+/// `pow(10, 22)`) comes out exact -- matching the platform `pow` DuckDB calls. The old
+/// form rounded after each step: plain `exp(y * ln x)` loses the relative error of `ln x`
+/// times `|y ln x|` (`pow(10, 2.5)` was `316.22776601683825`, a dozen ulps high), and the
+/// repeated-squaring path it used for integer exponents rounded once per multiplication
+/// (`pow(1.1, 1000)` was ~600 ulps off, `pow(10, 300)` was `1.0000000000000006e+300`) and
+/// overflowed its intermediate before taking a reciprocal (`pow(10, -310)` was `0`).
+/// `pow(x, 0.5)` is [`f_sqrt`], which is correctly rounded.
 ///
 /// The IEEE 754 / C `pow` special cases come first: `pow(x, ±0)` and `pow(1, y)` are 1 even
 /// when the other operand is NaN (`duckdb -c "select pow(1, 'nan'::DOUBLE)"` -> `1.0`).
@@ -673,36 +704,22 @@ pub(super) fn f_pow(x: f64, y: f64) -> f64 {
     // `f_trunc` leaves an infinity alone, so `int_exp` is also true for `y = ±inf`. That is
     // what the parity test below wants: an infinite exponent has no parity (`inf % 2` is NaN),
     // and IEEE 754 gives `pow(negative, ±inf)` the same value as `pow(|negative|, ±inf)`.
-    let n = f_trunc(y);
-    let int_exp = n == y;
-    if int_exp && f_abs(y) <= 1024.0 {
-        let mut r = 1.0f64;
-        let mut b = x;
-        let mut k = f_abs(n) as u32;
-        while k > 0 {
-            if k & 1 == 1 {
-                r *= b;
-            }
-            b *= b;
-            k >>= 1;
-        }
-        // A negative exponent takes the reciprocal of the whole (exactly computed) positive
-        // power. Squaring `1/x` instead would carry that first rounding into every step:
-        // `pow(10, -2)` used to give `0.010000000000000002` rather than `0.01`.
-        return if n < 0.0 { 1.0 / r } else { r };
-    }
+    let int_exp = f_trunc(y) == y;
     // A negative base is defined only for an integer exponent; its magnitude comes from `|x|`
     // and its sign from whether that exponent is odd. `y % 2.0` is exact for every
     // integer-valued double (everything at or above 2^53 is even), which is what makes this
     // work for exponents far too large to square up: `pow(-2, 1025)` is `-inf`, `pow(-2, 2000)`
-    // is `+inf`. Before this, both came out NaN.
-    let negate = if x < 0.0 {
+    // is `+inf`.
+    // `-0.0` counts as negative here too: an odd integer power keeps its sign
+    // (`pow(-0.0, 3)` is `-0.0`, `pow(-0.0, -1)` is `-inf`), as IEEE 754 and DuckDB have it.
+    let negate = if x.is_sign_negative() {
         if !int_exp {
             // A negative *finite* base with a non-integer exponent has no real solution.
             // `-inf` is the exception: IEEE 754 gives `pow(-inf, y)` the same value as
             // `pow(+inf, y)` whenever `y` is not an odd integer, and DuckDB agrees
-            // (`pow(-inf, 0.5)` -> `inf`, `pow(-inf, -0.5)` -> `0`).
-            if x != f64::NEG_INFINITY {
+            // (`pow(-inf, 0.5)` -> `inf`, `pow(-inf, -0.5)` -> `0`). So is `-0.0`
+            // (`pow(-0.0, 0.5)` is `0`).
+            if x != f64::NEG_INFINITY && x != 0.0 {
                 return f64::NAN;
             }
             false
@@ -723,12 +740,134 @@ pub(super) fn f_pow(x: f64, y: f64) -> f64 {
         // `x == -1.0` (the positive case returned at the top). `ln(1)` is 0, so the general
         // form below would evaluate `inf * 0` = NaN for an infinite exponent.
         1.0
-    } else {
+    } else if !a.is_finite() || !y.is_finite() {
+        // Only the sign of `y * ln a` matters here (the answer is 0, 1 or infinity).
         f_exp(y * f_ln(a))
+    } else if y == 0.5 {
+        f_sqrt(a)
+    } else {
+        let l = ln_dd(a);
+        let p = y * l.0;
+        // Far outside the range where the result is a finite, nonzero double. Deciding it
+        // here also keeps `two_prod` below away from operands its splitting would overflow.
+        if p > 1_000.0 {
+            f64::INFINITY
+        } else if p < -1_000.0 {
+            0.0
+        } else {
+            let (h, e) = two_prod(y, l.0);
+            exp_dd(fast_two_sum(h, e + y * l.1))
+        }
     };
     if negate {
         -mag
     } else {
         mag
     }
+}
+
+/// A double-double: the unevaluated sum `hi + lo` with `|lo| <= ulp(hi) / 2`, carrying about
+/// 106 significant bits. Just enough of it for [`f_pow`].
+type Dd = (f64, f64);
+
+/// `ln(2)` as a double-double (the nearest double and the correctly rounded remainder).
+const LN2_DD: Dd = (core::f64::consts::LN_2, 2.319_046_813_846_299_6e-17);
+
+/// Knuth's two-sum: `a + b == s + e` exactly.
+fn two_sum(a: f64, b: f64) -> Dd {
+    let s = a + b;
+    let bb = s - a;
+    (s, (a - (s - bb)) + (b - bb))
+}
+
+/// Dekker's fast two-sum, for `|a| >= |b|` (or `a == 0`).
+fn fast_two_sum(a: f64, b: f64) -> Dd {
+    let s = a + b;
+    (s, b - (s - a))
+}
+
+fn dd_add(a: Dd, b: Dd) -> Dd {
+    let (s, e) = two_sum(a.0, b.0);
+    let (t, f) = two_sum(a.1, b.1);
+    let (s, e) = fast_two_sum(s, e + t);
+    fast_two_sum(s, e + f)
+}
+
+fn dd_mul(a: Dd, b: Dd) -> Dd {
+    let (p, e) = two_prod(a.0, b.0);
+    fast_two_sum(p, e + (a.0 * b.1 + a.1 * b.0))
+}
+
+fn dd_div(a: Dd, b: Dd) -> Dd {
+    let q = a.0 / b.0;
+    let (p, e) = two_prod(q, b.0);
+    fast_two_sum(q, (((a.0 - p) - e) + a.1 - q * b.1) / b.0)
+}
+
+/// `1 / n` as a double-double. The series coefficients below are built with it rather than
+/// spelled out as constant pairs.
+fn recip(n: f64) -> Dd {
+    dd_div((1.0, 0.0), (n, 0.0))
+}
+
+/// `ln(x)` as a double-double, for finite `x > 0`, good to about 2^-100 relative.
+///
+/// `x = 2^k * m` with `m` in `[sqrt(2)/2, sqrt(2))`, and `ln(m) = 2 atanh(s)` with
+/// `s = (m - 1) / (m + 1)`, `|s| <= 0.172`: the series `2s (1 + s^2/3 + s^4/5 + ...)` is
+/// summed to the 17th term, where it is below 2^-100.
+fn ln_dd(x: f64) -> Dd {
+    let mut bits = x.to_bits();
+    let mut k = 0i32;
+    // Subnormals are scaled by 2^64 first so the exponent field is meaningful.
+    if (bits >> 52) & 0x7ff == 0 {
+        bits = (x * 18_446_744_073_709_551_616.0).to_bits();
+        k -= 64;
+    }
+    k += ((bits >> 52) & 0x7ff) as i32 - 1023;
+    let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | (1023u64 << 52));
+    if m > core::f64::consts::SQRT_2 {
+        m *= 0.5;
+        k += 1;
+    }
+    // `m - 1` is exact (Sterbenz); `m + 1` is carried as a two-sum.
+    let s = dd_div((m - 1.0, 0.0), two_sum(m, 1.0));
+    let z = dd_mul(s, s);
+    let mut p = recip(33.0);
+    for n in (0..16).rev() {
+        p = dd_add(dd_mul(p, z), recip((2 * n + 1) as f64));
+    }
+    let lm = dd_mul(s, p);
+    let kf = k as f64;
+    let (kh, kl) = two_prod(kf, LN2_DD.0);
+    dd_add(fast_two_sum(kh, kl + kf * LN2_DD.1), (2.0 * lm.0, 2.0 * lm.1))
+}
+
+/// `exp(t)` for a double-double `t`, rounded once to a double.
+///
+/// `t = k ln 2 + r` with `|r| <= ln(2)/2` (the subtraction in double-double), then
+/// `exp(r) = (1 + u)^256` with `u = expm1(r / 256)` from its Taylor series to `r^7`; each of the
+/// eight squarings is carried as `u <- 2u + u^2`, which never forms the `1 +` that would round
+/// the small `u` away. The result is scaled by `2^k` last.
+fn exp_dd(t: Dd) -> f64 {
+    if t.0 > 710.0 {
+        return f64::INFINITY;
+    }
+    if t.0 < -746.0 {
+        return 0.0;
+    }
+    let k = round_half_up(t.0 / core::f64::consts::LN_2);
+    let (kh, kl) = two_prod(k, LN2_DD.0);
+    let kln2 = fast_two_sum(kh, kl + k * LN2_DD.1);
+    let r = dd_add(t, (-kln2.0, -kln2.1));
+    let r = (r.0 / 256.0, r.1 / 256.0);
+    let mut q = recip(5040.0);
+    for c in [720.0, 120.0, 24.0, 6.0, 2.0, 1.0] {
+        q = dd_add(dd_mul(q, r), recip(c));
+    }
+    let mut u = dd_mul(q, r);
+    for _ in 0..8 {
+        u = dd_add((2.0 * u.0, 2.0 * u.1), dd_mul(u, u));
+    }
+    let v = dd_add((1.0, 0.0), u);
+    scale2(v.0, k as i32)
 }

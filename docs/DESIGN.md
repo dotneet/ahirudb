@@ -283,7 +283,9 @@ Statistics pruning follows the same pattern: the default `may_match`
 fragment are stripped first); an unrecognized extension defaults to Parquet,
 the primary target format. Kinds: `Parquet`, `Csv`, `Tsv`, `Jsonl`, `Json`
 (a single top-level JSON array/object, i.e. `read_json`/`read_json_auto`
-style).
+style; a `.json` file that turns out to hold one value per line -- what
+`COPY ... TO 'x.json'` writes -- is detected from a leading sample and handed
+to the JSONL reader, so it streams split by split like any `.jsonl`).
 
 **Non-Parquet formats are behind Cargo features** (`csv`, `jsonl` — `jsonl`
 also covers the single-document `Json` reader, since it shares most of the
@@ -301,7 +303,7 @@ format list isn't how the budget gets met.
 | Encodings | PLAIN, RLE, RLE_DICTIONARY, PLAIN_DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY |
 | Compression | UNCOMPRESSED, SNAPPY, LZ4_RAW (built in) / ZSTD (built in by default, feature `zstd`) / GZIP (host-delegated, §6) |
 | Physical types | BOOLEAN, INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY, INT96 (timestamp-compatible) |
-| Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, integer width/signedness |
+| Logical types | STRING, JSON (read as `JSON`), DATE, TIME, TIMESTAMP, DECIMAL, UUID, integer width/signedness |
 | Nested types | `STRUCT` is flattened into dotted column names where possible; `LIST`/`MAP` (and any `STRUCT` containing them) are exposed as a `JSON`-typed column, sharing the same JSON-path/`list_*`/`map_*` function surface as the `JSON` type itself |
 | Pruning | ColumnChunk min/max/null-count statistics, PageIndex (ColumnIndex/OffsetIndex), Split Block Bloom Filters — see §17 for coverage details |
 | Encryption | Not supported |
@@ -495,7 +497,7 @@ FROM <table | parquet('url') | read_json[_auto]('url') | generate_series(...) | 
   [, LATERAL? UNNEST(<expr>) ...]
   [TABLESAMPLE|USING SAMPLE <n>% | <n> ROWS | (bernoulli|system|reservoir)(...) ]
 [WHERE <expr>]
-[GROUP BY <expr>, ... | ALL | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
+[GROUP BY ALL | <expr | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)>, ...]
 [HAVING <expr>] [QUALIFY <expr>]
 [WINDOW name AS (...), ...]
 [ORDER BY <expr> [ASC|DESC] [NULLS FIRST|LAST], ... | ALL [ASC|DESC] [NULLS FIRST|LAST]]
@@ -705,6 +707,30 @@ recursively per row.
 > handling of `IN`/`BETWEEN` at the Parquet scan layer (§17) — the VM's job
 > is correctly evaluating the predicate against whatever rows already got
 > read; pruning's job is deciding which RowGroups/pages to read at all.
+>
+> **Guarded operands (`Lazy`).** "Evaluate both sides" stopped being
+> unobservable once scalar functions could raise per-row errors
+> (`factorial` overflow, `repeat` size limit, `CAST(... AS JSON)`):
+> `CASE WHEN i < 30 THEN factorial(i) END` failed on rows the WHEN had
+> excluded. So an operand that not every row reaches — a later WHEN
+> condition, a THEN/ELSE value, the rhs of `AND`/`OR`, a later
+> `COALESCE`/`IFNULL` argument, a later WHERE conjunct merged by
+> `and_programs` — is compiled as its own program first. If
+> `Program::may_raise` says it cannot fail (no call, no narrowing or JSON
+> cast), it is inlined exactly as before, so the common case pays nothing.
+> Otherwise it goes into `Program::subs` and one `Lazy` instruction runs it
+> over only the rows a mask register selects: the selected rows' batch
+> indices become a narrower selection vector over the *same* columns (no
+> copy), and the dense result is scattered back with NULL elsewhere. No row
+> selected skips the sub-program entirely; every row selected runs it with
+> no gather/scatter. The combining `Select`/`And`/`Or`/`Coalesce` is
+> unchanged. This keeps the "no branch instructions, linear walk" property;
+> `CASE` lowers flat (a running "already matched" register per WHEN), so a
+> long WHEN list does not nest programs. The alternative — a masked-error
+> mode where fallible kernels record per-row errors that are raised only if
+> selected — would have touched every fallible kernel and still wasted the
+> work on unreached rows. User-facing guarantee: docs/sql/queries.md
+> ("Guarded evaluation").
 
 ```
 instr: { op: u8, ty: u8, dst: u16, a: u16, b: u16 }
@@ -1004,9 +1030,15 @@ to be explicit:
   small addends to a large one: `sum([1e100, 1.0, -1e100])` is `1.0` here,
   from `SELECT sum(x)` and `SELECT sum(x) OVER ()` alike, where an
   uncompensated accumulator (DuckDB's included) gives `0.0`.
+- `stddev`/`variance`/`stddev_pop`/`var_pop` over an input containing
+  `NaN` or `±inf` are `NaN`, where DuckDB raises "out of range" — the same
+  "floats stay IEEE" rule. (They used to return `0.0`: the clamp that keeps
+  rounding from making a variance negative was written with `f64::max`,
+  which drops a `NaN` operand.)
 - `abs`/`sign` clear the sign bit rather than negating, so neither can
-  return `-0.0`. `sqrt` and `cbrt` are correctly rounded; `exp`/`ln` are
-  within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see
+  return `-0.0`. `sqrt` and `cbrt` are correctly rounded, and so is `pow`
+  (a double-double `exp(y ln x)`) outside the rarest near-halfway cases;
+  `exp`/`ln` are within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see
   `docs/sql/functions-numeric.md`).
 
 ---

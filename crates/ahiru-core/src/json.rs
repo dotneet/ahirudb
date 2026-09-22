@@ -13,7 +13,7 @@
 //! extracts one particular subtree". Only the **tokenizer itself** below those
 //! higher-level iterators -- skipping whitespace, strings, numbers, scalars, and any
 //! single value, plus escape expansion -- is entirely common to both. So only the
-//! tokenizer lives here, and `format::jsonl` `use`s it (the NDJSON-specific parts --
+//! tokenizer lives here, and `format::jsonl`/`format::json` `use` it (the NDJSON-specific parts --
 //! `Members`/`Member`, the type lattice for schema inference, the date parser, and so
 //! on -- stay in `format::jsonl` as they were).
 //!
@@ -47,10 +47,6 @@
 //!   (the caller, `expr::kernels::compare`, merely compares bytes).
 
 use crate::prelude::*;
-
-/// The nesting limit for values. Same value and same reason as `format::jsonl`
-/// (the kinds of open containers fit in a `u32` bit stack).
-pub(crate) const MAX_DEPTH: u32 = 32;
 
 /// The kind of a JSON value.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,31 +183,62 @@ pub(crate) fn skip_member_key(b: &[u8], i: usize) -> Result<usize> {
     Ok(ni + 1)
 }
 
+/// The kinds (object or array) of the containers open while skipping a value, as a bit stack.
+///
+/// The innermost 64 levels live in one word; deeper ones spill to the heap a word at a time, so
+/// depth is bounded only by the input's length (one bit per level, far less than the bytes that
+/// spell it). Nothing that walks JSON text in this crate recurses, so there is no stack to
+/// protect -- a fixed cap used to reject a deeply nested value even in a column the query never
+/// selected (the reader still has to skip past it).
+struct Kinds {
+    /// Bit 1 = object, 0 = array. The lowest bit is the current container.
+    top: u64,
+    spill: Vec<u64>,
+    depth: usize,
+}
+
+impl Kinds {
+    fn push(&mut self, obj: bool) {
+        if self.depth > 0 && self.depth.is_multiple_of(64) {
+            self.spill.push(self.top);
+            self.top = 0;
+        }
+        self.top = (self.top << 1) | obj as u64;
+        self.depth += 1;
+    }
+
+    fn pop(&mut self) {
+        self.top >>= 1;
+        self.depth -= 1;
+        if self.depth > 0 && self.depth.is_multiple_of(64) {
+            self.top = self.spill.pop().unwrap_or(0);
+        }
+    }
+
+    fn in_object(&self) -> bool {
+        self.top & 1 == 1
+    }
+}
+
 /// Skips one value starting at `b[i]` and returns the position just after it.
 ///
-/// Non-recursive. The kinds of open containers live in a `u32` bit stack, and depth
-/// is capped by `MAX_DEPTH` (kept equal to the bit width of `u32`).
+/// Non-recursive, and not depth-limited (see `Kinds`).
 pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
     let mut i = start;
-    // Bit 1 = object, 0 = array. The lowest bit is the current container.
-    let mut stack: u32 = 0;
-    let mut depth: u32 = 0;
+    let mut stack = Kinds { top: 0, spill: Vec::new(), depth: 0 };
 
     'value: loop {
         i = skip_ws(b, i);
         let c = byte_at(b, i)?;
         if c == b'{' || c == b'[' {
             let obj = c == b'{';
-            ensure!(depth < MAX_DEPTH, NestingTooDeep, i);
-            stack = (stack << 1) | obj as u32;
-            depth += 1;
+            stack.push(obj);
             i = skip_ws(b, i + 1);
             let n = byte_at(b, i)?;
             if (obj && n == b'}') || (!obj && n == b']') {
                 // An empty container. Falls through to the closing logic below as though one value had been consumed.
                 i += 1;
-                stack >>= 1;
-                depth -= 1;
+                stack.pop();
             } else {
                 if obj {
                     i = skip_member_key(b, i)?;
@@ -224,12 +251,12 @@ pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
 
         // One value consumed. Handle the separator or closing bracket.
         loop {
-            if depth == 0 {
+            if stack.depth == 0 {
                 return Ok(i);
             }
             i = skip_ws(b, i);
             let c = byte_at(b, i)?;
-            let obj = stack & 1 == 1;
+            let obj = stack.in_object();
             match c {
                 b',' => {
                     i += 1;
@@ -240,13 +267,11 @@ pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
                 }
                 b'}' if obj => {
                     i += 1;
-                    stack >>= 1;
-                    depth -= 1;
+                    stack.pop();
                 }
                 b']' if !obj => {
                     i += 1;
-                    stack >>= 1;
-                    depth -= 1;
+                    stack.pop();
                 }
                 _ => err!(SyntaxError, i),
             }
@@ -802,6 +827,96 @@ pub(crate) fn write_extracted_text(span: &[u8], kind: Kind, out: &mut Vec<u8>) -
 }
 
 // =========================================================================
+// Ordering (LIST semantics)
+// =========================================================================
+
+/// The total order `ORDER BY`, `MIN`/`MAX`/`ARG_MIN`/`ARG_MAX` and window ordering use for
+/// `Ty::Json` values.
+///
+/// A LIST is stored as JSON array text (§8 of DESIGN.md), and ordering it by bytes gets
+/// lists wrong: `[10]` sorted before `[9]` and `[]` after `[2]`. When **both** documents are
+/// arrays they are compared the way DuckDB compares LISTs: element by element, the first
+/// difference deciding, and a list that is a prefix of the other first. Elements compare as
+///
+/// - numbers: numerically (as `i64` when both are integers, otherwise as `f64`);
+/// - strings: by their decoded bytes, so an escape does not reorder them;
+/// - arrays: recursively;
+/// - `null`: after every value (DuckDB places a NULL element last);
+/// - anything else (objects, booleans, mixed kinds): by their text.
+///
+/// Every other pair -- an object, a scalar document, or an array against a non-array --
+/// keeps byte order, which is also what DuckDB does for its (text-backed) `JSON` type. So
+/// does a malformed array, rather than failing a sort halfway through.
+pub(crate) fn cmp_json(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    let (i, j) = (skip_ws(a, 0), skip_ws(b, 0));
+    if a.get(i) == Some(&b'[') && b.get(j) == Some(&b'[') {
+        if let Ok(o) = cmp_array(&a[i..], &b[j..]) {
+            return o;
+        }
+    }
+    a.cmp(b)
+}
+
+/// Element-wise comparison of two arrays; `a` and `b` both start with `[`.
+fn cmp_array(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering> {
+    let (mut i, mut j) = (skip_ws(a, 1), skip_ws(b, 1));
+    loop {
+        let (ea, eb) = (byte_at(a, i)? == b']', byte_at(b, j)? == b']');
+        if ea || eb {
+            // Whichever ran out first is the shorter list, a prefix of the other.
+            return Ok(eb.cmp(&ea));
+        }
+        let (ie, je) = (skip_value(a, i)?, skip_value(b, j)?);
+        let o = cmp_element(&a[i..ie], &b[j..je])?;
+        if o.is_ne() {
+            return Ok(o);
+        }
+        i = next_element(a, ie)?;
+        j = next_element(b, je)?;
+    }
+}
+
+/// Steps past the `,` after an element; stays on the closing `]`.
+fn next_element(b: &[u8], i: usize) -> Result<usize> {
+    let i = skip_ws(b, i);
+    match byte_at(b, i)? {
+        b',' => Ok(skip_ws(b, i + 1)),
+        b']' => Ok(i),
+        _ => err!(SyntaxError, i),
+    }
+}
+
+/// Compares two array elements (non-empty spans already validated by `skip_value`).
+fn cmp_element(x: &[u8], y: &[u8]) -> Result<core::cmp::Ordering> {
+    use core::cmp::Ordering;
+    Ok(match (kind_of(x[0]), kind_of(y[0])) {
+        (Kind::Null, Kind::Null) => Ordering::Equal,
+        (Kind::Null, _) => Ordering::Greater,
+        (_, Kind::Null) => Ordering::Less,
+        (Kind::Array, Kind::Array) => cmp_array(x, y)?,
+        (Kind::Num, Kind::Num) => match (parse_i64(x), parse_i64(y)) {
+            (Some(p), Some(q)) => p.cmp(&q),
+            _ => match (parse_f64(x), parse_f64(y)) {
+                (Some(p), Some(q)) => crate::exec::rowkey::ord_f64(p, q),
+                _ => x.cmp(y),
+            },
+        },
+        (Kind::Str, Kind::Str) => {
+            let ((sx, ex, _), (sy, ey, _)) = (scan_string(x, 0)?, scan_string(y, 0)?);
+            if ex || ey {
+                let (mut dx, mut dy) = (Vec::new(), Vec::new());
+                decode_string(sx, &mut dx)?;
+                decode_string(sy, &mut dy)?;
+                dx.cmp(&dy)
+            } else {
+                sx.cmp(sy)
+            }
+        }
+        _ => x.cmp(y),
+    })
+}
+
+// =========================================================================
 // Serialization
 // =========================================================================
 
@@ -1070,23 +1185,38 @@ mod tests {
     // --- Boundary values and corrupt input --------------------------------------
 
     #[test]
-    fn nesting_exactly_at_max_depth_succeeds_one_more_fails() {
-        // `skip_value` is non-recursive (a `u32` bit stack), so deep nesting cannot
-        // overflow the stack, but MAX_DEPTH (32) itself should still act as an
-        // explicit limit.
-        let mut at_limit = vec![b'['; MAX_DEPTH as usize];
-        at_limit.extend(vec![b']'; MAX_DEPTH as usize]);
-        assert!(whole(&at_limit).is_ok(), "exactly MAX_DEPTH passes");
+    fn nesting_depth_is_not_limited() {
+        // `skip_value` is non-recursive and its container-kind stack spills to the heap, so any
+        // depth passes -- including across the 64-level word boundaries of that stack, where a
+        // wrong spill/restore would misread which kind of container is open.
+        for depth in [1usize, 32, 33, 63, 64, 65, 127, 128, 129, 10_000] {
+            let mut arr = vec![b'['; depth];
+            arr.extend(vec![b']'; depth]);
+            assert!(whole(&arr).is_ok(), "arrays nested {depth} deep");
 
-        let mut over_limit = vec![b'['; MAX_DEPTH as usize + 1];
-        over_limit.extend(vec![b']'; MAX_DEPTH as usize + 1]);
-        assert_eq!(code_of(whole(&over_limit)), Some(Code::NestingTooDeep));
+            // Alternate objects and arrays, so each level's kind matters on the way out.
+            let mut mixed = Vec::new();
+            for d in 0..depth {
+                mixed.extend_from_slice(if d % 2 == 0 { b"{\"k\":" } else { b"[" });
+            }
+            mixed.push(b'1');
+            for d in (0..depth).rev() {
+                mixed.push(if d % 2 == 0 { b'}' } else { b']' });
+            }
+            assert!(whole(&mixed).is_ok(), "mixed nesting {depth} deep");
+
+            // A mismatched closer at the innermost level is still caught at every depth.
+            let mut bad = mixed.clone();
+            let at = bad.iter().position(|&c| c == b'}' || c == b']').unwrap();
+            bad[at] = if bad[at] == b'}' { b']' } else { b'}' };
+            assert_eq!(code_of(whole(&bad)), Some(Code::SyntaxError), "depth {depth}");
+        }
     }
 
     #[test]
     fn very_deeply_nested_input_errors_without_panicking_or_hanging() {
-        // Confirm that input many times deeper than MAX_DEPTH does not panic (the
-        // implementation is non-recursive) and ends in a plain SyntaxError/NestingTooDeep.
+        // Unclosed input many levels deep does not panic (the implementation is non-recursive)
+        // and ends in a plain error.
         let deep: Vec<u8> = vec![b'['; 10_000];
         assert!(whole(&deep).is_err());
     }
@@ -1139,5 +1269,32 @@ mod tests {
         assert_eq!(code_of(whole(b"[00]")), Some(Code::SyntaxError));
         assert!(whole(b"0").is_ok());
         assert!(whole(b"-0.1").is_ok());
+    }
+
+    #[test]
+    fn cmp_json_orders_arrays_like_duckdb_lists() {
+        use core::cmp::Ordering::*;
+        let c = |a: &str, b: &str| cmp_json(a.as_bytes(), b.as_bytes());
+        // Numerically, not by bytes; a prefix first.
+        assert_eq!(c("[9]", "[10]"), Less);
+        assert_eq!(c("[]", "[2]"), Less);
+        assert_eq!(c("[1]", "[1,2]"), Less);
+        assert_eq!(c("[1, 2]", "[1,2]"), Equal);
+        assert_eq!(c("[-5,7]", "[1]"), Less);
+        assert_eq!(c("[1.5]", "[2]"), Less);
+        assert_eq!(c("[1e20]", "[10.0]"), Greater);
+        // A NULL element after every value.
+        assert_eq!(c("[1,null]", "[1,3]"), Greater);
+        assert_eq!(c("[null]", "[null]"), Equal);
+        // Nested arrays recursively.
+        assert_eq!(c("[[1,2]]", "[[1]]"), Greater);
+        assert_eq!(c("[[]]", "[[0,5]]"), Less);
+        // Strings on decoded bytes: `\"` is `"` (0x22), which sorts before `b`.
+        assert_eq!(c(r#"["a\"b"]"#, r#"["ab"]"#), Less);
+        assert_eq!(c(r#"["A"]"#, r#"["a"]"#), Less);
+        assert_eq!(c(r#"["b"]"#, r#"["b"]"#), Equal);
+        // Anything that is not two arrays keeps byte order, including malformed input.
+        assert_eq!(c(r#"{"a":10}"#, r#"{"a":9}"#), Less);
+        assert_eq!(c("[9", "[9]"), Less);
     }
 }

@@ -192,6 +192,7 @@ fn op_name(op: BinaryOp) -> &'static str {
         Sub => "-",
         Mul => "*",
         Div => "/",
+        IntDiv => "//",
         Mod => "%",
         Eq => "=",
         Ne => "!=",
@@ -933,7 +934,10 @@ fn column_refs_and_params() {
 fn integer_literal_widths() {
     assert_eq!(ex("2147483647"), "2147483647i32");
     assert_eq!(ex("2147483648"), "2147483648i64");
-    assert_eq!(ex("-2147483648"), "-2147483648i32");
+    // INTEGER is picked by the unsigned magnitude (duckdb:
+    // `typeof(-2147483648)` -> BIGINT, `typeof(-2147483647)` -> INTEGER).
+    assert_eq!(ex("-2147483648"), "-2147483648i64");
+    assert_eq!(ex("-2147483647"), "-2147483647i32");
     assert_eq!(ex("-2147483649"), "-2147483649i64");
     assert_eq!(ex("9223372036854775807"), "9223372036854775807i64");
     assert_eq!(ex("-9223372036854775808"), "-9223372036854775808i64");
@@ -1206,6 +1210,31 @@ fn grouping_sets_rollup_cube_syntax() {
         sel("SELECT a, sum(c) FROM t GROUP BY ROLLUP (a)"),
         "SELECT a, sum(c) FROM t GROUP BY GROUPING SETS ((a), ())"
     );
+    // Several elements combine as a cross product, in either order, and a plain
+    // expression counts as the single set `(e)` (as in DuckDB/PostgreSQL).
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY b, ROLLUP (a)"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((b, a), (b))"
+    );
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY ROLLUP (a), b"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a, b), (b))"
+    );
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY ROLLUP (a), CUBE (b)"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a, b), (a), (b), ())"
+    );
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY a, GROUPING SETS ((b), ())"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a, b), (a))"
+    );
+    // The expansion is capped like a single CUBE.
+    assert_eq!(
+        code("SELECT 1 FROM t GROUP BY CUBE (a, b, c, d, e), CUBE (f, g, h, i)"),
+        Code::ExpressionTooDeep as u16
+    );
+    // Plain lists are unchanged, including columns named after the constructs.
+    assert_eq!(sel("SELECT a FROM t GROUP BY a, rollup"), "SELECT a FROM t GROUP BY a, rollup");
 
     // `GROUPING`/`SETS`/`ROLLUP`/`CUBE` are keywords only in the context right after GROUP
     // BY. That is the same class of trap as the past ROWS/RANGE/QUALIFY incidents, so this
@@ -2516,16 +2545,16 @@ fn isnull_binds_at_comparison_strength() {
 // --- `//` integer division -------------------------------------------------
 
 #[test]
-fn integer_division_operator_desugars_to_div() {
-    assert_eq!(ex("a // b"), "(a / b)");
+fn integer_division_operator_parses_to_int_div() {
+    assert_eq!(ex("a // b"), "(a // b)");
 }
 
 #[test]
 fn integer_division_binds_like_star_and_slash() {
     // duckdb: 2 + 5 // 2 -> 4, i.e. 2 + (5 // 2)
-    assert_eq!(ex("2 + 5 // 2"), "(2i32 + (5i32 / 2i32))");
+    assert_eq!(ex("2 + 5 // 2"), "(2i32 + (5i32 // 2i32))");
     // duckdb: 5 // 2 // 2 -> 1, left-associative: (5 // 2) // 2
-    assert_eq!(ex("5 // 2 // 2"), "((5i32 / 2i32) / 2i32)");
+    assert_eq!(ex("5 // 2 // 2"), "((5i32 // 2i32) // 2i32)");
 }
 
 // --- `@` absolute value -----------------------------------------------------
@@ -2901,18 +2930,33 @@ fn in_between_like_bind_tighter_than_comparison() {
 }
 
 #[test]
-fn is_family_stays_at_comparison_strength() {
-    // PostgreSQL puts `IS` one notch below comparison, DuckDB collapses the two.
-    //   duckdb: `1 IS DISTINCT FROM 1 = 1` -> false, `2 = 1 IS DISTINCT FROM 1`
-    //           -> true, `1 = 1 IS NOT NULL` -> true, `true = 1 ISNULL` -> false
-    // All four are "one left-associative band", which is what `BP_CMP` is.
+fn is_family_binds_one_notch_below_comparison() {
+    // PostgreSQL (and DuckDB) put `IS` one notch below comparison, so a
+    // comparison on either side groups first. duckdb:
+    //   `1 IS DISTINCT FROM 2 = false`      -> true  (= `1 IS DISTINCT FROM (2 = false)`)
+    //   `null IS DISTINCT FROM true = null` -> false (= `null IS DISTINCT FROM (true = null)`)
+    //   `2 = 1 IS DISTINCT FROM 1`          -> `(2 = 1) IS DISTINCT FROM 1`
+    //   `1 = 1 IS NOT NULL` -> true, `null IS NULL = false` -> false
+    assert_eq!(ex("a IS DISTINCT FROM b = c"), ex("a IS DISTINCT FROM (b = c)"));
+    assert_eq!(ex("a IS NOT DISTINCT FROM b < c"), ex("a IS NOT DISTINCT FROM (b < c)"));
+    assert_eq!(ex("a = b IS DISTINCT FROM c"), ex("(a = b) IS DISTINCT FROM c"));
+    assert_eq!(ex("a = b IS DISTINCT FROM c = d"), ex("(a = b) IS DISTINCT FROM (c = d)"));
+    // The right operand still stops at `AND` and still absorbs predicates.
+    assert_eq!(ex("a IS DISTINCT FROM b AND c"), ex("(a IS DISTINCT FROM b) AND c"));
+    assert_eq!(ex("a IS DISTINCT FROM b IN (c)"), ex("a IS DISTINCT FROM (b IN (c))"));
     assert_eq!(ex("a = b IS NULL"), "((a = b) IS NULL)");
     assert_eq!(ex("a = b ISNULL"), "((a = b) IS NULL)");
     assert_eq!(ex("a = b NOTNULL"), "((a = b) IS NOT NULL)");
-    // A predicate binds tighter than `IS`, and `IS` tighter than nothing else
-    // in that band, so the two compose left to right in source order.
+    assert_eq!(ex("a = b IS TRUE"), ex("(a = b) IS TRUE"));
+    // A postfix `IS NULL` followed by a comparison: the finished `IS NULL`
+    // becomes the comparison's left operand.
+    assert_eq!(ex("a IS NULL = b"), "((a IS NULL) = b)");
+    // A predicate binds tighter than `IS`, so the two compose left to right
+    // in source order.
     assert_eq!(ex("a IN (b) IS NULL"), "((a IN [b]) IS NULL)");
     assert_eq!(ex("a IS NULL IN (b)"), "((a IS NULL) IN [b])");
+    // `NOT` is still looser than `IS`.
+    assert_eq!(ex("NOT a IS NULL"), "(NOT (a IS NULL))");
 }
 
 #[test]

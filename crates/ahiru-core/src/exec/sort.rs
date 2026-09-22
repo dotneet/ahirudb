@@ -267,6 +267,8 @@ fn cmp_data(c: &Vector, a: usize, b: usize) -> Ordering {
         Data::I128(v) if c.ty() == Ty::Interval => interval_key(v[a]).cmp(&interval_key(v[b])),
         Data::I128(v) => v[a].cmp(&v[b]),
         Data::F64(v) => f64_key(v[a]).cmp(&f64_key(v[b])),
+        // A LIST (JSON array text) compares element-wise, not by bytes (`json::cmp_json`).
+        Data::Bytes(v) if c.ty() == Ty::Json => crate::json::cmp_json(v.get(a), v.get(b)),
         // Lexicographic. On a common prefix the shorter one is smaller.
         Data::Bytes(v) => v.get(a).cmp(v.get(b)),
     }
