@@ -192,6 +192,7 @@ fn op_name(op: BinaryOp) -> &'static str {
         Sub => "-",
         Mul => "*",
         Div => "/",
+        IntDiv => "//",
         Mod => "%",
         Eq => "=",
         Ne => "!=",
@@ -2544,16 +2545,16 @@ fn isnull_binds_at_comparison_strength() {
 // --- `//` integer division -------------------------------------------------
 
 #[test]
-fn integer_division_operator_desugars_to_div() {
-    assert_eq!(ex("a // b"), "(a / b)");
+fn integer_division_operator_parses_to_int_div() {
+    assert_eq!(ex("a // b"), "(a // b)");
 }
 
 #[test]
 fn integer_division_binds_like_star_and_slash() {
     // duckdb: 2 + 5 // 2 -> 4, i.e. 2 + (5 // 2)
-    assert_eq!(ex("2 + 5 // 2"), "(2i32 + (5i32 / 2i32))");
+    assert_eq!(ex("2 + 5 // 2"), "(2i32 + (5i32 // 2i32))");
     // duckdb: 5 // 2 // 2 -> 1, left-associative: (5 // 2) // 2
-    assert_eq!(ex("5 // 2 // 2"), "((5i32 / 2i32) / 2i32)");
+    assert_eq!(ex("5 // 2 // 2"), "((5i32 // 2i32) // 2i32)");
 }
 
 // --- `@` absolute value -----------------------------------------------------

@@ -121,18 +121,15 @@ impl<'a> Parser<'a> {
                 Tok::Minus => (BinaryOp::Sub, BP_ADD),
                 Tok::Star => (BinaryOp::Mul, BP_MUL),
                 Tok::Slash => (BinaryOp::Div, BP_MUL),
-                // `//` (integer division). Sugar for plain `/`, not a new
-                // `BinaryOp` variant: this engine's `/` is *already*
-                // truncating integer division when both operands are
-                // integers (`7/2` = 3, `-7/2` = -3, matching DuckDB's `//`
-                // exactly), and stays real-valued division when either
-                // operand is a float (`5.0/2` = 2.5). That's the same
-                // behavior DuckDB gives `//` specifically (its plain `/`
-                // instead always returns a float, e.g. `7/2` = 3.5 — a
-                // pre-existing, out-of-scope divergence from DuckDB noted
-                // in docs/sql/functions-numeric.md). If `/`'s semantics
-                // ever change, this alias must be revisited.
-                Tok::SlashSlash => (BinaryOp::Div, BP_MUL),
+                // `//` (integer division). On integers this is exactly `/`,
+                // which is *already* truncating integer division in this
+                // engine (`7/2` = 3, `-7/2` = -3, matching DuckDB's `//`);
+                // DuckDB's plain `/` always returns a float instead -- a
+                // pre-existing divergence noted in
+                // docs/sql/functions-numeric.md. It is still its own
+                // `BinaryOp` because the two differ on floating point: `5.0/0`
+                // is `inf` but `5.0 // 0` is NULL, as in DuckDB.
+                Tok::SlashSlash => (BinaryOp::IntDiv, BP_MUL),
                 Tok::Percent => (BinaryOp::Mod, BP_MUL),
                 // Like `->`/`->>`, `&`/`|`/`<<`/`>>`/`^`/`**` add no new `BinaryOp` and
                 // are expanded as sugar for existing scalar function calls

@@ -112,7 +112,7 @@ macro_rules! int_arith {
                         if y == 0 || (y == -1 && x == <$t>::MIN) {
                             funcs::set_null(bad, i, n);
                             0
-                        } else if matches!(op, OpCode::Div) {
+                        } else if matches!(op, OpCode::Div | OpCode::IntDiv) {
                             x.wrapping_div(y)
                         } else {
                             x.wrapping_rem(y)
@@ -130,8 +130,17 @@ int_arith!(arith_i32, i32);
 int_arith!(arith_i64, i64);
 int_arith!(arith_i128, i128);
 
-/// Floating point follows IEEE. Division by zero gives inf/NaN rather than NULL.
-fn arith_f64(op: OpCode, a: &[f64], sa: usize, b: &[f64], sb: usize, n: usize) -> Vec<f64> {
+/// Floating point follows IEEE. `/` by zero gives inf/NaN rather than NULL; `//` by zero
+/// (`IntDiv`, either zero's sign) gives NULL, as DuckDB's `//` does on doubles.
+fn arith_f64(
+    op: OpCode,
+    a: &[f64],
+    sa: usize,
+    b: &[f64],
+    sb: usize,
+    n: usize,
+    bad: &mut Option<Bitmap>,
+) -> Vec<f64> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let x = a[i * sa];
@@ -141,6 +150,11 @@ fn arith_f64(op: OpCode, a: &[f64], sa: usize, b: &[f64], sb: usize, n: usize) -
             OpCode::Sub => x - y,
             OpCode::Mul => x * y,
             OpCode::Div => x / y,
+            OpCode::IntDiv if y == 0.0 => {
+                funcs::set_null(bad, i, n);
+                0.0
+            }
+            OpCode::IntDiv => x / y,
             OpCode::Neg => -x,
             _ => x % y,
         });
@@ -148,7 +162,7 @@ fn arith_f64(op: OpCode, a: &[f64], sa: usize, b: &[f64], sb: usize, n: usize) -
     out
 }
 
-/// `Add`/`Sub`/`Mul`/`Div`/`Mod`/`Neg`. For `Neg` the VM passes a as b as well.
+/// `Add`/`Sub`/`Mul`/`Div`/`IntDiv`/`Mod`/`Neg`. For `Neg` the VM passes a as b as well.
 ///
 /// DECIMAL is computed as a raw integer. `Add`/`Sub` are correct this way once the scales are
 /// aligned, and the scale adjustment for `Mul`/`Div` is done by the binder with a `Cast`.
@@ -156,7 +170,13 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(
         matches!(
             op,
-            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Neg
+            OpCode::Add
+                | OpCode::Sub
+                | OpCode::Mul
+                | OpCode::Div
+                | OpCode::IntDiv
+                | OpCode::Mod
+                | OpCode::Neg
         ),
         Internal
     );
@@ -167,6 +187,20 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
     let data = match phys {
         PhysType::I32 => {
             let values = arith_i32(op, a.i32s(), sa, b.i32s(), sb, n, &mut bad);
+            if matches!(op, OpCode::Div | OpCode::IntDiv | OpCode::Mod)
+                && matches!(out_ty, Ty::TinyInt | Ty::SmallInt)
+            {
+                // `arith_i32` only knows the i32 minimum, but TINYINT/SMALLINT share its
+                // lane: `-128::TINYINT // -1` is the same undefined `MIN / -1` as
+                // `i32::MIN // -1`, so it is NULL too rather than a wrapped `-128`.
+                let min = if out_ty == Ty::TinyInt { i8::MIN as i32 } else { i16::MIN as i32 };
+                let (av, bv) = (a.i32s(), b.i32s());
+                for i in 0..n {
+                    if av[i * sa] == min && bv[i * sb] == -1 {
+                        funcs::set_null(&mut bad, i, n);
+                    }
+                }
+            }
             if out_ty == Ty::Date {
                 // A date is a day count, and `arith_i32` wraps like every other integer
                 // lane. A wrapped day count is not a wrapped integer, though -- it is a
@@ -195,7 +229,7 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
         PhysType::I64 => Data::I64(arith_i64(op, a.i64s(), sa, b.i64s(), sb, n, &mut bad)),
         PhysType::I128 => Data::I128(arith_i128(op, a.i128s(), sa, b.i128s(), sb, n, &mut bad)),
         PhysType::F64 => {
-            let mut values = arith_f64(op, a.f64s(), sa, b.f64s(), sb, n);
+            let mut values = arith_f64(op, a.f64s(), sa, b.f64s(), sb, n, &mut bad);
             if out_ty == Ty::Float {
                 // FLOAT shares DOUBLE's physical f64 register, and `FLOAT op FLOAT` is a
                 // FLOAT (`Ty::unify`'s `a == b` arm), so the f64 result has to be rounded
@@ -213,30 +247,49 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
         _ => err!(TypeMismatch),
     };
     let mut data = data;
-    wrap_unsigned(out_ty, &mut data);
+    wrap_narrow(out_ty, &mut data);
     Ok(finish(out_ty, data, combine_validity(a, sa, b, sb, n), bad))
 }
 
-/// Folds an arithmetic result back into an unsigned type's own domain.
+/// Folds an arithmetic result back into the declared type's own domain.
 ///
-/// Unsigned integers are stored in the *next wider signed* physical type
-/// (DESIGN.md §8: `UINTEGER` lives in an `I64`, `UBIGINT` in an `I128`), so the
-/// signed wrap that `int_arith` performs happens at the wrong width. `1::UINTEGER -
-/// 2::UINTEGER` produced `-1` and still called itself a `UINTEGER`, a value outside
-/// the declared type's domain. Masking to the type's own bit width makes the answer
-/// `4294967295` instead — the same "integer arithmetic overflow wraps" rule the
-/// signed types already follow and that docs/sql/limitations.md documents, now
-/// applied consistently at every unsigned width.
+/// Several integer types share a wider physical lane (DESIGN.md §8): TINYINT and
+/// SMALLINT live in an `I32`, and the unsigned types in the *next wider signed* type
+/// (`UINTEGER` in an `I64`, `UBIGINT` in an `I128`). `int_arith` wraps at the lane's
+/// width, which is the wrong width for these: `127::TINYINT + 1::TINYINT` produced
+/// `128` and `1::UINTEGER - 2::UINTEGER` produced `-1`, each still calling itself the
+/// narrow type -- a value outside the declared domain, which a Parquet writer then
+/// stores as a file this engine cannot read back. Wrapping at the type's own bit width
+/// gives `-128` and `4294967295` instead: the same "integer arithmetic overflow wraps"
+/// rule `INTEGER`/`BIGINT` already follow (docs/sql/types.md), applied at every width.
 ///
-/// (DuckDB raises an out-of-range error here instead. Wrapping is chosen over
-/// raising because this engine's arithmetic kernels have no per-row error channel —
-/// `int_arith` is deliberately branch-free apart from division by zero — and
-/// because wrapping is already the documented contract for the signed widths;
-/// making unsigned the one exception would be the surprising choice.)
+/// (DuckDB raises an out-of-range error here instead. Wrapping is chosen over raising
+/// because this engine's arithmetic kernels have no per-row error channel --
+/// `int_arith` is deliberately branch-free apart from division by zero -- and because
+/// wrapping is already the documented contract for the wide types; making the narrow
+/// ones the exception would be the surprising choice.)
 ///
-/// A two's-complement `AND` with the mask is exactly the unsigned wrap: `-1 & 0xFF`
-/// is `255`.
-fn wrap_unsigned(out_ty: Ty, data: &mut Data) {
+/// Unsigned: a two's-complement `AND` with the mask is exactly the unsigned wrap
+/// (`-1 & 0xFF` is `255`). Signed: truncating to `i8`/`i16` and sign-extending back is
+/// exactly the signed wrap (`128 as i8` is `-128`).
+fn wrap_narrow(out_ty: Ty, data: &mut Data) {
+    if let Data::I32(v) = data {
+        match out_ty {
+            Ty::TinyInt => {
+                for x in v.iter_mut() {
+                    *x = *x as i8 as i32;
+                }
+                return;
+            }
+            Ty::SmallInt => {
+                for x in v.iter_mut() {
+                    *x = *x as i16 as i32;
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
     let bits: u32 = match out_ty {
         Ty::UTinyInt => 8,
         Ty::USmallInt => 16,
@@ -707,20 +760,31 @@ fn pow10_f64(k: u8) -> f64 {
     r
 }
 
+/// Strips leading and trailing ASCII whitespace -- space, `\t`, `\n`, `\v`, `\f`, `\r` --
+/// the set every text-to-value cast ignores around the value, as DuckDB's does.
+///
+/// Not `<[u8]>::trim_ascii`: that follows `u8::is_ascii_whitespace`, which leaves out
+/// `\v`. The casts used to strip only space and tab, so a value read from a CRLF file
+/// (`'5\r'`) or with a trailing newline cast to NULL.
+pub(crate) fn trim_space(s: &[u8]) -> &[u8] {
+    let ws = |c: u8| c == b' ' || (b'\t'..=b'\r').contains(&c);
+    let mut lo = 0;
+    let mut hi = s.len();
+    while lo < hi && ws(s[lo]) {
+        lo += 1;
+    }
+    while hi > lo && ws(s[hi - 1]) {
+        hi -= 1;
+    }
+    &s[lo..hi]
+}
+
 /// Parses the non-decimal spellings that DuckDB accepts when casting text to a
 /// floating-point value. These values are part of the IEEE representation used
 /// by the rest of the engine (for example `1.0 / 0.0` already produces `inf`),
 /// so treating them as an unreadable string would make text round-trips lossy.
 fn parse_special_f64(s: &[u8]) -> Option<f64> {
-    let mut lo = 0;
-    let mut hi = s.len();
-    while lo < hi && (s[lo] == b' ' || s[lo] == b'\t') {
-        lo += 1;
-    }
-    while hi > lo && (s[hi - 1] == b' ' || s[hi - 1] == b'\t') {
-        hi -= 1;
-    }
-    let s = &s[lo..hi];
+    let s = trim_space(s);
     let eq = |word: &[u8]| {
         s.len() == word.len() && s.iter().zip(word).all(|(a, b)| a.to_ascii_lowercase() == *b)
     };
@@ -789,7 +853,7 @@ fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> 
 
 /// Reads text as an `f64`, exactly.
 ///
-/// The whole string (after trimming spaces/tabs) must be a number; `core`'s own
+/// The whole string (after [`trim_space`]) must be a number; `core`'s own
 /// `FromStr` does the digits, which means the result is the correctly-rounded nearest
 /// `f64` rather than an approximation. It used to be `parse_dec` + `scale_f64`
 /// (mantissa times a binary-decomposed power of ten), which accumulated error and
@@ -804,15 +868,32 @@ fn parse_f64(s: &[u8]) -> Option<f64> {
     if let Some(v) = parse_special_f64(s) {
         return Some(v);
     }
-    let mut lo = 0;
-    let mut hi = s.len();
-    while lo < hi && (s[lo] == b' ' || s[lo] == b'\t') {
-        lo += 1;
+    core::str::from_utf8(trim_space(s)).ok()?.parse::<f64>().ok()
+}
+
+/// Reads text as a value of the floating-point type `to`, rounding exactly once.
+///
+/// For `FLOAT` the digits go straight to the nearest `f32`. Parsing to the nearest
+/// `f64` first and then narrowing rounds twice, which is wrong whenever the text lies
+/// just past an `f32` halfway point but its nearest `f64` lands exactly on it:
+/// `'1.00000005960464477539062500001'` is above the midpoint between `1.0` and the next
+/// `f32`, yet its nearest double *is* that midpoint, which then ties to even and gave
+/// `1.0` instead of `1.0000001192092896`. (`f32`'s `FromStr` is already linked, by
+/// `expr::float`'s shortest-digit round-trip check.) A finite value beyond the `FLOAT`
+/// range is NULL, as in [`narrow_f64`].
+fn parse_float(s: &[u8], to: Ty) -> Option<f64> {
+    if to != Ty::Float {
+        return parse_f64(s);
     }
-    while hi > lo && (s[hi - 1] == b' ' || s[hi - 1] == b'\t') {
-        hi -= 1;
+    if let Some(v) = parse_special_f64(s) {
+        return Some(v as f32 as f64);
     }
-    core::str::from_utf8(&s[lo..hi]).ok()?.parse::<f64>().ok()
+    let f = core::str::from_utf8(trim_space(s)).ok()?.parse::<f32>().ok()?;
+    if f.is_infinite() {
+        None
+    } else {
+        Some(f as f64)
+    }
 }
 
 /// Applies the target floating-point width.
@@ -841,7 +922,7 @@ fn narrow_f64(f: f64, to: Ty) -> Option<f64> {
 /// at exactly 0.5 matches both as well (`1.5 -> 2`, `4.5 -> 4`).
 /// Rounding away from zero would systematically inflate sums over all-positive data, so
 /// round-half-to-even is preferable for statistics.
-fn f_round(x: f64) -> f64 {
+pub(crate) fn f_round(x: f64) -> f64 {
     let t = funcs::f_trunc(x);
     let frac = x - t;
     if frac > 0.5 {
@@ -966,12 +1047,15 @@ fn int_conv(from: Ty, to: Ty) -> Result<(i128, i128, bool)> {
             // (the one-sided cast when `Ty::unify` settles `Date`/`Timestamp` on `Timestamptz`
             // comes through here).
             (Timestamp, Timestamptz) | (Timestamptz, Timestamp) => (1, 1, false),
-            // Temporal types and integers keep their raw values. Conversion with BOOLEAN or DECIMAL is meaningless.
-            (f, t)
-                if (f.is_temporal() && t.is_integer()) || (f.is_integer() && t.is_temporal()) =>
-            {
-                (1, 1, false)
-            }
+            // A temporal value converts to an integer as its raw day/microsecond count
+            // (`DATE - DATE` widens its operands to BIGINT this way).
+            (f, t) if f.is_temporal() && t.is_integer() => (1, 1, false),
+            // The reverse is rejected, as in DuckDB. Reinterpreting a number as a raw
+            // day/microsecond count made one silently acceptable wherever a DATE/TIMESTAMP
+            // was expected -- `year(1500)` and `dayname(3)` answered, `CAST(5 AS DATE)` was
+            // `1970-01-06` and `epoch_ms(1500)` read 1500 as microseconds -- instead of
+            // being an error. `epoch_ms(<integer>)`, `make_timestamp(<integer>)` and
+            // `to_timestamp(<number>)` are the explicit conversions.
             _ => err!(InvalidCast),
         });
     }
@@ -1122,15 +1206,7 @@ pub fn fmt_f32(x: f64, out: &mut Vec<u8>) {
 /// representable as a positive `i128`, so accumulating positively would make exactly the lower
 /// bound (`-170141183460469231731687303715884105728`) unreadable.
 fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
-    let mut lo = 0usize;
-    let mut hi = s.len();
-    while lo < hi && (s[lo] == b' ' || s[lo] == b'\t') {
-        lo += 1;
-    }
-    while hi > lo && (s[hi - 1] == b' ' || s[hi - 1] == b'\t') {
-        hi -= 1;
-    }
-    let s = &s[lo..hi];
+    let s = trim_space(s);
     let mut i = 0usize;
     let mut neg = false;
     if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
@@ -1507,16 +1583,21 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                 // (s <= 22), so only the wide case takes the slower route through the decimal
                 // text, which `parse_f64` rounds correctly in a single step. The DOUBLE ->
                 // DECIMAL direction already goes through text (`f64_to_scaled_i128`).
-                let f = if s == 0 {
-                    x as f64
-                } else if s <= 22 && x.unsigned_abs() < (1u128 << 53) {
-                    x as f64 / pow10_f64(s)
+                //
+                // A FLOAT target must round exactly once too, so for it only an exact
+                // `f64` (a whole number below 2^53) may be narrowed; everything else is
+                // read from its text straight to the nearest `f32` (`parse_float`).
+                let exact = x.unsigned_abs() < (1u128 << 53);
+                let f = if s == 0 && (exact || to != Ty::Float) {
+                    Some(x as f64)
+                } else if to != Ty::Float && s <= 22 && exact {
+                    Some(x as f64 / pow10_f64(s))
                 } else {
                     buf.clear();
                     fmt_int(x.unsigned_abs(), x < 0, s, &mut buf);
-                    parse_f64(&buf).unwrap_or(0.0)
+                    parse_float(&buf, to)
                 };
-                match narrow_f64(f, to) {
+                match f.and_then(|f| narrow_f64(f, to)) {
                     Some(f) => push_f64(&mut data, f),
                     None => {
                         push_default(&mut data);
@@ -1643,7 +1724,7 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         (Fam::Str, Fam::Flt) => {
             let sv = a.bytes();
             for i in 0..n {
-                match parse_f64(sv.get(i)).and_then(|f| narrow_f64(f, to)) {
+                match parse_float(sv.get(i), to) {
                     Some(f) => push_f64(&mut data, f),
                     None => {
                         push_default(&mut data);
@@ -2262,5 +2343,92 @@ mod tests {
         assert_eq!(sub(Ty::UInt, 5, 2), 3);
         assert_eq!(sub(Ty::Int, 1, 2), -1);
         assert_eq!(sub(Ty::BigInt, 1, 2), -1);
+    }
+
+    fn i32v(ty: Ty, vals: &[i32]) -> Vector {
+        let mut v = Vector::new(ty);
+        for x in vals {
+            v.push_value(&crate::vector::Value::I32(*x));
+        }
+        v
+    }
+
+    #[test]
+    fn tinyint_and_smallint_arithmetic_wraps_inside_their_own_width() {
+        let t = |op: OpCode, ty: Ty, x: i32, y: i32| {
+            let out = arith(op, ty, &i32v(ty, &[x]), &i32v(ty, &[y])).unwrap();
+            out.is_valid(0).then(|| out.i32s()[0])
+        };
+        assert_eq!(t(OpCode::Add, Ty::TinyInt, 127, 1), Some(-128));
+        assert_eq!(t(OpCode::Mul, Ty::TinyInt, -128, -1), Some(-128));
+        assert_eq!(t(OpCode::Mul, Ty::TinyInt, 100, 3), Some(44));
+        assert_eq!(t(OpCode::Sub, Ty::TinyInt, -128, 1), Some(127));
+        assert_eq!(t(OpCode::Neg, Ty::TinyInt, -128, -128), Some(-128));
+        assert_eq!(t(OpCode::Add, Ty::SmallInt, 32_767, 1), Some(-32_768));
+        assert_eq!(t(OpCode::Neg, Ty::SmallInt, -32_768, -32_768), Some(-32_768));
+        // `MIN / -1` is NULL at every width, not a wrapped `MIN`.
+        assert_eq!(t(OpCode::Div, Ty::TinyInt, -128, -1), None);
+        assert_eq!(t(OpCode::IntDiv, Ty::TinyInt, -128, -1), None);
+        assert_eq!(t(OpCode::Mod, Ty::SmallInt, -32_768, -1), None);
+        assert_eq!(t(OpCode::Div, Ty::TinyInt, -127, -1), Some(127));
+        // INTEGER is untouched.
+        assert_eq!(t(OpCode::Add, Ty::Int, 127, 1), Some(128));
+    }
+
+    #[test]
+    fn int_div_by_zero_is_null_for_floats_too() {
+        let out =
+            arith(OpCode::IntDiv, Ty::Double, &dbl(&[5.0, 5.0, 7.0]), &dbl(&[0.0, -0.0, 2.0]))
+                .unwrap();
+        assert!(!out.is_valid(0) && !out.is_valid(1));
+        assert_eq!(out.f64s()[2], 3.5, "`//` on doubles does not floor (DuckDB)");
+        // Plain `/` stays IEEE.
+        let out = arith(OpCode::Div, Ty::Double, &dbl(&[5.0]), &dbl(&[0.0])).unwrap();
+        assert_eq!(out.f64s()[0], f64::INFINITY);
+    }
+
+    #[test]
+    fn text_casts_trim_every_ascii_whitespace_character() {
+        assert_eq!(trim_space(b" \t\n\x0b\x0c\r5\r\n"), b"5");
+        assert_eq!(trim_space(b"\x0e5"), b"\x0e5", "only the six ASCII spaces");
+        let src = txt(&["5\r", "\n5.5\n", "\x0b5\x0c", " 2024-01-01\r"]);
+        let out = cast(Ty::Varchar, Ty::BigInt, &src.gather(&[0])).unwrap();
+        assert_eq!(out.i64s()[0], 5);
+        let out = cast(Ty::Varchar, Ty::Double, &src.gather(&[1])).unwrap();
+        assert_eq!(out.f64s()[0], 5.5);
+        let out = cast(Ty::Varchar, Ty::decimal(3, 1), &src.gather(&[2])).unwrap();
+        assert_eq!(out.i64s()[0], 50);
+        let out = cast(Ty::Varchar, Ty::Date, &src.gather(&[3])).unwrap();
+        assert_eq!(out.i32s()[0], 19_723);
+    }
+
+    #[test]
+    fn text_to_float_rounds_once() {
+        // Just above the midpoint between 1.0 and the next f32, but the nearest *double* is
+        // that midpoint, which then ties to even: parsing through f64 gave 1.0.
+        let out = cast(Ty::Varchar, Ty::Float, &txt(&["1.00000005960464477539062500001"])).unwrap();
+        assert_eq!(out.f64s()[0], 1.000_000_119_209_289_6);
+        let out = cast(Ty::Varchar, Ty::Float, &txt(&["1e39", " -inf ", "3.4028235e38"])).unwrap();
+        assert!(!out.is_valid(0), "a finite value past FLOAT's range is NULL");
+        assert_eq!(out.f64s()[1], f64::NEG_INFINITY);
+        assert_eq!(out.f64s()[2], f32::MAX as f64);
+        // A wide DECIMAL goes the same single-rounding way.
+        let dec = Ty::decimal(38, 30);
+        let mut d = Vector::new(dec);
+        d.push_value(&crate::vector::Value::I128(1_000_000_059_604_644_775_390_625_000_001));
+        let out = cast(dec, Ty::Float, &d).unwrap();
+        assert_eq!(out.f64s()[0], 1.000_000_119_209_289_6);
+    }
+
+    #[test]
+    fn numbers_do_not_cast_to_temporal_types() {
+        let one = i32v(Ty::Int, &[5]);
+        for to in [Ty::Date, Ty::Time, Ty::Timestamp, Ty::Timestamptz] {
+            assert!(cast(Ty::Int, to, &one).is_err());
+            assert!(try_cast(Ty::Int, to, &one).is_err());
+        }
+        // The raw count still comes out the other way (`DATE - DATE` relies on it).
+        let d = i32v(Ty::Date, &[1]);
+        assert_eq!(cast(Ty::Date, Ty::BigInt, &d).unwrap().i64s()[0], 1);
     }
 }

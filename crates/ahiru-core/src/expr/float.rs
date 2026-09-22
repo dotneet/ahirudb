@@ -15,9 +15,9 @@
 //! the same `f64` bit pattern, choosing (when more than one digit string of
 //! that shortest length round-trips) the one nearest the value's exact
 //! binary value, with exact ties broken to the even digit -- matching
-//! Ryū/Grisu/Dragon4-style correctly-rounded shortest formatters (and, by
-//! construction, Rust `std`'s own `f64` Display, Python's `repr`, and
-//! DuckDB's writer).
+//! Ryū/Grisu/Dragon4-style correctly-rounded shortest formatters (Python's
+//! `repr` and DuckDB's writer; Rust `std`'s `f64` Display too, except that it
+//! breaks an exact tie the other way).
 //!
 //! This lives in one place, rather than once per writer, because this exact
 //! logic was previously written out in full independently in both
@@ -40,56 +40,14 @@
 // on the wasm target, where neither is in scope by default.
 use crate::prelude::*;
 
-/// The number of significant decimal digits the first-pass conversion
-/// (`normalize_and_correct`) computes.
-///
-/// 17 significant digits always suffice to round-trip any finite `f64`
-/// (Steele & White, "How to Print Floating-Point Numbers Accurately"), which
-/// is why this is not tuned down further.
-const SIG_DIGITS: u32 = 17;
-/// `10^(SIG_DIGITS - 1)`: the smallest `SIG_DIGITS`-digit integer.
-const SCALE: u128 = 10_000_000_000_000_000;
-/// `SCALE` as an `f64`. `SCALE` itself (`10^16`) exceeds `2^53`, so this cast
-/// is not bit-exact, but the round-trip correction in `normalize_and_correct`
-/// absorbs that; it only needs to be close.
-const SCALE_F: f64 = 1e16;
-
 /// Writes a finite `f64` (including positive/negative zero) as shortest
 /// round-trip decimal text. Callers are responsible for handling non-finite
 /// values (`NaN`/infinities) themselves before calling this -- see the
 /// module doc for why that part is not shared.
 ///
-/// The approach, in two stages:
-///
-/// 1. `normalize_and_correct`: normalize `v` to a mantissa in `[1, 10)` and a
-///    decimal exponent using plain `f64` multiply/divide by 10. That is not
-///    exact -- each step rounds, and for extreme exponents (subnormal-to-huge)
-///    the rounding compounds over up to ~324 steps -- so the candidate
-///    `SIG_DIGITS`-digit integer is then corrected to be exact by
-///    round-tripping it back through `f64: FromStr` (`core::num::dec2flt`,
-///    already linked in for this crate's own CSV/JSONL number parsing) and
-///    nudging it until the reparsed value matches the original bit-for-bit.
-/// 2. `shortest_digits`: that alone picks *a* valid `SIG_DIGITS`-digit
-///    round-tripping representative, not the *shortest* one (there is
-///    usually a range of decimal strings that all round-trip to the same
-///    `f64`). This crate's own reader does not care which one it gets, but
-///    this project's test suite compares CSV/JSONL output against DuckDB
-///    byte for byte, and DuckDB (like Rust's own `std` float `Display` and
-///    Python's `repr`, via Ryū/Grisu) always emits the *shortest* decimal
-///    string that round-trips, choosing the candidate nearest the true
-///    value when more than one of that shortest length round-trips (ties
-///    broken to even). `shortest_digits` finds the shortest working length
-///    cheaply (rounding the `SIG_DIGITS`-digit candidate down, same as
-///    before), but the *nearest*-candidate choice at that length is done via
-///    exact big-integer arithmetic (`cmp_midpoint`/`nearest_at_length`)
-///    against `x`'s exact binary value (`decompose`), not by comparing
-///    reparsed floats -- comparing reparsed floats reintroduces the exact
-///    ULP-level bias this is trying to avoid (see `normalize_and_correct`'s
-///    doc comment for how that was discovered).
-///
-/// Together this sidesteps implementing a full from-scratch correctly-rounded
-/// *shortest* decimal conversion (Ryū/Grisu/Dragon4-style, meaningfully more
-/// code and a lookup table) while still landing on the same output.
+/// The digits come from [`shortest_digits`], an exact big-integer
+/// implementation of the Steele & White / Burger & Dybvig "free-format"
+/// algorithm, and are then laid out by [`write_decimal`].
 pub(crate) fn write_f64_finite(out: &mut Vec<u8>, v: f64) {
     write_finite(out, v, Prec::F64)
 }
@@ -102,20 +60,20 @@ pub(crate) fn write_f64_finite(out: &mut Vec<u8>, v: f64) {
 /// the round-trip against `f64` therefore asks for far more digits than the value
 /// actually carries: `1.1::FLOAT` is the `f64` 1.100000023841858, and that is what
 /// `CAST(... AS VARCHAR)` and the CSV writer used to print, where DuckDB prints `1.1`.
-/// Measuring it against `f32` instead -- the only thing that changes, since the exact
-/// binary value the digits are chosen nearest to is the same number either way --
-/// gives the shortest string that round-trips through the type the value really has.
+/// Measuring it against `f32` instead -- the only thing that changes is the width of
+/// the rounding interval the digits must land in -- gives the shortest string that
+/// round-trips through the type the value really has.
 ///
 /// Callers handle non-finite values themselves, exactly as for [`write_f64_finite`].
 pub(crate) fn write_f32_finite(out: &mut Vec<u8>, v: f64) {
     write_finite(out, v, Prec::F32)
 }
 
-/// Which floating-point width a candidate digit string has to round-trip through.
-/// It changes *only* the round-trip test; digit generation, the nearest-candidate
-/// choice and the fixed-vs-exponential rendering are identical (DuckDB likewise
-/// spells an `f32` and an `f64` of the same value the same way once the digits are
-/// chosen -- verified against the `duckdb` CLI for the notation thresholds).
+/// Which floating-point width a digit string has to round-trip through. It changes
+/// *only* the rounding interval; digit generation, the nearest-candidate choice and
+/// the fixed-vs-exponential rendering are identical (DuckDB likewise spells an `f32`
+/// and an `f64` of the same value the same way once the digits are chosen -- verified
+/// against the `duckdb` CLI for the notation thresholds).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Prec {
     F64,
@@ -127,336 +85,186 @@ fn write_finite(out: &mut Vec<u8>, v: f64, prec: Prec) {
         out.extend_from_slice(if v.is_sign_negative() { b"-0.0" } else { b"0.0" });
         return;
     }
-    let neg = v.is_sign_negative();
-    let x = if neg { -v } else { v };
-    if neg {
+    if v.is_sign_negative() {
         out.push(b'-');
     }
-    let (d, e10) = normalize_and_correct(x);
-    let (mantissa, exp2) = decompose(x);
-    let (digits, e10) = shortest_digits(d, e10, x, mantissa, exp2, prec);
+    let (f, e, p, min_e) = decompose(v, prec);
+    let (digits, e10) = shortest_digits(f, e, p, min_e);
     write_decimal(out, &digits, e10);
 }
 
-/// Whether the decimal `val * 10^last_digit_exp` reads back as exactly `x` at `prec`'s
-/// width. For `Prec::F32` the text is parsed straight into an `f32` rather than parsed
-/// as an `f64` and then narrowed: those two disagree when the `f64` rounding lands
-/// exactly on an `f32` halfway point (classic double rounding), and this comparison is
-/// what the whole search hangs on.
-fn round_trips(val: u128, last_digit_exp: i32, x: f64, prec: Prec) -> bool {
-    let mut buf = [0u8; 48];
-    let n = decimal_text(val, last_digit_exp, &mut buf);
-    let Ok(s) = core::str::from_utf8(&buf[..n]) else {
-        return false;
+/// Splits `|v|` (finite, nonzero) into `(f, e, p, min_e)` with `|v| == f * 2^e`
+/// *exactly*, read directly off the IEEE 754 bit layout of the width `prec` names:
+/// `p` is that format's significand width (hidden bit included) and `min_e` the
+/// exponent of its subnormals. A FLOAT's `f64` is exactly an `f32`, so the `f32`
+/// narrowing is lossless.
+fn decompose(v: f64, prec: Prec) -> (u64, i32, u32, i32) {
+    let (bits, frac_bits, bias) = match prec {
+        Prec::F64 => (v.to_bits(), 52u32, 1075i32),
+        Prec::F32 => ((v as f32).to_bits() as u64, 23, 150),
     };
-    match prec {
-        Prec::F64 => s.parse::<f64>() == Ok(x),
-        Prec::F32 => s.parse::<f32>() == Ok(x as f32),
-    }
-}
-
-/// Returns `(d, e10)` such that `x` (positive, finite, nonzero) is the
-/// nearest `f64` to `d * 10^(e10 - (SIG_DIGITS - 1))` -- i.e. `d` is a
-/// `SIG_DIGITS`-digit integer whose leading digit sits at decimal exponent
-/// `e10`. This alone is *a* valid round-tripping representative, not
-/// necessarily the shortest one; see `shortest_digits`.
-fn normalize_and_correct(x: f64) -> (u128, i32) {
-    let mut m = x;
-    let mut e10: i32 = 0;
-    while m >= 10.0 {
-        m /= 10.0;
-        e10 += 1;
-    }
-    while m < 1.0 {
-        m *= 10.0;
-        e10 -= 1;
-    }
-    // A last-step rounding overshoot lands exactly on 10.0; rare, but cheap to guard.
-    if m >= 10.0 {
-        m /= 10.0;
-        e10 += 1;
-    }
-    let mut d = (m * SCALE_F) as u128;
-    // The normalize loop above runs up to ~324 times for the most extreme
-    // exponents (denormal-to-huge), each step rounding by up to ~0.5 ULP, so
-    // its worst-case compounded error is a few hundred units of `d`, not the
-    // "handful" a single normalization step alone would suggest. Rather than
-    // loop that many times one unit at a time, one ratio-scaled refinement
-    // step collapses that down to (empirically, and by construction: this is
-    // exactly a single step of Newton's method on `redecode(d, e10) == x`)
-    // a handful of units first.
-    let got0 = redecode(d, e10 - (SIG_DIGITS as i32 - 1));
-    if got0 != x && got0 != 0.0 {
-        let refined = (d as f64) * (x / got0);
-        if refined.is_finite() && refined >= 1.0 {
-            d = refined as u128;
-        }
-    }
-    // Bounded, exact fine-tuning for whatever the refinement step above did
-    // not already land exactly on.
-    for _ in 0..32 {
-        let got = redecode(d, e10 - (SIG_DIGITS as i32 - 1));
-        if got == x {
-            break;
-        }
-        if got < x {
-            d += 1;
-        } else if d > 0 {
-            d -= 1;
-        } else {
-            break;
-        }
-    }
-    // A nudge can cross a power-of-ten boundary either way; re-pin the
-    // leading digit at decimal exponent `e10` if so.
-    if d >= SCALE * 10 {
-        d /= 10;
-        e10 += 1;
-    } else if d != 0 && d < SCALE {
-        d *= 10;
-        e10 -= 1;
-    }
-    // `d` is now *a* `SIG_DIGITS`-digit value that round-trips to `x` -- good
-    // enough as a seed for `shortest_digits`, which determines both the
-    // shortest working length and (via exact big-integer arithmetic, not
-    // more `redecode`-based nudging) the precise nearest-to-`x` digit string
-    // at that length on its own. An earlier version of this function tried
-    // to *also* center `d` here by expanding to the round-trip window's two
-    // edges and averaging them; that was not just unnecessary work but
-    // actively wrong: the midpoint of the window of decimals that round-trip
-    // to `x` is not the same point as `x`'s own exact value, so rounding
-    // that midpoint down to fewer digits does not reliably give the
-    // nearest-to-`x` shorter candidate either (found via a 400-value
-    // randomized sweep against DuckDB, Python, and Rust `std`'s Display, all
-    // three of which agree with each other and disagree with the old
-    // midpoint-based choice ~14% of the time, always in the same direction).
-    (d, e10)
-}
-
-/// Decomposes `x` (positive, finite, nonzero) into `(mantissa, exp2)` such
-/// that `x == mantissa * 2^exp2` *exactly* -- read directly off the IEEE 754
-/// bit layout, not approximated by any floating-point arithmetic. This is
-/// the exact value `shortest_digits`' big-integer nearest-candidate
-/// comparison (`cmp_midpoint`) is anchored on, which is what makes it immune
-/// to the kind of ULP-level bias a `redecode`-based (parse-and-compare)
-/// comparison can reintroduce.
-fn decompose(x: f64) -> (u64, i32) {
-    let bits = x.to_bits();
-    let biased_exp = ((bits >> 52) & 0x7FF) as i32;
-    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
-    if biased_exp == 0 {
-        // Subnormal: no implicit leading 1 bit, and the exponent is pinned
-        // to the smallest normal exponent's value rather than decoded from
-        // `biased_exp`.
-        (frac, -1074)
+    let exp_mask = match prec {
+        Prec::F64 => 0x7FF,
+        Prec::F32 => 0xFF,
+    };
+    let biased = ((bits >> frac_bits) & exp_mask) as i32;
+    let frac = bits & ((1u64 << frac_bits) - 1);
+    let min_e = 1 - bias;
+    if biased == 0 {
+        // Subnormal: no implicit leading bit, and the exponent is pinned to the
+        // smallest normal exponent's value.
+        (frac, min_e, frac_bits + 1, min_e)
     } else {
-        (frac | (1u64 << 52), biased_exp - 1075)
+        (frac | (1u64 << frac_bits), biased - bias, frac_bits + 1, min_e)
     }
 }
 
-/// Finds the shortest decimal digit string that still round-trips to `x`,
-/// choosing (once a length is known to work at all) the candidate nearest
-/// `x`'s exact value at that length, starting from the `SIG_DIGITS`-digit
-/// `d` (exact for `x`, from `normalize_and_correct`) as a seed.
+/// The shortest decimal digit string that reads back as `f * 2^e`, and the decimal
+/// exponent of its leading digit.
 ///
-/// Two passes, deliberately kept separate:
+/// Every real number strictly inside the rounding interval of `v` -- halfway to the
+/// next representable value on either side, with the endpoints themselves included
+/// when `f` is even, because a reader rounds an exact halfway point to the even
+/// significand -- reads back as `v`. This is the classic free-format algorithm (Steele
+/// & White's FPP², in Burger & Dybvig's formulation): scale the value `r / s` and the
+/// two half-gaps `m- / s`, `m+ / s` so the first digit sits just below the decimal
+/// point, then peel off one digit at a time until the remaining digits are no longer
+/// needed to stay inside the interval. When stopping, the last digit is rounded
+/// towards whichever of the two candidates is nearer `v`, with an exact tie going to
+/// the even digit -- the choice DuckDB and Python's `repr` make (Rust's `std` breaks
+/// that one tie the other way).
 ///
-/// 1. **Which length is shortest?** Tries every length from 1 up to
-///    `SIG_DIGITS`, rounding `d` to that many significant digits
-///    (`round_to_length`, round-half-to-even) and checking whether that
-///    candidate (or an immediate neighbor, in case `d`'s limited precision
-///    made that rounding step land on a false tie) reconstructs `x` exactly
-///    via `redecode`. This existence check only needs "does *something*
-///    round-trip here", so a `redecode`-based (reparse-and-compare) check is
-///    fine for it -- the length it finds does not depend on *which*
-///    candidate happened to match.
-/// 2. **Which candidate, exactly, at that length?** Once a length is known
-///    to work, `nearest_at_length` finds the specific digit string nearest
-///    `x`'s *exact* value there, via big-integer arithmetic anchored on
-///    `x`'s exact binary decomposition (`decompose`/`cmp_midpoint`) rather
-///    than by comparing reparsed floats. This split matters: an earlier
-///    version picked among the length-1 pass's own candidates directly
-///    (whichever `redecode`-verified one it found first), which is provably
-///    *not* the same thing as nearest -- confirmed by a 400-value randomized
-///    sweep against DuckDB, Python's `repr`, and Rust `std`'s Display (all
-///    three independently implement correctly-rounded shortest-round-trip
-///    and agreed with each other on every case, and disagreed with the old
-///    choice on ~14% of values, always in the same direction: the old code
-///    was systematically biased toward the low end of the round-trip
-///    window rather than picking the point nearest `x`).
-fn shortest_digits(
-    d: u128,
-    e10: i32,
-    x: f64,
-    mantissa: u64,
-    exp2: i32,
-    prec: Prec,
-) -> (Vec<u8>, i32) {
-    for len in 1..=SIG_DIGITS {
-        let (primary, carry) = round_to_length(d, len);
-        let cand_e10 = e10 + carry;
-        if !any_round_trips_at_length(primary, cand_e10, len, x, prec) {
+/// All of it runs on exact big integers ([`Big`]), so there is no floating-point
+/// rounding anywhere in the decision. An earlier implementation seeded the digits from
+/// repeated `f64` multiplications by ten and repaired them by re-parsing candidates;
+/// when that normalization overshot a power of ten it re-pinned the 17-digit seed by
+/// multiplying it by ten, throwing its last digit away, and so
+/// `0.09999999999999999` came out as the non-shortest `0.099999999999999992`.
+fn shortest_digits(f: u64, e: i32, p: u32, min_e: i32) -> (Vec<u8>, i32) {
+    // The lower half-gap is half as wide as the upper one exactly at a power of two
+    // (the value below it has a smaller exponent), except at the bottom of the range.
+    let unequal = f == 1u64 << (p - 1) && e > min_e;
+    let (mut r, mut s, mut m_plus, mut m_minus);
+    if e >= 0 {
+        let be = Big::from_u64(1).shl(e as u32);
+        if unequal {
+            r = Big::from_u64(f).shl(e as u32 + 2);
+            s = Big::from_u64(4);
+            m_plus = be.clone().shl(1);
+            m_minus = be;
+        } else {
+            r = Big::from_u64(f).shl(e as u32 + 1);
+            s = Big::from_u64(2);
+            m_plus = be.clone();
+            m_minus = be;
+        }
+    } else if unequal {
+        r = Big::from_u64(f).shl(2);
+        s = Big::from_u64(1).shl((2 - e) as u32);
+        m_plus = Big::from_u64(2);
+        m_minus = Big::from_u64(1);
+    } else {
+        r = Big::from_u64(f).shl(1);
+        s = Big::from_u64(1).shl((1 - e) as u32);
+        m_plus = Big::from_u64(1);
+        m_minus = Big::from_u64(1);
+    }
+    let even = f.is_multiple_of(2);
+    // `high_ok`: is the value just above the kept digits still inside the interval?
+    let high_ok = |r: &Big, m_plus: &Big, s: &Big| {
+        let hi = r.add(m_plus);
+        match hi.cmp(s) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Equal => even,
+            core::cmp::Ordering::Less => false,
+        }
+    };
+    // An estimate of `k = ceil(log10(v))`, low by at most one: `floor(log2(v))` is
+    // `e + bitlen(f) - 1`, and 78913 / 2^18 is log10(2) rounded down.
+    let log2 = e + (64 - f.leading_zeros() as i32) - 1;
+    let mut k = ((log2 as i64 * 78_913) >> 18) as i32 + 1;
+    if k >= 0 {
+        s = s.mul_pow10(k as u32);
+    } else {
+        let n = (-k) as u32;
+        r = r.mul_pow10(n);
+        m_plus = m_plus.mul_pow10(n);
+        m_minus = m_minus.mul_pow10(n);
+    }
+    // Fix the estimate up so that `(r + m+) / s` is in `[0.1, 1)`: the leading digit
+    // then comes out of the first multiplication by ten.
+    while high_ok(&r, &m_plus, &s) {
+        s = s.mul_small(10);
+        k += 1;
+    }
+    loop {
+        let (r10, p10) = (r.clone().mul_small(10), m_plus.clone().mul_small(10));
+        if high_ok(&r10, &p10, &s) {
+            break;
+        }
+        r = r10;
+        m_plus = p10;
+        m_minus = m_minus.mul_small(10);
+        k -= 1;
+    }
+    let mut digits = Vec::new();
+    loop {
+        r = r.mul_small(10);
+        m_plus = m_plus.mul_small(10);
+        m_minus = m_minus.mul_small(10);
+        let mut d = 0u8;
+        while r.cmp(&s) != core::cmp::Ordering::Less {
+            r = r.sub(&s);
+            d += 1;
+        }
+        let low = match r.cmp(&m_minus) {
+            core::cmp::Ordering::Less => true,
+            core::cmp::Ordering::Equal => even,
+            core::cmp::Ordering::Greater => false,
+        };
+        let high = high_ok(&r, &m_plus, &s);
+        if !low && !high {
+            digits.push(d);
             continue;
         }
-        let (val, final_e10) = nearest_at_length(mantissa, exp2, primary, cand_e10, len);
-        let last_digit_exp = final_e10 - (len as i32 - 1);
-        if round_trips(val, last_digit_exp, x, prec) {
-            return (unsigned_digits(val), final_e10);
+        let up = match (low, high) {
+            (true, false) => false,
+            (false, true) => true,
+            // Both candidates round-trip: take the nearer, and the even one on a tie.
+            _ => match r.shl(1).cmp(&s) {
+                core::cmp::Ordering::Less => false,
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Equal => d % 2 == 1,
+            },
+        };
+        digits.push(d + up as u8);
+        break;
+    }
+    // A rounded-up 9 carries into the digits before it.
+    let mut i = digits.len() - 1;
+    while digits[i] == 10 {
+        digits[i] = 0;
+        if i == 0 {
+            digits.insert(0, 1);
+            k += 1;
+            break;
         }
-        // Defensive fallback, not expected to trigger: if *something* at
-        // this length round-trips (just confirmed above), the nearest
-        // candidate -- being no farther from `x` than that something is --
-        // must round-trip too. If it somehow doesn't, fall through to a
-        // longer length rather than emit an unverified value.
+        i -= 1;
+        digits[i] += 1;
     }
-    // Unreachable in practice -- `len == SIG_DIGITS` is exact by construction
-    // of `d` -- but never leave a path that produces no output.
-    (unsigned_digits(d), e10)
+    while digits.len() > 1 && *digits.last().unwrap_or(&1) == 0 {
+        digits.pop();
+    }
+    for d in digits.iter_mut() {
+        *d += b'0';
+    }
+    (digits, k - 1)
 }
 
-/// Existence check only: does *any* candidate within one unit of `primary`
-/// (at the same `len`-digit length) reconstruct `x` exactly? `d` only has
-/// `SIG_DIGITS` digits of precision, so `round_to_length`'s own rounding of
-/// it can land on a false tie (see `shortest_digits`'s doc comment); the
-/// immediate neighbors cover that without needing to know, at this point,
-/// which of them (if more than one matches) is actually nearest `x` -- that
-/// is `nearest_at_length`'s job, done separately once a length is confirmed
-/// to work at all.
-fn any_round_trips_at_length(primary: u128, cand_e10: i32, len: u32, x: f64, prec: Prec) -> bool {
-    let lower = if len == 1 { 0 } else { 10u128.pow(len - 1) };
-    let upper = 10u128.pow(len);
-    let mut candidates: [Option<u128>; 3] = [Some(primary), None, None];
-    if primary + 1 < upper {
-        candidates[1] = Some(primary + 1);
-    }
-    if primary > lower {
-        candidates[2] = Some(primary - 1);
-    }
-    let last_digit_exp = cand_e10 - (len as i32 - 1);
-    candidates.into_iter().flatten().any(|val| round_trips(val, last_digit_exp, x, prec))
-}
-
-/// Finds the `len`-digit decimal (leading digit at decimal exponent
-/// `seed_e10`, i.e. last digit at `seed_e10 - (len - 1)`) nearest to `x`'s
-/// *exact* value `mantissa * 2^exp2`, starting the search from `seed`
-/// (expected to already be within a handful of units of the answer, e.g.
-/// from `round_to_length`).
-///
-/// At each step, `cmp_midpoint` exactly compares `x` against the midpoint
-/// between two adjacent decimal candidates (no floating-point
-/// re-involved -- see its doc comment), which is enough to walk to the true
-/// nearest candidate in a small, bounded number of steps: check whether `x`
-/// is above the midpoint between `val` and `val + 1` (if so, the answer is
-/// higher -- move up and repeat) or, if not, whether `x` is also below the
-/// midpoint between `val - 1` and `val` (if so, the answer is lower -- move
-/// down and repeat); once neither holds, `val` is nearest. An exact tie at
-/// either boundary is broken to the even candidate, matching Ryū/`std`/
-/// DuckDB/Python's convention.
-fn nearest_at_length(mantissa: u64, exp2: i32, seed: u128, seed_e10: i32, len: u32) -> (u128, i32) {
-    let mut val = seed;
-    let k = seed_e10 - (len as i32 - 1);
-    for _ in 0..8 {
-        match cmp_midpoint(mantissa, exp2, val, k) {
-            core::cmp::Ordering::Greater => {
-                val += 1;
-            }
-            core::cmp::Ordering::Equal => {
-                if !val.is_multiple_of(2) {
-                    val += 1;
-                }
-                break;
-            }
-            core::cmp::Ordering::Less => {
-                if val == 0 {
-                    break;
-                }
-                match cmp_midpoint(mantissa, exp2, val - 1, k) {
-                    core::cmp::Ordering::Less => {
-                        val -= 1;
-                    }
-                    core::cmp::Ordering::Equal => {
-                        if (val - 1).is_multiple_of(2) {
-                            val -= 1;
-                        }
-                        break;
-                    }
-                    core::cmp::Ordering::Greater => break,
-                }
-            }
-        }
-    }
-    let mut e10 = seed_e10;
-    // The walk above can cross a power-of-ten boundary (e.g. `x` nearest to
-    // exactly `10^len` at this precision); re-pin to exactly `len` digits.
-    let upper = 10u128.pow(len);
-    let lower = if len == 1 { 0 } else { 10u128.pow(len - 1) };
-    if val >= upper {
-        val /= 10;
-        e10 += 1;
-    } else if val != 0 && val < lower {
-        val *= 10;
-        e10 -= 1;
-    }
-    (val, e10)
-}
-
-/// Compares `x`'s exact value (`mantissa * 2^exp2`) against the midpoint
-/// between the decimal candidates `d_cand` and `d_cand + 1` at scale
-/// `10^k` -- i.e. against `(2 * d_cand + 1) * 10^k / 2` -- computed exactly
-/// via a small fixed-precision big-integer comparison (`Big`). `Ordering::
-/// Less` means `x` is closer to `d_cand`; `Greater` means closer to
-/// `d_cand + 1`; `Equal` is an exact tie.
-///
-/// This is deliberately *not* implemented by reparsing decimal strings back
-/// to `f64` and comparing floats: that reintroduces up to half a ULP of
-/// rounding error into the very comparison meant to resolve sub-ULP
-/// ambiguity, which is exactly the bug this function replaces (see
-/// `shortest_digits`'s doc comment).
-///
-/// Derivation: comparing `2x` against `(2*d_cand+1) * 10^k` is equivalent to
-/// comparing `mantissa * 2^(exp2+1)` against `(2*d_cand+1) * 2^k * 5^k`.
-/// Negative exponents on either side are cleared by multiplying *both*
-/// sides by the same power of 2/5 (which does not change the comparison),
-/// leaving two non-negative-integer big numbers to compare directly.
-fn cmp_midpoint(mantissa: u64, exp2: i32, d_cand: u128, k: i32) -> core::cmp::Ordering {
-    let mut lhs_pow2 = exp2 + 1;
-    let mut lhs_pow5: i32 = 0;
-    let mut rhs_pow2: i32 = 0;
-    let mut rhs_pow5: i32 = 0;
-    if k >= 0 {
-        rhs_pow2 += k;
-        rhs_pow5 += k;
-    } else {
-        lhs_pow2 += -k;
-        lhs_pow5 += -k;
-    }
-    if lhs_pow2 < 0 {
-        rhs_pow2 += -lhs_pow2;
-        lhs_pow2 = 0;
-    }
-
-    let mut lhs = Big::from_u64(mantissa);
-    lhs.mul_pow5(lhs_pow5 as u32);
-    lhs.shl(lhs_pow2 as u32);
-
-    let mut rhs = Big::from_u128(2 * d_cand + 1);
-    rhs.mul_pow5(rhs_pow5 as u32);
-    rhs.shl(rhs_pow2 as u32);
-
-    lhs.cmp(&rhs)
-}
-
-/// A minimal growable, little-endian, base-`2^32` unsigned big integer.
-///
-/// This exists solely to make `cmp_midpoint` exact: comparing the huge
-/// integers that appear once `x`'s binary exponent (up to ~1074) and a
-/// decimal candidate's power-of-five scaling (up to ~324) are cleared into
-/// plain integers is well outside `u128`'s ~38 decimal digits, but the
-/// *operations* actually needed -- multiply by a small constant, and
-/// compare -- are a small fraction of a general-purpose big-integer
-/// library. Not performance-tuned (`mul_pow5`/`shl` multiply one small
-/// factor at a time rather than batching into larger chunks): this runs at
-/// most a handful of times per `f64` written, not in a hot loop.
+/// A minimal little-endian, base-`2^32` unsigned big integer: just the operations
+/// [`shortest_digits`] needs (shift, multiply by a small factor or a power of ten,
+/// add, subtract, compare). The operands reach about 1100 bits for the most extreme
+/// exponents and stay at two or three limbs for everyday values.
 #[derive(Clone)]
 struct Big {
     limbs: Vec<u32>,
@@ -464,24 +272,18 @@ struct Big {
 
 impl Big {
     fn from_u64(v: u64) -> Self {
-        let mut limbs = vec![v as u32, (v >> 32) as u32];
-        Self::trim(&mut limbs);
-        Big { limbs }
+        let mut b = Big { limbs: vec![v as u32, (v >> 32) as u32] };
+        b.trim();
+        b
     }
 
-    fn from_u128(v: u128) -> Self {
-        let mut limbs = vec![v as u32, (v >> 32) as u32, (v >> 64) as u32, (v >> 96) as u32];
-        Self::trim(&mut limbs);
-        Big { limbs }
-    }
-
-    fn trim(limbs: &mut Vec<u32>) {
-        while limbs.len() > 1 && *limbs.last().unwrap() == 0 {
-            limbs.pop();
+    fn trim(&mut self) {
+        while self.limbs.len() > 1 && self.limbs.last() == Some(&0) {
+            self.limbs.pop();
         }
     }
 
-    fn mul_small(&mut self, m: u32) {
+    fn mul_small(mut self, m: u32) -> Self {
         let mut carry: u64 = 0;
         for limb in self.limbs.iter_mut() {
             let prod = (*limb as u64) * (m as u64) + carry;
@@ -491,21 +293,72 @@ impl Big {
         if carry > 0 {
             self.limbs.push(carry as u32);
         }
-        Self::trim(&mut self.limbs);
+        self.trim();
+        self
     }
 
-    /// Multiplies by `5^n`, one factor of 5 at a time.
-    fn mul_pow5(&mut self, n: u32) {
-        for _ in 0..n {
-            self.mul_small(5);
+    /// Multiplies by `10^n`, nine decimal digits at a time.
+    fn mul_pow10(mut self, mut n: u32) -> Self {
+        while n >= 9 {
+            self = self.mul_small(1_000_000_000);
+            n -= 9;
         }
+        self.mul_small(10u32.pow(n))
     }
 
-    /// Multiplies by `2^n` (a left shift), one bit at a time.
-    fn shl(&mut self, n: u32) {
-        for _ in 0..n {
-            self.mul_small(2);
+    /// Multiplies by `2^n`.
+    fn shl(&self, n: u32) -> Self {
+        let (words, bits) = ((n / 32) as usize, n % 32);
+        let mut limbs = vec![0u32; words];
+        let mut carry = 0u32;
+        for &l in &self.limbs {
+            if bits == 0 {
+                limbs.push(l);
+            } else {
+                limbs.push((l << bits) | carry);
+                carry = l >> (32 - bits);
+            }
         }
+        if carry > 0 {
+            limbs.push(carry);
+        }
+        let mut b = Big { limbs };
+        b.trim();
+        b
+    }
+
+    fn add(&self, other: &Big) -> Self {
+        let n = self.limbs.len().max(other.limbs.len());
+        let mut limbs = Vec::with_capacity(n + 1);
+        let mut carry = 0u64;
+        for i in 0..n {
+            let a = *self.limbs.get(i).unwrap_or(&0) as u64;
+            let b = *other.limbs.get(i).unwrap_or(&0) as u64;
+            let sum = a + b + carry;
+            limbs.push(sum as u32);
+            carry = sum >> 32;
+        }
+        if carry > 0 {
+            limbs.push(carry as u32);
+        }
+        Big { limbs }
+    }
+
+    /// `self - other`, which the caller guarantees is not negative.
+    fn sub(mut self, other: &Big) -> Self {
+        let mut borrow = 0i64;
+        for i in 0..self.limbs.len() {
+            let diff = self.limbs[i] as i64 - *other.limbs.get(i).unwrap_or(&0) as i64 - borrow;
+            if diff < 0 {
+                self.limbs[i] = (diff + (1i64 << 32)) as u32;
+                borrow = 1;
+            } else {
+                self.limbs[i] = diff as u32;
+                borrow = 0;
+            }
+        }
+        self.trim();
+        self
     }
 
     fn cmp(&self, other: &Big) -> core::cmp::Ordering {
@@ -521,76 +374,7 @@ impl Big {
     }
 }
 
-/// Rounds `d` (a `SIG_DIGITS`-digit integer) to `len` significant digits,
-/// round-half-to-even. Returns `(rounded, carry)`; `carry` is `1` if
-/// rounding up overflowed into one more digit than `len` (e.g.
-/// `999... -> 1000...`), meaning the result's leading digit moved up one
-/// decimal exponent -- the caller adds `carry` to its exponent, and the
-/// returned value is exactly `len` digits long either way.
-fn round_to_length(d: u128, len: u32) -> (u128, i32) {
-    if len >= SIG_DIGITS {
-        return (d, 0);
-    }
-    let divisor = 10u128.pow(SIG_DIGITS - len);
-    let q = d / divisor;
-    let r = d % divisor;
-    let half = divisor / 2;
-    let round_up = r > half || (r == half && q % 2 == 1);
-    let q = if round_up { q + 1 } else { q };
-    if q >= 10u128.pow(len) {
-        (q / 10, 1)
-    } else {
-        (q, 0)
-    }
-}
-
-/// Writes `digits(val) * 10^last_digit_exp` into `buf` and returns its length, so a
-/// candidate from `normalize_and_correct`/`shortest_digits` can be parsed back and
-/// checked against the original value (`round_trips`). `FromStr`'s grammar accepts a
-/// bare `<digits>e<exp>` with no decimal point, so this does not need to place one.
-fn decimal_text(val: u128, last_digit_exp: i32, buf: &mut [u8; 48]) -> usize {
-    let mut n = 0usize;
-    for &b in &unsigned_digits(val) {
-        buf[n] = b;
-        n += 1;
-    }
-    buf[n] = b'e';
-    n += 1;
-    if last_digit_exp < 0 {
-        buf[n] = b'-';
-        n += 1;
-    }
-    for &b in &unsigned_digits(last_digit_exp.unsigned_abs() as u128) {
-        buf[n] = b;
-        n += 1;
-    }
-    n
-}
-
-/// Parses `digits(val) * 10^last_digit_exp` back into an `f64`.
-fn redecode(val: u128, last_digit_exp: i32) -> f64 {
-    let mut buf = [0u8; 48];
-    let n = decimal_text(val, last_digit_exp, &mut buf);
-    core::str::from_utf8(&buf[..n]).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN)
-}
-
-/// `v`'s decimal digits, most significant first, with no leading zero (`0` itself renders as `"0"`).
-fn unsigned_digits(v: u128) -> Vec<u8> {
-    let mut buf = [0u8; 40];
-    let mut n = 0usize;
-    let mut u = v;
-    loop {
-        buf[n] = b'0' + (u % 10) as u8;
-        n += 1;
-        u /= 10;
-        if u == 0 {
-            break;
-        }
-    }
-    buf[..n].iter().rev().copied().collect()
-}
-
-/// Renders `0.<digits> * 10^(e10 + 1)` (see `normalize_and_correct`) as
+/// Renders the significant `digits` (ASCII, leading digit at decimal exponent `e10`) as
 /// plain decimal or exponent notation, matching both how this crate's own
 /// CSV/JSONL readers accept numbers and (verified against the `duckdb` CLI
 /// directly) how DuckDB's CSV/JSON writer formats them -- this project's
@@ -995,12 +779,11 @@ mod tests {
             // specific cases, confirmed directly with the `duckdb` CLI,
             // `std` disagrees with DuckDB/Python/this crate, all three of
             // which round to even; elsewhere `std` is a faithful oracle. So
-            // before treating a mismatch as a failure, check -- via this
-            // crate's own already DuckDB-verified exact big-integer
-            // comparison (`cmp_midpoint`), not `std` -- whether it is
-            // really one of these ties; if so, this crate's choice must
-            // still be the even one, and that is asserted for real rather
-            // than the mismatch being silently waved through.
+            // before treating a mismatch as a failure, check -- from `v`'s
+            // exact decimal expansion (`exact_tie`) -- whether it is really
+            // one of these ties; if so, this crate's choice must still be the
+            // even one, and that is asserted for real rather than the
+            // mismatch being silently waved through.
             let (ours_val, theirs_val) = (to_u128(&ours), to_u128(&theirs));
             assert!(
                 ours.len() == theirs.len() && ours_val.abs_diff(theirs_val) == 1,
@@ -1010,17 +793,11 @@ mod tests {
                 String::from_utf8_lossy(&ours),
                 String::from_utf8_lossy(&theirs)
             );
-            let x = v.abs();
-            let (mantissa, exp2) = decompose(x);
-            let (_, e10) = normalize_and_correct(x);
-            let len = ours.len() as u32;
-            let k = e10 - (len as i32 - 1);
             let lo = ours_val.min(theirs_val);
-            assert_eq!(
-                cmp_midpoint(mantissa, exp2, lo, k),
-                core::cmp::Ordering::Equal,
+            assert!(
+                exact_tie(v, ours.len()),
                 "{v}: wrote {written:?}, std wrote {std_form:?}, and they differ by exactly one \
-                 unit but `cmp_midpoint` says this is *not* an exact tie -- a real bug, not the \
+                 unit but {v} is *not* exactly halfway between them -- a real bug, not the \
                  known std-vs-DuckDB tie-break disagreement"
             );
             let even_val = if lo % 2 == 0 { lo } else { lo + 1 };
@@ -1031,6 +808,93 @@ mod tests {
                  ({ours_val}), not the even choice ({even_val}) DuckDB/Python use",
                 lo + 1
             );
+        }
+    }
+
+    /// Whether `v` lies *exactly* halfway between two `len`-significant-digit decimals:
+    /// its exact decimal expansion (`std` prints every digit when asked for enough
+    /// precision) continues after `len` digits with a single `5` and nothing else.
+    fn exact_tie(v: f64, len: usize) -> bool {
+        let full = std::format!("{:.1100e}", v.abs());
+        let mantissa = full.split('e').next().unwrap();
+        let digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
+        digits[len] == b'5' && digits[len + 1..].iter().all(|&d| d == b'0')
+    }
+
+    /// `std`'s shortest digits and leading-digit exponent (`{:e}` is shortest
+    /// round-trip too), laid out by this module's own `write_decimal`, so the whole
+    /// rendered string can be compared.
+    fn std_rendered(sci: &str) -> String {
+        let (m, e) = sci.split_once('e').unwrap();
+        let neg = m.starts_with('-');
+        let digits: Vec<u8> = m.bytes().filter(u8::is_ascii_digit).collect();
+        let mut out = Vec::new();
+        if neg {
+            out.push(b'-');
+        }
+        write_decimal(&mut out, &digits, e.parse().unwrap());
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A broad randomized sweep over raw bit patterns -- every exponent, subnormals
+    /// included -- comparing the whole rendered text with `std`'s shortest round trip,
+    /// for both widths. `AHIRU_FLOAT_FUZZ` raises the sample count (it was run at
+    /// 1,000,000 per width when the formatter was rewritten). The only tolerated
+    /// difference is an exact tie, which `std` breaks upward and this module to even.
+    #[test]
+    fn full_text_matches_std_on_random_bit_patterns() {
+        let n: u64 =
+            std::env::var("AHIRU_FLOAT_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for i in 0..n {
+            // Raw bit patterns spread over every binary exponent; every other draw is
+            // instead an everyday magnitude (a uniform fraction times 10^-3 .. 10^6).
+            let v = if i % 2 == 0 {
+                f64::from_bits(next())
+            } else {
+                (next() >> 11) as f64 / (1u64 << 53) as f64 * 10f64.powi((i % 10) as i32 - 3)
+            };
+            if v.is_finite() && v != 0.0 {
+                let got = written(v);
+                let want = std_rendered(&std::format!("{v:e}"));
+                if got != want {
+                    let len = got.bytes().filter(u8::is_ascii_digit).count();
+                    assert!(exact_tie(v, len.min(17)), "{v:e}: wrote {got}, std {want}");
+                }
+            }
+            let w = f32::from_bits(next() as u32);
+            if w.is_finite() && w != 0.0 {
+                let got = written32(w);
+                let want = std_rendered(&std::format!("{w:e}"));
+                if got != want {
+                    let len = got.bytes().filter(u8::is_ascii_digit).count();
+                    assert!(exact_tie(w as f64, len.min(9)), "{w:e}: wrote {got}, std {want}");
+                }
+            }
+        }
+    }
+
+    /// The case that exposed the old seed-and-repair algorithm: the double just
+    /// below 0.1. Normalizing it by repeated `* 10.0` overshot to exactly `10.0`, the
+    /// 17-digit seed was then re-pinned by multiplying it by ten (dropping a digit),
+    /// and the shortest length was missed. Values next to every power of ten, where
+    /// that overshoot happens, are checked the same way.
+    #[test]
+    fn values_next_to_powers_of_ten_are_shortest() {
+        assert_eq!(written(0.09999999999999999), "0.09999999999999999");
+        assert_eq!(written(0.9999999999999999), "0.9999999999999999");
+        assert_eq!(written(9.999999999999998), "9.999999999999998");
+        for k in -300..300 {
+            let p = std::format!("1e{k}").parse::<f64>().unwrap();
+            for v in [p, f64::from_bits(p.to_bits() - 1), f64::from_bits(p.to_bits() + 1)] {
+                assert_eq!(written(v), std_rendered(&std::format!("{v:e}")), "{v:e}");
+            }
         }
     }
 }

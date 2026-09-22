@@ -157,7 +157,7 @@ fn date_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<(Ty, bool)> {
 /// DECIMAL with a smaller scale. The result *precision* is still clamped to the maximum,
 /// which is also what DuckDB does (`DECIMAL(20,2) * DECIMAL(19,2)` -> `DECIMAL(38,4)`).
 fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Result<Option<(Ty, Ty, Ty)>> {
-    if !matches!(op, BinaryOp::Mul | BinaryOp::Div) {
+    if !matches!(op, BinaryOp::Mul | BinaryOp::Div | BinaryOp::IntDiv) {
         return Ok(None);
     }
     // If neither side is DECIMAL, take the ordinary path.
@@ -171,7 +171,7 @@ fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Result<Option<(Ty, Ty, Ty)>> {
     let (Some((p1, s1)), Some((p2, s2))) = (lt.as_decimal(), rt.as_decimal()) else {
         return Ok(None);
     };
-    if op == BinaryOp::Div {
+    if matches!(op, BinaryOp::Div | BinaryOp::IntDiv) {
         return Ok(Some((Ty::Double, Ty::Double, Ty::Double)));
     }
     // Multiplication: precision adds, and so does scale.
@@ -1123,7 +1123,11 @@ impl<'a> Compiler<'a> {
         if let Some((lcast, rcast, res)) = decimal_arith(op, lt, rt)? {
             let l = self.coerce(lr, lt, lcast)?;
             let r = self.coerce(rr, rt, rcast)?;
-            let code = if op == BinaryOp::Mul { OpCode::Mul } else { OpCode::Div };
+            let code = match op {
+                BinaryOp::Mul => OpCode::Mul,
+                BinaryOp::IntDiv => OpCode::IntDiv,
+                _ => OpCode::Div,
+            };
             return Ok((self.emit(code, res, l, r), res));
         }
 
@@ -1169,6 +1173,7 @@ impl<'a> Compiler<'a> {
             BinaryOp::Sub => OpCode::Sub,
             BinaryOp::Mul => OpCode::Mul,
             BinaryOp::Div => OpCode::Div,
+            BinaryOp::IntDiv => OpCode::IntDiv,
             BinaryOp::Mod => OpCode::Mod,
             _ => err!(Internal),
         };

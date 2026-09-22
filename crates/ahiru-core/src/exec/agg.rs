@@ -1082,7 +1082,9 @@ fn push_json_scalar(col: &Vector, row: usize, out: &mut Vec<u8>) {
                 }
                 Data::I128(v) => kernels::fmt_int(v[row].unsigned_abs(), v[row] < 0, scale, out),
                 // The same text `CAST(x AS VARCHAR)` gives. A private renderer here used to
-                // print 0.5 as `5e-1`.
+                // print 0.5 as `5e-1`. A FLOAT is spelled at `f32` precision (`0.1`, not
+                // `0.10000000149011612`), again as the cast spells it.
+                Data::F64(v) if ty == Ty::Float => kernels::fmt_f32(v[row], out),
                 Data::F64(v) => kernels::fmt_f64(v[row], out),
                 Data::Bytes(b) => crate::json::write_json_string(b.get(row), out),
             }

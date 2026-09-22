@@ -190,6 +190,23 @@ relying on a cast to reject bad data.
 
 The one conversion that does raise is non-JSON text `CAST AS JSON`.
 
+Text casts ignore leading and trailing ASCII whitespace — space, tab, `\n`,
+`\v`, `\f` and `\r` — around the value, as DuckDB does, so a value read
+from a CRLF file still converts: `CAST('5' || chr(13) AS BIGINT)` is `5`.
+
+Text to `FLOAT` rounds once, straight to the nearest `f32`, rather than to
+the nearest `DOUBLE` and then again to `FLOAT`:
+`CAST('1.00000005960464477539062500001' AS FLOAT)` is `1.0000001`, not `1.0`.
+
+A number does not cast to `DATE`/`TIME`/`TIMESTAMP` (an error, as in
+DuckDB), and so is not accepted where one is expected either (`year(1500)`
+is an error). Use `epoch_ms`/`make_timestamp`/`to_timestamp` to build a
+timestamp from an epoch count (see
+[functions-datetime.md](functions-datetime.md#extracting-fields)). The other
+direction still works here, where DuckDB rejects it: `CAST(DATE
+'1970-01-02' AS BIGINT)` is the raw day count `1` (a `TIMESTAMP` gives
+microseconds).
+
 Accepted `CAST` type-name spellings (case-insensitive):
 
 ```
@@ -263,7 +280,11 @@ it needs to be explicit:
   `2` a float-to-*integer* cast gives). Monetary rounding therefore doesn't
   systematically under-round, and `DECIMAL(p, 0)` follows the same rule as
   every other scale of the same type. DuckDB draws the line in the same place.
-- Integer arithmetic overflow **wraps** (no error), except `SUM`, which
+- Integer arithmetic overflow **wraps** (no error) within the result's own
+  type, including the narrow ones: `127::TINYINT + 1::TINYINT` is `-128`
+  and `32767::SMALLINT + 1::SMALLINT` is `-32768` (DuckDB raises). The
+  narrow `MIN // -1` and `MIN % -1` are `NULL`, the same as for the wide
+  types. The exceptions are `SUM`, which
   accumulates in a 128-bit integer internally and only errors
   (`ValueOutOfRange`) if that itself overflows, and `factorial`/`!`, which
   errors on the same code the moment its `HUGEINT` result itself overflows
@@ -315,9 +336,13 @@ it needs to be explicit:
 - A **`FLOAT`** casts to the shortest text that round-trips through `FLOAT`,
   not through `DOUBLE`: `CAST(1.1::FLOAT AS VARCHAR)` is `'1.1'`, not the
   `'1.100000023841858'` that spelling out the widened `DOUBLE` would give.
-  The same goes for how a `FLOAT` displays in the CLI and how it is written
-  by `COPY ... TO` in CSV and JSONL. (DuckDB agrees everywhere except its
-  own JSON writer, which prints the widened `DOUBLE` there.)
+  The same goes for how a `FLOAT` displays in the CLI, how it is written
+  by `COPY ... TO` in CSV and JSONL, and how it is spelled inside a list or
+  a JSON value: `[0.1::FLOAT]` and `list(x)` over a `FLOAT` column print
+  `[0.1]`, as in DuckDB. (DuckDB's own JSON functions are the exception
+  there — its `to_json(0.1::FLOAT)` prints the widened `DOUBLE`,
+  `0.10000000149011612`, where this engine prints `0.1`, since lists and
+  JSON are one type here.)
 
 ## Typed date/time literals
 

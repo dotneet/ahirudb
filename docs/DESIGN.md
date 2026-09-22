@@ -1036,8 +1036,9 @@ to be explicit:
   rounding from making a variance negative was written with `f64::max`,
   which drops a `NaN` operand.)
 - `abs`/`sign` clear the sign bit rather than negating, so neither can
-  return `-0.0`. `sqrt` and `cbrt` are correctly rounded; `exp`/`ln` are
-  within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see
+  return `-0.0`. `sqrt` and `cbrt` are correctly rounded, and so is `pow`
+  (a double-double `exp(y ln x)`) outside the rarest near-halfway cases;
+  `exp`/`ln` are within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see
   `docs/sql/functions-numeric.md`).
 
 ---

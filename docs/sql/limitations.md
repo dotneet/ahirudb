@@ -162,8 +162,9 @@ user-visible effect.
 - **Integer `/` truncates instead of returning a float.** `SELECT 7 / 2`
   is `3` here and `3.5` in DuckDB; `5.0 / 2` is `2.5` in both. This is a
   long-standing divergence that predates the `//` operator (which DuckDB
-  defines as truncating integer division, and which is therefore exact
-  sugar for `/` here). Whether `/` should change to match DuckDB is an
+  defines as truncating integer division, and which is therefore the same
+  as `/` on integers here; on floats `//` differs only in giving `NULL`
+  for a division by zero). Whether `/` should change to match DuckDB is an
   open question. See
   [functions-numeric.md](functions-numeric.md#division-and-integer-division).
 - **Postfix `!` (factorial) binds tighter than every binary operator

@@ -1793,3 +1793,150 @@ fn hex_reads_the_arguments_own_width() {
     assert_eq!(str_at(&out, 1).as_deref(), Some("0"));
     assert_eq!(str_at(&out, 2).as_deref(), Some("FF"));
 }
+
+// --- Wave-4 regressions ---------------------------------------------------
+
+#[test]
+fn printf_precision_limits_strings_and_pads_integers() {
+    let f = |fmt: &str, arg: &Vector| {
+        let fmt_v = vs(&[Some(fmt)]);
+        let (id, _, ret) = resolve("printf", &[Ty::Varchar, arg.ty()]).unwrap();
+        str_at(&call(id, ret, &[&fmt_v, arg]).unwrap(), 0).unwrap()
+    };
+    let abc = vs(&[Some("abcdef")]);
+    // All measured with duckdb v1.4.
+    assert_eq!(f("%.3s|", &abc), "abc|");
+    assert_eq!(f("%5.1s|", &abc), "    a|");
+    assert_eq!(f("%.0s|", &abc), "|");
+    assert_eq!(f("%.s|", &abc), "|");
+    assert_eq!(f("%.10s|", &abc), "abcdef|");
+    // The precision counts characters, not bytes.
+    assert_eq!(f("%.2s|", &vs(&[Some("日本語")])), "日本|");
+    // Not capped at `%f`'s 32-digit limit.
+    assert_eq!(f("%.40s", &vs(&[Some(&"a".repeat(50))])), "a".repeat(40));
+    let five = vi(Ty::BigInt, &[Some(5)]);
+    let neg = vi(Ty::BigInt, &[Some(-5)]);
+    assert_eq!(f("%.3d|", &five), "005|");
+    assert_eq!(f("%.3d|", &neg), "-005|");
+    assert_eq!(f("%5.3d|", &neg), " -005|");
+    assert_eq!(f("%-6.3d|", &five), "005   |");
+    assert_eq!(f("%06.3d|", &five), "000005|");
+    assert_eq!(f("%.0d|", &vi(Ty::BigInt, &[Some(0)])), "0|");
+    assert_eq!(f("%.1d|", &vi(Ty::BigInt, &[Some(12345)])), "12345|");
+    // `%f` keeps its default of 6 digits and its own cap.
+    assert_eq!(f("%f", &vf(&[Some(1.5)])), "1.500000");
+}
+
+#[test]
+fn substr_out_of_range_starts_match_duckdb() {
+    let f = |s: &str, a: i64, b: i64| {
+        let out = run(
+            "substr",
+            &[&vs(&[Some(s)]), &vi(Ty::BigInt, &[Some(a)]), &vi(Ty::BigInt, &[Some(b)])],
+        );
+        str_at(&out.unwrap(), 0).unwrap()
+    };
+    // duckdb v1.4.4 (a start before the string counts the missing positions against the
+    // length; a negative length reaches back from the start).
+    assert_eq!(f("hello", -7, 3), "h");
+    assert_eq!(f("hello", -6, 2), "h");
+    assert_eq!(f("hello", 7, -1), "");
+    assert_eq!(f("hello", 6, -2), "lo");
+    assert_eq!(f("hello", 0, -1), "");
+    assert_eq!(f("日本語です", -6, 3), "日本");
+    assert_eq!(f("日本語です", -4, -9), "日");
+}
+
+#[test]
+fn pow_is_correctly_rounded() {
+    // Each expected value is the double nearest the exact power (and what DuckDB prints).
+    assert_eq!(f_pow(10.0, -310.0), 1e-310);
+    assert_eq!(f_pow(10.0, -24.0), 1e-24);
+    assert_eq!(f_pow(10.0, 300.0), 1e300);
+    assert_eq!(f_pow(10.0, 22.0), 1e22);
+    assert_eq!(f_pow(1.1, 1000.0), 2.469_932_918_006_025_6e41);
+    assert_eq!(f_pow(10.0, 2.5), 316.227_766_016_837_96);
+    assert_eq!(f_pow(2.0, 0.5), core::f64::consts::SQRT_2);
+    assert_eq!(f_pow(2.0, -1074.0), 5e-324);
+    assert_eq!(f_pow(2.0, 1023.0), 8.988_465_674_311_58e307);
+    assert_eq!(f_pow(2.0, 1024.0), f64::INFINITY);
+    assert_eq!(f_pow(0.5, 1075.0), 0.0);
+    assert_eq!(f_pow(-2.0, 3.0), -8.0);
+    assert_eq!(f_pow(-2.0, -3.0), -0.125);
+    assert_eq!(f_pow(3.0, 40.0), 12_157_665_459_056_928_801.0);
+    // `-0.0` keeps its sign under an odd integer power (IEEE 754, DuckDB).
+    assert_eq!(f_pow(-0.0, -1.0), f64::NEG_INFINITY);
+    assert!(f_pow(-0.0, 3.0).is_sign_negative());
+    assert!(f_pow(-0.0, 2.0).is_sign_positive());
+    assert!(f_pow(-0.0, 0.5).is_sign_positive());
+    assert_eq!(f_pow(-0.0, -0.5), f64::INFINITY);
+    // A few the platform `pow` DuckDB calls on macOS gets one ulp wrong; checked against
+    // exact decimal arithmetic.
+    assert_eq!(f_pow(-22.0, 21.0), -1.551_944_897_110_089e28);
+    assert_eq!(f_pow(546_868.098_915_965_5, 0.5), 739.505_306_888_304_6);
+}
+
+#[test]
+fn centuries_and_decades_before_year_one_match_duckdb() {
+    // duckdb v1.4.4: there is no century/millennium 0, and decades truncate toward zero.
+    let d = |lit: &str| {
+        let days = parse_date(lit.as_bytes()).unwrap();
+        vi(Ty::Timestamp, &[Some(days * 86_400_000_000)])
+    };
+    let part =
+        |p: &str, lit: &str| int_at(&run("date_part", &[&vs(&[Some(p)]), &d(lit)]).unwrap(), 0);
+    assert_eq!(part("century", "-0001-07-27"), Some(-1));
+    assert_eq!(part("century", "0000-07-27"), Some(-1));
+    assert_eq!(part("century", "-0099-07-27"), Some(-1));
+    assert_eq!(part("century", "-0100-07-27"), Some(-2));
+    assert_eq!(part("century", "0001-07-27"), Some(1));
+    assert_eq!(part("millennium", "0000-07-27"), Some(-1));
+    assert_eq!(part("millennium", "-1000-07-27"), Some(-2));
+    assert_eq!(part("millennium", "-0999-07-27"), Some(-1));
+    assert_eq!(part("decade", "-0084-07-27"), Some(-8));
+    assert_eq!(part("decade", "-0009-07-27"), Some(0));
+    assert_eq!(part("decade", "-0010-07-27"), Some(-1));
+    let trunc = |p: &str, lit: &str| {
+        let us = int_at(&run("date_trunc", &[&vs(&[Some(p)]), &d(lit)]).unwrap(), 0).unwrap();
+        civil_from_days(us.div_euclid(86_400_000_000)).0
+    };
+    assert_eq!(trunc("decade", "-0084-07-27"), -80);
+    assert_eq!(trunc("decade", "-0009-07-27"), 0);
+    let diff = |p: &str, a: &str, b: &str| {
+        int_at(&run("date_diff", &[&vs(&[Some(p)]), &d(a), &d(b)]).unwrap(), 0)
+    };
+    assert_eq!(diff("decade", "-0005-06-01", "0005-06-01"), Some(0));
+    assert_eq!(diff("decade", "-0011-06-01", "0001-06-01"), Some(1));
+    assert_eq!(diff("decade", "-0010-06-01", "-0009-06-01"), Some(1));
+}
+
+#[test]
+fn epoch_numbers_build_timestamps_through_explicit_overloads() {
+    // `epoch_ms(<integer>)` is milliseconds -> TIMESTAMP (DuckDB); on a TIMESTAMP it still
+    // goes the other way.
+    let (_, want, ret) = resolve("epoch_ms", &[Ty::Int]).unwrap();
+    assert_eq!((want, ret), (vec![Ty::BigInt], Ty::Timestamp));
+    let out =
+        run("epoch_ms", &[&vi(Ty::BigInt, &[Some(1500), Some(-1500), Some(i64::MAX)])]).unwrap();
+    assert_eq!(int_at(&out, 0), Some(1_500_000));
+    assert_eq!(int_at(&out, 1), Some(-1_500_000));
+    assert_eq!(int_at(&out, 2), None, "overflow is NULL");
+    let (_, _, ret) = resolve("epoch_ms", &[Ty::Timestamp]).unwrap();
+    assert_eq!(ret, Ty::BigInt);
+    // `make_timestamp(<microseconds>)`.
+    let (_, want, ret) = resolve("make_timestamp", &[Ty::BigInt]).unwrap();
+    assert_eq!((want, ret), (vec![Ty::BigInt], Ty::Timestamp));
+    assert!(resolve("make_timestamp", &[Ty::Double]).is_err());
+    // `to_timestamp(<seconds>)` -> TIMESTAMPTZ, rounded half to even to microseconds.
+    let (_, want, ret) = resolve("to_timestamp", &[Ty::Int]).unwrap();
+    assert_eq!((want, ret), (vec![Ty::Double], Ty::Timestamptz));
+    let (_, _, ret) = resolve("to_timestamp", &[Ty::Varchar]).unwrap();
+    assert_eq!(ret, Ty::Timestamp);
+    let secs = vf(&[Some(1.5), Some(-1.5), Some(1.0000015), Some(-0.0000005), Some(f64::NAN)]);
+    let out = run("to_timestamp", &[&secs]).unwrap();
+    assert_eq!(int_at(&out, 0), Some(1_500_000));
+    assert_eq!(int_at(&out, 1), Some(-1_500_000));
+    assert_eq!(int_at(&out, 2), Some(1_000_002));
+    assert_eq!(int_at(&out, 3), Some(0));
+    assert_eq!(int_at(&out, 4), None);
+}
