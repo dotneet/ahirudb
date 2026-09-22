@@ -119,7 +119,8 @@ user-visible effect.
   quantile in all spellings. DuckDB's `quantile` is the discrete version,
   and its `quantile_disc` isn't implemented. A list-valued fraction
   (`quantile_cont(x, [0.25, 0.75])`) isn't supported either — the fraction
-  must be a single constant in `[0, 1]`.
+  must be a single constant in `[0, 1]` (any constant numeric expression:
+  `0`, `1`, `0.25`, `0.5::DECIMAL(2,1)`).
 - **`make_date`/`make_timestamp`** return `NULL` for an out-of-range
   component where DuckDB raises, and `make_timestamp` takes six integer
   arguments only (no `DOUBLE` seconds, no single-argument microseconds
@@ -142,7 +143,12 @@ user-visible effect.
 - **JSON equality is byte-comparison**, not semantic comparison — two JSON
   documents that differ only in whitespace (`'{"a": 1}'` vs `'{"a":1}'`)
   compare unequal. Only `=`/`<>` are defined on `JSON`; ordering comparisons
-  (`<`, `>`, ...) are a type error.
+  (`<`, `>`, ...) are a type error. **Sorting** a `JSON` column is allowed
+  (`ORDER BY`, `min`/`max`, `arg_min`/`arg_max`, window `ORDER BY`): two
+  arrays — i.e. two LISTs — compare element by element the way DuckDB orders
+  LISTs (`[9] < [10]`, a prefix first, a `NULL` element last, numbers
+  numerically, strings on their decoded text, nested lists recursively);
+  any other pair, including objects, sorts by its text.
 - **`TIMESTAMPTZ` has no session timezone concept.** A `CAST(... AS
   TIMESTAMPTZ)` literal with no explicit offset (`+HH`, `+HH:MM`, or `Z`) is
   assumed to already be UTC, rather than being interpreted in a configured
@@ -296,6 +302,13 @@ around `||`:
 See [functions-json.md](functions-json.md#concatenating-lists) for the
 `list_concat` function, which is defined on the same values but handles
 `NULL` differently (as DuckDB also does).
+
+The same ambiguity decides **ordering**. `ORDER BY`, `min`/`max`,
+`arg_min`/`arg_max` and window ordering compare two JSON arrays element by
+element, the way DuckDB orders LISTs (`[9]` before `[10]`, `[]` first, a
+`NULL` element last). DuckDB sorts its `JSON` type by text instead, so
+`ORDER BY` over array-valued `JSON` documents can differ there; objects and
+other non-array documents sort by text in both.
 
 ## No spilling
 

@@ -802,6 +802,96 @@ pub(crate) fn write_extracted_text(span: &[u8], kind: Kind, out: &mut Vec<u8>) -
 }
 
 // =========================================================================
+// Ordering (LIST semantics)
+// =========================================================================
+
+/// The total order `ORDER BY`, `MIN`/`MAX`/`ARG_MIN`/`ARG_MAX` and window ordering use for
+/// `Ty::Json` values.
+///
+/// A LIST is stored as JSON array text (§8 of DESIGN.md), and ordering it by bytes gets
+/// lists wrong: `[10]` sorted before `[9]` and `[]` after `[2]`. When **both** documents are
+/// arrays they are compared the way DuckDB compares LISTs: element by element, the first
+/// difference deciding, and a list that is a prefix of the other first. Elements compare as
+///
+/// - numbers: numerically (as `i64` when both are integers, otherwise as `f64`);
+/// - strings: by their decoded bytes, so an escape does not reorder them;
+/// - arrays: recursively;
+/// - `null`: after every value (DuckDB places a NULL element last);
+/// - anything else (objects, booleans, mixed kinds): by their text.
+///
+/// Every other pair -- an object, a scalar document, or an array against a non-array --
+/// keeps byte order, which is also what DuckDB does for its (text-backed) `JSON` type. So
+/// does a malformed array, rather than failing a sort halfway through.
+pub(crate) fn cmp_json(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    let (i, j) = (skip_ws(a, 0), skip_ws(b, 0));
+    if a.get(i) == Some(&b'[') && b.get(j) == Some(&b'[') {
+        if let Ok(o) = cmp_array(&a[i..], &b[j..]) {
+            return o;
+        }
+    }
+    a.cmp(b)
+}
+
+/// Element-wise comparison of two arrays; `a` and `b` both start with `[`.
+fn cmp_array(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering> {
+    let (mut i, mut j) = (skip_ws(a, 1), skip_ws(b, 1));
+    loop {
+        let (ea, eb) = (byte_at(a, i)? == b']', byte_at(b, j)? == b']');
+        if ea || eb {
+            // Whichever ran out first is the shorter list, a prefix of the other.
+            return Ok(eb.cmp(&ea));
+        }
+        let (ie, je) = (skip_value(a, i)?, skip_value(b, j)?);
+        let o = cmp_element(&a[i..ie], &b[j..je])?;
+        if o.is_ne() {
+            return Ok(o);
+        }
+        i = next_element(a, ie)?;
+        j = next_element(b, je)?;
+    }
+}
+
+/// Steps past the `,` after an element; stays on the closing `]`.
+fn next_element(b: &[u8], i: usize) -> Result<usize> {
+    let i = skip_ws(b, i);
+    match byte_at(b, i)? {
+        b',' => Ok(skip_ws(b, i + 1)),
+        b']' => Ok(i),
+        _ => err!(SyntaxError, i),
+    }
+}
+
+/// Compares two array elements (non-empty spans already validated by `skip_value`).
+fn cmp_element(x: &[u8], y: &[u8]) -> Result<core::cmp::Ordering> {
+    use core::cmp::Ordering;
+    Ok(match (kind_of(x[0]), kind_of(y[0])) {
+        (Kind::Null, Kind::Null) => Ordering::Equal,
+        (Kind::Null, _) => Ordering::Greater,
+        (_, Kind::Null) => Ordering::Less,
+        (Kind::Array, Kind::Array) => cmp_array(x, y)?,
+        (Kind::Num, Kind::Num) => match (parse_i64(x), parse_i64(y)) {
+            (Some(p), Some(q)) => p.cmp(&q),
+            _ => match (parse_f64(x), parse_f64(y)) {
+                (Some(p), Some(q)) => crate::exec::rowkey::ord_f64(p, q),
+                _ => x.cmp(y),
+            },
+        },
+        (Kind::Str, Kind::Str) => {
+            let ((sx, ex, _), (sy, ey, _)) = (scan_string(x, 0)?, scan_string(y, 0)?);
+            if ex || ey {
+                let (mut dx, mut dy) = (Vec::new(), Vec::new());
+                decode_string(sx, &mut dx)?;
+                decode_string(sy, &mut dy)?;
+                dx.cmp(&dy)
+            } else {
+                sx.cmp(sy)
+            }
+        }
+        _ => x.cmp(y),
+    })
+}
+
+// =========================================================================
 // Serialization
 // =========================================================================
 
@@ -1139,5 +1229,32 @@ mod tests {
         assert_eq!(code_of(whole(b"[00]")), Some(Code::SyntaxError));
         assert!(whole(b"0").is_ok());
         assert!(whole(b"-0.1").is_ok());
+    }
+
+    #[test]
+    fn cmp_json_orders_arrays_like_duckdb_lists() {
+        use core::cmp::Ordering::*;
+        let c = |a: &str, b: &str| cmp_json(a.as_bytes(), b.as_bytes());
+        // Numerically, not by bytes; a prefix first.
+        assert_eq!(c("[9]", "[10]"), Less);
+        assert_eq!(c("[]", "[2]"), Less);
+        assert_eq!(c("[1]", "[1,2]"), Less);
+        assert_eq!(c("[1, 2]", "[1,2]"), Equal);
+        assert_eq!(c("[-5,7]", "[1]"), Less);
+        assert_eq!(c("[1.5]", "[2]"), Less);
+        assert_eq!(c("[1e20]", "[10.0]"), Greater);
+        // A NULL element after every value.
+        assert_eq!(c("[1,null]", "[1,3]"), Greater);
+        assert_eq!(c("[null]", "[null]"), Equal);
+        // Nested arrays recursively.
+        assert_eq!(c("[[1,2]]", "[[1]]"), Greater);
+        assert_eq!(c("[[]]", "[[0,5]]"), Less);
+        // Strings on decoded bytes: `\"` is `"` (0x22), which sorts before `b`.
+        assert_eq!(c(r#"["a\"b"]"#, r#"["ab"]"#), Less);
+        assert_eq!(c(r#"["A"]"#, r#"["a"]"#), Less);
+        assert_eq!(c(r#"["b"]"#, r#"["b"]"#), Equal);
+        // Anything that is not two arrays keeps byte order, including malformed input.
+        assert_eq!(c(r#"{"a":10}"#, r#"{"a":9}"#), Less);
+        assert_eq!(c("[9", "[9]"), Less);
     }
 }

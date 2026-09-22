@@ -31,22 +31,22 @@ SELECT arg_max(name, score), arg_min(name, score) FROM t;
 | `count(x)` | — | Count of non-`NULL` `x` values |
 | `count(DISTINCT x)` | — | Count of distinct non-`NULL` `x` values |
 | `sum(x)` | — | Integer inputs accumulate in a 128-bit integer to avoid overflow; only errors (`ValueOutOfRange`) if *that* itself overflows |
-| `min(x)` / `max(x)` | — | Returns the input type unchanged |
-| `avg(x)` | `mean(x)` | Result is always `DOUBLE` |
-| `stddev(x)` | `stddev_samp(x)` | Sample standard deviation |
+| `min(x)` / `max(x)` | — | Returns the input type unchanged. LIST values compare element-wise, as in DuckDB (`max` over `[9]` and `[10]` is `[10]`; see [limitations.md](limitations.md#partially-supported)) |
+| `avg(x)` | `mean(x)` | Result is always `DOUBLE`. `DECIMAL` input is summed exactly and divided once by `count * 10^scale`, as DuckDB does |
+| `stddev(x)` | `stddev_samp(x)` | Sample standard deviation. `NaN` if any input is `NaN`/`±inf` (DuckDB raises "out of range"; floats stay IEEE here) — likewise for the three below |
 | `variance(x)` | `var_samp(x)` | Sample variance |
 | `median(x)` | — | Continuous/interpolated median (equivalent to the 0.5 quantile) |
-| `mode(x)` | — | Most frequent value; ties broken by first-seen (implementation-defined, matching DuckDB) |
+| `mode(x)` | — | Most frequent value; ties broken by first-seen (implementation-defined, matching DuckDB). Values that are equal but spelled differently (`INTERVAL '1 month'` and `'30 days'`) count together, and the result is the first spelling seen |
 | `approx_count_distinct(x)` | — | Currently an **exact** count internally, despite the name — a HyperLogLog-based approximation is a possible future swap, not a correctness gap today |
 | `stddev_pop(x)` | — | Population standard deviation; defined from one row (the sample version needs two) |
 | `var_pop(x)` | — | Population variance; same one-row note |
-| `quantile_cont(x, frac)` | `quantile`, `percentile_cont` | Interpolated quantile; `frac` must be a constant literal in `[0, 1]`. DuckDB's `quantile` is the *discrete* version — here all three spellings are continuous, i.e. `quantile(x, 0.5)` equals `median(x)` |
+| `quantile_cont(x, frac)` | `quantile`, `percentile_cont` | Interpolated quantile, `lo*(1-w) + hi*w` between the two bracketing values as in DuckDB (so an infinite neighbour gives `±inf`, not `NaN`); `frac` must be a constant in `[0, 1]` (`0`, `1`, `0.9`, `0.5::DECIMAL(2,1)` all work). DuckDB's `quantile` is the *discrete* version — here all three spellings are continuous, i.e. `quantile(x, 0.5)` equals `median(x)` |
 | `string_agg(x, sep)` | `group_concat(x, sep)`, `listagg` | `sep` must be a constant literal; defaults to `','` if omitted |
 | `array_agg(x)` | `list(x)` | Collects values into a `JSON`-array-shaped result (no separate LIST physical type — see [functions-json.md](functions-json.md)). Elements are rendered from their **logical** type, exactly as `to_json` renders them: `DECIMAL` keeps its decimal point, `DOUBLE` uses the `CAST(x AS VARCHAR)` spelling, and `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`/`UUID` come out as quoted text |
 | `any_value(x)` | `first(x)`, `arbitrary(x)` | First non-`NULL` value seen. Input order is not guaranteed without `ORDER BY`, so treat it as "some value" |
 | `last(x)` | — | Last non-`NULL` value seen; same ordering caveat |
 | `bool_and(x)` / `bool_or(x)` | — | `BOOLEAN` input; `NULL`s are skipped, so an all-`NULL` group is `NULL` |
-| `count_if(x)` | `countif(x)` | Counts rows where `x` is true; a group with none counts `0`, not `NULL` |
+| `count_if(x)` | `countif(x)` | Counts rows where `x` is true. Like DuckDB (where it is a `sum` over booleans), a group whose `x` is never non-`NULL` — including empty input — gives `NULL`; a group of only `false` rows gives `0` |
 | `product(x)` | — | Accumulated in `DOUBLE` (an exact integer product would overflow immediately) |
 | `arg_max(v, k)` / `arg_min(v, k)` | `max_by`, `min_by` | `v` at the row with the largest/smallest `k`. Rows where **either** argument is `NULL` take no part. `DISTINCT` is rejected here (it would have to deduplicate on the pair) |
 
@@ -85,12 +85,12 @@ SELECT id, nth_value(score, 2) OVER (ORDER BY id) FROM t LIMIT 3;
 | `dense_rank()` | No arguments; ties share a rank, next rank doesn't skip |
 | `percent_rank()` | No arguments; `(rank - 1) / (rows - 1)`, so it spans 0..1. A single-row partition is `0` |
 | `cume_dist()` | No arguments; the fraction of the partition at or before this row's peer group |
-| `ntile(n)` | Splits the partition into `n` buckets, the first `rows % n` of them one row larger. `n < 1` gives `NULL` (DuckDB errors) |
-| `lag(x[, offset[, default]])` | Up to 3 arguments; `offset` defaults to 1, `default` defaults to `NULL` and is cast to `x`'s type |
+| `ntile(n)` | Splits the partition into `n` buckets, the first `rows % n` of them one row larger. `n < 1` gives `NULL` (DuckDB errors). `n` is cast to `BIGINT`, as in DuckDB |
+| `lag(x[, offset[, default]])` | Up to 3 arguments; `offset` defaults to 1 and is cast to `BIGINT`, `default` defaults to `NULL` and is cast to `x`'s type |
 | `lead(x[, offset[, default]])` | Same shape as `lag`, looking forward instead of back |
 | `first_value(x)` | First value in the current window frame |
 | `last_value(x)` | Last value in the current window frame |
-| `nth_value(x, n)` | The `n`-th row (1-based) of the current frame, or `NULL` if the frame has not reached it yet |
+| `nth_value(x, n)` | The `n`-th row (1-based) of the current frame, or `NULL` if the frame has not reached it yet. `n` is cast to `BIGINT` |
 
 Aggregates that only ever *add* to the frame can also run as window
 functions: `sum`, `count`, `count(*)`, `avg`, `min`, `max`, `any_value`,
