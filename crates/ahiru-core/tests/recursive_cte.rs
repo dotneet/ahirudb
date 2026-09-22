@@ -299,6 +299,33 @@ fn self_reference_in_anchor_is_rejected() {
     assert_eq!(code_of(err), Some(Code::UnsupportedFeature));
 }
 
+/// A trailing `ORDER BY`/`LIMIT`/`OFFSET` on a recursive body used to be dropped silently
+/// (the `LIMIT 3` query below counted 10 rows). DuckDB rejects all three ("LIMIT or OFFSET
+/// in a recursive query is not allowed" / "ORDER BY in a recursive query is not allowed").
+#[test]
+fn order_by_limit_offset_on_a_recursive_body_are_rejected() {
+    let mut db = session_with_dual();
+    for tail in ["LIMIT 3", "OFFSET 3", "ORDER BY 1", "ORDER BY ALL", "LIMIT 3 OFFSET 1"] {
+        let sql = format!(
+            "WITH RECURSIVE r(n) AS (SELECT 1 FROM dual UNION ALL \
+             SELECT n + 1 FROM r WHERE n < 10 {tail}) SELECT count(*) FROM r"
+        );
+        assert_eq!(code_of(db.prepare(&sql, &[])), Some(Code::SyntaxError), "{sql}");
+    }
+    // DuckDB decides this syntactically: a `UNION` body under `WITH RECURSIVE` is
+    // rejected even when it does not reference itself.
+    let sql = "WITH RECURSIVE r(n) AS (SELECT 1 FROM dual UNION ALL SELECT 2 FROM dual LIMIT 1) \
+               SELECT count(*) FROM r";
+    assert_eq!(code_of(db.prepare(sql, &[])), Some(Code::SyntaxError));
+    // A parenthesised recursive member keeps its own LIMIT (duckdb: 10), and so
+    // does a body that is not a UNION (duckdb: 1).
+    let sql = "WITH RECURSIVE r(n) AS (SELECT 1 FROM dual UNION ALL \
+               (SELECT n + 1 FROM r WHERE n < 10 LIMIT 3)) SELECT count(*) FROM r";
+    assert_eq!(run(&mut db, sql), vec![vec![Value::I64(10)]]);
+    let sql = "WITH RECURSIVE r(n) AS (SELECT 1 FROM dual LIMIT 1) SELECT count(*) FROM r";
+    assert_eq!(run(&mut db, sql), vec![vec![Value::I64(1)]]);
+}
+
 /// Rejected clearly when the column-name list's column count doesn't match the body (the
 /// anchor produces only 1 column, but `t(a, b)` specifies 2).
 #[test]

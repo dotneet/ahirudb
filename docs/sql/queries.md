@@ -271,6 +271,12 @@ WITH RECURSIVE
 SELECT a.n, b.n FROM a, b WHERE a.n = b.n - 99 ORDER BY a.n;
 ```
 
+As in DuckDB, a trailing `ORDER BY`/`LIMIT`/`OFFSET` on the body of a
+recursive CTE (`... UNION ALL SELECT n + 1 FROM r WHERE n < 10 LIMIT 3`) is
+rejected with a syntax error rather than ignored; put the clause on the
+outer query instead. A parenthesised recursive member
+(`UNION ALL (SELECT ... LIMIT 3)`) is accepted.
+
 The recursive working set and its deduplication ("seen") set each have a
 fixed in-memory cap — see [limitations.md](limitations.md#no-spilling).
 
