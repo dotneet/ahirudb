@@ -1005,8 +1005,9 @@ to be explicit:
   from `SELECT sum(x)` and `SELECT sum(x) OVER ()` alike, where an
   uncompensated accumulator (DuckDB's included) gives `0.0`.
 - `abs`/`sign` clear the sign bit rather than negating, so neither can
-  return `-0.0`. `sqrt` and `cbrt` are correctly rounded; `exp`/`ln` are
-  within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see
+  return `-0.0`. `sqrt` and `cbrt` are correctly rounded, and so is `pow`
+  (a double-double `exp(y ln x)`) outside the rarest near-halfway cases;
+  `exp`/`ln` are within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see
   `docs/sql/functions-numeric.md`).
 
 ---

@@ -246,6 +246,8 @@ Two formatting styles, both usable directly on table columns:
 SELECT printf('id=%d name=%s', id, name) FROM t LIMIT 2;
 SELECT printf('%05d', 3);      -- '00003'
 SELECT printf('%.2f', 3.14159); -- '3.14'
+SELECT printf('%.3d', 5);       -- '005'   (precision = minimum digits)
+SELECT printf('%.3s', 'abcdef'); -- 'abc'  (precision = maximum characters)
 SELECT printf('%%');            -- '%'
 
 SELECT format('{}-{}', 42, 'x');     -- '42-x'
@@ -275,6 +277,13 @@ SELECT printf('%s', 170141183460469231731687303715884105727::HUGEINT);
 -- '170141183460469231731687303715884105727'
 SELECT format('{}', INTERVAL '2 months');                -- '2 months'
 ```
+
+A precision on `%s` cuts the rendered text to at most that many
+characters — code points, not bytes, so a multi-byte character is never
+split (`printf('%.2s', '日本語')` is `'日本'`, `printf('%.0s', 'abc')` is
+`''`). On `%d` it is the minimum number of digits, zero-filled after the
+sign (`printf('%.3d', -5)` is `'-005'`); a width then pads the result as
+usual. Both match DuckDB.
 
 `%d` and `%f`, by contrast, **reject an `INTERVAL` argument** with a
 `TypeMismatch` — there is no meaningful single number to print for a value

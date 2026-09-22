@@ -178,7 +178,7 @@ fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<
             let (ty, v) = &p.consts[c];
             const_vector(*ty, v)?
         }
-        Add | Sub | Mul | Div | Mod | Neg => {
+        Add | Sub | Mul | Div | IntDiv | Mod | Neg => {
             let a = reg(regs, ins.a)?;
             // Unary Neg does not use b. `a` is passed so an uninitialized register is never read.
             let b = if ins.op == Neg { a } else { reg(regs, ins.b)? };

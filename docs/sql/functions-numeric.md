@@ -70,6 +70,15 @@ it's worth knowing which is which:
   through `exp(ln(x)/3)`, which was the old source of error; measured
   against exact arithmetic it is now more accurate than DuckDB's own
   `cbrt`, which is off by 1 ulp on a small share of inputs.)
+- **`pow`/`power` is correctly rounded** apart from the rarest inputs
+  whose true value lies within about 2^-80 of a rounding boundary: it is
+  evaluated as `exp(y * ln x)` in double-double arithmetic and rounded
+  once, so every exactly representable power (`pow(2, 10)`, `pow(10, 22)`)
+  is exact, subnormal results come out (`pow(10, -310)` is `1e-310`), and
+  a large exponent does not magnify a rounding error (`pow(1.1, 1000)` is
+  `2.4699329180060256e+41`). Against exact arithmetic it disagrees with
+  DuckDB on roughly 0.1% of random inputs, each time because DuckDB's
+  platform `pow` is the one off by an ulp.
 - **`exp` and `ln` are within 1 ulp**, correctly rounded on the large
   majority of inputs and one ulp out on a small remainder (roughly 2% of a
   log-uniform sample over `1e-8`–`1e8`).
@@ -134,8 +143,10 @@ SELECT 7 / 2;      -- 3      (both operands integer -> truncates toward zero)
 SELECT -7 / 2;     -- -3
 SELECT 5.0 / 2;    -- 2.5    (either operand a float -> real-valued division)
 SELECT 5 / 0;      -- NULL  (not an error)
-SELECT 7 // 2;     -- 3      (// is sugar for /, see below)
+SELECT 7 // 2;     -- 3      (// is / on integers, see below)
 SELECT 5 // 0;     -- NULL
+SELECT 5.0 / 0;    -- inf    (IEEE)
+SELECT 5.0 // 0;   -- NULL   (// by zero is NULL for floats too, as in DuckDB)
 ```
 
 **ahirudb's plain `/` is already truncating integer division when both
@@ -145,13 +156,15 @@ returns a float (`duckdb`'s `7/2` is `3.5`, not `3`). This predates the
 whether `/` should change to match DuckDB is an open question, not a
 settled decision.
 
-`//` is DuckDB's own truncating-integer-division operator, and it happens
-to be exact sugar for `/` in ahirudb specifically *because* `/` already
-behaves that way here: `//` binds at the same precedence as `*`/`/` (so `2
-+ 5 // 2` is `2 + (5 // 2)` = `4`) and is left-associative (`5 // 2 // 2` =
-`(5 // 2) // 2` = `1`). Division by zero returns `NULL` either way, and if
-`/`'s semantics ever change to match DuckDB's, `//` would need to be
-revisited to keep its own (DuckDB-matching) truncating behavior.
+`//` is DuckDB's own truncating-integer-division operator, and on integers
+it is exactly `/` in ahirudb specifically *because* `/` already behaves that
+way here: `//` binds at the same precedence as `*`/`/` (so `2 + 5 // 2` is
+`2 + (5 // 2)` = `4`) and is left-associative (`5 // 2 // 2` =
+`(5 // 2) // 2` = `1`). On floating-point operands `//` is real-valued
+division like `/` (`7.0 // 2` is `3.5`, as in DuckDB), except that a
+division by zero is `NULL` rather than `inf`/`NaN`. If `/`'s semantics ever
+change to match DuckDB's, `//` would need to be revisited to keep its own
+(DuckDB-matching) truncating behavior.
 
 ## Factorial
 

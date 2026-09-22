@@ -526,12 +526,14 @@ const MAX_PRINTF_WIDTH: usize = 1 << 16;
 /// `printf(fmt, args...)`. Of C's `%` formats, only the following are supported:
 ///
 /// - `%%`  a literal `%`
-/// - `%[-][0][<width>]d`  an integer. The corresponding actual argument is BOOLEAN (0/1) or an
-///   integer type. Floating point is truncated toward zero.
+/// - `%[-][0][<width>][.<precision>]d`  an integer. The corresponding actual argument is BOOLEAN
+///   (0/1) or an integer type. Floating point is truncated toward zero. The precision is the
+///   minimum number of digits (zero-filled).
 /// - `%[-][0][<width>][.<precision>]f`  fixed-point notation for floating point. The precision
 ///   defaults to 6 digits (the same as C's `printf`; confirmed that
 ///   `duckdb -c "select printf('%f', 3.5)"` gives `3.500000`) and can go up to `MAX_PRINTF_PREC`.
-/// - `%[-][<width>]s`  stringified by the same rules as `write_display`.
+/// - `%[-][<width>][.<precision>]s`  stringified by the same rules as `write_display`, then cut to
+///   at most `<precision>` characters (code points).
 ///
 /// A known difference from DuckDB: DuckDB errors when a FLOAT is passed to `%d` or an INTEGER to
 /// `%s` (the `fmt` library's type strictness), whereas here practicality wins and both are accepted
@@ -577,17 +579,20 @@ fn printf_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
             width = (width.saturating_mul(10) + (b - b'0') as usize).min(MAX_PRINTF_WIDTH);
             i += 1;
         }
-        let mut prec: u32 = 6;
+        // `None` when no `.` was written. `%f` then defaults to 6 digits; `%d`/`%s` have no
+        // precision at all. Capped like the width, for the same reason.
+        let mut prec: Option<usize> = None;
         if fmt.get(i) == Some(&b'.') {
             i += 1;
-            prec = 0;
+            let mut p = 0usize;
             while let Some(&b) = fmt.get(i) {
                 if !b.is_ascii_digit() {
                     break;
                 }
-                prec = (prec.saturating_mul(10) + (b - b'0') as u32).min(MAX_PRINTF_PREC);
+                p = (p.saturating_mul(10) + (b - b'0') as usize).min(MAX_PRINTF_WIDTH);
                 i += 1;
             }
+            prec = Some(p);
         }
         ensure!(i < fmt.len(), SyntaxError);
         let conv = fmt[i];
@@ -605,13 +610,31 @@ fn printf_scan(fmt: &[u8], a: &A, out: &mut Vec<u8>) -> Result<()> {
         match conv {
             b'd' => {
                 let x = numeric_i128(v, row)?;
-                kernels::fmt_int(x.unsigned_abs(), x < 0, 0, &mut body);
+                if x < 0 {
+                    body.push(b'-');
+                }
+                let mut digits = Vec::new();
+                kernels::fmt_int(x.unsigned_abs(), false, 0, &mut digits);
+                // The precision is the minimum number of digits, zero-filled after the sign
+                // (`printf('%.3d', -5)` is `-005`), as in C and DuckDB. `%.0d` of 0 still
+                // prints `0` there, so nothing is ever dropped.
+                body.resize(body.len() + prec.unwrap_or(0).saturating_sub(digits.len()), b'0');
+                body.extend_from_slice(&digits);
             }
             b'f' => {
                 let x = numeric_f64(v, row)?;
-                fmt_fixed(x, prec as u8, &mut body);
+                let p = prec.map_or(6, |p| p.min(MAX_PRINTF_PREC as usize));
+                fmt_fixed(x, p as u8, &mut body);
             }
-            b's' => write_display(v, row, &mut body)?,
+            b's' => {
+                write_display(v, row, &mut body)?;
+                // The precision is the maximum number of characters -- code points, not bytes,
+                // so a multi-byte character is never cut in half (`printf('%.2s', '日本語')`
+                // is `日本`).
+                if let Some(p) = prec {
+                    body.truncate(cp_byte(&body, p));
+                }
+            }
             _ => err!(UnsupportedFeature),
         }
         pad_field(out, &body, width, left, zero && conv != b's');

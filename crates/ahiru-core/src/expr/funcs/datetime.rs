@@ -98,6 +98,16 @@ fn iso_year_start(days: i64) -> i64 {
     iso_thursday(days_from_civil(iso_year(days), 1, 4)) - 3
 }
 
+/// DuckDB's 1-based century/millennium number for a `span`-year period: positive years
+/// count up from 1, and year 0 and earlier count down from -1, so neither has a period 0.
+fn one_based(y: i64, span: i64) -> i64 {
+    if y > 0 {
+        (y - 1) / span + 1
+    } else {
+        y / span - 1
+    }
+}
+
 /// The body of `date_part` / `year()` and friends.
 pub(super) fn date_part(p: u8, us: i64) -> Option<i64> {
     let c = civil(us);
@@ -121,13 +131,17 @@ pub(super) fn date_part(p: u8, us: i64) -> Option<i64> {
             0 => 7,
             w => w,
         },
-        // Year 1-100 is century 1, 2021 is century 21 (DuckDB's definition).
+        // Year 1-100 is century 1, 2021 is century 21 (DuckDB's definition). There is no
+        // century 0: years 0 to -99 are century -1, -100 to -199 century -2, and so on
+        // (DuckDB's `year / 100 - 1` for `year <= 0`, with truncating division).
         // Note `date_trunc`/`date_diff` deliberately do *not* share this 1-based definition;
         // see their own comments.
-        P_CENTURY => (c.y - 1).div_euclid(100) + 1,
-        P_DECADE => c.y.div_euclid(10),
-        // Same 1-based definition as the century (`date_part('millennium', 2024)` is 3).
-        P_MILLENNIUM => (c.y - 1).div_euclid(1000) + 1,
+        P_CENTURY => one_based(c.y, 100),
+        // Truncating toward zero, as DuckDB does: `-0084` is decade -8, and `-0009` decade 0.
+        P_DECADE => c.y / 10,
+        // Same 1-based definition as the century (`date_part('millennium', 2024)` is 3,
+        // and year 0 is millennium -1).
+        P_MILLENNIUM => one_based(c.y, 1000),
         P_ISOYEAR => iso_year(c.days),
         // DuckDB returns a DOUBLE including fractional seconds; here it is BIGINT seconds (floored).
         _ => us.div_euclid(US_PER_SEC),
@@ -152,7 +166,9 @@ pub(super) fn date_trunc(p: u8, us: i64) -> Result<Option<i64>> {
         P_SECOND => unit(US_PER_SEC),
         P_MILLISECOND => unit(1_000),
         P_MICROSECOND => Some(us),
-        P_DECADE => day(days_from_civil(c.y.div_euclid(10) * 10, 1, 1)),
+        // Toward zero like the century and millennium below, again as DuckDB does
+        // (`date_trunc('decade', DATE '-0084-07-27')` is year -80, not -90).
+        P_DECADE => day(days_from_civil(c.y / 10 * 10, 1, 1)),
         // DuckDB truncates to `year / 100 * 100`, not to the start of the 1-based century that
         // `date_part('century')` counts: `date_trunc('century', DATE '2024-05-05')` is
         // `2000-01-01` and `date_trunc('century', DATE '1900-12-31')` is `1900-01-01`.
@@ -190,7 +206,9 @@ pub(super) fn date_diff(p: u8, a: i64, b: i64) -> Result<Option<i64>> {
             Some(v) => v,
             None => err!(ValueOutOfRange),
         },
-        P_DECADE => cb.y.div_euclid(10) - ca.y.div_euclid(10),
+        // Truncating toward zero, like `date_trunc` and DuckDB: years -9 to 9 are all one
+        // decade, so `date_diff('decade', DATE '-0005-06-01', DATE '0005-06-01')` is 0.
+        P_DECADE => cb.y / 10 - ca.y / 10,
         // Like `date_trunc`, DuckDB counts century and millennium boundaries with a plain
         // `year / 100` (truncating toward zero), not with the 1-based numbering
         // `date_part('century')` returns: `date_diff('century', DATE '1900-01-01',
@@ -366,18 +384,6 @@ fn scan(s: &[u8], i: usize, lo: usize, hi: usize) -> Option<(i64, usize)> {
     }
 }
 
-fn trim_ws(s: &[u8]) -> &[u8] {
-    let mut lo = 0;
-    let mut hi = s.len();
-    while lo < hi && (s[lo] == b' ' || s[lo] == b'\t') {
-        lo += 1;
-    }
-    while hi > lo && (s[hi - 1] == b' ' || s[hi - 1] == b'\t') {
-        hi -= 1;
-    }
-    &s[lo..hi]
-}
-
 /// Reads `YYYY-MM-DD`. The position read up to is returned as well (for use from TIMESTAMP).
 fn scan_date(s: &[u8]) -> Option<(i64, usize)> {
     let neg = s.first() == Some(&b'-');
@@ -439,7 +445,7 @@ fn scan_time(s: &[u8], i: usize) -> Option<(i64, usize)> {
 
 /// VARCHAR -> DATE. `None` if unreadable (the caller makes that row NULL).
 pub(crate) fn parse_date(s: &[u8]) -> Option<i64> {
-    let s = trim_ws(s);
+    let s = crate::expr::kernels::trim_space(s);
     let (d, i) = scan_date(s)?;
     if i == s.len() {
         return Some(d);
@@ -462,7 +468,7 @@ pub(crate) fn parse_date(s: &[u8]) -> Option<i64> {
 /// VARCHAR -> TIMESTAMP. `YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]][zone]`.
 /// A date alone counts as midnight.
 pub(crate) fn parse_timestamp(s: &[u8]) -> Option<i64> {
-    let s = trim_ws(s);
+    let s = crate::expr::kernels::trim_space(s);
     let (d, i) = scan_date(s)?;
     let base = d.checked_mul(US_PER_DAY)?;
     if i == s.len() {
@@ -529,7 +535,7 @@ fn scan_ignored_timestamp_offset(s: &[u8], i: usize) -> Option<usize> {
 
 /// VARCHAR -> TIME.
 pub(crate) fn parse_time(s: &[u8]) -> Option<i64> {
-    let s = trim_ws(s);
+    let s = crate::expr::kernels::trim_space(s);
     let (t, i) = scan_time(s, 0)?;
     if i == s.len() {
         Some(t)
@@ -572,7 +578,7 @@ fn scan_offset(s: &[u8], i: usize) -> Option<(i64, usize)> {
 /// simplification as `CURRENT_TIMESTAMP` in `sql::now`). The offset is subtracted to normalize
 /// "that locale's wall-clock time" into a UTC instant (for example `12:00+09` is `03:00` in UTC).
 pub(crate) fn parse_timestamptz(s: &[u8]) -> Option<i64> {
-    let s = trim_ws(s);
+    let s = crate::expr::kernels::trim_space(s);
     let (d, i) = scan_date(s)?;
     let base = d.checked_mul(US_PER_DAY)?;
     if i == s.len() {
@@ -624,7 +630,7 @@ pub(crate) fn fmt_uuid(bytes: &[u8; 16], out: &mut Vec<u8>) {
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` -> 16 bytes. Case-insensitive.
 /// Even the hyphen positions are checked strictly (DuckDB accepts only this form as well).
 pub(crate) fn parse_uuid(s: &[u8]) -> Option<[u8; 16]> {
-    let s = trim_ws(s);
+    let s = crate::expr::kernels::trim_space(s);
     if s.len() != 36 {
         return None;
     }

@@ -8,7 +8,7 @@
 //!     `DOUBLE` here and a `DECIMAL` in DuckDB, so the DuckDB reference values
 //!     below always cast explicitly to `DOUBLE` where that matters.
 //!   - Unsigned integer arithmetic **wraps inside the unsigned domain** here;
-//!     DuckDB raises an out-of-range error instead. See `wrap_unsigned` in
+//!     DuckDB raises an out-of-range error instead. See `wrap_narrow` in
 //!     `expr::kernels` for why wrapping was chosen.
 //!
 //! A `SELECT <expr>` with no `FROM` is unsupported (`plan::bind`), so these run

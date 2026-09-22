@@ -79,6 +79,9 @@ pub enum OpCode {
     Mul,
     /// Division by zero returns NULL (rather than an error).
     Div,
+    /// `//`. Identical to `Div` on the integer lanes; on `F64` a zero divisor gives NULL
+    /// instead of IEEE `inf`/`NaN`, as DuckDB's `//` does.
+    IntDiv,
     Mod,
     Neg,
 
