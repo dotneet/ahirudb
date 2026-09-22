@@ -329,10 +329,15 @@ fn push_timestamp_string(out: &mut Vec<u8>, micros: i64) {
     push_padded(out, rem / 60_000_000 % 60, 2);
     out.push(b':');
     push_padded(out, rem / 1_000_000 % 60, 2);
+    // Trailing zeros are dropped from the fraction (`.5`, not `.500000`), the same as
+    // `CAST(... AS VARCHAR)` (`expr::funcs::fmt_time`) and DuckDB's JSON writer.
     let sub = rem % 1_000_000;
     if sub != 0 {
         out.push(b'.');
         push_padded(out, sub, 6);
+        while out.last() == Some(&b'0') {
+            out.pop();
+        }
     }
     out.push(b'"');
 }
@@ -396,6 +401,26 @@ mod tests {
             crate::format::FormatKind::Csv,
         );
         assert_eq!(lines, vec![r#"{"id":1,"name":"alice"}"#, r#"{"id":2,"name":"bob"}"#]);
+    }
+
+    /// A negative year pads its digits to four, not the sign, matching
+    /// `CAST(... AS VARCHAR)` (the CLI's own renderer used to get this wrong).
+    #[test]
+    fn timestamps_pad_negative_years_and_trim_the_fraction() {
+        let lines = run(
+            "SELECT TIMESTAMP '-0015-01-01 00:00:00' AS a, \
+             TIMESTAMP '-0015-01-01 00:00:00'::TIMESTAMPTZ AS b FROM t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"a":"-0015-01-01 00:00:00","b":"-0015-01-01 00:00:00+00"}"#]);
+        // The fraction drops trailing zeros, as `CAST(... AS VARCHAR)` and DuckDB do.
+        let lines = run(
+            "SELECT TIMESTAMP '2020-01-01 00:00:00.5'::TIMESTAMPTZ AS a FROM t",
+            b"id\n1\n".to_vec(),
+            crate::format::FormatKind::Csv,
+        );
+        assert_eq!(lines, vec![r#"{"a":"2020-01-01 00:00:00.5+00"}"#]);
     }
 
     #[test]

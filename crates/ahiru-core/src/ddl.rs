@@ -192,7 +192,12 @@ fn eval_scalar(
 /// therefore rejected with `ValueOutOfRange` rather than silently written. Because
 /// both `insert` and `update` validate the entire statement before touching any row,
 /// the failing statement mutates nothing.
-pub(crate) fn cast_value(session: &mut Session, v: Value, src_ty: Ty, target_ty: Ty) -> Result<Value> {
+pub(crate) fn cast_value(
+    session: &mut Session,
+    v: Value,
+    src_ty: Ty,
+    target_ty: Ty,
+) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
