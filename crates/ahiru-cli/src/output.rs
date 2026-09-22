@@ -179,10 +179,12 @@ impl<'a> Writer<'a> {
             Mode::JsonLines => self.write_row_jsonlines(values),
             Mode::Json => self.write_row_json(values),
             Mode::Box | Mode::Duckbox => {
+                // Escaped here, before buffering, so the column widths computed in
+                // `finish_box` measure exactly the text that gets printed.
                 let cells: Vec<String> = values
                     .iter()
                     .zip(&self.types)
-                    .map(|(v, ty)| crate::render::render(v, *ty, &self.settings.null))
+                    .map(|(v, ty)| box_escape(crate::render::render(v, *ty, &self.settings.null)))
                     .collect();
                 self.box_rows.push(cells);
                 Ok(())
@@ -402,7 +404,8 @@ impl<'a> Writer<'a> {
 
         // --- Column content widths, across the header, the type line (duck
         // only) and every displayed data row. ---
-        let mut col_width: Vec<usize> = self.names.iter().map(|n| str_width(n)).collect();
+        let names: Vec<String> = self.names.iter().map(|n| box_escape(n.clone())).collect();
+        let mut col_width: Vec<usize> = names.iter().map(|n| str_width(n)).collect();
         if duck {
             for (w, ty) in col_width.iter_mut().zip(&self.types) {
                 *w = (*w).max(str_width(&ty.name().to_ascii_lowercase()));
@@ -486,7 +489,7 @@ impl<'a> Writer<'a> {
             match c {
                 Col::Real(i) => {
                     let right = crate::render::is_numeric(self.types[*i]);
-                    header.push_str(&pad_cell(&self.names[*i], w, right));
+                    header.push_str(&pad_cell(&names[*i], w, right));
                     type_line.push_str(&pad_cell(
                         &self.types[*i].name().to_ascii_lowercase(),
                         w,
@@ -806,6 +809,52 @@ pub(crate) fn char_width(c: char) -> usize {
 /// Returns the display column width of a string in a monospace terminal.
 pub(crate) fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
+}
+
+/// Makes a cell (or column name) safe to print inside a boxed table.
+///
+/// A raw newline breaks the row across lines, a tab advances to the next tab
+/// stop, and ESC starts a terminal escape sequence that the data could use to
+/// recolor or rewrite the screen. All of them are zero-width to `str_width`,
+/// so the borders come out misaligned as well. Every C0 control is therefore
+/// spelled the way DuckDB's duckbox mode spells it: `\n`, `\t`, `\r`, `\e`,
+/// `\0`, `\a`, `\b`, `\v`, `\f`, and `\<decimal code>` for the rest (`\1`,
+/// `\31`).
+///
+/// DuckDB prints DEL (U+007F) and the C1 controls (U+0080..U+009F) raw. They
+/// are escaped here in the same `\<decimal>` form (`\127`, `\155`) because
+/// they are just as invisible and zero-width, and U+009B is a single-character
+/// CSI to terminals that honour C1 controls.
+///
+/// Only the boxed modes escape. The machine-readable modes (csv/tsv/json/
+/// insert) have their own quoting, and DuckDB leaves `line`/`list`/`markdown`
+/// cells raw as well.
+fn box_escape(text: String) -> String {
+    let needs = |c: char| (c as u32) < 0x20 || (0x7f..0xa0).contains(&(c as u32));
+    if !text.chars().any(needs) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len() + 4);
+    for c in text.chars() {
+        if !needs(c) {
+            out.push(c);
+            continue;
+        }
+        out.push('\\');
+        match c {
+            '\n' => out.push('n'),
+            '\t' => out.push('t'),
+            '\r' => out.push('r'),
+            '\0' => out.push('0'),
+            '\u{7}' => out.push('a'),
+            '\u{8}' => out.push('b'),
+            '\u{b}' => out.push('v'),
+            '\u{c}' => out.push('f'),
+            '\u{1b}' => out.push('e'),
+            _ => out.push_str(&(c as u32).to_string()),
+        }
+    }
+    out
 }
 
 /// Pads `text` to `width` with one space of padding on each side, right- or
@@ -1176,6 +1225,39 @@ mod tests {
 │ x  │  1 │
 │ yy │ 22 │
 └────┴────┘
+";
+        assert_eq!(as_str(&buf), expected);
+    }
+
+    /// Control characters used to reach the terminal raw inside a boxed table: a
+    /// newline split the row, ESC passed escape sequences through, and all of them
+    /// counted as zero width, so the borders did not line up. They are now spelled
+    /// as DuckDB's duckbox spells them, and the width is that of the escaped text.
+    #[test]
+    fn box_escapes_control_characters_and_measures_the_escaped_text() {
+        assert_eq!(box_escape("l1\nl2".to_string()), "l1\\nl2");
+        assert_eq!(box_escape("\u{1b}[31mred".to_string()), "\\e[31mred");
+        assert_eq!(box_escape("a\tb\rc\0d".to_string()), "a\\tb\\rc\\0d");
+        assert_eq!(box_escape("\u{7}\u{8}\u{b}\u{c}".to_string()), "\\a\\b\\v\\f");
+        assert_eq!(box_escape("\u{1}\u{1f}".to_string()), "\\1\\31");
+        assert_eq!(box_escape("\u{7f}\u{9b}".to_string()), "\\127\\155");
+        // Printable text, backslashes and wide characters pass through untouched.
+        assert_eq!(box_escape("back\\slash 日本".to_string()), "back\\slash 日本");
+
+        let schema = [field("a\nb", Ty::Varchar)];
+        let mut buf = Vec::new();
+        let mut w = writer(&mut buf, Settings { mode: Mode::Box, ..Settings::default() });
+        w.begin(&schema).unwrap();
+        w.row(&[Value::Bytes(b"x\ny".to_vec())]).unwrap();
+        w.row(&[Value::Bytes(b"\x1b[0m".to_vec())]).unwrap();
+        w.finish().unwrap();
+        let expected = "\
+┌───────┐
+│ a\\nb  │
+├───────┤
+│ x\\ny  │
+│ \\e[0m │
+└───────┘
 ";
         assert_eq!(as_str(&buf), expected);
     }
