@@ -12,7 +12,7 @@ just a name bound to one or more Parquet/CSV/TSV/JSONL/JSON files.
 | Parquet | always on | `.parquet` |
 | CSV / TSV | `csv` | `.csv`, `.tsv` |
 | JSONL / NDJSON | `jsonl` | `.jsonl`, `.ndjson` |
-| JSON (single document: a top-level array or object) | `jsonl` | `.json` |
+| JSON (single document: a top-level array or object; newline-delimited content is detected and read as JSONL) | `jsonl` | `.json` |
 
 Parquet is the primary target and is always available. CSV/TSV and
 JSONL/JSON support are opt-in Cargo features on the core (kept out of the
@@ -104,6 +104,47 @@ wins. `a.csv` (`id,v` / `1,10`) plus a header-only `c.csv` keeps
 mismatch between two Parquet parts is a `TypeMismatch` error, since a
 Parquet schema is a declaration rather than a guess.
 
+### CSV headers
+
+There is no `header=` option; whether the first line is a header is
+detected the way DuckDB's sniffer does it:
+
+- Blank (or all-space) lines before the first record are skipped.
+- The first record is **data** when every non-empty value in it fits the
+  type the rest of the sample infers for its column, and at least one
+  column infers to something other than `VARCHAR`. `1,2\n3,4\n5,6\n` is
+  three rows with generated names `column0`, `column1`; `a,1\nb,2\n` is two
+  rows too (`a` fits `VARCHAR`, `1` fits `BIGINT`).
+- Otherwise it is the **header**: `id,v\n1,2\n` (`id` is not a number),
+  `1.5,2\n3,4\n` (`1.5` is not a `BIGINT`), `x,1\n,2\n` (a column whose
+  sampled values are all empty fits nothing but an empty value), and any
+  file whose columns all infer as `VARCHAR` (`name,city` over text data —
+  there is no evidence either way, so the first line keeps its usual role).
+  An all-empty first record is a header whose names are generated.
+- A file of a single record decides from that record alone: `1,2` is one
+  data row, `a,b` a header-only (zero-row) file.
+
+A header whose names look exactly like the data (every name a number, say)
+is therefore read as a data row, as it is in DuckDB.
+
+### Padding
+
+Spaces around a value do not stop it from being typed: `1, 2` infers
+`BIGINT` for both columns, and the padding is dropped when the value is
+read as a number, date or timestamp (a padding-only cell there is `NULL`,
+like an empty one). A `VARCHAR` column keeps its value byte for byte.
+Spaces or tabs between a closing quote and the delimiter (`1,"x" `), and
+spaces before an opening quote (`1, "x"`), are padding too — both read as
+`1`, `x`, as in DuckDB.
+
+### Quotes in TSV
+
+A TSV file rarely quotes, so a `"` that opens a field but does not close it
+properly (`"hello<TAB>1`) is read as a literal character (`"hello`), as in
+DuckDB, instead of failing. A properly quoted TSV field (`"x<TAB>y"<TAB>1`)
+is still unquoted. CSV keeps the strict reading, where the same input is a
+parse error.
+
 ### Malformed CSV records
 
 The reader never silently discards part of a record:
@@ -112,7 +153,8 @@ The reader never silently discards part of a record:
   DuckDB. Dropping the surplus hid the usual cause — an unquoted delimiter
   inside a value, which shifts every following field.
 - Any byte between a **closing quote** and the next delimiter or line
-  terminator is a parse error too (`"x"junk,1`), again matching DuckDB.
+  terminator is a parse error too (`"x"junk,1`), again matching DuckDB —
+  except padding spaces and tabs (see [Padding](#padding)).
 - A row with **fewer** fields is `NULL`-padded (DuckDB's `null_padding`),
   since nothing the file contains is lost that way.
 - A **blank line** is skipped, except in a one-column file, where it is the
@@ -138,6 +180,22 @@ SELECT a, b FROM t;   -- against a file containing {"a": 1, "b": "hello"}
 -- named "json"
 SELECT sum(json) AS total FROM t;   -- against a file containing [1, 2, 3]
 ```
+
+- A `null` record (a `null` line in JSONL, a `null` element of an array) is
+  a row of `NULL`s and adds no column: `{"a":1}\nnull\n{"a":2}\n` is column
+  `a` with `1`, `NULL`, `2`, as in DuckDB.
+- Column names are matched case-insensitively, so keys that differ only in
+  case (`{"a":1,"A":2}`, or `id` in one record and `ID` in another) get
+  distinct names the way DuckDB gives them: the first spelling is kept and
+  each later one becomes `A_1` (then `_2`, ...). The values still follow
+  their own key.
+- A `.json` file holding one value per line — which is what
+  `COPY ... TO 'x.json'` writes, as DuckDB does — is detected and read as
+  JSONL, split by split. A single document (a top-level array or object) is
+  read as before.
+- Nesting depth is not limited: a deeply nested value reads (as `JSON` or
+  raw-JSON text), and skipping one in a column the query doesn't select
+  costs nothing but the scan.
 
 ## Reading via the CLI
 
@@ -262,6 +320,15 @@ Parquet's nested types (`STRUCT`, `LIST`, `MAP`) don't map onto SQL columns
   -- (works the same way whether keys are strings or numbers):
   SELECT id, m FROM t;   -- m: '[{"key":"a","value":0},{"key":"b","value":0}]'
   ```
+
+  Leaves render as `to_json` does in DuckDB: numbers as numbers, dates,
+  timestamps, UUIDs and `INTERVAL`s as strings (`["02:00:00","1 day"]`),
+  and a `JSON` leaf as the document it holds.
+
+- **A column with the `JSON` logical type is a `JSON` column**, not
+  `VARCHAR`, so the JSON functions apply to it directly and
+  `COPY ... TO 'x.jsonl'` nests its documents (`{"j":{"a":1}}`) rather than
+  quoting them as text.
 
 Once a `LIST`/`MAP` column is in this `JSON` representation, the full
 JSON-path/`list_*`/`map_*`/lambda function surface documented in

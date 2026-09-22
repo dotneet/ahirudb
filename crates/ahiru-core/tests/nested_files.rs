@@ -320,3 +320,33 @@ fn zero_row_row_groups_do_not_break_nested_columns() {
     let rows = run_sql(&mut sess, "SELECT count(*), count(l), count(s) FROM t");
     assert_eq!(rows, vec![vec![Value::I64(30), Value::I64(30), Value::I64(30)]]);
 }
+
+/// INTERVAL leaves inside a LIST (and inside a list-carrying STRUCT) used to be
+/// rendered as the packed 128-bit integer (`[7200000000]` for 2 hours), and a
+/// JSON-typed column was read as VARCHAR, so its document came back as a quoted
+/// string. `tests/data/interval_json.parquet` (see `scripts/gen-testdata.sh`);
+/// duckdb: `SELECT to_json(ivs), to_json(s), j, to_json(js)` gives
+/// `["02:00:00","1 year 1 month 5 days"]`, `{"d":["1 day"]}`, `{"a":1}`,
+/// `[{"b":[2]},null]`.
+#[test]
+fn interval_and_json_leaves_render_as_duckdb_does() {
+    let (schema, cols) = read_all(data("interval_json.parquet"), &[1, 2, 3, 4]);
+    let tys: Vec<Ty> = schema.iter().map(|f| f.ty).collect();
+    assert_eq!(tys, [Ty::Int, Ty::Json, Ty::Json, Ty::Json, Ty::Json]);
+    let got: Vec<String> = cols.iter().map(|c| json_str(&c.value_at(0)).unwrap()).collect();
+    assert_eq!(
+        got,
+        [
+            "[\"02:00:00\",\"1 year 1 month 5 days\"]",
+            "{\"d\":[\"1 day\"]}",
+            "{\"a\":1}",
+            "[{\"b\":[2]},null]",
+        ]
+    );
+
+    // A JSON column is a document, not text, to SQL too.
+    let mut sess = Session::new();
+    sess.register_bytes_as("t", data("interval_json.parquet"), FormatKind::Parquet).unwrap();
+    let rows = run_sql(&mut sess, "SELECT typeof(j), j->>'a' FROM t");
+    assert_eq!(rows, vec![vec![Value::Bytes(b"JSON".to_vec()), Value::Bytes(b"1".to_vec())]]);
+}

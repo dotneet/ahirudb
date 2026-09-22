@@ -283,7 +283,9 @@ Statistics pruning follows the same pattern: the default `may_match`
 fragment are stripped first); an unrecognized extension defaults to Parquet,
 the primary target format. Kinds: `Parquet`, `Csv`, `Tsv`, `Jsonl`, `Json`
 (a single top-level JSON array/object, i.e. `read_json`/`read_json_auto`
-style).
+style; a `.json` file that turns out to hold one value per line -- what
+`COPY ... TO 'x.json'` writes -- is detected from a leading sample and handed
+to the JSONL reader, so it streams split by split like any `.jsonl`).
 
 **Non-Parquet formats are behind Cargo features** (`csv`, `jsonl` — `jsonl`
 also covers the single-document `Json` reader, since it shares most of the
@@ -301,7 +303,7 @@ format list isn't how the budget gets met.
 | Encodings | PLAIN, RLE, RLE_DICTIONARY, PLAIN_DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY |
 | Compression | UNCOMPRESSED, SNAPPY, LZ4_RAW (built in) / ZSTD (built in by default, feature `zstd`) / GZIP (host-delegated, §6) |
 | Physical types | BOOLEAN, INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY, INT96 (timestamp-compatible) |
-| Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, integer width/signedness |
+| Logical types | STRING, JSON (read as `JSON`), DATE, TIME, TIMESTAMP, DECIMAL, UUID, integer width/signedness |
 | Nested types | `STRUCT` is flattened into dotted column names where possible; `LIST`/`MAP` (and any `STRUCT` containing them) are exposed as a `JSON`-typed column, sharing the same JSON-path/`list_*`/`map_*` function surface as the `JSON` type itself |
 | Pruning | ColumnChunk min/max/null-count statistics, PageIndex (ColumnIndex/OffsetIndex), Split Block Bloom Filters — see §17 for coverage details |
 | Encryption | Not supported |

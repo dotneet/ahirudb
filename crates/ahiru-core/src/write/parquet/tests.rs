@@ -220,12 +220,12 @@ fn uuid_round_trips_as_sixteen_raw_bytes() {
 }
 
 #[test]
-fn json_round_trips_as_text() {
-    // The reader maps the JSON logical type to VARCHAR (module doc), so the
-    // bytes survive but the type widens.
+fn json_round_trips_as_json() {
+    // The reader maps the JSON logical type back to JSON, so both the bytes and
+    // the type survive.
     let text = b"{\"a\":[1,2]}".to_vec();
     let (ty, got) = round_trip_one(Ty::Json, Value::Bytes(text.clone()));
-    assert_eq!(ty, Ty::Varchar);
+    assert_eq!(ty, Ty::Json);
     assert_eq!(got, Value::Bytes(text));
 }
 

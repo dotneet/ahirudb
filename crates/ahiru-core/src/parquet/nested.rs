@@ -54,7 +54,8 @@ use crate::vector::{Ty, Value, Vector};
 enum JsonValue {
     Null,
     Bool(bool),
-    /// A valid JSON number token (sign, digits, decimal point, exponent only).
+    /// Written verbatim: a valid JSON number token (sign, digits, decimal point, exponent only),
+    /// or the already-validated text of a `JSON`-typed leaf.
     Num(Vec<u8>),
     /// Raw byte string. Escaped at serialization time.
     Str(Vec<u8>),
@@ -173,6 +174,11 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
         }
         Value::Bytes(b) => match ty {
             Ty::Varchar => JsonValue::Str(b),
+            // A JSON leaf (the Parquet JSON logical type) nests as the document it holds, as in
+            // DuckDB. Text that is not valid JSON falls back to a string, so the assembled value
+            // stays a valid document either way.
+            Ty::Json if crate::json::validate(&b).is_ok() => JsonValue::Num(b),
+            Ty::Json => JsonValue::Str(b),
             Ty::Uuid => {
                 let mut h = Vec::new();
                 if let Ok(raw) = <[u8; 16]>::try_from(b.as_slice()) {
@@ -200,6 +206,14 @@ fn int_like_to_json(ty: Ty, x: i128) -> JsonValue {
         Ty::Date => {
             let mut b = Vec::new();
             funcs::fmt_date(x as i64, &mut b);
+            JsonValue::Str(b)
+        }
+        // INTERVAL has no JSON type, so it becomes its text (`"02:00:00"`, `"1 day"`), as in
+        // `COPY ... TO 'x.json'`. It used to come out as the packed 128-bit integer.
+        Ty::Interval => {
+            let (months, days, micros) = crate::vector::unpack_interval(x);
+            let mut b = Vec::new();
+            crate::vector::fmt_interval(months, days, micros, &mut b);
             JsonValue::Str(b)
         }
         _ => {
