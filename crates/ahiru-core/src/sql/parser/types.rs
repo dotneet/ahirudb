@@ -115,8 +115,14 @@ pub(super) fn int_literal(text: &str, negative: bool, pos: usize) -> Result<Valu
     let limit = if negative { 1u128 << 127 } else { (1u128 << 127) - 1 };
     ensure!(mag <= limit, NumberOverflow, pos);
     let v = if negative { (mag as i128).wrapping_neg() } else { mag as i128 };
-    Ok(if let Ok(x) = i32::try_from(v) {
-        Value::I32(x)
+    // INTEGER is chosen by the unsigned magnitude, as DuckDB does, so
+    // `-2147483648` is BIGINT (its magnitude does not fit INTEGER) and
+    // `-2147483648 - 1` does not wrap around in 32 bits. From BIGINT upwards
+    // DuckDB goes by the signed value: `-9223372036854775808` is BIGINT there
+    // too (`duckdb -c "select typeof(-2147483648), typeof(-9223372036854775808)"`
+    // -> BIGINT, BIGINT).
+    Ok(if mag <= i32::MAX as u128 {
+        Value::I32(v as i32)
     } else if let Ok(x) = i64::try_from(v) {
         Value::I64(x)
     } else {

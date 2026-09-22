@@ -3,7 +3,7 @@
 //! NULL/zero coalescing used when decorrelating correlated `COUNT`
 //! aggregates.
 
-use super::refs::{const_program, default_name, each_child_flat};
+use super::refs::{const_program, default_name, each_child, each_child_flat};
 use super::*;
 
 /// Drops the trailing `k` columns used as correlation keys by the most recent join.
@@ -499,10 +499,10 @@ pub(super) fn check_grouped(
     depth: u32,
 ) -> Result<()> {
     ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
-    if groups.iter().any(|&g| expr_eq(arena, g, id)) {
-        return Ok(());
-    }
-    if aggs.iter().any(|&a| expr_eq(arena, a, id)) {
+    let covered = |e: ExprId| {
+        groups.iter().any(|&g| expr_eq(arena, g, e)) || aggs.iter().any(|&a| expr_eq(arena, a, e))
+    };
+    if covered(id) {
         return Ok(());
     }
     match arena.get(id) {
@@ -526,7 +526,34 @@ pub(super) fn check_grouped(
         _ => {}
     }
     let d = depth + 1;
-    each_child_flat(arena, id, &mut |c| check_grouped(arena, scope, c, groups, aggs, const_subs, d))
+    // A left-deep binary chain is descended in a loop (see `each_child_flat` for why), but
+    // unlike `each_child_flat` every inner node of the spine is matched against the grouping
+    // and aggregate expressions too: in `SELECT a*2 + 1 ... GROUP BY a*2` the grouped
+    // expression `a*2` is exactly such an inner node, and descending past it would reject
+    // the bare `a` underneath.
+    let mut spine: Vec<ExprId> = Vec::new();
+    let mut cur = id;
+    let mut bottom_covered = false;
+    while let Expr::Binary { lhs, rhs, .. } = arena.get(cur) {
+        spine.push(*rhs);
+        cur = *lhs;
+        if covered(cur) {
+            bottom_covered = true;
+            break;
+        }
+    }
+    if spine.is_empty() {
+        return each_child(arena, id, &mut |c| {
+            check_grouped(arena, scope, c, groups, aggs, const_subs, d)
+        });
+    }
+    if !bottom_covered {
+        check_grouped(arena, scope, cur, groups, aggs, const_subs, d)?;
+    }
+    for &r in spine.iter().rev() {
+        check_grouped(arena, scope, r, groups, aggs, const_subs, d)?;
+    }
+    Ok(())
 }
 
 /// Whether any grouping expression is a column reference naming input column `col`.

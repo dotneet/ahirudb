@@ -933,7 +933,10 @@ fn column_refs_and_params() {
 fn integer_literal_widths() {
     assert_eq!(ex("2147483647"), "2147483647i32");
     assert_eq!(ex("2147483648"), "2147483648i64");
-    assert_eq!(ex("-2147483648"), "-2147483648i32");
+    // INTEGER is picked by the unsigned magnitude (duckdb:
+    // `typeof(-2147483648)` -> BIGINT, `typeof(-2147483647)` -> INTEGER).
+    assert_eq!(ex("-2147483648"), "-2147483648i64");
+    assert_eq!(ex("-2147483647"), "-2147483647i32");
     assert_eq!(ex("-2147483649"), "-2147483649i64");
     assert_eq!(ex("9223372036854775807"), "9223372036854775807i64");
     assert_eq!(ex("-9223372036854775808"), "-9223372036854775808i64");
