@@ -127,7 +127,7 @@ fn copy_to_jsonl_writes_non_finite_doubles_and_decimals_readably() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert_eq!(
         text.trim_end(),
-        r#"{"n":"NaN","p":"Infinity","m":"-Infinity","z":null,"d":12.345}"#
+        r#"{"n":"nan","p":"inf","m":"-inf","z":null,"d":12.345}"#
     );
 
     // And the engine reads its own output back without error.

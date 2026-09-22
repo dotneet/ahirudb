@@ -180,6 +180,60 @@ fn copy_jsonl_format_matches_duckdb_byte_for_byte() {
     let _ = std::fs::remove_file(&duckdb_out);
 }
 
+/// Non-finite DOUBLEs in a JSONL export must survive a round trip through DuckDB.
+///
+/// They used to be written as `"Infinity"` / `"-Infinity"`, which DuckDB's JSON reader
+/// sniffs as a DATE column and reads back as `1900-01-01`. The `"inf"` / `"-inf"` /
+/// `"nan"` spelling stays VARCHAR there, and casts back to the original value in both
+/// engines.
+#[test]
+fn copy_jsonl_non_finite_doubles_round_trip_through_duckdb() {
+    skip_without_duckdb!();
+    let out = tmp_path("jsonl_nonfinite", "jsonl");
+    run_ahiru_copy(
+        &["tests/data/basic.csv"],
+        &format!(
+            "COPY (SELECT 'inf'::DOUBLE AS p, '-inf'::DOUBLE AS m, 'nan'::DOUBLE AS n \
+             FROM t LIMIT 1) TO '{}'",
+            out.display()
+        ),
+    );
+    let text = std::fs::read_to_string(&out).expect("no output from ahiru");
+    assert_eq!(text.trim_end(), r#"{"p":"inf","m":"-inf","n":"nan"}"#);
+
+    let src = format!("read_json('{}')", out.display());
+    assert_eq!(
+        duckdb_scalar(&format!(
+            "SELECT typeof(p) || ',' || typeof(m) || ',' || typeof(n) FROM {src}"
+        )),
+        "VARCHAR,VARCHAR,VARCHAR"
+    );
+    assert_eq!(
+        duckdb_scalar(&format!(
+            "SELECT p::DOUBLE = 'inf'::DOUBLE AND m::DOUBLE = '-inf'::DOUBLE \
+             AND isnan(n::DOUBLE) FROM {src}"
+        )),
+        "true"
+    );
+
+    let ahiru = Command::new(env!("CARGO_BIN_EXE_ahiru"))
+        .args([
+            "-csv",
+            "-noheader",
+            "-c",
+            &format!(
+                "SELECT p::DOUBLE = 'inf'::DOUBLE AND m::DOUBLE = '-inf'::DOUBLE \
+                 AND isnan(n::DOUBLE) FROM '{}'",
+                out.display()
+            ),
+        ])
+        .output()
+        .expect("failed to run ahiru");
+    assert!(ahiru.status.success(), "{}", String::from_utf8_lossy(&ahiru.stderr));
+    assert_eq!(String::from_utf8_lossy(&ahiru.stdout).lines().next(), Some("true"));
+    let _ = std::fs::remove_file(&out);
+}
+
 /// Confirms that `COPY <table> TO ...` (a plain table name rather than a subquery)
 /// produces the same result as `SELECT * FROM <table>`, cross-checked against a
 /// DuckDB side written with an explicit `SELECT *`.

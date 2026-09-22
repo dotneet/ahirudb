@@ -251,10 +251,14 @@ worth knowing about:
 - A **`DECIMAL`** is written as a JSON *number* (`{"d":1.25}`), not as a
   quoted string. It reads back as `DOUBLE`, here and in DuckDB.
 - A **non-finite `DOUBLE`** is written as one of the quoted strings
-  `"NaN"`, `"Infinity"`, `"-Infinity"`. JSON has no literal for these, and
-  a bare `NaN` token would make the file unparseable by any strict reader.
-  The cost is that such a column reads back as `VARCHAR` rather than
-  `DOUBLE` — again in both engines, so the file round-trips through either.
+  `"nan"`, `"inf"`, `"-inf"` (the `CAST(x AS VARCHAR)` spelling). JSON has
+  no literal for these, and a bare `NaN` token would make the file
+  unparseable by any strict reader. The cost is that such a column reads
+  back as `VARCHAR` rather than `DOUBLE` — again in both engines, and
+  `CAST(... AS DOUBLE)` restores the value in either. The longhand
+  `"Infinity"` written by earlier versions is sniffed as a `DATE` by
+  DuckDB's JSON reader (it comes back as `1900-01-01`); this engine still
+  reads such files correctly.
 
 A **`FLOAT`** is written at `FLOAT` precision in both formats — `1.1`, not
 the `1.100000023841858` that spelling out the widened `DOUBLE` would give
@@ -274,7 +278,7 @@ as `DOUBLE`.
 ```sql
 COPY (SELECT CAST('1.25' AS DECIMAL(5,2)) AS d, 'nan'::DOUBLE AS n FROM range(1))
   TO 'out.jsonl';
--- {"d":1.25,"n":"NaN"}
+-- {"d":1.25,"n":"nan"}
 ```
 
 **Limitation:** `COPY`/CTAS/`INSERT ... SELECT` are non-resumable — if

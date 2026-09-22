@@ -439,7 +439,7 @@ mod tests {
     fn non_finite_values_render_as_nan_and_infinity() {
         // CSV's own share of `push_f64`: non-finite handling is the one
         // thing that is not shared with the JSONL writer (JSON has no
-        // NaN/Infinity literal, so `write/jsonl.rs` writes `null` instead --
+        // NaN/Infinity literal, so `write/jsonl.rs` quotes them instead --
         // see that file's equivalent test). Everything else -- shortest
         // round-trip digit generation, exact-tie regression cases, and the
         // std-Display property test -- is covered once, for both writers,
