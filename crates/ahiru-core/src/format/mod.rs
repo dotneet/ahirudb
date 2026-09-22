@@ -424,6 +424,33 @@ pub(crate) fn scan_tz_suffix(s: &[u8]) -> Option<(i64, usize)> {
     }
 }
 
+/// Column names for a JSON/JSONL table from its object keys, made unique ignoring ASCII case.
+///
+/// Column references are case-insensitive, so `{"a":1,"A":2}` used to give two columns that no
+/// query could tell apart (`a` was ambiguous either way). DuckDB keeps the first spelling and
+/// renames each later one `<key>_1` (then `_2`, ...), and so does this. The keys themselves are
+/// unchanged -- the readers still match object members against them exactly.
+#[cfg(feature = "jsonl")]
+pub(crate) fn unique_json_names(keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(keys.len());
+    for k in keys {
+        let taken = |s: &str| out.iter().any(|p| eq_ascii_ci(p.as_bytes(), s.as_bytes()));
+        let mut name = k.clone();
+        let mut n: u128 = 0;
+        // Each attempt uses a larger suffix and at most `keys.len()` names are taken, so this
+        // terminates.
+        while taken(&name) {
+            n += 1;
+            let mut b = Vec::from(k.as_bytes());
+            b.push(b'_');
+            crate::expr::kernels::fmt_int(n, false, 0, &mut b);
+            name = String::from_utf8(b).unwrap_or_default();
+        }
+        out.push(name);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

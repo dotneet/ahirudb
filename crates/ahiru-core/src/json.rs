@@ -13,7 +13,7 @@
 //! extracts one particular subtree". Only the **tokenizer itself** below those
 //! higher-level iterators -- skipping whitespace, strings, numbers, scalars, and any
 //! single value, plus escape expansion -- is entirely common to both. So only the
-//! tokenizer lives here, and `format::jsonl` `use`s it (the NDJSON-specific parts --
+//! tokenizer lives here, and `format::jsonl`/`format::json` `use` it (the NDJSON-specific parts --
 //! `Members`/`Member`, the type lattice for schema inference, the date parser, and so
 //! on -- stay in `format::jsonl` as they were).
 //!
@@ -47,10 +47,6 @@
 //!   (the caller, `expr::kernels::compare`, merely compares bytes).
 
 use crate::prelude::*;
-
-/// The nesting limit for values. Same value and same reason as `format::jsonl`
-/// (the kinds of open containers fit in a `u32` bit stack).
-pub(crate) const MAX_DEPTH: u32 = 32;
 
 /// The kind of a JSON value.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,31 +183,62 @@ pub(crate) fn skip_member_key(b: &[u8], i: usize) -> Result<usize> {
     Ok(ni + 1)
 }
 
+/// The kinds (object or array) of the containers open while skipping a value, as a bit stack.
+///
+/// The innermost 64 levels live in one word; deeper ones spill to the heap a word at a time, so
+/// depth is bounded only by the input's length (one bit per level, far less than the bytes that
+/// spell it). Nothing that walks JSON text in this crate recurses, so there is no stack to
+/// protect -- a fixed cap used to reject a deeply nested value even in a column the query never
+/// selected (the reader still has to skip past it).
+struct Kinds {
+    /// Bit 1 = object, 0 = array. The lowest bit is the current container.
+    top: u64,
+    spill: Vec<u64>,
+    depth: usize,
+}
+
+impl Kinds {
+    fn push(&mut self, obj: bool) {
+        if self.depth > 0 && self.depth.is_multiple_of(64) {
+            self.spill.push(self.top);
+            self.top = 0;
+        }
+        self.top = (self.top << 1) | obj as u64;
+        self.depth += 1;
+    }
+
+    fn pop(&mut self) {
+        self.top >>= 1;
+        self.depth -= 1;
+        if self.depth > 0 && self.depth.is_multiple_of(64) {
+            self.top = self.spill.pop().unwrap_or(0);
+        }
+    }
+
+    fn in_object(&self) -> bool {
+        self.top & 1 == 1
+    }
+}
+
 /// Skips one value starting at `b[i]` and returns the position just after it.
 ///
-/// Non-recursive. The kinds of open containers live in a `u32` bit stack, and depth
-/// is capped by `MAX_DEPTH` (kept equal to the bit width of `u32`).
+/// Non-recursive, and not depth-limited (see `Kinds`).
 pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
     let mut i = start;
-    // Bit 1 = object, 0 = array. The lowest bit is the current container.
-    let mut stack: u32 = 0;
-    let mut depth: u32 = 0;
+    let mut stack = Kinds { top: 0, spill: Vec::new(), depth: 0 };
 
     'value: loop {
         i = skip_ws(b, i);
         let c = byte_at(b, i)?;
         if c == b'{' || c == b'[' {
             let obj = c == b'{';
-            ensure!(depth < MAX_DEPTH, NestingTooDeep, i);
-            stack = (stack << 1) | obj as u32;
-            depth += 1;
+            stack.push(obj);
             i = skip_ws(b, i + 1);
             let n = byte_at(b, i)?;
             if (obj && n == b'}') || (!obj && n == b']') {
                 // An empty container. Falls through to the closing logic below as though one value had been consumed.
                 i += 1;
-                stack >>= 1;
-                depth -= 1;
+                stack.pop();
             } else {
                 if obj {
                     i = skip_member_key(b, i)?;
@@ -224,12 +251,12 @@ pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
 
         // One value consumed. Handle the separator or closing bracket.
         loop {
-            if depth == 0 {
+            if stack.depth == 0 {
                 return Ok(i);
             }
             i = skip_ws(b, i);
             let c = byte_at(b, i)?;
-            let obj = stack & 1 == 1;
+            let obj = stack.in_object();
             match c {
                 b',' => {
                     i += 1;
@@ -240,13 +267,11 @@ pub(crate) fn skip_value(b: &[u8], start: usize) -> Result<usize> {
                 }
                 b'}' if obj => {
                     i += 1;
-                    stack >>= 1;
-                    depth -= 1;
+                    stack.pop();
                 }
                 b']' if !obj => {
                     i += 1;
-                    stack >>= 1;
-                    depth -= 1;
+                    stack.pop();
                 }
                 _ => err!(SyntaxError, i),
             }
@@ -1070,23 +1095,38 @@ mod tests {
     // --- Boundary values and corrupt input --------------------------------------
 
     #[test]
-    fn nesting_exactly_at_max_depth_succeeds_one_more_fails() {
-        // `skip_value` is non-recursive (a `u32` bit stack), so deep nesting cannot
-        // overflow the stack, but MAX_DEPTH (32) itself should still act as an
-        // explicit limit.
-        let mut at_limit = vec![b'['; MAX_DEPTH as usize];
-        at_limit.extend(vec![b']'; MAX_DEPTH as usize]);
-        assert!(whole(&at_limit).is_ok(), "exactly MAX_DEPTH passes");
+    fn nesting_depth_is_not_limited() {
+        // `skip_value` is non-recursive and its container-kind stack spills to the heap, so any
+        // depth passes -- including across the 64-level word boundaries of that stack, where a
+        // wrong spill/restore would misread which kind of container is open.
+        for depth in [1usize, 32, 33, 63, 64, 65, 127, 128, 129, 10_000] {
+            let mut arr = vec![b'['; depth];
+            arr.extend(vec![b']'; depth]);
+            assert!(whole(&arr).is_ok(), "arrays nested {depth} deep");
 
-        let mut over_limit = vec![b'['; MAX_DEPTH as usize + 1];
-        over_limit.extend(vec![b']'; MAX_DEPTH as usize + 1]);
-        assert_eq!(code_of(whole(&over_limit)), Some(Code::NestingTooDeep));
+            // Alternate objects and arrays, so each level's kind matters on the way out.
+            let mut mixed = Vec::new();
+            for d in 0..depth {
+                mixed.extend_from_slice(if d % 2 == 0 { b"{\"k\":" } else { b"[" });
+            }
+            mixed.push(b'1');
+            for d in (0..depth).rev() {
+                mixed.push(if d % 2 == 0 { b'}' } else { b']' });
+            }
+            assert!(whole(&mixed).is_ok(), "mixed nesting {depth} deep");
+
+            // A mismatched closer at the innermost level is still caught at every depth.
+            let mut bad = mixed.clone();
+            let at = bad.iter().position(|&c| c == b'}' || c == b']').unwrap();
+            bad[at] = if bad[at] == b'}' { b']' } else { b'}' };
+            assert_eq!(code_of(whole(&bad)), Some(Code::SyntaxError), "depth {depth}");
+        }
     }
 
     #[test]
     fn very_deeply_nested_input_errors_without_panicking_or_hanging() {
-        // Confirm that input many times deeper than MAX_DEPTH does not panic (the
-        // implementation is non-recursive) and ends in a plain SyntaxError/NestingTooDeep.
+        // Unclosed input many levels deep does not panic (the implementation is non-recursive)
+        // and ends in a plain error.
         let deep: Vec<u8> = vec![b'['; 10_000];
         assert!(whole(&deep).is_err());
     }

@@ -66,12 +66,19 @@
 //! - A column that was all NULL in the sample becomes the safe `Ty::Varchar`, as in
 //!   `format::jsonl` (`duckdb` makes it `JSON`, but consistency with `jsonl` won out).
 //!
-//! The low-level JSON scanner (scanning strings and numbers, decoding escapes, detecting
-//! dates/timestamps) follows the same idea as `format::jsonl`'s implementation, but `jsonl`'s types
-//! are private and cannot be reused from this module, and changing `jsonl.rs` itself is outside
-//! this task's scope (its existing implementation is optimized for the split-boundary I/O barrier
-//! and is left alone), so this is written up as an independent implementation. The structure is
-//! kept as close as possible, so unifying them into one later should be feasible.
+//! The low-level tokenizer (skipping values, scanning strings, decoding escapes, reading numbers)
+//! is `crate::json`'s, shared with `format::jsonl` and the JSON functions. The object/array
+//! iterators, the inference lattice and the date parser follow `format::jsonl`'s but are kept
+//! separate, since `jsonl`'s are private and tuned to its line-at-a-time reading.
+//!
+//! ## Newline-delimited `.json`
+//!
+//! `COPY ... TO 'x.json'` writes one object per line (as DuckDB does), and many other tools write
+//! `.json` files the same way. Such a file is not one JSON document, so reading it back used to
+//! fail with a syntax error. DuckDB auto-detects the layout, and so does this: when the first
+//! top-level value is followed, after a line break, by another value, the file is read by
+//! `format::jsonl` instead (see `JsonFormat::ndjson`) -- which also brings back streaming,
+//! split-by-split reading and lifts the `MAX_JSON_BYTES` cap for it.
 //!
 //! ## The input is untrusted
 //!
@@ -81,10 +88,12 @@
 //! `format::csv`, `format::jsonl` and DuckDB all report for the same input. A *key* beyond the
 //! sample is not dropped either: the whole document is resident, so every element contributes its
 //! keys and the column set is complete no matter where a key first appears.
-//! Scanning does not recurse, and nesting is cut off at `MAX_DEPTH`.
+//! Scanning does not recurse, so nesting depth is not limited (see `crate::json::skip_value`).
 
 use crate::catalog::Source;
+use crate::format::jsonl::JsonlFormat;
 use crate::format::{get_or_internal, ResolveStep, TableFormat};
+use crate::json::{byte_at, decode_string, parse_f64, parse_i64, scan_string, skip_value, skip_ws};
 use crate::prelude::*;
 use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
@@ -94,9 +103,6 @@ use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 /// they still contribute their **keys**, so the column set is always complete. What they do not do
 /// is widen the type of a column the sample already settled on.
 pub const SAMPLE_ELEMENTS: usize = 1000;
-
-/// The nesting limit for values. The same reason and the same value as `format::jsonl::MAX_DEPTH`.
-const MAX_DEPTH: u32 = 32;
 
 /// The cap on the number of columns inference creates. The same as `format::jsonl::MAX_COLUMNS`.
 const MAX_COLUMNS: usize = 1024;
@@ -121,6 +127,12 @@ pub struct JsonFormat {
     /// Per column: the sample held only `null` for it, so its `Ty::Varchar` is a default rather
     /// than a reading of the data. See `TableFormat::column_has_no_evidence`.
     no_evidence: Vec<bool>,
+    /// Per column: the object key it holds (see `format::unique_json_names` for why a column's
+    /// name can differ from its key).
+    keys: Vec<String>,
+    /// Set in `resolve` when the file turns out to be newline-delimited (see the module docs);
+    /// every method then forwards to it.
+    ndjson: Option<JsonlFormat>,
 }
 
 impl JsonFormat {
@@ -132,8 +144,29 @@ impl JsonFormat {
             row_count: 0,
             raw_json: false,
             no_evidence: Vec::new(),
+            keys: Vec::new(),
+            ndjson: None,
         }
     }
+
+    /// Switches this file over to the JSONL reader and resolves it there.
+    fn resolve_as_ndjson(&mut self, src: &Source) -> Result<ResolveStep> {
+        let j = self.ndjson.insert(JsonlFormat::new());
+        j.resolve(src)
+    }
+}
+
+/// Whether `b` (a prefix of the file, or all of it) starts like newline-delimited JSON: its first
+/// top-level value is complete and followed, after a line break, by more content.
+///
+/// A single document never has anything but whitespace after its top-level value, so this cannot
+/// misfire on one. A first value that does not end within `b` gives `false`; `resolve` asks again
+/// once the whole file is in hand.
+fn looks_like_ndjson(b: &[u8]) -> bool {
+    let i = skip_ws(b, skip_bom(b));
+    let Ok(end) = skip_value(b, i) else { return false };
+    let next = skip_ws(b, end);
+    next < b.len() && b[end..next].contains(&b'\n')
 }
 
 impl Default for JsonFormat {
@@ -144,20 +177,39 @@ impl Default for JsonFormat {
 
 impl TableFormat for JsonFormat {
     fn resolve(&mut self, src: &Source) -> Result<ResolveStep> {
+        if let Some(j) = &mut self.ndjson {
+            return j.resolve(src);
+        }
         if self.resolved {
             return Ok(Ok(()));
         }
-        ensure!(src.total_len <= MAX_JSON_BYTES, Oom);
         // An empty file has no top-level value and so is invalid as JSON to begin with
         // (unlike JSONL, this premises reading "one JSON document").
         ensure!(src.total_len > 0, UnexpectedEof);
+        // A leading sample first, to tell a newline-delimited file (read by `format::jsonl`,
+        // split by split) from a single document (which needs the whole file) before committing
+        // to fetching all of it.
+        let n = src.total_len.min(crate::format::jsonl::SAMPLE_BYTES);
+        let head = match src.get(0, n as usize) {
+            Some(b) => b,
+            None => return Ok(Err((0, n))),
+        };
+        if looks_like_ndjson(head) {
+            return self.resolve_as_ndjson(src);
+        }
+        ensure!(src.total_len <= MAX_JSON_BYTES, Oom);
         self.total_len = src.total_len;
         let buf = match src.get(0, src.total_len as usize) {
             Some(b) => b,
             // It requests "the whole file" rather than a split boundary barrier (see the module docs).
             None => return Ok(Err((0, src.total_len))),
         };
-        let (schema, row_count, raw_json, no_evidence) = parse_schema(buf)?;
+        // A first record longer than the sample is only seen whole now.
+        if n < src.total_len && looks_like_ndjson(buf) {
+            return self.resolve_as_ndjson(src);
+        }
+        let (keys, schema, row_count, raw_json, no_evidence) = parse_schema(buf)?;
+        self.keys = keys;
         self.schema = schema;
         self.row_count = row_count;
         self.raw_json = raw_json;
@@ -167,14 +219,23 @@ impl TableFormat for JsonFormat {
     }
 
     fn is_resolved(&self) -> bool {
-        self.resolved
+        match &self.ndjson {
+            Some(j) => j.is_resolved(),
+            None => self.resolved,
+        }
     }
 
     fn schema(&self) -> &[Field] {
-        &self.schema
+        match &self.ndjson {
+            Some(j) => j.schema(),
+            None => &self.schema,
+        }
     }
 
     fn num_splits(&self) -> usize {
+        if let Some(j) = &self.ndjson {
+            return j.num_splits();
+        }
         // The non-streaming design: the split is always the whole file, exactly one (see the module docs).
         if self.resolved {
             1
@@ -184,6 +245,9 @@ impl TableFormat for JsonFormat {
     }
 
     fn split_rows(&self, split: usize) -> Option<u64> {
+        if let Some(j) = &self.ndjson {
+            return j.split_rows(split);
+        }
         if split == 0 {
             Some(self.row_count)
         } else {
@@ -194,9 +258,12 @@ impl TableFormat for JsonFormat {
     fn split_ranges(
         &self,
         split: usize,
-        _projection: &[usize],
+        projection: &[usize],
         out: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
+        if let Some(j) = &self.ndjson {
+            return j.split_ranges(split, projection, out);
+        }
         ensure!(split < self.num_splits(), Internal);
         // The structure is not settled, so the whole file is always needed even with a projection.
         out.push((0, self.total_len));
@@ -204,6 +271,9 @@ impl TableFormat for JsonFormat {
     }
 
     fn read_split(&self, src: &Source, split: usize, projection: &[usize]) -> Result<Vec<Vector>> {
+        if let Some(j) = &self.ndjson {
+            return j.read_split(src, split, projection);
+        }
         ensure!(self.resolved, Internal);
         ensure!(split < self.num_splits(), Internal);
         let buf = get_or_internal(src, 0, self.total_len)?;
@@ -211,11 +281,8 @@ impl TableFormat for JsonFormat {
         let mut names: Vec<&[u8]> = Vec::with_capacity(projection.len());
         let mut builders: Vec<Builder> = Vec::with_capacity(projection.len());
         for &c in projection {
-            let f = match self.schema.get(c) {
-                Some(f) => f,
-                None => err!(Internal),
-            };
-            names.push(f.name.as_bytes());
+            let (Some(f), Some(k)) = (self.schema.get(c), self.keys.get(c)) else { err!(Internal) };
+            names.push(k.as_bytes());
             builders.push(Builder::new(f.ty, 64));
         }
 
@@ -262,17 +329,23 @@ impl TableFormat for JsonFormat {
     }
 
     fn column_has_no_evidence(&self, col: usize) -> bool {
+        if let Some(j) = &self.ndjson {
+            return j.column_has_no_evidence(col);
+        }
         self.no_evidence.get(col).copied().unwrap_or(false)
     }
 }
 
 // --- Schema inference ----------------------------------------------------------
 
-/// Resolves all of `buf` as one JSON document and returns
-/// `(schema, row count, raw-JSON mode, per-column "no evidence" flags)`.
+/// What `parse_schema` settles:
+/// `(per-column object keys, schema, row count, raw-JSON mode, per-column "no evidence" flags)`.
+type Resolved = (Vec<String>, Vec<Field>, u64, bool, Vec<bool>);
+
+/// Resolves all of `buf` as one JSON document.
 /// The row count is exact even beyond `SAMPLE_ELEMENTS` (every element is walked for the syntax
 /// check anyway, so there is no extra cost). Only the widen computation is limited to the sample.
-fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64, bool, Vec<bool>)> {
+fn parse_schema(buf: &[u8]) -> Result<Resolved> {
     let i = skip_ws(buf, skip_bom(buf));
     let c = byte_at(buf, i)?;
 
@@ -317,8 +390,9 @@ fn parse_schema(buf: &[u8]) -> Result<(Vec<Field>, u64, bool, Vec<bool>)> {
     }
 
     let no_evidence = infs.iter().map(|i| *i == Inf::Null).collect();
-    let schema = names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect();
-    Ok((schema, row_count, raw_json, no_evidence))
+    let cols = crate::format::unique_json_names(&names);
+    let schema = cols.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect();
+    Ok((names, schema, row_count, raw_json, no_evidence))
 }
 
 /// Folds one row's worth (one array element, or a single top-level value) into the column set.
@@ -337,6 +411,10 @@ fn accumulate_row(
             let name = member_key(&m, key)?;
             merge(names, infs, name, infer(&m), frozen)?;
         }
+    } else if c == b'n' {
+        // A `null` element is a row of NULLs, as in DuckDB (`[null, {"a":1}]` is `a`: NULL, 1),
+        // so it contributes no column. It used to add a phantom `json` column holding only NULL.
+        // `process_row` gives it NULL in every column.
     } else {
         // A non-object row puts the raw value into a single `"json"` column
         // (see the module docs).
@@ -636,7 +714,8 @@ fn push_member(b: &mut Builder, m: Option<&Member<'_>>, scratch: &mut Vec<u8>) -
 
 // --- JSON scanning --------------------------------------------------------------
 //
-// An independent implementation following the same idea as `format::jsonl`'s private scanner (see the module docs).
+// The iterators over one object's members and one array's elements. The tokenizer underneath
+// them is `crate::json`'s (see the module docs).
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -788,267 +867,7 @@ fn member_key<'k>(m: &Member<'k>, scratch: &'k mut Vec<u8>) -> Result<&'k [u8]> 
     Ok(scratch)
 }
 
-/// Skips one value starting at `b[i]` and returns the position just after it.
-///
-/// Non-recursive. The kinds of open containers live in a `u32` bit stack, and depth is capped by
-/// `MAX_DEPTH` (kept equal to the bit width of `u32`).
-fn skip_value(b: &[u8], start: usize) -> Result<usize> {
-    let mut i = start;
-    // Bit 1 = object, 0 = array. The lowest bit is the current container.
-    let mut stack: u32 = 0;
-    let mut depth: u32 = 0;
-
-    'value: loop {
-        i = skip_ws(b, i);
-        let c = byte_at(b, i)?;
-        if c == b'{' || c == b'[' {
-            let obj = c == b'{';
-            ensure!(depth < MAX_DEPTH, NestingTooDeep, i);
-            stack = (stack << 1) | obj as u32;
-            depth += 1;
-            i = skip_ws(b, i + 1);
-            let n = byte_at(b, i)?;
-            if (obj && n == b'}') || (!obj && n == b']') {
-                // An empty container. Falls through to the closing logic below as though one value had been consumed.
-                i += 1;
-                stack >>= 1;
-                depth -= 1;
-            } else {
-                if obj {
-                    i = skip_member_key(b, i)?;
-                }
-                continue 'value;
-            }
-        } else {
-            i = skip_scalar(b, i)?;
-        }
-
-        // One value consumed. Handle the separator or closing bracket.
-        loop {
-            if depth == 0 {
-                return Ok(i);
-            }
-            i = skip_ws(b, i);
-            let c = byte_at(b, i)?;
-            let obj = stack & 1 == 1;
-            match c {
-                b',' => {
-                    i += 1;
-                    if obj {
-                        i = skip_member_key(b, skip_ws(b, i))?;
-                    }
-                    continue 'value;
-                }
-                b'}' if obj => {
-                    i += 1;
-                    stack >>= 1;
-                    depth -= 1;
-                }
-                b']' if !obj => {
-                    i += 1;
-                    stack >>= 1;
-                    depth -= 1;
-                }
-                _ => err!(SyntaxError, i),
-            }
-        }
-    }
-}
-
-/// Skips `"key" :` and returns the position where the value starts.
-fn skip_member_key(b: &[u8], i: usize) -> Result<usize> {
-    let i = skip_ws(b, i);
-    ensure!(byte_at(b, i)? == b'"', SyntaxError, i);
-    let (_, _, ni) = scan_string(b, i)?;
-    let ni = skip_ws(b, ni);
-    ensure!(byte_at(b, ni)? == b':', SyntaxError, ni);
-    Ok(ni + 1)
-}
-
-fn skip_scalar(b: &[u8], i: usize) -> Result<usize> {
-    match byte_at(b, i)? {
-        b'"' => Ok(scan_string(b, i)?.2),
-        b't' => skip_lit(b, i, b"true"),
-        b'f' => skip_lit(b, i, b"false"),
-        b'n' => skip_lit(b, i, b"null"),
-        _ => scan_number(b, i),
-    }
-}
-
-fn skip_lit(b: &[u8], i: usize, w: &[u8]) -> Result<usize> {
-    let e = i + w.len();
-    ensure!(b.len() >= e, UnexpectedEof, i);
-    ensure!(&b[i..e] == w, SyntaxError, i);
-    Ok(e)
-}
-
-fn scan_number(b: &[u8], start: usize) -> Result<usize> {
-    let mut i = start;
-    if b.get(i) == Some(&b'-') {
-        i += 1;
-    }
-    let d0 = i;
-    if b.get(i) == Some(&b'0') {
-        i += 1;
-        ensure!(!matches!(b.get(i), Some(c) if c.is_ascii_digit()), SyntaxError, i);
-    } else {
-        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
-            i += 1;
-        }
-    }
-    ensure!(i > d0, SyntaxError, start);
-    if b.get(i) == Some(&b'.') {
-        i += 1;
-        let f0 = i;
-        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
-            i += 1;
-        }
-        ensure!(i > f0, SyntaxError, start);
-    }
-    if matches!(b.get(i), Some(b'e') | Some(b'E')) {
-        i += 1;
-        if matches!(b.get(i), Some(b'+') | Some(b'-')) {
-            i += 1;
-        }
-        let e0 = i;
-        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
-            i += 1;
-        }
-        ensure!(i > e0, SyntaxError, start);
-    }
-    Ok(i)
-}
-
-/// `b[i]` is `"`. Returns `(body, whether escaped, the position after the closing quote)`.
-fn scan_string(b: &[u8], i: usize) -> Result<(&[u8], bool, usize)> {
-    let mut j = i + 1;
-    let mut esc = false;
-    loop {
-        match byte_at(b, j)? {
-            b'"' => {
-                ensure!(core::str::from_utf8(&b[i + 1..j]).is_ok(), SyntaxError, i);
-                return Ok((&b[i + 1..j], esc, j + 1));
-            }
-            b'\\' => {
-                // Validate escapes here because callers may only skip the string without
-                // decoding it. Otherwise invalid JSON such as `"\\q"` is accepted.
-                match byte_at(b, j + 1)? {
-                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => j += 2,
-                    b'u' => {
-                        hex4(b, j + 2)?;
-                        j += 6;
-                    }
-                    _ => err!(SyntaxError, j + 1),
-                }
-                esc = true;
-            }
-            0x00..=0x1f => err!(SyntaxError, j),
-            _ => j += 1,
-        }
-    }
-}
-
-/// Expands the escapes in a string body and writes it to `out` as UTF-8.
-fn decode_string(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
-    let mut i = 0;
-    while i < body.len() {
-        let c = body[i];
-        if c != b'\\' {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let e = byte_at(body, i)?;
-        i += 1;
-        match e {
-            b'"' => out.push(b'"'),
-            b'\\' => out.push(b'\\'),
-            b'/' => out.push(b'/'),
-            b'b' => out.push(0x08),
-            b'f' => out.push(0x0c),
-            b'n' => out.push(b'\n'),
-            b'r' => out.push(b'\r'),
-            b't' => out.push(b'\t'),
-            b'u' => {
-                let hi = hex4(body, i)?;
-                i += 4;
-                let cp = if (0xD800..0xDC00).contains(&hi) {
-                    // A high surrogate. Combine if a low surrogate follows immediately.
-                    match (body.get(i), body.get(i + 1)) {
-                        (Some(b'\\'), Some(b'u')) => match hex4(body, i + 2) {
-                            Ok(lo) if (0xDC00..0xE000).contains(&lo) => {
-                                i += 6;
-                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                            }
-                            // An unpaired high surrogate is collapsed to U+FFFD rather than made an
-                            // error (losing a whole row to broken input is worse).
-                            _ => 0xFFFD,
-                        },
-                        _ => 0xFFFD,
-                    }
-                } else if (0xDC00..0xE000).contains(&hi) {
-                    // A lone low surrogate.
-                    0xFFFD
-                } else {
-                    hi
-                };
-                let ch = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-            }
-            _ => err!(SyntaxError, i),
-        }
-    }
-    Ok(())
-}
-
-fn hex4(b: &[u8], i: usize) -> Result<u32> {
-    let mut v = 0u32;
-    for k in 0..4 {
-        let c = byte_at(b, i + k)?;
-        let d = match c {
-            b'0'..=b'9' => (c - b'0') as u32,
-            b'a'..=b'f' => (c - b'a' + 10) as u32,
-            b'A'..=b'F' => (c - b'A' + 10) as u32,
-            _ => err!(SyntaxError, i + k),
-        };
-        v = (v << 4) | d;
-    }
-    Ok(v)
-}
-
 // --- Numbers and date-times -----------------------------------------------------
-
-/// An integer literal as i64. `None` when it has a decimal point or exponent, or is out of range.
-fn parse_i64(s: &[u8]) -> Option<i64> {
-    let (neg, ds) = match s.first() {
-        Some(b'-') => (true, &s[1..]),
-        _ => (false, s),
-    };
-    if ds.is_empty() {
-        return None;
-    }
-    // Accumulated on the negative side. That avoids special-casing i64::MIN.
-    let mut acc: i64 = 0;
-    for &c in ds {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i64)?;
-    }
-    if neg {
-        Some(acc)
-    } else {
-        acc.checked_neg()
-    }
-}
-
-/// Floating point is left to core's `str::parse::<f64>` (dec2flt).
-/// It is smaller than writing one in-house and rounds correctly.
-fn parse_f64(s: &[u8]) -> Option<f64> {
-    core::str::from_utf8(s).ok()?.parse::<f64>().ok()
-}
 
 /// Reads the leading `n` bytes as a decimal number. `None` if anything but digits is mixed in.
 fn digits(s: &[u8], n: usize) -> Option<u32> {
@@ -1161,20 +980,6 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
 }
 
 // --- Byte-sequence utilities ------------------------------------------------------
-
-fn byte_at(b: &[u8], i: usize) -> Result<u8> {
-    match b.get(i) {
-        Some(&c) => Ok(c),
-        None => err!(UnexpectedEof, i),
-    }
-}
-
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
-    while matches!(b.get(i), Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')) {
-        i += 1;
-    }
-    i
-}
 
 /// Skips a UTF-8 BOM if present.
 fn skip_bom(b: &[u8]) -> usize {
@@ -1624,24 +1429,50 @@ mod tests {
 
     #[test]
     fn resolve_requests_the_whole_file_when_bytes_are_missing() {
-        let mut f = JsonFormat::new();
-        let src = Source::remote(1_000_000);
-        match f.resolve(&src).unwrap() {
-            Err((off, len)) => {
-                assert_eq!(off, 0);
-                assert_eq!(len, 1_000_000);
-            }
-            Ok(()) => panic!("it cannot possibly resolve with no bytes"),
+        // A leading sample first (to tell NDJSON from a single document), then -- for a single
+        // document -- the whole file.
+        let mut doc = b"[".to_vec();
+        while doc.len() < 1_000_000 {
+            doc.extend_from_slice(b"{\"a\":1},");
         }
+        doc.extend_from_slice(b"{\"a\":1}]");
+        let mut f = JsonFormat::new();
+        let mut src = Source::remote(doc.len() as u64);
+        let sample = crate::format::jsonl::SAMPLE_BYTES;
+        assert_eq!(f.resolve(&src).unwrap(), Err((0, sample)));
+        src.insert(0, doc[..sample as usize].to_vec());
+        assert_eq!(f.resolve(&src).unwrap(), Err((0, doc.len() as u64)));
         assert!(!f.is_resolved());
         assert_eq!(f.num_splits(), 0);
+        src.insert(0, doc.clone());
+        assert_eq!(f.resolve(&src).unwrap(), Ok(()));
+        assert_eq!(f.num_splits(), 1);
     }
 
     #[test]
-    fn oversized_file_is_rejected_before_reading_any_bytes() {
+    fn oversized_file_is_rejected_before_reading_it_whole() {
         let mut f = JsonFormat::new();
-        let src = Source::remote(MAX_JSON_BYTES + 1);
+        let mut src = Source::remote(MAX_JSON_BYTES + 1);
+        let sample = crate::format::jsonl::SAMPLE_BYTES;
+        assert_eq!(f.resolve(&src).unwrap(), Err((0, sample)));
+        // The sample shows a single document (its first value does not even end within it), which
+        // would have to be held whole.
+        src.insert(0, vec![b'['; sample as usize]);
         assert_eq!(code_of(f.resolve(&src)), Some(Code::Oom));
+    }
+
+    #[test]
+    fn oversized_ndjson_file_is_read_split_by_split() {
+        // The whole-file cap does not apply once the file is known to be newline-delimited: it is
+        // streamed like any `.jsonl`.
+        let mut f = JsonFormat::new();
+        let mut src = Source::remote(MAX_JSON_BYTES + 1);
+        let sample = crate::format::jsonl::SAMPLE_BYTES as usize;
+        let mut head = b"{\"a\":1}\n".repeat(sample / 8 + 1);
+        head.truncate(sample);
+        src.insert(0, head);
+        assert_eq!(f.resolve(&src).unwrap(), Ok(()));
+        assert!(f.num_splits() > 1);
     }
 
     #[test]
@@ -1689,36 +1520,90 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_input_hits_the_depth_cap() {
-        // Nests the array elements themselves deeply. `Elements::next` calls `skip_value` directly
-        // from the element's start (its own `[`/`{`) to find the element's span, so depth is counted
-        // from this element's outermost shell (when embedded as an object member, that member's
-        // line -- the element's own `{` -- consumes one level, so one less depth is available.
-        // `format::jsonl`'s `Members` calls `skip_value` only on a member's value, so its origin
-        // does not shift -- this difference is exactly the "independent implementation" note in the
-        // module docs).
-        let mut text = String::from("[");
-        let deep = MAX_DEPTH as usize + 1;
-        for _ in 0..deep {
-            text.push('[');
-        }
-        text.push('1');
-        for _ in 0..deep {
-            text.push(']');
-        }
-        text.push(']');
-        assert_eq!(resolve_err(&text), Some(Code::NestingTooDeep));
+    fn deeply_nested_values_are_read() {
+        // A value 40 levels deep used to fail the whole file with NestingTooDeep, even in a
+        // column the query never selected. DuckDB reads it.
+        let deep = "[".repeat(40) + &"]".repeat(40);
+        let text = format!("[{{\"a\":1,\"n\":{deep}}}]");
+        let got = read_all(&text);
+        assert_eq!(got[0], vec![Value::I64(1)]);
+        assert_eq!(got[1], vec![s(&deep)]);
+        // Elements themselves nested far deeper, too.
+        let deeper = "[".repeat(5000) + "1" + &"]".repeat(5000);
+        assert_eq!(read_all(&format!("[{deeper}]"))[0], vec![s(&deeper)]);
+    }
 
-        let mut ok = String::from("[");
-        for _ in 0..MAX_DEPTH {
-            ok.push('[');
+    #[test]
+    fn a_null_element_is_a_row_of_nulls() {
+        // DuckDB: `[null, {"a":1}]` is column `a` holding NULL, 1. The `null` used to add a phantom
+        // `json` column.
+        assert_eq!(schema_of("[null, {\"a\":1}]"), vec![("a".to_owned(), Ty::BigInt)]);
+        assert_eq!(
+            read_all("[null, {\"a\":1}, null]")[0],
+            vec![Value::Null, Value::I64(1), Value::Null]
+        );
+        // With nothing but `null` there is no key to make a column of: one NULL `json` row each.
+        assert_eq!(schema_of("[null, null]"), vec![("json".to_owned(), Ty::Json)]);
+        assert_eq!(read_all("[null, null]")[0], vec![Value::Null, Value::Null]);
+        // A top-level `null` document is one such row.
+        assert_eq!(read_all("null")[0], vec![Value::Null]);
+    }
+
+    #[test]
+    fn keys_differing_only_in_case_get_distinct_columns() {
+        // DuckDB renames the later key `A_1`; both used to be named as spelled, which made each
+        // of them ambiguous to a (case-insensitive) column reference.
+        assert_eq!(
+            schema_of("[{\"a\":1,\"A\":\"x\"},{\"A\":\"y\"}]"),
+            vec![("a".to_owned(), Ty::BigInt), ("A_1".to_owned(), Ty::Varchar)]
+        );
+        let got = read_all("[{\"a\":1,\"A\":\"x\"},{\"A\":\"y\"}]");
+        assert_eq!(got[0], vec![Value::I64(1), Value::Null]);
+        assert_eq!(got[1], vec![s("x"), s("y")]);
+    }
+
+    /// Resolves and reads every split, for a file that may be read as NDJSON.
+    fn read_every_split(text: &str) -> (Vec<String>, Vec<Vec<Value>>) {
+        let (f, src) = resolve(text.as_bytes());
+        let projection: Vec<usize> = (0..f.schema().len()).collect();
+        let mut out: Vec<Vec<Value>> = projection.iter().map(|_| Vec::new()).collect();
+        for split in 0..f.num_splits() {
+            let mut ranges = Vec::new();
+            f.split_ranges(split, &projection, &mut ranges).expect("split_ranges");
+            let cols = f.read_split(&src, split, &projection).expect("read_split");
+            for (j, c) in cols.iter().enumerate() {
+                for i in 0..c.len() {
+                    out[j].push(c.value_at(i));
+                }
+            }
         }
-        ok.push('1');
-        for _ in 0..MAX_DEPTH {
-            ok.push(']');
-        }
-        ok.push(']');
-        assert_eq!(resolve_err(&ok), None);
+        (f.schema().iter().map(|c| c.name.clone()).collect(), out)
+    }
+
+    #[test]
+    fn newline_delimited_json_is_read_as_jsonl() {
+        // `COPY ... TO 'x.json'` writes one object per line, as DuckDB does, and reading it back
+        // used to fail with a syntax error. DuckDB auto-detects the layout.
+        let (names, got) = read_every_split("{\"a\":1,\"b\":\"x\"}\n{\"a\":2,\"b\":\"y\"}\n");
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+        assert_eq!(got[1], vec![s("x"), s("y")]);
+        // CRLF, a BOM and blank lines are all JSONL's business once detected.
+        let (_, got) = read_every_split("\u{feff}{\"a\":1}\r\n\r\n{\"a\":2}\r\n");
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+
+        // A first record longer than the detection sample is still recognized.
+        let long = "x".repeat(crate::format::jsonl::SAMPLE_BYTES as usize);
+        let text = format!("{{\"a\":\"{long}\"}}\n{{\"a\":\"y\"}}\n");
+        let (_, got) = read_every_split(&text);
+        assert_eq!(got[0], vec![s(&long), s("y")]);
+
+        // A single document is unaffected, including one followed by trailing newlines, and two
+        // values on one line are still a syntax error rather than silently NDJSON.
+        let (names, got) = read_every_split("[{\"a\":1},\n{\"a\":2}]\n\n");
+        assert_eq!(names, ["a"]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+        assert_eq!(resolve_err("{\"a\":1} {\"a\":2}"), Some(Code::SyntaxError));
     }
 
     #[test]

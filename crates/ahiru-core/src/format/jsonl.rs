@@ -42,7 +42,7 @@
 //! ## The input is untrusted
 //!
 //! Broken JSON gives `Err` or a NULL cell. It never panics, reads out of range, or recurses
-//! infinitely. Scanning does not recurse, and nesting is cut off at `MAX_DEPTH`.
+//! infinitely. Scanning does not recurse, so nesting depth is not limited (`crate::json::skip_value`).
 
 use crate::catalog::Source;
 use crate::format::{get_or_internal, ResolveStep, TableFormat, TEXT_MAX_RECORD, TEXT_SPLIT_BYTES};
@@ -91,11 +91,16 @@ pub struct JsonlFormat {
     /// Per column: the sample held only `null` for it, so its `Ty::Varchar` is a default rather
     /// than a reading of the data. See `TableFormat::column_has_no_evidence`.
     no_evidence: Vec<bool>,
+    /// Per column: the object key it holds. Usually the column's name, but keys that differ only
+    /// in case get distinct names (`format::unique_json_names`), while members are still matched
+    /// against the key exactly.
+    keys: Vec<String>,
 }
 
 impl JsonlFormat {
     pub fn new() -> Self {
         JsonlFormat {
+            keys: Vec::new(),
             schema: Vec::new(),
             resolved: false,
             total_len: 0,
@@ -185,8 +190,15 @@ impl TableFormat for JsonlFormat {
                     continue;
                 }
                 lines += 1;
+                let c = byte_at(line, skip_ws(line, 0))?;
+                // A `null` record is a row of NULLs (DuckDB reads `{"a":1}\nnull\n` as `1`, NULL),
+                // so it has nothing to say about the schema. It used to switch the whole file into
+                // raw-JSON mode below, turning every object into one text column.
+                if c == b'n' {
+                    continue;
+                }
                 // A line that is not an object puts the whole file into raw-JSON mode (see `raw_json`).
-                if byte_at(line, skip_ws(line, 0))? != b'{' {
+                if c != b'{' {
                     raw = true;
                     break;
                 }
@@ -229,8 +241,10 @@ impl TableFormat for JsonlFormat {
                 vec![Field::new(String::from("json"), Ty::Varchar, true)]
             } else {
                 self.no_evidence = infs.iter().map(|i| *i == Inf::Null).collect();
+                let cols = crate::format::unique_json_names(&names);
+                self.keys = names;
                 // A JSON value can be missing at any time, so every column is nullable.
-                names.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect()
+                cols.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect()
             };
             self.resolved = true;
             return Ok(Ok(()));
@@ -286,7 +300,8 @@ impl TableFormat for JsonlFormat {
                 Some(f) => f,
                 None => err!(Internal),
             };
-            names.push(f.name.as_bytes());
+            // In raw-JSON mode there are no keys; the one column's name is never matched.
+            names.push(self.keys.get(c).map_or(f.name.as_bytes(), |k| k.as_bytes()));
             // A rough reservation assuming around 64 bytes per line. Being off does not affect correctness.
             builders.push(Builder::new(f.ty, (buf.len() / 64).min(1 << 16)));
         }
@@ -351,6 +366,17 @@ impl TableFormat for JsonlFormat {
             for s in slots.iter_mut() {
                 *s = None;
             }
+            let start = skip_ws(line, 0);
+            if kind_of(byte_at(line, start)?) == Kind::Null {
+                // A `null` record is a row of NULLs (see `resolve`). It must still be exactly
+                // `null`, with nothing after it.
+                let end = skip_value(line, start)?;
+                ensure!(skip_ws(line, end) == line.len(), SyntaxError, end);
+                for b in builders.iter_mut() {
+                    b.push(None);
+                }
+                continue;
+            }
             let mut it = Members::new(line)?;
             while let Some(m) = it.next()? {
                 let name = member_key(&m, &mut key)?;
@@ -358,7 +384,7 @@ impl TableFormat for JsonlFormat {
                 // decoded (Members merely skips their value spans).
                 if let Some(j) = names.iter().position(|n| *n == name) {
                     slots[j] = Some(m);
-                } else if !self.schema.iter().any(|f| f.name.as_bytes() == name) {
+                } else if !self.keys.iter().any(|k| k.as_bytes() == name) {
                     // A key the schema has never heard of. The schema comes from a bounded
                     // leading sample (`SAMPLE_BYTES` / `SAMPLE_LINES`) and, unlike `format::json`,
                     // is fixed before any split is read -- the file is consumed split by split, so
@@ -1402,31 +1428,59 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_input_hits_the_depth_cap() {
-        use crate::json::MAX_DEPTH;
-        let mut text = String::from("{\"a\":");
-        let deep = MAX_DEPTH as usize + 1;
-        for _ in 0..deep {
-            text.push('[');
-        }
-        text.push('1');
-        for _ in 0..deep {
-            text.push(']');
-        }
-        text.push_str("}\n");
-        assert_eq!(read_err(&text), Some(Code::NestingTooDeep));
+    fn deeply_nested_values_are_read() {
+        // `{"a":1,"n":` + 40 x `[` ... used to fail with NestingTooDeep even when only `a` was
+        // selected: the reader has to skip past `n` either way. DuckDB reads it.
+        let deep = "[".repeat(40) + &"]".repeat(40);
+        let text = format!("{{\"a\":1,\"n\":{deep}}}\n{{\"a\":2,\"n\":[]}}\n");
+        let got = read_cols(text.as_bytes(), 0, Some(&[0]));
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
+        let got = read_all(&text);
+        assert_eq!(got[1], vec![s(&deep), s("[]")]);
+    }
 
-        // Exactly at the limit passes (the raw text rides in a VARCHAR column).
-        let mut ok = String::from("{\"a\":");
-        for _ in 0..MAX_DEPTH {
-            ok.push('[');
+    #[test]
+    fn a_null_record_is_a_row_of_nulls() {
+        // DuckDB reads `{"a":1}\nnull\n{"a":2}\n` as `a`: 1, NULL, 2. The `null` line used to
+        // switch the whole file into the one-`json`-column shape.
+        let text = "{\"a\":1,\"b\":\"x\"}\nnull\n {\"a\":2,\"b\":\"y\"}\n  null  \n";
+        assert_eq!(
+            schema_of(text),
+            vec![("a".to_owned(), Ty::BigInt), ("b".to_owned(), Ty::Varchar)]
+        );
+        for split in [0u64, 1, 5, 13] {
+            let got = read_cols(text.as_bytes(), split, None);
+            assert_eq!(got[0], vec![Value::I64(1), Value::Null, Value::I64(2), Value::Null]);
+            assert_eq!(got[1], vec![s("x"), Value::Null, s("y"), Value::Null]);
         }
-        ok.push('1');
-        for _ in 0..MAX_DEPTH {
-            ok.push(']');
-        }
-        ok.push_str("}\n");
-        assert_eq!(read_err(&ok), None);
+        // `null` must still be exactly `null`.
+        assert_eq!(read_err("{\"a\":1}\nnulx\n"), Some(Code::SyntaxError));
+        assert_eq!(read_err("{\"a\":1}\nnull x\n"), Some(Code::SyntaxError));
+        // A file of nothing but `null` records keeps the `json` shape, one NULL per line.
+        assert_eq!(schema_of("null\nnull\n"), vec![("json".to_owned(), Ty::Varchar)]);
+        assert_eq!(read_all("null\nnull\n")[0], vec![Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn keys_differing_only_in_case_get_distinct_columns() {
+        // Column references are case-insensitive, so `a` and `A` as two columns were both
+        // ambiguous. DuckDB renames the later key `A_1`; the values still follow their own key.
+        assert_eq!(
+            schema_of("{\"a\":1,\"A\":2}\n"),
+            vec![("a".to_owned(), Ty::BigInt), ("A_1".to_owned(), Ty::BigInt)]
+        );
+        let got = read_all("{\"a\":1,\"A\":2}\n{\"A\":4}\n");
+        assert_eq!(got[0], vec![Value::I64(1), Value::Null]);
+        assert_eq!(got[1], vec![Value::I64(2), Value::I64(4)]);
+
+        // Across rows too, and a generated name that is itself taken moves on to the next suffix.
+        let text = "{\"id\":1}\n{\"ID\":2}\n{\"id_1\":3,\"Id\":4}\n";
+        let names: Vec<String> = schema_of(text).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["id", "ID_1", "id_1_1", "Id_2"]);
+        let got = read_all(text);
+        assert_eq!(got[1], vec![Value::Null, Value::I64(2), Value::Null]);
+        assert_eq!(got[2], vec![Value::Null, Value::Null, Value::I64(3)]);
+        assert_eq!(got[3], vec![Value::Null, Value::Null, Value::I64(4)]);
     }
 
     #[test]
