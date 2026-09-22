@@ -4,7 +4,10 @@
 //! with explicit `Cast` instructions inserted where needed. Execution kernels never have
 //! to think about type conversion, so the number of kernels does not grow (DESIGN.md §11).
 
-use crate::expr::{funcs, CallSpec, Instr, OpCode, Program, Reg};
+use crate::expr::{
+    funcs, CallSpec, Instr, OpCode, Program, Reg, MASK_NOT_FALSE, MASK_NOT_TRUE, MASK_NULL,
+    MASK_TRUE,
+};
 use crate::plan::{AggKind, Scope};
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
@@ -269,6 +272,7 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
         || !fits(lhs.casts.len(), rhs.casts.len())
         || !fits(lhs.calls.len(), rhs.calls.len())
         || !fits(lhs.lambdas.len(), rhs.lambdas.len())
+        || !fits(lhs.subs.len(), rhs.subs.len())
     {
         lhs.overflow = true;
         // `rhs` is dropped unmerged. The caller still gets two in-range register
@@ -281,6 +285,7 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
     let cbase = lhs.casts.len() as u16;
     let fbase = lhs.calls.len() as u16;
     let lbase = lhs.lambdas.len() as u16;
+    let sbase = lhs.subs.len() as u16;
 
     lhs.consts.extend(rhs.consts.iter().cloned());
     lhs.casts.extend(rhs.casts.iter().copied());
@@ -289,6 +294,8 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
     // scope), so they move over as-is; only the index that points at them
     // shifts.
     lhs.lambdas.extend(rhs.lambdas);
+    // Guarded sub-programs are self-contained in the same way.
+    lhs.subs.extend(rhs.subs);
     for c in rhs.calls {
         lhs.calls.push(CallSpec {
             func: c.func,
@@ -317,6 +324,11 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
             // `Call` takes no register operands (`a`/`b` are unused); its
             // arguments live in `calls[aux].args`, already rebased above.
             OpCode::Call => i2.aux += fbase,
+            // `b` is a mask mode, not a register; `aux` indexes `Program::subs`.
+            OpCode::Lazy => {
+                i2.a += base;
+                i2.aux += sbase;
+            }
             _ => {
                 i2.a += base;
                 i2.b += base;
@@ -329,6 +341,22 @@ pub(crate) fn merge_program_bodies(lhs: &mut Program, rhs: Program) -> (Reg, Reg
 }
 
 pub fn and_programs(mut lhs: Program, rhs: Program) -> Result<Program> {
+    // A right-hand side that may raise an error is evaluated only for the rows the left-hand
+    // side has not already rejected (`WHERE i < 30 AND factorial(i) > 0`), the same guarantee a
+    // single `AND` expression gets from `Compiler::binary_rhs`. The WHERE conjuncts reach here
+    // one at a time, in the order they were written.
+    if rhs.may_raise() {
+        let a = lhs.result;
+        let ty = rhs.result_ty;
+        let aux = lhs.add_sub(rhs);
+        let b = lhs.alloc_reg();
+        lhs.push(Instr::with_aux(OpCode::Lazy, ty.phys(), b, a, MASK_NOT_FALSE, aux));
+        let dst = lhs.alloc_reg();
+        lhs.push(Instr::new(OpCode::And, crate::vector::PhysType::Bool, dst, a, b));
+        lhs.result = dst;
+        lhs.result_ty = Ty::Boolean;
+        return Ok(lhs);
+    }
     // No register-count guard here: `merge_program_bodies` owns that check for every
     // caller now (it used to be duplicated here, and only here, covering `num_regs`
     // alone while the constant/cast/call/lambda tables could still wrap).
@@ -475,6 +503,50 @@ impl<'a> Compiler<'a> {
         let dst = self.prog.alloc_reg();
         self.prog.push(Instr::new(op, ty.phys(), dst, a, b));
         dst
+    }
+
+    /// Compiles `id` as a stand-alone program over the same input scope, so the caller can
+    /// decide afterwards whether it runs over every row (`inline`) or only the rows that reach
+    /// it (`guarded`).
+    fn sub_program(&mut self, id: ExprId) -> Result<Program> {
+        let mut c = Compiler {
+            arena: self.arena,
+            scope: self.scope,
+            params: self.params,
+            subs: self.subs,
+            prog: Program::new(),
+            depth: self.depth,
+        };
+        let (reg, ty) = c.expr(id)?;
+        c.prog.result = reg;
+        c.prog.result_ty = ty;
+        Ok(c.prog)
+    }
+
+    /// Appends a `sub_program` to this program, evaluated over every row.
+    #[inline(never)]
+    fn inline(&mut self, p: Program) -> (Reg, Ty) {
+        let ty = p.result_ty;
+        let (_, r) = merge_program_bodies(&mut self.prog, p);
+        (r, ty)
+    }
+
+    /// Appends a `sub_program` that only the rows where `mask` satisfies `mode` reach (`None`:
+    /// every row reaches it).
+    ///
+    /// If it cannot raise an error, evaluating it over every row is unobservable and cheaper, so
+    /// it is simply inlined. Otherwise it becomes an `OpCode::Lazy` whose result is NULL for
+    /// every row outside the mask; the caller's combining instruction never picks those rows.
+    #[inline(never)]
+    fn guarded(&mut self, p: Program, mask: Option<Reg>, mode: u16) -> (Reg, Ty) {
+        let Some(mask) = mask.filter(|_| p.may_raise()) else {
+            return self.inline(p);
+        };
+        let ty = p.result_ty;
+        let aux = self.prog.add_sub(p);
+        let dst = self.prog.alloc_reg();
+        self.prog.push(Instr::with_aux(OpCode::Lazy, ty.phys(), dst, mask, mode, aux));
+        (dst, ty)
     }
 
     fn konst(&mut self, ty: Ty, v: Value) -> Reg {
@@ -724,10 +796,31 @@ impl<'a> Compiler<'a> {
         }
         let mut regs = Vec::with_capacity(args.len());
         let mut tys = Vec::with_capacity(args.len());
-        for a in args {
-            let (r, t) = self.expr(*a)?;
-            regs.push(r);
-            tys.push(t);
+        // `coalesce`/`ifnull` evaluate a later argument only for the rows every earlier argument
+        // left NULL (`coalesce(1, factorial(i))` must not raise). When no later argument can
+        // raise, the ordinary call below is equivalent and stays the fast path.
+        let short_circuit = args.len() >= 2
+            && (eq_ascii_ci(name.as_bytes(), b"coalesce")
+                || eq_ascii_ci(name.as_bytes(), b"ifnull"));
+        if short_circuit {
+            let mut progs = Vec::with_capacity(args.len());
+            for a in args {
+                progs.push(self.sub_program(*a)?);
+            }
+            if progs[1..].iter().any(Program::may_raise) {
+                return self.guarded_coalesce(name, progs);
+            }
+            for p in progs {
+                let (r, t) = self.inline(p);
+                regs.push(r);
+                tys.push(t);
+            }
+        } else {
+            for a in args {
+                let (r, t) = self.expr(*a)?;
+                regs.push(r);
+                tys.push(t);
+            }
         }
         // `typeof` is decided entirely by the argument's static type, which is known right here,
         // so it folds to a literal too. Going through `resolve`/`call` would additionally make
@@ -751,6 +844,27 @@ impl<'a> Compiler<'a> {
         let dst = self.prog.alloc_reg();
         self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
         Ok((dst, res))
+    }
+
+    /// `coalesce(a, b, ...)` / `ifnull(a, b)` lowered to a chain of `Coalesce` instructions in
+    /// which each later argument is evaluated only for the rows still NULL so far.
+    fn guarded_coalesce(&mut self, name: &str, progs: Vec<Program>) -> Result<(Reg, Ty)> {
+        let tys: Vec<Ty> = progs.iter().map(|p| p.result_ty).collect();
+        let (_, want, res) = crate::expr::funcs::resolve(name, &tys)?;
+        ensure!(want.len() == progs.len(), WrongArgCount);
+        let mut acc: Option<Reg> = None;
+        for (p, w) in progs.into_iter().zip(want) {
+            let (r, t) = self.guarded(p, acc, MASK_NULL);
+            let r = self.coerce(r, t, w)?;
+            acc = Some(match acc {
+                None => r,
+                Some(a) => self.emit(OpCode::Coalesce, res, a, r),
+            });
+        }
+        match acc {
+            Some(r) => Ok((r, res)),
+            None => err!(Internal),
+        }
     }
 
     /// `list_transform(list, x -> expr)` / `list_filter(list, x -> expr)` /
@@ -930,14 +1044,22 @@ impl<'a> Compiler<'a> {
     /// Compiles one binary operator, with its left operand already compiled.
     fn binary_rhs(&mut self, op: BinaryOp, lhs: (Reg, Ty), rhs: ExprId) -> Result<(Reg, Ty)> {
         let (lr, lt) = lhs;
-        let (rr, rt) = self.expr(rhs)?;
 
         if op.is_logical() {
+            // The right-hand side is evaluated only for the rows the left-hand side does not
+            // already decide: not FALSE for `AND`, not TRUE for `OR` (see `guarded`).
             let l = self.coerce(lr, lt, Ty::Boolean)?;
+            let p = self.sub_program(rhs)?;
+            let (code, mode) = if op == BinaryOp::And {
+                (OpCode::And, MASK_NOT_FALSE)
+            } else {
+                (OpCode::Or, MASK_NOT_TRUE)
+            };
+            let (rr, rt) = self.guarded(p, Some(l), mode);
             let r = self.coerce(rr, rt, Ty::Boolean)?;
-            let code = if op == BinaryOp::And { OpCode::And } else { OpCode::Or };
             return Ok((self.emit(code, Ty::Boolean, l, r), Ty::Boolean));
         }
+        let (rr, rt) = self.expr(rhs)?;
 
         if op == BinaryOp::Concat {
             // `||` between two JSON operands is *list* concatenation, not text
@@ -1105,6 +1227,17 @@ impl<'a> Compiler<'a> {
         Ok((self.maybe_not(r, negated), Ty::Boolean))
     }
 
+    /// `CASE`. A WHEN condition is evaluated only for the rows no earlier WHEN took, a THEN value
+    /// only for the rows its WHEN took, and the ELSE only for the rows no WHEN took -- the
+    /// guarantee that lets `CASE WHEN i < 30 THEN factorial(i) END` run at all.
+    ///
+    /// Every condition and value is compiled as its own program first. If none of the ones that
+    /// not every row reaches can raise an error, all of them are inlined and combined with a
+    /// stack of `Select`s, exactly as if everything were evaluated over every row (it is, and
+    /// that is unobservable). Otherwise the fallible ones become `Lazy` instructions masked by a
+    /// running "some earlier WHEN matched" register. The lowering is flat -- one level per
+    /// WHEN, never one nested program per WHEN -- so a long WHEN list does not deepen the VM's
+    /// recursion.
     fn case(
         &mut self,
         operand: Option<ExprId>,
@@ -1113,57 +1246,84 @@ impl<'a> Compiler<'a> {
     ) -> Result<(Reg, Ty)> {
         ensure!(!whens.is_empty(), SyntaxError);
 
-        // Conditions and values are evaluated first, then the result type is decided and Select instructions are stacked from the back.
+        // `CASE x WHEN a ...` compares `x = a`; `x` is evaluated once, over every row.
         let operand = match operand {
             Some(o) => Some(self.expr(o)?),
             None => None,
         };
 
-        let mut conds = Vec::with_capacity(whens.len());
-        let mut vals = Vec::with_capacity(whens.len());
+        // `parts` = [cond 1, value 1, cond 2, value 2, ..., else?], each its own program.
+        let mut parts = Vec::with_capacity(2 * whens.len() + 1);
         let mut result_ty = Ty::Null;
-        for (c, v) in whens {
-            let cond = match operand {
-                // `CASE x WHEN a ...` is read as `x = a`.
-                Some((or, ot)) => {
-                    let (cr, ct) = self.expr(c)?;
-                    let (l, r, t) = self.unify_operands(or, ot, cr, ct)?;
-                    let dst = self.prog.alloc_reg();
-                    self.prog.push(Instr::new(OpCode::Eq, t.phys(), dst, l, r));
-                    dst
+        for (c, v) in whens.iter().map(|&(c, v)| (Some(c), v)).chain(else_.map(|e| (None, e))) {
+            if let Some(c) = c {
+                parts.push(self.sub_program(c)?);
+            }
+            let p = self.sub_program(v)?;
+            result_ty = Ty::unify_or_mismatch(result_ty, p.result_ty)?;
+            parts.push(p);
+        }
+        // The first condition is reached by every row, so it never needs guarding.
+        let guard = parts[1..].iter().any(Program::may_raise);
+
+        // `(hit, value)` per WHEN. When guarding, `hit` is a definite (never NULL) BOOLEAN that
+        // is TRUE only where this WHEN is the one that matched.
+        let mut arms = Vec::with_capacity(whens.len());
+        // When guarding: a definite BOOLEAN, TRUE where some earlier WHEN matched.
+        let mut taken: Option<Reg> = None;
+        let mut parts = parts.into_iter();
+        while arms.len() < whens.len() {
+            let (Some(cp), Some(vp)) = (parts.next(), parts.next()) else { err!(Internal) };
+            // A lazily evaluated condition is already NULL (so `hit` FALSE) for taken rows.
+            let lazy_cond = taken.is_some() && cp.may_raise();
+            let c = self.guarded(cp, taken, MASK_NOT_TRUE);
+            let mut hit = self.when_cond(operand, c)?;
+            if guard {
+                let f = self.konst(Ty::Boolean, Value::Bool(false));
+                hit = self.emit(OpCode::Coalesce, Ty::Boolean, hit, f);
+                if let (Some(t), false) = (taken, lazy_cond) {
+                    let free = self.emit(OpCode::Not, Ty::Boolean, t, 0);
+                    hit = self.emit(OpCode::And, Ty::Boolean, hit, free);
                 }
-                None => {
-                    let (cr, ct) = self.expr(c)?;
-                    self.coerce(cr, ct, Ty::Boolean)?
-                }
-            };
-            let (vr, vt) = self.expr(v)?;
-            result_ty = Ty::unify_or_mismatch(result_ty, vt)?;
-            conds.push(cond);
-            vals.push((vr, vt));
+                taken = Some(match taken {
+                    Some(t) => self.emit(OpCode::Or, Ty::Boolean, t, hit),
+                    None => hit,
+                });
+            }
+            let v = self.guarded(vp, guard.then_some(hit), MASK_TRUE);
+            arms.push((hit, v));
         }
 
-        let else_reg = match else_ {
-            Some(e) => {
-                let (er, et) = self.expr(e)?;
-                result_ty = Ty::unify_or_mismatch(result_ty, et)?;
-                Some((er, et))
+        let mut acc = match parts.next() {
+            Some(p) => {
+                let (r, t) = self.guarded(p, taken, MASK_NOT_TRUE);
+                self.coerce(r, t, result_ty)?
             }
-            None => None,
-        };
-
-        let mut acc = match else_reg {
-            Some((r, t)) => self.coerce(r, t, result_ty)?,
             None => self.konst(result_ty, Value::Null),
         };
         // Stacking from the last WHEN forward nests the conditions in priority order.
-        for (cond, (vr, vt)) in conds.into_iter().zip(vals).rev() {
+        for &(cond, (vr, vt)) in arms.iter().rev() {
             let v = self.coerce(vr, vt, result_ty)?;
             let dst = self.prog.alloc_reg();
             self.prog.push(Instr::with_aux(OpCode::Select, result_ty.phys(), dst, cond, v, acc));
             acc = dst;
         }
         Ok((acc, result_ty))
+    }
+
+    /// A WHEN condition as a BOOLEAN register: `operand = c` for a simple CASE, `c` itself
+    /// otherwise.
+    fn when_cond(&mut self, operand: Option<(Reg, Ty)>, c: (Reg, Ty)) -> Result<Reg> {
+        let (cr, ct) = c;
+        match operand {
+            Some((or, ot)) => {
+                let (l, r, t) = self.unify_operands(or, ot, cr, ct)?;
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::new(OpCode::Eq, t.phys(), dst, l, r));
+                Ok(dst)
+            }
+            None => self.coerce(cr, ct, Ty::Boolean),
+        }
     }
 
     fn maybe_not(&mut self, r: Reg, negated: bool) -> Reg {
@@ -1681,13 +1841,26 @@ mod tests {
         a.push(Expr::Binary { op: BinaryOp::Eq, lhs: up, rhs: s })
     }
 
+    /// `merge_program_bodies` followed by an `And`, the shape `and_programs` used to build for
+    /// every right-hand side. It now keeps a right-hand side that may raise (any call) in a
+    /// guarded sub-program instead, but the merge itself still inlines calls elsewhere
+    /// (`Compiler::inline`, `plan::bind::agg::coalesce_programs`), so its rebasing is tested
+    /// directly.
+    fn merged(mut lhs: Program, rhs: Program) -> Program {
+        let (a, b) = merge_program_bodies(&mut lhs, rhs);
+        let dst = lhs.alloc_reg();
+        lhs.push(Instr::new(OpCode::And, crate::vector::PhysType::Bool, dst, a, b));
+        lhs.result = dst;
+        lhs
+    }
+
     /// Merging a call-free `lhs` with a `rhs` that has one must not leave the
     /// `Call` instruction pointing into `lhs`'s (empty) call table. This is the
     /// shape predicate pushdown produces for `WHERE id = 1 AND upper(name) =
     /// 'X'`: the equality is compiled first (and separately consumed into a
     /// scan pruner), then merged with the residual conjunct.
     #[test]
-    fn and_programs_rebases_the_call_table_of_the_right_hand_side() {
+    fn merge_rebases_the_call_table_of_the_right_hand_side() {
         let mut a = ExprArena::new();
         let lhs_id = bin(&mut a, BinaryOp::Eq, "id", Value::I32(1));
         let rhs_id = upper_eq(&mut a, "NAME_1");
@@ -1697,7 +1870,7 @@ mod tests {
         assert_eq!(rhs.calls.len(), 1);
         let upper = rhs.calls[0].func;
 
-        let p = and_programs(lhs, rhs).unwrap();
+        let p = merged(lhs, rhs);
         assert_eq!(p.calls.len(), 1);
         for i in p.instrs.iter().filter(|i| i.op == OpCode::Call) {
             let spec = p.calls.get(i.aux as usize).expect("call index out of range");
@@ -1713,7 +1886,7 @@ mod tests {
     /// (`WHERE lower(name) = 'a' AND upper(name) = 'A'` returned no rows at
     /// all rather than erroring).
     #[test]
-    fn and_programs_keeps_both_sides_call_tables_distinct() {
+    fn merge_keeps_both_sides_call_tables_distinct() {
         let mut a = ExprArena::new();
         let col = a.push(Expr::ColumnRef { qualifier: None, name: "name".into() });
         let low = func_call(&mut a, "lower", vec![col]);
@@ -1725,7 +1898,7 @@ mod tests {
         let (lower, upper) = (lhs.calls[0].func, rhs.calls[0].func);
         assert_ne!(lower, upper);
 
-        let p = and_programs(lhs, rhs).unwrap();
+        let p = merged(lhs, rhs);
         assert_eq!(p.calls.len(), 2);
         let called: Vec<u16> = p
             .instrs
@@ -1739,7 +1912,7 @@ mod tests {
     /// `CallSpec::lambda` indexes `Program::lambdas`, so that table has to be
     /// merged and the index rebased too.
     #[test]
-    fn and_programs_rebases_the_lambda_table() {
+    fn merge_rebases_the_lambda_table() {
         let mut a = ExprArena::new();
         let lhs_id = bin(&mut a, BinaryOp::Eq, "id", Value::I32(1));
         let list = json_lit(&mut a, "[1,2,3]");
@@ -1757,13 +1930,90 @@ mod tests {
         assert!(lhs.lambdas.is_empty());
         assert_eq!(rhs.lambdas.len(), 1);
 
-        let p = and_programs(lhs, rhs).unwrap();
+        let p = merged(lhs, rhs);
         assert_eq!(p.lambdas.len(), 1);
         for spec in &p.calls {
             if let Some(l) = spec.lambda {
                 assert!((l as usize) < p.lambdas.len(), "lambda index out of range");
             }
         }
+    }
+
+    /// `WHERE id = 1 AND upper(name) = 'X'` as pushdown rebuilds it: the right-hand side has a
+    /// call, so it becomes a guarded sub-program run only where the left-hand side is not FALSE.
+    #[test]
+    fn and_programs_guards_a_right_hand_side_that_may_raise() {
+        let mut a = ExprArena::new();
+        let lhs_id = bin(&mut a, BinaryOp::Eq, "id", Value::I32(1));
+        let rhs_id = upper_eq(&mut a, "NAME_1");
+        let lhs = compile(&a, &cols(), &[], lhs_id).unwrap();
+        let rhs = compile(&a, &cols(), &[], rhs_id).unwrap();
+        let lhs_result = lhs.result;
+        let p = and_programs(lhs, rhs).unwrap();
+        assert!(p.calls.is_empty());
+        assert_eq!(p.subs.len(), 1);
+        assert_eq!(p.subs[0].calls.len(), 1);
+        let lazy = p.instrs.iter().find(|i| i.op == OpCode::Lazy).expect("a Lazy instruction");
+        assert_eq!((lazy.a, lazy.b, lazy.aux), (lhs_result, MASK_NOT_FALSE, 0));
+
+        // A right-hand side that cannot raise is still merged inline.
+        let rhs_id = bin(&mut a, BinaryOp::Lt, "big", Value::I64(9));
+        let lhs = compile(&a, &cols(), &[], lhs_id).unwrap();
+        let rhs = compile(&a, &cols(), &[], rhs_id).unwrap();
+        let p = and_programs(lhs, rhs).unwrap();
+        assert!(p.subs.is_empty());
+        assert!(!p.instrs.iter().any(|i| i.op == OpCode::Lazy));
+    }
+
+    /// `CASE WHEN id > 0 THEN <then> ELSE 0 END`.
+    fn case_of(a: &mut ExprArena, then: ExprId) -> ExprId {
+        let cond = bin(a, BinaryOp::Gt, "id", Value::I32(0));
+        let zero = a.push(Expr::Literal(Value::I32(0)));
+        a.push(Expr::Case { operand: None, whens: vec![(cond, then)], else_: Some(zero) })
+    }
+
+    #[test]
+    fn case_inlines_branches_that_cannot_raise_and_guards_the_rest() {
+        let mut a = ExprArena::new();
+        let then = bin(&mut a, BinaryOp::Add, "id", Value::I32(1));
+        let id = case_of(&mut a, then);
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert!(p.subs.is_empty(), "no branch can raise: plain Select, no Lazy");
+        assert!(!p.instrs.iter().any(|i| i.op == OpCode::Lazy));
+        assert_eq!(p.instrs.iter().filter(|i| i.op == OpCode::Select).count(), 1);
+
+        let mut a = ExprArena::new();
+        let col = a.push(Expr::ColumnRef { qualifier: None, name: "id".into() });
+        let then = func_call(&mut a, "factorial", vec![col]);
+        let id = case_of(&mut a, then);
+        let p = compile(&a, &cols(), &[], id).unwrap();
+        assert_eq!(p.subs.len(), 1, "the THEN is guarded; the literal ELSE is inlined");
+        let lazy: Vec<_> = p.instrs.iter().filter(|i| i.op == OpCode::Lazy).collect();
+        assert_eq!(lazy.len(), 1);
+        assert_eq!(lazy[0].b, MASK_TRUE);
+    }
+
+    /// `Lazy`'s `a` is a register and `aux` a sub-program index, both rebased by a merge; its
+    /// `b` is a mask mode and must survive unchanged.
+    #[test]
+    fn merge_rebases_lazy_operands_but_not_the_mask_mode() {
+        let mut a = ExprArena::new();
+        let lhs_id = bin(&mut a, BinaryOp::Eq, "id", Value::I32(1));
+        let rhs_id = upper_eq(&mut a, "X");
+        let lhs = compile(&a, &cols(), &[], lhs_id).unwrap();
+        let rhs = compile(&a, &cols(), &[], rhs_id).unwrap();
+        let guarded = and_programs(lhs, rhs).unwrap();
+        let lhs = compile(&a, &cols(), &[], lhs_id).unwrap();
+        let rhs = compile(&a, &cols(), &[], rhs_id).unwrap();
+        let guarded2 = and_programs(lhs, rhs).unwrap();
+
+        let p = merged(guarded, guarded2);
+        assert_eq!(p.subs.len(), 2);
+        let lazy: Vec<_> = p.instrs.iter().filter(|i| i.op == OpCode::Lazy).collect();
+        assert_eq!(lazy.len(), 2);
+        assert_eq!((lazy[0].aux, lazy[1].aux), (0, 1));
+        assert!(lazy.iter().all(|i| i.b == MASK_NOT_FALSE && i.a < p.num_regs));
+        assert_ne!(lazy[0].a, lazy[1].a);
     }
 
     /// A `Program` with `n` registers, one instruction, and `k` constants. Registers are

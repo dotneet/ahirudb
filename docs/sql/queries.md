@@ -143,6 +143,46 @@ than erroring (DuckDB itself raises an error there) — consistent with how
 this engine already treats other undefined integer arithmetic (division by
 zero, etc.; see [types.md](types.md#null-and-three-valued-logic)).
 
+### Guarded evaluation: CASE, AND, OR, COALESCE
+
+An operand that a row never reaches is never evaluated for that row, so an
+error it would raise (`factorial` overflowing, `repeat` exceeding the size
+limit, an invalid `CAST(... AS JSON)`, ...) is not raised either:
+
+| Construct | The operand ... | ... is evaluated only for rows where |
+|---|---|---|
+| `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ... ELSE e END` | `c2`, `c3`, ... | every earlier WHEN condition was FALSE or NULL |
+| | `v1`, `v2`, ... | its own WHEN condition is TRUE (and no earlier one was) |
+| | `e` | every WHEN condition was FALSE or NULL |
+| `CASE x WHEN a1 THEN ...` | same as above, with `x = ak` as the conditions (`x` itself is evaluated for every row) | |
+| `IIF(c, a, b)` / `IF(c, a, b)` | same as `CASE WHEN c THEN a ELSE b END` | |
+| `l AND r` | `r` | `l` is TRUE or NULL |
+| `l OR r` | `r` | `l` is FALSE or NULL |
+| `COALESCE(a1, a2, ...)` / `IFNULL(a1, a2)` | `a2`, `a3`, ... | every earlier argument was NULL |
+
+```sql
+SELECT sum(CASE WHEN i < 30 THEN factorial(i::INTEGER) ELSE 0 END) FROM range(40) t(i);
+SELECT count(coalesce(1, factorial(i::INTEGER))) FROM range(40) t(i);        -- 40
+SELECT count(*) FROM range(40) t(i) WHERE i < 30 AND factorial(i::INTEGER) > 0; -- 30
+```
+
+`WHERE`, `HAVING`, `QUALIFY` and join `ON` conditions keep the guarantee
+when the planner splits them at their top-level `AND`s: a conjunct is still
+evaluated only for the rows every conjunct written before it (and pushed to
+the same place) left not FALSE, including when they are pushed into a scan.
+Conjuncts that reference different tables of a join can be pushed to
+different sides of it, and then run in plan order rather than written
+order — the same freedom DuckDB's optimizer takes.
+
+The first WHEN condition, the left-hand side of `AND`/`OR`, the first
+`COALESCE` argument and a simple-`CASE` operand are reached by every row
+and always evaluated. The guarantee is only about errors: which value comes
+out is the same either way. `NULLIF`, `GREATEST`/`LEAST`, `IN (...)` and
+`BETWEEN` evaluate all of their operands. DuckDB gives the same answers for
+the examples above; it does not promise it in every shape (it can, for
+example, evaluate an `AND` nested inside an `OR` eagerly and raise where
+this engine does not).
+
 ## Joins
 
 ```sql
