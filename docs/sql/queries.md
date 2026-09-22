@@ -111,7 +111,9 @@ SELECT 3 IS TRUE, NULL IS TRUE, NULL IS NOT TRUE;   -- true, false, true
 
 -- IS [NOT] DISTINCT FROM: NULL-safe equality/inequality (never UNKNOWN,
 -- always TRUE/FALSE -- NULL is treated as equal to NULL and unequal to
--- anything else)
+-- anything else). As in PostgreSQL/DuckDB, the IS family binds one notch
+-- looser than comparison: `a IS DISTINCT FROM b = c` is
+-- `a IS DISTINCT FROM (b = c)`, and `a = b IS NULL` is `(a = b) IS NULL`.
 -- (`VALUES` is only an INSERT source here, not a table -- see
 -- limitations.md; use a real table for a scratch example.)
 SELECT a, b FROM t WHERE a IS DISTINCT FROM b;

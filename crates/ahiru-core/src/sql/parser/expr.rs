@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
             // `SELECT 1 AS isnull` reads the alias via a separate `ident()`
             // call in `opt_alias` after `expr()` has already returned.
             if self.is_soft_kw(b"isnull") {
-                if BP_CMP < min_bp {
+                if BP_IS < min_bp {
                     break;
                 }
                 self.bump()?;
@@ -100,7 +100,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.is_soft_kw(b"notnull") {
-                if BP_CMP < min_bp {
+                if BP_IS < min_bp {
                     break;
                 }
                 self.bump()?;
@@ -321,12 +321,11 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 // The `IS` family (`IS [NOT] NULL`/`TRUE`/`FALSE`/`UNKNOWN`,
-                // `IS [NOT] DISTINCT FROM`) is postfix/infix at the same
-                // binding power as comparison — see `BP_CMP`'s doc for the
-                // `duckdb` measurements that pin it there rather than one
-                // notch below, where PostgreSQL puts it.
+                // `IS [NOT] DISTINCT FROM`) is postfix/infix one notch looser
+                // than comparison — see `BP_IS`'s doc for the `duckdb`
+                // measurements.
                 Tok::Kw(Kw::Is) => {
-                    if BP_CMP < min_bp {
+                    if BP_IS < min_bp {
                         break;
                     }
                     lhs = self.predicate(lhs)?;
@@ -451,7 +450,7 @@ impl<'a> Parser<'a> {
                 if self.is(Tok::Kw(Kw::Distinct)) && self.peek()? == Tok::Kw(Kw::From) {
                     self.bump()?; // distinct
                     self.bump()?; // from
-                    let rhs = self.expr_bp(BP_CMP + 1)?;
+                    let rhs = self.expr_bp(BP_IS + 1)?;
                     return Ok(self.distinct_from(arg, rhs, neg));
                 }
                 // `IS [NOT] TRUE`/`IS [NOT] FALSE`. `Kw::True`/`Kw::False`

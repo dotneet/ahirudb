@@ -54,19 +54,29 @@ type StarModifiers = (Vec<String>, Vec<(ExprId, String)>, Vec<(String, String)>)
 const BP_OR: u8 = 1;
 const BP_AND: u8 = 2;
 const BP_NOT: u8 = 3;
-// `= <> < <= > >=`, plus the `IS` family (`IS [NOT] NULL`/`TRUE`/`FALSE`/
-// `UNKNOWN`, `IS [NOT] DISTINCT FROM`, and the `ISNULL`/`NOTNULL` postfix
-// aliases). PostgreSQL puts `IS` one notch *below* comparison, but DuckDB
-// collapses the two — confirmed with the `duckdb` CLI:
-//   `1 IS DISTINCT FROM 1 = 1` -> false  = `(1 IS DISTINCT FROM 1) = 1`
-//   `2 = 1 IS DISTINCT FROM 1` -> true   = `(2 = 1) IS DISTINCT FROM 1`
-// Both are exactly "one left-associative band", which is what this level is.
-const BP_CMP: u8 = 4;
+// The `IS` family: `IS [NOT] NULL`/`TRUE`/`FALSE`/`UNKNOWN`,
+// `IS [NOT] DISTINCT FROM`, and the `ISNULL`/`NOTNULL` postfix aliases. One
+// notch *below* comparison, as in PostgreSQL (and therefore DuckDB), so a
+// comparison on either side of `IS` groups first. Confirmed with the
+// `duckdb` CLI:
+//   `1 IS DISTINCT FROM 2 = false`      -> true  = `1 IS DISTINCT FROM (2 = false)`
+//   `null IS DISTINCT FROM true = null` -> false = `null IS DISTINCT FROM (true = null)`
+//   `2 = 1 IS DISTINCT FROM 1`          -> `(2 = 1) IS DISTINCT FROM 1`
+//   `null = 1 IS NULL`                  -> true  = `(null = 1) IS NULL`
+//   `null IS NULL = false`              -> false = `(null IS NULL) = false`
+// The last one is the Pratt loop's natural reading of a postfix operator:
+// once `IS NULL` has been folded into `lhs`, a following `=` (which binds
+// tighter than the `min_bp` this call started with) simply continues.
+// DuckDB rejects chains like `a IS DISTINCT FROM b IS TRUE` (the band is
+// non-associative there); this parser accepts them left-associatively.
+const BP_IS: u8 = 4;
+// `= <> < <= > >=`.
+const BP_CMP: u8 = 5;
 // `[NOT] BETWEEN`/`[NOT] IN`/`[NOT] LIKE`/`[NOT] ILIKE`/`[NOT] SIMILAR TO`/
 // `GLOB`. One notch tighter than comparison, so a predicate never attaches to
 // a finished comparison (confirmed with the `duckdb` CLI: `false = true IN
 // (false, true)` -> false, `true = 'a' GLOB 'a'` -> true).
-const BP_PRED: u8 = 5;
+const BP_PRED: u8 = 6;
 // PostgreSQL's "any other operator" band: `||`, the bitwise operators
 // `&`/`|`/`<<`/`>>`, the JSON path operators `->`/`->>`, `^@`, the regex
 // operators `~`/`!~`, and the `~~` (LIKE) punctuation family. Tighter than
@@ -76,13 +86,13 @@ const BP_PRED: u8 = 5;
 // `(3 & 2) = 2`, `1 & 2 || 3` = `(1 & 2) || 3` (= `'03'`), `1 || 2 & 3` =
 // `(1 || 2) & 3`. The relative precedence *within* the band has not been
 // measured, so it is one left-associative level.
-const BP_OTHER: u8 = 6;
-const BP_ADD: u8 = 7;
-const BP_MUL: u8 = 8;
+const BP_OTHER: u8 = 7;
+const BP_ADD: u8 = 8;
+const BP_MUL: u8 = 9;
 // `^`/`**`. Confirmed with the `duckdb` CLI: `2 + 3^2` = `2 + (3^2)`, `-2^2` = `(-2)^2`
 // (tighter than `*`/`/`, looser than unary `-`). Left-associative
 // (`2^3^2` = `(2^3)^2` = 64, not the right-associative 512).
-const BP_POW: u8 = 9;
+const BP_POW: u8 = 10;
 // Postfix `!` (factorial). DuckDB's own precedence for `!` is internally
 // inconsistent Postgres legacy (`3! ^ 2` parses fine but `2 ^ 3!` is a
 // syntax error; `2 + 3!` silently reads as `(2+3)!` while `3! + 1` is a
@@ -107,8 +117,8 @@ const BP_POW: u8 = 9;
 //
 // The binary-operator cases documented in docs/sql/limitations.md
 // (`2 + 3!` = `2 + (3!)` = `8` here, not `(2+3)!` = `120`) are unchanged.
-const BP_BANG: u8 = 10;
-const BP_UNARY: u8 = 11;
+const BP_BANG: u8 = 11;
+const BP_UNARY: u8 = 12;
 
 pub fn parse(sql: &str) -> Result<Parsed> {
     let mut p = Parser::new(sql)?;

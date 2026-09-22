@@ -2901,18 +2901,33 @@ fn in_between_like_bind_tighter_than_comparison() {
 }
 
 #[test]
-fn is_family_stays_at_comparison_strength() {
-    // PostgreSQL puts `IS` one notch below comparison, DuckDB collapses the two.
-    //   duckdb: `1 IS DISTINCT FROM 1 = 1` -> false, `2 = 1 IS DISTINCT FROM 1`
-    //           -> true, `1 = 1 IS NOT NULL` -> true, `true = 1 ISNULL` -> false
-    // All four are "one left-associative band", which is what `BP_CMP` is.
+fn is_family_binds_one_notch_below_comparison() {
+    // PostgreSQL (and DuckDB) put `IS` one notch below comparison, so a
+    // comparison on either side groups first. duckdb:
+    //   `1 IS DISTINCT FROM 2 = false`      -> true  (= `1 IS DISTINCT FROM (2 = false)`)
+    //   `null IS DISTINCT FROM true = null` -> false (= `null IS DISTINCT FROM (true = null)`)
+    //   `2 = 1 IS DISTINCT FROM 1`          -> `(2 = 1) IS DISTINCT FROM 1`
+    //   `1 = 1 IS NOT NULL` -> true, `null IS NULL = false` -> false
+    assert_eq!(ex("a IS DISTINCT FROM b = c"), ex("a IS DISTINCT FROM (b = c)"));
+    assert_eq!(ex("a IS NOT DISTINCT FROM b < c"), ex("a IS NOT DISTINCT FROM (b < c)"));
+    assert_eq!(ex("a = b IS DISTINCT FROM c"), ex("(a = b) IS DISTINCT FROM c"));
+    assert_eq!(ex("a = b IS DISTINCT FROM c = d"), ex("(a = b) IS DISTINCT FROM (c = d)"));
+    // The right operand still stops at `AND` and still absorbs predicates.
+    assert_eq!(ex("a IS DISTINCT FROM b AND c"), ex("(a IS DISTINCT FROM b) AND c"));
+    assert_eq!(ex("a IS DISTINCT FROM b IN (c)"), ex("a IS DISTINCT FROM (b IN (c))"));
     assert_eq!(ex("a = b IS NULL"), "((a = b) IS NULL)");
     assert_eq!(ex("a = b ISNULL"), "((a = b) IS NULL)");
     assert_eq!(ex("a = b NOTNULL"), "((a = b) IS NOT NULL)");
-    // A predicate binds tighter than `IS`, and `IS` tighter than nothing else
-    // in that band, so the two compose left to right in source order.
+    assert_eq!(ex("a = b IS TRUE"), ex("(a = b) IS TRUE"));
+    // A postfix `IS NULL` followed by a comparison: the finished `IS NULL`
+    // becomes the comparison's left operand.
+    assert_eq!(ex("a IS NULL = b"), "((a IS NULL) = b)");
+    // A predicate binds tighter than `IS`, so the two compose left to right
+    // in source order.
     assert_eq!(ex("a IN (b) IS NULL"), "((a IN [b]) IS NULL)");
     assert_eq!(ex("a IS NULL IN (b)"), "((a IS NULL) IN [b])");
+    // `NOT` is still looser than `IS`.
+    assert_eq!(ex("NOT a IS NULL"), "(NOT (a IS NULL))");
 }
 
 #[test]
