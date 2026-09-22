@@ -1004,6 +1004,11 @@ to be explicit:
   small addends to a large one: `sum([1e100, 1.0, -1e100])` is `1.0` here,
   from `SELECT sum(x)` and `SELECT sum(x) OVER ()` alike, where an
   uncompensated accumulator (DuckDB's included) gives `0.0`.
+- `stddev`/`variance`/`stddev_pop`/`var_pop` over an input containing
+  `NaN` or `±inf` are `NaN`, where DuckDB raises "out of range" — the same
+  "floats stay IEEE" rule. (They used to return `0.0`: the clamp that keeps
+  rounding from making a variance negative was written with `f64::max`,
+  which drops a `NaN` operand.)
 - `abs`/`sign` clear the sign bit rather than negating, so neither can
   return `-0.0`. `sqrt` and `cbrt` are correctly rounded; `exp`/`ln` are
   within 1 ulp; `log10`/`log2`/`log(b, x)` are within 2 ulp (see

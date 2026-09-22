@@ -308,6 +308,19 @@ pub(super) fn build_window(
         let default = arg_progs.remove(2);
         arg_progs.insert(2, cast_program(default, want)?);
     }
+    // The count/offset arguments -- `ntile(n)`, `nth_value(x, n)`, `lag/lead(x, offset)` -- are
+    // BIGINT in DuckDB, and any other numeric type is cast to it. `exec::window` reads them
+    // with `Value::as_i64`, which sees a DECIMAL's raw scaled integer (`2::DECIMAL(4,1)` as 20)
+    // and nothing at all for a DOUBLE, so they are converted here once.
+    let count_arg = match kind {
+        WindowKind::NTile => Some(0),
+        WindowKind::NthValue | WindowKind::Lag | WindowKind::Lead => Some(1),
+        _ => None,
+    };
+    if let Some(i) = count_arg.filter(|&i| i < arg_progs.len()) {
+        let p = arg_progs.remove(i);
+        arg_progs.insert(i, cast_program(p, Ty::BigInt)?);
+    }
 
     let mut parts = Vec::with_capacity(partition_by.len());
     for p in partition_by {
@@ -443,9 +456,19 @@ pub(super) fn build_agg(
             };
         }
         SecondArg::Fraction => {
-            let f = match args.get(1).map(|&id| arena.get(id)) {
-                Some(Expr::Literal(Value::F64(f))) => *f,
-                Some(Expr::Literal(Value::I64(i))) => *i as f64,
+            // Any constant expression is accepted -- `0` and `1` (INTEGER literals, not just
+            // BIGINT ones), `-0.0`, `0.5::DECIMAL(2,1)` -- by casting it to DOUBLE and folding
+            // it here, once. Matching literal shapes instead used to reject `quantile_cont(x, 0)`.
+            let id2 = match args.get(1) {
+                Some(&id) => id,
+                None => err!(WrongArgCount),
+            };
+            let p = cast_program(compile(arena, scope, params, id2)?, Ty::Double)?;
+            ensure!(p.is_constant(), UnsupportedFeature);
+            let v = crate::expr::vm::Vm::new().eval(&p, &crate::vector::Batch::rows_only(1))?;
+            let f = match v.value_at(0) {
+                Value::F64(f) => f,
+                // A NULL fraction.
                 _ => err!(UnsupportedFeature),
             };
             // DuckDB rejects a fraction outside [0, 1] outright; so does this.
