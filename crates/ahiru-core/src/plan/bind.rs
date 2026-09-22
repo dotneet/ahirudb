@@ -14,7 +14,7 @@ use crate::expr::{Instr, OpCode, Program};
 use crate::format::{PruneOp, Pruner};
 use crate::plan::compile::{
     and_programs, cast_program, column_program, compile, compile_predicate,
-    compile_predicate_with_subs, compile_with_subs, expr_eq, Substitution,
+    compile_predicate_with_subs, compile_with_subs, expr_eq, expr_eq_in, Substitution,
 };
 #[cfg(feature = "ddl")]
 use crate::plan::MemScanSpec;

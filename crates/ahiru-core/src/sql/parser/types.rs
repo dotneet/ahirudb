@@ -40,6 +40,30 @@ pub(super) fn cube_sets(cols: Vec<ExprId>, pos: usize) -> Result<Vec<Vec<ExprId>
     Ok(sets)
 }
 
+/// The cap on the number of grouping sets a `GROUP BY` clause expands into, the same
+/// bound `MAX_CUBE_COLS` puts on a single `CUBE` (each set becomes one `Node::Aggregate`).
+const MAX_GROUPING_SETS: usize = 1 << MAX_CUBE_COLS;
+
+/// The cross product of two lists of grouping sets: every set of `acc` concatenated with
+/// every set of `elem`. This is how the comma-separated elements of a `GROUP BY` combine
+/// (`GROUP BY b, ROLLUP (a)` = `(b)` x `((a), ())` = `((b, a), (b))`).
+pub(super) fn cross_sets(
+    acc: &[Vec<ExprId>],
+    elem: &[Vec<ExprId>],
+    pos: usize,
+) -> Result<Vec<Vec<ExprId>>> {
+    ensure!(acc.len().saturating_mul(elem.len()) <= MAX_GROUPING_SETS, ExpressionTooDeep, pos);
+    let mut out = Vec::with_capacity(acc.len() * elem.len());
+    for a in acc {
+        for e in elem {
+            let mut set = a.clone();
+            set.extend_from_slice(e);
+            out.push(set);
+        }
+    }
+    Ok(out)
+}
+
 // --- Lambdas ------------------------------------------------------------------
 
 /// Whether this function name may interpret a `->` in argument position as a lambda.

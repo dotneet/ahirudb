@@ -13,7 +13,7 @@ use super::from::{build_tree, flatten_from, full_scope, narrow_scope, rel_ranges
 use super::refs::{
     collect_join_refs, collect_outer_refs, collect_refs, collect_refs_aliased, const_program,
     default_name, distinct_on_output_column, group_name, order_output_column, push_u32,
-    resolve_group_ref, resolve_select_ref,
+    resolve_group_ref, resolve_select_ref, walk_pruned,
 };
 use super::subquery::{
     and_all, build_quantified_comparison, build_semijoin, classify_conjunct, collect_colrefs,
@@ -356,52 +356,44 @@ fn add_having_alias_subs(
     Ok(())
 }
 
-/// Makes a column reference spelled differently from its grouping expression resolve to the
+/// Makes an expression spelled differently from its grouping expression resolve to the
 /// aggregate's grouping column.
 ///
-/// `GROUP BY emp.dept` with `SELECT dept` (or the reverse) names one and the same input column,
-/// but the `structural: true` substitution installed for a grouping expression matches raw
-/// syntax, so the qualifier difference would leave `dept` compiled against the aggregate's
-/// output scope — where the input column no longer exists. Each such reference gets its own
-/// exact-node (`structural: false`) substitution instead, which cannot mis-match a same-named
-/// column of another relation the way a loosened structural comparison would.
+/// `GROUP BY emp.dept` with `SELECT dept` (or `GROUP BY v.b + 1` with `SELECT b + 1`) names
+/// one and the same value, but the `structural: true` substitution installed for a grouping
+/// expression matches raw syntax, so the qualifier difference would leave `dept` compiled
+/// against the aggregate's output scope — where the input column no longer exists. Each such
+/// node gets its own exact-node (`structural: false`) substitution instead, found by comparing
+/// against `scope`-resolved columns ([`expr_eq_in`]); an exact-node substitution cannot
+/// mis-match a same-named column of another relation the way a loosened structural comparison
+/// would. Aggregate calls are not entered: their arguments are evaluated below the aggregate.
 fn add_equivalent_group_subs(
     arena: &ExprArena,
     scope: &Scope,
     sel: &SelectStmt,
     group_exprs: &[ExprId],
+    agg_calls: &[ExprId],
     subs: &mut Vec<Substitution>,
 ) -> Result<()> {
-    // (input column, grouping column) for every grouping expression that is a plain column ref.
-    let mut gcols: Vec<(usize, usize)> = Vec::new();
-    for (i, &g) in group_exprs.iter().enumerate() {
-        if let Expr::ColumnRef { qualifier, name } = arena.get(g) {
-            if let Ok(c) = scope.resolve(qualifier.as_deref(), name) {
-                gcols.push((c, i));
-            }
-        }
-    }
-    if gcols.is_empty() {
+    if group_exprs.is_empty() {
         return Ok(());
     }
-    let mut refs = Vec::new();
-    for item in &sel.items {
-        collect_colrefs(arena, item.expr, &[], &mut refs, 0)?;
-    }
-    for e in [sel.having, sel.qualify].into_iter().flatten() {
-        collect_colrefs(arena, e, &[], &mut refs, 0)?;
-    }
-    for o in &sel.order_by {
-        collect_colrefs(arena, o.expr, &[], &mut refs, 0)?;
-    }
-    for (rid, qual, name) in refs {
-        if group_exprs.contains(&rid) {
-            continue;
+    let mut visit = |e: ExprId| -> Result<bool> {
+        if agg_calls.contains(&e) {
+            return Ok(true);
         }
-        let Ok(c) = scope.resolve(qual.as_deref(), &name) else { continue };
-        if let Some(&(_, gi)) = gcols.iter().find(|&&(gc, _)| gc == c) {
-            subs.push(Substitution { expr: rid, column: gi, structural: false });
+        let Some(i) = group_exprs.iter().position(|&g| expr_eq_in(arena, scope, g, e)) else {
+            return Ok(false);
+        };
+        if !expr_eq(arena, group_exprs[i], e) {
+            subs.push(Substitution { expr: e, column: i, structural: false });
         }
+        Ok(true)
+    };
+    let roots = sel.items.iter().map(|it| it.expr);
+    let roots = roots.chain([sel.having, sel.qualify].into_iter().flatten());
+    for e in roots.chain(sel.order_by.iter().map(|o| o.expr)) {
+        walk_pruned(arena, e, &mut visit, 0)?;
     }
     Ok(())
 }
@@ -1129,7 +1121,7 @@ pub(super) fn bind_select_in(
         if let Some(h) = sel.having {
             check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
-        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &mut subs)?;
+        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
         add_having_alias_subs(arena, &scope, sel, &mut subs)?;
 
         let agg_scope = Scope::from_fields(out_fields.clone());
@@ -1156,7 +1148,8 @@ pub(super) fn bind_select_in(
         ensure!(!sets.is_empty(), Internal);
 
         // The union of the grouping columns across all sets is treated as "the grouping columns"
-        // (structurally equal columns are merged into one). GROUP BY ordinals and aliases are
+        // (equal columns are merged into one, comparing column references by the input column
+        // they resolve to, so `b` and `v.b` are one key). GROUP BY ordinals and aliases are
         // resolved as in an ordinary GROUP BY.
         let mut resolved_sets: Vec<Vec<ExprId>> = Vec::with_capacity(sets.len());
         let mut group_exprs: Vec<ExprId> = Vec::new();
@@ -1164,7 +1157,7 @@ pub(super) fn bind_select_in(
             let mut rs = Vec::with_capacity(set.len());
             for &g in set {
                 let r = resolve_group_ref(arena, sel, &scope, g)?;
-                if !group_exprs.iter().any(|&e| expr_eq(arena, e, r)) {
+                if !group_exprs.iter().any(|&e| expr_eq_in(arena, &scope, e, r)) {
                     group_exprs.push(r);
                 }
                 rs.push(r);
@@ -1208,7 +1201,7 @@ pub(super) fn bind_select_in(
         if let Some(h) = sel.having {
             check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
-        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &mut subs)?;
+        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
 
         // The arguments of GROUPING()/GROUPING_ID() must be grouping columns.
         // Only which column (an index into `group_exprs`) each argument points at is remembered;
@@ -1223,7 +1216,7 @@ pub(super) fn bind_select_in(
             let mut idxs = Vec::with_capacity(args.len());
             for a in args {
                 let r = resolve_group_ref(arena, sel, &scope, a)?;
-                let pos = group_exprs.iter().position(|&g| expr_eq(arena, g, r));
+                let pos = group_exprs.iter().position(|&g| expr_eq_in(arena, &scope, g, r));
                 idxs.push(match pos {
                     Some(p) => p,
                     None => err!(NotGrouped),
@@ -1267,7 +1260,7 @@ pub(super) fn bind_select_in(
             } else {
                 let mut set_groups = Vec::with_capacity(ngroups);
                 for (i, &g) in group_exprs.iter().enumerate() {
-                    if set.iter().any(|&s| expr_eq(arena, s, g)) {
+                    if set.iter().any(|&s| expr_eq_in(arena, &scope, s, g)) {
                         set_groups.push(group_progs[i].clone());
                     } else {
                         set_groups.push(const_program(group_progs[i].result_ty, Value::Null));
@@ -1308,7 +1301,8 @@ pub(super) fn bind_select_in(
                     let bits = idxs.len() as u32;
                     let mut v: i64 = 0;
                     for (bit_pos, &gi) in idxs.iter().enumerate() {
-                        let in_set = set.iter().any(|&s| expr_eq(arena, s, group_exprs[gi]));
+                        let in_set =
+                            set.iter().any(|&s| expr_eq_in(arena, &scope, s, group_exprs[gi]));
                         if !in_set {
                             v |= 1i64 << (bits - 1 - bit_pos as u32);
                         }

@@ -139,3 +139,82 @@ fn group_by_all_ignores_constant_select_items() {
     let rows = run(&mut s, "SELECT 1, count(*) FROM v GROUP BY ALL");
     assert_eq!(rows, vec![vec![Value::I32(1), i(6)]]);
 }
+
+/// An all-integer result as `Option<i64>` cells (`None` = NULL), for compact expectations.
+fn grid(s: &mut Session, sql: &str) -> Vec<Vec<Option<i64>>> {
+    let cell = |v: &Value| match v {
+        Value::Null => None,
+        Value::I32(x) => Some(*x as i64),
+        Value::I64(x) => Some(*x),
+        Value::I128(x) => Some(*x as i64),
+        other => panic!("{sql}: unexpected value {other:?}"),
+    };
+    run(s, sql).iter().map(|r| r.iter().map(cell).collect()).collect()
+}
+
+const N: Option<i64> = None;
+
+fn g<const K: usize>(rows: &[[Option<i64>; K]]) -> Vec<Vec<Option<i64>>> {
+    rows.iter().map(|r| r.to_vec()).collect()
+}
+
+// --- One column spelled two ways is one grouping key ---------------------------
+
+#[test]
+fn grouping_keys_compare_resolved_columns_not_spelling() {
+    let mut s = session();
+    let (s1, s2, s5, s6, s7, s8) = (Some(1), Some(2), Some(5), Some(6), Some(7), Some(8));
+    // duckdb: 1,2 1,2 5,2 5,2 7,1 7,1 NULL,1 NULL,1 -- both sets group by b.
+    let sql = "SELECT b, count(*) FROM v GROUP BY GROUPING SETS ((b), (v.b)) ORDER BY ALL";
+    let want = [[s1, s2], [s1, s2], [s5, s2], [s5, s2], [s7, s1], [s7, s1], [N, s1], [N, s1]];
+    assert_eq!(grid(&mut s, sql), g(&want));
+    // duckdb: 2,2 2,2 6,2 6,2 8,1 8,1 NULL,1 NULL,1 NULL,6
+    let sql = "SELECT b + 1 AS x, count(*) FROM v GROUP BY ROLLUP(v.b + 1, b) ORDER BY ALL";
+    let want =
+        [[s2, s2], [s2, s2], [s6, s2], [s6, s2], [s8, s1], [s8, s1], [N, s1], [N, s1], [N, s6]];
+    assert_eq!(grid(&mut s, sql), g(&want));
+    // duckdb: 1,0,2 5,0,2 7,0,1 NULL,0,1 NULL,1,6
+    let sql = "SELECT b, grouping(v.b), count(*) FROM v GROUP BY ROLLUP(b) ORDER BY ALL";
+    let z = Some(0);
+    let want = [[s1, z, s2], [s5, z, s2], [s7, z, s1], [N, z, s1], [N, s1, s6]];
+    assert_eq!(grid(&mut s, sql), g(&want));
+    // The plain GROUP BY path too. duckdb: 2,2 6,2 8,1 NULL,1
+    let sql = "SELECT b+1, count(*) FROM v GROUP BY v.b+1 ORDER BY ALL";
+    assert_eq!(grid(&mut s, sql), g(&[[s2, s2], [s6, s2], [s8, s1], [N, s1]]));
+    // duckdb: 3,4 / 6,1 (b+1 > 2 drops the b = 1 group)
+    let sql = "SELECT b + 1, sum(a) FROM v GROUP BY v.b + 1 HAVING b + 1 > 2 ORDER BY b + 1";
+    assert_eq!(grid(&mut s, sql), g(&[[s6, Some(3)], [s8, N]]));
+}
+
+// --- Plain keys mixed with ROLLUP/CUBE/GROUPING SETS ---------------------------
+
+#[test]
+fn plain_keys_and_rollup_combine_as_a_cross_product() {
+    let mut s = session();
+    let (z, s1, s2, s3, s4, s5, s6, s7) =
+        (Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7));
+    // duckdb: GROUP BY b, ROLLUP(a) = GROUPING SETS ((b, a), (b))
+    let want = [
+        [s1, s3, z, z, s1],
+        [s1, s4, z, z, s1],
+        [s1, N, s1, z, s2],
+        [s5, s1, z, z, s1],
+        [s5, s2, z, z, s1],
+        [s5, N, s1, z, s2],
+        [s7, N, z, z, s1],
+        [s7, N, s1, z, s1],
+        [N, s6, z, z, s1],
+        [N, N, s1, z, s1],
+    ];
+    for group_by in ["b, ROLLUP(a)", "ROLLUP(a), b", "b, GROUPING SETS ((a), ())"] {
+        let sql = format!(
+            "SELECT b, a, grouping(a), grouping(b), count(*) FROM v GROUP BY {group_by} \
+             ORDER BY ALL"
+        );
+        assert_eq!(grid(&mut s, &sql), g(&want), "{sql}");
+    }
+    // Two constructs: ROLLUP(b) x ROLLUP(a) = ((b, a), (b), (a), ()); 6 + 4 + 6 + 1 rows
+    // (duckdb).
+    let sql = "SELECT b, a, count(*) FROM v GROUP BY ROLLUP(b), ROLLUP(a)";
+    assert_eq!(run(&mut s, sql).len(), 17);
+}

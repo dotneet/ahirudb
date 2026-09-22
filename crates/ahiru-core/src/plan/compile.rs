@@ -361,10 +361,17 @@ pub fn cast_program(mut p: Program, to: Ty) -> Result<Program> {
 /// Name comparison is case-insensitive (`GROUP BY a` and `SELECT A` count as the same).
 /// Constants are judged by value equality.
 pub fn expr_eq(arena: &ExprArena, a: ExprId, b: ExprId) -> bool {
-    expr_eq_at(arena, a, b, 0)
+    expr_eq_at(arena, None, a, b, 0)
 }
 
-fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
+/// [`expr_eq`], except that column references are compared by the input column they resolve
+/// to in `scope`, so `b` and `v.b` (one column spelled two ways) count as equal. A reference
+/// that does not resolve (an alias, an ambiguous name) falls back to comparing its spelling.
+pub fn expr_eq_in(arena: &ExprArena, scope: &Scope, a: ExprId, b: ExprId) -> bool {
+    expr_eq_at(arena, Some(scope), a, b, 0)
+}
+
+fn expr_eq_at(arena: &ExprArena, scope: Option<&Scope>, a: ExprId, b: ExprId, depth: u32) -> bool {
     if a == b {
         return true;
     }
@@ -372,10 +379,10 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
         return false;
     }
     let d = depth + 1;
-    let eq = |x: &ExprId, y: &ExprId| expr_eq_at(arena, *x, *y, d);
+    let eq = |x: &ExprId, y: &ExprId| expr_eq_at(arena, scope, *x, *y, d);
     let eq_opt = |x: &Option<ExprId>, y: &Option<ExprId>| match (x, y) {
         (None, None) => true,
-        (Some(x), Some(y)) => expr_eq_at(arena, *x, *y, d),
+        (Some(x), Some(y)) => expr_eq_at(arena, scope, *x, *y, d),
         _ => false,
     };
     let ci = |x: &Option<String>, y: &Option<String>| match (x, y) {
@@ -391,7 +398,16 @@ fn expr_eq_at(arena: &ExprArena, a: ExprId, b: ExprId, depth: u32) -> bool {
         (
             Expr::ColumnRef { qualifier: q1, name: n1 },
             Expr::ColumnRef { qualifier: q2, name: n2 },
-        ) => ci(q1, q2) && crate::rt::hash::eq_ascii_ci(n1.as_bytes(), n2.as_bytes()),
+        ) => {
+            if let Some(sc) = scope {
+                if let (Ok(x), Ok(y)) =
+                    (sc.resolve(q1.as_deref(), n1), sc.resolve(q2.as_deref(), n2))
+                {
+                    return x == y;
+                }
+            }
+            ci(q1, q2) && crate::rt::hash::eq_ascii_ci(n1.as_bytes(), n2.as_bytes())
+        }
         (Expr::Unary { op: o1, arg: a1 }, Expr::Unary { op: o2, arg: a2 }) => {
             o1 == o2 && eq(a1, a2)
         }

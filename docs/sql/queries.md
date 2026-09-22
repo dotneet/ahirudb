@@ -17,7 +17,7 @@ FROM <table | parquet('url') | read_json[_auto]('url') | generate_series(...) | 
   [, LATERAL? UNNEST(<expr>) ...]
   [TABLESAMPLE|USING SAMPLE <n>% | <n> ROWS | (bernoulli|system|reservoir)(...)]
 [WHERE <expr>]
-[GROUP BY <expr>, ... | ALL | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
+[GROUP BY ALL | <expr | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)>, ...]
 [HAVING <expr>]
 [WINDOW name AS (...), ...]
 [QUALIFY <expr>]
@@ -310,7 +310,9 @@ SELECT DISTINCT ON (region) region, amount FROM orders ORDER BY region, amount D
 
 `GROUPING SETS`/`ROLLUP`/`CUBE` compute several grouping granularities in
 one pass, unioning the results together (rows from a coarser grouping have
-`NULL` in the columns that grouping doesn't group by):
+`NULL` in the columns that grouping doesn't group by). A column spelled two
+ways (`b` and `v.b`) is one grouping key, and a clause may expand to at most
+256 grouping sets:
 
 ```sql
 -- two granularities at once: grouped by flag, and the grand total
@@ -329,6 +331,11 @@ SELECT flag, id % 3 AS m, count(*) c FROM t GROUP BY CUBE (flag, id % 3) ORDER B
 SELECT flag, id % 3 AS m, count(*) c,
        grouping(flag) gf, grouping(id % 3) gm, grouping(flag, id % 3) gid
 FROM t GROUP BY CUBE (flag, id % 3) ORDER BY 1, 2;
+
+-- plain keys and several constructs mix in one GROUP BY; the elements
+-- combine as a cross product, as in DuckDB/PostgreSQL:
+-- GROUP BY flag, ROLLUP (id % 3) = GROUPING SETS ((flag, id % 3), (flag))
+SELECT flag, id % 3 AS m, count(*) c FROM t GROUP BY flag, ROLLUP (id % 3) ORDER BY 1, 2;
 
 -- HAVING can reference GROUPING() to pick out just one granularity
 SELECT flag, id % 3 AS m, count(*) c

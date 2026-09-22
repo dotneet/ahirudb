@@ -294,6 +294,46 @@ pub(super) fn each_child_flat(
     Ok(())
 }
 
+/// Visits `id` and its descendants in pre-order, not descending below a node for which `f`
+/// returns `true`.
+///
+/// Left-deep binary chains are descended in a loop, as in [`each_child_flat`], so a long flat
+/// chain costs one stack frame. Unlike `each_child_flat`, every inner node of the spine is
+/// offered to `f` as well: in `a*2 + 1` the node `a*2` is such an inner node, and a caller
+/// matching sub-expressions against `GROUP BY a*2` must get to see it.
+pub(super) fn walk_pruned(
+    arena: &ExprArena,
+    id: ExprId,
+    f: &mut dyn FnMut(ExprId) -> Result<bool>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    if f(id)? {
+        return Ok(());
+    }
+    let d = depth + 1;
+    let mut spine: Vec<ExprId> = Vec::new();
+    let mut cur = id;
+    let mut bottom_done = false;
+    while let Expr::Binary { lhs, rhs, .. } = arena.get(cur) {
+        spine.push(*rhs);
+        cur = *lhs;
+        if f(cur)? {
+            bottom_done = true;
+            break;
+        }
+    }
+    // `cur` has been offered to `f` already (it is `id` when there is no spine), so only its
+    // children are left. When the loop stopped on a non-binary node, that is all of them.
+    if !bottom_done {
+        each_child(arena, cur, &mut |c| walk_pruned(arena, c, f, d))?;
+    }
+    for &r in spine.iter().rev() {
+        walk_pruned(arena, r, f, d)?;
+    }
+    Ok(())
+}
+
 /// Collects the scope column numbers an expression references. Nonexistent columns are detected here.
 pub(super) fn collect_refs(
     arena: &ExprArena,

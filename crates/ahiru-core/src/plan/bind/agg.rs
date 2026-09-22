@@ -3,7 +3,7 @@
 //! NULL/zero coalescing used when decorrelating correlated `COUNT`
 //! aggregates.
 
-use super::refs::{const_program, default_name, each_child, each_child_flat};
+use super::refs::{const_program, default_name, each_child_flat, walk_pruned};
 use super::*;
 
 /// Drops the trailing `k` columns used as correlation keys by the most recent join.
@@ -486,6 +486,11 @@ fn agg_name(fname: &str, arena: &ExprArena, arg: ExprId) -> String {
 
 /// Detects a bare column reference that is not in GROUP BY.
 ///
+/// A sub-expression matching a grouping expression is grouped as a whole, however its column
+/// references are spelled: `SELECT b + 1 ... GROUP BY v.b + 1` and `SELECT a*2 + 1 ... GROUP
+/// BY a*2` both pass (the comparison resolves references against `scope`, and
+/// [`walk_pruned`] offers the inner nodes of an operator chain too).
+///
 /// `const_subs` lists the scalar subqueries that are constant with respect to
 /// the grouping (uncorrelated ones, which `bind_select_in` attaches *after* the
 /// aggregate). Any other scalar subquery varies per input row and is rejected.
@@ -498,62 +503,32 @@ pub(super) fn check_grouped(
     const_subs: &[ExprId],
     depth: u32,
 ) -> Result<()> {
-    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
-    let covered = |e: ExprId| {
-        groups.iter().any(|&g| expr_eq(arena, g, e)) || aggs.iter().any(|&a| expr_eq(arena, a, e))
-    };
-    if covered(id) {
-        return Ok(());
-    }
-    match arena.get(id) {
-        Expr::ColumnRef { qualifier, name } => {
-            // A column that exists in the input reaching here = it is in neither GROUP BY nor an aggregate.
-            if let Ok(col) = scope.resolve(qualifier.as_deref(), name) {
-                // `GROUP BY emp.dept` and `SELECT dept` name the same column in
-                // two spellings, which `expr_eq` (raw syntax) does not match.
-                // Resolve both sides against the input scope before deciding.
-                if grouped_column(arena, scope, groups, col) {
-                    return Ok(());
-                }
-                err!(NotGrouped);
+    walk_pruned(
+        arena,
+        id,
+        &mut |e| {
+            if groups.iter().any(|&g| expr_eq_in(arena, scope, g, e))
+                || aggs.iter().any(|&a| expr_eq(arena, a, e))
+            {
+                return Ok(true);
             }
-        }
-        // An uncorrelated scalar subquery is a constant, and so is legal anywhere in an
-        // aggregating query. A correlated one is attached as a pre-aggregation column whose
-        // value varies per input row, so referencing it above the aggregate is rejected like
-        // a bare column reference.
-        Expr::ScalarSubquery(_) if !const_subs.contains(&id) => err!(NotGrouped),
-        _ => {}
-    }
-    let d = depth + 1;
-    // A left-deep binary chain is descended in a loop (see `each_child_flat` for why), but
-    // unlike `each_child_flat` every inner node of the spine is matched against the grouping
-    // and aggregate expressions too: in `SELECT a*2 + 1 ... GROUP BY a*2` the grouped
-    // expression `a*2` is exactly such an inner node, and descending past it would reject
-    // the bare `a` underneath.
-    let mut spine: Vec<ExprId> = Vec::new();
-    let mut cur = id;
-    let mut bottom_covered = false;
-    while let Expr::Binary { lhs, rhs, .. } = arena.get(cur) {
-        spine.push(*rhs);
-        cur = *lhs;
-        if covered(cur) {
-            bottom_covered = true;
-            break;
-        }
-    }
-    if spine.is_empty() {
-        return each_child(arena, id, &mut |c| {
-            check_grouped(arena, scope, c, groups, aggs, const_subs, d)
-        });
-    }
-    if !bottom_covered {
-        check_grouped(arena, scope, cur, groups, aggs, const_subs, d)?;
-    }
-    for &r in spine.iter().rev() {
-        check_grouped(arena, scope, r, groups, aggs, const_subs, d)?;
-    }
-    Ok(())
+            match arena.get(e) {
+                // A column that exists in the input reaching here = it is in neither GROUP BY
+                // nor an aggregate.
+                Expr::ColumnRef { qualifier, name } => {
+                    ensure!(scope.resolve(qualifier.as_deref(), name).is_err(), NotGrouped);
+                    Ok(true)
+                }
+                // An uncorrelated scalar subquery is a constant, and so is legal anywhere in
+                // an aggregating query. A correlated one is attached as a pre-aggregation
+                // column whose value varies per input row, so referencing it above the
+                // aggregate is rejected like a bare column reference.
+                Expr::ScalarSubquery(_) if !const_subs.contains(&e) => err!(NotGrouped),
+                _ => Ok(false),
+            }
+        },
+        depth,
+    )
 }
 
 /// Whether any grouping expression is a column reference naming input column `col`.

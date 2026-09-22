@@ -1209,6 +1209,31 @@ fn grouping_sets_rollup_cube_syntax() {
         sel("SELECT a, sum(c) FROM t GROUP BY ROLLUP (a)"),
         "SELECT a, sum(c) FROM t GROUP BY GROUPING SETS ((a), ())"
     );
+    // Several elements combine as a cross product, in either order, and a plain
+    // expression counts as the single set `(e)` (as in DuckDB/PostgreSQL).
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY b, ROLLUP (a)"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((b, a), (b))"
+    );
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY ROLLUP (a), b"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a, b), (b))"
+    );
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY ROLLUP (a), CUBE (b)"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a, b), (a), (b), ())"
+    );
+    assert_eq!(
+        sel("SELECT a, b, sum(c) FROM t GROUP BY a, GROUPING SETS ((b), ())"),
+        "SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a, b), (a))"
+    );
+    // The expansion is capped like a single CUBE.
+    assert_eq!(
+        code("SELECT 1 FROM t GROUP BY CUBE (a, b, c, d, e), CUBE (f, g, h, i)"),
+        Code::ExpressionTooDeep as u16
+    );
+    // Plain lists are unchanged, including columns named after the constructs.
+    assert_eq!(sel("SELECT a FROM t GROUP BY a, rollup"), "SELECT a FROM t GROUP BY a, rollup");
 
     // `GROUPING`/`SETS`/`ROLLUP`/`CUBE` are keywords only in the context right after GROUP
     // BY. That is the same class of trap as the past ROWS/RANGE/QUALIFY incidents, so this
