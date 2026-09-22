@@ -12,8 +12,8 @@ use super::cte::CteScope;
 use super::from::{build_tree, flatten_from, full_scope, narrow_scope, rel_ranges, Rel};
 use super::refs::{
     collect_join_refs, collect_outer_refs, collect_refs, collect_refs_aliased, const_program,
-    default_name, distinct_on_output_column, group_name, order_output_column, push_u32,
-    resolve_group_ref, resolve_select_ref,
+    default_name, distinct_on_output_column, group_name, order_output_column, output_alias_column,
+    push_u32, resolve_group_ref, resolve_select_ref, walk_pruned,
 };
 use super::subquery::{
     and_all, build_quantified_comparison, build_semijoin, classify_conjunct, collect_colrefs,
@@ -264,7 +264,8 @@ pub(super) fn expand_columns(
 /// ```
 ///
 /// Note the second line: `sum(x)+1` is excluded even though the item itself
-/// is not an aggregate call — containing one anywhere is what counts.
+/// is not an aggregate call — containing one anywhere is what counts. An item
+/// that references no column at all (`42`, `'x'`, `1+1`) is excluded as well.
 ///
 /// `SELECT *` combined with `GROUP BY ALL` is rejected rather than expanded.
 /// duckdb supports it (it groups by every column of the star expansion), but
@@ -285,9 +286,20 @@ fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprI
         ensure!(!matches!(arena.get(item.expr), Expr::Star { .. }), UnsupportedFeature);
         let mut aggs = Vec::new();
         collect_aggregates(arena, item.expr, &mut aggs, 0)?;
-        if aggs.is_empty() {
-            out.push(item.expr);
+        if !aggs.is_empty() {
+            continue;
         }
+        // An item that reads no column is constant per group, and DuckDB leaves it out of
+        // the grouping (`select 1, count(*) from empty group by all` -> one row `1, 0`).
+        // Keeping it would also be wrong here: a bare integer literal in the grouping list is
+        // read as an ordinal downstream, so `SELECT b, 42, count(*) ... GROUP BY ALL` failed
+        // with "column not found" and `SELECT 3, b, count(*)` grouped by the aggregate.
+        let mut refs = Vec::new();
+        collect_colrefs(arena, item.expr, &[], &mut refs, 0)?;
+        if refs.is_empty() && !contains_subquery(arena, item.expr, 0) {
+            continue;
+        }
+        out.push(item.expr);
     }
     Ok(out)
 }
@@ -344,54 +356,53 @@ fn add_having_alias_subs(
     Ok(())
 }
 
-/// Makes a column reference spelled differently from its grouping expression resolve to the
+/// Makes an expression spelled differently from its grouping expression resolve to the
 /// aggregate's grouping column.
 ///
-/// `GROUP BY emp.dept` with `SELECT dept` (or the reverse) names one and the same input column,
-/// but the `structural: true` substitution installed for a grouping expression matches raw
-/// syntax, so the qualifier difference would leave `dept` compiled against the aggregate's
-/// output scope — where the input column no longer exists. Each such reference gets its own
-/// exact-node (`structural: false`) substitution instead, which cannot mis-match a same-named
-/// column of another relation the way a loosened structural comparison would.
+/// `GROUP BY emp.dept` with `SELECT dept` (or `GROUP BY v.b + 1` with `SELECT b + 1`) names
+/// one and the same value, but the `structural: true` substitution installed for a grouping
+/// expression matches raw syntax, so the qualifier difference would leave `dept` compiled
+/// against the aggregate's output scope — where the input column no longer exists. Each such
+/// node gets its own exact-node (`structural: false`) substitution instead, found by comparing
+/// against `scope`-resolved columns ([`expr_eq_in`]); an exact-node substitution cannot
+/// mis-match a same-named column of another relation the way a loosened structural comparison
+/// would. Aggregate calls are not entered: their arguments are evaluated below the aggregate.
 fn add_equivalent_group_subs(
     arena: &ExprArena,
     scope: &Scope,
     sel: &SelectStmt,
     group_exprs: &[ExprId],
+    agg_calls: &[ExprId],
     subs: &mut Vec<Substitution>,
 ) -> Result<()> {
-    // (input column, grouping column) for every grouping expression that is a plain column ref.
-    let mut gcols: Vec<(usize, usize)> = Vec::new();
-    for (i, &g) in group_exprs.iter().enumerate() {
-        if let Expr::ColumnRef { qualifier, name } = arena.get(g) {
-            if let Ok(c) = scope.resolve(qualifier.as_deref(), name) {
-                gcols.push((c, i));
-            }
-        }
-    }
-    if gcols.is_empty() {
+    if group_exprs.is_empty() {
         return Ok(());
     }
-    let mut refs = Vec::new();
-    for item in &sel.items {
-        collect_colrefs(arena, item.expr, &[], &mut refs, 0)?;
-    }
-    for e in [sel.having, sel.qualify].into_iter().flatten() {
-        collect_colrefs(arena, e, &[], &mut refs, 0)?;
-    }
-    for o in &sel.order_by {
-        collect_colrefs(arena, o.expr, &[], &mut refs, 0)?;
-    }
-    for (rid, qual, name) in refs {
-        if group_exprs.contains(&rid) {
-            continue;
+    let mut visit = |e: ExprId| -> Result<bool> {
+        if agg_calls.contains(&e) {
+            return Ok(true);
         }
-        let Ok(c) = scope.resolve(qual.as_deref(), &name) else { continue };
-        if let Some(&(_, gi)) = gcols.iter().find(|&&(gc, _)| gc == c) {
-            subs.push(Substitution { expr: rid, column: gi, structural: false });
+        let Some(i) = group_exprs.iter().position(|&g| expr_eq_in(arena, scope, g, e)) else {
+            return Ok(false);
+        };
+        if !expr_eq(arena, group_exprs[i], e) {
+            subs.push(Substitution { expr: e, column: i, structural: false });
         }
+        Ok(true)
+    };
+    let roots = sel.items.iter().map(|it| it.expr);
+    let roots = roots.chain([sel.having, sel.qualify].into_iter().flatten());
+    for e in roots.chain(sel.order_by.iter().map(|o| o.expr)) {
+        walk_pruned(arena, e, &mut visit, 0)?;
     }
     Ok(())
+}
+
+/// Whether a bare name in ORDER BY/QUALIFY may be read as a SELECT-list alias: only when the
+/// input scope does not have it. An ambiguous name *is* an input column, several times over,
+/// and is left to input resolution to report (the rule `resolve_group_ref` uses too).
+fn is_alias_candidate(scope: &Scope, name: &str) -> bool {
+    matches!(scope.resolve(None, name), Err(e) if e.code != Code::AmbiguousColumn)
 }
 
 /// The name of an unaliased output column, at output position `pos`.
@@ -1117,7 +1128,7 @@ pub(super) fn bind_select_in(
         if let Some(h) = sel.having {
             check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
-        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &mut subs)?;
+        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
         add_having_alias_subs(arena, &scope, sel, &mut subs)?;
 
         let agg_scope = Scope::from_fields(out_fields.clone());
@@ -1144,7 +1155,8 @@ pub(super) fn bind_select_in(
         ensure!(!sets.is_empty(), Internal);
 
         // The union of the grouping columns across all sets is treated as "the grouping columns"
-        // (structurally equal columns are merged into one). GROUP BY ordinals and aliases are
+        // (equal columns are merged into one, comparing column references by the input column
+        // they resolve to, so `b` and `v.b` are one key). GROUP BY ordinals and aliases are
         // resolved as in an ordinary GROUP BY.
         let mut resolved_sets: Vec<Vec<ExprId>> = Vec::with_capacity(sets.len());
         let mut group_exprs: Vec<ExprId> = Vec::new();
@@ -1152,7 +1164,7 @@ pub(super) fn bind_select_in(
             let mut rs = Vec::with_capacity(set.len());
             for &g in set {
                 let r = resolve_group_ref(arena, sel, &scope, g)?;
-                if !group_exprs.iter().any(|&e| expr_eq(arena, e, r)) {
+                if !group_exprs.iter().any(|&e| expr_eq_in(arena, &scope, e, r)) {
                     group_exprs.push(r);
                 }
                 rs.push(r);
@@ -1196,7 +1208,7 @@ pub(super) fn bind_select_in(
         if let Some(h) = sel.having {
             check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
-        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &mut subs)?;
+        add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
 
         // The arguments of GROUPING()/GROUPING_ID() must be grouping columns.
         // Only which column (an index into `group_exprs`) each argument points at is remembered;
@@ -1211,7 +1223,7 @@ pub(super) fn bind_select_in(
             let mut idxs = Vec::with_capacity(args.len());
             for a in args {
                 let r = resolve_group_ref(arena, sel, &scope, a)?;
-                let pos = group_exprs.iter().position(|&g| expr_eq(arena, g, r));
+                let pos = group_exprs.iter().position(|&g| expr_eq_in(arena, &scope, g, r));
                 idxs.push(match pos {
                     Some(p) => p,
                     None => err!(NotGrouped),
@@ -1255,7 +1267,7 @@ pub(super) fn bind_select_in(
             } else {
                 let mut set_groups = Vec::with_capacity(ngroups);
                 for (i, &g) in group_exprs.iter().enumerate() {
-                    if set.iter().any(|&s| expr_eq(arena, s, g)) {
+                    if set.iter().any(|&s| expr_eq_in(arena, &scope, s, g)) {
                         set_groups.push(group_progs[i].clone());
                     } else {
                         set_groups.push(const_program(group_progs[i].result_ty, Value::Null));
@@ -1296,7 +1308,8 @@ pub(super) fn bind_select_in(
                     let bits = idxs.len() as u32;
                     let mut v: i64 = 0;
                     for (bit_pos, &gi) in idxs.iter().enumerate() {
-                        let in_set = set.iter().any(|&s| expr_eq(arena, s, group_exprs[gi]));
+                        let in_set =
+                            set.iter().any(|&s| expr_eq_in(arena, &scope, s, group_exprs[gi]));
                         if !in_set {
                             v |= 1i64 << (bits - 1 - bit_pos as u32);
                         }
@@ -1421,6 +1434,9 @@ pub(super) fn bind_select_in(
     // --- Projection ---------------------------------------------------------
     let mut exprs = Vec::new();
     let mut schema = Vec::new();
+    // Per output column: whether its name comes from an explicit `AS` alias (see
+    // `output_alias_column`). Filled lazily; star columns are `false`.
+    let mut aliased: Vec<bool> = Vec::new();
     for item in &sel.items {
         match arena.get(item.expr) {
             Expr::Star { qualifier, columns, exclude, replace, rename } => {
@@ -1512,6 +1528,8 @@ pub(super) fn bind_select_in(
                     Some(a) => a.clone(),
                     None => output_name(arena, item.expr, schema.len()),
                 };
+                aliased.resize(schema.len(), false);
+                aliased.push(item.alias.is_some());
                 schema.push(Field::new(name, p.result_ty, true));
                 exprs.push(p);
             }
@@ -1521,6 +1539,7 @@ pub(super) fn bind_select_in(
     // How many columns `ORDER BY ALL` sorts by. It is settled here so the correlation key
     // columns (implementation hidden columns appended below) are not included.
     let projected = exprs.len();
+    aliased.resize(projected, false);
     // The correlation key columns are appended at the end of the output (in the non-aggregate
     // case; correlation with aggregation is completed on the early-return path above and never
     // reaches here). The caller (binding of a correlated scalar subquery / `EXISTS` / `IN`) uses
@@ -1567,10 +1586,12 @@ pub(super) fn bind_select_in(
         let mut q_refs = Vec::new();
         collect_colrefs(arena, q, &covered, &mut q_refs, 0)?;
         for (rid, qual, rname) in q_refs {
-            let out_hit = if qual.is_none() {
-                schema.iter().rposition(|f| {
-                    !f.name.is_empty() && eq_ascii_ci(f.name.as_bytes(), rname.as_bytes())
-                })
+            // A name resolves the way WHERE/HAVING resolve it: an input column first, and a
+            // SELECT-list alias only for a name the input does not have (DuckDB:
+            // `SELECT a*1 AS b, rank() OVER (...) FROM t QUALIFY b = 3` filters on the input
+            // `b`). An ambiguous input name is left to the input path, which reports it.
+            let out_hit = if qual.is_none() && is_alias_candidate(&scope, &rname) {
+                output_alias_column(&rname, &schema[..projected], &aliased)
             } else {
                 None
             };
@@ -1602,17 +1623,68 @@ pub(super) fn bind_select_in(
             keys.push((col, oa.desc, oa.nulls_first));
         }
     }
+    // ORDER BY terms that mix a SELECT-list alias with anything else (`ORDER BY x || id`,
+    // `length(x) + sum(id)`). Such a term cannot be compiled into the projection like other
+    // sort keys, because the alias names an *output* column; instead its alias-free parts are
+    // added to the projection as hidden columns and the term itself is compiled against the
+    // projection's output, straight into the sort key: `(key index, expr, substitutions)`.
+    let mut output_keys: Vec<(usize, ExprId, Vec<Substitution>)> = Vec::new();
     for o in &sel.order_by {
         // Only the projected columns are addressable. Everything appended after them
         // (correlation keys, QUALIFY helpers, earlier ORDER BY sort keys) is an
         // implementation detail that `ORDER BY <ordinal>` must not be able to reach.
-        let col = match order_output_column(arena, sel, o, &schema[..projected])? {
+        let col = match order_output_column(arena, sel, o, &schema[..projected], &aliased)? {
             Some(c) => c,
             None => {
-                let p = compile_with_subs(arena, &item_scope, params, &subs, o.expr)?;
-                schema.push(Field::new(String::new(), p.result_ty, true));
-                exprs.push(p);
-                exprs.len() - 1
+                // As in DuckDB, a name inside an ORDER BY expression is an input column when
+                // the input has it, and a SELECT-list alias only otherwise.
+                let mut refs = Vec::new();
+                collect_colrefs(arena, o.expr, &[], &mut refs, 0)?;
+                let mut ksubs: Vec<Substitution> = Vec::new();
+                for (rid, qual, name) in refs {
+                    if qual.is_some() || !is_alias_candidate(&scope, &name) {
+                        continue;
+                    }
+                    if let Some(c) = output_alias_column(&name, &schema[..projected], &aliased) {
+                        ksubs.push(Substitution { expr: rid, column: c, structural: false });
+                    }
+                }
+                if ksubs.is_empty() {
+                    let p = compile_with_subs(arena, &item_scope, params, &subs, o.expr)?;
+                    schema.push(Field::new(String::new(), p.result_ty, true));
+                    exprs.push(p);
+                    exprs.len() - 1
+                } else {
+                    let alias_ids: Vec<ExprId> = ksubs.iter().map(|k| k.expr).collect();
+                    walk_pruned(
+                        arena,
+                        o.expr,
+                        &mut |e| {
+                            if alias_ids.contains(&e) {
+                                return Ok(true);
+                            }
+                            let mut inner = Vec::new();
+                            collect_colrefs(arena, e, &[], &mut inner, 0)?;
+                            if inner.iter().any(|(r, _, _)| alias_ids.contains(r)) {
+                                return Ok(false);
+                            }
+                            // Reads no column: compiles against the output as it is.
+                            if inner.is_empty() && !contains_subquery(arena, e, 0) {
+                                return Ok(true);
+                            }
+                            let p = compile_with_subs(arena, &item_scope, params, &subs, e)?;
+                            schema.push(Field::new(String::new(), p.result_ty, true));
+                            exprs.push(p);
+                            let column = exprs.len() - 1;
+                            ksubs.push(Substitution { expr: e, column, structural: false });
+                            Ok(true)
+                        },
+                        0,
+                    )?;
+                    output_keys.push((keys.len(), o.expr, ksubs));
+                    // Not a projection column; always past `visible`.
+                    usize::MAX
+                }
             }
         };
         keys.push((col, o.desc, o.nulls_first));
@@ -1641,9 +1713,8 @@ pub(super) fn bind_select_in(
     node = Node::Project { input: Box::new(node), exprs, schema: project_schema.clone() };
     let project_scope = Scope::from_fields(project_schema);
 
-    // QUALIFY filters the projected rows. Unqualified names resolve to the
-    // last output column of that name (`* REPLACE`, a trailing `AS` that
-    // shadows a star column, `RENAME`), matching DuckDB.
+    // QUALIFY filters the projected rows. An unqualified name that the input does not have
+    // resolves to an output column (an alias, or a `RENAME`d star column), matching DuckDB.
     if let Some(q) = sel.qualify {
         let pred = compile_predicate_with_subs(arena, &project_scope, params, &qualify_subs, q)?;
         node = Node::Filter { input: Box::new(node), pred };
@@ -1678,12 +1749,12 @@ pub(super) fn bind_select_in(
     // --- Sorting ------------------------------------------------------------
     if !keys.is_empty() {
         let mut sort_keys = Vec::with_capacity(keys.len());
-        for (col, desc, nulls_first) in keys {
-            sort_keys.push(SortKey {
-                expr: column_program(&project_scope, col)?,
-                desc,
-                nulls_first,
-            });
+        for (k, (col, desc, nulls_first)) in keys.into_iter().enumerate() {
+            let expr = match output_keys.iter().find(|(i, _, _)| *i == k) {
+                Some((_, e, ksubs)) => compile_with_subs(arena, &project_scope, params, ksubs, *e)?,
+                None => column_program(&project_scope, col)?,
+            };
+            sort_keys.push(SortKey { expr, desc, nulls_first });
         }
         // `ORDER BY ... LIMIT n OFFSET k` only needs to hold the top n+k. Lowering to a Top-N
         // avoids buffering everything. With DISTINCT ON (or DISTINCT that must wait until

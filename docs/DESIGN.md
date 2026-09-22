@@ -497,7 +497,7 @@ FROM <table | parquet('url') | read_json[_auto]('url') | generate_series(...) | 
   [, LATERAL? UNNEST(<expr>) ...]
   [TABLESAMPLE|USING SAMPLE <n>% | <n> ROWS | (bernoulli|system|reservoir)(...) ]
 [WHERE <expr>]
-[GROUP BY <expr>, ... | ALL | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)]
+[GROUP BY ALL | <expr | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)>, ...]
 [HAVING <expr>] [QUALIFY <expr>]
 [WINDOW name AS (...), ...]
 [ORDER BY <expr> [ASC|DESC] [NULLS FIRST|LAST], ... | ALL [ASC|DESC] [NULLS FIRST|LAST]]

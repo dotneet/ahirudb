@@ -61,6 +61,23 @@ pub(super) fn resolve_select_ref(
     Ok(id)
 }
 
+/// The output column a bare name refers to when it is read as a SELECT-list alias.
+///
+/// An explicit `AS` alias wins over an output column that merely carries the name (a plain
+/// column reference, a `*` expansion): `SELECT order_id AS amount, amount ... ORDER BY amount`
+/// sorts by `order_id`, as in DuckDB. Among several explicit aliases, or several plain names,
+/// the last one wins (DuckDB: `SELECT a AS x, b AS x ... ORDER BY x` sorts by `b`).
+///
+/// `aliased[i]` says whether output column `i` got its name from an explicit alias; `schema`
+/// is the projected output only (see `order_output_column`).
+pub(super) fn output_alias_column(name: &str, schema: &[Field], aliased: &[bool]) -> Option<usize> {
+    let named = |i: usize| eq_ascii_ci(schema[i].name.as_bytes(), name.as_bytes());
+    (0..schema.len())
+        .rev()
+        .find(|&i| aliased.get(i).copied().unwrap_or(false) && named(i))
+        .or_else(|| (0..schema.len()).rev().find(|&i| !schema[i].name.is_empty() && named(i)))
+}
+
 /// Returns the column number if an ORDER BY item points at an output column.
 ///
 /// `schema` is the *projected* output schema only. Hidden columns appended after it
@@ -72,6 +89,7 @@ pub(super) fn order_output_column(
     sel: &SelectStmt,
     o: &OrderByItem,
     schema: &[Field],
+    aliased: &[bool],
 ) -> Result<Option<usize>> {
     if let Some(n) = numeric_ordinal_of(arena, o.expr) {
         return Ok(Some(ordinal_index(n, schema.len())?));
@@ -80,12 +98,7 @@ pub(super) fn order_output_column(
         // Resolve aliases against the *expanded* output schema, not the
         // select-item index. `SELECT *, expr AS extra ORDER BY extra` has
         // `extra` as item 1 but schema column N after the star expands.
-        // Output aliases are resolved last-wins when a SELECT list contains
-        // duplicate names. This is also the rule used by QUALIFY, and keeps
-        // ORDER BY consistent with the post-projection output scope.
-        if let Some(i) =
-            schema.iter().rposition(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
-        {
+        if let Some(i) = output_alias_column(name, schema, aliased) {
             return Ok(Some(i));
         }
     }
@@ -290,6 +303,46 @@ pub(super) fn each_child_flat(
     f(cur)?;
     for &r in spine.iter().rev() {
         f(r)?;
+    }
+    Ok(())
+}
+
+/// Visits `id` and its descendants in pre-order, not descending below a node for which `f`
+/// returns `true`.
+///
+/// Left-deep binary chains are descended in a loop, as in [`each_child_flat`], so a long flat
+/// chain costs one stack frame. Unlike `each_child_flat`, every inner node of the spine is
+/// offered to `f` as well: in `a*2 + 1` the node `a*2` is such an inner node, and a caller
+/// matching sub-expressions against `GROUP BY a*2` must get to see it.
+pub(super) fn walk_pruned(
+    arena: &ExprArena,
+    id: ExprId,
+    f: &mut dyn FnMut(ExprId) -> Result<bool>,
+    depth: u32,
+) -> Result<()> {
+    ensure!(depth < MAX_EXPR_DEPTH, ExpressionTooDeep);
+    if f(id)? {
+        return Ok(());
+    }
+    let d = depth + 1;
+    let mut spine: Vec<ExprId> = Vec::new();
+    let mut cur = id;
+    let mut bottom_done = false;
+    while let Expr::Binary { lhs, rhs, .. } = arena.get(cur) {
+        spine.push(*rhs);
+        cur = *lhs;
+        if f(cur)? {
+            bottom_done = true;
+            break;
+        }
+    }
+    // `cur` has been offered to `f` already (it is `id` when there is no spine), so only its
+    // children are left. When the loop stopped on a non-binary node, that is all of them.
+    if !bottom_done {
+        each_child(arena, cur, &mut |c| walk_pruned(arena, c, f, d))?;
+    }
+    for &r in spine.iter().rev() {
+        walk_pruned(arena, r, f, d)?;
     }
     Ok(())
 }
