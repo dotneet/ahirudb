@@ -1,7 +1,9 @@
 //! The bytecode VM's execution loop.
 //!
 //! One instruction = one kernel call. There are no branch instructions, so execution is a simple
-//! linear walk of the instruction sequence (see the design decision in mod.rs).
+//! linear walk of the instruction sequence (see the design decision in mod.rs). The one
+//! instruction that does not evaluate over every row, `Lazy`, runs a nested sub-program over a
+//! narrower selection of the same batch (see "Guarded operands" in mod.rs).
 //!
 //! The VM has only three responsibilities:
 //! - Resolving selection. `LoadCol` gathers, so every kernel afterwards sees only dense vectors
@@ -11,9 +13,9 @@
 //!   type (DECIMAL scale and the like) is decided and passed by the VM.
 
 use crate::expr::kernels;
-use crate::expr::{Instr, OpCode, Program, Reg};
+use crate::expr::{Instr, OpCode, Program, Reg, MASK_NOT_FALSE, MASK_NOT_TRUE, MASK_NULL};
 use crate::prelude::*;
-use crate::vector::{Batch, PhysType, Ty, Value, Vector};
+use crate::vector::{Batch, Bitmap, PhysType, Ty, Value, Vector};
 
 /// The register file. Reused across a query to keep allocations down.
 pub struct Vm {
@@ -28,17 +30,30 @@ impl Vm {
     /// Evaluates `p` against `batch` and returns the result vector.
     /// The returned vector's length is `batch.card()`.
     pub fn eval(&mut self, p: &Program, batch: &Batch) -> Result<Vector> {
+        self.eval_rows(p, &batch.cols, batch.sel.as_deref(), batch.card())
+    }
+
+    /// `eval` over explicit parts of a batch: its columns, the selection (`None` = every row) and
+    /// the row count after selection. `Lazy` uses this to run a sub-program over a narrower
+    /// selection of the same columns without copying them into a new `Batch`.
+    fn eval_rows(
+        &mut self,
+        p: &Program,
+        cols: &[Vector],
+        sel: Option<&[u32]>,
+        n: usize,
+    ) -> Result<Vector> {
         // A program whose register/side-table counters saturated while it was
         // being compiled cannot be executed: its `u16` operand fields would
         // alias two different values onto the same slot, which is a wrong
         // answer rather than a slow one. See `Program::overflow`.
         ensure!(!p.overflow, LimitExceeded);
-        let n = batch.card();
         while self.regs.len() < p.num_regs as usize {
             self.regs.push(Vector::new(Ty::Null));
         }
+        let rows = Rows { cols, sel, n };
         for ins in p.instrs.iter() {
-            exec(&mut self.regs, ins, p, batch)?;
+            exec(&mut self.regs, ins, p, &rows)?;
         }
         let r = p.result as usize;
         ensure!(r < self.regs.len(), Internal);
@@ -160,18 +175,84 @@ fn const_vector(ty: Ty, v: &Value) -> Result<Vector> {
     Ok(out)
 }
 
-fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, batch: &Batch) -> Result<()> {
+/// The rows a program runs over: the batch's columns, its selection and the selected row count.
+struct Rows<'a> {
+    cols: &'a [Vector],
+    sel: Option<&'a [u32]>,
+    n: usize,
+}
+
+/// `OpCode::Lazy`: evaluates `p.subs[ins.aux]` over the rows where register `ins.a` satisfies
+/// mask mode `ins.b`, NULL elsewhere.
+///
+/// When no row is selected the sub-program is not run at all and a length-1 NULL comes back (the
+/// combining instruction broadcasts it). When every row is selected it runs over the same
+/// selection with no gather/scatter. Otherwise the selected rows' batch row numbers become the
+/// sub-program's selection, and its dense result is scattered back to `n` rows with a gather.
+#[inline(never)]
+fn lazy(regs: &[Vector], ins: &Instr, p: &Program, rows: &Rows) -> Result<Vector> {
+    let sub = match p.subs.get(ins.aux as usize) {
+        Some(s) => s,
+        None => err!(Internal),
+    };
+    let m = reg(regs, ins.a)?;
+    let n = rows.n;
+    let konst = m.len() == 1;
+    ensure!(konst || m.len() == n, Internal);
+    let bool_mask = ins.b != MASK_NULL;
+    if bool_mask {
+        ensure!(m.data().phys() == PhysType::Bool, TypeMismatch);
+    }
+    let mut hit = Bitmap::with_capacity(n);
+    for i in 0..n {
+        let j = if konst { 0 } else { i };
+        let valid = m.is_valid(j);
+        let t = bool_mask && m.bools().get(j);
+        hit.push(match ins.b {
+            MASK_NULL => !valid,
+            MASK_NOT_TRUE => !(valid && t),
+            MASK_NOT_FALSE => !valid || t,
+            _ => valid && t,
+        });
+    }
+    let k = hit.count_ones();
+    if k == 0 {
+        return const_vector(sub.result_ty, &Value::Null);
+    }
+    if k == n {
+        return Vm::new().eval_rows(sub, rows.cols, rows.sel, n);
+    }
+    let mut picked = Vec::with_capacity(k);
+    hit.append_set_indices(&mut picked);
+    let sub_sel: Vec<u32> = match rows.sel {
+        Some(s) => picked.iter().map(|&i| s[i as usize]).collect(),
+        None => picked.clone(),
+    };
+    let part = Vm::new().eval_rows(sub, rows.cols, Some(&sub_sel), k)?;
+    // Scatter: row `picked[j]` takes `part[j]`; every other row takes `part[0]` and is then
+    // masked to NULL.
+    let mut idx = vec![0u32; n];
+    for (j, &i) in picked.iter().enumerate() {
+        idx[i as usize] = j as u32;
+    }
+    let mut out = part.gather(&idx);
+    out.validity_mut().and_assign(&hit);
+    Ok(out)
+}
+
+fn exec(regs: &mut [Vector], ins: &Instr, p: &Program, rows: &Rows) -> Result<()> {
     use OpCode::*;
     let out = match ins.op {
         LoadCol => {
             let c = ins.aux as usize;
-            ensure!(c < batch.cols.len(), Internal);
-            match &batch.sel {
+            ensure!(c < rows.cols.len(), Internal);
+            match rows.sel {
                 // Resolving selection here means no kernel afterwards has to know about selection at all.
-                Some(sel) => batch.cols[c].gather(sel),
-                None => batch.cols[c].clone(),
+                Some(sel) => rows.cols[c].gather(sel),
+                None => rows.cols[c].clone(),
             }
         }
+        Lazy => lazy(regs, ins, p, rows)?,
         LoadConst => {
             let c = ins.aux as usize;
             ensure!(c < p.consts.len(), Internal);
@@ -704,6 +785,68 @@ mod tests {
         assert_eq!(i32s_of(&r)[0], 1);
         assert_eq!(i32s_of(&r)[1], 8);
         assert!(!r.is_valid(2));
+    }
+
+    // --- Lazy (guarded sub-programs) -----------------------------------------
+
+    /// `Lazy(mode, mask = col0)` over a sub-program computing `col1 * 10`. The sub-program's
+    /// `LoadCol` sees only the selected rows, and every other row comes back NULL.
+    fn lazy_of(mode: u16, batch: &Batch) -> Vector {
+        let mut sub = Program::new();
+        let r0 = sub.alloc_reg();
+        let r1 = sub.alloc_reg();
+        let r2 = sub.alloc_reg();
+        sub.push(Instr::with_aux(OpCode::LoadCol, PhysType::I32, r0, 0, 0, 1));
+        let k = sub.add_const(Ty::Int, Value::I32(10));
+        sub.push(Instr::with_aux(OpCode::LoadConst, PhysType::I32, r1, 0, 0, k));
+        sub.push(Instr::new(OpCode::Mul, PhysType::I32, r2, r0, r1));
+        sub.result = r2;
+        sub.result_ty = Ty::Int;
+
+        let mut p = Program::new();
+        let rm = p.alloc_reg();
+        let rd = p.alloc_reg();
+        p.push(Instr::with_aux(OpCode::LoadCol, PhysType::Bool, rm, 0, 0, 0));
+        let si = p.add_sub(sub);
+        p.push(Instr::with_aux(OpCode::Lazy, PhysType::I32, rd, rm, mode, si));
+        p.result = rd;
+        Vm::new().eval(&p, batch).unwrap()
+    }
+
+    fn opt_i32(v: &Vector) -> Vec<Option<i32>> {
+        (0..v.len()).map(|i| if v.is_valid(i) { Some(v.i32s()[i]) } else { None }).collect()
+    }
+
+    #[test]
+    fn lazy_evaluates_only_the_masked_rows() {
+        use crate::expr::{MASK_NOT_FALSE, MASK_NOT_TRUE, MASK_NULL, MASK_TRUE};
+        let batch = Batch::new(vec![bools(&[T, F, N, T]), ints(&[1, 2, 3, 4])]);
+        assert_eq!(opt_i32(&lazy_of(MASK_TRUE, &batch)), vec![Some(10), None, None, Some(40)]);
+        assert_eq!(opt_i32(&lazy_of(MASK_NOT_TRUE, &batch)), vec![None, Some(20), Some(30), None]);
+        assert_eq!(
+            opt_i32(&lazy_of(MASK_NOT_FALSE, &batch)),
+            vec![Some(10), None, Some(30), Some(40)]
+        );
+        assert_eq!(opt_i32(&lazy_of(MASK_NULL, &batch)), vec![None, None, Some(30), None]);
+    }
+
+    #[test]
+    fn lazy_with_no_row_or_every_row_selected() {
+        use crate::expr::MASK_TRUE;
+        let batch = Batch::new(vec![bools(&[F, N]), ints(&[1, 2])]);
+        // Nothing selected: the sub-program does not run and every row is NULL.
+        assert_eq!(opt_i32(&lazy_of(MASK_TRUE, &batch)), vec![None, None]);
+        let batch = Batch::new(vec![bools(&[T, T]), ints(&[1, 2])]);
+        assert_eq!(opt_i32(&lazy_of(MASK_TRUE, &batch)), vec![Some(10), Some(20)]);
+    }
+
+    #[test]
+    fn lazy_composes_with_the_batch_selection() {
+        use crate::expr::MASK_TRUE;
+        let mut batch = Batch::new(vec![bools(&[T, T, F, T, N, T]), ints(&[1, 2, 3, 4, 5, 6])]);
+        // Batch rows 1, 2, 4, 5 are live; of those the mask selects rows 1 and 5.
+        batch.sel = Some(vec![1, 2, 4, 5]);
+        assert_eq!(opt_i32(&lazy_of(MASK_TRUE, &batch)), vec![Some(20), None, None, Some(60)]);
     }
 
     // --- Bytes --------------------------------------------------------------

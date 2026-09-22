@@ -705,6 +705,30 @@ recursively per row.
 > handling of `IN`/`BETWEEN` at the Parquet scan layer (§17) — the VM's job
 > is correctly evaluating the predicate against whatever rows already got
 > read; pruning's job is deciding which RowGroups/pages to read at all.
+>
+> **Guarded operands (`Lazy`).** "Evaluate both sides" stopped being
+> unobservable once scalar functions could raise per-row errors
+> (`factorial` overflow, `repeat` size limit, `CAST(... AS JSON)`):
+> `CASE WHEN i < 30 THEN factorial(i) END` failed on rows the WHEN had
+> excluded. So an operand that not every row reaches — a later WHEN
+> condition, a THEN/ELSE value, the rhs of `AND`/`OR`, a later
+> `COALESCE`/`IFNULL` argument, a later WHERE conjunct merged by
+> `and_programs` — is compiled as its own program first. If
+> `Program::may_raise` says it cannot fail (no call, no narrowing or JSON
+> cast), it is inlined exactly as before, so the common case pays nothing.
+> Otherwise it goes into `Program::subs` and one `Lazy` instruction runs it
+> over only the rows a mask register selects: the selected rows' batch
+> indices become a narrower selection vector over the *same* columns (no
+> copy), and the dense result is scattered back with NULL elsewhere. No row
+> selected skips the sub-program entirely; every row selected runs it with
+> no gather/scatter. The combining `Select`/`And`/`Or`/`Coalesce` is
+> unchanged. This keeps the "no branch instructions, linear walk" property;
+> `CASE` lowers flat (a running "already matched" register per WHEN), so a
+> long WHEN list does not nest programs. The alternative — a masked-error
+> mode where fallible kernels record per-row errors that are raised only if
+> selected — would have touched every fallible kernel and still wasted the
+> work on unreached rows. User-facing guarantee: docs/sql/queries.md
+> ("Guarded evaluation").
 
 ```
 instr: { op: u8, ty: u8, dst: u16, a: u16, b: u16 }
