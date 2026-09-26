@@ -517,6 +517,8 @@ fn agg_name(fname: &str, arena: &ExprArena, arg: ExprId) -> String {
 /// `const_subs` lists the scalar subqueries that are constant with respect to
 /// the grouping (uncorrelated ones, which `bind_select_in` attaches *after* the
 /// aggregate). Any other scalar subquery varies per input row and is rejected.
+/// It may also list column references already bound to a SELECT-list alias
+/// (HAVING's `add_having_alias_subs`), which are let through the same way.
 pub(super) fn check_grouped(
     arena: &ExprArena,
     scope: &Scope,
@@ -539,7 +541,11 @@ pub(super) fn check_grouped(
                 // A column that exists in the input reaching here = it is in neither GROUP BY
                 // nor an aggregate.
                 Expr::ColumnRef { qualifier, name } => {
-                    ensure!(scope.resolve(qualifier.as_deref(), name).is_err(), NotGrouped);
+                    ensure!(
+                        const_subs.contains(&e)
+                            || scope.resolve(qualifier.as_deref(), name).is_err(),
+                        NotGrouped
+                    );
                     Ok(true)
                 }
                 // An uncorrelated scalar subquery is a constant, and so is legal anywhere in

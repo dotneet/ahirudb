@@ -59,6 +59,25 @@ impl FromTree {
             }
         }
     }
+
+    /// Marks every column on the NULL-padded side of an outer join nullable (the right side of
+    /// a LEFT JOIN, the left of a RIGHT JOIN, both of a FULL JOIN). A `NOT NULL` column there
+    /// still produces NULLs, and `DESCRIBE`, the `NOT IN` anti-join choice and the writers all
+    /// read `Field::nullable`.
+    pub(super) fn mark_outer_nullable(&self, rels: &mut [Rel], padded: bool) {
+        match self {
+            FromTree::Rel(i) => {
+                if padded {
+                    rels[*i].all.iter_mut().for_each(|f| f.nullable = true);
+                }
+            }
+            FromTree::Join { left, right, kind, .. } => {
+                let full = *kind == JoinKind::Full;
+                left.mark_outer_nullable(rels, padded || full || *kind == JoinKind::Right);
+                right.mark_outer_nullable(rels, padded || full || *kind == JoinKind::Left);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

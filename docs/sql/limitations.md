@@ -66,6 +66,12 @@ user-visible effect.
   rebuild their output column list while being desugared, so the shorthand
   is rejected rather than silently resolved against the wrong columns. Use
   an explicit `ORDER BY` list there.
+- **`QUALIFY` next to a select-list `UNNEST` sees no select-list aliases.**
+  The expansion happens after `QUALIFY` (as in DuckDB), so the filter runs
+  against the input columns and window results only; DuckDB also accepts a
+  reference to another item's alias there (`SELECT id + 1 AS j, UNNEST(xs)
+  ... QUALIFY j = 2`), which here fails with `column not found`. Repeat the
+  expression instead.
 - **`PIVOT ... ON x`** requires an explicit `IN (...)` value list.
   DuckDB's auto-detect-distinct-values form (`PIVOT t ON x USING agg(y)`
   with no `IN`) is not supported — enumerate the pivot values yourself.
@@ -74,7 +80,10 @@ user-visible effect.
   `USING sum(a), avg(b)` aggregates aren't supported.
 - **`UNPIVOT`** supports only single-column-at-a-time unpivoting; DuckDB's
   `UNPIVOT ... ON (a, b), (c, d)` (unpivoting several columns into several
-  value columns at once) isn't supported.
+  value columns at once) isn't supported. Neither is the SQL-standard
+  `FROM t UNPIVOT [INCLUDE NULLS] (v FOR n IN (...))` form, so there is no
+  way to keep the rows whose value is NULL (the `UNPIVOT` statement drops
+  them, as DuckDB's does).
 - **Star expressions**: `COLUMNS(*)`, `COLUMNS('regex')`,
   `COLUMNS(['a','b'])` and the `AS '\1'` capture-group renaming form all
   work (see [queries.md](queries.md#columns)), but four DuckDB star-expression
@@ -257,6 +266,14 @@ user-visible effect.
     are `Box` chains whose *drop* alone recurses once per link, so the cap
     stays low. Nest them differently (union in batches through a CTE) if you
     generate SQL that hits it.
+  - *Plan depth* is capped at 256 operator levels. Some constructs stack
+    plan levels without nesting anything in the SQL text: a chain of CTEs
+    each reading the previous one (`WITH c1 AS (... FROM c0), c2 AS (...
+    FROM c1), ...`), views expanding to such chains, or hundreds of
+    `IN (SELECT ...)` / `EXISTS` / `> ANY (...)` conjuncts. Building and
+    running a plan recurses once per level, so a plan past the cap is
+    rejected with `expression nesting too deep` (a plain CTE chain of about
+    250 links is the practical maximum). DuckDB has no such limit.
 - **`printf('%f', ...)` prints the value's full exact binary expansion**,
   as C's `printf` does. `printf('%f', 1e300)` therefore prints all 301
   integer digits of the `DOUBLE` nearest `1e300`, where DuckDB prints the
