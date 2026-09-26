@@ -25,17 +25,18 @@
 //!
 //! ## Path syntax (what is supported)
 //!
-//! DuckDB's `$.a.b[0]` form, implemented straightforwardly, plus the ability to omit
-//! the leading `$` (`a.b[0]` means the same; a deliberate simplification that is not DuckDB-compatible).
+//! The three forms DuckDB accepts, told apart by the first character:
 //!
-//! - `$` or omitted: the whole root
-//! - `.key` / a bare `key`: an object member
-//! - `."quoted key"`: for keys containing `.`/`[`. Only `\"` and `\\` escapes are supported
-//!   (a simplification: the full JSON string escape set, `\uXXXX` and friends, is not supported)
-//! - `[N]`: an array element. 0-based, and negative counts from the end (as in DuckDB)
-//! - any number of the above can be chained (`$.a[0].b` and so on)
-//!
-//! **Unsupported**: JSON Pointer notation (`/a/b/0`).
+//! - `$...`: JSONPath.
+//!   - `$` alone: the whole root
+//!   - `.key`: an object member
+//!   - `."quoted key"`: for keys containing `.`/`[`
+//!   - `[N]`: an array element. 0-based, and negative counts from the end (as in DuckDB)
+//!   - any number of the above can be chained (`$.a[0].b` and so on)
+//! - `/...`: JSON Pointer (RFC 6901, `/a/b/0`, with `~1` for `/` and `~0` for `~`). A token
+//!   is an index only on an array, and only as a plain non-negative decimal.
+//! - anything else: the whole string is one member name (`'a.b'` is the key `a.b`, not a
+//!   path; an empty path is the whole document).
 //!
 //! ## Known limitations
 //!
@@ -123,6 +124,13 @@ pub(crate) fn scan_number(b: &[u8], start: usize) -> Result<usize> {
     let mut i = start;
     if b.get(i) == Some(&b'-') {
         i += 1;
+    }
+    // DuckDB writes non-finite doubles as `NaN`/`Infinity`/`-Infinity` and reads them back
+    // (`json_valid('[NaN,-Infinity]')` is true), so they are number tokens here too.
+    for w in [&b"NaN"[..], b"Infinity"] {
+        if b.get(i..).is_some_and(|r| r.starts_with(w)) {
+            return Ok(i + w.len());
+        }
     }
     let d0 = i;
     if b.get(i) == Some(&b'0') {
@@ -410,12 +418,43 @@ pub fn minify_into(doc: &[u8], out: &mut Vec<u8>) {
 enum Seg {
     Key(Vec<u8>),
     Index(i64),
+    /// A JSON Pointer reference token: a member name on an object, an index on an array.
+    Ptr(Vec<u8>),
 }
 
 /// Turns a path string into a sequence of segments. See "Path syntax" in the module docs.
 fn parse_path(p: &[u8]) -> Result<Vec<Seg>> {
-    let mut i = if p.first() == Some(&b'$') { 1 } else { 0 };
     let mut segs = Vec::new();
+    match p.first() {
+        // An empty path is the whole document.
+        None => return Ok(segs),
+        Some(b'$') => {}
+        // JSON Pointer (RFC 6901): `/`-separated tokens with `~1` for `/` and `~0` for `~`.
+        Some(b'/') => {
+            for tok in p[1..].split(|&c| c == b'/') {
+                let mut k = Vec::with_capacity(tok.len());
+                let mut j = 0;
+                while j < tok.len() {
+                    match (tok[j], tok.get(j + 1)) {
+                        (b'~', Some(&e @ (b'0' | b'1'))) => {
+                            k.push(if e == b'1' { b'/' } else { b'~' });
+                            j += 2;
+                        }
+                        (c, _) => {
+                            k.push(c);
+                            j += 1;
+                        }
+                    }
+                }
+                segs.push(Seg::Ptr(k));
+            }
+            return Ok(segs);
+        }
+        // DuckDB reads any other path as one member name, whole: `'a.b'` looks up the key
+        // `a.b`, not `a` then `b`.
+        Some(_) => return Ok(vec![Seg::Key(p.to_vec())]),
+    }
+    let mut i = 1;
     while i < p.len() {
         match p[i] {
             b'.' => {
@@ -460,15 +499,7 @@ fn parse_path(p: &[u8]) -> Result<Vec<Seg>> {
                 segs.push(Seg::Index(n));
                 i = j + 1;
             }
-            _ => {
-                // A shorthand path whose first segment starts without `.`/`[` (`a.b[0]`).
-                let start = i;
-                while i < p.len() && !matches!(p[i], b'.' | b'[') {
-                    i += 1;
-                }
-                ensure!(i > start, SyntaxError, start);
-                segs.push(Seg::Key(p[start..i].to_vec()));
-            }
+            _ => err!(SyntaxError, i),
         }
     }
     Ok(segs)
@@ -569,25 +600,25 @@ pub(crate) fn extract<'a>(doc: &'a [u8], path: &[u8]) -> Result<Option<(&'a [u8]
     let mut vs = skip_ws(doc, 0);
     for seg in &segs {
         let b0 = byte_at(doc, vs)?;
-        match seg {
-            Seg::Key(k) => {
-                if b0 != b'{' {
-                    return Ok(None);
-                }
-                match find_member(doc, vs, k)? {
-                    Some(s) => vs = s,
-                    None => return Ok(None),
-                }
+        let (key, idx) = match seg {
+            Seg::Key(k) => (Some(k.as_slice()), None),
+            Seg::Index(n) => (None, Some(*n)),
+            // A pointer token indexes an array only when it is a plain non-negative decimal
+            // without leading zeros (`/0`, `/12`; `/01` and `/-1` find nothing, as in DuckDB).
+            Seg::Ptr(k) if b0 == b'[' => {
+                let ok = !k.is_empty() && (k.len() == 1 || k[0] != b'0');
+                (None, if ok { parse_i64(k).filter(|&n| n >= 0 && k[0] != b'-') } else { None })
             }
-            Seg::Index(idx) => {
-                if b0 != b'[' {
-                    return Ok(None);
-                }
-                match nth_element(doc, vs, *idx)? {
-                    Some(s) => vs = s,
-                    None => return Ok(None),
-                }
-            }
+            Seg::Ptr(k) => (Some(k.as_slice()), None),
+        };
+        let next = match (key, idx) {
+            (Some(k), _) if b0 == b'{' => find_member(doc, vs, k)?,
+            (None, Some(n)) if b0 == b'[' => nth_element(doc, vs, n)?,
+            _ => None,
+        };
+        match next {
+            Some(s) => vs = s,
+            None => return Ok(None),
         }
     }
     let end = skip_value(doc, vs)?;
@@ -653,14 +684,13 @@ pub(crate) fn list_slice(doc: &[u8], start: i64, end: i64) -> Result<Option<(usi
     if count == 0 {
         return Ok(Some((empty_at, empty_at)));
     }
-    // Normalize to a 1-based inclusive interval before clamping. 0 is treated as 1
-    // (confirmed by `duckdb -c "select [1,2,3,4,5][0:2]"` returning the same `[1, 2]`
-    // as `[1,2,3,4,5][1:2]`). Negatives use `saturating_add` to avoid overflow
-    // (guarding against huge negative indices from untrusted input).
+    // Normalize to a 1-based inclusive interval before clamping. A start of 0 is treated
+    // as 1 but an end of 0 as 0, i.e. before the first element (confirmed by `duckdb -c
+    // "select [1,2,3,4,5][0:2], [1,2,3][2:0], list_slice([1,2,3], 0, 0)"` -> `[1, 2]`, `[]`,
+    // `[]`). Negatives use `saturating_add` to avoid overflow (guarding against huge
+    // negative indices from untrusted input).
     let norm = |v: i64| -> i64 {
-        if v == 0 {
-            1
-        } else if v < 0 {
+        if v < 0 {
             count.saturating_add(v).saturating_add(1)
         } else {
             v
@@ -789,8 +819,13 @@ pub(crate) fn array_elements(doc: &[u8]) -> Result<Option<Vec<Elem<'_>>>> {
 
 /// A JSON number token as an `i64`. With a decimal point or exponent, or out of range,
 /// gives `None` (the caller turns it into SQL NULL). The same judgment as
-/// `format::jsonl::parse_i64`, but placed on the `json` side specifically for UNNEST's native type recovery.
+/// `format::jsonl::parse_i64`.
 pub(crate) fn parse_i64(s: &[u8]) -> Option<i64> {
+    parse_i128(s)?.try_into().ok()
+}
+
+/// A JSON integer token (digits with an optional `-`) as an `i128`; `None` otherwise.
+pub(crate) fn parse_i128(s: &[u8]) -> Option<i128> {
     let (neg, ds) = match s.first() {
         Some(b'-') => (true, &s[1..]),
         _ => (false, s),
@@ -798,13 +833,13 @@ pub(crate) fn parse_i64(s: &[u8]) -> Option<i64> {
     if ds.is_empty() {
         return None;
     }
-    // Accumulate on the negative side. That avoids special-casing i64::MIN.
-    let mut acc: i64 = 0;
+    // Accumulate on the negative side. That avoids special-casing i128::MIN.
+    let mut acc: i128 = 0;
     for &c in ds {
         if !c.is_ascii_digit() {
             return None;
         }
-        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i64)?;
+        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i128)?;
     }
     if neg {
         Some(acc)
@@ -818,10 +853,10 @@ pub(crate) fn parse_f64(s: &[u8]) -> Option<f64> {
     core::str::from_utf8(s).ok()?.parse::<f64>().ok()
 }
 
-/// The type name for `json_type`. Matches DuckDB's actual strings, except that
-/// DuckDB's behavior of picking UBIGINT/DOUBLE for numbers based on sign and overflow
-/// is not reproduced: every integer is simplified to `"BIGINT"` (an additional
-/// simplification beyond the module docs; see the tests and docs in `expr::funcs`).
+/// The type name for `json_type`, DuckDB's strings. An integer is `UBIGINT` when it is
+/// non-negative and fits 64 bits, `BIGINT` when negative and fits, and `DOUBLE` otherwise
+/// (`json_type('1')` is `UBIGINT`, `json_type('-12345678901234567890')` is `DOUBLE`), as
+/// DuckDB's reader types it.
 pub(crate) fn type_name(kind: Kind, span: &[u8]) -> &'static str {
     match kind {
         Kind::Null => "NULL",
@@ -829,13 +864,11 @@ pub(crate) fn type_name(kind: Kind, span: &[u8]) -> &'static str {
         Kind::Str => "VARCHAR",
         Kind::Object => "OBJECT",
         Kind::Array => "ARRAY",
-        Kind::Num => {
-            if span.iter().any(|&c| c == b'.' || c == b'e' || c == b'E') {
-                "DOUBLE"
-            } else {
-                "BIGINT"
-            }
-        }
+        Kind::Num => match parse_i128(span) {
+            Some(v) if span[0] == b'-' && v >= i64::MIN as i128 => "BIGINT",
+            Some(v) if span[0] != b'-' && v <= u64::MAX as i128 => "UBIGINT",
+            _ => "DOUBLE",
+        },
     }
 }
 
@@ -908,25 +941,48 @@ fn cmp_array(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering> {
     }
 }
 
-/// Steps past the `,` after an element; stays on the closing `]`.
+/// Member-wise comparison of two objects (DuckDB compares STRUCTs field by field, in order);
+/// `a` and `b` both start with `{`. The keys are not compared.
+fn cmp_object(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering> {
+    let (mut i, mut j) = (skip_ws(a, 1), skip_ws(b, 1));
+    loop {
+        let (ea, eb) = (byte_at(a, i)? == b'}', byte_at(b, j)? == b'}');
+        if ea || eb {
+            return Ok(eb.cmp(&ea));
+        }
+        let (vi, vj) = (skip_ws(a, skip_member_key(a, i)?), skip_ws(b, skip_member_key(b, j)?));
+        let (ie, je) = (skip_value(a, vi)?, skip_value(b, vj)?);
+        let o = cmp_element(&a[vi..ie], &b[vj..je])?;
+        if o.is_ne() {
+            return Ok(o);
+        }
+        i = next_element(a, ie)?;
+        j = next_element(b, je)?;
+    }
+}
+
+/// Steps past the `,` after an element or member; stays on the closing `]`/`}`.
 fn next_element(b: &[u8], i: usize) -> Result<usize> {
     let i = skip_ws(b, i);
     match byte_at(b, i)? {
         b',' => Ok(skip_ws(b, i + 1)),
-        b']' => Ok(i),
+        b']' | b'}' => Ok(i),
         _ => err!(SyntaxError, i),
     }
 }
 
-/// Compares two array elements (non-empty spans already validated by `skip_value`).
-fn cmp_element(x: &[u8], y: &[u8]) -> Result<core::cmp::Ordering> {
+/// Compares two list elements (non-empty spans already validated by `skip_value`) the way
+/// DuckDB orders the typed values they stand for. Also the equality `list_contains`/
+/// `list_position` use, so `2` finds `2.0`.
+pub(crate) fn cmp_element(x: &[u8], y: &[u8]) -> Result<core::cmp::Ordering> {
     use core::cmp::Ordering;
     Ok(match (kind_of(x[0]), kind_of(y[0])) {
         (Kind::Null, Kind::Null) => Ordering::Equal,
         (Kind::Null, _) => Ordering::Greater,
         (_, Kind::Null) => Ordering::Less,
         (Kind::Array, Kind::Array) => cmp_array(x, y)?,
-        (Kind::Num, Kind::Num) => match (parse_i64(x), parse_i64(y)) {
+        (Kind::Object, Kind::Object) => cmp_object(x, y)?,
+        (Kind::Num, Kind::Num) => match (parse_i128(x), parse_i128(y)) {
             (Some(p), Some(q)) => p.cmp(&q),
             _ => match (parse_f64(x), parse_f64(y)) {
                 (Some(p), Some(q)) => crate::exec::rowkey::ord_f64(p, q),
@@ -1040,9 +1096,33 @@ mod tests {
     }
 
     #[test]
-    fn extract_bare_path_is_our_simplification() {
-        // In DuckDB 'a.b[1]' is NULL, but here omitting $ is allowed.
-        assert_eq!(ext(r#"{"a":{"b":[1,2,3]}}"#, "a.b[1]").unwrap().0, "2");
+    fn extract_bare_path_is_one_whole_key_like_duckdb() {
+        // duckdb: json_extract('{"a":{"b":1}}', 'a.b') -> NULL, json_extract('{"a.b":7}',
+        // 'a.b') -> 7, json_extract('{"a":1}', 'a') -> 1, json_extract('{"a":1}', '') -> {"a":1}.
+        assert!(ext(r#"{"a":{"b":[1,2,3]}}"#, "a.b[1]").is_none());
+        assert!(ext(r#"{"a":{"b":1}}"#, "a.b").is_none());
+        assert_eq!(ext(r#"{"a.b":7}"#, "a.b").unwrap().0, "7");
+        assert_eq!(ext(r#"{"a[0]":7}"#, "a[0]").unwrap().0, "7");
+        assert_eq!(ext(r#"{"a":1}"#, "a").unwrap().0, "1");
+        assert_eq!(ext(r#"{"a":1}"#, "").unwrap().0, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn extract_json_pointer_like_duckdb() {
+        // duckdb: json_extract('{"a":{"b":1}}', '/a/b') -> 1, '[1,[2,3]]' '/1/0' -> 2,
+        // '{"a/b":1,"m~n":2}' '/a~1b' -> 1 and '/m~0n' -> 2, '{"":5}' '/' -> 5,
+        // '{"a":{"1":9}}' '/a/1' -> 9; '/a/-1', '/a/5', '/a/x' on {"a":[1,2]} and '/01' on
+        // [1,2] -> NULL.
+        assert_eq!(ext(r#"{"a":{"b":1}}"#, "/a/b").unwrap().0, "1");
+        assert_eq!(ext("[1,[2,3]]", "/1/0").unwrap().0, "2");
+        assert_eq!(ext(r#"{"a/b":1,"m~n":2}"#, "/a~1b").unwrap().0, "1");
+        assert_eq!(ext(r#"{"a/b":1,"m~n":2}"#, "/m~0n").unwrap().0, "2");
+        assert_eq!(ext(r#"{"":5}"#, "/").unwrap().0, "5");
+        assert_eq!(ext(r#"{"a":{"1":9}}"#, "/a/1").unwrap().0, "9");
+        for p in ["/a/-1", "/a/5", "/a/x"] {
+            assert!(ext(r#"{"a":[1,2]}"#, p).is_none(), "{p}");
+        }
+        assert!(ext("[1,2]", "/01").is_none());
     }
 
     #[test]
@@ -1154,7 +1234,10 @@ mod tests {
         assert_eq!(type_name(Kind::Str, b"\"x\""), "VARCHAR");
         assert_eq!(type_name(Kind::Bool, b"true"), "BOOLEAN");
         assert_eq!(type_name(Kind::Null, b"null"), "NULL");
-        assert_eq!(type_name(Kind::Num, b"1"), "BIGINT");
+        // duckdb: json_type('1') is UBIGINT, json_type('-9223372036854775809') DOUBLE.
+        assert_eq!(type_name(Kind::Num, b"1"), "UBIGINT");
+        assert_eq!(type_name(Kind::Num, b"-9223372036854775809"), "DOUBLE");
+        assert_eq!(type_name(Kind::Num, b"-Infinity"), "DOUBLE");
         assert_eq!(type_name(Kind::Num, b"-1"), "BIGINT");
         assert_eq!(type_name(Kind::Num, b"1.5"), "DOUBLE");
         assert_eq!(type_name(Kind::Num, b"1e3"), "DOUBLE");

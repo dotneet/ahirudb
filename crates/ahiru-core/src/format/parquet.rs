@@ -275,7 +275,7 @@ impl TableFormat for ParquetFormat {
             .columns
             .iter()
             .zip(crate::format::unique_column_names(&names))
-            .map(|(c, name)| Field::new(name, c.ty, c.nullable))
+            .map(|(c, name)| Field::new(name, c.ty, c.nullable).shaped(c.shape()))
             .collect();
         self.file = Some(f);
         Ok(Ok(()))

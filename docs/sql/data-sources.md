@@ -343,9 +343,18 @@ Parquet's nested types (`STRUCT`, `LIST`, `MAP`) don't map onto SQL columns
   SELECT id, m FROM t;   -- m: '[{"key":"a","value":0},{"key":"b","value":0}]'
   ```
 
-  Leaves render as `to_json` does in DuckDB: numbers as numbers, dates,
-  timestamps, UUIDs and `INTERVAL`s as strings (`["02:00:00","1 day"]`),
-  and a `JSON` leaf as the document it holds.
+  Leaves render as `to_json` does in DuckDB: numbers as numbers
+  (non-finite doubles as `NaN`/`Infinity`/`-Infinity`, a `DECIMAL` of
+  precision 15 or less as a double: `1.5`, not `1.50`), dates, timestamps,
+  UUIDs and `INTERVAL`s as strings (`["02:00:00","1 day"]`), a `BLOB` as a
+  string of its VARCHAR form (`["\\x00\\x01\\xFF","abc"]`), and a `JSON` leaf
+  as the document it holds.
+
+  The element type is not lost: for a `LIST` of a plain scalar type, and a
+  `MAP` of scalar keys and values, `xs[i]`, `m[k]` and `UNNEST(xs)` return
+  the element as its Parquet type (`INTEGER`, `VARCHAR`, `DECIMAL(4,2)`,
+  `BLOB`, ...), as they do in DuckDB — see
+  [functions-json.md](functions-json.md#accessing-listmap-elements).
 
 - **A column with the `JSON` logical type is a `JSON` column**, not
   `VARCHAR`, so the JSON functions apply to it directly and

@@ -630,18 +630,21 @@ cannot refer to the `UNNEST` output, nor (unlike DuckDB) to any other
 select-list alias of such a query — see
 [limitations.md](limitations.md#partially-supported).
 
-If every element of the array is the same scalar type, `UNNEST` restores
-that native type (`BIGINT`, `VARCHAR`, `BOOLEAN`, ...) rather than leaving
-the result as `JSON` text; a mixed-type array stays `JSON`. A `NULL` or
-empty array produces zero rows (not a row with a `NULL` value).
+When the array's element type is known before the query runs, `UNNEST`
+returns the elements as that type, as DuckDB does: a Parquet `LIST<scalar>`
+column (`INTEGER[]` gives `INTEGER`, `VARCHAR[]` gives unquoted `VARCHAR`,
+`DOUBLE[]`/`DECIMAL`/`DATE`/`TIMESTAMP`/`BLOB`/... likewise),
+`string_split(...)`, a list literal whose elements share one scalar type, and
+the list functions that keep their input's elements (`list_sort`,
+`list_slice`, `list_filter`, ...). Anything else — a `JSON` value read from a
+JSON/JSONL file, a list of lists, a mixed-type literal — stays `JSON`. A
+`NULL` or empty array produces zero rows (not a row with a `NULL` value).
 
-The restored type is wide enough for every element, so an integer past
-`BIGINT` comes back as `HUGEINT` (`UNNEST([1, 9223372036854775808])` yields
-`1` and `9223372036854775808`, as in DuckDB) rather than turning into
-`NULL`. One known gap: arrays travel as JSON text, and JSON has no way to
-spell infinity or NaN, so a non-finite `DOUBLE` element written into an
-array literal (`UNNEST([1.5, 1e400])`) becomes `NULL` — DuckDB, which has a
-real `LIST` type, keeps `inf` there.
+A literal's element type is the common type of its elements, so an integer
+past `BIGINT` comes back as `HUGEINT` (`UNNEST([1, 9223372036854775808])`
+yields `1` and `9223372036854775808`, as in DuckDB), and non-finite `DOUBLE`
+elements survive the JSON text as `NaN`/`Infinity`/`-Infinity`
+(`UNNEST([1.5, 1e400])` yields `1.5` and `inf`).
 
 ## Table functions: generate_series / range
 

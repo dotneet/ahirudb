@@ -282,8 +282,8 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             out.extend_from_slice(name);
         }
         F_STRING_SPLIT => string_split(a.bytes(0), a.bytes(1), out),
-        F_LIST_SORT | F_LIST_DISTINCT | F_LIST_REVERSE => {
-            return super::json::list_rearrange(id, a.bytes(0), out);
+        F_LIST_SORT | F_LIST_REVERSE_SORT | F_LIST_DISTINCT | F_LIST_REVERSE => {
+            return super::json::list_rearrange(id, a, out);
         }
         F_REVERSE => {
             let s = a.bytes(0);
@@ -408,14 +408,21 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                 write_json_scalar(v, j, out);
             }
         }
-        F_LIST_EXTRACT => {
-            return match crate::json::list_index(a.bytes(0), a.int(1))? {
-                Some(span) => {
-                    out.extend_from_slice(span);
-                    Ok(true)
-                }
-                None => Ok(false),
+        // A JSON `null` element is SQL NULL, as a NULL list element is in DuckDB. The `_TEXT`
+        // forms unquote a string element so `Compiler::subscript` can cast it to the element type.
+        F_LIST_EXTRACT | F_LIST_EXTRACT_TEXT | F_MAP_VALUE | F_MAP_VALUE_TEXT => {
+            let found = if matches!(id, F_LIST_EXTRACT | F_LIST_EXTRACT_TEXT) {
+                crate::json::list_index(a.bytes(0), a.int(1))?
+            } else {
+                crate::json::map_get(a.bytes(0), a.bytes(1))?
             };
+            let Some(span) = found else { return Ok(false) };
+            let kind = crate::json::kind_of(span.first().copied().unwrap_or(b'n'));
+            if matches!(id, F_LIST_EXTRACT_TEXT | F_MAP_VALUE_TEXT) {
+                return crate::json::write_extracted_text(span, kind, out);
+            }
+            out.extend_from_slice(span);
+            return Ok(kind != crate::json::Kind::Null);
         }
         F_LIST_SLICE => {
             let doc = a.bytes(0);
@@ -429,14 +436,14 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                 None => Ok(false),
             };
         }
+        // DuckDB 1.4's `map_extract` returns a list: `[value]`, or `[]` for a missing key
+        // (the subscript `m[k]` is the value itself, `F_MAP_VALUE`).
         F_MAP_EXTRACT => {
-            return match crate::json::map_get(a.bytes(0), a.bytes(1))? {
-                Some(span) => {
-                    out.extend_from_slice(span);
-                    Ok(true)
-                }
-                None => Ok(false),
-            };
+            out.push(b'[');
+            if let Some(span) = crate::json::map_get(a.bytes(0), a.bytes(1))? {
+                out.extend_from_slice(span);
+            }
+            out.push(b']');
         }
         // NULL propagation can be left to the default in the caller's `call()` (the `live(i)`
         // check), so unlike `json_array`/`concat` there is no need to bypass directly under

@@ -5,7 +5,7 @@
 //! it through `Vm::eval`", it builds a small one-row batch per array element and repeatedly
 //! evaluates `body` (already compiled by `plan::compile::Compiler::lambda_call`).
 //!
-//! A parameter's declared type is `Ty::Json` (the same as `list_extract`'s result). JSON `null` is
+//! A parameter's declared type is `Ty::Json` (whatever the list's static element type). JSON `null` is
 //! the SQL NULL representation of a list element (that is how `json_array`/`list_value` embed a
 //! NULL argument; see the module docs at the top), so it is bound directly as SQL NULL, and a
 //! JSON *string* element is bound as the VARCHAR it stands for rather than as its serialized

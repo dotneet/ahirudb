@@ -175,37 +175,42 @@ pub(super) fn concat_ws_build(args: &[&Vector], ty: Ty) -> Result<Vector> {
 // LIST functions over the JSON representation
 // =========================================================================
 
-/// Serializes one row of a `list_contains`/`list_position` search value into JSON text, so it
-/// can be compared byte-wise against the array's element spans.
-fn search_text(a: &A, out: &mut Vec<u8>) {
-    if let Some((v, j)) = a.at(1) {
-        write_json_scalar(v, j, out);
-    }
-}
-
 /// The 1-based index of `needle` in the array, or 0 when absent. `None` when the argument is
 /// not an array at all (the caller turns that into SQL NULL, matching duckdb's behavior for
 /// `list_position` on a non-list).
+///
+/// The needle is serialized to JSON text and compared with `crate::json::cmp_element`, so
+/// numbers compare by value (`list_contains([1.0, 2.0], 2)`, as DuckDB's implicit cast to
+/// the element type gives) and strings by their decoded text.
 pub(super) fn list_find(a: &A) -> Result<Option<i64>> {
     let mut needle = Vec::new();
-    search_text(a, &mut needle);
+    if let Some((v, j)) = a.at(1) {
+        write_json_scalar(v, j, &mut needle);
+    }
     let doc = a.bytes(0);
     let elems = match crate::json::array_elements(doc)? {
         Some(e) => e,
         None => return Ok(None),
     };
     for (k, (span, _)) in elems.iter().enumerate() {
-        if *span == needle.as_slice() {
+        if crate::json::cmp_element(span, &needle)?.is_eq() {
             return Ok(Some(k as i64 + 1));
         }
     }
     Ok(Some(0))
 }
 
-/// `list_sort` / `list_distinct` / `list_reverse`. All three only reorder or drop whole element
-/// spans, so one body covers them: parse once, permute the spans, re-emit.
-pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Result<bool> {
-    let elems = match crate::json::array_elements(doc)? {
+/// `list_sort` / `list_reverse_sort` / `list_distinct` / `list_reverse`. All of them only
+/// reorder or drop whole element spans, so one body covers them: parse once, permute the
+/// spans, re-emit.
+///
+/// The sorts order elements with `crate::json::cmp_element` (the order of the typed values:
+/// numbers by value, strings by decoded bytes, lists and structs element-wise) and take
+/// DuckDB's optional arguments: `list_sort(l, 'ASC'|'DESC', 'NULLS FIRST'|'NULLS LAST')` and
+/// `list_reverse_sort(l, 'NULLS FIRST'|'NULLS LAST')`. NULLs go last by default either way,
+/// as in DuckDB (`list_reverse_sort([3, NULL, 1])` is `[3, 1, NULL]`).
+pub(super) fn list_rearrange(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
+    let elems = match crate::json::array_elements(a.bytes(0))? {
         Some(e) => e,
         // Not an array -> NULL, the same judgment as `list_find`.
         None => return Ok(false),
@@ -213,7 +218,46 @@ pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Resul
     let mut order: Vec<usize> = (0..elems.len()).collect();
     match id {
         F_LIST_REVERSE => order.reverse(),
-        F_LIST_SORT => order.sort_by(|&x, &y| cmp_elem(elems[x], elems[y])),
+        F_LIST_SORT | F_LIST_REVERSE_SORT => {
+            let opt = |k: usize, want: &[u8]| -> Result<bool> {
+                if a.n() <= k {
+                    return Ok(false);
+                }
+                let s = a.bytes(k);
+                if crate::rt::hash::eq_ascii_ci(s, want) {
+                    return Ok(true);
+                }
+                // The other spelling of the same option.
+                let other: &[u8] = match want {
+                    b"DESC" => b"ASC",
+                    _ => b"NULLS LAST",
+                };
+                ensure!(crate::rt::hash::eq_ascii_ci(s, other), UnsupportedFeature);
+                Ok(false)
+            };
+            let rev = id == F_LIST_REVERSE_SORT;
+            let desc = rev || opt(1, b"DESC")?;
+            let nulls_first = opt(if rev { 1 } else { 2 }, b"NULLS FIRST")?;
+            let null = |k: usize| elems[k].1 == crate::json::Kind::Null;
+            order.sort_by(|&x, &y| match (null(x), null(y)) {
+                (false, false) => {
+                    let o = crate::json::cmp_element(elems[x].0, elems[y].0)
+                        .unwrap_or_else(|_| elems[x].0.cmp(elems[y].0));
+                    if desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                }
+                (nx, ny) => {
+                    if nulls_first {
+                        ny.cmp(&nx)
+                    } else {
+                        nx.cmp(&ny)
+                    }
+                }
+            });
+        }
         // Keeps first-occurrence order (duckdb's `list_distinct` does not promise an order, and
         // this way the function needs no comparator). SQL NULL list elements are not retained,
         // matching DuckDB's `list_distinct([NULL, 1, NULL]) = [1]`.
@@ -230,31 +274,6 @@ pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Resul
     }
     out.push(b']');
     Ok(true)
-}
-
-/// The ordering `list_sort` uses. JSON is untyped, so elements are ranked by kind first
-/// (numbers < strings < booleans < arrays < objects, with `null` last like duckdb's default
-/// `NULLS LAST`), then within a kind: numbers numerically, everything else by raw span bytes.
-fn cmp_elem(a: crate::json::Elem, b: crate::json::Elem) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
-    let rank = |k: crate::json::Kind| match k {
-        crate::json::Kind::Num => 0u8,
-        crate::json::Kind::Str => 1,
-        crate::json::Kind::Bool => 2,
-        crate::json::Kind::Array => 3,
-        crate::json::Kind::Object => 4,
-        crate::json::Kind::Null => 5,
-    };
-    match rank(a.1).cmp(&rank(b.1)) {
-        Ordering::Equal => {}
-        o => return o,
-    }
-    if a.1 == crate::json::Kind::Num {
-        if let (Some(x), Some(y)) = (crate::json::parse_f64(a.0), crate::json::parse_f64(b.0)) {
-            return ord_f64(x, y);
-        }
-    }
-    a.0.cmp(b.0)
 }
 
 // =========================================================================
@@ -295,6 +314,7 @@ pub(super) fn write_json_scalar(v: &Vector, row: usize, out: &mut Vec<u8>) {
             fmt_timestamp(v.i64s()[row], out);
             out.push(b'"');
         }
+        Ty::Blob => write_json_blob(v.bytes().get(row), out),
         Ty::Float | Ty::Double => {
             let x = v.f64s()[row];
             if x.is_finite() && v.ty() == Ty::Float {
@@ -302,31 +322,61 @@ pub(super) fn write_json_scalar(v: &Vector, row: usize, out: &mut Vec<u8>) {
                 // `f32`, as `CAST(x AS VARCHAR)` does: `[0.1::FLOAT]` is `[0.1]` (as in DuckDB),
                 // not the widened double's `[0.10000000149011612]`.
                 kernels::fmt_f32(x, out);
-            } else if x.is_finite() {
-                kernels::fmt_f64(x, out);
             } else {
-                // NaN/Infinity have no JSON representation, so they become null.
-                out.extend_from_slice(b"null");
+                write_json_f64(x, out);
             }
         }
         t => {
-            // The integer family and DECIMAL. `fmt_int` writes an unsigned magnitude plus a scale.
-            let scale = match t {
-                Ty::Decimal { scale, .. } => scale,
-                _ => 0,
+            // The integer family and DECIMAL.
+            let x = match v.data() {
+                Data::I32(d) => d[row] as i128,
+                Data::I64(d) => d[row] as i128,
+                Data::I128(d) => d[row],
+                _ => return out.extend_from_slice(b"null"),
             };
-            match v.data() {
-                Data::I32(d) => {
-                    kernels::fmt_int(d[row].unsigned_abs() as u128, d[row] < 0, scale, out)
-                }
-                Data::I64(d) => {
-                    kernels::fmt_int(d[row].unsigned_abs() as u128, d[row] < 0, scale, out)
-                }
-                Data::I128(d) => kernels::fmt_int(d[row].unsigned_abs(), d[row] < 0, scale, out),
-                _ => out.extend_from_slice(b"null"),
-            }
+            write_json_int(t, x, out);
         }
     }
+}
+
+/// A DOUBLE as JSON. Non-finite values are written `NaN`/`Infinity`/`-Infinity`, as DuckDB's
+/// `to_json` does (and its JSON reader accepts; so does `crate::json::scan_number`), so a
+/// list holding them reads back as the same values.
+pub(crate) fn write_json_f64(x: f64, out: &mut Vec<u8>) {
+    if x.is_nan() {
+        out.extend_from_slice(b"NaN");
+    } else if x.is_infinite() {
+        out.extend_from_slice(if x < 0.0 { b"-Infinity" } else { b"Infinity" });
+    } else {
+        kernels::fmt_f64(x, out);
+    }
+}
+
+/// An integer or DECIMAL (`x` is the scaled value) as JSON. DuckDB's `to_json` writes a
+/// DECIMAL of precision 15 or less through DOUBLE (`-0.50::DECIMAL(4,2)` is `-0.5`,
+/// `5::DECIMAL(9,0)` is `5.0`) and a wider one as its exact text (`1.50::DECIMAL(16,2)` is
+/// `1.50`); every such DECIMAL value is below 2^53, so the double is exact.
+pub(crate) fn write_json_int(ty: Ty, x: i128, out: &mut Vec<u8>) {
+    let (p, scale) = match ty {
+        Ty::Decimal { precision, scale } => (precision, scale),
+        _ => (u8::MAX, 0),
+    };
+    if p <= 15 {
+        let mut d = 1.0;
+        for _ in 0..scale {
+            d *= 10.0;
+        }
+        write_json_f64(x as f64 / d, out);
+    } else {
+        kernels::fmt_int(x.unsigned_abs(), x < 0, scale, out);
+    }
+}
+
+/// A BLOB as JSON: a string holding its VARCHAR form (`\xHH` escapes), as DuckDB's `to_json`.
+fn write_json_blob(b: &[u8], out: &mut Vec<u8>) {
+    let mut s = Vec::new();
+    kernels::escape_blob(b, &mut s);
+    crate::json::write_json_string(&s, out);
 }
 
 /// `json_array`/`list_value`. Serializes each argument as an element. The arguments' types need

@@ -185,9 +185,14 @@ fn list_extract_is_one_based_like_duckdb() {
 
 #[test]
 fn map_extract_looks_up_object_keys() {
+    // DuckDB 1.4's `map_extract` returns a list (`[value]`, `[]` when the key is missing);
+    // `map_extract_value` and the subscript return the value itself.
     let mut sess = session_with_basic();
-    assert_eq!(one(&mut sess, r#"map_extract('{"a":1,"b":2}', 'a')"#), s("1"));
-    assert_eq!(one(&mut sess, r#"map_extract('{"a":1}', 'z')"#), Value::Null);
+    assert_eq!(one(&mut sess, r#"map_extract('{"a":1,"b":2}', 'a')"#), s("[1]"));
+    assert_eq!(one(&mut sess, r#"map_extract('{"a":1}', 'z')"#), s("[]"));
+    assert_eq!(one(&mut sess, r#"map_extract_value('{"a":1,"b":2}', 'b')"#), s("2"));
+    assert_eq!(one(&mut sess, r#"CAST('{"a":1,"b":2}' AS JSON)['b']"#), s("2"));
+    assert_eq!(one(&mut sess, r#"map_extract_value('{"a":1}', 'z')"#), Value::Null);
 }
 
 #[test]
@@ -197,11 +202,14 @@ fn map_extract_reads_parquet_map_pair_arrays() {
     let mut sess = Session::new();
     sess.register_bytes_as("t", data("map_basic.parquet"), ahiru_core::format::FormatKind::Parquet)
         .unwrap();
+    // duckdb -c "select map_extract(m,'a'), m['b'], m['c'], m['z'], map_extract(m,'z') from
+    // 'map_basic.parquet' where id = 1" -> [1], 2, NULL, NULL, []. The column is
+    // MAP(VARCHAR, BIGINT), so the subscript returns a BIGINT.
     let rows = run(
         &mut sess,
-        "SELECT map_extract(m, 'a'), map_extract(m, 'b'), map_extract(m, 'z') FROM t WHERE id = 1",
+        "SELECT map_extract(m, 'a'), m['b'], m['c'], m['z'], map_extract(m, 'z') FROM t WHERE id = 1",
     );
-    assert_eq!(rows, vec![vec![s("1"), s("2"), Value::Null]]);
+    assert_eq!(rows, vec![vec![s("[1]"), Value::I64(2), Value::Null, Value::Null, s("[]")]]);
 
     let mut sess = Session::new();
     sess.register_bytes_as(
@@ -210,8 +218,11 @@ fn map_extract_reads_parquet_map_pair_arrays() {
         ahiru_core::format::FormatKind::Parquet,
     )
     .unwrap();
-    let rows = run(&mut sess, "SELECT map_extract(m, '1') FROM t WHERE id = 1");
-    assert_eq!(rows, vec![vec![s("\"v1\"")]]);
+    // An integer subscript on a MAP(BIGINT, VARCHAR) is a key lookup, not a list position:
+    // duckdb -c "select m[1], m[2], m[3], map_extract(m, 2) from 'map_int_key.parquet' where
+    // id = 1" -> v1, v2, NULL, [v2].
+    let rows = run(&mut sess, "SELECT m[1], m[2], m[3], map_extract(m, 2) FROM t WHERE id = 1");
+    assert_eq!(rows, vec![vec![s("v1"), s("v2"), Value::Null, s("[\"v2\"]")]]);
 }
 
 // --- list_concat / `||` on lists ---------------------------------------------

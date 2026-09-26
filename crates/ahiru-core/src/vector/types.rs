@@ -508,17 +508,51 @@ pub fn fmt_interval(months: i32, days: i32, micros: i64, out: &mut Vec<u8>) {
     }
 }
 
+/// What is statically known about the contents of a `Ty::Json` value.
+///
+/// A LIST or MAP has no type of its own here (it is JSON text, see `Ty::Json`), but where its
+/// element type is known before execution -- a Parquet `LIST<scalar>`/`MAP<scalar, scalar>`
+/// column, `string_split`, a list literal of one scalar type -- the binder carries it alongside
+/// so `xs[i]`, `m[k]` and `UNNEST` can hand the element back as that native type, as DuckDB does.
+/// `Any` is the conservative answer: the element stays `Ty::Json`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Shape {
+    #[default]
+    Any,
+    /// A list whose elements are all of this type (`Ty::Json` when they are themselves nested).
+    List(Ty),
+    /// A MAP (`[{"key":k,"value":v},...]`) with these key and value types.
+    Map(Ty, Ty),
+}
+
+impl Shape {
+    /// The native type of one element (a MAP's elements are its values), `Ty::Json` if unknown.
+    pub fn elem(self) -> Ty {
+        match self {
+            Shape::List(t) | Shape::Map(_, t) => t,
+            Shape::Any => Ty::Json,
+        }
+    }
+}
+
 /// One column of the output schema.
 #[derive(Clone)]
 pub struct Field {
     pub name: String,
     pub ty: Ty,
     pub nullable: bool,
+    /// Meaningful only when `ty` is `Ty::Json`.
+    pub shape: Shape,
 }
 
 impl Field {
     pub fn new(name: impl Into<String>, ty: Ty, nullable: bool) -> Self {
-        Field { name: name.into(), ty, nullable }
+        Field { name: name.into(), ty, nullable, shape: Shape::Any }
+    }
+
+    pub fn shaped(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
     }
 }
 

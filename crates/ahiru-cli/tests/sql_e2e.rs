@@ -938,3 +938,39 @@ e2e!(
          GROUP BY GROUPING SETS ((m), ()) HAVING c > 600 ORDER BY 1 NULLS FIRST",
     ]
 );
+
+// List/MAP elements come back as their static element type (xs[i], m[k], UNNEST).
+e2e!(
+    list_element_types,
+    "tests/data/list_varied.parquet",
+    [
+        "SELECT count(xs[2]), max(xs[2]), sum(xs[-1]) FROM t",
+        "SELECT id, xs[1], xs[2] IS NULL FROM t ORDER BY id LIMIT 10",
+        "SELECT sum(u.x), count(u.x) FROM t AS s, unnest(s.xs) AS u(x)",
+        "SELECT id, list_contains(xs, 5.0), list_position(xs, 6) FROM t ORDER BY id LIMIT 10",
+    ]
+);
+
+e2e!(
+    list_scalar_leaves,
+    "tests/data/list_scalars.parquet",
+    [
+        // (`ss[2]` holds a `"`, which the two CSV writers quote differently.)
+        "SELECT id, ds[1], ds[2], ss[1], ss[3], decs[1], dates[1], flags[1] FROM t ORDER BY id",
+        "SELECT u.x FROM t AS s, unnest(s.ds) AS u(x) ORDER BY 1",
+        "SELECT u.v FROM t AS s, unnest(s.ss) AS u(v) WHERE u.v <> 'b\"c' ORDER BY 1",
+        "SELECT sum(x) FROM (SELECT unnest(decs) AS x FROM t)",
+    ]
+);
+
+e2e!(
+    map_subscript,
+    "tests/data/map_basic.parquet",
+    ["SELECT id, m['a'], m['b'], m['c'], m['z'] FROM t ORDER BY id LIMIT 5"]
+);
+
+e2e!(
+    map_int_key_subscript,
+    "tests/data/map_int_key.parquet",
+    ["SELECT id, m[1], m[2], m[3] FROM t ORDER BY id LIMIT 5"]
+);

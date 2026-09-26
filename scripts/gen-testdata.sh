@@ -157,6 +157,19 @@ COPY (SELECT i::INTEGER AS id, map([i, i + 1], ['v' || i, 'v' || (i + 1)]) AS m
       FROM range(0, 20) t(i))
 TO 'map_int_key.parquet' (FORMAT PARQUET);"
 
+# LISTs of assorted scalar leaves: how each leaf type renders inside the JSON text,
+# and that xs[i]/UNNEST hand it back as the element type (NaN/Infinity doubles,
+# BLOBs, strings needing escapes, DECIMAL, DATE, TIMESTAMP, BOOLEAN).
+duckdb -c "
+COPY (SELECT * FROM (VALUES
+    (1, [1.5, 'nan'::DOUBLE, 'inf'::DOUBLE, '-inf'::DOUBLE],
+        ['\x00\x01\xFF'::BLOB, 'abc'::BLOB], ['a', 'b\"c', 'd\\e'],
+        [1.50::DECIMAL(4,2), -0.50], [DATE '2024-01-02', NULL],
+        [TIMESTAMP '2024-01-02 03:04:05.5'], [true, false]),
+    (2, [], NULL, ['z'], [], [], [], [NULL])
+  ) AS t(id, ds, bs, ss, decs, dates, tss, flags))
+TO 'list_scalars.parquet' (FORMAT PARQUET);"
+
 # LIST<STRUCT<..., LIST<...>>>: three levels of nesting (array -> struct -> array).
 # list_of_struct/struct_with_list only combine two levels, so this checks that
 # Dremel assembly stacks repetition/definition levels correctly at three levels

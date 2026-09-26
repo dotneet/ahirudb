@@ -1410,7 +1410,7 @@ pub fn try_cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
 /// Writes a BLOB's text form: printable ASCII stays as it is, everything else -- the
 /// backslash included, so the escape is unambiguous -- becomes an uppercase `\xHH`.
 /// This is the spelling DuckDB's `BLOB -> VARCHAR` cast produces.
-fn escape_blob(bytes: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn escape_blob(bytes: &[u8], out: &mut Vec<u8>) {
     for &b in bytes {
         if (0x20..0x7f).contains(&b) && b != b'\\' {
             out.push(b);

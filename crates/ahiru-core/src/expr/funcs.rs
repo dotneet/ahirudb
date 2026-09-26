@@ -162,7 +162,10 @@ const F_JSON_EXTRACT: FuncId = 80;
 const F_JSON_EXTRACT_STRING: FuncId = 81;
 const F_JSON_TYPE: FuncId = 82;
 const F_TO_JSON: FuncId = 83;
-const F_LIST_EXTRACT: FuncId = 84;
+// `list_extract` is `pub(crate)` along with its siblings below because
+// `plan::compile::Compiler::subscript` emits them directly: which one applies
+// depends on the base's `Shape`, which `resolve` does not see.
+pub(crate) const F_LIST_EXTRACT: FuncId = 84;
 const F_MAP_EXTRACT: FuncId = 85;
 const F_JSON_OBJECT: FuncId = 86;
 const F_JSON_ARRAY: FuncId = 87;
@@ -214,6 +217,12 @@ const F_CHR: FuncId = 99;
 // to 200.
 const F_JSON_EXTRACT_IDX: FuncId = 100;
 const F_JSON_EXTRACT_STRING_IDX: FuncId = 101;
+const F_LIST_REVERSE_SORT: FuncId = 106;
+/// `list_extract` returning the element as text (see `Compiler::subscript`).
+pub(crate) const F_LIST_EXTRACT_TEXT: FuncId = 107;
+/// `m[k]` / `map_extract_value`: a MAP's value for a key, as JSON / as text.
+pub(crate) const F_MAP_VALUE: FuncId = 108;
+pub(crate) const F_MAP_VALUE_TEXT: FuncId = 109;
 const F_DAYNAME: FuncId = 110;
 const F_MONTHNAME: FuncId = 111;
 const F_HEX: FuncId = 112;
@@ -668,7 +677,10 @@ pub fn resolve_const(
             ensure!(json_encodable(args[1]), TypeMismatch);
             Ok((F_LIST_POSITION, vec![Json, args[1]], BigInt))
         }
-        "list_sort" | "array_sort" => fixed(F_LIST_SORT, &[Json], n, 1, Json),
+        "list_sort" | "array_sort" => fixed(F_LIST_SORT, &[Json, Varchar, Varchar], n, 1, Json),
+        "list_reverse_sort" | "array_reverse_sort" => {
+            fixed(F_LIST_REVERSE_SORT, &[Json, Varchar], n, 1, Json)
+        }
         // Note `list_unique` is deliberately *not* an alias here: in DuckDB it returns the
         // *count* of distinct elements, not the deduplicated list.
         "list_distinct" | "array_distinct" => fixed(F_LIST_DISTINCT, &[Json], n, 1, Json),
@@ -922,12 +934,12 @@ fn num1_whole(
 }
 
 /// Whether the type is writable as a value of `to_json`/`json_array`/`json_object`.
-/// Supported are NULL/BOOLEAN/integers/floating point/DECIMAL/VARCHAR/DATE/TIME/TIMESTAMP/JSON
-/// (embedded as is). BLOB and INTERVAL are unsupported (they have no natural JSON representation,
-/// so like CAST they are rejected with `TypeMismatch`).
+/// Supported are NULL/BOOLEAN/integers/floating point/DECIMAL/VARCHAR/BLOB/DATE/TIME/TIMESTAMP/
+/// JSON (embedded as is). INTERVAL is unsupported (like CAST it is rejected with
+/// `TypeMismatch`).
 fn json_encodable(t: Ty) -> bool {
     use Ty::*;
-    t.is_numeric() || matches!(t, Null | Boolean | Varchar | Date | Time | Timestamp | Json)
+    t.is_numeric() || matches!(t, Null | Boolean | Varchar | Blob | Date | Time | Timestamp | Json)
 }
 
 /// A variadic any-type function. Every argument settles on a common type.
@@ -1377,5 +1389,6 @@ pub(crate) use datetime::{
 // unused).
 #[cfg(all(feature = "export", any(feature = "csv", feature = "jsonl")))]
 pub(crate) use datetime::civil_from_days;
+pub(crate) use json::{write_json_f64, write_json_int};
 pub use lambda::call_lambda;
 pub(crate) use numeric::{f_abs, f_trunc};
