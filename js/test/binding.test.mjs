@@ -458,6 +458,24 @@ test('COPY ... TO hands its bytes to onCopy, and fails loudly without it', { ski
     db.close();
   }
 
+  // `out.csv.gz` is gzip-compressed CSV, as in DuckDB: the core leaves the compression to
+  // the host, which used to hand onCopy plain CSV under the .gz name.
+  const gz = [];
+  const zdb = await openDb({ onCopy: (path, bytes) => gz.push({ path, bytes }) });
+  try {
+    zdb.register('t', A);
+    await zdb.query("COPY (SELECT id FROM t ORDER BY id) TO 'out.csv.gz'");
+    assert.equal(gz.length, 1);
+    assert.equal(gz[0].path, 'out.csv.gz');
+    assert.deepEqual([...gz[0].bytes.subarray(0, 2)], [0x1f, 0x8b], 'not gzip');
+    const plainText = await new Response(
+      new Blob([gz[0].bytes]).stream().pipeThrough(new DecompressionStream('gzip')),
+    ).text();
+    assert.equal(plainText, 'id\n0\n1\n2\n');
+  } finally {
+    zdb.close();
+  }
+
   const plain = await openDb();
   try {
     plain.register('t', A);

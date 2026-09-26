@@ -318,6 +318,9 @@ const FORMAT_PATH = 0x100;
 /** `ahiru_register_as` total length meaning "not known yet" (`catalog::SIZE_UNKNOWN`). */
 const SIZE_UNKNOWN = 0xffff_ffff_ffff_ffffn;
 
+/** `ahiru_copy_result` flag: gzip the bytes before handing them to `onCopy` (`COPY_GZIP`). */
+const COPY_GZIP = 1;
+
 /** `ahiru_query_start`'s "register these paths and call me again" (`START_NEED_TABLES`). */
 const START_NEED_TABLES = -3;
 
@@ -1327,6 +1330,17 @@ export class Batch {
 // is small (DESIGN.md §6). GZIP goes to `DecompressionStream`, which browsers /
 // Node have built in; ZSTD goes to a separate wasm module.
 
+/** GZIP compression for `COPY ... TO 'x.gz'` (the core has no deflate encoder). */
+async function gzip(bytes) {
+  if (typeof CompressionStream !== 'function') {
+    throw new AhiruError(Code.UNSUPPORTED_CODEC, {
+      detail: 'writing a .gz file needs CompressionStream (browser or Node 18+)',
+    });
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
 /** GZIP. Costing zero extra bytes is the whole point of this delegation. */
 async function gunzip(bytes, maxLen) {
   if (typeof DecompressionStream !== 'function') {
@@ -1704,7 +1718,7 @@ export class AhiruDB {
       resident: [],
       fetched: [],
       // The exact coalesced ranges fetched (the range-cache keys), for `#bytesAt`.
-      jobs: new Map(),
+      jobs: new JobIndex(),
     };
     // Declaring while idle surfaces registration errors (a name CREATE TABLE
     // already took, a format this build lacks) right here.
@@ -2055,10 +2069,15 @@ export class AhiruDB {
     if (n === 0) return false;
     const out = this.#out();
     const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
-    const pathEnd = wireEnd(out, 4, wireU32(dv, out, 0, 'COPY result'), 'COPY path');
-    const path = decodeUtf8(out.subarray(4, pathEnd), 'COPY path');
+    const pathLen = wireU32(dv, out, 0, 'COPY result');
+    const flags = wireU32(dv, out, 4, 'COPY flags');
+    const pathEnd = wireEnd(out, 8, pathLen, 'COPY path');
+    const path = decodeUtf8(out.subarray(8, pathEnd), 'COPY path');
     // Copied out before anything else can call into wasm and reuse the buffer.
-    const bytes = out.slice(pathEnd);
+    let bytes = out.slice(pathEnd);
+    // `out.csv.gz`: the core wrote plain CSV and leaves the compression to the host,
+    // as DuckDB compresses by the file name.
+    if (flags & COPY_GZIP) bytes = await gzip(bytes);
     if (this.#onCopy === undefined) {
       throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
         sql,
@@ -2253,7 +2272,7 @@ export class AhiruDB {
         // start alone drops it, and `#bytesAt` then reports bytes we did fetch as
         // never fetched (E900).
         recordFetched(rec.fetched, part, offset, len);
-        if (len > 0) rememberJob(rec.jobs, part, offset, len);
+        if (len > 0) rec.jobs.add(part, offset, len);
         const covered = rec.resident.some(
           (c) => c.part === part && c.offset <= offset && offset + len <= c.offset + c.bytes.length,
         );
@@ -2290,8 +2309,7 @@ export class AhiruDB {
   #fromCachedJobs(rec, part, offset, len) {
     const end = offset + len;
     const pieces = [];
-    for (const j of rec.jobs.values()) {
-      if (j.part !== part || j.offset >= end || j.offset + j.len <= offset) continue;
+    for (const j of rec.jobs.overlapping(part, offset, end)) {
       const hit = this.#cache.get(this.#cacheKey(rec, part, j.offset, j.len));
       if (hit instanceof Uint8Array && hit.byteLength === j.len) pieces.push({ at: j.offset, hit });
     }
@@ -2451,14 +2469,81 @@ export class AhiruDB {
 const NO_POS = 0xffffffff;
 
 /**
- * Remembers one coalesced range fetched for a table (a range-cache key), most
+ * The coalesced ranges fetched for one registration (each a range-cache key), most
  * recent last, forgetting the oldest beyond `MAX_REMEMBERED_JOBS`.
+ *
+ * `#read` consults it on every exact-key cache miss -- which includes every range's
+ * first fetch -- so the ranges overlapping a request are found through a per-part
+ * array sorted by offset instead of a scan over every remembered range.
  */
-function rememberJob(jobs, part, offset, len) {
-  const key = `${part}:${offset}:${len}`;
-  jobs.delete(key);
-  jobs.set(key, { part, offset, len });
-  if (jobs.size > MAX_REMEMBERED_JOBS) jobs.delete(jobs.keys().next().value);
+class JobIndex {
+  /** `part:offset:len` -> job, in recency order (for eviction). */
+  #lru = new Map();
+  /** part -> { jobs sorted by offset, the longest length ever added }. */
+  #byPart = new Map();
+
+  add(part, offset, len) {
+    const key = `${part}:${offset}:${len}`;
+    if (this.#lru.has(key)) {
+      const job = this.#lru.get(key);
+      this.#lru.delete(key);
+      this.#lru.set(key, job);
+      return;
+    }
+    const job = { part, offset, len };
+    this.#lru.set(key, job);
+    let p = this.#byPart.get(part);
+    if (p === undefined) {
+      p = { jobs: [], maxLen: 0 };
+      this.#byPart.set(part, p);
+    }
+    p.jobs.splice(upperBound(p.jobs, offset), 0, job);
+    if (len > p.maxLen) p.maxLen = len;
+    if (this.#lru.size > MAX_REMEMBERED_JOBS) {
+      const [oldKey, old] = this.#lru.entries().next().value;
+      this.#lru.delete(oldKey);
+      const q = this.#byPart.get(old.part);
+      q.jobs.splice(q.jobs.indexOf(old, lowerBound(q.jobs, old.offset)), 1);
+    }
+  }
+
+  /** The remembered jobs of `part` that overlap `[offset, end)`. */
+  *overlapping(part, offset, end) {
+    const p = this.#byPart.get(part);
+    if (p === undefined) return;
+    // Every job starting at or past `end` misses; one starting more than the longest
+    // length before `offset` cannot reach it.
+    const from = lowerBound(p.jobs, offset - p.maxLen);
+    const to = lowerBound(p.jobs, end);
+    for (let i = from; i < to; i++) {
+      const j = p.jobs[i];
+      if (j.offset + j.len > offset) yield j;
+    }
+  }
+}
+
+/** The first index in offset-sorted `jobs` whose offset is `>= at`. */
+function lowerBound(jobs, at) {
+  let lo = 0;
+  let hi = jobs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (jobs[mid].offset < at) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** The first index in offset-sorted `jobs` whose offset is `> at`. */
+function upperBound(jobs, at) {
+  let lo = 0;
+  let hi = jobs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (jobs[mid].offset <= at) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 function groupBy(items, keyOf) {

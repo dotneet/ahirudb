@@ -137,10 +137,12 @@ pub struct ParquetSchema {
 }
 
 impl ColumnDesc {
-    /// The element type of a nested column, read off the same structure `reader::nested`
-    /// renders from (`render_present`/`render_element`): a list of one plain leaf is
+    /// The element type of a nested column, read off the same structure and the same
+    /// `NestedNode::unwrap` decisions `reader::nested` renders from
+    /// (`render_present`/`render_element`): a list whose element is one plain leaf is
     /// `List(leaf type)`, a repeated group of exactly a `key` and a `value` leaf is a MAP, and
-    /// any deeper nesting keeps its elements as `Ty::Json`.
+    /// any other element (a struct, a nested list) stays `Ty::Json`. A column that renders as
+    /// a struct (an unannotated group, even one whose only child is repeated) is `Any`.
     pub fn shape(&self) -> Shape {
         let Some(root) = self.nested.as_deref() else {
             return Shape::Any;
@@ -153,14 +155,15 @@ impl ColumnDesc {
         };
         let arr = match &root.content {
             _ if root.repetition == Repetition::Repeated => root,
-            NestedContent::Group(c) if c.len() == 1 && c[0].repetition == Repetition::Repeated => {
-                &c[0]
-            }
+            NestedContent::Group(c) if root.unwrap => &c[0],
             _ => return Shape::Any,
         };
         match &arr.content {
             NestedContent::Leaf(i) => Shape::List(self.leaves.get(*i).map_or(Ty::Json, |l| l.ty)),
-            NestedContent::Group(c) if c.len() == 1 => Shape::List(leaf(&c[0]).unwrap_or(Ty::Json)),
+            // Only an unwrapped repeated group hands its one field over as the element; a
+            // legacy `array`/`<name>_tuple` group or a bare repeated group is itself the
+            // element, rendered as an object.
+            NestedContent::Group(c) if arr.unwrap => Shape::List(leaf(&c[0]).unwrap_or(Ty::Json)),
             NestedContent::Group(c)
                 if c.len() == 2 && c[0].name == "key" && c[1].name == "value" =>
             {
@@ -870,15 +873,20 @@ mod tests {
             e
         }
         let leaf = |name: &str| elem(name, Some(PType::Int32), Repetition::Required);
-        // `(outer group, repeated group name)` -> (outer unwraps, repeated group unwraps)
+        // `(outer group, repeated group name)` -> (outer unwraps, repeated group unwraps,
+        // shape). The shape must follow the same decisions, or `xs[i]`/`UNNEST` would cast
+        // an element rendered as an object (`{"x":1}`) to the leaf type and get NULL.
         let list = Some(ConvertedType::List);
         let cases = [
-            ("l", list, "list", true, true), // standard 3-level: the one field is the element
-            ("l", list, "array", true, false), // legacy: the repeated group is the element
-            ("l", list, "l_tuple", true, false),
-            ("l", None, "list", false, false), // unannotated: a STRUCT with a list field
+            // standard 3-level: the one field is the element
+            ("l", list, "list", true, true, Shape::List(Ty::Int)),
+            // legacy: the repeated group is the element
+            ("l", list, "array", true, false, Shape::List(Ty::Json)),
+            ("l", list, "l_tuple", true, false, Shape::List(Ty::Json)),
+            // unannotated: a STRUCT with a list field
+            ("l", None, "list", false, false, Shape::Any),
         ];
-        for (outer, ct, rname, outer_unwraps, rep_unwraps) in cases {
+        for (outer, ct, rname, outer_unwraps, rep_unwraps, shape) in cases {
             let md = FileMetaData {
                 version: 2,
                 schema: vec![
@@ -896,7 +904,20 @@ mod tests {
             assert_eq!(node.unwrap, outer_unwraps, "{rname}");
             let NestedContent::Group(children) = &node.content else { panic!() };
             assert_eq!(children[0].unwrap, rep_unwraps, "{rname}");
+            assert_eq!(s.columns[0].shape(), shape, "{rname}");
         }
+
+        // A bare repeated group (no LIST annotation anywhere) is a list of structs, even with
+        // a single field.
+        let md = FileMetaData {
+            version: 2,
+            schema: vec![root(1), group("pts", Repetition::Repeated, 1, None), leaf("x")],
+            num_rows: 0,
+            row_groups: Vec::new(),
+            created_by: None,
+        };
+        let s = resolve_schema(&md).unwrap();
+        assert_eq!(s.columns[0].shape(), Shape::List(Ty::Json));
     }
 
     // --- End-to-end verification through real files (DuckDB output) ------------

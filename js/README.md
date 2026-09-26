@@ -151,7 +151,8 @@ The engine never writes files. With a wasm core built with the `export`
 feature, `COPY (SELECT …) TO 'out.csv'` runs the query and hands the encoded
 bytes to the `onCopy` option; `query()` resolves to `[]` once it returns.
 Without `onCopy` the statement fails with E409 instead of silently doing
-nothing.
+nothing. A path ending in `.gz` (`out.csv.gz`) is handed over already
+gzip-compressed, as DuckDB writes it.
 
 ```js
 const db = await AhiruDB.init({

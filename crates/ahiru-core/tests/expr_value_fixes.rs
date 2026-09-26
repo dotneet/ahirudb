@@ -148,7 +148,12 @@ fn float_values_parse_and_print_at_f32_precision() {
     assert_eq!(text(&mut s, "CAST('1.00000005960464477539062500001' AS FLOAT)"), "1.0000001");
     assert_eq!(text(&mut s, "list_value(CAST(0.1 AS FLOAT))"), "[0.1]");
     assert_eq!(text(&mut s, "[CAST(0.1 AS FLOAT)]"), "[0.1]");
-    assert_eq!(text(&mut s, "[CAST(1e30 AS FLOAT), CAST(0.1 AS DOUBLE)]"), "[1e+30,0.1]");
+    // A list literal's elements share one type, here DOUBLE, so the FLOAT is widened
+    // first (duckdb: `[1.0000000150474662e+30, 0.1]`).
+    assert_eq!(
+        text(&mut s, "[CAST(1e30 AS FLOAT), CAST(0.1 AS DOUBLE)]"),
+        "[1.0000000150474662e+30,0.1]"
+    );
     let rows =
         run(&mut s, "SELECT CAST(list(CAST(i / 10.0 AS FLOAT)) AS VARCHAR) FROM range(3) t(i)");
     assert_eq!(rows, vec![vec![Value::Bytes(b"[0.0, 0.1, 0.2]".to_vec())]]);

@@ -727,13 +727,22 @@ pub fn resolve_const(
             }
             Ok((F_JSON_OBJECT, want, Json))
         }
-        // `list_value` is DuckDB's conventional alias for `json_array`.
+        // `list_value` (and the `[...]` literal) is DuckDB's LIST constructor: its elements
+        // share one type, so each argument is cast to it first (`[1.5, 2]` is
+        // `[1.5, 2.0]`, `[DATE ..., TIMESTAMP ...]` two timestamps) -- the type the list's
+        // `Shape` then promises (`plan::compile::result_shape`). `json_array` keeps every
+        // argument's own type, as DuckDB's JSON function does (`json_array(1.5, 2)` is
+        // `[1.5,2]`); so does a list whose elements have no common scalar type.
         "json_array" | "list_value" => {
             ensure!(n >= 1, WrongArgCount);
             for &a in args {
                 ensure!(json_encodable(a), TypeMismatch);
             }
-            Ok((F_JSON_ARRAY, args.to_vec(), Json))
+            let want = match list_elem_ty(args) {
+                Some(t) if lower == "list_value" && json_encodable(t) => vec![t; n],
+                _ => args.to_vec(),
+            };
+            Ok((F_JSON_ARRAY, want, Json))
         }
 
         // --- Any type -------------------------------------------------------
@@ -946,6 +955,17 @@ fn num1_whole(
 fn json_encodable(t: Ty) -> bool {
     use Ty::*;
     t.is_numeric() || matches!(t, Null | Boolean | Varchar | Blob | Date | Time | Timestamp | Json)
+}
+
+/// The common element type of a list literal's arguments: the type they merge to
+/// (`Ty::unify_value`, as values merged into one column do), or `None` when they have no
+/// common type, when that type is `JSON` (a nested list), or when every argument is NULL.
+pub(crate) fn list_elem_ty(args: &[Ty]) -> Option<Ty> {
+    let mut acc = Ty::Null;
+    for &t in args {
+        acc = Ty::unify_value(acc, t).filter(|&u| u != Ty::Json)?;
+    }
+    (acc != Ty::Null).then_some(acc)
 }
 
 /// A variadic any-type function. Every argument settles on a common type.

@@ -104,6 +104,29 @@ fn a_literal_list_element_has_the_literals_common_type() {
 }
 
 #[test]
+fn a_list_literal_stores_its_elements_in_the_common_type() {
+    // duckdb -c "select [1.5, 2], [DATE '2024-01-01', TIMESTAMP '2024-01-01 10:00'],
+    // [true, 1], json_array(1.5, 2)"
+    // -> [1.5, 2.0], ['2024-01-01 00:00:00', '2024-01-01 10:00:00'], [1, 1], [1.5,2]
+    // The element type the list's Shape declares is also the text it holds, so the two
+    // spellings of one value (`2` / `2.0`) cannot both appear in one list. `json_array`
+    // is DuckDB's JSON function and keeps every argument's own type.
+    assert_eq!(
+        row("CAST([1.5, 2] AS VARCHAR), \
+             CAST([DATE '2024-01-01', TIMESTAMP '2024-01-01 10:00'] AS VARCHAR), \
+             CAST([true, 1] AS VARCHAR), CAST(json_array(1.5, 2) AS VARCHAR), \
+             list_distinct([2, 2.0])"),
+        [
+            s("[1.5,2.0]"),
+            s("[\"2024-01-01 00:00:00\",\"2024-01-01 10:00:00\"]"),
+            s("[1,1]"),
+            s("[1.5,2]"),
+            Value::Bytes(b"[2.0]".to_vec()),
+        ]
+    );
+}
+
+#[test]
 fn subscripts_on_typed_parquet_leaves() {
     // duckdb -c "select ds[2], ds[3], ds[4], bs[1], ss[2], ss[3], decs[1], decs[2], dates[1],
     // tss[1], flags[2], typeof(decs[1]), typeof(bs[1]) from 'list_scalars.parquet' where id = 1"

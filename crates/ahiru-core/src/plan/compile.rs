@@ -546,21 +546,12 @@ fn result_shape(name: &str, tys: &[Ty], shapes: &[Shape]) -> Shape {
     let first = shapes.first().copied().unwrap_or_default();
     match name {
         "string_split" | "str_split" | "string_to_array" | "split" => Shape::List(Ty::Varchar),
-        // A list literal: the arguments' common type, when they are all plain scalars.
-        "list_value" | "json_array" => {
-            let mut acc = Ty::Null;
-            for &t in tys {
-                match Ty::unify(acc, t) {
-                    Some(u) if u != Ty::Json => acc = u,
-                    _ => return Shape::Any,
-                }
-            }
-            if acc == Ty::Null {
-                Shape::Any
-            } else {
-                Shape::List(acc)
-            }
-        }
+        // A list literal: the arguments' common type, when they are all plain scalars (the
+        // same type `funcs::resolve_const` casts `list_value`'s arguments to).
+        "list_value" | "json_array" => match funcs::list_elem_ty(tys) {
+            Some(t) => Shape::List(t),
+            None => Shape::Any,
+        },
         "list_sort" | "array_sort" | "list_reverse_sort" | "array_reverse_sort"
         | "list_distinct" | "array_distinct" | "list_reverse" | "array_reverse" | "list_slice"
         | "array_slice" => first,

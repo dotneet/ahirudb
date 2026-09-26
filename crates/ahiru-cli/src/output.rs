@@ -306,10 +306,11 @@ impl<'a> Writer<'a> {
                     let text = crate::render::render(v, *ty, "NULL");
                     format!("'{}'", text.replace('\'', "''"))
                 } else if matches!(ty, Ty::Decimal { .. }) {
-                    // A bare `1.25` is a DOUBLE literal here, so replaying it would
-                    // round a wide DECIMAL (`DECIMAL(38,10)`) through a float. The
-                    // quoted text cast to the exact type is read back digit for digit
-                    // by both this engine and DuckDB.
+                    // A bare `1.25` is an exact DECIMAL literal, but only of the width
+                    // its digits spell (`DECIMAL(3,2)`), and past 38 digits it turns
+                    // into a DOUBLE. The quoted text cast to the column's declared type
+                    // keeps both the value and the type, digit for digit, in this
+                    // engine and in DuckDB.
                     let text = crate::render::render(v, *ty, "NULL");
                     format!("'{text}'::{}", ty.full_name())
                 } else if *ty == Ty::Boolean || crate::render::is_numeric(*ty) {

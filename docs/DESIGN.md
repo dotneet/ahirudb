@@ -391,7 +391,7 @@ u8*  ahiru_out_ptr();  usize ahiru_out_len();   // last result/request buffer
 u32  ahiru_last_error();  u32 ahiru_last_error_pos();
 usize ahiru_heap_used();
 isize ahiru_schema(i32 q);
-isize ahiru_copy_result(i32 q);           // `export`: COPY's [path][bytes]
+isize ahiru_copy_result(i32 q);           // `export`: COPY's [path_len][flags][path][bytes]
 i32  ahiru_ddl_object_count(i32 h);       // `ddl`: in-memory tables + views
 ```
 

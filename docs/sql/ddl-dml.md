@@ -229,7 +229,8 @@ A trailing `.gz` names the compression, as in DuckDB: `out.csv.gz` is CSV
 (the format comes from the rest of the name) and the file is gzip-compressed.
 The core has no deflate encoder, so it only flags the result
 (`CopyResult::gzip`) and the host compresses; the native CLI pipes it
-through the system `gzip`. `.zst` output is refused with `UnsupportedCodec`
+through the system `gzip`, and the JS host compresses with `CompressionStream`
+before calling `onCopy`. `.zst` output is refused with `UnsupportedCodec`
 rather than written uncompressed, since there is no zstd encoder at all.
 Parquet compresses its own pages, so `out.parquet.gz`/`.zst` is written as a
 plain Parquet file, which is also what DuckDB does. The suffix is

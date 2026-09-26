@@ -49,6 +49,10 @@ pub const STATUS_NEED_CODEC: i32 = 4;
 /// the SQL text itself.
 pub const START_NEED_TABLES: i32 = -3;
 
+/// Flag bit in `ahiru_copy_result`'s header: gzip `data` before writing it.
+#[cfg(feature = "export")]
+pub const COPY_GZIP: u32 = 1;
+
 /// Flag bit in `ahiru_register_as`'s `format` argument: `name` is a path a SQL
 /// string literal referenced, registered case-sensitively
 /// (`Catalog::register_path`) instead of as an identifier.
@@ -730,9 +734,12 @@ pub extern "C" fn ahiru_last_error_pos() -> u32 {
 }
 
 /// Moves a `COPY ... TO` result into the out buffer:
-/// `[path_len:u32][path][data]`. `ahiru-core` never touches a file system, so the
-/// host writes `data` to `path` itself. Returns the buffer length, 0 when the
-/// statement was not a `COPY`, or -1 for a bad handle.
+/// `[path_len:u32][flags:u32][path][data]`. `ahiru-core` never touches a file
+/// system, so the host writes `data` to `path` itself. Flag bit
+/// [`COPY_GZIP`] means the path ends in `.gz` and the host must gzip `data`
+/// before writing it (`CopyResult::gzip`; the core has no deflate encoder).
+/// Returns the buffer length, 0 when the statement was not a `COPY`, or -1 for a
+/// bad handle.
 #[cfg(feature = "export")]
 #[no_mangle]
 pub extern "C" fn ahiru_copy_result(q: i32) -> isize {
@@ -749,8 +756,9 @@ pub extern "C" fn ahiru_copy_result(q: i32) -> isize {
         None => return fail_code(crate::error::Code::Internal, -1),
     };
     let Some(c) = copy else { return 0 };
-    let mut out = Vec::with_capacity(4 + c.path.len() + c.data.len());
+    let mut out = Vec::with_capacity(8 + c.path.len() + c.data.len());
     put_u32(&mut out, c.path.len() as u32);
+    put_u32(&mut out, if c.gzip { COPY_GZIP } else { 0 });
     out.extend_from_slice(c.path.as_bytes());
     out.extend_from_slice(&c.data);
     st.out = out;
