@@ -234,8 +234,16 @@ The full table is in the module doc of
 The engine core itself never touches a filesystem (it's `no_std`) — `COPY`
 runs the query to completion in memory and hands the resulting bytes plus
 the destination path back to the host, which performs the actual file
-write. In the native CLI this happens automatically; a JS host would do
-the equivalent via its own file-write API.
+write. In the native CLI this happens automatically. The JS host passes
+them to the `onCopy(path, bytes)` option of `AhiruDB.init()` (the wasm core
+must be built with `export`), and `query()` resolves to `[]` once the
+handler returns; without `onCopy`, `COPY ... TO` fails with E409 instead of
+silently doing nothing:
+
+```js
+const db = await AhiruDB.init({ wasmUrl, onCopy: (path, bytes) => save(path, bytes) });
+await db.query("COPY (SELECT * FROM trips) TO 'trips.csv'");
+```
 
 Writing over a file the same session has already read is safe in the CLI:
 after the write it re-reads every table backed by that path, so the next
@@ -281,11 +289,15 @@ COPY (SELECT CAST('1.25' AS DECIMAL(5,2)) AS d, 'nan'::DOUBLE AS n FROM range(1)
 -- {"d":1.25,"n":"nan"}
 ```
 
-**Limitation:** `COPY`/CTAS/`INSERT ... SELECT` are non-resumable — if
-reading the source data would require pausing for I/O partway through
-(`NEED_IO`), the statement fails with `IoFailed` instead of suspending and
-resuming. They only work when the source data is already fully available in
-memory (typical CLI usage, or a JS caller that pre-fetched the table).
+**Limitation:** `COPY`/CTAS/`INSERT ... SELECT` cannot pause for I/O partway
+through (`NEED_IO`): they run to completion inside one engine call. Instead,
+the engine reports the bytes the statement was waiting on, the host fetches
+them, and the statement starts again from scratch; the JS host does this
+automatically, so these statements work over remote (range-fetched) tables.
+Each restart re-runs the query, and the whole input ends up on the wasm heap
+at once, so they suit modest inputs; for large results prefer streaming a
+`SELECT`. An embedder calling `Session::prepare` directly sees the reads as
+`Prepared::NeedIo` and must answer them and call `prepare` again.
 
 A delegated **codec** request (`NEED_CODEC`) is different, and no longer a
 failure: the write paths service it in place through the session's codec
