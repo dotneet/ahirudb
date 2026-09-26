@@ -836,12 +836,15 @@ fn plain_encode_for_bloom(desc: &ColumnDesc, v: &Value) -> Option<Vec<u8>> {
             Value::I32(x) => Some((*x as i64).to_le_bytes().to_vec()),
             _ => None,
         },
+        // A float has more than one bit pattern for one SQL value: `0.0 = -0.0` (and this engine,
+        // like DuckDB, treats every NaN as equal), but the filter hashes the bits. Neither zero nor
+        // NaN has a single key to probe, so both skip the filter.
         PType::Float => match v {
-            Value::F64(x) => Some((*x as f32).to_le_bytes().to_vec()),
+            Value::F64(x) if *x != 0.0 && !x.is_nan() => Some((*x as f32).to_le_bytes().to_vec()),
             _ => None,
         },
         PType::Double => match v {
-            Value::F64(x) => Some(x.to_le_bytes().to_vec()),
+            Value::F64(x) if *x != 0.0 && !x.is_nan() => Some(x.to_le_bytes().to_vec()),
             _ => None,
         },
         PType::ByteArray => match v {
@@ -1087,6 +1090,19 @@ mod tests {
         let desc = desc_for(Ty::Timestamp, PType::Int96, None);
         let reader_value = Value::I64(1_700_000_000_000_000);
         assert_eq!(plain_encode_for_bloom(&desc, &reader_value), None);
+    }
+
+    #[test]
+    fn bloom_encode_skips_float_zero_and_nan() {
+        // `0.0 = -0.0`, but the two hash differently; probing only one would drop rows holding
+        // the other. NaN likewise has many bit patterns.
+        for pt in [PType::Float, PType::Double] {
+            let desc = desc_for(Ty::Double, pt, None);
+            for x in [0.0, -0.0, f64::NAN] {
+                assert_eq!(plain_encode_for_bloom(&desc, &Value::F64(x)), None);
+            }
+            assert!(plain_encode_for_bloom(&desc, &Value::F64(1.5)).is_some());
+        }
     }
 
     #[test]
