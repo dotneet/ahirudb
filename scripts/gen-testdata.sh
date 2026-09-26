@@ -557,6 +557,17 @@ else
   echo "!! pyarrow not found; skipping regeneration of pagetest.parquet / list_pagetest.parquet / nan_stats.parquet / footer_fit.parquet / footer_big.parquet / dict_mr.parquet / empty_rg_nested.parquet / float16.parquet" >&2
 fi
 
+# --- FLOAT statistics ------------------------------------------------------
+# 400 FLOAT rows, one value per 100-row RowGroup, so every RowGroup's min = max.
+# A DECIMAL or integer literal compares against a FLOAT column in FLOAT (`f = 1.1`
+# rounds the literal to the f32 the column holds), so a pruner has to round the
+# literal the same way before checking it against the statistics.
+duckdb -c "
+COPY (SELECT (CASE i // 100 WHEN 0 THEN 1.1 WHEN 1 THEN 0.1 WHEN 2 THEN 3.3
+              ELSE 16777216 END)::FLOAT AS f, i::INTEGER AS id
+      FROM range(0, 400) t(i))
+TO 'float_stats.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 100);"
+
 # --- INTERVAL (FIXED_LEN_BYTE_ARRAY(12)) ----------------------------------
 # Months/days/milliseconds as three unsigned 32-bit little-endian integers.
 # A plain INTEGER column sits next to it so "one unsupported column must not make

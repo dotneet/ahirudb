@@ -227,7 +227,30 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
             Data::I32(values)
         }
         PhysType::I64 => Data::I64(arith_i64(op, a.i64s(), sa, b.i64s(), sb, n, &mut bad)),
-        PhysType::I128 => Data::I128(arith_i128(op, a.i128s(), sa, b.i128s(), sb, n, &mut bad)),
+        PhysType::I128 => {
+            let (x, y) = (a.i128s(), b.i128s());
+            let values = arith_i128(op, x, sa, y, sb, n, &mut bad);
+            if let Ty::Decimal { precision, .. } = out_ty {
+                // Integers wrap, but a DECIMAL has no wrapped value to give: past 38
+                // digits (or past the lane's own 2^127, which `arith_i128` wraps at) it
+                // is simply out of range, and that is an error, as in DuckDB ("Overflow
+                // in multiplication of DECIMAL(38)"). Only a 38-digit result can get
+                // here: every narrower DECIMAL result type has room for its operands.
+                let lim = pow10_i128(precision as u32).unwrap_or(i128::MAX);
+                for i in 0..n {
+                    let (p, q) = (x[i * sa], y[i * sb]);
+                    let exact = match op {
+                        OpCode::Add => p.checked_add(q),
+                        OpCode::Sub => p.checked_sub(q),
+                        OpCode::Mul => p.checked_mul(q),
+                        _ => Some(values[i]),
+                    };
+                    let fits = exact.is_some_and(|r| r.unsigned_abs() < lim as u128);
+                    ensure!(fits || !a.is_valid(i * sa) || !b.is_valid(i * sb), ValueOutOfRange);
+                }
+            }
+            Data::I128(values)
+        }
         PhysType::F64 => {
             let mut values = arith_f64(op, a.f64s(), sa, b.f64s(), sb, n, &mut bad);
             if out_ty == Ty::Float {
