@@ -486,6 +486,7 @@ impl TableFormat for CsvFormat {
                 continue;
             }
             let mut fi = 0;
+            let mut trailing_delim;
             loop {
                 let f = match sc.field() {
                     Ok(f) => f,
@@ -502,6 +503,7 @@ impl TableFormat for CsvFormat {
                     }
                 } // Columns outside the projection are not converted. Only the scan is done.
                 fi += 1;
+                trailing_delim = fi == ncols + 1 && !f.quoted && f.start == f.end;
                 if f.term != Term::Field {
                     // If the buffer runs out without meeting a line terminator: at end of file that
                     // is the final record; otherwise the overread was insufficient.
@@ -513,7 +515,9 @@ impl TableFormat for CsvFormat {
             // quietly truncate: dropping the surplus loses data the file plainly contains, and the
             // usual cause (an unquoted delimiter inside a value) shifts every following field too.
             // DuckDB rejects such a row as well, unless `ignore_errors` is asked for explicitly.
-            ensure!(fi <= ncols, SyntaxError, sc.pos());
+            // The one exception is a single empty field after a trailing delimiter (`1,2,` under
+            // `a,b`): nothing is lost by dropping it, and DuckDB reads such files the same way.
+            ensure!(fi <= ncols || (fi == ncols + 1 && trailing_delim), SyntaxError, sc.pos());
             // A row with too few fields has the rest set to NULL (DuckDB's `null_padding`).
             for c in fi..ncols {
                 if let Some(Some(slot)) = slot_of.get(c) {
@@ -2152,6 +2156,22 @@ mod tests {
         // `(1, 2)`. duckdb rejects such a row (its sniffer refuses the file outright).
         let (f, src) = open(b"a,b\n1,2,3\n", b',');
         assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
+        // Two surplus fields, or a quoted empty one, are still more than a trailing delimiter.
+        let (f, src) = open(b"a,b\n1,2,,\n", b',');
+        assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
+        let (f, src) = open(b"a,b\n1,2,\"\"\n", b',');
+        assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
+    }
+
+    #[test]
+    fn a_trailing_delimiter_on_data_rows_is_ignored() {
+        // duckdb reads `a,b\n1,2,\n3,4,\n` as two rows of two columns.
+        let (f, src) = open(b"a,b\n1,2,\n3,4,\n", b',');
+        let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(3)]);
+        assert_eq!(got[1], vec![Value::I64(2), Value::I64(4)]);
+        let (f, src) = open(b"a\n1,\n2,\n", b',');
+        assert_eq!(read_all(&f, &src, &[0])[0], vec![Value::I64(1), Value::I64(2)]);
     }
 
     #[test]

@@ -157,7 +157,9 @@ The reader never silently discards part of a record:
 
 - A row with **more** fields than the header is a parse error, as it is in
   DuckDB. Dropping the surplus hid the usual cause — an unquoted delimiter
-  inside a value, which shifts every following field.
+  inside a value, which shifts every following field. The exception is a
+  trailing delimiter: a single empty extra field (`1,2,` under `a,b`) is
+  dropped, as DuckDB reads such files.
 - Any byte between a **closing quote** and the next delimiter or line
   terminator is a parse error too (`"x"junk,1`), again matching DuckDB —
   except padding spaces and tabs (see [Padding](#padding)).
