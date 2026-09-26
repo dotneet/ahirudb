@@ -346,6 +346,18 @@ pq.write_table(
 )
 PY
 
+  # Repeated column names (exactly and ignoring case). DuckDB refuses to write
+  # them; pyarrow writes them as asked. DuckDB reads them as a, a_1, A_2.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+table = pa.Table.from_arrays(
+    [pa.array([1, 2]), pa.array([3, 4]), pa.array([5, 6])], names=["a", "a", "A"]
+)
+pq.write_table(table, "dup_names.parquet")
+PY
+
   # A footer that does not fit the 64 KiB speculative tail fetch
   # (`parquet::file::FOOTER_PROBE`). `format::parquet::resolve` has to notice and
   # refetch the exact footer range instead of probing the same tail again.

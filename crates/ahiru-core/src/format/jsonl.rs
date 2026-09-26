@@ -92,7 +92,7 @@ pub struct JsonlFormat {
     /// than a reading of the data. See `TableFormat::column_has_no_evidence`.
     no_evidence: Vec<bool>,
     /// Per column: the object key it holds. Usually the column's name, but keys that differ only
-    /// in case get distinct names (`format::unique_json_names`), while members are still matched
+    /// in case get distinct names (`format::unique_column_names`), while members are still matched
     /// against the key exactly.
     keys: Vec<String>,
 }
@@ -241,7 +241,7 @@ impl TableFormat for JsonlFormat {
                 vec![Field::new(String::from("json"), Ty::Varchar, true)]
             } else {
                 self.no_evidence = infs.iter().map(|i| *i == Inf::Null).collect();
-                let cols = crate::format::unique_json_names(&names);
+                let cols = crate::format::unique_column_names(&names);
                 self.keys = names;
                 // A JSON value can be missing at any time, so every column is nullable.
                 cols.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect()

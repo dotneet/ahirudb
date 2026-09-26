@@ -127,7 +127,7 @@ pub struct JsonFormat {
     /// Per column: the sample held only `null` for it, so its `Ty::Varchar` is a default rather
     /// than a reading of the data. See `TableFormat::column_has_no_evidence`.
     no_evidence: Vec<bool>,
-    /// Per column: the object key it holds (see `format::unique_json_names` for why a column's
+    /// Per column: the object key it holds (see `format::unique_column_names` for why a column's
     /// name can differ from its key).
     keys: Vec<String>,
     /// Set in `resolve` when the file turns out to be newline-delimited (see the module docs);
@@ -390,7 +390,7 @@ fn parse_schema(buf: &[u8]) -> Result<Resolved> {
     }
 
     let no_evidence = infs.iter().map(|i| *i == Inf::Null).collect();
-    let cols = crate::format::unique_json_names(&names);
+    let cols = crate::format::unique_column_names(&names);
     let schema = cols.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect();
     Ok((names, schema, row_count, raw_json, no_evidence))
 }

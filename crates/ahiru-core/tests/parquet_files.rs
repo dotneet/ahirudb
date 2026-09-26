@@ -270,3 +270,26 @@ fn float16_column_widens_to_float_exactly() {
         }
     }
 }
+
+/// `dup_names.parquet` has columns `a`, `a`, `A` (pyarrow writes what it is given). They
+/// used to share the name `a`, so none of them could be referenced (E402). DuckDB names
+/// them `a`, `a_1`, `A_2`.
+#[test]
+fn repeated_column_names_are_made_unique() {
+    use ahiru_core::format::FormatKind;
+    use ahiru_core::session::{Prepared, QueryStep, Session};
+    let mut s = Session::new();
+    s.register_bytes_as("t", data("dup_names.parquet"), FormatKind::Parquet).unwrap();
+    let Prepared::Ready(mut q) = s.prepare("SELECT a, a_1, A_2 FROM t", &[]).unwrap() else {
+        panic!("unexpected NeedIo")
+    };
+    let mut rows = Vec::new();
+    while let QueryStep::Batch(mut b) = s.step(&mut q).unwrap() {
+        b.materialize();
+        for r in 0..b.num_rows() {
+            rows.push(b.cols.iter().map(|c| c.value_at(r)).collect::<Vec<_>>());
+        }
+    }
+    let i = Value::I64;
+    assert_eq!(rows, vec![vec![i(1), i(3), i(5)], vec![i(2), i(4), i(6)]]);
+}

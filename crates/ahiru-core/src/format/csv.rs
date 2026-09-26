@@ -558,26 +558,23 @@ fn finish(cols: Vec<ColBuf>, uniq: &[usize], projection: &[usize]) -> Result<Vec
 
 /// Decides the column names from the header.
 ///
-/// Empty, non-UTF-8, and duplicate names are replaced with `columnN`. Leaving duplicates would
-/// make it impossible to decide which one a column reference means, so they are always made unique.
+/// As in DuckDB, surrounding spaces are trimmed (`a, b ,c` names `a`, `b`, `c`), an empty or
+/// non-UTF-8 name becomes `columnN`, and a repeated name (ignoring case) becomes `a_1`, `a_2`, ...
+/// Leaving duplicates would make it impossible to decide which one a column reference means.
 fn column_names(raw: &[Vec<u8>]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    for (i, r) in raw.iter().enumerate() {
-        let mut name = match core::str::from_utf8(r) {
-            Ok(s) if !s.is_empty() => s.to_owned(),
-            _ => generated_name(i),
-        };
-        if out.iter().any(|p| eq_ascii_ci(p.as_bytes(), name.as_bytes())) {
-            name = generated_name(i);
-        }
-        // In case a generated name collides again (an earlier column was literally "column3", say).
-        // The length grows each time, so it always terminates.
-        while out.iter().any(|p| eq_ascii_ci(p.as_bytes(), name.as_bytes())) {
-            name.push('_');
-        }
-        out.push(name);
-    }
-    out
+    let names: Vec<String> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let start = r.iter().position(|&b| b != b' ').unwrap_or(r.len());
+            let end = r.iter().rposition(|&b| b != b' ').map_or(start, |e| e + 1);
+            match core::str::from_utf8(&r[start..end]) {
+                Ok(s) if !s.is_empty() => s.to_owned(),
+                _ => generated_name(i),
+            }
+        })
+        .collect();
+    crate::format::unique_column_names(&names)
 }
 
 /// Decides whether the first record is a header, the way DuckDB's sniffer does.
@@ -1456,14 +1453,16 @@ mod tests {
     #[test]
     fn header_names_are_made_unique() {
         let (f, _) = open(b"a,,a,B,column2\n1,2,3,4,5\n", b',');
-        // Empty -> column1; a duplicate (ignoring case) -> column2. The fifth column collides with
-        // the "column2" generated before it, so it becomes column4.
-        assert_eq!(names(&f), vec!["a", "column1", "column2", "B", "column4"]);
-        // When generated names collide with one another, a `_` is added to make them unique.
+        // As in DuckDB: empty -> column1; a duplicate (ignoring case) -> a_1.
+        assert_eq!(names(&f), vec!["a", "column1", "a_1", "B", "column2"]);
         let (g, _) = open(b"x,column1,x\n1,2,3\n", b',');
-        assert_eq!(names(&g), vec!["x", "column1", "column2"]);
-        let (h, _) = open(b"column2,a,a\n1,2,3\n", b',');
-        assert_eq!(names(&h), vec!["column2", "a", "column2_"]);
+        assert_eq!(names(&g), vec!["x", "column1", "x_1"]);
+        // A generated name that collides with a real one is suffixed the same way.
+        let (h, _) = open(b"column1,,a\n1,2,3\n", b',');
+        assert_eq!(names(&h), vec!["column1", "column1_1", "a"]);
+        // Spaces around a name are trimmed (tabs are not); a spaces-only name is empty.
+        let (p, _) = open(b"a, b ,\"  c\",\td , \n1,2,3,4,5\n", b',');
+        assert_eq!(names(&p), vec!["a", "b", "c", "\td", "column4"]);
     }
 
     #[test]

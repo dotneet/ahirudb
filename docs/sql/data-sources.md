@@ -127,6 +127,12 @@ detected the way DuckDB's sniffer does it:
 A header whose names look exactly like the data (every name a number, say)
 is therefore read as a data row, as it is in DuckDB.
 
+Header names are cleaned up as DuckDB does it: spaces around a name are
+trimmed (`a, b ,c` names `a`, `b`, `c`; tabs are kept), an empty name
+becomes `columnN` (its 0-based position), and a name repeated ignoring case
+becomes `a_1`, `a_2`, ... (`a,a,A` names `a`, `a_1`, `A_2`). Parquet column
+names that repeat — pyarrow writes them if asked — are renamed the same way.
+
 ### Padding
 
 Spaces around a value do not stop it from being typed: `1, 2` infers

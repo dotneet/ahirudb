@@ -267,8 +267,16 @@ impl TableFormat for ParquetFormat {
                 }
             }
         };
-        self.schema =
-            f.schema.columns.iter().map(|c| Field::new(c.name.clone(), c.ty, c.nullable)).collect();
+        // A writer may repeat a name (pyarrow writes `a`/`a` or `A`/`a` as asked); DuckDB renames
+        // the later ones `a_1`, ... so every column stays reachable.
+        let names: Vec<String> = f.schema.columns.iter().map(|c| c.name.clone()).collect();
+        self.schema = f
+            .schema
+            .columns
+            .iter()
+            .zip(crate::format::unique_column_names(&names))
+            .map(|(c, name)| Field::new(name, c.ty, c.nullable))
+            .collect();
         self.file = Some(f);
         Ok(Ok(()))
     }
