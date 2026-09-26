@@ -73,20 +73,29 @@ pub fn canonical_f64(v: f64) -> u64 {
 /// span, so an equi-join on them found nothing, `UNION` kept both, and `ORDER BY` ranked
 /// `1 day` above `25 hours` (the months field dominates the high bits).
 ///
-/// DuckDB (and PostgreSQL) compare intervals by flattening them with the fixed conversions
-/// **1 month = 30 days** and **1 day = 24 hours**, and that is what this reproduces. The
-/// conversions are deliberately calendar-independent: interval comparison has no anchor date, so
-/// there is nothing to ask how long "one month" really is. Adding an interval to a timestamp
-/// still uses real calendar arithmetic (`expr::funcs::add_interval_to_ts`) -- only comparison
-/// normalizes.
+/// DuckDB compares intervals after `interval_t::Normalize`, which carries whole days out of the
+/// microseconds and whole 30-day months out of the days with **truncating** division (so each
+/// carry keeps its field's sign), and then compares `(months, days, micros)`
+/// lexicographically. That is what this reproduces. It is a flattening with **1 month = 30
+/// days** and **1 day = 24 hours** as long as the fields agree in sign (`1 day` = `24 hours`,
+/// `1 month` = `30 days`), but not across mixed signs: `2 months -45 days` normalizes to
+/// `(1, -15, 0)` and so ranks above `16 days`, and `-1 day 1 hour` is not `-23 hours`. The
+/// conversions are deliberately calendar-independent: interval comparison has no anchor date,
+/// so there is nothing to ask how long "one month" really is. Adding an interval to a
+/// timestamp still uses real calendar arithmetic (`expr::funcs::add_interval_to_ts`) -- only
+/// comparison normalizes.
 ///
-/// The result cannot overflow: the widest input (`i32::MAX` months + `i32::MAX` days +
-/// `i64::MIN` microseconds) stays below 6e24, far inside i128.
+/// The key packs the normalized fields so that integer order is the lexicographic order: the
+/// micros are below one day (< 2^37) in magnitude and the days below 30, so `days << 40` and
+/// `months << 64` never overlap a lower field's range. The months stay within ~2^32, far inside
+/// i128.
 #[inline]
 pub fn interval_key(v: i128) -> i128 {
-    const US_PER_DAY: i128 = 86_400_000_000;
+    const US_PER_DAY: i64 = 86_400_000_000;
     let (months, days, micros) = crate::vector::unpack_interval(v);
-    (months as i128) * 30 * US_PER_DAY + (days as i128) * US_PER_DAY + micros as i128
+    let days = days as i64 + micros / US_PER_DAY;
+    let months = months as i64 + days / 30;
+    ((months as i128) << 64) + (((days % 30) as i128) << 40) + (micros % US_PER_DAY) as i128
 }
 
 /// Whether the key contains even one NULL. In an equi-join a NULL key never matches, so this is
