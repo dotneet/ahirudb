@@ -582,8 +582,14 @@ pub fn resolve_const(
         "isnan" => fixed(F_ISNAN, &[Double], n, 1, Boolean),
         "isinf" => fixed(F_ISINF, &[Double], n, 1, Boolean),
         "isfinite" => fixed(F_ISFINITE, &[Double], n, 1, Boolean),
-        "gcd" | "greatest_common_divisor" => fixed(F_GCD, &[BigInt, BigInt], n, 2, BigInt),
-        "lcm" | "least_common_multiple" => fixed(F_LCM, &[BigInt, BigInt], n, 2, BigInt),
+        // BIGINT, or HUGEINT once an argument needs it (as in DuckDB, which has the
+        // same two overloads): a UBIGINT past BIGINT's range used to turn NULL.
+        "gcd" | "greatest_common_divisor" | "lcm" | "least_common_multiple" => {
+            let t =
+                if args.iter().any(|t| matches!(t, HugeInt | UBigInt)) { HugeInt } else { BigInt };
+            let id = if name.starts_with('g') { F_GCD } else { F_LCM };
+            fixed(id, &[t, t], n, 2, t)
+        }
         // An integer argument keeps its own type so the bits are counted at its declared
         // width (`bit_count(-1::TINYINT)` is 8, as in DuckDB, not 64).
         "bit_count" => {

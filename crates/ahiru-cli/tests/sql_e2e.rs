@@ -197,6 +197,30 @@ e2e!(
     ]
 );
 
+e2e!(
+    numeric_literals_and_casts,
+    "tests/data/basic.parquet",
+    [
+        // Decimal literals are exact DECIMALs; DOUBLE -> DECIMAL rounds x * 10^s.
+        "SELECT 0.1 + 0.2 = 0.3, CAST(4.5 AS INTEGER), 123456789012345678901234567.89::DECIMAL(38,2), 1.005::DOUBLE::DECIMAL(10,2), 2.675::DOUBLE::DECIMAL(10,2) FROM t LIMIT 1",
+        "SELECT '1_000'::INTEGER, '0x10'::INTEGER, CAST('8999999999999999999.99999999999999999995' AS DECIMAL(38,19)), -5::UTINYINT, gcd(18446744073709551615::UBIGINT, 5) FROM t LIMIT 1",
+        "SELECT round(1.5e-300::DOUBLE, 300), round(1e300::DOUBLE, -300), coalesce(CAST('123456789012345678901234567890' AS DECIMAL(38,0)), CAST('1.5' AS DECIMAL(38,18))) FROM t LIMIT 1",
+    ]
+);
+
+e2e!(
+    float_column_against_decimal_literals,
+    "tests/data/float_stats.parquet",
+    [
+        "SELECT count(*) FROM t WHERE f = 1.1",
+        "SELECT count(*) FROM t WHERE f IN (0.1, 3.3)",
+        "SELECT count(*) FROM t WHERE f > 1.1",
+        "SELECT count(*) FROM t WHERE f = 16777217",
+        "SELECT count(*) FROM t WHERE f = 1.1::DOUBLE",
+        "SELECT count(*) FROM t WHERE f BETWEEN 1.1 AND 3.3",
+    ]
+);
+
 e2e!(expressions, "tests/data/basic.parquet", [
     "SELECT id + 1, id * 2, id - 1 FROM t ORDER BY id LIMIT 5",
     "SELECT score / 2 FROM t ORDER BY id LIMIT 5",

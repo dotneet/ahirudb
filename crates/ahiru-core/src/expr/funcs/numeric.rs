@@ -81,27 +81,7 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
             };
             Some(bits.count_ones() as i64)
         }
-        // Always non-negative, matching DuckDB (`select gcd(-4, 6)` -> `2`).
-        F_GCD => gcd(a.int(0), a.int(1)),
-        F_LCM => {
-            let (x, y) = (a.int(0), a.int(1));
-            if x == 0 || y == 0 {
-                // Short-circuit before gcd: lcm(i64::MIN, 0) is exactly zero
-                // even though abs(i64::MIN), and therefore its gcd with zero,
-                // is not representable as a positive BIGINT.
-                Some(0)
-            } else {
-                match gcd(x, y) {
-                    None => None,
-                    // Both inputs are non-zero, so their gcd cannot be zero.
-                    Some(0) => None,
-                    Some(g) => {
-                        // Divide first so the product does not overflow needlessly.
-                        (x / g).checked_mul(y).and_then(|v| v.checked_abs())
-                    }
-                }
-            }
-        }
+        F_GCD | F_LCM => narrow(gcd_lcm(id, a.int(0) as i128, a.int(1) as i128)),
         // Out-of-range components give NULL rather than silently normalizing
         // (`make_date(2024, 13, 1)` is an error in DuckDB; NULL is this engine's convention
         // for an undefined argument, the same as `sqrt(-1)`).
@@ -192,6 +172,7 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
 pub(super) fn eval_i128(id: FuncId, a: &A, res: Ty) -> Result<Option<i128>> {
     Ok(match id {
         F_FACTORIAL => Some(factorial(a.int(0))?),
+        F_GCD | F_LCM => gcd_lcm(id, a.i128(0), a.i128(1)),
         F_ABS_I => a.i128(0).checked_abs(),
         F_ROUND_I => {
             let d = if a.n() >= 2 { a.int(1) } else { 0 };
@@ -317,16 +298,23 @@ fn factorial(n: i64) -> Result<i128> {
     Ok(acc)
 }
 
-/// The greatest common divisor, always non-negative. i64::MIN has no positive
-/// absolute value in BIGINT, so an unrepresentable result is returned as None.
-fn gcd(a: i64, b: i64) -> Option<i64> {
-    let (mut x, mut y) = (a.unsigned_abs(), b.unsigned_abs());
-    while y != 0 {
-        let t = x % y;
-        x = y;
-        y = t;
+/// `gcd`/`lcm`, always non-negative (`gcd(-4, 6)` is 2, as in DuckDB), computed at
+/// `i128` width for both the BIGINT and HUGEINT overloads; the caller narrows. A result
+/// with no positive representation (`gcd(i64::MIN, 0)`, an `lcm` that overflows) is None.
+fn gcd_lcm(id: FuncId, x: i128, y: i128) -> Option<i128> {
+    let (mut g, mut r) = (x.unsigned_abs(), y.unsigned_abs());
+    while r != 0 {
+        (g, r) = (r, g % r);
     }
-    i64::try_from(x).ok()
+    if id == F_GCD {
+        return i128::try_from(g).ok();
+    }
+    if g == 0 {
+        // lcm(0, 0); any other zero argument makes g the other magnitude.
+        return Some(0);
+    }
+    // Divide first so the product does not overflow needlessly; lcm(x, 0) is 0.
+    (x.unsigned_abs() / g).checked_mul(y.unsigned_abs()).and_then(|v| i128::try_from(v).ok())
 }
 
 /// `make_date(y, m, d)` -> days since the epoch. Out-of-range month or day gives `None`
@@ -474,29 +462,48 @@ pub(super) fn round_half_up(x: f64) -> f64 {
     }
 }
 
-/// `round(x, d)`. Like DuckDB it multiplies by 10^d, rounds, and divides back.
+/// `round(x, d)`. Exactly DuckDB's formula: multiply by `10^d`, round half away from
+/// zero, divide back (for `d < 0`, divide by `10^-d` and multiply back). When that
+/// overflows or meets a non-finite value, DuckDB answers `x` itself for `d >= 0` and
+/// `0` for `d < 0`, and so does this: `round(1.23e-310, 312)` is `1.23e-310` (the
+/// multiplier `1e312` is infinite), `round(1.5e300, -400)` and `round(inf, -2)` are 0.
 fn round_f64(x: f64, d: i64) -> f64 {
-    if !x.is_finite() {
-        return x;
-    }
-    if d == 0 {
-        return round_half_up(x);
-    }
-    let m = pow10(d.unsigned_abs().min(308) as u32);
-    let r = if d > 0 { round_half_up(x * m) / m } else { round_half_up(x / m) * m };
-    if r.is_finite() {
-        r
+    let m = pow10(d.unsigned_abs());
+    if d < 0 {
+        let r = round_half_up(x / m) * m;
+        if r.is_finite() {
+            r
+        } else {
+            0.0
+        }
     } else {
-        x
+        let r = round_half_up(x * m) / m;
+        if r.is_finite() {
+            r
+        } else {
+            x
+        }
     }
 }
 
-pub(super) fn pow10(k: u32) -> f64 {
-    let mut r = 1.0f64;
-    for _ in 0..k {
-        r *= 10.0;
+/// `10^k`, correctly rounded (`inf` past `f64`'s range). Repeated multiplication is
+/// exact only up to `10^22`; beyond that each step rounds again, and `round(1.5e-300,
+/// 300)` came out as `1.9999999999999997e-300` instead of `2e-300`. So larger powers
+/// are read from the text `1e<k>`, which `str::parse` rounds once.
+pub(super) fn pow10(k: u64) -> f64 {
+    if k <= 22 {
+        let mut r = 1.0f64;
+        for _ in 0..k {
+            r *= 10.0;
+        }
+        return r;
     }
-    r
+    if k > 400 {
+        return f64::INFINITY;
+    }
+    let text =
+        [b'1', b'e', b'0' + (k / 100) as u8, b'0' + (k / 10 % 10) as u8, b'0' + (k % 10) as u8];
+    core::str::from_utf8(&text).ok().and_then(|t| t.parse().ok()).unwrap_or(f64::INFINITY)
 }
 
 /// `ln(2)` split so that `k * LN2_HI` is exact for every exponent `k` a double can carry

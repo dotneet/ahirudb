@@ -174,15 +174,17 @@ fn interval_ordering_comparisons() {
 fn cast_shorthand_chains() {
     let mut db = session_with_dual();
     let rows = run(&mut db, "SELECT 3.7::INTEGER::VARCHAR FROM dual");
-    assert_eq!(rows, vec![vec![Value::Bytes(b"4".to_vec())]]); // round-half-to-even
+    assert_eq!(rows, vec![vec![Value::Bytes(b"4".to_vec())]]);
 }
 
 #[test]
 fn cast_shorthand_binds_tighter_than_unary_minus() {
-    // duckdb: SELECT -1::VARCHAR -> '-1' (parses as -(1::VARCHAR))
+    // duckdb 1.4: `SELECT -5::UTINYINT` -> 251, i.e. -(5::UTINYINT) wrapping in
+    // UTINYINT, and `SELECT -1::VARCHAR` is a binder error (no `-(VARCHAR)`).
     let mut db = session_with_dual();
-    let rows = run(&mut db, "SELECT -1::VARCHAR FROM dual");
-    assert_eq!(rows, vec![vec![Value::Bytes(b"-1".to_vec())]]);
+    let rows = run(&mut db, "SELECT -5::UTINYINT, -1::INTEGER FROM dual");
+    assert_eq!(rows, vec![vec![Value::I32(251), Value::I32(-1)]]);
+    assert_eq!(code_of(db.prepare("SELECT -1::VARCHAR FROM dual", &[])), Some(Code::TypeMismatch));
 }
 
 // --- ^ / ** power ---------------------------------------------------------------

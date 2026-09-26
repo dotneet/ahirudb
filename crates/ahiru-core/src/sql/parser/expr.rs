@@ -364,15 +364,19 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 // A negative integer folds into a single literal. Otherwise a value that
                 // does not fit on the positive side, such as -9223372036854775808, could
-                // not be written. This literal does not go through `primary_atom`, so the
-                // postfix `::` is folded here as well (see the `primary` docs; confirmed
-                // with `duckdb -c "select -1::varchar"` that `-1::VARCHAR` means
-                // `(-1)::VARCHAR`).
+                // not be written. A postfix `::` binds tighter than the minus, though:
+                // `-5::UTINYINT` is `-(5::UTINYINT)` (251 in DuckDB 1.4, where
+                // `-1::VARCHAR` is a binder error for the same reason), so with a cast
+                // the literal stays positive and the negation wraps the cast.
                 if let Tok::Int(text) = self.cur {
-                    let v = int_literal(text, true, self.pos)?;
+                    let pos = self.pos;
                     self.bump()?;
-                    let node = self.arena.push(Expr::Literal(v));
-                    return self.cast_postfix(node);
+                    if self.is(Tok::ColonColon) {
+                        let lit = self.arena.push(Expr::Literal(int_literal(text, false, pos)?));
+                        let arg = self.cast_postfix(lit)?;
+                        return Ok(self.arena.push(Expr::Unary { op: UnaryOp::Neg, arg }));
+                    }
+                    return Ok(self.arena.push(Expr::Literal(int_literal(text, true, pos)?)));
                 }
                 let arg = self.expr_bp(BP_UNARY)?;
                 Ok(self.arena.push(Expr::Unary { op: UnaryOp::Neg, arg }))

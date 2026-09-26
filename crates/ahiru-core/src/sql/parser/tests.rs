@@ -654,7 +654,10 @@ fn cast_shorthand_desugars_to_cast() {
     assert_eq!(ex("'42'::INTEGER"), "CAST('42' AS INTEGER)");
     // `::` binds tighter than prefix operators (confirmed by `duckdb -c "select -1::varchar"`
     // being interpreted as `-(1::VARCHAR)` and thus a type error).
-    assert_eq!(ex("-1::VARCHAR"), "CAST(-1i32 AS VARCHAR)");
+    assert_eq!(ex("-1::VARCHAR"), "(- CAST(1i32 AS VARCHAR))");
+    assert_eq!(ex("-5::UTINYINT"), "(- CAST(5i32 AS UTINYINT))");
+    // Without a cast the minus still folds into the literal.
+    assert_eq!(ex("-9223372036854775808"), "-9223372036854775808i64");
     assert_eq!(ex("(1 + 2)::VARCHAR"), "CAST((1i32 + 2i32) AS VARCHAR)");
     // Repeated application folds too.
     assert_eq!(ex("x::INTEGER::VARCHAR"), "CAST(CAST(x AS INTEGER) AS VARCHAR)");

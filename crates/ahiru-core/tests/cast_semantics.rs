@@ -386,7 +386,9 @@ fn double_to_float_overflow_is_null_not_infinity() {
     assert_eq!(one(&mut s, "TRY_CAST(1e39 AS FLOAT)"), Value::Null);
     assert_eq!(one(&mut s, "CAST(1e308 AS FLOAT)"), Value::Null);
     assert_eq!(one(&mut s, "CAST(-1e308 AS FLOAT)"), Value::Null);
-    assert_eq!(one(&mut s, "CAST('1e39' AS FLOAT)"), Value::Null);
+    // Text is different: it rounds straight to FLOAT, and past its range that is
+    // infinite, as in DuckDB.
+    assert_eq!(f64_of(&one(&mut s, "CAST('1e39' AS FLOAT)")), f64::INFINITY);
     // An infinity that was already in the input still passes through.
     assert!(f64_of(&one(&mut s, "CAST(CAST('inf' AS DOUBLE) AS FLOAT)")).is_infinite());
     assert!(f64_of(&one(&mut s, "CAST('-inf' AS FLOAT)")).is_infinite());

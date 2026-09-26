@@ -248,3 +248,184 @@ fn double_to_decimal_rounds_the_double_not_its_shortest_text() {
         "1.00|0.28|0.13|2.68|1.01|5|-0.13"
     );
 }
+
+// --- Text -> DECIMAL / HUGEINT past 38 digits ---------------------------------
+
+#[test]
+fn text_to_decimal_rounds_on_the_digits_past_the_mantissa() {
+    // duckdb: the digit past the 38th used to be dropped rather than rounded on.
+    assert_eq!(
+        text("CAST('8999999999999999999.99999999999999999995' AS DECIMAL(38,19))"),
+        "9000000000000000000.0000000000000000000"
+    );
+    assert_eq!(
+        text("CAST('8999999999999999999.99999999999999999995' AS DECIMAL(38,18))"),
+        "9000000000000000000.000000000000000000"
+    );
+    assert_eq!(
+        text("'99999999999999999999999999999999999999.5'::HUGEINT"),
+        "100000000000000000000000000000000000000"
+    );
+    assert_eq!(
+        text("'-99999999999999999999999999999999999999.5'::HUGEINT"),
+        "-100000000000000000000000000000000000000"
+    );
+    // 10^38 does not fit DECIMAL(38,0): NULL here, a conversion error in DuckDB.
+    assert_eq!(
+        text("TRY_CAST('99999999999999999999999999999999999999.5' AS DECIMAL(38,0))"),
+        "NULL"
+    );
+    // A tail below one half never rounds up, even when the dropped digits are many.
+    assert_eq!(text("'1.4999999999999999999999999999999999999999'::DECIMAL(38,0)"), "1");
+    assert_eq!(text("'0.49999999999999999999999999999999999999999'::INTEGER"), "0");
+}
+
+// --- Text -> number spellings -------------------------------------------------
+
+#[test]
+fn text_to_number_accepts_separators_and_radix_prefixes() {
+    // duckdb: 1000, 16, 31, 5, 10.55, 10.550, 11, 15000000000.0, 18446744073709551615, 16
+    assert_eq!(
+        texts(&[
+            "'1_000'::INTEGER",
+            "'0x10'::INTEGER",
+            "'0X1f'::BIGINT",
+            "'0b101'::INTEGER",
+            "'1_0.5_5'::DOUBLE",
+            "'1_0.5_5'::DECIMAL(10,3)",
+            "'1_0.5_5'::INTEGER",
+            "'1.5e1_0'::DOUBLE",
+            "'0xFFFFFFFFFFFFFFFF'::UBIGINT",
+            "'0x1_0'::INTEGER",
+        ]),
+        "1000|16|31|5|10.55|10.550|11|15000000000.0|18446744073709551615|16"
+    );
+    // Misplaced separators, a sign or whitespace before a radix prefix, a radix prefix
+    // on a non-integer target or HUGEINT, and a value past the target: all NULL.
+    for e in [
+        "'1__000'::INTEGER",
+        "'_1'::INTEGER",
+        "'1_'::INTEGER",
+        "'1_.5'::DOUBLE",
+        "'-0x10'::INTEGER",
+        "' 0x10 '::INTEGER",
+        "'0x10'::HUGEINT",
+        "'0x10'::DECIMAL(5,1)",
+        "'0x10'::DOUBLE",
+        "'0x8000000000000000'::BIGINT",
+        "'0xFF'::TINYINT",
+        "'0x'::BIGINT",
+        "'0o17'::INTEGER",
+    ] {
+        assert_eq!(text(e), "NULL", "{e}");
+    }
+}
+
+#[test]
+fn text_past_the_float_range_is_infinite() {
+    // duckdb: inf, inf, -inf, inf, 0.0
+    assert_eq!(
+        texts(&[
+            "'1e400'::FLOAT",
+            "'1e400'::DOUBLE",
+            "'-1e400'::DOUBLE",
+            "'1e39'::FLOAT",
+            "'1e-400'::DOUBLE"
+        ]),
+        "inf|inf|-inf|inf|0.0"
+    );
+    // A DOUBLE value too large for FLOAT is still NULL (DuckDB raises).
+    assert_eq!(text("TRY_CAST(1e39 AS FLOAT)"), "NULL");
+}
+
+#[test]
+fn text_to_boolean_accepts_only_the_boolean_spellings() {
+    // duckdb: true, false, true, false, true; everything in the loop is a conversion
+    // error there (NULL here, the engine's cast convention).
+    assert_eq!(
+        texts(&[
+            "'1'::BOOLEAN",
+            "'0'::BOOLEAN",
+            "'TRUE'::BOOLEAN",
+            "'no'::BOOLEAN",
+            "'Y'::BOOLEAN"
+        ]),
+        "true|false|true|false|true"
+    );
+    for e in ["'0.4'", "'2'", "'-1'", "'1.0'", "'00'", "' 1 '", "' true '", "'on'"] {
+        assert_eq!(text(&format!("TRY_CAST({e} AS BOOLEAN)")), "NULL", "{e}");
+    }
+}
+
+#[test]
+fn integer_literal_past_hugeint_is_a_double() {
+    // duckdb: 1e+42 (DOUBLE); it has a UHUGEINT step first, which this engine does not.
+    let big = "1000000000000000000000000000000000000000000";
+    assert_eq!(texts(&[big, &format!("typeof({big})")]), "1e+42|DOUBLE");
+    assert_eq!(text("-170141183460469231731687303715884105729"), "-1.7014118346046923e+38");
+    // The HUGEINT extremes are still HUGEINT.
+    assert_eq!(text("typeof(-170141183460469231731687303715884105728)"), "HUGEINT");
+}
+
+// --- Unary minus and `::` -----------------------------------------------------
+
+#[test]
+fn a_cast_binds_tighter_than_unary_minus() {
+    // duckdb: 251 (-(5::UTINYINT) wraps in UTINYINT) and -5; the typing of a bare
+    // negative literal is unchanged (BIGINT, BIGINT).
+    assert_eq!(
+        texts(&[
+            "-5::UTINYINT",
+            "-5::TINYINT",
+            "typeof(-2147483648)",
+            "typeof(-9223372036854775808)",
+            "-9223372036854775808",
+        ]),
+        "251|-5|BIGINT|BIGINT|-9223372036854775808"
+    );
+}
+
+// --- round(DOUBLE, d) ---------------------------------------------------------
+
+#[test]
+fn round_double_is_exact_at_large_digit_counts() {
+    // duckdb: every value below. The power of ten used to be built by repeated
+    // multiplication, off by an ulp past 10^22, and an overflowing multiplier gave 0.
+    assert_eq!(
+        texts(&[
+            "round(1e300::DOUBLE, -300)",
+            "round(1.5e-300::DOUBLE, 300)",
+            "round(1.23e-310::DOUBLE, 312)",
+            "round(5e-324::DOUBLE, 324)",
+            "round(1.5e300::DOUBLE, -400)",
+            "round(1.7976931348623157e308::DOUBLE, -308)",
+            "round('inf'::DOUBLE, -2)",
+            "round('inf'::DOUBLE, 2)",
+            "round(123.456::DOUBLE, -1)",
+            "round(-2.5::DOUBLE)",
+        ]),
+        "1e+300|2e-300|1.23e-310|5e-324|0.0|0.0|0.0|inf|120.0|-3.0"
+    );
+}
+
+// --- gcd / lcm ----------------------------------------------------------------
+
+#[test]
+fn gcd_and_lcm_take_hugeint_arguments() {
+    // duckdb: 5, HUGEINT, 1, 36893488147419103230, BIGINT, 2, 12
+    assert_eq!(
+        texts(&[
+            "gcd(18446744073709551615::UBIGINT, 5)",
+            "typeof(gcd(18446744073709551615::UBIGINT, 5))",
+            "gcd(170141183460469231731687303715884105727::HUGEINT, 7)",
+            "lcm(18446744073709551615::UBIGINT, 2)",
+            "typeof(lcm(1::INTEGER, 2))",
+            "gcd(-9223372036854775808, 6)",
+            "lcm(-4::HUGEINT, 6)",
+        ]),
+        "5|HUGEINT|1|36893488147419103230|BIGINT|2|12"
+    );
+    // No positive BIGINT holds 2^63 (DuckDB raises); an lcm past HUGEINT is NULL too.
+    assert_eq!(text("gcd(-9223372036854775808, 0)"), "NULL");
+    assert_eq!(text("lcm(170141183460469231731687303715884105727::HUGEINT, 2)"), "NULL");
+}
