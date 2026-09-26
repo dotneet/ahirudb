@@ -152,12 +152,15 @@ pub(super) fn bind_one_cte(
                 Some(e) => e,
                 None => err!(Internal),
             };
-            entry.plan = CtePlan::Ready(Box::new(Node::RecursiveCte {
+            let node = Node::RecursiveCte {
                 anchor: Box::new(anchor),
                 recursive_term: Box::new(recursive_term),
                 union_all,
                 schema: out_schema,
-            }));
+            };
+            // The anchor and recursive term bypass `bind_query_in`'s depth check.
+            check_plan_depth(&node)?;
+            entry.plan = CtePlan::Ready(Box::new(node));
             return Ok(());
         }
     }

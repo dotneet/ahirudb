@@ -12,7 +12,7 @@
 //! `tests` module and `tests/unnest.rs`.
 
 use crate::exec::{ExecContext, Operator, Step};
-use crate::expr::Program;
+use crate::expr::{kernels, Program};
 use crate::json::{self, Kind};
 use crate::prelude::*;
 use crate::vector::{Batch, Ty, Value, Vector, BATCH_SIZE};
@@ -72,7 +72,10 @@ impl Operator for Unnest {
                 None => err!(Internal),
             };
 
-            let mut out_elem = Vector::with_capacity(self.elem_ty, BATCH_SIZE);
+            // A native element type is built as text and cast once per batch (see `push_elem`).
+            let text = self.elem_ty != Ty::Json;
+            let mut out_elem =
+                Vector::with_capacity(if text { Ty::Varchar } else { Ty::Json }, BATCH_SIZE);
             let mut dup: Vec<u32> = Vec::new();
             let mut scratch = Vec::new();
             while cur.row < cur.rows && out_elem.len() < BATCH_SIZE {
@@ -96,7 +99,7 @@ impl Operator for Unnest {
                 }
                 while cur.elem_pos < elems.len() && out_elem.len() < BATCH_SIZE {
                     let (span, kind) = elems[cur.elem_pos];
-                    push_elem(&mut out_elem, self.elem_ty, span, kind, &mut scratch)?;
+                    push_elem(&mut out_elem, text, span, kind, &mut scratch)?;
                     dup.push(cur.row as u32);
                     cur.elem_pos += 1;
                 }
@@ -111,6 +114,9 @@ impl Operator for Unnest {
                 self.cur = None;
                 continue;
             }
+            if text && self.elem_ty != Ty::Varchar {
+                out_elem = kernels::cast(Ty::Varchar, self.elem_ty, &out_elem)?;
+            }
             let mut out_cols: Vec<Vector> = cur.cols.iter().map(|c| c.gather(&dup)).collect();
             out_cols.push(out_elem);
             if cur.row >= cur.rows {
@@ -121,86 +127,27 @@ impl Operator for Unnest {
     }
 }
 
-/// Pushes one array element into `out` according to the declared type `elem_ty`. JSON `null`
-/// becomes SQL NULL (the same judgment as `json::write_extracted_text`). When an element's
-/// actual kind disagrees with the declared type (when `elem_ty`'s narrowing did not go through a
-/// static guarantee, or as a defense against a future caller's mistake) it becomes NULL -- with
-/// neither a panic nor an error.
-///
-/// A *number* that does not fit the declared type is a different matter and raises
-/// `ValueOutOfRange`: turning it into NULL would silently corrupt the data. The narrowing in
-/// `plan::bind::narrow_unnest_elem_ty` picks a type wide enough for every element's static type,
-/// so this is a backstop rather than something a normal query reaches.
+/// Pushes one array element into `out`: its JSON text when the element column is `Ty::Json`,
+/// otherwise its text form (a string unquoted, anything else verbatim), which the caller casts
+/// from VARCHAR to the declared element type for the whole batch. Going through the cast gives
+/// every element type `plan::bind::narrow_unnest_elem_ty` can pick (DECIMAL, DATE, BLOB, ...)
+/// exactly the reading `CAST(<text> AS <type>)` has, and an element that does not parse as the
+/// declared type becomes NULL rather than an error (the contract of `kernels::cast`). JSON
+/// `null` is SQL NULL either way.
 fn push_elem(
     out: &mut Vector,
-    elem_ty: Ty,
+    text: bool,
     span: &[u8],
     kind: Kind,
     scratch: &mut Vec<u8>,
 ) -> Result<()> {
-    if kind == Kind::Null {
+    scratch.clear();
+    if kind == Kind::Null || (text && !json::write_extracted_text(span, kind, scratch)?) {
         out.push_null();
         return Ok(());
     }
-    match elem_ty {
-        Ty::BigInt => match (kind, json::parse_i64(span)) {
-            (Kind::Num, Some(v)) => out.push_value(&Value::I64(v)),
-            (Kind::Num, None) => err!(ValueOutOfRange),
-            _ => out.push_null(),
-        },
-        Ty::HugeInt => match (kind, parse_i128(span)) {
-            (Kind::Num, Some(v)) => out.push_value(&Value::I128(v)),
-            (Kind::Num, None) => err!(ValueOutOfRange),
-            _ => out.push_null(),
-        },
-        Ty::Double => match (kind, json::parse_f64(span)) {
-            (Kind::Num, Some(v)) => out.push_value(&Value::F64(v)),
-            (Kind::Num, None) => err!(ValueOutOfRange),
-            _ => out.push_null(),
-        },
-        Ty::Varchar => match kind {
-            Kind::Str => {
-                scratch.clear();
-                let body = if span.len() >= 2 { &span[1..span.len() - 1] } else { &[][..] };
-                json::decode_string(body, scratch)?;
-                out.push_value(&Value::Bytes(scratch.clone()));
-            }
-            _ => out.push_null(),
-        },
-        Ty::Boolean => match kind {
-            Kind::Bool => out.push_value(&Value::Bool(span.first() == Some(&b't'))),
-            _ => out.push_null(),
-        },
-        // Ty::Json, or an unexpected declared type (a safe fallback in case of a bug in the
-        // narrowing logic), pushes the raw JSON text unchanged.
-        _ => out.push_value(&Value::Bytes(span.to_vec())),
-    }
+    out.push_value(&Value::Bytes(if text { scratch.clone() } else { span.to_vec() }));
     Ok(())
-}
-
-/// A JSON integer token as `i128`. The same shape as `json::parse_i64` (digits only, no
-/// exponent or decimal point), one width up, for the HUGEINT element column.
-fn parse_i128(s: &[u8]) -> Option<i128> {
-    let (neg, ds) = match s.first() {
-        Some(b'-') => (true, &s[1..]),
-        _ => (false, s),
-    };
-    if ds.is_empty() {
-        return None;
-    }
-    // Accumulated on the negative side so that i128::MIN needs no special case.
-    let mut acc: i128 = 0;
-    for &c in ds {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i128)?;
-    }
-    if neg {
-        Some(acc)
-    } else {
-        acc.checked_neg()
-    }
 }
 
 #[cfg(test)]

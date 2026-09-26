@@ -134,8 +134,10 @@ fn push_value(out: &mut Vec<u8>, v: &Value, ty: Ty) {
         // DESIGN.md §5). Embed them verbatim so nested arrays/objects come out
         // as real JSON structure, matching `duckdb`'s `COPY ... (FORMAT JSON)`
         // (`{"tags":[1,2,3]}`, not `{"tags":"[1,2,3]"}`). Every other Bytes
-        // value (VARCHAR/BLOB) is an opaque string and must be escaped.
-        Value::Bytes(b) if ty == Ty::Json => out.extend_from_slice(b),
+        // value (VARCHAR/BLOB) is an opaque string and must be escaped. The text is
+        // minified on the way: a pretty-printed value would otherwise carry its
+        // newlines into the file and split one record over several lines.
+        Value::Bytes(b) if ty == Ty::Json => crate::json::minify_into(b, out),
         // UUID's physical representation is the raw 16 bytes; render as the
         // usual hyphenated hex text, not the opaque escaped-string form used
         // for VARCHAR/BLOB.

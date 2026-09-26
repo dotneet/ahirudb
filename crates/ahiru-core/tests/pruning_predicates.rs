@@ -292,3 +292,17 @@ fn nan_does_not_disable_the_other_float_pruners() {
     assert_eq!(count(NANF, "d IN (5.0, 6.0)"), 160);
     assert_eq!(count(NANF, "d + 0 IN (5.0, 6.0)"), 160);
 }
+
+#[test]
+fn negative_zero_rows_survive_the_bloom_filter() {
+    // pyarrow hashes -0.0's own bits into the Bloom filter, while `0.0 = -0.0`; probing the
+    // filter with +0.0 used to drop the whole row group. DuckDB 1.4.4 returns 5 for the `IN`.
+    const F: &str = "negzero_bloom.parquet";
+    for col in ["d", "f"] {
+        assert_eq!(count(F, &format!("{col} IN (0.0, 1.0)")), 5, "{col}");
+        assert_eq!(count(F, &format!("{col} = 0.0")), 5, "{col}");
+        assert_eq!(count(F, &format!("{col} = -0.0")), 5, "{col}");
+        assert_eq!(count(F, &format!("{col} = 5.0")), 5, "{col}");
+        assert_eq!(count(F, &format!("{col} = 7.0")), 0, "{col}");
+    }
+}

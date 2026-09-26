@@ -67,9 +67,8 @@ fn one(session: &mut Session, expr: &str) -> Value {
     rows[0][0].clone()
 }
 
-/// A helper that compares against the raw JSON token byte sequence (for numbers, unquoted
-/// numeric text). `Ty::Json` values are not restored to a native type
-/// (same reason as `unnest.rs::json_tok`).
+/// A helper that compares against the raw JSON text of a `Ty::Json` value (a list, or an
+/// element whose type is not statically known, such as a nested list's).
 fn j(v: &str) -> Value {
     Value::Bytes(v.as_bytes().to_vec())
 }
@@ -88,9 +87,9 @@ const NULL: Value = Value::Null;
 fn subscript_is_one_based_with_negative_from_end_and_null_out_of_range() {
     let mut sess = session_with_basic();
     // duckdb -c "select [1,2,3][1], [1,2,3][-1], [1,2,3][10], [1,2,3][0]"
-    // -> 1 / 3 / NULL / NULL
-    assert_eq!(one(&mut sess, "[1,2,3][1]"), j("1"));
-    assert_eq!(one(&mut sess, "[1,2,3][-1]"), j("3"));
+    // -> 1 / 3 / NULL / NULL. The element comes back as the literal's INTEGER.
+    assert_eq!(one(&mut sess, "[1,2,3][1]"), i32v(1));
+    assert_eq!(one(&mut sess, "[1,2,3][-1]"), i32v(3));
     assert_eq!(one(&mut sess, "[1,2,3][10]"), NULL);
     assert_eq!(one(&mut sess, "[1,2,3][0]"), NULL);
 }
@@ -98,7 +97,7 @@ fn subscript_is_one_based_with_negative_from_end_and_null_out_of_range() {
 #[test]
 fn subscript_index_can_be_an_arbitrary_expression() {
     let mut sess = session_with_basic();
-    assert_eq!(one(&mut sess, "[10,20,30][1 + 1]"), j("20"));
+    assert_eq!(one(&mut sess, "[10,20,30][1 + 1]"), i32v(20));
 }
 
 #[test]
@@ -122,6 +121,7 @@ fn subscript_and_cast_interleave_by_written_order() {
     // (docs/DESIGN.md §8), so `[i]` always means the 1-based list_extract
     // rule regardless of whether the value was cast to JSON first. This is a
     // deliberate, documented deviation from DuckDB for this one case.
+    // (The cast also drops the static element type, so the element stays JSON text.)
     assert_eq!(one(&mut sess, "([1,2,3]::json)[1]"), j("1"));
 }
 
@@ -206,7 +206,8 @@ fn subscript_on_a_parquet_list_column() {
     let mut sess = Session::new();
     sess.register_bytes_as("t", data("list1.parquet"), FormatKind::Parquet).unwrap();
     let (_, rows) = run(&mut sess, "SELECT id, xs[1], xs[2:3] FROM t WHERE id < 2 ORDER BY id");
-    assert_eq!(rows, vec![vec![i32v(0), j("1"), j("[2,3]")], vec![i32v(1), j("1"), j("[2,3]")]]);
+    // xs is INTEGER[] in DuckDB, so xs[1] is an INTEGER here too (the column's `Shape`).
+    assert_eq!(rows, vec![vec![i32v(0), i32v(1), j("[2,3]")], vec![i32v(1), i32v(1), j("[2,3]")]]);
 }
 
 #[test]
@@ -222,11 +223,11 @@ fn subscript_on_a_parquet_list_column_with_null_and_empty_rows() {
     assert_eq!(
         rows,
         vec![
-            vec![i32v(0), NULL, NULL],    // list itself is SQL NULL
-            vec![i32v(1), NULL, j("[]")], // empty list: [1] is NULL, [1:2] is []
-            vec![i32v(2), j("2"), j("[2]")],
-            vec![i32v(3), j("3"), j("[3,null]")],
-            vec![i32v(4), j("4"), j("[4,5]")],
+            vec![i32v(0), NULL, NULL],              // list itself is SQL NULL
+            vec![i32v(1), NULL, j("[]")],           // empty list: [1] is NULL, [1:2] is []
+            vec![i32v(2), Value::I64(2), j("[2]")], // xs is BIGINT[]
+            vec![i32v(3), Value::I64(3), j("[3,null]")],
+            vec![i32v(4), Value::I64(4), j("[4,5]")],
         ]
     );
 }
@@ -263,9 +264,9 @@ fn subscript_in_a_join() {
     assert_eq!(
         rows,
         vec![
-            vec![i32v(0), Value::Bytes(b"name_0".to_vec()), j("1")],
-            vec![i32v(1), Value::Bytes(b"name_1".to_vec()), j("1")],
-            vec![i32v(2), Value::Bytes(b"name_2".to_vec()), j("1")],
+            vec![i32v(0), Value::Bytes(b"name_0".to_vec()), i32v(1)],
+            vec![i32v(1), Value::Bytes(b"name_1".to_vec()), i32v(1)],
+            vec![i32v(2), Value::Bytes(b"name_2".to_vec()), i32v(1)],
         ]
     );
 }
@@ -277,7 +278,7 @@ fn subscript_result_can_be_grouped_by() {
     let mut sess = Session::new();
     sess.register_bytes_as("t", data("list1.parquet"), FormatKind::Parquet).unwrap();
     let (_, rows) = run(&mut sess, "SELECT xs[1] AS g, COUNT(*) FROM t GROUP BY 1");
-    assert_eq!(rows, vec![vec![j("1"), Value::I64(10)]]);
+    assert_eq!(rows, vec![vec![i32v(1), Value::I64(10)]]);
 }
 
 #[test]

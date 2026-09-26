@@ -1,0 +1,7 @@
+The Parquet files in this directory are copied unmodified from the Apache
+Parquet test-data repository, https://github.com/apache/parquet-testing
+(its data/ directory), licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+- repeated_no_annotation.parquet: an unannotated group around a repeated field
+- nonnullable.impala.parquet: BIT_PACKED level encodings with max level 0

@@ -353,14 +353,17 @@ fn read_data_page_v2(
     let n = check_count(dp.num_values)?;
     let rep_len = check_len(dp.repetition_levels_byte_length)?;
     let def_len = check_len(dp.definition_levels_byte_length)?;
-    ensure!(rep_len == 0, UnsupportedNested);
-    ensure!(def_len <= raw.len(), UnexpectedEof, 0);
+    // A flat column has no repetition, but some writers still emit a (trivial)
+    // repetition-level run; it is skipped rather than rejected, as DuckDB does.
+    ensure!(rep_len <= raw.len(), UnexpectedEof, 0);
+    ensure!(def_len <= raw.len() - rep_len, UnexpectedEof, rep_len);
+    let skip = rep_len + def_len;
 
     let page_validity = if desc.max_def_level > 0 {
         let mut bm = Bitmap::with_capacity(n);
         if def_len > 0 {
             let bw = encoding::bit_width(desc.max_def_level as u32);
-            let mut d = RleDecoder::new(&raw[..def_len], bw);
+            let mut d = RleDecoder::new(&raw[rep_len..skip], bw);
             d.read_levels_into(n, desc.max_def_level as u32, &mut bm)?;
         } else {
             bm.push_n(true, n);
@@ -370,13 +373,13 @@ fn read_data_page_v2(
         None
     };
 
-    let values_raw = &raw[def_len..];
+    let values_raw = &raw[skip..];
     let values = if dp.is_compressed {
         // v2 levels sit uncompressed at the start of the page. Only the value
         // portion is compressed, so subtract the levels' share from the decompressed size.
-        let want = (hdr.uncompressed_page_size as i64) - (rep_len + def_len) as i64;
+        let want = (hdr.uncompressed_page_size as i64) - skip as i64;
         ensure!(want >= 0, BadPageHeader);
-        decompress(meta.codec, values_raw, want as i32, raw_off + def_len as u64, cache)?
+        decompress(meta.codec, values_raw, want as i32, raw_off + skip as u64, cache)?
     } else {
         ensure!(raw.len() == hdr.uncompressed_page_size as usize, BadCompressedData);
         Cow::Borrowed(values_raw)
@@ -1235,6 +1238,79 @@ mod tests {
             crate::error::code_of(push_codec_page(&meta, &bad_v2, 0, 2, &mut Vec::new())),
             Some(Code::BadPageHeader)
         );
+    }
+
+    /// Some writers emit a repetition-level run even for a flat column (parquet-testing's
+    /// `rle_boolean_encoding.parquet`); its bytes are skipped, not rejected.
+    #[test]
+    fn flat_v2_page_skips_a_repetition_level_run() {
+        let meta = ColumnMetaData {
+            ptype: PType::Int32,
+            encodings: Vec::new(),
+            path_in_schema: Vec::new(),
+            codec: Compression::Uncompressed,
+            num_values: 3,
+            total_uncompressed_size: 0,
+            total_compressed_size: 0,
+            data_page_offset: 0,
+            index_page_offset: None,
+            dictionary_page_offset: None,
+            statistics: None,
+            bloom_filter_offset: None,
+            bloom_filter_length: None,
+        };
+        let desc = ColumnDesc {
+            name: "a".into(),
+            ty: Ty::Int,
+            nullable: true,
+            max_def_level: 1,
+            ptype: PType::Int32,
+            type_length: 0,
+            time_unit: None,
+            phys_cols: Vec::new(),
+            leaves: Vec::new(),
+            nested: None,
+        };
+        // rep: an RLE run of three zeros (bit width 0); def: one bit-packed group 1,0,1;
+        // then the two present PLAIN values.
+        let mut raw = vec![0x06, 0x03, 0x05];
+        raw.extend_from_slice(&7i32.to_le_bytes());
+        raw.extend_from_slice(&9i32.to_le_bytes());
+        let hdr = PageHeader {
+            ptype: PageType::DataPageV2,
+            uncompressed_page_size: raw.len() as i32,
+            compressed_page_size: raw.len() as i32,
+            crc: None,
+            data_page: None,
+            dict_page: None,
+            data_page_v2: Some(DataPageHeaderV2 {
+                num_values: 3,
+                num_nulls: 1,
+                num_rows: 3,
+                encoding: Encoding::Plain,
+                definition_levels_byte_length: 2,
+                repetition_levels_byte_length: 1,
+                is_compressed: false,
+            }),
+        };
+        let mut out = Vector::with_capacity(Ty::Int, 3);
+        let mut validity = Some(Bitmap::with_capacity(3));
+        let n = read_data_page_v2(
+            &desc,
+            &meta,
+            &hdr,
+            &raw,
+            0,
+            None,
+            &mut out,
+            &mut validity,
+            &NoPageCache,
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+        let bm = validity.unwrap();
+        assert_eq!((bm.get(0), bm.get(1), bm.get(2)), (true, false, true));
+        assert_eq!((out.i32s()[0], out.i32s()[2]), (7, 9));
     }
 
     #[test]

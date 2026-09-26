@@ -172,23 +172,21 @@ fn alter_table_rename_column_from_a_nonexistent_column_is_column_not_found() {
 }
 
 #[test]
-fn alter_table_drop_the_only_column_then_add_a_new_one_restores_a_usable_table() {
-    // Regression-shaped check for `catalog::MemTable::batch`'s special case
-    // when `schema.is_empty()` (documented in `catalog.rs`): dropping every
-    // column must not corrupt the table's row count bookkeeping, and adding
-    // a column back afterwards must produce a normal, queryable table.
+fn alter_table_drop_the_only_column_is_rejected_and_leaves_the_table_intact() {
+    // DuckDB: "Cannot drop column: table only has one column remaining!". This
+    // engine used to allow it and leave a zero-column table behind.
     let mut sess = Session::new();
     sess.prepare("CREATE TABLE t (only_col INTEGER)", &[]).unwrap();
     sess.prepare("INSERT INTO t VALUES (1), (2), (3)", &[]).unwrap();
-    sess.prepare("ALTER TABLE t DROP COLUMN only_col", &[]).unwrap();
-    assert_eq!(
-        affected(&mut sess, "SELECT count(*) FROM t"),
-        3,
-        "row count must survive a 0-column schema"
-    );
+    let r = sess.prepare("ALTER TABLE t DROP COLUMN only_col", &[]);
+    assert_eq!(code_of(r), Some(Code::UnsupportedFeature));
+    let rows = run(&mut sess, "SELECT only_col FROM t ORDER BY only_col");
+    assert_eq!(rows, vec![vec![Value::I32(1)], vec![Value::I32(2)], vec![Value::I32(3)]]);
 
+    // With a second column present, the first one can go.
     sess.prepare("ALTER TABLE t ADD COLUMN new_col INTEGER DEFAULT 7", &[]).unwrap();
-    let rows = run(&mut sess, "SELECT new_col FROM t");
+    sess.prepare("ALTER TABLE t DROP COLUMN only_col", &[]).unwrap();
+    let rows = run(&mut sess, "SELECT * FROM t");
     assert_eq!(rows, vec![vec![Value::I32(7)]; 3]);
 }
 

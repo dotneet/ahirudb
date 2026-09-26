@@ -1,9 +1,8 @@
 //! Expression parsing: Pratt precedence climbing, prefix/primary/postfix,
 //! CAST, CASE, window function calls, lambdas, and literal parsing helpers.
 use super::types::{
-    comparison_binop, float_literal, int_literal, is_lambda_func, lookup_interval_unit,
-    lookup_type, parse_interval_text, parse_signed_int, temporal_literal_ty, unit_to_interval,
-    unquote,
+    comparison_binop, decimal_literal, int_literal, is_lambda_func, lookup_type,
+    parse_interval_text, parse_signed_int, temporal_literal_ty, unit_to_interval, unquote,
 };
 use super::*;
 use crate::expr::funcs;
@@ -364,15 +363,19 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 // A negative integer folds into a single literal. Otherwise a value that
                 // does not fit on the positive side, such as -9223372036854775808, could
-                // not be written. This literal does not go through `primary_atom`, so the
-                // postfix `::` is folded here as well (see the `primary` docs; confirmed
-                // with `duckdb -c "select -1::varchar"` that `-1::VARCHAR` means
-                // `(-1)::VARCHAR`).
+                // not be written. A postfix `::` binds tighter than the minus, though:
+                // `-5::UTINYINT` is `-(5::UTINYINT)` (251 in DuckDB 1.4, where
+                // `-1::VARCHAR` is a binder error for the same reason), so with a cast
+                // the literal stays positive and the negation wraps the cast.
                 if let Tok::Int(text) = self.cur {
-                    let v = int_literal(text, true, self.pos)?;
+                    let pos = self.pos;
                     self.bump()?;
-                    let node = self.arena.push(Expr::Literal(v));
-                    return self.cast_postfix(node);
+                    if self.is(Tok::ColonColon) {
+                        let lit = self.arena.push(Expr::Literal(int_literal(text, false, pos)?));
+                        let arg = self.cast_postfix(lit)?;
+                        return Ok(self.arena.push(Expr::Unary { op: UnaryOp::Neg, arg }));
+                    }
+                    return Ok(self.arena.push(Expr::Literal(int_literal(text, true, pos)?)));
                 }
                 let arg = self.expr_bp(BP_UNARY)?;
                 Ok(self.arena.push(Expr::Unary { op: UnaryOp::Neg, arg }))
@@ -720,9 +723,8 @@ impl<'a> Parser<'a> {
                 Expr::Literal(v)
             }
             Tok::Float(t) => {
-                let v = float_literal(t, pos)?;
                 self.bump()?;
-                Expr::Literal(v)
+                decimal_literal(t, pos)?
             }
             Tok::Str(s) => {
                 let v = Value::Bytes(unquote(s, b'\'').into_bytes());
@@ -933,12 +935,12 @@ impl<'a> Parser<'a> {
                 // is the `INTERVAL '3' DAY` form.
                 let t2 = lx.next_token()?.tok;
                 if let (Some(n), Tok::Ident(u)) = (parse_signed_int(&text), t2) {
-                    if let Some(unit) = lookup_interval_unit(u.as_bytes()) {
-                        let pos = self.pos;
+                    let pos = self.pos;
+                    if let Some(packed) = unit_to_interval(u, n, pos) {
+                        let packed = packed?;
                         self.bump()?; // INTERVAL
                         self.bump()?; // the string
                         self.bump()?; // the unit word
-                        let packed = unit_to_interval(unit, n, pos)?;
                         return Ok(self.arena.push(Expr::IntervalLiteral(packed)));
                     }
                 }
@@ -956,15 +958,15 @@ impl<'a> Parser<'a> {
                 let Tok::Ident(u) = t2 else {
                     return self.name_ref();
                 };
-                let Some(unit) = lookup_interval_unit(u.as_bytes()) else {
-                    return self.name_ref();
-                };
                 let pos = self.pos;
                 let Some(n) = parse_signed_int(text) else { err!(NumberOverflow, pos) };
+                let Some(packed) = unit_to_interval(u, n, pos) else {
+                    return self.name_ref();
+                };
+                let packed = packed?;
                 self.bump()?; // INTERVAL
                 self.bump()?; // the number
                 self.bump()?; // the unit word
-                let packed = unit_to_interval(unit, n, pos)?;
                 Ok(self.arena.push(Expr::IntervalLiteral(packed)))
             }
             _ => self.name_ref(),
@@ -1495,11 +1497,39 @@ impl<'a> Parser<'a> {
         self.bump()?;
         if matches!(ty, Ty::Decimal { .. }) && self.eat(Tok::LParen)? {
             let p = self.uint()?;
-            self.expect(Tok::Comma)?;
-            let s = self.uint()?;
+            // `DECIMAL(p)` is `DECIMAL(p,0)`, as in DuckDB.
+            let s = if self.eat(Tok::Comma)? { self.uint()? } else { 0 };
             self.expect(Tok::RParen)?;
             ensure!((1..=38).contains(&p) && s <= p, InvalidCast, pos);
             return Ok(Ty::Decimal { precision: p as u8, scale: s as u8 });
+        }
+        // A single modifier that DuckDB accepts and this engine has no use for: the
+        // length of `VARCHAR(10)`/`CHAR(3)` (not enforced by DuckDB either), and the
+        // mantissa bits of `FLOAT(n)`, which pick DOUBLE above 24 as in DuckDB.
+        if matches!(ty, Ty::Varchar | Ty::Float) && self.eat(Tok::LParen)? {
+            let n = self.uint()?;
+            self.expect(Tok::RParen)?;
+            return Ok(if ty == Ty::Float && n > 24 { Ty::Double } else { ty });
+        }
+        // Two-word spellings: `DOUBLE PRECISION`, `CHARACTER VARYING[(n)]`, and the
+        // explicit `TIMESTAMP`/`TIME WITHOUT TIME ZONE` (the default anyway).
+        if (ty == Ty::Double && self.is_soft_kw(b"precision"))
+            || (eq_ascii_ci(name.as_bytes(), b"character") && self.is_soft_kw(b"varying"))
+        {
+            self.bump()?;
+            if ty == Ty::Varchar && self.eat(Tok::LParen)? {
+                self.uint()?;
+                self.expect(Tok::RParen)?;
+            }
+            return Ok(ty);
+        }
+        if matches!(ty, Ty::Timestamp | Ty::Time) && self.is_soft_kw(b"without") {
+            self.bump()?;
+            ensure!(self.is_soft_kw(b"time"), InvalidCast, pos);
+            self.bump()?;
+            ensure!(self.is_soft_kw(b"zone"), InvalidCast, pos);
+            self.bump()?;
+            return Ok(ty);
         }
         // The standard SQL spelling `TIMESTAMP WITH TIME ZONE`. The single word
         // `timestamptz` (the `TYPES` table) is the everyday shorthand; this is the

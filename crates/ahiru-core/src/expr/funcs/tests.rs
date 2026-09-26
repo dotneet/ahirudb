@@ -1170,8 +1170,13 @@ fn json_type_matches_duckdb_strings() {
         ("true", "BOOLEAN"),
         ("null", "NULL"),
         ("1.5", "DOUBLE"),
-        ("1", "BIGINT"),
+        // duckdb: a non-negative integer is UBIGINT, a negative one BIGINT, and one that
+        // overflows 64 bits DOUBLE.
+        ("1", "UBIGINT"),
         ("-1", "BIGINT"),
+        ("18446744073709551615", "UBIGINT"),
+        ("-12345678901234567890", "DOUBLE"),
+        ("NaN", "DOUBLE"),
     ];
     for (doc, want) in cases {
         let d = vj(&[Some(doc)]);
@@ -1344,13 +1349,17 @@ fn list_concat_rejects_malformed_json_instead_of_truncating() {
 }
 
 #[test]
-fn map_extract_looks_up_a_key_or_returns_null() {
+fn map_extract_returns_a_list_of_the_value_or_an_empty_list() {
+    // duckdb 1.4: map_extract(m, 'b') -> [0], a missing key -> [] (`m['b']` is the bare value).
     let m = vj(&[Some(r#"{"a":1,"b":2}"#)]);
     assert_eq!(
         str_at(&run("map_extract", &[&m, &vs(&[Some("a")])]).unwrap(), 0).as_deref(),
-        Some("1")
+        Some("[1]")
     );
-    assert_eq!(str_at(&run("map_extract", &[&m, &vs(&[Some("z")])]).unwrap(), 0), None);
+    assert_eq!(
+        str_at(&run("map_extract", &[&m, &vs(&[Some("z")])]).unwrap(), 0).as_deref(),
+        Some("[]")
+    );
 }
 
 #[test]
@@ -1435,8 +1444,8 @@ fn malformed_json_source_is_an_error_not_a_silent_null() {
 fn json_resolve_errors() {
     assert_eq!(code_of(resolve("json_extract", &[Ty::Json])), Some(Code::WrongArgCount));
     assert_eq!(code_of(resolve("to_json", &[])), Some(Code::WrongArgCount));
-    // BLOB/INTERVAL are outside the scope of to_json/json_array.
-    assert_eq!(code_of(resolve("to_json", &[Ty::Blob])), Some(Code::TypeMismatch));
+    // INTERVAL is outside the scope of to_json/json_array (BLOB is in: DuckDB writes its text).
+    assert!(resolve("to_json", &[Ty::Blob]).is_ok());
     assert_eq!(code_of(resolve("to_json", &[Ty::Interval])), Some(Code::TypeMismatch));
     assert_eq!(
         code_of(resolve("json_object", &[Ty::Varchar])),
@@ -1503,8 +1512,16 @@ fn resolve_coerces_argument_types() {
     assert_eq!(resolve("sign", &[dec]).unwrap().2, Ty::BigInt);
     assert_eq!(resolve("sign", &[Ty::HugeInt]).unwrap().2, Ty::BigInt);
     assert_eq!(resolve("length", &[Ty::Varchar]).unwrap().2, Ty::BigInt);
-    // Date-time functions settle on TIMESTAMP (DATE columns and VARCHARs both arrive via a Cast).
-    assert_eq!(resolve("year", &[Ty::Date]).unwrap().1, vec![Ty::Timestamp]);
+    // Date-time functions settle on TIMESTAMP (a VARCHAR arrives via a Cast), but a DATE stays
+    // a day count so dates past TIMESTAMP's range still work.
+    assert_eq!(resolve("year", &[Ty::Varchar]).unwrap().1, vec![Ty::Timestamp]);
+    assert_eq!(resolve("year", &[Ty::Date]).unwrap().1, vec![Ty::Date]);
+    assert_eq!(resolve("hour", &[Ty::Time]).unwrap().1, vec![Ty::Time]);
+    assert!(resolve("year", &[Ty::Time]).is_err());
+    assert!(resolve("dayofweek", &[Ty::Interval]).is_err());
+    assert_eq!(resolve("date_trunc", &[Ty::Varchar, Ty::Timestamptz]).unwrap().2, Ty::Timestamptz);
+    // `nullif` keeps its first argument's type (DuckDB).
+    assert_eq!(resolve("nullif", &[Ty::Date, Ty::Timestamp]).unwrap().2, Ty::Date);
     assert_eq!(
         resolve("date_trunc", &[Ty::Varchar, Ty::Date]).unwrap().1,
         vec![Ty::Varchar, Ty::Timestamp]

@@ -236,7 +236,9 @@ fn float_classification_predicates() {
 #[test]
 fn typeof_reports_the_static_type_including_for_null() {
     let mut sess = dual();
-    assert_eq!(one(&mut sess, "typeof(1.5)"), s("DOUBLE"));
+    // `1.5` is a DECIMAL literal and `1.5e0` a DOUBLE one, as in DuckDB.
+    assert_eq!(one(&mut sess, "typeof(1.5)"), s("DECIMAL(2,1)"));
+    assert_eq!(one(&mut sess, "typeof(1.5e0)"), s("DOUBLE"));
     assert_eq!(one(&mut sess, "typeof('a')"), s("VARCHAR"));
     assert_eq!(one(&mut sess, "typeof(DATE '2024-01-01')"), s("DATE"));
     assert_eq!(one(&mut sess, "typeof([1, 2])"), s("JSON"));

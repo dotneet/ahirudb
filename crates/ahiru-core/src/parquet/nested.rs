@@ -126,13 +126,6 @@ fn hex_digit(n: u8) -> u8 {
     }
 }
 
-fn hex_encode(bytes: &[u8], out: &mut Vec<u8>) {
-    for &b in bytes {
-        out.push(hex_digit(b >> 4));
-        out.push(hex_digit(b & 0xF));
-    }
-}
-
 /// Convert a leaf's `Value` into its JSON representation according to its
 /// logical type. Number formatting is delegated to `expr::kernels`, and
 /// date/time to the existing `expr::funcs` implementations (using the same
@@ -163,13 +156,10 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
         },
         Value::I128(x) => int_like_to_json(ty, x),
         Value::F64(x) => {
+            // `NaN`/`Infinity`/`-Infinity` for the non-finite values, as DuckDB's `to_json`
+            // writes them, so `UNNEST`/`xs[i]` read them back as the same DOUBLE.
             let mut b = Vec::new();
-            if x.is_finite() {
-                kernels::fmt_f64(x, &mut b);
-            } else {
-                // JSON has no NaN/Infinity. DuckDB's to_json collapses these to NULL too.
-                b.extend_from_slice(b"null");
-            }
+            funcs::write_json_f64(x, &mut b);
             JsonValue::Num(b)
         }
         Value::Bytes(b) => match ty {
@@ -186,10 +176,11 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
                 }
                 JsonValue::Str(h)
             }
-            // BLOB has no direct JSON equivalent, so it becomes a hex string.
+            // BLOB becomes a string of its VARCHAR form (`\xHH` escapes), as DuckDB's `to_json`
+            // renders it; `CAST(<that text> AS BLOB)` reads it back.
             _ => {
                 let mut h = Vec::new();
-                hex_encode(&b, &mut h);
+                kernels::escape_blob(&b, &mut h);
                 JsonValue::Str(h)
             }
         },
@@ -198,9 +189,9 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
 
 fn int_like_to_json(ty: Ty, x: i128) -> JsonValue {
     match ty {
-        Ty::Decimal { scale, .. } => {
+        Ty::Decimal { .. } => {
             let mut b = Vec::new();
-            kernels::fmt_int(x.unsigned_abs(), x < 0, scale, &mut b);
+            funcs::write_json_int(ty, x, &mut b);
             JsonValue::Num(b)
         }
         Ty::Date => {
@@ -292,12 +283,20 @@ fn read_nested_page_v1(
     let page = reader::decompress(meta.codec, raw, hdr.uncompressed_page_size, raw_off, cache)?;
     let mut off = 0usize;
 
-    ensure!(dp.repetition_level_encoding == Encoding::Rle, UnsupportedEncoding);
+    // A level stream whose max level is 0 is not written at all, so its declared
+    // encoding (Impala writes BIT_PACKED) is irrelevant -- as in the flat reader.
+    ensure!(
+        max_rep_level == 0 || dp.repetition_level_encoding == Encoding::Rle,
+        UnsupportedEncoding
+    );
     ensure!(off <= page.len(), UnexpectedEof, off);
     let (rep_levels, used) = read_levels_v1(&page[off..], n, max_rep_level)?;
     off += used;
 
-    ensure!(dp.definition_level_encoding == Encoding::Rle, UnsupportedEncoding);
+    ensure!(
+        max_def_level == 0 || dp.definition_level_encoding == Encoding::Rle,
+        UnsupportedEncoding
+    );
     ensure!(off <= page.len(), UnexpectedEof, off);
     let (def_levels, used2) = read_levels_v1(&page[off..], n, max_def_level)?;
     off += used2;
@@ -552,15 +551,16 @@ fn consume_boundary(node: &NestedNode, cursors: &mut [LeafCursor]) {
     }
 }
 
-/// Render the "present" contents of a non-REPEATED node. If it has exactly
-/// one child and that child is itself REPEATED (a LIST/MAP wrapper group),
-/// delegate straight through without creating a name (otherwise we'd get an
-/// extra layer of nesting like `{"list": [...]}`).
+/// Render the "present" contents of a non-REPEATED node. A LIST/MAP wrapper
+/// group (`node.unwrap`) delegates straight through to its repeated child
+/// without creating a name (otherwise we'd get an extra layer of nesting like
+/// `{"list": [...]}`). An unannotated group is a STRUCT even when its only
+/// child is repeated: `{"phone": [...]}`, as DuckDB and pyarrow read it.
 fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
         NestedContent::Leaf(idx) => take_leaf_value(*idx, cursors),
         NestedContent::Group(children) => {
-            if children.len() == 1 && children[0].repetition == Repetition::Repeated {
+            if node.unwrap {
                 return assemble(&children[0], cursors);
             }
             let mut obj = Vec::with_capacity(children.len());
@@ -572,17 +572,16 @@ fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonV
     }
 }
 
-/// Render "one element's worth" of a REPEATED node. If it has exactly one
-/// child (the intermediate group of 3-level/2-level encoding, or the element
-/// of a LIST<STRUCT>), use that child directly as the element (unlike
-/// `render_present`, this doesn't care whether it's REPEATED -- the sole
-/// child of a repeated node is always passed through unwrapped). If it has
-/// two or more children (e.g. a MAP's key/value), it becomes a named object.
+/// Render "one element's worth" of a REPEATED node. When the LIST rules make
+/// its one child the element (`node.unwrap`: the intermediate group of the
+/// 3-level encoding), that child is used directly. Otherwise the repeated
+/// group itself is the element and becomes a named object (a MAP's
+/// key/value, a legacy `array` group, a bare repeated group).
 fn render_element(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
         NestedContent::Leaf(idx) => take_leaf_value(*idx, cursors),
         NestedContent::Group(children) => {
-            if children.len() == 1 {
+            if node.unwrap {
                 return assemble(&children[0], cursors);
             }
             let mut obj = Vec::with_capacity(children.len());

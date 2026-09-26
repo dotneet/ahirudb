@@ -27,13 +27,23 @@ never changes query results.
 | `JSON` | Dynamically-typed JSON document. Also how Parquet `LIST`/`MAP` values are exposed — see [data-sources.md](data-sources.md#nested-parquet-types) |
 | `UUID` | 16-byte UUID, displayed/parsed as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. See [UUID](#uuid) below |
 
+There is no nanosecond type. A Parquet `TIMESTAMP(NANOS)` column (DuckDB's
+`TIMESTAMP_NS`) reads as `TIMESTAMP` (`TIMESTAMPTZ` when adjusted to UTC),
+and `TIME(NANOS)` as `TIME`, with the sub-microsecond digits dropped —
+truncated toward zero, so `1969-12-31 23:59:59.999999999` reads as
+`1970-01-01 00:00:00`, and `typeof` says `TIMESTAMP` where DuckDB says
+`TIMESTAMP_NS`. Nothing reports the loss; see
+[limitations.md](limitations.md#partially-supported). (DuckDB itself reads
+`INT96` timestamps as microseconds, and the two agree there.)
+
 ## Integer promotion and mixed-type arithmetic
 
 Kernels only exist for 6 physical types, so logical types are promoted onto
 one of them:
 
-- `TINYINT`/`SMALLINT`/`INTEGER`/`DATE`/`TIME` share the 32-bit physical lane.
-- `BIGINT`/`TIMESTAMP`/`TIMESTAMPTZ`/`DECIMAL(p ≤ 18)` share the 64-bit lane.
+- `TINYINT`/`SMALLINT`/`INTEGER`/`DATE` share the 32-bit physical lane.
+- `BIGINT`/`TIME`/`TIMESTAMP`/`TIMESTAMPTZ`/`DECIMAL(p ≤ 18)` share the 64-bit
+  lane (a `TIME` is microseconds since midnight).
 - `HUGEINT`/`DECIMAL(p > 18)`/`INTERVAL` share the 128-bit lane.
 - `UUID` shares the same byte-buffer lane as `VARCHAR`/`BLOB`, but (like
   `JSON`) never implicitly converts to/from them — see [UUID](#uuid).
@@ -63,12 +73,19 @@ them in:
   `DECIMAL` in it: the `DECIMAL` rule below is checked first and wins. Nor
   does it decide a signed/unsigned pair — the two share a rank there, and
   the rule above is checked first.
+- `BOOLEAN` combined with any number becomes that number, as in DuckDB:
+  `true = 1` and `true IN (1, 2)` are true, and `coalesce(flag, 0)` and
+  `CASE ... THEN true ELSE 1 END` are `INTEGER`. Arithmetic on a `BOOLEAN`
+  (`true + 1`) is still a type error. (DuckDB rejects `coalesce(true,
+  1.5::DOUBLE)`; here it is a `DOUBLE`.)
 - A `DECIMAL` combined with another `DECIMAL` — or with an **integer**,
   which counts as a `DECIMAL` of scale 0 — unifies to a `DECIMAL` wide
   enough for both: the new precision is
   `max(p1 - s1, p2 - s2) + max(s1, s2) + 1` (the `+1` covers carry on
   addition, matching DuckDB), and the new scale is `max(s1, s2)`. The
-  precision is capped at 38.
+  precision is capped at 38. `UBIGINT` counts as 20 digits (its maximum
+  has one more than `BIGINT`'s), so `DECIMAL(4,1) + UBIGINT` is
+  `DECIMAL(22,1)`, as in DuckDB.
 
   Widening the `DECIMAL` side rather than the integer side is what keeps
   the fractional digits: `DECIMAL(4,1) + BIGINT` becomes `DECIMAL(21,1)`
@@ -80,12 +97,27 @@ them in:
   SELECT CAST('7.5' AS DECIMAL(4,1)) + 1::HUGEINT;   -- 8.5
   ```
 
-  `typeof` here reports a bare `DECIMAL` without the precision and scale,
-  so it cannot be used to observe the unified width the way DuckDB's
-  `typeof` can.
-- A `DECIMAL` combined with `FLOAT`/`DOUBLE` always becomes `DOUBLE` (never a
-  wider `DECIMAL`); `FLOAT` combined with any other numeric type always
-  becomes `DOUBLE` (never stays `FLOAT`).
+  `typeof` reports the unified width as DuckDB's does
+  (`typeof(CAST('7.5' AS DECIMAL(4,1)) + 1::BIGINT)` is `DECIMAL(21,1)`).
+
+  Values that are *merged* into one column rather than combined —
+  `COALESCE`, `CASE`, `greatest`/`least` and the columns of a
+  `UNION`/`INTERSECT`/`EXCEPT` — follow DuckDB's slightly different rule
+  when both sides are `DECIMAL`s: no carry digit is added, and when the
+  integer digits plus the larger scale exceed 38 it is the **scale** that
+  gives way. `COALESCE(DECIMAL(38,0), DECIMAL(38,18))` is `DECIMAL(38,0)`,
+  so a 30-digit value survives (the fractional side rounds to a whole
+  number); arithmetic and comparisons keep the larger scale, so they never
+  round a fractional operand, and a value that then does not fit becomes
+  `NULL` (DuckDB raises a conversion error).
+- `FLOAT` combined with any integer or `DECIMAL` stays `FLOAT`; only
+  `DOUBLE` outranks it, and a `DECIMAL` combined with `DOUBLE` becomes
+  `DOUBLE` — all as in DuckDB. This is what makes `float_col = 1.1` match
+  the row holding `1.1::FLOAT`: the `DECIMAL` literal `1.1` rounds to the
+  same `f32` the column holds, whereas comparing in `DOUBLE`
+  (`float_col = 1.1::DOUBLE`, or `1.1e0`) compares `1.100000023841858`
+  against `1.1` and never matches. Parquet statistics pruning rounds the
+  literal the same way.
 - `FLOAT` combined with `FLOAT` stays `FLOAT`, and the result is a genuine
   32-bit value: arithmetic is evaluated in the engine's `f64` registers and
   then **rounded back to `f32`**, so `16777216::FLOAT + 1::FLOAT` is
@@ -119,37 +151,50 @@ because the scale changes:
   is `DECIMAL(38,4)`), but a product whose **scale** would exceed 38 is an
   error (`ValueOutOfRange`) rather than a silently truncated type — again
   matching DuckDB. Cast an operand to `DOUBLE`, or to a `DECIMAL` with a
-  smaller scale, when you hit it:
+  smaller scale, when you hit it. Likewise a `DECIMAL(38, s)` sum,
+  difference or product whose *value* needs more than 38 digits is a
+  `ValueOutOfRange` error, as in DuckDB ("Overflow in multiplication of
+  DECIMAL(38)"), rather than a wrapped or over-long value:
 
   ```sql
   SELECT 0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20);          -- error: scale 40 > 38
   SELECT 0.01::DECIMAL(25,20) * 0.01::DECIMAL(25,20)::DOUBLE;  -- 0.0001
+  SELECT 13.1::DECIMAL(38,18) * 13.1::DECIMAL(38,18);          -- error: 171.61 needs 39 digits at scale 36
   ```
 - `/` always falls to `DOUBLE` (as in DuckDB). Integer division of the raw
   scaled values would subtract the scales and lose every fractional digit.
 
 A plain (unsuffixed) integer literal is `INTEGER` if it fits, else `BIGINT`,
-else `HUGEINT`.
+else `HUGEINT`, else `DOUBLE` (DuckDB has a `UHUGEINT` step before
+`DOUBLE`; this engine does not).
 
 Numeric literals accept **`_` as a digit separator** between digits
 (`1_000_000`, `1_0.5_5`, `1.5e1_0`), and a float may be written in
 **leading-dot form** (`.5` is `0.5`) — both matching DuckDB.
 
-A literal with a decimal point or an exponent (`1.005`, `.5`, `1e3`) is
-**`DOUBLE`**. DuckDB types the same literal as a `DECIMAL` wide enough to
-hold it exactly (`typeof(1.005)` is `DECIMAL(4,3)` there, `DOUBLE` here).
-The consequence is that exact-decimal identities hold in DuckDB and not
-here:
+A literal with a decimal point and no exponent is an exact **`DECIMAL`**,
+as in DuckDB: its width is the number of digits written (leading zeros
+included) and its scale the number after the point, so `1.005` is
+`DECIMAL(4,3)`, `0.5` is `DECIMAL(2,1)` and `.5` is `DECIMAL(1,1)`. A
+literal with an exponent (`1e3`, `1.5e-2`), or with more than 38 digits, is
+a **`DOUBLE`**. Exact-decimal identities therefore hold, and a cast of a
+literal keeps every digit:
 
 ```sql
-SELECT 0.1 + 0.2 = 0.3;                          -- false here, true in DuckDB
-SELECT CAST(123456789012345678.005 AS DECIMAL(30,3));
--- 123456789012345680.000 here (the literal was rounded to a DOUBLE first);
--- 123456789012345678.005 in DuckDB
+SELECT 0.1 + 0.2 = 0.3;                                  -- true
+SELECT CAST(123456789012345678.005 AS DECIMAL(30,3));    -- 123456789012345678.005
+SELECT CAST(4.5 AS INTEGER);                             -- 5 (a DECIMAL rounds half away from zero)
+SELECT CAST(4.5::DOUBLE AS INTEGER);                     -- 4 (a DOUBLE rounds half to even)
+SELECT 0.1::DOUBLE + 0.2::DOUBLE;                        -- 0.30000000000000004
 ```
 
-Write `CAST('0.1' AS DECIMAL(...))` — or a `DECIMAL`-typed column — when
-you need exact decimal arithmetic on constants.
+Write `::DOUBLE` (or an exponent) when you want floating-point arithmetic on
+constants. `/` of two `DECIMAL`s is always a `DOUBLE`, as in DuckDB.
+
+A minus directly in front of an integer literal folds into it (`-2147483648`
+is a `BIGINT` literal, `-9223372036854775808` a `BIGINT` too, as in DuckDB),
+but a `::` cast binds tighter than that minus: `-5::UTINYINT` is
+`-(5::UTINYINT)`, i.e. `251`, as in DuckDB 1.4.
 
 ## CAST and TRY_CAST
 
@@ -197,6 +242,26 @@ from a CRLF file still converts: `CAST('5' || chr(13) AS BIGINT)` is `5`.
 Text to `FLOAT` rounds once, straight to the nearest `f32`, rather than to
 the nearest `DOUBLE` and then again to `FLOAT`:
 `CAST('1.00000005960464477539062500001' AS FLOAT)` is `1.0000001`, not `1.0`.
+Text past the `FLOAT` range is infinite (`CAST('1e39' AS FLOAT)` is `inf`,
+as in DuckDB); a `DOUBLE` *value* past it is `NULL`, per the rule above.
+
+Text to a number follows DuckDB's spellings:
+
+- `_` separators between digits are accepted (`'1_000'::INTEGER` is
+  `1000`, `'1_0.5_5'::DOUBLE` is `10.55`); a misplaced one (`'1__0'`,
+  `'_1'`, `'1_.5'`) makes the value `NULL`.
+- Integer types other than `HUGEINT` also read hexadecimal and binary:
+  `'0x1F'::INTEGER` is `31`, `'0b101'::INTEGER` is `5`. The digits are an
+  unsigned magnitude with no sign or surrounding whitespace, checked
+  against the target's range (`'0xFF'::TINYINT` is `NULL`).
+- Text with more than 38 significant digits is rounded on the first digit
+  dropped, so `CAST('8999999999999999999.99999999999999999995' AS
+  DECIMAL(38,19))` is `9000000000000000000.0000000000000000000` and
+  `'99999999999999999999999999999999999999.5'::HUGEINT` is `10^38`.
+- Text to `BOOLEAN` accepts only `true`/`false`/`t`/`f`/`yes`/`no`/`y`/`n`
+  (in any case) and `1`/`0`, with no surrounding whitespace. Any other
+  number (`'2'`, `'0.4'`) is `NULL` (DuckDB raises) rather than "non-zero
+  means true" — that rule is only for casting a *number* to `BOOLEAN`.
 
 A number does not cast to `DATE`/`TIME`/`TIMESTAMP` (an error, as in
 DuckDB), and so is not accepted where one is expected either (`year(1500)`
@@ -207,33 +272,44 @@ direction still works here, where DuckDB rejects it: `CAST(DATE
 '1970-01-02' AS BIGINT)` is the raw day count `1` (a `TIMESTAMP` gives
 microseconds).
 
+`CAST(<timestamp> AS TIME)` keeps the time of day
+(`CAST(TIMESTAMP '2024-01-01 10:20:30.5' AS TIME)` is `10:20:30.5`), and
+text cast to `TIME` may carry a zone suffix, which is ignored
+(`'12:00:00+05'::TIME` is `12:00:00`), both as in DuckDB.
+
 Accepted `CAST` type-name spellings (case-insensitive):
 
 ```
-BOOLEAN | BOOL
-TINYINT
-SMALLINT
-INT | INTEGER
-BIGINT
-HUGEINT
-UTINYINT
-USMALLINT
-UINTEGER
-UBIGINT
-FLOAT | REAL
-DOUBLE
-DECIMAL | NUMERIC        -- bare form = DECIMAL(18, 3)
-DECIMAL(p, s) | NUMERIC(p, s)
-VARCHAR | TEXT | STRING | CHAR
-BLOB | BYTEA
+BOOLEAN | BOOL | LOGICAL
+TINYINT | INT1
+SMALLINT | INT2 | INT16 | SHORT
+INT | INTEGER | INT4 | INT32 | SIGNED
+BIGINT | INT8 | INT64 | LONG
+HUGEINT | INT128
+UTINYINT | UINT8
+USMALLINT | UINT16
+UINTEGER | UINT32
+UBIGINT | UINT64
+FLOAT | REAL | FLOAT4 | FLOAT(n), n <= 24
+DOUBLE | FLOAT8 | DOUBLE PRECISION | FLOAT(n), n > 24
+DECIMAL | NUMERIC | DEC   -- bare form = DECIMAL(18, 3)
+DECIMAL(p, s) | NUMERIC(p, s) | DEC(p, s)
+DECIMAL(p) | NUMERIC(p)  -- = DECIMAL(p, 0)
+VARCHAR | TEXT | STRING | CHAR | CHARACTER | BPCHAR | NCHAR | NVARCHAR
+  | CHARACTER VARYING    -- each also with a length, VARCHAR(10); the length is not enforced
+BLOB | BYTEA | BINARY | VARBINARY
 DATE
-TIME
-TIMESTAMP | DATETIME
+TIME | TIME WITHOUT TIME ZONE
+TIMESTAMP | DATETIME | TIMESTAMP WITHOUT TIME ZONE
 TIMESTAMPTZ | TIMESTAMP WITH TIME ZONE
 JSON
-UUID
+UUID | GUID
 INTERVAL
 ```
+
+These are the spellings DuckDB accepts for the same types, and the same names
+work in `CREATE TABLE` column definitions. `DESCRIBE` and `typeof()` report the
+canonical name, with a DECIMAL's parameters spelled out: `DECIMAL(10,2)`.
 
 `INTERVAL` is nameable in a type position, and casts round-trip through
 text in both directions:
@@ -272,14 +348,26 @@ filtered out by `WHERE`/`JOIN ON`/`HAVING` just like `FALSE`):
 These are deliberately matched to DuckDB, since the two diverge easily and
 it needs to be explicit:
 
-- Casting a float to an integer type rounds to the **nearest even**
-  (`CAST(1.5 AS INTEGER)` → `2`, `CAST(4.5 AS INTEGER)` → `4`).
+- Casting a `FLOAT`/`DOUBLE` to an integer type rounds to the **nearest
+  even** (`CAST(1.5::DOUBLE AS INTEGER)` → `2`, `CAST(4.5::DOUBLE AS
+  INTEGER)` → `4`). Casting a `DECIMAL` to an integer rounds **away from
+  zero** — and a literal such as `4.5` is a `DECIMAL`, so `CAST(4.5 AS
+  INTEGER)` → `5`, and `INSERT INTO t (int_col) VALUES (2.5)` stores `3`.
+  Both match DuckDB.
 - Casting to a `DECIMAL` rounds **away from zero** at every scale, whether it
   is reducing an existing `DECIMAL`'s scale (`CAST(1.235 AS DECIMAL(10,2))` →
-  `1.24`) or coming from a float (`CAST(2.5 AS DECIMAL(3,0))` → `3`, not the
-  `2` a float-to-*integer* cast gives). Monetary rounding therefore doesn't
-  systematically under-round, and `DECIMAL(p, 0)` follows the same rule as
-  every other scale of the same type. DuckDB draws the line in the same place.
+  `1.24`) or coming from a float (`CAST(2.5::DOUBLE AS DECIMAL(3,0))` → `3`,
+  not the `2` a float-to-*integer* cast gives). Monetary rounding therefore
+  doesn't systematically under-round, and `DECIMAL(p, 0)` follows the same
+  rule as every other scale of the same type. DuckDB draws the line in the
+  same place. From a `DOUBLE`, what is rounded is `x * 10^scale` computed in
+  `DOUBLE` while that product is below 2^53, exactly as DuckDB does:
+  `1.005::DOUBLE` is really `1.00499999999999989...`, so
+  `CAST(1.005::DOUBLE AS DECIMAL(10,2))` is `1.00` (the text `'1.005'` gives
+  `1.01`). Past 2^53 the double's shortest round-trip digits are rescaled
+  exactly instead, where DuckDB keeps the multiply's rounding error
+  (`12345678901234567890.5::DOUBLE::DECIMAL(38,1)` is
+  `12345678901234567000.0` here, `12345678901234566758.4` in DuckDB).
 - Integer arithmetic overflow **wraps** (no error) within the result's own
   type, including the narrow ones: `127::TINYINT + 1::TINYINT` is `-128`
   and `32767::SMALLINT + 1::SMALLINT` is `-32768` (DuckDB raises). The
@@ -289,12 +377,20 @@ it needs to be explicit:
   (`ValueOutOfRange`) if that itself overflows, and `factorial`/`!`, which
   errors on the same code the moment its `HUGEINT` result itself overflows
   (`factorial(34)` and above — see
-  [functions-numeric.md](functions-numeric.md#factorial)).
+  [functions-numeric.md](functions-numeric.md#factorial)). `DECIMAL`
+  arithmetic is not integer arithmetic in this sense: a `DECIMAL` has no
+  wrapped value, so a result past 38 digits is `ValueOutOfRange` (see
+  above).
 - `DATE ± INTEGER` is the exception to that wrap: a day count that leaves the
   range a `DATE` can hold would be a fictitious calendar date rather than a
   wrapped integer, so the result is `NULL` (`DATE '2024-01-01' + 2147480000`
   → `NULL`). DuckDB raises `Date out of range` for the same inputs; `NULL` is
-  this engine's usual answer for an undefined value.
+  this engine's usual answer for an undefined value. The same goes for
+  `INTERVAL` arithmetic: a field-wise `+`, `-` or `*` whose month, day or
+  microsecond field would overflow (`INTERVAL '1 day' * 3000000000`), a
+  multiplier outside `INTEGER`, `TIMESTAMP ± INTERVAL` leaving the
+  `TIMESTAMP` range and a `TIMESTAMP - TIMESTAMP` difference that does not
+  fit are all `NULL` (DuckDB raises); none of them wraps.
 - `-0.0` and `0.0` are treated as identical for grouping/join keys; all
   `NaN` values collapse to one representative for grouping purposes.
 - **`NaN` compares under a total order, not under IEEE rules** (matching
@@ -389,9 +485,35 @@ SELECT INTERVAL 1 DAY;
 SELECT CAST('2024-01-01' AS DATE) + INTERVAL 1 DAY;   -- 2024-01-02
 ```
 
-Accepted units (singular or plural): `YEAR(S)`, `MONTH(S)`, `DAY(S)`,
-`HOUR(S)`, `MINUTE(S)`, `SECOND(S)`, `MILLISECOND(S)`, `MICROSECOND(S)`.
-Other DuckDB shorthand units (`mon`, `y`, `wk`, ...) are not recognized.
+
+The text of an interval — in a literal or in `CAST(... AS INTERVAL)` — is
+read the way DuckDB reads it:
+
+- Terms `<n> <unit>`, where `<n>` may be negative or fractional and the
+  space before the unit is optional (`'1h'`, `'1 day1 hour'`). The unit is
+  any `date_part` spelling of `millennium`, `century`, `decade`, `year`,
+  `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`,
+  `millisecond` or `microsecond`, singular, plural or abbreviated (`y`,
+  `mon`, `d`, `h`, `m` = minute, `s`, `ms`, `us`, `millennia`, ... — see
+  [functions-datetime.md](functions-datetime.md#extracting-fields)); `wk`
+  is not one of them. Repeated units add up (`'1 month 1 month'` is
+  `2 months`).
+- Optionally a trailing time component `HH:MM[:SS[.ffffff]]` (hours are not
+  wrapped at 24; minutes and seconds must be below 60).
+- Optionally a final `ago`, which negates the whole interval
+  (`'1 day 2 hours ago'` is `-1 day -02:00:00`), and an optional leading
+  `@`.
+- A bare decimal is seconds (`'1.5'` is `00:00:01.5`).
+
+A **fraction** cascades into the next smaller field only, truncated there,
+using 1 year = 12 months, 1 month = 30 days and 1 day = 24 hours:
+`'1.5 days'` is `1 day 12:00:00`, but `'1.25 months'` is `1 month 7 days`
+(the remaining half day is dropped) and `'1.3 years'` is
+`1 year 3 months`. A fraction of a quarter or a week cascades one field
+further (`'1.5 quarters'` is `4 months 15 days`).
+
+The `INTERVAL <n> <unit>` and `INTERVAL '<n>' <unit>` forms take the same
+unit words, with a whole number.
 
 An interval is stored as one packed value combining a month count, a day
 count, and a microsecond count (kept separate internally because "1 month"
@@ -402,12 +524,32 @@ moved). Displaying one back out looks like:
 1 year 2 months 3 days 01:02:03
 ```
 
-**Comparing** two intervals flattens those three components with DuckDB's
-fixed conversions — **1 month = 30 days** and **1 day = 24 hours** — and
-compares the resulting microsecond spans. There is no anchor date in a
-comparison, so there is nothing to ask how long "one month" really is; only
-adding an interval to a `DATE`/`TIMESTAMP` uses real calendar arithmetic.
-The normalization applies everywhere a value is compared or keyed:
+### Interval arithmetic
+
+| Expression | Result |
+|---|---|
+| `DATE`/`TIMESTAMP` `±` `INTERVAL` | `TIMESTAMP` (calendar arithmetic; a month added to Jan 31 lands on the month's last day) |
+| `TIMESTAMPTZ` `±` `INTERVAL` | `TIMESTAMPTZ` |
+| `TIMESTAMP - TIMESTAMP` (either side may be a `DATE` or `TIMESTAMPTZ`) | `INTERVAL` of whole days plus the rest, both truncated toward zero: `-61 days -10:00:00` |
+| `DATE - DATE` | `BIGINT` day count |
+| `TIME ± INTERVAL` | `TIME`; only the time-of-day part of the interval moves the clock, which wraps at midnight (`TIME '23:00' + INTERVAL 2 HOUR` is `01:00:00`) |
+| `DATE + TIME` | `TIMESTAMP` |
+| `INTERVAL ± INTERVAL`, `INTERVAL * integer` | `INTERVAL`, field by field, never carrying between fields |
+| `INTERVAL * DOUBLE`, `INTERVAL / number` | `INTERVAL`; a fractional month cascades into days (30 per month) and a fractional day into microseconds, each rounded to a microsecond, as PostgreSQL and DuckDB do (`INTERVAL '1 month' / 7` is `4 days 06:51:25.6896`). Dividing by zero is `NULL` |
+
+A result that leaves its type's range is `NULL` rather than an error (see
+[Rounding and floating-point conventions](#rounding-and-floating-point-conventions)).
+
+### Comparing intervals
+
+**Comparing** two intervals follows DuckDB's normalization: whole days are
+carried out of the microseconds and whole 30-day months out of the days
+(1 day = 24 hours, 1 month = 30 days), and the normalized
+`(months, days, microseconds)` are compared in that order. There is no
+anchor date in a comparison, so there is nothing to ask how long "one
+month" really is; only adding an interval to a `DATE`/`TIMESTAMP` uses real
+calendar arithmetic. The normalization applies everywhere a value is
+compared or keyed:
 
 ```sql
 SELECT INTERVAL 1 DAY = INTERVAL 24 HOUR;        -- true
@@ -420,9 +562,19 @@ SELECT INTERVAL '90 minutes'
 -- 23:00:00 < 1 day < 25:00:00
 ```
 
-`=`, `<>`, `<`, `<=`, `>`, `>=` and `BETWEEN` all use that same flattened
-span, so an interval comparison agrees with `ORDER BY` on an interval
-column.
+The carries truncate toward zero, so each one keeps its own field's sign,
+and an interval whose fields have **mixed signs** is not simply its total
+length — again exactly as in DuckDB:
+
+```sql
+SELECT INTERVAL '2 months -45 days' < INTERVAL '16 days';   -- false: (1 month, -15 days) vs (16 days)
+SELECT INTERVAL '-1 day 1 hour' = INTERVAL '-23 hours';     -- false
+```
+
+`=`, `<>`, `<`, `<=`, `>`, `>=` and `BETWEEN` all use that same
+normalization, so an interval comparison agrees with `ORDER BY` on an
+interval column.
+
 
 ## UUID
 
@@ -464,14 +616,17 @@ logical-type flag is set, and plain `TIMESTAMP` otherwise (files written
 via the legacy `ConvertedType` annotation, which has no such flag, always
 read back as `TIMESTAMP`).
 
-`CAST(... AS TIMESTAMPTZ)` from text accepts an optional timezone offset
-suffix — `Z`, `+HH`, `+HH:MM`, `-HH`, or `-HH:MM` — and normalizes to UTC.
+`CAST(... AS TIMESTAMPTZ)` from text accepts the same text as a
+`TIMESTAMP` cast, including an optional timezone offset suffix — `Z`,
+`±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS`, or a separate ` UTC` — and
+normalizes to UTC. Each offset field is exactly two digits but, as in
+DuckDB, not range-checked (`+25` is 25 hours).
 **There is no session timezone concept in this engine**, so a literal with
 no offset is simply assumed to already be UTC (unlike DuckDB, which applies
 its configured session timezone). Comparing/mixing `DATE` or `TIMESTAMP`
 with `TIMESTAMPTZ` widens to `TIMESTAMPTZ` rather than erroring (see
 [Integer promotion and mixed-type arithmetic](#integer-promotion-and-mixed-type-arithmetic)
 above). Displaying a `TIMESTAMPTZ` always appends a `+00` suffix, since the
-value is always UTC.
-
-with zero-valued components omitted.
+value is always UTC. Adding or subtracting an `INTERVAL` keeps a
+`TIMESTAMPTZ` a `TIMESTAMPTZ` (`now() - INTERVAL 1 DAY`), as does
+`date_trunc`.

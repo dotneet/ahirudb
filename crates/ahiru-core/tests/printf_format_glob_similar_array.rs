@@ -64,11 +64,9 @@ fn array_literal_is_sugar_for_list_value() {
     let mut sess = session_with_basic();
     // duckdb: [1,2,3] = list_value(1,2,3) -> true
     assert_eq!(one(&mut sess, "[1, 2, 3] = list_value(1, 2, 3)"), Value::Bool(true));
-    // duckdb: [1,2,3][1] -> 1 (1-based; confirmed via list_extract).
-    // `list_extract`'s result is designed to return Ty::Json (raw JSON text), so the
-    // expected value is also the text "10" (see the module-top doc on `list_extract` and the
-    // `list_extract_is_one_based_with_negative_from_end` unit test in `funcs.rs`).
-    assert_eq!(one(&mut sess, "list_extract([10, 20, 30], 1)"), s("10"));
+    // duckdb: [1,2,3][1] -> 1 (1-based; confirmed via list_extract). The literal's element
+    // type is INTEGER, so the element comes back as one (as in DuckDB).
+    assert_eq!(one(&mut sess, "list_extract([10, 20, 30], 1)"), Value::I32(10));
     // duckdb: [] is a valid expression (an empty array). json_array_length([]) = 0.
     assert_eq!(one(&mut sess, "json_array_length([])"), Value::I64(0));
     // Mixed types are also allowed (same as `list_value`/`json_array`).
@@ -323,10 +321,9 @@ fn similar_to_supports_alternation_and_quantifiers() {
 #[test]
 fn array_literal_allows_mixed_numeric_types_and_nesting() {
     let mut sess = session_with_basic();
-    // Mixing integers and floats also just rides along into JSON without any special
-    // conversion (`Ty::Json` is dynamically typed, so unlike duckdb it does not unify numeric
-    // types; same policy as the mixed-type test in `array_literal_is_sugar_for_list_value`).
-    assert_eq!(one(&mut sess, "to_json([1, 2.5])"), s("[1,2.5]"));
+    // Mixed numeric elements are cast to their common type first, as in duckdb
+    // (`to_json([1, 2.5])` is `[1.0,2.5]`: INTEGER and DECIMAL(2,1) merge to DECIMAL).
+    assert_eq!(one(&mut sess, "to_json([1, 2.5])"), s("[1.0,2.5]"));
     // An array containing a NULL element.
     assert_eq!(one(&mut sess, "to_json([1, NULL, 3])"), s("[1,null,3]"));
     // An array of arrays (nested).

@@ -643,7 +643,9 @@ fn insert_mode_blob_round_trips_through_replay() {
     let script = format!("CREATE TABLE t (b BLOB);\n{}{check}", r.stdout);
     let replay = run_with_stdin(&["-csv", "-noheader"], Some(&script));
     assert!(replay.ok, "{}", replay.stderr);
-    assert!(replay.stdout.contains("\n2\n"), "{}", replay.stdout);
+    // The CREATE/INSERT statements print nothing (as in DuckDB), so the count is
+    // all there is on stdout.
+    assert_eq!(replay.stdout, "2\n");
 
     // DuckDB parses the same script (skipped where it is not installed).
     if let Ok(out) = Command::new("duckdb").args(["-csv", "-noheader", "-c", &script]).output() {
@@ -1035,4 +1037,130 @@ fn a_non_utf8_argument_is_an_argument_error_not_a_panic() {
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("not valid UTF-8"), "stderr: {stderr}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+}
+
+// ---- write-path output ---------------------------------------------------
+
+/// DDL/DML print nothing on stdout (as in the DuckDB CLI), so a multi-statement
+/// `-json` run emits exactly one JSON document -- the SELECT's.
+#[test]
+fn ddl_and_dml_print_nothing_so_json_output_stays_parseable() {
+    let r = run(&[
+        "-json",
+        "-c",
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2); \
+         UPDATE t SET a = 3 WHERE a = 1; DELETE FROM t WHERE a = 2; \
+         ALTER TABLE t ADD COLUMN b INTEGER; CREATE VIEW v AS SELECT a FROM t; \
+         SELECT * FROM t; DROP VIEW v; DROP TABLE t",
+    ]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "[\n\t{\"a\":3,\"b\":null}\n]\n");
+}
+
+/// A pretty-printed JSON value used to carry its newlines into `-jsonlines`/`-json`
+/// output, splitting one record over several lines.
+#[test]
+fn json_modes_minify_json_values() {
+    let sql = "SELECT CAST('{' || chr(10) || '\"a\" : [1, \" x  y\"]}' AS JSON) AS j";
+    let r = run(&["-jsonlines", "-c", sql]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "{\"j\":{\"a\":[1,\" x  y\"]}}\n");
+    let r = run(&["-json", "-c", sql]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "[\n\t{\"j\":{\"a\":[1,\" x  y\"]}}\n]\n");
+}
+
+/// `.schema` quotes names that need it, both in the `DESCRIBE` it runs and in the
+/// CREATE TABLE text it prints.
+#[test]
+fn dot_schema_quotes_names_that_need_it() {
+    let script = "CREATE TABLE \"my \"\"tbl\" (a DECIMAL(10,2) NOT NULL);\n.schema\n";
+    let r = run_with_stdin(&["-batch", "order=tests/data/basic.csv"], Some(script));
+    assert!(r.ok, "{}", r.stderr);
+    assert!(r.stdout.contains("CREATE TABLE \"order\"(\n  \"id\" BIGINT,"), "{}", r.stdout);
+    assert!(
+        r.stdout.contains("CREATE TABLE \"my \"\"tbl\"(\n  \"a\" DECIMAL(10,2) NOT NULL\n);"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("E301") && !r.stderr.contains("not found"), "{}", r.stderr);
+}
+
+/// `-insert` used to write a DECIMAL as a bare number, which reads back as a DOUBLE
+/// literal and loses the low digits of a wide DECIMAL on replay.
+#[test]
+fn insert_mode_decimal_round_trips_exactly() {
+    let select = "SELECT CAST('1234567890123456789012345678.1234567891' AS DECIMAL(38,10)) AS d, \
+                  CAST('-1.25' AS DECIMAL(5,2)) AS e, \
+                  170141183460469231731687303715884105727::HUGEINT AS h, \
+                  18446744073709551615::UBIGINT AS u";
+    let r = run(&["-c", ".mode insert t", "-c", select]);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "INSERT INTO t VALUES ('1234567890123456789012345678.1234567891'::DECIMAL(38,10), \
+         '-1.25'::DECIMAL(5,2), 170141183460469231731687303715884105727, \
+         18446744073709551615);\n"
+    );
+    let script = format!(
+        "CREATE TABLE t (d DECIMAL(38,10), e DECIMAL(5,2), h HUGEINT, u UBIGINT);\n{}\
+         SELECT * FROM t;\n",
+        r.stdout
+    );
+    let want = "1234567890123456789012345678.1234567891,-1.25,\
+                170141183460469231731687303715884105727,18446744073709551615\n";
+    let replay = run_with_stdin(&["-csv", "-noheader"], Some(&script));
+    assert!(replay.ok, "{}", replay.stderr);
+    assert_eq!(replay.stdout, want);
+    if let Ok(out) = Command::new("duckdb").args(["-csv", "-noheader", "-c", &script]).output() {
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    }
+}
+
+/// `COPY ... TO 'x.csv.gz'` writes gzip, as DuckDB does, instead of plain CSV under
+/// a `.gz` name.
+#[test]
+fn copy_to_a_gz_path_writes_gzip() {
+    let p = tmp_file("copy_gz", "csv.gz");
+    let sql = format!("COPY (SELECT 1 AS a, 'x' AS b FROM range(1)) TO '{}'", p.display());
+    let r = run(&["-c", &sql]);
+    assert!(r.ok, "{}", r.stderr);
+    let bytes = std::fs::read(&p).unwrap();
+    assert_eq!(&bytes[..2], &[0x1f, 0x8b], "not gzip");
+    let out = Command::new("gzip").arg("-dc").arg(&p).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a,b\n1,x\n");
+    let _ = std::fs::remove_file(&p);
+}
+
+/// String-literal paths are looked up case-sensitively. On a case-insensitive
+/// file system (macOS, Windows) `'Case.csv'` and `'case.csv'` name one file and
+/// both spellings must read it; on a case-sensitive one they are two files and
+/// each must read its own -- the case-folding catalog used to hand the second
+/// spelling the first file's table.
+#[test]
+fn string_literal_paths_that_differ_in_case() {
+    let dir = std::env::temp_dir().join(format!("ahiru_cli_case_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let upper = dir.join("Case.csv");
+    let lower = dir.join("case.csv");
+    std::fs::write(&upper, "a\n1\n").unwrap();
+    let insensitive = lower.exists();
+    if !insensitive {
+        std::fs::write(&lower, "a\n2\n").unwrap();
+    }
+    let r = run(&[
+        "-csv",
+        "-noheader",
+        "-c",
+        &format!("SELECT a FROM '{}'", upper.display()),
+        "-c",
+        &format!("SELECT a FROM '{}'", lower.display()),
+        "-c",
+        &format!("SELECT a FROM '{}'", upper.display()),
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(r.ok, "{}", r.stderr);
+    let expected = if insensitive { "1\n1\n1\n" } else { "1\n2\n1\n" };
+    assert_eq!(r.stdout, expected);
 }

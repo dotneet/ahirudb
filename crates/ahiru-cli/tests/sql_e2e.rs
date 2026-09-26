@@ -197,6 +197,33 @@ e2e!(
     ]
 );
 
+e2e!(
+    numeric_literals_and_casts,
+    "tests/data/basic.parquet",
+    [
+        // Decimal literals are exact DECIMALs; DOUBLE -> DECIMAL rounds x * 10^s.
+        "SELECT 0.1 + 0.2 = 0.3, CAST(4.5 AS INTEGER), 123456789012345678901234567.89::DECIMAL(38,2), 1.005::DOUBLE::DECIMAL(10,2), 2.675::DOUBLE::DECIMAL(10,2) FROM t LIMIT 1",
+        "SELECT '1_000'::INTEGER, '0x10'::INTEGER, CAST('8999999999999999999.99999999999999999995' AS DECIMAL(38,19)), -5::UTINYINT, gcd(18446744073709551615::UBIGINT, 5) FROM t LIMIT 1",
+        "SELECT round(1.5e-300::DOUBLE, 300), round(1e300::DOUBLE, -300), coalesce(CAST('123456789012345678901234567890' AS DECIMAL(38,0)), CAST('1.5' AS DECIMAL(38,18))) FROM t LIMIT 1",
+        // Result types: literal widths, the DECIMAL merge rule, FLOAT with DECIMAL.
+        // (`,` in `DECIMAL(p,s)` is replaced: the CSV comparison splits on it.)
+        "SELECT replace(typeof(1.5), ',', '/'), replace(typeof(00.50), ',', '/'), replace(typeof(.5), ',', '/'), replace(typeof(1.5e3), ',', '/'), replace(typeof(coalesce(1::DECIMAL(38,0), 1::DECIMAL(38,18))), ',', '/'), replace(typeof(coalesce(1::DECIMAL(36,20), 1::BIGINT)), ',', '/'), replace(typeof(1::DECIMAL(38,0) + 1::DECIMAL(38,18)), ',', '/'), replace(typeof(1::DECIMAL(4,1) + 1::UBIGINT), ',', '/'), replace(typeof(1.5 * 1::FLOAT), ',', '/') FROM t LIMIT 1",
+    ]
+);
+
+e2e!(
+    float_column_against_decimal_literals,
+    "tests/data/float_stats.parquet",
+    [
+        "SELECT count(*) FROM t WHERE f = 1.1",
+        "SELECT count(*) FROM t WHERE f IN (0.1, 3.3)",
+        "SELECT count(*) FROM t WHERE f > 1.1",
+        "SELECT count(*) FROM t WHERE f = 16777217",
+        "SELECT count(*) FROM t WHERE f = 1.1::DOUBLE",
+        "SELECT count(*) FROM t WHERE f BETWEEN 1.1 AND 3.3",
+    ]
+);
+
 e2e!(expressions, "tests/data/basic.parquet", [
     "SELECT id + 1, id * 2, id - 1 FROM t ORDER BY id LIMIT 5",
     "SELECT score / 2 FROM t ORDER BY id LIMIT 5",
@@ -819,6 +846,81 @@ e2e!(
     ]
 );
 
+e2e_multi!(
+    star_hides_binder_helper_columns,
+    ["tests/data/small_a.parquet", "tests/data/small_b.parquet"],
+    [
+        "SELECT *, (SELECT max(w) FROM t2) AS m FROM t ORDER BY 1",
+        "SELECT * FROM t WHERE v > (SELECT avg(v) FROM t) ORDER BY 1",
+        "SELECT * FROM t WHERE k > ANY (SELECT k FROM t2) ORDER BY 1",
+        "SELECT COLUMNS(*) FROM t WHERE k > ALL (SELECT k - 3 FROM t2) ORDER BY ALL",
+        "SELECT * FROM (SELECT * FROM t WHERE v > (SELECT avg(v) FROM t)) \
+         UNION ALL SELECT * FROM t ORDER BY 1, 2",
+        // HAVING: an alias beats an ungrouped input column of the same name.
+        "SELECT k % 2 AS k2, sum(v) AS v FROM t GROUP BY k % 2 HAVING v > 8",
+        "SELECT v, sum(k) AS v FROM t GROUP BY v HAVING v > 4 ORDER BY 1",
+    ]
+);
+
+e2e!(
+    select_list_unnest_after_windows,
+    "tests/data/list1.parquet",
+    [
+        "SELECT id, UNNEST(xs) AS x, count(*) OVER () AS n FROM t WHERE id < 2 ORDER BY 1, 2",
+        "SELECT id, UNNEST(xs) AS x FROM t QUALIFY row_number() OVER (ORDER BY id) = 2 ORDER BY 2",
+        "SELECT * EXCLUDE (xs), UNNEST(xs) AS u FROM t WHERE id < 2 ORDER BY 1, 2",
+    ]
+);
+
+e2e!(
+    distinct_on_ordinal,
+    "tests/data/pivot_small.parquet",
+    [
+        "SELECT DISTINCT ON (1) region, amount FROM t ORDER BY 1, 2",
+        "SELECT DISTINCT ON (2) * FROM t ORDER BY 2 DESC, 1",
+    ]
+);
+
+e2e!(
+    unpivot_drops_nulls,
+    "tests/data/basic.parquet",
+    ["UNPIVOT t ON big INTO NAME n VALUE v ORDER BY v NULLS FIRST LIMIT 3"]
+);
+
+// Date/time/interval operators, parts and text forms. TIMESTAMPTZ is left out: DuckDB renders
+// it in the machine's session time zone, which this engine does not have.
+e2e!(
+    datetime_and_interval_semantics,
+    "tests/data/basic.parquet",
+    [
+        "SELECT TIMESTAMP '2024-01-01' - TIMESTAMP '2024-03-02 10:00:00', \
+         DATE '2024-01-02' - TIMESTAMP '2024-01-01 01:00' FROM t LIMIT 1",
+        "SELECT CAST(TIMESTAMP '1960-01-01 10:20:30.5' AS TIME), hour(TIME '10:20:30'), \
+         millisecond(TIME '10:20:30.5'), date_part('epoch', TIME '10:20:30') FROM t LIMIT 1",
+        "SELECT TIME '23:00' + INTERVAL 2 HOUR, TIME '01:00' - INTERVAL '1 day 2 hours', \
+         DATE '2024-01-01' + TIME '10:00' FROM t LIMIT 1",
+        "SELECT year(INTERVAL '30 months'), date_part('quarter', INTERVAL '-7 months'), \
+         date_part('hour', INTERVAL '1 day 25 hours'), date_part('epoch', INTERVAL '13 months') \
+         FROM t LIMIT 1",
+        "SELECT INTERVAL '1 month 1 day 1 hour' / 7, INTERVAL '1 month' * 1.3, \
+         INTERVAL '1 day' / 0 FROM t LIMIT 1",
+        "SELECT date_diff('dow', DATE '2024-01-01', DATE '2024-01-10'), \
+         date_trunc('epoch', TIMESTAMP '2024-01-03 10:00:01.5') FROM t LIMIT 1",
+        "SELECT year(DATE '300000-01-01'), dayname(DATE '300000-01-01'), \
+         last_day(DATE '300000-02-01'), date_diff('hour', DATE '300000-01-01', DATE '300001-01-01') \
+         FROM t LIMIT 1",
+        "SELECT strftime('%Y-%m-%d', DATE '2024-01-05'), strftime(TIMESTAMP '-0044-01-05', '%Y') \
+         FROM t LIMIT 1",
+        "SELECT TRY_CAST('2024/1/5' AS DATE), TRY_CAST('2024 01 05 10:00' AS TIMESTAMP), \
+         TRY_CAST('2024/01-05' AS DATE) FROM t LIMIT 1",
+        "SELECT CAST('1.25 months' AS INTERVAL), CAST('1h' AS INTERVAL), \
+         CAST('1 day 2 hours ago' AS INTERVAL), CAST('1.5 quarters' AS INTERVAL) FROM t LIMIT 1",
+        "SELECT INTERVAL '2 months -45 days' < INTERVAL '16 days', \
+         INTERVAL '-1 day 1 hour' = INTERVAL '-23 hours' FROM t LIMIT 1",
+        "SELECT true = 1, true IN (1, 2), coalesce(NULL::BOOLEAN, 0) FROM t LIMIT 1",
+    ]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // Rewriting the t inside `t2` or `text` would break the SQL being compared.
@@ -862,4 +964,40 @@ e2e!(
         "SELECT id % 2 AS m, count(*) AS c FROM t \
          GROUP BY GROUPING SETS ((m), ()) HAVING c > 600 ORDER BY 1 NULLS FIRST",
     ]
+);
+
+// List/MAP elements come back as their static element type (xs[i], m[k], UNNEST).
+e2e!(
+    list_element_types,
+    "tests/data/list_varied.parquet",
+    [
+        "SELECT count(xs[2]), max(xs[2]), sum(xs[-1]) FROM t",
+        "SELECT id, xs[1], xs[2] IS NULL FROM t ORDER BY id LIMIT 10",
+        "SELECT sum(u.x), count(u.x) FROM t AS s, unnest(s.xs) AS u(x)",
+        "SELECT id, list_contains(xs, 5.0), list_position(xs, 6) FROM t ORDER BY id LIMIT 10",
+    ]
+);
+
+e2e!(
+    list_scalar_leaves,
+    "tests/data/list_scalars.parquet",
+    [
+        // (`ss[2]` holds a `"`, which the two CSV writers quote differently.)
+        "SELECT id, ds[1], ds[2], ss[1], ss[3], decs[1], dates[1], flags[1] FROM t ORDER BY id",
+        "SELECT u.x FROM t AS s, unnest(s.ds) AS u(x) ORDER BY 1",
+        "SELECT u.v FROM t AS s, unnest(s.ss) AS u(v) WHERE u.v <> 'b\"c' ORDER BY 1",
+        "SELECT sum(x) FROM (SELECT unnest(decs) AS x FROM t)",
+    ]
+);
+
+e2e!(
+    map_subscript,
+    "tests/data/map_basic.parquet",
+    ["SELECT id, m['a'], m['b'], m['c'], m['z'] FROM t ORDER BY id LIMIT 5"]
+);
+
+e2e!(
+    map_int_key_subscript,
+    "tests/data/map_int_key.parquet",
+    ["SELECT id, m[1], m[2], m[3] FROM t ORDER BY id LIMIT 5"]
 );

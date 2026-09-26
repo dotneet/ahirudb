@@ -26,7 +26,7 @@
 //!
 //! ## Type inference
 //!
-//! Looking at up to `SAMPLE_LINES` rows within the leading `SAMPLE_BYTES` (grown up to
+//! Looking at every complete line within the leading `SAMPLE_BYTES` (grown up to
 //! `MAX_SAMPLE_BYTES` when that does not hold one complete line), each column widens along the
 //! lattice NULL -> BIGINT -> DOUBLE -> VARCHAR, with BOOLEAN a sibling of the numbers rather than
 //! a step below them (`true` mixed with `1` gives VARCHAR -- see `widen`). The column set is the
@@ -52,9 +52,6 @@ use crate::vector::{Bitmap, Data, Field, Ty, Vector};
 
 /// How many leading bytes are read for schema inference.
 pub const SAMPLE_BYTES: u64 = 256 * 1024;
-
-/// The maximum rows used for schema inference. Looking at more is unlikely to change the types.
-pub const SAMPLE_LINES: usize = 1000;
 
 /// The cap on the number of columns inference creates. A stop against unbounded allocation on
 /// pathological input whose keys differ per row.
@@ -92,7 +89,7 @@ pub struct JsonlFormat {
     /// than a reading of the data. See `TableFormat::column_has_no_evidence`.
     no_evidence: Vec<bool>,
     /// Per column: the object key it holds. Usually the column's name, but keys that differ only
-    /// in case get distinct names (`format::unique_json_names`), while members are still matched
+    /// in case get distinct names (`format::unique_column_names`), while members are still matched
     /// against the key exactly.
     keys: Vec<String>,
 }
@@ -179,7 +176,7 @@ impl TableFormat for JsonlFormat {
             let mut lines = 0usize;
             let mut truncated = false;
             let mut raw = false;
-            while pos < buf.len() && lines < SAMPLE_LINES {
+            while pos < buf.len() {
                 let (line, next, terminated) = next_line(buf, pos);
                 pos = next;
                 if !terminated && partial {
@@ -241,7 +238,7 @@ impl TableFormat for JsonlFormat {
                 vec![Field::new(String::from("json"), Ty::Varchar, true)]
             } else {
                 self.no_evidence = infs.iter().map(|i| *i == Inf::Null).collect();
-                let cols = crate::format::unique_json_names(&names);
+                let cols = crate::format::unique_column_names(&names);
                 self.keys = names;
                 // A JSON value can be missing at any time, so every column is nullable.
                 cols.into_iter().zip(infs).map(|(n, i)| Field::new(n, i.ty(), true)).collect()
@@ -386,7 +383,7 @@ impl TableFormat for JsonlFormat {
                     slots[j] = Some(m);
                 } else if !self.keys.iter().any(|k| k.as_bytes() == name) {
                     // A key the schema has never heard of. The schema comes from a bounded
-                    // leading sample (`SAMPLE_BYTES` / `SAMPLE_LINES`) and, unlike `format::json`,
+                    // leading sample (`SAMPLE_BYTES`) and, unlike `format::json`,
                     // is fixed before any split is read -- the file is consumed split by split, so
                     // a complete key set is not available up front. Skipping the key would drop a
                     // whole column the file plainly contains, which is the "silently wrong answer"
@@ -576,7 +573,7 @@ impl Builder {
 /// Pushes one member according to the column's type. A missing key (`None`) and `null` are both NULL.
 ///
 /// A value that is *present* but does not fit the column's type is `InvalidCast`. The schema comes
-/// from a bounded leading sample (`SAMPLE_BYTES` / `SAMPLE_LINES`), so a later line can genuinely
+/// from a bounded leading sample (`SAMPLE_BYTES`), so a later line can genuinely
 /// hold a `2.5` where the sample only ever showed integers -- but silently turning that cell into
 /// NULL loses data the file plainly contains, which is the "silently wrong answer" `docs/DESIGN.md`
 /// §15 says the engine never produces. DuckDB reports the same situation as a conversion error.
@@ -899,6 +896,9 @@ mod tests {
     use crate::error::{code_of, Code};
     use crate::vector::Value;
 
+    /// How many 8-byte `{"a":1}` lines fill the inference sample and then some.
+    const PAST_SAMPLE: usize = SAMPLE_BYTES as usize / 8 + 1;
+
     fn data_file(name: &str) -> Vec<u8> {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/");
         std::fs::read(format!("{p}{name}")).unwrap_or_else(|e| panic!("{name}: {e}"))
@@ -1118,12 +1118,12 @@ mod tests {
         let cols = read_all("{\"a\":1e3}\n{\"a\":-1.5E-2}\n{\"a\":7}\n");
         assert_eq!(cols[0], [Value::F64(1000.0), Value::F64(-0.015), Value::F64(7.0)]);
 
-        // Inference sees only the sample (SAMPLE_LINES rows). A row outside it carrying a value of
+        // Inference sees only the leading SAMPLE_BYTES. A row outside it carrying a value of
         // the wrong type used to become NULL, silently dropping data the file plainly contains; it
         // is now a clear `InvalidCast`.
         for tail in ["{\"a\":1.5}", "{\"a\":\"x\"}", "{\"a\":[1]}"] {
             let mut text = String::new();
-            for _ in 0..SAMPLE_LINES {
+            for _ in 0..PAST_SAMPLE {
                 text.push_str("{\"a\":1}\n");
             }
             text.push_str(tail);
@@ -1135,15 +1135,15 @@ mod tests {
         }
         // A missing key and an explicit `null` are still NULL, not an error.
         let mut text = String::new();
-        for _ in 0..SAMPLE_LINES {
+        for _ in 0..PAST_SAMPLE {
             text.push_str("{\"a\":1}\n");
         }
         text.push_str("{}\n{\"a\":null}\n{\"a\":2}\n");
         let cols = read_all(&text);
-        assert_eq!(cols[0].len(), SAMPLE_LINES + 3);
-        assert_eq!(cols[0][SAMPLE_LINES], Value::Null);
-        assert_eq!(cols[0][SAMPLE_LINES + 1], Value::Null);
-        assert_eq!(cols[0][SAMPLE_LINES + 2], Value::I64(2));
+        assert_eq!(cols[0].len(), PAST_SAMPLE + 3);
+        assert_eq!(cols[0][PAST_SAMPLE], Value::Null);
+        assert_eq!(cols[0][PAST_SAMPLE + 1], Value::Null);
+        assert_eq!(cols[0][PAST_SAMPLE + 2], Value::I64(2));
     }
 
     // A key that first appears past the inference sample has no column to go into. It
@@ -1155,7 +1155,7 @@ mod tests {
     #[test]
     fn a_key_first_seen_past_the_sample_is_an_error_not_a_silent_drop() {
         let mut text = String::new();
-        for _ in 0..SAMPLE_LINES {
+        for _ in 0..PAST_SAMPLE {
             text.push_str("{\"a\":1}\n");
         }
         let tail_at = text.len();
@@ -1485,8 +1485,8 @@ mod tests {
 
     #[test]
     fn too_many_columns_is_rejected() {
-        // A few rows each carrying a great many keys, shaped so the column cap is reached before
-        // SAMPLE_LINES caps things.
+        // A few rows each carrying a great many keys, shaped so the column cap is reached within
+        // the sample.
         let mut text = String::new();
         for chunk in 0..2 {
             text.push('{');

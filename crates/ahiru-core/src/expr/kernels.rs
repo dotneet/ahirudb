@@ -227,7 +227,30 @@ pub fn arith(op: OpCode, out_ty: Ty, a: &Vector, b: &Vector) -> Result<Vector> {
             Data::I32(values)
         }
         PhysType::I64 => Data::I64(arith_i64(op, a.i64s(), sa, b.i64s(), sb, n, &mut bad)),
-        PhysType::I128 => Data::I128(arith_i128(op, a.i128s(), sa, b.i128s(), sb, n, &mut bad)),
+        PhysType::I128 => {
+            let (x, y) = (a.i128s(), b.i128s());
+            let values = arith_i128(op, x, sa, y, sb, n, &mut bad);
+            if let Ty::Decimal { precision, .. } = out_ty {
+                // Integers wrap, but a DECIMAL has no wrapped value to give: past 38
+                // digits (or past the lane's own 2^127, which `arith_i128` wraps at) it
+                // is simply out of range, and that is an error, as in DuckDB ("Overflow
+                // in multiplication of DECIMAL(38)"). Only a 38-digit result can get
+                // here: every narrower DECIMAL result type has room for its operands.
+                let lim = pow10_i128(precision as u32).unwrap_or(i128::MAX);
+                for i in 0..n {
+                    let (p, q) = (x[i * sa], y[i * sb]);
+                    let exact = match op {
+                        OpCode::Add => p.checked_add(q),
+                        OpCode::Sub => p.checked_sub(q),
+                        OpCode::Mul => p.checked_mul(q),
+                        _ => Some(values[i]),
+                    };
+                    let fits = exact.is_some_and(|r| r.unsigned_abs() < lim as u128);
+                    ensure!(fits || !a.is_valid(i * sa) || !b.is_valid(i * sb), ValueOutOfRange);
+                }
+            }
+            Data::I128(values)
+        }
         PhysType::F64 => {
             let mut values = arith_f64(op, a.f64s(), sa, b.f64s(), sb, n, &mut bad);
             if out_ty == Ty::Float {
@@ -808,23 +831,23 @@ fn parse_special_f64(s: &[u8]) -> Option<f64> {
 /// once into the product and then a second time into the integer, so
 /// `CAST(<double> AS DECIMAL(38,1))` lost digits the value actually had: the double
 /// nearest `12345678901234567890.5` came out as `12345678901234566758.4`, off by more
-/// than a thousand. Instead the double is rendered as its shortest round-tripping
-/// decimal (the exact same text [`fmt_f64`] produces) and rescaled with the integer
-/// arithmetic the `VARCHAR -> DECIMAL` path already uses, so
-/// `CAST(x AS DECIMAL(p,s))` and `CAST(CAST(x AS VARCHAR) AS DECIMAL(p,s))` now agree
-/// by construction.
+/// than a thousand (DuckDB's answer, from that very multiply). Instead the double is
+/// rendered as its shortest round-tripping decimal (the exact same text [`fmt_f64`]
+/// produces) and rescaled with the integer arithmetic the `VARCHAR -> DECIMAL` path
+/// already uses.
+///
+/// That text is only used once the product has at least 2^53 in magnitude, though.
+/// Below that, `x * 10^scale` (with `scale <= 22`, so the power of ten is exact) keeps
+/// its whole integer part and the fraction the rounding looks at, and it is what DuckDB
+/// rounds: `1.005::DOUBLE` is really `1.00499999999999989...`, so the product is
+/// `100.49999999999999` and scale 2 gives `1.00` (the text `1.005` would give `1.01`),
+/// while `2.675 * 100` rounds to exactly `267.5` and gives `2.68`, both as in DuckDB.
 ///
 /// `half_away` selects the rounding rule for the digits that fall off the end:
 /// DECIMAL targets round half *away from zero* (`CAST(2.5 AS DECIMAL(3,0))` = 3,
 /// like DuckDB), while integer targets round half *to even*
-/// (`CAST(2.5 AS INTEGER)` = 2, also like DuckDB). It only makes a difference at
-/// `scale == 0`: above that, the text path below already rounds away from zero
-/// through `rescale_i128`, so `DECIMAL(3,0)` used to be the one scale that
-/// disagreed with every other scale of the same type.
-///
-/// An integer target at `scale == 0` keeps the direct `f_round` path: it is
-/// already exact, and it is what carries this engine's documented
-/// round-half-to-even rule for float-to-integer casts.
+/// (`CAST(2.5::DOUBLE AS INTEGER)` = 2, also like DuckDB). An integer target at
+/// `scale == 0` keeps the direct `f_round` path: it is already exact.
 fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> Option<i128> {
     if !x.is_finite() {
         return None;
@@ -835,11 +858,19 @@ fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> 
         }
         return Some(f_round(x) as i128);
     }
+    if scale <= 22 {
+        let y = x * pow10_f64(scale);
+        if y.abs() < 9_007_199_254_740_992.0 {
+            // Half away from zero; `y - t` is exact below 2^53.
+            let t = funcs::f_trunc(y);
+            return Some(if (y - t).abs() >= 0.5 { t + y.signum() } else { t } as i128);
+        }
+    }
     buf.clear();
     crate::expr::float::write_f64_finite(buf, x);
     // A shortest-round-trip rendering never has more than 17 significant digits, so
     // `parse_dec` can always hold the mantissa and never reports it inexact.
-    let (m, e, _) = parse_dec(buf)?;
+    let (m, e, _, _) = parse_dec(buf)?;
     let k = e + scale as i32;
     if k >= 0 {
         pow10_i128(k as u32).and_then(|p| m.checked_mul(p))
@@ -865,6 +896,9 @@ fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> 
 /// `parse_special_f64` runs first because it accepts spellings `FromStr` does not
 /// (`+nan`, `-nan`) and because it fixes the sign of `-nan`, which is otherwise lost.
 fn parse_f64(s: &[u8]) -> Option<f64> {
+    if s.contains(&b'_') {
+        return parse_f64(&strip_separators(s)?);
+    }
     if let Some(v) = parse_special_f64(s) {
         return Some(v);
     }
@@ -879,21 +913,61 @@ fn parse_f64(s: &[u8]) -> Option<f64> {
 /// `'1.00000005960464477539062500001'` is above the midpoint between `1.0` and the next
 /// `f32`, yet its nearest double *is* that midpoint, which then ties to even and gave
 /// `1.0` instead of `1.0000001192092896`. (`f32`'s `FromStr` is already linked, by
-/// `expr::float`'s shortest-digit round-trip check.) A finite value beyond the `FLOAT`
-/// range is NULL, as in [`narrow_f64`].
+/// `expr::float`'s shortest-digit round-trip check.) Text beyond the `FLOAT` range is
+/// infinite, as in DuckDB (`'1e39'::FLOAT` is `inf`), unlike a `DOUBLE` value too large
+/// for `FLOAT`, which [`narrow_f64`] turns NULL.
 fn parse_float(s: &[u8], to: Ty) -> Option<f64> {
     if to != Ty::Float {
         return parse_f64(s);
+    }
+    if s.contains(&b'_') {
+        return parse_float(&strip_separators(s)?, to);
     }
     if let Some(v) = parse_special_f64(s) {
         return Some(v as f32 as f64);
     }
     let f = core::str::from_utf8(trim_space(s)).ok()?.parse::<f32>().ok()?;
-    if f.is_infinite() {
-        None
-    } else {
-        Some(f as f64)
+    Some(f as f64)
+}
+
+/// Drops the `_` digit separators DuckDB accepts in numeric text (`'1_000'`,
+/// `'1.5e1_0'`), so the rest can be parsed as usual. As in a numeric literal, a
+/// separator must sit between two digits; `None` for one that does not (`'1__0'`,
+/// `'1_.5'`, `'_1'`).
+fn strip_separators(s: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len());
+    for (i, &c) in s.iter().enumerate() {
+        if c != b'_' {
+            out.push(c);
+        } else if i == 0
+            || !s[i - 1].is_ascii_digit()
+            || !s.get(i + 1).is_some_and(u8::is_ascii_digit)
+        {
+            return None;
+        }
     }
+    Some(out)
+}
+
+/// `0x1F` / `0b101`: the hexadecimal and binary spellings DuckDB accepts when casting
+/// text to an integer type other than `HUGEINT`. The digits are an unsigned 64-bit
+/// magnitude with no sign and no surrounding whitespace, and may carry `_` separators
+/// between digits (`'0x1_0'` is 16). `None` when the text is not one of these.
+fn parse_radix(s: &[u8]) -> Option<i128> {
+    let (radix, digits) = match s {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', b'b' | b'B', rest @ ..] => (2, rest),
+        _ => return None,
+    };
+    let digit = |c: u8| (c as char).to_digit(radix);
+    let mut v: u64 = 0;
+    for (i, &c) in digits.iter().enumerate() {
+        if c == b'_' && i > 0 && digits.get(i + 1).and_then(|&d| digit(d)).is_some() {
+            continue;
+        }
+        v = v.checked_mul(radix as u64)?.checked_add(digit(c)? as u64)?;
+    }
+    (!digits.is_empty()).then_some(v as i128)
 }
 
 /// Applies the target floating-point width.
@@ -1195,6 +1269,7 @@ pub fn fmt_f32(x: f64, out: &mut Vec<u8>) {
 }
 
 /// Reads a decimal number as `mant * 10^exp`. `None` (= NULL) if it cannot be read.
+/// `_` separators between digits are accepted, as in DuckDB ([`strip_separators`]).
 ///
 /// The third return value is "whether integer digits were dropped because they did not fit the
 /// mantissa". When they were, `mant * 10^exp` is a rounded version of the original, so integer
@@ -1202,10 +1277,21 @@ pub fn fmt_f32(x: f64, out: &mut Vec<u8>) {
 /// `CAST('...105727' AS HUGEINT)` into `...105720`). Floating point has only mantissa precision to
 /// begin with, so it can ignore this.
 ///
+/// The fourth is "whether the fractional digits dropped for the same reason amount to at
+/// least half a unit of the mantissa's last digit". A caller that keeps every mantissa
+/// digit (the target scale is the mantissa's own) rounds the magnitude up by one on it,
+/// so `'...99.99999999999999999995'` still rounds up at 38 digits. A caller that rounds
+/// at a coarser position must not: its own half-away rounding of the mantissa is
+/// already exact, since digits below the mantissa's last one can never turn a remainder
+/// under one half into a tie.
+///
 /// The mantissa is **accumulated on the negative side**. `i128::MIN`'s magnitude is not
 /// representable as a positive `i128`, so accumulating positively would make exactly the lower
 /// bound (`-170141183460469231731687303715884105728`) unreadable.
-fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
+fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool, bool)> {
+    if s.contains(&b'_') {
+        return parse_dec(&strip_separators(s)?);
+    }
     let s = trim_space(s);
     let mut i = 0usize;
     let mut neg = false;
@@ -1217,6 +1303,8 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
     let mut mant: i128 = 0;
     let mut exp: i32 = 0;
     let mut inexact = false;
+    // `None` until a fractional digit is dropped; then whether that first one was >= 5.
+    let mut round_up: Option<bool> = None;
     let mut seen = false;
     while i < s.len() && s[i].is_ascii_digit() {
         seen = true;
@@ -1238,9 +1326,14 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
             let d = (s[i] - b'0') as i128;
             // Dropping trailing fractional digits does not change the value as an integer, so
             // inexact is not set here (it does not affect the integer cast's result).
-            if let Some(m) = mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
-                mant = m;
-                exp -= 1;
+            match mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
+                Some(m) if round_up.is_none() => {
+                    mant = m;
+                    exp -= 1;
+                }
+                _ => {
+                    round_up.get_or_insert(d >= 5);
+                }
             }
             i += 1;
         }
@@ -1287,15 +1380,18 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
             }
         }
     };
-    Some((mant, exp, inexact))
+    Some((mant, exp, inexact, round_up == Some(true)))
 }
 
+/// Text to BOOLEAN accepts exactly DuckDB's spellings: the words below in any case, and
+/// `1`/`0`. Other numbers are not "non-zero means true" here -- `'2'` and `'0.4'` are not
+/// booleans (NULL; DuckDB raises) -- and surrounding whitespace is not trimmed either.
 fn parse_bool(s: &[u8]) -> Option<bool> {
     let eq =
         |w: &[u8]| s.len() == w.len() && s.iter().zip(w).all(|(a, b)| a.to_ascii_lowercase() == *b);
-    if eq(b"true") || eq(b"t") || eq(b"yes") || eq(b"y") {
+    if eq(b"true") || eq(b"t") || eq(b"yes") || eq(b"y") || eq(b"1") {
         Some(true)
-    } else if eq(b"false") || eq(b"f") || eq(b"no") || eq(b"n") {
+    } else if eq(b"false") || eq(b"f") || eq(b"no") || eq(b"n") || eq(b"0") {
         Some(false)
     } else {
         None
@@ -1410,7 +1506,7 @@ pub fn try_cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
 /// Writes a BLOB's text form: printable ASCII stays as it is, everything else -- the
 /// backslash included, so the escape is unambiguous -- becomes an uppercase `\xHH`.
 /// This is the spelling DuckDB's `BLOB -> VARCHAR` cast produces.
-fn escape_blob(bytes: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn escape_blob(bytes: &[u8], out: &mut Vec<u8>) {
     for &b in bytes {
         if (0x20..0x7f).contains(&b) && b != b'\\' {
             out.push(b);
@@ -1554,6 +1650,15 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             ensure!(!from.is_temporal(), InvalidCast);
             for i in 0..n {
                 store_i128(&mut data, (load_i128(src, i) != 0) as i128);
+            }
+        }
+        (Fam::Int, Fam::Int)
+            if to == Ty::Time && matches!(from, Ty::Timestamp | Ty::Timestamptz) =>
+        {
+            // The time of day, floored so a timestamp before the epoch keeps its clock time
+            // (`CAST(TIMESTAMP '2024-01-01 10:20:30.5' AS TIME)` is `10:20:30.5`, as in DuckDB).
+            for i in 0..n {
+                store_i128(&mut data, load_i128(src, i).rem_euclid(MICROS_PER_DAY));
             }
         }
         (Fam::Int, Fam::Int) => {
@@ -1758,29 +1863,29 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         }
         (Fam::Str, Fam::Int) => {
             let scale = dec_scale(to) as i32;
-            let is_bool = to == Ty::Boolean;
+            let radix_ok = to.is_integer() && to != Ty::HugeInt;
             let sv = a.bytes();
             for i in 0..n {
                 let b = sv.get(i);
-                let mut ok = false;
-                if is_bool {
-                    if let Some(v) = parse_bool(b) {
-                        ok = store_i128_typed(&mut data, to, v as i128);
-                    }
-                }
-                if !ok {
-                    // For BOOLEAN too, anything but 'true'/'false' is read as a number and counts as true when non-zero.
-                    ok = match parse_dec(b) {
-                        Some((m, e, inexact)) => {
+                let y = if to == Ty::Boolean {
+                    parse_bool(b).map(|v| v as i128)
+                } else if let Some(v) = parse_radix(b).filter(|_| radix_ok) {
+                    Some(v)
+                } else {
+                    match parse_dec(b) {
+                        // If integer digits were dropped, only a rounded value exists.
+                        // It is treated like out of range and becomes NULL (returning the
+                        // rounded value would silently mangle the digits). DuckDB errors
+                        // under CAST and gives NULL under TRY_CAST. This engine always
+                        // takes the NULL side.
+                        Some((_, _, true, _)) | None => None,
+                        Some((m, e, false, up)) => {
                             let k = e + scale;
-                            // If integer digits were dropped, only a rounded value exists.
-                            // It is treated like out of range and becomes NULL (returning the rounded
-                            // value would silently mangle the digits). DuckDB errors under CAST and
-                            // gives NULL under TRY_CAST. This engine always takes the NULL side.
-                            let y = if inexact {
-                                None
-                            } else if k >= 0 {
-                                pow10_i128(k as u32).and_then(|p| m.checked_mul(p))
+                            if k >= 0 {
+                                // Every mantissa digit is kept, so a dropped tail of at
+                                // least one half rounds the magnitude up here.
+                                let m = if up { m.checked_add(m.signum()) } else { Some(m) };
+                                m.zip(pow10_i128(k as u32)).and_then(|(m, p)| m.checked_mul(p))
                             } else if -k > 38 {
                                 Some(0)
                             } else {
@@ -1789,21 +1894,17 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                                 // `CAST('1.5' AS INTEGER)` must not truncate
                                 // to 1).
                                 pow10_i128((-k) as u32).and_then(|p| rescale_i128(m, 1, p, false))
-                            };
-                            match y {
-                                Some(y) => store_i128_typed(&mut data, to, y),
-                                None => {
-                                    push_default(&mut data);
-                                    false
-                                }
                             }
                         }
-                        None => {
-                            push_default(&mut data);
-                            false
-                        }
-                    };
-                }
+                    }
+                };
+                let ok = match y {
+                    Some(y) => store_i128_typed(&mut data, to, y),
+                    None => {
+                        push_default(&mut data);
+                        false
+                    }
+                };
                 if !ok {
                     funcs::set_null(&mut bad, i, n);
                 }
@@ -1842,7 +1943,30 @@ pub fn ts_add_interval(a: &Vector, b: &Vector) -> Result<Vector> {
             }
         }
     }
-    Ok(finish(Ty::Timestamp, Data::I64(out), combine_validity(a, sa, b, sb, n), bad))
+    Ok(finish(a.ty(), Data::I64(out), combine_validity(a, sa, b, sb, n), bad))
+}
+
+/// Builds an INTERVAL vector row by row from a field-wise operation. A row whose result does not
+/// fit its fields is NULL -- DuckDB raises an out-of-range error there, and a wrapped value
+/// (`INTERVAL '1 day' * 3000000000` used to print `-1294967296 days`) would be a silently
+/// wrong answer; NULL is this engine's answer for an undefined value (docs/sql/types.md).
+fn interval_rows(
+    n: usize,
+    validity: Option<Bitmap>,
+    f: impl Fn(usize) -> Option<(i32, i32, i64)>,
+) -> Vector {
+    let mut out = Vec::with_capacity(n);
+    let mut bad = None;
+    for i in 0..n {
+        match f(i) {
+            Some((m, d, u)) => out.push(pack_interval(m, d, u)),
+            None => {
+                out.push(0);
+                funcs::set_null(&mut bad, i, n);
+            }
+        }
+    }
+    finish(Ty::Interval, Data::I128(out), validity, bad)
 }
 
 /// INTERVAL +- INTERVAL. Field-wise addition (no carrying; DuckDB likewise leaves
@@ -1851,41 +1975,36 @@ pub fn interval_add(a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I128, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
     let (av, bv) = (a.i128s(), b.i128s());
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
+    Ok(interval_rows(n, combine_validity(a, sa, b, sb, n), |i| {
         let (m1, d1, u1) = unpack_interval(av[i * sa]);
         let (m2, d2, u2) = unpack_interval(bv[i * sb]);
-        out.push(pack_interval(m1.wrapping_add(m2), d1.wrapping_add(d2), u1.wrapping_add(u2)));
-    }
-    Ok(finish(Ty::Interval, Data::I128(out), combine_validity(a, sa, b, sb, n), None))
+        Some((m1.checked_add(m2)?, d1.checked_add(d2)?, u1.checked_add(u2)?))
+    }))
 }
 
 /// Negating an INTERVAL. Done field-wise (negating the raw 128-bit two's complement would break
 /// across field boundaries and cannot be used).
 pub fn interval_neg(a: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128, TypeMismatch);
-    let mut out = Vec::with_capacity(a.len());
-    for &packed in a.i128s() {
-        let (m, d, u) = unpack_interval(packed);
-        out.push(pack_interval(m.wrapping_neg(), d.wrapping_neg(), u.wrapping_neg()));
-    }
-    Ok(finish(Ty::Interval, Data::I128(out), a.validity().cloned(), None))
+    let av = a.i128s();
+    Ok(interval_rows(av.len(), a.validity().cloned(), |i| {
+        let (m, d, u) = unpack_interval(av[i]);
+        Some((m.checked_neg()?, d.checked_neg()?, u.checked_neg()?))
+    }))
 }
 
-/// INTERVAL * BIGINT. Field-wise multiplication (no carrying; the same as DuckDB).
+/// INTERVAL * BIGINT. Field-wise multiplication (no carrying; the same as DuckDB). As in DuckDB
+/// the multiplier itself has to fit an INTEGER, even for an interval of microseconds only.
 pub fn interval_mul(a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I64, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
     let (av, bv) = (a.i128s(), b.i64s());
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
+    Ok(interval_rows(n, combine_validity(a, sa, b, sb, n), |i| {
         let (m, d, u) = unpack_interval(av[i * sa]);
         let k = bv[i * sb];
-        let m = (m as i64).wrapping_mul(k) as i32;
-        let d = (d as i64).wrapping_mul(k) as i32;
-        out.push(pack_interval(m, d, u.wrapping_mul(k)));
-    }
-    Ok(finish(Ty::Interval, Data::I128(out), combine_validity(a, sa, b, sb, n), None))
+        let k32 = i32::try_from(k).ok()?;
+        Some((m.checked_mul(k32)?, d.checked_mul(k32)?, u.checked_mul(k)?))
+    }))
 }
 
 #[cfg(test)]
@@ -2066,15 +2185,21 @@ mod tests {
 
     #[test]
     fn parse_dec_forms() {
-        assert_eq!(parse_dec(b"123"), Some((123, 0, false)));
-        assert_eq!(parse_dec(b" -12.5 "), Some((-125, -1, false)));
-        assert_eq!(parse_dec(b"+1e3"), Some((1, 3, false)));
-        assert_eq!(parse_dec(b".5"), Some((5, -1, false)));
-        assert_eq!(parse_dec(b"1E-2"), Some((1, -2, false)));
+        assert_eq!(parse_dec(b"123"), Some((123, 0, false, false)));
+        assert_eq!(parse_dec(b" -12.5 "), Some((-125, -1, false, false)));
+        assert_eq!(parse_dec(b"+1e3"), Some((1, 3, false, false)));
+        assert_eq!(parse_dec(b".5"), Some((5, -1, false, false)));
+        assert_eq!(parse_dec(b"1E-2"), Some((1, -2, false, false)));
         assert_eq!(parse_dec(b""), None);
         assert_eq!(parse_dec(b"abc"), None);
         assert_eq!(parse_dec(b"1.2.3"), None);
         assert_eq!(parse_dec(b"1e"), None);
+        // `_` separators between digits, as in DuckDB.
+        assert_eq!(parse_dec(b"1_000.2_5"), Some((100025, -2, false, false)));
+        assert_eq!(parse_dec(b"1e1_0"), Some((1, 10, false, false)));
+        assert_eq!(parse_dec(b"1__0"), None);
+        assert_eq!(parse_dec(b"1_.5"), None);
+        assert_eq!(parse_dec(b"_1"), None);
     }
 
     /// The i128 extremes. Since the mantissa accumulates on the negative side, even the exact lower
@@ -2083,26 +2208,34 @@ mod tests {
     fn parse_dec_i128_boundaries() {
         assert_eq!(
             parse_dec(b"170141183460469231731687303715884105727"),
-            Some((i128::MAX, 0, false))
+            Some((i128::MAX, 0, false, false))
         );
         assert_eq!(
             parse_dec(b"-170141183460469231731687303715884105728"),
-            Some((i128::MIN, 0, false))
+            Some((i128::MIN, 0, false, false))
         );
         // Upper + 1 / lower - 1 do not fit the mantissa. A rounded value comes back, but inexact is
         // set and the integer cast side consults it and gives NULL.
-        let (_, _, inexact) = parse_dec(b"170141183460469231731687303715884105728").unwrap();
+        let (_, _, inexact, _) = parse_dec(b"170141183460469231731687303715884105728").unwrap();
         assert!(inexact);
-        let (_, _, inexact) = parse_dec(b"-170141183460469231731687303715884105729").unwrap();
+        let (_, _, inexact, _) = parse_dec(b"-170141183460469231731687303715884105729").unwrap();
         assert!(inexact);
         // Up to 38 digits it was exact all along.
         assert_eq!(
             parse_dec(b"12345678901234567890123456789012345678"),
-            Some((12345678901234567890123456789012345678, 0, false))
+            Some((12345678901234567890123456789012345678, 0, false, false))
         );
         // Dropping the fractional part does not affect the value as an integer, so it is not inexact.
         let long_frac = b"1.000000000000000000000000000000000000000000000005";
-        assert_eq!(parse_dec(long_frac).map(|(_, _, x)| x), Some(false));
+        assert_eq!(parse_dec(long_frac).map(|(_, _, x, _)| x), Some(false));
+        // The first dropped fractional digit decides whether a caller keeping every
+        // mantissa digit rounds up.
+        let (m, e, _, up) = parse_dec(b"8999999999999999999.99999999999999999995").unwrap();
+        assert_eq!((m, e, up), (89999999999999999999999999999999999999, -19, true));
+        let (_, _, _, up) = parse_dec(b"8999999999999999999.99999999999999999994").unwrap();
+        assert!(!up);
+        let (_, _, _, up) = parse_dec(b"8999999999999999999.99999999999999999949").unwrap();
+        assert!(up);
     }
 
     // --- INTERVAL -------------------------------------------------------------
@@ -2154,47 +2287,29 @@ mod tests {
         assert_eq!(unpack_interval(r.i128s()[0]), (2, 6, 7_200_000_000));
     }
 
-    // The design decision "integers wrap; overflow does not panic" (see the `int_arith!` comment at
-    // the top of this file) applies consistently to INTERVAL's field-wise operations too.
-    // The wrapping behavior at this boundary is pinned down here.
+    // A field-wise INTERVAL result that does not fit its field is NULL rather than a wrapped
+    // value (DuckDB raises an out-of-range error for all of these).
     #[test]
-    fn interval_neg_of_i32_min_stays_negative_due_to_two_s_complement_wraparound() {
-        // i32::MIN.wrapping_neg() == i32::MIN (a positive i32::MAX+1 is not representable).
-        // The same intended wrapping behavior as the ordinary integer Neg kernel.
-        let a = ivec(&[(i32::MIN, i32::MIN, i64::MIN)]);
-        let r = interval_neg(&a).unwrap();
-        assert_eq!(unpack_interval(r.i128s()[0]), (i32::MIN, i32::MIN, i64::MIN));
-    }
+    fn interval_ops_make_an_overflowing_row_null() {
+        let big = ivec(&[(i32::MIN, 0, 0), (1, 2, 3)]);
+        let r = interval_neg(&big).unwrap();
+        assert!(!r.is_valid(0));
+        assert_eq!(unpack_interval(r.i128s()[1]), (-1, -2, -3));
 
-    #[test]
-    fn interval_add_wraps_on_months_and_days_overflow() {
-        let a = ivec(&[(i32::MAX, i32::MAX, 0)]);
-        let b = ivec(&[(1, 1, 0)]);
-        let r = interval_add(&a, &b).unwrap();
-        assert_eq!(unpack_interval(r.i128s()[0]), (i32::MIN, i32::MIN, 0));
-    }
+        let r = interval_add(&ivec(&[(0, i32::MAX, 0)]), &ivec(&[(0, 1, 0)])).unwrap();
+        assert!(!r.is_valid(0));
 
-    #[test]
-    fn interval_mul_wraps_without_double_truncation_of_the_multiplier() {
-        // The multiplication happens at i64 intermediate precision and is then truncated to i32
-        // (`(m as i64).wrapping_mul(k) as i32`). k itself is not truncated to i32 before
-        // multiplying, so even for large k the low 32 bits of the final result are consistently the
-        // same value (there is no double truncation).
-        let a = ivec(&[(1_000_000, 0, 0)]);
-        let mut k = Vector::new(Ty::BigInt);
-        k.push_value(&crate::vector::Value::I64(10_000));
-        let r = interval_mul(&a, &k).unwrap();
-        let expect_months = ((1_000_000i64).wrapping_mul(10_000) as i32, 0, 0);
-        assert_eq!(unpack_interval(r.i128s()[0]), expect_months);
-    }
-
-    #[test]
-    fn interval_mul_wraps_on_micros_overflow() {
-        let a = ivec(&[(0, 0, i64::MAX)]);
-        let mut k = Vector::new(Ty::BigInt);
-        k.push_value(&crate::vector::Value::I64(2));
-        let r = interval_mul(&a, &k).unwrap();
-        assert_eq!(unpack_interval(r.i128s()[0]), (0, 0, i64::MAX.wrapping_mul(2)));
+        let mul = |iv: (i32, i32, i64), k: i64| {
+            let mut kv = Vector::new(Ty::BigInt);
+            kv.push_value(&crate::vector::Value::I64(k));
+            interval_mul(&ivec(&[iv]), &kv).unwrap()
+        };
+        assert!(!mul((0, 1, 0), 3_000_000_000).is_valid(0));
+        // The multiplier has to fit an INTEGER even when every field would (DuckDB).
+        assert!(!mul((0, 0, 1), 3_000_000_000).is_valid(0));
+        assert!(!mul((0, 0, i64::MAX), 2).is_valid(0));
+        assert!(!mul((1_000_000, 0, 0), 10_000).is_valid(0));
+        assert_eq!(unpack_interval(mul((1, 2, 3), -2).i128s()[0]), (-2, -4, -6));
     }
 
     #[test]
@@ -2275,6 +2390,16 @@ mod tests {
         assert_eq!(f64_to_scaled_i128(3.5, 0, true, &mut buf), Some(4));
         assert_eq!(f64_to_scaled_i128(-2.5, 0, true, &mut buf), Some(-3));
         assert_eq!(f64_to_scaled_i128(0.5, 0, true, &mut buf), Some(1));
+        // Below 2^53 the product x * 10^scale is rounded, as in DuckDB: 1.005, 0.285
+        // and 1.015 are just below their decimal ties, 0.125 is exactly on it, and
+        // 2.675 * 100 rounds up onto 267.5 (duckdb: 1.00, 0.28, 0.13, 2.68, 1.01).
+        assert_eq!(f64_to_scaled_i128(1.005, 2, true, &mut buf), Some(100));
+        assert_eq!(f64_to_scaled_i128(-1.005, 2, true, &mut buf), Some(-100));
+        assert_eq!(f64_to_scaled_i128(0.285, 2, true, &mut buf), Some(28));
+        assert_eq!(f64_to_scaled_i128(0.125, 2, true, &mut buf), Some(13));
+        assert_eq!(f64_to_scaled_i128(-0.125, 2, true, &mut buf), Some(-13));
+        assert_eq!(f64_to_scaled_i128(2.675, 2, true, &mut buf), Some(268));
+        assert_eq!(f64_to_scaled_i128(1.015, 2, true, &mut buf), Some(101));
     }
 
     #[test]
@@ -2409,7 +2534,8 @@ mod tests {
         let out = cast(Ty::Varchar, Ty::Float, &txt(&["1.00000005960464477539062500001"])).unwrap();
         assert_eq!(out.f64s()[0], 1.000_000_119_209_289_6);
         let out = cast(Ty::Varchar, Ty::Float, &txt(&["1e39", " -inf ", "3.4028235e38"])).unwrap();
-        assert!(!out.is_valid(0), "a finite value past FLOAT's range is NULL");
+        // Text past FLOAT's range is infinite, as in DuckDB (`'1e39'::FLOAT` is `inf`).
+        assert_eq!(out.f64s()[0], f64::INFINITY);
         assert_eq!(out.f64s()[1], f64::NEG_INFINITY);
         assert_eq!(out.f64s()[2], f32::MAX as f64);
         // A wide DECIMAL goes the same single-rounding way.

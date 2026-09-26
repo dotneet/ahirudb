@@ -19,6 +19,12 @@
 //! an ABI shaped like `ahiru_query_step` for the write side too; that is
 //! deferred past v1.
 //!
+//! `COPY` through `Session::prepare` gets a cruder form of it: the reads the
+//! statement was waiting on are stashed on the session, and `prepare` returns
+//! them as `Prepared::NeedIo` instead of `IoFailed`. A host that answers them
+//! and prepares again restarts the statement with more of the data in memory,
+//! until it completes (the JS host does exactly this).
+//!
 //! `NEED_CODEC` is **not** part of that limitation, even though it used to be
 //! treated as one. A codec request never means "bytes are missing": the
 //! compressed bytes were already delivered by the preceding `NEED_IO`, and
@@ -148,11 +154,18 @@ fn export_query(
     query: &QueryStmt,
     params: &[Value],
     sink: &mut dyn TableSink,
+    dedup_names: bool,
 ) -> Result<Vec<u8>> {
     let mut q = match session.prepare_query(arena, query, params)? {
         Prepared::Ready(q) => q,
         Prepared::NeedIo(_) => err!(IoFailed),
     };
+    // A CSV header or Parquet schema with two columns of the same name is written as
+    // `a`, `a_1`, ... like DuckDB. JSONL keeps them, so its sink rejects the duplicate
+    // key (DuckDB fails there too) instead of silently renaming an object key.
+    if dedup_names {
+        crate::catalog::Catalog::dedup_column_names(&mut q.schema);
+    }
     sink.begin(&q.schema)?;
     loop {
         match session.step(&mut q)? {
@@ -175,7 +188,7 @@ fn export_query(
 
 /// Execution body for `Stmt::Copy`. Called from `Session::prepare`.
 ///
-/// The format comes from an explicit `FORMAT csv|jsonl|json|parquet` when
+/// The format comes from an explicit `FORMAT csv|jsonl|json|ndjson|parquet` when
 /// given, and otherwise from the extension of `path` via
 /// `format::FormatKind::detect`. Which formats can actually be written
 /// depends on the enabled features (`csv`, `jsonl`, `export-parquet`);
@@ -192,30 +205,43 @@ pub(crate) fn copy(
     format: Option<&str>,
     params: &[Value],
 ) -> Result<Prepared> {
-    let fmt = resolve_format(path, format)?;
+    // As in DuckDB, a `.gz`/`.zst` suffix names the compression, and the format comes
+    // from what precedes it (`out.csv.gz` is gzipped CSV). Parquet compresses its pages
+    // itself, so DuckDB writes a plain Parquet file under such a name; so does this.
+    let (base, gzip, zstd) = match (path.strip_suffix(".gz"), path.strip_suffix(".zst")) {
+        (Some(b), _) => (b, true, false),
+        (_, Some(b)) => (b, false, true),
+        _ => (path, false, false),
+    };
+    let fmt = resolve_format(base, format)?;
+    #[cfg(feature = "export-parquet")]
+    let (gzip, zstd) = if fmt == ExportFormat::Parquet { (false, false) } else { (gzip, zstd) };
+    // There is no zstd encoder anywhere (host included), and writing uncompressed
+    // bytes under a `.zst` name would leave a file no reader can open.
+    ensure!(!zstd, UnsupportedCodec);
     let data = match fmt {
         #[cfg(feature = "csv")]
         ExportFormat::Csv => {
             let mut sink = csv::CsvSink::new();
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, true)?
         }
         #[cfg(feature = "csv")]
         ExportFormat::Tsv => {
             let mut sink = csv::CsvSink::with_delimiter(b'\t');
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, true)?
         }
         #[cfg(feature = "jsonl")]
         ExportFormat::Jsonl => {
             let mut sink = jsonl::JsonlSink::new();
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, false)?
         }
         #[cfg(feature = "export-parquet")]
         ExportFormat::Parquet => {
             let mut sink = parquet::ParquetSink::new();
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, true)?
         }
     };
-    Ok(Prepared::Ready(Query::copy_result(path.to_owned(), data)))
+    Ok(Prepared::Ready(Query::copy_result(path.to_owned(), data, gzip)))
 }
 
 /// Resolves `format` if given, otherwise infers it from `path`'s extension.
@@ -284,7 +310,10 @@ fn format_by_name(name: &str) -> Result<ExportFormat> {
         return Ok(ExportFormat::Tsv);
     }
     #[cfg(feature = "jsonl")]
-    if eq_ascii_ci(name.as_bytes(), b"jsonl") || eq_ascii_ci(name.as_bytes(), b"json") {
+    if eq_ascii_ci(name.as_bytes(), b"jsonl")
+        || eq_ascii_ci(name.as_bytes(), b"json")
+        || eq_ascii_ci(name.as_bytes(), b"ndjson")
+    {
         return Ok(ExportFormat::Jsonl);
     }
     #[cfg(feature = "export-parquet")]
@@ -437,12 +466,32 @@ mod tests {
         assert_eq!(crate::error::code_of(r), Some(crate::error::Code::UnsupportedFeature));
     }
 
+    /// `COPY` cannot pause mid-statement, but `prepare` reports the reads it
+    /// was waiting on instead of a bare `IoFailed`, so a host that answers them
+    /// and prepares again makes progress (the statement restarts from scratch).
     #[test]
     #[cfg(feature = "csv")]
-    fn copy_need_io_fails_clearly_for_unresolved_remote_table() {
+    fn copy_reports_the_reads_an_unresolved_remote_table_needs() {
         let mut s = Session::new();
-        s.register_remote("t", 100).unwrap();
-        let r = s.prepare("COPY (SELECT * FROM t) TO 'out.csv'", &[]);
-        assert_eq!(crate::error::code_of(r), Some(crate::error::Code::IoFailed));
+        let csv = b"id\n1\n2\n".to_vec();
+        s.register_remote("t.csv", csv.len() as u64).unwrap();
+        let sql = "COPY (SELECT * FROM \"t.csv\") TO 'out.csv'";
+        let mut rounds = 0;
+        let copy = loop {
+            match s.prepare(sql, &[]).unwrap() {
+                Prepared::Ready(mut q) => break q.copy.take().expect("no COPY result"),
+                Prepared::NeedIo(io) => {
+                    assert!(!io.is_empty());
+                    for r in io {
+                        let (o, l) = (r.offset as usize, r.len as usize);
+                        s.provide(r.table, r.part, r.offset, csv[o..o + l].to_vec()).unwrap();
+                    }
+                }
+            }
+            rounds += 1;
+            assert!(rounds < 10, "no progress");
+        };
+        assert!(rounds >= 1, "the remote table should have needed I/O");
+        assert_eq!(String::from_utf8(copy.data).unwrap(), "id\n1\n2\n");
     }
 }

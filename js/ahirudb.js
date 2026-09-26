@@ -3,10 +3,14 @@
 // The entire contract with the wasm side lives in crates/ahiru-core/src/abi.rs.
 // When changing status values, the wire format, or error codes, change that file and this one together.
 //
-// This host is responsible for exactly three things:
+// This host is responsible for:
 //   1. the NEED_IO loop ... coalesce the byte ranges the engine asks for, fetch them in parallel, and hand them back
 //   2. decoding the result buffer ... columnar little-endian representation -> JS values
 //   3. assembling error messages (the table in errors.js)
+//   4. binding tables ... every register() is declared to the engine without I/O; the
+//      engine asks for the lengths of the tables it resolves and names the SQL
+//      string-literal paths nobody registered. The host never parses SQL itself.
+//   5. replacing the wasm instance after a trap (see `isWasmTrap`)
 //
 // --- Handling wasm memory (important) ----------------------------------------
 // `ahiru_alloc` / `ahiru_provide` may grow the wasm heap, and the moment it grows
@@ -305,94 +309,64 @@ function makeCache(spec, maxBytes) {
 /** The format argument of `ahiru_register_as`. 1:1 with `format_kind` in abi.rs. */
 const FORMAT_CODES = { auto: 0, parquet: 1, csv: 2, tsv: 3, jsonl: 4, json: 5 };
 
-/** File-table functions whose first argument is a path registered by the host. */
-const FILE_FUNCTION_NAMES = new Set([
-  'parquet',
-  'read_parquet',
-  'read_csv',
-  'read_csv_auto',
-  'read_json',
-  'read_json_auto',
-]);
+/**
+ * Flag OR-ed into `ahiru_register_as`'s format argument for a path a SQL string
+ * literal referenced (`FORMAT_PATH` in abi.rs): registered case-sensitively.
+ */
+const FORMAT_PATH = 0x100;
 
-const SQL_IDENTIFIER_CHAR = /[\p{L}\p{N}]/u;
-const SQL_WHITESPACE = /\s/u;
+/** `ahiru_register_as` total length meaning "not known yet" (`catalog::SIZE_UNKNOWN`). */
+const SIZE_UNKNOWN = 0xffff_ffff_ffff_ffffn;
 
-function isSqlIdentifierChar(ch) {
-  return ch === '_' || ch === '$' || ch === '.' || SQL_IDENTIFIER_CHAR.test(ch);
+/** `ahiru_copy_result` flag: gzip the bytes before handing them to `onCopy` (`COPY_GZIP`). */
+const COPY_GZIP = 1;
+
+/** `ahiru_query_start`'s "register these paths and call me again" (`START_NEED_TABLES`). */
+const START_NEED_TABLES = -3;
+
+/**
+ * The table-function family a path reported by `START_NEED_TABLES` came from,
+ * by the `format_kind` code the SQL asked for. A bare `FROM 'x.csv'` reports the
+ * family its extension implies. Passed to `sqlUrlPolicy` as `functionName`.
+ */
+const FUNCTION_FAMILY = ['parquet', 'parquet', 'read_csv', 'read_csv', 'read_json', 'read_json'];
+
+/**
+ * The format to register a SQL-referenced path with, from the `format_kind` code
+ * the SQL asked for. `parquet('x.csv')` keeps the historical "the extension
+ * decides" behaviour (Auto); `read_csv('x.tsv')` / `read_json('x.jsonl')` pick
+ * the variant the extension names.
+ */
+function formatForSqlPath(code, path) {
+  const detected = detectFormat(path);
+  switch (code) {
+    case FORMAT_CODES.csv:
+      return detected === 'tsv' ? 'tsv' : 'csv';
+    case FORMAT_CODES.json:
+      return detected === 'jsonl' ? 'jsonl' : 'json';
+    case FORMAT_CODES.tsv:
+      return 'tsv';
+    case FORMAT_CODES.jsonl:
+      return 'jsonl';
+    default:
+      return undefined;
+  }
 }
 
 /**
- * Scans the small subset of SQL needed for host-side table binding.
- *
- * The core lexer ignores comments and folds doubled quotes (`''` / `""`). Keeping
- * those rules here prevents text in comments from looking like a table reference
- * and lets file paths containing an escaped quote reach the catalog unchanged.
+ * Resolves a path from SQL the way `fetch()` would: against the page's base URL
+ * when there is one (a browser), verbatim otherwise. A protocol-relative
+ * `//host/x` or a relative `x.parquet` is a network request to *some* origin in
+ * a browser, so the URL policy has to see where it really goes.
  */
-function scanSqlTokens(sql) {
-  const tokens = [];
-  let i = 0;
-  while (i < sql.length) {
-    const codePoint = sql.codePointAt(i);
-    const ch = String.fromCodePoint(codePoint);
-    if (SQL_WHITESPACE.test(ch)) {
-      i += ch.length;
-      continue;
-    }
-    if (ch === '-' && sql[i + 1] === '-') {
-      i += 2;
-      while (i < sql.length && sql[i] !== '\n') i++;
-      continue;
-    }
-    if (ch === '/' && sql[i + 1] === '*') {
-      const end = sql.indexOf('*/', i + 2);
-      i = end < 0 ? sql.length : end + 2;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      let value = '';
-      let closed = false;
-      i++;
-      while (i < sql.length) {
-        if (sql[i] === quote) {
-          if (sql[i + 1] === quote) {
-            value += quote;
-            i += 2;
-            continue;
-          }
-          i++;
-          closed = true;
-          break;
-        }
-        const codePoint = sql.codePointAt(i);
-        const character = String.fromCodePoint(codePoint);
-        value += character;
-        i += character.length;
-      }
-      // The core reports an unterminated string as a syntax error. Do not bind
-      // anything from its incomplete tail before that error is produced.
-      if (closed) {
-        tokens.push({ type: quote === "'" ? 'string' : 'quoted-identifier', value });
-      }
-      continue;
-    }
-    if (isSqlIdentifierChar(ch)) {
-      const start = i;
-      i += ch.length;
-      while (i < sql.length) {
-        const codePoint = sql.codePointAt(i);
-        const character = String.fromCodePoint(codePoint);
-        if (!isSqlIdentifierChar(character)) break;
-        i += character.length;
-      }
-      tokens.push({ type: 'identifier', value: sql.slice(start, i) });
-      continue;
-    }
-    tokens.push({ type: 'punctuation', value: ch });
-    i += ch.length;
+function resolveSqlPath(path) {
+  const base = globalThis.document?.baseURI ?? globalThis.location?.href;
+  if (base === undefined) return path;
+  try {
+    return new URL(path, base).href;
+  } catch {
+    return path;
   }
-  return tokens;
 }
 
 /**
@@ -495,15 +469,6 @@ function redactUrl(url) {
     // Not a parseable absolute URL (a relative path, or something else). Still
     // drop anything that looks like a query string / fragment as a fallback.
     return String(url).split(/[?#]/)[0];
-  }
-}
-
-function isHttpUrl(value) {
-  try {
-    const protocol = new URL(String(value)).protocol.toLowerCase();
-    return protocol === 'http:' || protocol === 'https:';
-  } catch {
-    return false;
   }
 }
 
@@ -764,6 +729,10 @@ function ensureSafeRange(offset, len, what) {
  * Single-file registration (`ahiru_register`/`ahiru_register_as`) is always 0.
  * It must be passed straight back when calling `ahiru_provide` -- `table` alone
  * cannot uniquely identify the file the byte offsets are relative to.
+ *
+ * A request at offset `u64::MAX` with length 0 is a size request for a table
+ * declared before its length was known; it decodes as `{ table, part, size: true }`
+ * and is answered with `ahiru_set_size`.
  */
 export function decodeIoRequests(u8) {
   if (u8.byteLength < 4) {
@@ -777,6 +746,10 @@ export function decodeIoRequests(u8) {
   const out = [];
   for (let i = 0; i < n; i++) {
     const p = 4 + i * IO_REQUEST_SIZE;
+    if (dv.getBigUint64(p + 8, true) === SIZE_UNKNOWN && dv.getBigUint64(p + 16, true) === 0n) {
+      out.push({ table: dv.getUint32(p, true), part: dv.getUint32(p + 4, true), size: true });
+      continue;
+    }
     const offset = toSafeNumber(dv.getBigUint64(p + 8, true), 'I/O request offset');
     const len = toSafeNumber(dv.getBigUint64(p + 16, true), 'I/O request length');
     ensureSafeRange(offset, len, 'I/O request');
@@ -823,6 +796,26 @@ export function decodeCodecRequests(u8) {
       len,
       outLen,
     });
+  }
+  return out;
+}
+
+/**
+ * `encode_missing`: [count:u32][{format:u32, path_len:u32, path}...] -- the paths
+ * a statement's string literals named that no table is registered under
+ * (`START_NEED_TABLES`). `format` is the `FORMAT_CODES` value the SQL asked for.
+ */
+export function decodeMissingTables(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const n = wireU32(dv, u8, 0, 'missing-table header');
+  const out = [];
+  let p = 4;
+  for (let i = 0; i < n; i++) {
+    const format = wireU32(dv, u8, p, 'missing-table format');
+    const len = wireU32(dv, u8, p + 4, 'missing-table path length');
+    const end = wireEnd(u8, p + 8, len, 'missing-table path');
+    out.push({ format, path: decodeUtf8(u8.subarray(p + 8, end), 'missing-table path') });
+    p = end;
   }
   return out;
 }
@@ -977,7 +970,8 @@ export function encodeParams(params) {
         detail:
           `cannot bind ${Object.prototype.toString.call(v)}; ` +
           'use null / boolean / number / bigint / string / Uint8Array ' +
-          '(pass TIMESTAMP as BigInt microseconds)',
+          '(for a TIMESTAMP, bind BigInt microseconds and write make_timestamp(?), ' +
+          'or bind an ISO string and write ?::TIMESTAMP)',
       });
     }
   }
@@ -1298,17 +1292,31 @@ export class Batch {
    */
   toRows() {
     const keys = this.#rowKeys();
+    // A column literally named `__proto__` must become an own property. Plain
+    // assignment would invoke the `__proto__` setter instead: the value vanished
+    // from the row, and an object value (an INTERVAL) became the row's prototype.
+    const proto = keys.indexOf('__proto__');
     const rows = new Array(this.numRows);
     for (let r = 0; r < this.numRows; r++) {
       const o = {};
       for (let j = 0; j < this.columns.length; j++) {
         const c = this.columns[j];
-        o[keys[j]] =
+        const v =
           c.valid !== null && c.valid[r] === 0
             ? null
             : c.physType === PHYS_BOOL
               ? c.values[r] === 1
               : c.values[r];
+        if (j === proto) {
+          Object.defineProperty(o, '__proto__', {
+            value: v,
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          });
+        } else {
+          o[keys[j]] = v;
+        }
       }
       rows[r] = o;
     }
@@ -1321,6 +1329,17 @@ export class Batch {
 // The core does not carry GZIP / ZSTD. Not carrying them is precisely why the core
 // is small (DESIGN.md §6). GZIP goes to `DecompressionStream`, which browsers /
 // Node have built in; ZSTD goes to a separate wasm module.
+
+/** GZIP compression for `COPY ... TO 'x.gz'` (the core has no deflate encoder). */
+async function gzip(bytes) {
+  if (typeof CompressionStream !== 'function') {
+    throw new AhiruError(Code.UNSUPPORTED_CODEC, {
+      detail: 'writing a .gz file needs CompressionStream (browser or Node 18+)',
+    });
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
 
 /** GZIP. Costing zero extra bytes is the whole point of this delegation. */
 async function gunzip(bytes, maxLen) {
@@ -1503,18 +1522,47 @@ async function loadWasmBytes(wasmUrl, fetchImpl) {
 
 // --- Main --------------------------------------------------------------------
 
+/**
+ * Whether an exception out of a wasm call means the instance can no longer be
+ * trusted. A trap (a stack overflow in deep recursion, `unreachable` from a
+ * panic, an out-of-bounds access) unwinds past every Rust epilogue, so the
+ * shadow `__stack_pointer` and whatever state was mid-update stay as they were:
+ * every later call traps too, or worse, runs on corrupt state. A recursion deep
+ * enough to exhaust the host's native stack first surfaces as a RangeError and
+ * leaves the instance in the same condition.
+ */
+function isWasmTrap(e) {
+  return (
+    e instanceof WebAssembly.RuntimeError ||
+    (e instanceof RangeError && /call stack/i.test(String(e.message)))
+  );
+}
+
+/** Bound on the coalesced ranges remembered per table for codec delegation (`#bytesAt`). */
+const MAX_REMEMBERED_JOBS = 4096;
+
 export class AhiruDB {
+  /** The compiled module, kept so a trapped instance can be replaced. */
+  #module;
   #exports;
   #memory;
   #session;
-  #tables = new Map(); // name(lower) -> record
-  #byIndex = new Map(); // wasm table index -> record
+  /** wasm table index -> registration record, for every table the current instance knows. */
+  #byIndex = new Map();
+  /**
+   * Registrations not declared to the wasm catalog yet: made while a run held
+   * the instance (replacing a table under a running scan would corrupt it), or
+   * carried over from a trapped instance. The next run declares them first.
+   */
+  #pending = [];
   #cache;
   /** When the cache was supplied from outside, close() must not clear it. */
   #ownsCache;
   #fetch;
-  /** Optional gate for URLs discovered directly in SQL file-function calls. */
+  /** Optional gate for paths discovered in SQL string literals. */
   #sqlUrlPolicy;
+  /** Where `COPY ... TO` results go (the engine never writes files itself). */
+  #onCopy;
   #memoryLimit;
   /** Cap on the fetched bytes retained for codec delegation. */
   #residentLimit;
@@ -1533,16 +1581,25 @@ export class AhiruDB {
   #currentRun = null;
   /** Prevents close() from freeing the session twice, including deferred close. */
   #sessionFreed = false;
+  /** A wasm call trapped: nothing may call into the current instance again. */
+  #trapped = false;
+  /**
+   * Why a trapped instance cannot be replaced (every later call fails with it),
+   * or null. Replacing it is only transparent while the session holds nothing
+   * that would be lost with it -- in-memory tables and views created by SQL.
+   */
+  #dead = null;
+  /** In-memory tables + views (`ddl`) the session held after the last run. */
+  #ddlObjects = 0;
 
-  constructor(instance, options) {
+  constructor(instance, options = {}, module = undefined) {
     this.#zstdOptions = {
       zstdUrl: options.zstdUrl,
       zstdBinary: options.zstdBinary,
       zstdModule: options.zstdModule,
       fetch: options.fetch,
     };
-    this.#exports = instance.exports;
-    this.#memory = instance.exports.memory;
+    this.#module = module instanceof WebAssembly.Module ? module : undefined;
     this.#ownsCache = typeof options.cache !== 'object' || options.cache === null;
     const cacheSize = requireNonNegativeSafeInteger(
       options.cacheSize ?? DEFAULT_CACHE_SIZE,
@@ -1559,9 +1616,12 @@ export class AhiruDB {
       throw new TypeError('sqlUrlPolicy must be a function or false');
     }
     this.#sqlUrlPolicy = options.sqlUrlPolicy;
+    if (options.onCopy !== undefined && typeof options.onCopy !== 'function') {
+      throw new TypeError('onCopy must be a function');
+    }
+    this.#onCopy = options.onCopy;
     this.#memoryLimit = requireNonNegativeSafeInteger(options.memoryLimit ?? 0, 'memoryLimit');
-    this.#session = this.#exports.ahiru_session_new();
-    if (this.#session < 0) throw new AhiruError(Code.INTERNAL, { detail: 'session_new failed' });
+    this.#bindInstance(instance);
   }
 
   /**
@@ -1572,24 +1632,39 @@ export class AhiruDB {
    */
   static async init(options = {}) {
     const { wasmUrl, wasmBinary, wasmModule } = options;
-    let instance;
-    if (wasmModule instanceof WebAssembly.Module) {
-      instance = await WebAssembly.instantiate(wasmModule, {});
-    } else {
+    let module = wasmModule;
+    if (!(module instanceof WebAssembly.Module)) {
       const bytes = wasmBinary
         ? ArrayBuffer.isView(wasmBinary)
           ? new Uint8Array(wasmBinary.buffer, wasmBinary.byteOffset, wasmBinary.byteLength)
           : new Uint8Array(wasmBinary)
         : await loadWasmBytes(wasmUrl ?? 'ahiru-core.wasm', options.fetch);
-      // The core has no imports at all (no_std, panic=abort).
-      ({ instance } = await WebAssembly.instantiate(bytes, {}));
+      // Compiled separately from instantiation so a trapped instance can be
+      // replaced later without fetching or compiling the module again.
+      module = await WebAssembly.compile(bytes);
     }
-    return new AhiruDB(instance, options);
+    // The core has no imports at all (no_std, panic=abort).
+    const instance = await WebAssembly.instantiate(module, {});
+    return new AhiruDB(instance, options, module);
+  }
+
+  /** Adopts a fresh instance and opens its session. */
+  #bindInstance(instance) {
+    const e = instance.exports;
+    this.#exports = e;
+    this.#memory = e.memory;
+    const session = e.ahiru_session_new();
+    if (session < 0) throw new AhiruError(Code.INTERNAL, { detail: 'session_new failed' });
+    this.#session = session;
+    this.#sessionFreed = false;
+    this.#trapped = false;
+    this.#ddlObjects = 0;
   }
 
   /**
    * Registers a table. No I/O whatsoever happens here.
-   * Fetching the total byte length and reading the footer / header are both deferred to the first query.
+   * Fetching the total byte length and reading the footer / header are both deferred
+   * to the first query that actually reads the table.
    *
    * Without `format`, the engine infers it from the **extension of the registered
    * name** (`format::FormatKind::detect`). When given, it takes precedence, so the
@@ -1602,14 +1677,20 @@ export class AhiruDB {
    *
    * An explicit choice that disagrees with the extension is allowed. Decoupling the
    * name from how it is read is the purpose of this option; blocking that with a check would defeat it.
+   *
+   * The name is an SQL identifier: it replaces an earlier registration whose name
+   * differs only in ASCII case, as the engine's catalog does.
    */
   register(name, source, { format } = {}) {
-    return this.#register(name, source, format, false);
+    return this.#register(name, source, format, { path: false, rejectRedirects: false });
   }
 
-  /** Internal registration path for SQL-discovered URLs; reject HTTP redirects. */
-  #register(name, source, format, rejectRedirects) {
-    this.#assertOpen();
+  /**
+   * `path`: a path a SQL string literal referenced, registered case-sensitively.
+   * `now`: declare immediately (the caller is the run holding the instance).
+   */
+  #register(name, source, format, { path, rejectRedirects, now = false }) {
+    this.#assertUsable();
     if (typeof name !== 'string' || name.length === 0) {
       throw new TypeError('register: a table name is required');
     }
@@ -1624,11 +1705,10 @@ export class AhiruDB {
         });
       }
     }
-    const src = makeSource(source, this.#fetch, { rejectRedirects });
-    // A duplicate name replaces the previous one (the wasm-side catalog follows the same rule).
-    this.#tables.set(name.toLowerCase(), {
+    const rec = {
       name,
-      source: src,
+      path,
+      source: makeSource(source, this.#fetch, { rejectRedirects }),
       index: -1,
       size: -1,
       // What it will actually be read as. For Auto, infer it with the engine's rule and show that.
@@ -1637,8 +1717,60 @@ export class AhiruDB {
       // The retained copy of supplied bytes, and the ranges fetched so far (used once the copy is dropped).
       resident: [],
       fetched: [],
-    });
+      // The exact coalesced ranges fetched (the range-cache keys), for `#bytesAt`.
+      jobs: new JobIndex(),
+    };
+    // Declaring while idle surfaces registration errors (a name CREATE TABLE
+    // already took, a format this build lacks) right here.
+    if (now || (this.#activeRuns === 0 && !this.#trapped)) {
+      try {
+        this.#declare(rec);
+      } catch (e) {
+        throw this.#asTrap(e);
+      }
+    } else {
+      this.#pending.push(rec);
+    }
     return this;
+  }
+
+  /** Declares a registration to the wasm catalog (no I/O; the length may still be unknown). */
+  #declare(rec) {
+    const e = this.#exports;
+    if (typeof e.ahiru_set_size !== 'function') {
+      throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
+        detail: 'this wasm core is older than the JS host (no ahiru_set_size); rebuild it',
+      });
+    }
+    const name = textEncoder.encode(rec.name);
+    const ptr = e.ahiru_alloc(name.length) >>> 0;
+    if (ptr === 0 && name.length > 0) throw new AhiruError(Code.OOM);
+    let idx;
+    try {
+      new Uint8Array(this.#memory.buffer).set(name, ptr);
+      idx = e.ahiru_register_as(
+        this.#session,
+        ptr,
+        name.length,
+        // A length learnt by an earlier instance (see #replaceInstance) is reused.
+        rec.size >= 0 ? BigInt(rec.size) : SIZE_UNKNOWN,
+        rec.formatCode | (rec.path ? FORMAT_PATH : 0),
+      );
+    } finally {
+      e.ahiru_free(ptr, name.length);
+    }
+    if (idx < 0) throw this.#lastError();
+    rec.index = idx;
+    // A re-registration reuses its predecessor's index, which drops the stale record.
+    this.#byIndex.set(idx, rec);
+  }
+
+  /** Declares the registrations queued while the instance was busy. */
+  #flushPending() {
+    while (this.#pending.length > 0) {
+      // A registration the engine rejects is dropped and reported by this run.
+      this.#declare(this.#pending.shift());
+    }
   }
 
   /** Alias for `register`. Accepts formats other than Parquet too. */
@@ -1677,8 +1809,8 @@ export class AhiruDB {
   close() {
     if (this.#closed) return;
     this.#closed = true;
-    this.#tables.clear();
     this.#byIndex.clear();
+    this.#pending = [];
     if (this.#ownsCache) this.#cache.clear();
     this.#abortCurrentRun();
     // A query may still be suspended at a source/fetch await. Do not free the
@@ -1698,13 +1830,14 @@ export class AhiruDB {
     if (run.q >= 0) {
       const q = run.q;
       run.q = -1;
-      this.#exports.ahiru_query_close(q);
+      if (!this.#trapped) this.#exports.ahiru_query_close(q);
     }
     run.finish();
   }
 
-  /** How many bytes the wasm heap currently holds. */
+  /** How many bytes the wasm heap currently holds (0 while a trapped instance awaits replacement). */
   get heapUsed() {
+    if (this.#trapped) return 0;
     // Unsigned: see the note in #out().
     return this.#exports.ahiru_heap_used() >>> 0;
   }
@@ -1712,7 +1845,7 @@ export class AhiruDB {
   // --- Execution loop -------------------------------------------------------
 
   async *#run(sql, params, copy) {
-    this.#assertOpen();
+    this.#assertUsable();
     // Every wasm entry point below shares module-level state (the out buffer,
     // last-error) across the whole instance, so only one #run may be in flight
     // at a time. The lock is held for the entire lifetime of this generator,
@@ -1735,14 +1868,17 @@ export class AhiruDB {
     this.#currentRun = run;
     this.#activeRuns++;
     try {
+      this.#assertUsable();
+      if (this.#trapped) await this.#replaceInstance();
       this.#assertOpen();
-      await this.#bindTables(sql);
-      this.#assertOpen();
+      this.#flushPending();
 
       const q = await this.#start(sql, params);
       run.q = q;
       this.#assertOpen();
       try {
+        // `COPY ... TO` has no rows; its bytes go to the onCopy handler.
+        if (await this.#deliverCopy(q, sql)) return;
         const schema = this.#readSchema(q, sql);
         let lastSignature = null;
         for (;;) {
@@ -1769,25 +1905,80 @@ export class AhiruDB {
           if (status === STATUS_DONE) return;
           throw this.#lastError(sql);
         }
+      } catch (e) {
+        // Noted before the `finally` below, which must not call into a trapped instance.
+        throw this.#asTrap(e, sql);
       } finally {
         // close() already closed it (and freed the session) if it aborted us.
-        if (!run.aborted && run.q >= 0) {
+        if (!run.aborted && run.q >= 0 && !this.#trapped) {
           run.q = -1;
+          // Closing also releases the bytes this query fetched into the wasm heap
+          // (the next query asks for them again, from the range cache).
           this.#exports.ahiru_query_close(q);
+          const count = this.#exports.ahiru_ddl_object_count;
+          this.#ddlObjects = typeof count === 'function' ? count(this.#session) : 0;
         }
       }
+    } catch (e) {
+      throw this.#asTrap(e, sql);
     } finally {
       run.finish();
     }
   }
 
   /**
-   * Starts a query. If the footer is not fetched yet it returns `-2`, so satisfy the request and retry.
+   * Normalizes an exception thrown out of a run. A wasm trap marks the instance
+   * as unusable (it is replaced before the next call, or the database is dead
+   * if replacing it would lose SQL-created state) and becomes an AhiruError.
+   */
+  #asTrap(e, sql) {
+    if (!isWasmTrap(e)) return e;
+    if (!this.#trapped) {
+      this.#trapped = true;
+      if (this.#module === undefined) {
+        this.#dead = 'the wasm engine trapped and no compiled module is available to replace it';
+      } else if (this.#ddlObjects > 0) {
+        this.#dead =
+          'the wasm engine trapped; replacing it would silently drop the in-memory tables ' +
+          'and views created by SQL, so this database cannot be used any more';
+      }
+    }
+    return new AhiruError(Code.INTERNAL, {
+      sql,
+      detail:
+        `the wasm engine trapped (${e.message}); ` +
+        (this.#dead === null
+          ? 'it is replaced with a fresh instance before the next call'
+          : 'create a new AhiruDB'),
+      cause: e,
+    });
+  }
+
+  /**
+   * Swaps a trapped instance for a fresh one from the same module. Every
+   * registration is declared again; lengths already learnt are reused, and bytes
+   * come back from the range cache, so nothing is fetched twice.
+   */
+  async #replaceInstance() {
+    const instance = await WebAssembly.instantiate(this.#module, {});
+    this.#assertOpen();
+    this.#bindInstance(instance);
+    const known = [...this.#byIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, rec]) => rec);
+    this.#byIndex.clear();
+    this.#pending = [...known, ...this.#pending];
+  }
+
+  /**
+   * Starts a query. The engine may first ask for bytes (`-2`: footers, table
+   * lengths, or the reads a one-shot statement such as `COPY` was waiting on) or
+   * for paths its string literals named (`START_NEED_TABLES`); satisfy the
+   * request and retry.
    */
   async #start(sql, params) {
     const bytes = textEncoder.encode(sql);
     const pbytes = encodeParams(params);
     let lastSignature = null;
+    const asked = new Set();
     for (;;) {
       const e = this.#exports;
       // The core has no clock, so the query start time is passed in here for
@@ -1814,11 +2005,89 @@ export class AhiruDB {
         }
       }
       if (h >= 0) return h;
+      if (h === START_NEED_TABLES) {
+        await this.#registerSqlPaths(decodeMissingTables(this.#out()), sql, asked);
+        this.#assertOpen();
+        continue;
+      }
       if (h !== -2) throw this.#lastError(sql);
-      // -2: not enough bytes to read the footer.
       lastSignature = await this.#pump(decodeIoRequests(this.#out()), lastSignature, sql);
       this.#assertOpen();
     }
+  }
+
+  /**
+   * Registers the paths a statement's string literals named (`FROM 'x.parquet'`,
+   * `parquet('https://…')`, `read_csv('…')`) under their exact spelling.
+   *
+   * The engine reports exactly the references it resolves, so a table name that
+   * merely appears as a column, alias, comment, or string value is never bound or
+   * fetched. `sqlUrlPolicy`, when configured, sees every such path -- resolved the
+   * way `fetch()` would resolve it -- before anything is registered or fetched.
+   */
+  async #registerSqlPaths(missing, sql, asked) {
+    for (const { format, path } of missing) {
+      // Registering it did not satisfy the engine; stop instead of looping.
+      if (asked.has(path)) {
+        throw new AhiruError(Code.TABLE_NOT_FOUND, { sql, detail: redactUrl(path) });
+      }
+      asked.add(path);
+      if (this.#sqlUrlPolicy !== undefined) {
+        const url = resolveSqlPath(path);
+        const functionName = FUNCTION_FAMILY[format] ?? 'parquet';
+        const allowed =
+          this.#sqlUrlPolicy === false
+            ? false
+            : await this.#sqlUrlPolicy(url, { functionName, sql });
+        this.#assertOpen();
+        if (!allowed) {
+          throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
+            detail: `SQL URL policy rejected ${redactUrl(url)}`,
+          });
+        }
+      }
+      // A policy-gated SQL URL must not escape its allowlist through an HTTP
+      // redirect. Keep the historical permissive behavior when no policy was
+      // configured at all.
+      this.#register(path, path, formatForSqlPath(format, path), {
+        path: true,
+        rejectRedirects: this.#sqlUrlPolicy !== undefined,
+        now: true,
+      });
+    }
+  }
+
+  /**
+   * Hands a `COPY ... TO` result to the `onCopy` handler. Returns false when the
+   * statement was not a `COPY` (or the core was built without `export`).
+   */
+  async #deliverCopy(q, sql) {
+    const take = this.#exports.ahiru_copy_result;
+    if (typeof take !== 'function') return false;
+    const n = take(q);
+    if (n < 0) throw this.#lastError(sql);
+    if (n === 0) return false;
+    const out = this.#out();
+    const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+    const pathLen = wireU32(dv, out, 0, 'COPY result');
+    const flags = wireU32(dv, out, 4, 'COPY flags');
+    const pathEnd = wireEnd(out, 8, pathLen, 'COPY path');
+    const path = decodeUtf8(out.subarray(8, pathEnd), 'COPY path');
+    // Copied out before anything else can call into wasm and reuse the buffer.
+    let bytes = out.slice(pathEnd);
+    // `out.csv.gz`: the core wrote plain CSV and leaves the compression to the host,
+    // as DuckDB compresses by the file name.
+    if (flags & COPY_GZIP) bytes = await gzip(bytes);
+    if (this.#onCopy === undefined) {
+      throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
+        sql,
+        detail:
+          `COPY ... TO '${redactUrl(path)}' produced ${bytes.byteLength} bytes, but the engine ` +
+          'never writes files itself: pass onCopy(path, bytes) to AhiruDB.init() to receive them',
+      });
+    }
+    await this.#onCopy(path, bytes);
+    return true;
   }
 
   /**
@@ -1843,10 +2112,7 @@ export class AhiruDB {
     // Promise.all would retain every decompressed block simultaneously and
     // multiply the per-page cap into an unbounded host-side allocation.
     for (const req of requests) {
-      const rec = this.#byIndex.get(req.table);
-      if (rec === undefined) {
-        throw new AhiruError(Code.INTERNAL, { sql, detail: `unknown table index ${req.table}` });
-      }
+      const rec = this.#recordAt(req.table, sql);
       const src = await this.#bytesAt(rec, req.part, req.offset, req.len, sql);
       const out =
         req.codec === CODEC_GZIP
@@ -1891,9 +2157,10 @@ export class AhiruDB {
    * Slices the bytes of a compressed block out of what is on hand.
    *
    * The normal case is that they are in the copy retained by the preceding NEED_IO.
-   * Only what was discarded when that copy overflowed gets refetched (which is not
-   * I/O if it is still cached). A request for a range never fetched at all is an
-   * engine-side inconsistency, so it is reported rather than silently fetched.
+   * Past that, the coalesced range that contained them may still be in the range
+   * cache under its own key, and is sliced from there. Only what is in neither
+   * gets refetched. A request for a range never fetched at all is an engine-side
+   * inconsistency, so it is reported rather than silently fetched.
    */
   async #bytesAt(rec, part, offset, len, sql) {
     for (const c of rec.resident) {
@@ -1903,6 +2170,11 @@ export class AhiruDB {
     }
     // Memory / Blob sources need no I/O to slice, so they keep no retained copy.
     if (rec.source.cacheable === false) return rec.source.read(offset, len);
+    // A page is only ever a piece of a coalesced fetch, and the cache is keyed by
+    // those; asking it for the page's own range always missed, so every page
+    // went back to the network even with the whole file cached.
+    const cached = this.#fromCachedJobs(rec, part, offset, len);
+    if (cached !== undefined) return cached;
     const everFetched = rec.fetched.some(
       (r) => r.part === part && r.offset <= offset && offset + len <= r.offset + r.len,
     );
@@ -1924,31 +2196,55 @@ export class AhiruDB {
     return decodeSchema(this.#out());
   }
 
+  /** The registration behind a wasm table index. */
+  #recordAt(table, sql) {
+    const rec = this.#byIndex.get(table);
+    if (rec === undefined) {
+      throw new AhiruError(Code.INTERNAL, { sql, detail: `unknown table index ${table}` });
+    }
+    return rec;
+  }
+
   /**
    * Satisfies I/O requests. Coalesce -> fetch in parallel -> `ahiru_provide`.
+   * Size requests (a table declared before its length was known) are answered
+   * alongside, with one `size()` (a HEAD for a URL) per table.
    * Returns a signature for comparison on the next round.
    */
   async #pump(requests, lastSignature, sql) {
-    const signature = requests.map((r) => `${r.table}.${r.part}/${r.offset}+${r.len}`).join(',');
+    const signature = requests
+      .map((r) => `${r.table}.${r.part}/${r.size ? 'size' : `${r.offset}+${r.len}`}`)
+      .join(',');
+    const sizes = requests.filter((r) => r.size);
 
     // `table` alone cannot tell which file of a multi-file table is meant (offsets
     // live in a separate space per file), so requests are grouped by the composite
     // key `table:part`. Single-file registration always has part=0, so this extends
     // safely to multiple files while behaving exactly as before.
     const jobs = [];
-    for (const [key, list] of groupBy(requests, (r) => `${r.table}:${r.part}`)) {
+    for (const [key, list] of groupBy(
+      requests.filter((r) => !r.size),
+      (r) => `${r.table}:${r.part}`,
+    )) {
       const [table, part] = key.split(':').map(Number);
-      const rec = this.#byIndex.get(table);
-      if (rec === undefined) {
-        throw new AhiruError(Code.INTERNAL, { sql, detail: `unknown table index ${table}` });
-      }
+      const rec = this.#recordAt(table, sql);
       for (const r of coalesceRanges(list, COALESCE_GAP, rec.size)) {
         jobs.push({ rec, table, part, offset: r.offset, len: r.len });
       }
     }
 
-    // Coalesced ranges are fetched in parallel, to avoid stacking round trips.
-    const buffers = await Promise.all(jobs.map((j) => this.#read(j.rec, j.part, j.offset, j.len, sql)));
+    // Sizes and coalesced ranges are fetched in parallel, to avoid stacking round trips.
+    const [, buffers] = await Promise.all([
+      Promise.all(
+        sizes.map(async (r) => {
+          const rec = this.#recordAt(r.table, sql);
+          if (rec.size < 0) rec.size = await rec.source.size();
+        }),
+      ),
+      Promise.all(jobs.map((j) => this.#read(j.rec, j.part, j.offset, j.len, sql))),
+    ]);
+    // `size()` and reads are user callbacks and may take arbitrarily long;
+    // close() can land while they are in flight.
     this.#assertOpen();
 
     // How many of the requested ranges were handed over *in full*. Counting bytes alone
@@ -1956,6 +2252,13 @@ export class AhiruDB {
     // non-zero count while `Source::insert` keeps only that prefix, so the engine asks
     // for the identical range on the next round, forever.
     let satisfied = 0;
+    for (const r of sizes) {
+      const size = this.#recordAt(r.table, sql).size;
+      if (this.#exports.ahiru_set_size(this.#session, r.table, r.part, BigInt(size)) !== 0) {
+        throw this.#lastError(sql);
+      }
+      satisfied++;
+    }
     for (let i = 0; i < jobs.length; i++) {
       const { rec, table, part, offset, len } = jobs[i];
       if (this.#provide(table, part, offset, buffers[i], sql) === len) satisfied++;
@@ -1969,6 +2272,7 @@ export class AhiruDB {
         // start alone drops it, and `#bytesAt` then reports bytes we did fetch as
         // never fetched (E900).
         recordFetched(rec.fetched, part, offset, len);
+        if (len > 0) rec.jobs.add(part, offset, len);
         const covered = rec.resident.some(
           (c) => c.part === part && c.offset <= offset && offset + len <= c.offset + c.bytes.length,
         );
@@ -1997,9 +2301,47 @@ export class AhiruDB {
     return signature;
   }
 
+  /**
+   * Assembles `[offset, offset + len)` from the cached coalesced ranges this
+   * registration fetched earlier (`rec.jobs`), or returns undefined when they do
+   * not cover it all.
+   */
+  #fromCachedJobs(rec, part, offset, len) {
+    const end = offset + len;
+    const pieces = [];
+    for (const j of rec.jobs.overlapping(part, offset, end)) {
+      const hit = this.#cache.get(this.#cacheKey(rec, part, j.offset, j.len));
+      if (hit instanceof Uint8Array && hit.byteLength === j.len) pieces.push({ at: j.offset, hit });
+    }
+    pieces.sort((a, b) => a.at - b.at);
+    // The common case: a single cached range contains the whole request.
+    for (const p of pieces) {
+      if (p.at <= offset && end <= p.at + p.hit.byteLength) {
+        return p.hit.subarray(offset - p.at, end - p.at);
+      }
+    }
+    const out = new Uint8Array(len);
+    let pos = offset;
+    for (const p of pieces) {
+      const pEnd = p.at + p.hit.byteLength;
+      if (p.at > pos) break; // a gap no cached range covers
+      if (pEnd <= pos) continue;
+      const stop = Math.min(pEnd, end);
+      out.set(p.hit.subarray(pos - p.at, stop - p.at), pos - offset);
+      pos = stop;
+      if (pos === end) return out;
+    }
+    return undefined;
+  }
+
+  /** The range-cache key of `[offset, offset + len)` of one registration's part. */
+  #cacheKey(rec, part, offset, len) {
+    return `${rec.source.key}:${part}:${offset}:${len}`;
+  }
+
   /** Reads a byte range through the cache. */
   async #read(rec, part, offset, len, sql) {
-    const key = `${rec.source.key}:${part}:${offset}:${len}`;
+    const key = this.#cacheKey(rec, part, offset, len);
     const cacheable = rec.source.cacheable !== false;
     if (cacheable) {
       const hit = this.#cache.get(key);
@@ -2012,6 +2354,13 @@ export class AhiruDB {
       // to the event loop. Anything else is treated as a miss, so the source is asked
       // directly; a genuinely short `ByteSource.read()` still throws IO_FAILED below.
       if (hit instanceof Uint8Array && hit.byteLength === len) return hit;
+      // The fetch that brought these bytes in may have been coalesced differently
+      // (a footer probe that happened to cover the last row group, a range next to
+      // columns the previous query did not read). Once the engine drops its copy
+      // after a query, the next one asks for ranges that exist in the cache only
+      // as pieces of those fetches.
+      const pieced = this.#fromCachedJobs(rec, part, offset, len);
+      if (pieced !== undefined) return pieced;
     }
     const bytes = await rec.source.read(offset, len);
     let u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -2056,105 +2405,6 @@ export class AhiruDB {
     return bytes.byteLength;
   }
 
-  /**
-   * Registers only the tables the SQL actually references.
-   *
-   * Registration needs the total byte length (= one HEAD round trip for a URL), so
-   * identifiers are collected to narrow it down and avoid round trips for unused tables.
-   */
-  async #bindTables(sql) {
-    const mentioned = new Set();
-    const add = (s) => {
-      mentioned.add(s.toLowerCase());
-      // For dotted names like `t.id`, take both the whole thing and each part as
-      // candidates (a table name itself may contain a dot, as in `basic.csv`).
-      if (s.includes('.')) for (const part of s.split('.')) mentioned.add(part.toLowerCase());
-    };
-    const tokens = scanSqlTokens(sql);
-    for (const token of tokens) {
-      if (
-        token.type === 'identifier' ||
-        token.type === 'string' ||
-        token.type === 'quoted-identifier'
-      ) {
-        add(token.value);
-      }
-    }
-    // `FROM parquet('https://...')` or `read_parquet('...')` is contracted to register the path itself as the
-    // table name (see resolve_from in plan/bind.rs).
-    // The function is named parquet/csv/json, but an extension such as .csv is read as CSV.
-    for (let i = 0; i + 2 < tokens.length; i++) {
-      const fn = tokens[i];
-      if (fn.type !== 'identifier' || !FILE_FUNCTION_NAMES.has(fn.value.toLowerCase())) continue;
-      if (tokens[i + 1].type !== 'punctuation' || tokens[i + 1].value !== '(') continue;
-      const path = tokens[i + 2];
-      if (path.type !== 'string') continue;
-      if (!this.#tables.has(path.value.toLowerCase())) {
-        const functionName = fn.value.toLowerCase();
-        if (isHttpUrl(path.value) && this.#sqlUrlPolicy !== undefined) {
-          const allowed =
-            this.#sqlUrlPolicy === false
-              ? false
-              : await this.#sqlUrlPolicy(path.value, { functionName, sql });
-          if (!allowed) {
-            throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
-              detail: `SQL URL policy rejected ${redactUrl(path.value)}`,
-            });
-          }
-        }
-        const detected = detectFormat(path.value);
-        const format = functionName.startsWith('read_csv')
-          ? detected === 'tsv'
-            ? 'tsv'
-            : 'csv'
-          : functionName.startsWith('read_json')
-            ? detected === 'jsonl'
-              ? 'jsonl'
-              : 'json'
-            : undefined;
-        // A policy-gated SQL URL must not escape its allowlist through an HTTP
-        // redirect. Keep the historical permissive behavior when no policy was
-        // configured at all.
-        this.#register(path.value, path.value, format, this.#sqlUrlPolicy !== undefined);
-      }
-      add(path.value);
-    }
-
-    for (const [key, rec] of this.#tables) {
-      if (rec.index >= 0 || !mentioned.has(key)) continue;
-      rec.size = await rec.source.size();
-      // `size()` is a user callback and may take arbitrarily long; close() can land
-      // while it is in flight. Without this check the loop went on calling into a
-      // freed session and surfaced a bare INTERNAL error instead of saying the
-      // database was closed, as every other close race does.
-      this.#assertOpen();
-      const e = this.#exports;
-      const name = textEncoder.encode(rec.name);
-      const ptr = e.ahiru_alloc(name.length) >>> 0;
-      if (ptr === 0 && name.length > 0) throw new AhiruError(Code.OOM);
-      let idx;
-      try {
-        // Older cores have no ahiru_register_as. For Auto the 4-argument version is
-        // equivalent, but silently ignoring an explicit choice would read it as another format, so fail.
-        const hasRegisterAs = typeof e.ahiru_register_as === 'function';
-        if (!hasRegisterAs && rec.formatCode !== FORMAT_CODES.auto) {
-          throw new AhiruError(Code.UNSUPPORTED_FEATURE, {
-            detail: `this wasm core has no ahiru_register_as; format="${rec.format}" cannot be honoured`,
-          });
-        }
-        new Uint8Array(this.#memory.buffer).set(name, ptr);
-        idx = hasRegisterAs
-          ? e.ahiru_register_as(this.#session, ptr, name.length, BigInt(rec.size), rec.formatCode)
-          : e.ahiru_register(this.#session, ptr, name.length, BigInt(rec.size));
-      } finally {
-        e.ahiru_free(ptr, name.length);
-      }
-      if (idx < 0) throw this.#lastError();
-      rec.index = idx;
-      this.#byIndex.set(idx, rec);
-    }
-  }
-
   // --- Odds and ends --------------------------------------------------------
 
   /** A view of the current out buffer. Valid only until the next wasm call. */
@@ -2169,8 +2419,11 @@ export class AhiruDB {
   }
 
   #lastError(sql) {
-    const code = this.#exports.ahiru_last_error();
-    return new AhiruError(code, { sql });
+    const e = this.#exports;
+    const code = e.ahiru_last_error();
+    // Where the engine knows it: a byte offset into the UTF-8 SQL for syntax errors.
+    const pos = typeof e.ahiru_last_error_pos === 'function' ? e.ahiru_last_error_pos() >>> 0 : NO_POS;
+    return new AhiruError(code, pos === NO_POS ? { sql } : { sql, position: pos });
   }
 
   #checkMemory(sql) {
@@ -2187,6 +2440,12 @@ export class AhiruDB {
     if (this.#closed) throw new AhiruError(Code.INTERNAL, { detail: 'database is closed' });
   }
 
+  /** `#assertOpen`, plus: a trap has not left this database unusable. */
+  #assertUsable() {
+    this.#assertOpen();
+    if (this.#dead !== null) throw new AhiruError(Code.INTERNAL, { detail: this.#dead });
+  }
+
   /** Fails a run that close() unwound while it was suspended. */
   #assertRunning(run) {
     if (run.aborted) {
@@ -2201,8 +2460,90 @@ export class AhiruDB {
   #freeSession() {
     if (this.#sessionFreed) return;
     this.#sessionFreed = true;
-    this.#exports.ahiru_session_free(this.#session);
+    // A trapped instance is never called again; it is simply dropped.
+    if (!this.#trapped) this.#exports.ahiru_session_free(this.#session);
   }
+}
+
+/** `ahiru_last_error_pos` when the error carries no position. */
+const NO_POS = 0xffffffff;
+
+/**
+ * The coalesced ranges fetched for one registration (each a range-cache key), most
+ * recent last, forgetting the oldest beyond `MAX_REMEMBERED_JOBS`.
+ *
+ * `#read` consults it on every exact-key cache miss -- which includes every range's
+ * first fetch -- so the ranges overlapping a request are found through a per-part
+ * array sorted by offset instead of a scan over every remembered range.
+ */
+class JobIndex {
+  /** `part:offset:len` -> job, in recency order (for eviction). */
+  #lru = new Map();
+  /** part -> { jobs sorted by offset, the longest length ever added }. */
+  #byPart = new Map();
+
+  add(part, offset, len) {
+    const key = `${part}:${offset}:${len}`;
+    if (this.#lru.has(key)) {
+      const job = this.#lru.get(key);
+      this.#lru.delete(key);
+      this.#lru.set(key, job);
+      return;
+    }
+    const job = { part, offset, len };
+    this.#lru.set(key, job);
+    let p = this.#byPart.get(part);
+    if (p === undefined) {
+      p = { jobs: [], maxLen: 0 };
+      this.#byPart.set(part, p);
+    }
+    p.jobs.splice(upperBound(p.jobs, offset), 0, job);
+    if (len > p.maxLen) p.maxLen = len;
+    if (this.#lru.size > MAX_REMEMBERED_JOBS) {
+      const [oldKey, old] = this.#lru.entries().next().value;
+      this.#lru.delete(oldKey);
+      const q = this.#byPart.get(old.part);
+      q.jobs.splice(q.jobs.indexOf(old, lowerBound(q.jobs, old.offset)), 1);
+    }
+  }
+
+  /** The remembered jobs of `part` that overlap `[offset, end)`. */
+  *overlapping(part, offset, end) {
+    const p = this.#byPart.get(part);
+    if (p === undefined) return;
+    // Every job starting at or past `end` misses; one starting more than the longest
+    // length before `offset` cannot reach it.
+    const from = lowerBound(p.jobs, offset - p.maxLen);
+    const to = lowerBound(p.jobs, end);
+    for (let i = from; i < to; i++) {
+      const j = p.jobs[i];
+      if (j.offset + j.len > offset) yield j;
+    }
+  }
+}
+
+/** The first index in offset-sorted `jobs` whose offset is `>= at`. */
+function lowerBound(jobs, at) {
+  let lo = 0;
+  let hi = jobs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (jobs[mid].offset < at) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** The first index in offset-sorted `jobs` whose offset is `> at`. */
+function upperBound(jobs, at) {
+  let lo = 0;
+  let hi = jobs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (jobs[mid].offset <= at) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 function groupBy(items, keyOf) {

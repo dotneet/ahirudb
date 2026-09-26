@@ -5,14 +5,11 @@
 //! see `scripts/gen-testdata.sh`. Do not change how they are generated or their contents).
 //!
 //! - Both the SELECT-list and FROM-clause syntaxes (task patterns (a)/(b)).
-//! - When the target column is a table's `Ty::Json` column itself, the elements are not
-//!   restored to a native type (it cannot be safely decided without looking at the actual
-//!   data; see the `narrow_unnest_elem_ty` doc in `plan::bind`), so expected values are
-//!   compared as the raw JSON token byte sequence.
-//! - For calls like `UNNEST(list_value(...))`/`UNNEST(json_array(...))`, where the target
-//!   builds a list on the spot and every element is the same non-nested scalar type,
-//!   verify with both the schema and the values that the result is restored to a native
-//!   type (BIGINT/DOUBLE/VARCHAR/BOOLEAN).
+//! - When the target's element type is known statically (a Parquet `LIST<scalar>` column,
+//!   `string_split`, a list literal of one scalar type; see the `narrow_unnest_elem_ty` doc in
+//!   `plan::bind`), the elements come back as that native type, as in DuckDB. Otherwise (a
+//!   JSON value, mixed or nested elements) they stay JSON and are compared as the raw JSON
+//!   token byte sequence.
 //! - Resuming across a NeedIo does not change the result (feed a real Parquet file
 //!   incrementally via `register_remote_as` + `provide`, and cross-check against feeding it
 //!   all at once via `register_bytes`).
@@ -82,28 +79,23 @@ const NULL: Value = Value::Null;
 
 /// duckdb: `SELECT id, UNNEST(xs) AS x FROM 'list1.parquet' WHERE id < 2` ->
 /// (0,1) (0,2) (0,3) (1,1) (1,2) (1,3) (every row is `[1,2,3]`).
-/// Since the target is the table's JSON column itself, also verify that the value is not
-/// restored and stays as a JSON token (`schema[1].ty == Ty::Json`).
+/// `xs` is `INTEGER[]`, so the expanded column is an INTEGER, as in DuckDB.
 #[test]
 fn select_list_unnest_duplicates_other_columns_per_element() {
     let mut sess = Session::new();
     sess.register_bytes_as("t", data("list1.parquet"), FormatKind::Parquet).unwrap();
     let (schema, rows) = run(&mut sess, "SELECT id, UNNEST(xs) AS x FROM t WHERE id < 2");
     assert_eq!(schema[1].name, "x");
-    assert_eq!(
-        schema[1].ty,
-        Ty::Json,
-        "UNNEST of a table column itself does not restore a native type"
-    );
+    assert_eq!(schema[1].ty, Ty::Int, "the LIST column's element type is restored");
     assert_eq!(
         rows,
         vec![
-            vec![i32v(0), json_tok("1")],
-            vec![i32v(0), json_tok("2")],
-            vec![i32v(0), json_tok("3")],
-            vec![i32v(1), json_tok("1")],
-            vec![i32v(1), json_tok("2")],
-            vec![i32v(1), json_tok("3")],
+            vec![i32v(0), i32v(1)],
+            vec![i32v(0), i32v(2)],
+            vec![i32v(0), i32v(3)],
+            vec![i32v(1), i32v(1)],
+            vec![i32v(1), i32v(2)],
+            vec![i32v(1), i32v(3)],
         ]
     );
 }
@@ -120,23 +112,24 @@ fn select_list_unnest_skips_null_and_empty_arrays() {
     let mut sess = Session::new();
     sess.register_bytes_as("t", data("list_varied.parquet"), FormatKind::Parquet).unwrap();
     let (_, rows) = run(&mut sess, "SELECT id, UNNEST(xs) AS x FROM t WHERE id < 10");
+    // `xs` is BIGINT[].
     let want: Vec<Vec<Value>> = vec![
-        vec![i32v(2), json_tok("2")],
-        vec![i32v(3), json_tok("3")],
+        vec![i32v(2), i64v(2)],
+        vec![i32v(3), i64v(3)],
         vec![i32v(3), NULL],
-        vec![i32v(3), json_tok("6")],
-        vec![i32v(4), json_tok("4")],
-        vec![i32v(4), json_tok("5")],
-        vec![i32v(4), json_tok("6")],
-        vec![i32v(4), json_tok("7")],
-        vec![i32v(7), json_tok("7")],
-        vec![i32v(8), json_tok("8")],
+        vec![i32v(3), i64v(6)],
+        vec![i32v(4), i64v(4)],
+        vec![i32v(4), i64v(5)],
+        vec![i32v(4), i64v(6)],
+        vec![i32v(4), i64v(7)],
+        vec![i32v(7), i64v(7)],
+        vec![i32v(8), i64v(8)],
         vec![i32v(8), NULL],
-        vec![i32v(8), json_tok("16")],
-        vec![i32v(9), json_tok("9")],
-        vec![i32v(9), json_tok("10")],
-        vec![i32v(9), json_tok("11")],
-        vec![i32v(9), json_tok("12")],
+        vec![i32v(8), i64v(16)],
+        vec![i32v(9), i64v(9)],
+        vec![i32v(9), i64v(10)],
+        vec![i32v(9), i64v(11)],
+        vec![i32v(9), i64v(12)],
     ];
     assert_eq!(rows, want);
 }
@@ -154,7 +147,7 @@ fn from_unnest_default_table_alias_is_unnest() {
     let mut db = session_with_dual();
     let (schema, rows) = run(&mut db, "SELECT unnest.* FROM dual, UNNEST(list_value(1, 2))");
     assert_eq!(schema[0].name, "unnest");
-    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)]]);
+    assert_eq!(rows, vec![vec![i32v(1)], vec![i32v(2)]]);
 }
 
 // --- FROM clause (implicit LATERAL) --------------------------------------------
@@ -171,14 +164,14 @@ fn from_clause_unnest_is_implicit_lateral_cross_join() {
     assert_eq!(
         rows,
         vec![
-            vec![i32v(2), json_tok("2")],
-            vec![i32v(3), json_tok("3")],
+            vec![i32v(2), i64v(2)],
+            vec![i32v(3), i64v(3)],
             vec![i32v(3), NULL],
-            vec![i32v(3), json_tok("6")],
-            vec![i32v(4), json_tok("4")],
-            vec![i32v(4), json_tok("5")],
-            vec![i32v(4), json_tok("6")],
-            vec![i32v(4), json_tok("7")],
+            vec![i32v(3), i64v(6)],
+            vec![i32v(4), i64v(4)],
+            vec![i32v(4), i64v(5)],
+            vec![i32v(4), i64v(6)],
+            vec![i32v(4), i64v(7)],
         ]
     );
 }
@@ -194,9 +187,9 @@ fn from_clause_unnest_star_keeps_source_array_column_too() {
     assert_eq!(
         rows,
         vec![
-            vec![i32v(0), json_tok("[1,2,3]"), json_tok("1")],
-            vec![i32v(0), json_tok("[1,2,3]"), json_tok("2")],
-            vec![i32v(0), json_tok("[1,2,3]"), json_tok("3")],
+            vec![i32v(0), json_tok("[1,2,3]"), i32v(1)],
+            vec![i32v(0), json_tok("[1,2,3]"), i32v(2)],
+            vec![i32v(0), json_tok("[1,2,3]"), i32v(3)],
         ]
     );
 }
@@ -216,26 +209,25 @@ fn chained_from_clause_unnests_cross_multiply_independently() {
     assert_eq!(
         rows,
         vec![
-            vec![i64v(1), i64v(10)],
-            vec![i64v(1), i64v(20)],
-            vec![i64v(2), i64v(10)],
-            vec![i64v(2), i64v(20)],
+            vec![i32v(1), i32v(10)],
+            vec![i32v(1), i32v(20)],
+            vec![i32v(2), i32v(10)],
+            vec![i32v(2), i32v(20)],
         ]
     );
 }
 
 // --- Restoring to a native type -------------------------------------------------
 
-/// duckdb: `SELECT UNNEST([1,2,3])` returns a BIGINT column. This engine has no array
-/// literal syntax, so write it as `list_value(1,2,3)` (an alias for `json_array`). Since all
-/// arguments are the same non-JSON scalar type, it can be determined to be BIGINT without
-/// looking at the actual data (`plan::bind::narrow_unnest_elem_ty`).
+/// duckdb: `SELECT typeof(UNNEST([1,2,3]))` is INTEGER, the literal's element type. Since all
+/// arguments are the same non-JSON scalar type, that is decided without looking at the actual
+/// data (`plan::bind::narrow_unnest_elem_ty`).
 #[test]
-fn unnest_of_list_value_literal_restores_bigint() {
+fn unnest_of_list_value_literal_restores_integer() {
     let mut db = session_with_dual();
     let (schema, rows) = run(&mut db, "SELECT UNNEST(list_value(1,2,3)) AS x FROM dual");
-    assert_eq!(schema[0].ty, Ty::BigInt);
-    assert_eq!(rows, vec![vec![i64v(1)], vec![i64v(2)], vec![i64v(3)]]);
+    assert_eq!(schema[0].ty, Ty::Int);
+    assert_eq!(rows, vec![vec![i32v(1)], vec![i32v(2)], vec![i32v(3)]]);
 }
 
 #[test]

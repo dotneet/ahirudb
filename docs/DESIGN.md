@@ -381,15 +381,39 @@ u8*  ahiru_alloc(usize len);              void ahiru_free(u8*, usize);
 i32  ahiru_session_new();                 void ahiru_session_free(i32);
 i32  ahiru_set_now(i32 h, i64 now_micros);
 i32  ahiru_register(...);  i32 ahiru_register_as(...);  i32 ahiru_register_multi(...);
+i32  ahiru_set_size(i32 h, u32 table, u32 part, u64 len); // answers a size request
 i32  ahiru_provide(...);   i32 ahiru_provide_codec(...);
-i32  ahiru_query_start(...);              // -> handle, or an IO/parse request first
+i32  ahiru_query_start(...);              // -> handle, -2 (NEED_IO first) or
+                                          //    -3 (unregistered SQL paths), -1 error
 i32  ahiru_query_step(i32 q);             // -> status
-void ahiru_query_close(i32 q);
+void ahiru_query_close(i32 q);            // also drops the bytes fetched for it
 u8*  ahiru_out_ptr();  usize ahiru_out_len();   // last result/request buffer
-u32  ahiru_last_error();
+u32  ahiru_last_error();  u32 ahiru_last_error_pos();
 usize ahiru_heap_used();
 isize ahiru_schema(i32 q);
+isize ahiru_copy_result(i32 q);           // `export`: COPY's [path_len][flags][path][bytes]
+i32  ahiru_ddl_object_count(i32 h);       // `ddl`: in-memory tables + views
 ```
+
+**Binding is driven by the engine.** The host never parses SQL. Every
+registration is declared to the catalog up front, without I/O and with an
+unknown length (`ahiru_register_as` with `total_len = u64::MAX`). When a
+statement resolves a table whose length is unknown, the `NEED_IO` list carries a
+*size request* for it (offset `u64::MAX`, length 0), which the host answers with
+`ahiru_set_size` after a `HEAD` (in parallel with the other reads of that
+round). A string-literal path (`FROM 'x.parquet'`, `parquet('https://…')`,
+`read_csv('…')`) that no table is registered under makes `ahiru_query_start`
+return `-3` with the list of such paths and the format the SQL asked for; the
+host applies its URL policy, registers them under their exact spelling
+(`FORMAT_PATH`), and starts again. So a registered name that merely appears as
+a column, alias or string is never sized or fetched, and a table reached only
+through a view is bound like any other.
+
+**Names.** Identifiers (`FROM trips`, `FROM "Data.parquet"`) are
+ASCII-case-insensitive, as in DuckDB, with an exact spelling preferred when
+several registrations differ only in case. Paths from string literals are
+case-sensitive: `parquet('…/Data.parquet')` and `parquet('…/data.parquet')` are
+two URLs and two tables (`Catalog::path_index_of` / `register_path`).
 
 Host-side driving loop (`js/ahirudb.js`):
 
@@ -468,6 +492,17 @@ through the same "lazily-loaded side module" path as the table above.
   `ByteRangeCache` the host supplies — e.g. the Cache API). This keeps it
   off the wasm heap and lets the host reuse whatever caching layer it
   already has.
+- The engine keeps fetched bytes (`Source` chunks) only while a query uses
+  them: when a session's last open query closes, the raw bytes of every
+  host-served source are dropped (`Source::release`), keeping only what the
+  formats parsed at `resolve` (footer, schema, split layout). The next query
+  asks for its splits again, and the JS cache answers without touching the
+  network — it also serves ranges that exist only as pieces of differently
+  coalesced earlier fetches. So the wasm heap holds one query's working set,
+  not every byte ever read, and `memoryLimit` bounds a single query.
+  In-memory (`from_bytes`) sources are the only copy and are never released.
+  The split-boundary barrier is unchanged: a split still asks for everything
+  it needs in one `NEED_IO`, and nothing is released mid-query.
 - GZIP is delegated to `DecompressionStream('gzip')` (zero extra bytes) —
   deliberately kept out of the core since browsers/Node already ship it.
 - ZSTD is built into the core by default (§ above, ~13 KB); disabling
@@ -583,7 +618,11 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
 - Tokenizer: hand-written; keywords resolve through a lookup table.
 - Parser: expressions via Pratt (precedence climbing), statements via
   recursive descent, with a bounded recursion depth (avoids stack
-  exhaustion on adversarial input).
+  exhaustion on adversarial input). Syntactic depth does not bound the
+  *plan* depth (a long CTE chain nests nothing in the text), so the binder
+  also rejects a plan tree deeper than 256 operators (`MAX_PLAN_DEPTH` in
+  `plan::bind`) before anything recurses over it: on wasm a stack overflow
+  is a trap, not an error.
 - The AST lives in an arena, referenced by `u32` index (`ExprId`), not
   `Box`/`Rc` — cuts both allocation count and code size.
 - Most new syntax (`WINDOW`, `PIVOT`/`UNPIVOT`, `EXCLUDE`/`REPLACE`,
@@ -604,8 +643,8 @@ types** — this is the main lever against kernel explosion (§11).
 | Logical type(s) | Physical representation |
 |---|---|
 | BOOLEAN | `Bool` (bitmap) |
-| TINYINT / SMALLINT / INTEGER / DATE / TIME | `I32` |
-| BIGINT / TIMESTAMP / TIMESTAMPTZ / DECIMAL(p≤18) | `I64` |
+| TINYINT / SMALLINT / INTEGER / DATE | `I32` |
+| BIGINT / TIME / TIMESTAMP / TIMESTAMPTZ / DECIMAL(p≤18) | `I64` |
 | FLOAT / DOUBLE | `F64` |
 | VARCHAR / BLOB / UUID | `Bytes` (offset + data buffers) |
 | DECIMAL(p>18) / HUGEINT / **INTERVAL** | `I128` |
@@ -802,10 +841,20 @@ await db.query("SELECT * FROM parquet('https://example.com/a.parquet') LIMIT 10"
   what the next `step()` call does to the wasm output buffer. This also
   meant never taking on an Arrow JS dependency, which resolves what used to
   be an open question in this document (§18).
-- Errors carry a numeric code + position (byte offset) from wasm;
-  `AhiruError` (in `js/errors.js`) attaches the human-readable message from
-  a JS-side table (`errorMessage(code)`), keeping message strings entirely
-  out of the wasm binary (§4).
+- Errors carry a numeric code (`ahiru_last_error`) and, when the engine
+  knows it, a position (`ahiru_last_error_pos`: a byte offset into the UTF-8
+  SQL for syntax errors, a file offset for some data errors; `u32::MAX` for
+  none). `AhiruError` (in `js/errors.js`) exposes it as `position` and
+  attaches the human-readable message from a JS-side table
+  (`errorMessage(code)`), keeping message strings entirely out of the wasm
+  binary (§4).
+- A wasm trap (native stack exhaustion, a panic) leaves the instance's
+  shadow stack pointer and state unusable. The host compiles the module once
+  and, after a trap, swaps in a fresh instance before the next call,
+  re-declaring every registration (known lengths reused, bytes served by the
+  cache). If the session holds `CREATE TABLE`/`CREATE VIEW` state a fresh
+  instance would lose, the database is marked dead instead (every call throws
+  E900).
 - `ahirudb.d.ts` ships with the package.
 
 ---
@@ -991,7 +1040,7 @@ behavior rather than a silent wrong answer.
 | Hash join build side | The side with fewer known rows becomes the build side, but Parquet row counts aren't always known ahead of a nested source (subquery, CTE); in that case it isn't guaranteed to pick the smaller side | Correct results either way, just potentially more memory than optimal |
 | Dictionary encoding is not preserved through execution | Decoded to plain values at the Parquet read boundary (§5, §9), not kept dictionary-coded for `GROUP BY`/equality | A plausible optimization (DuckDB-style dictionary-aware execution) that was never built, not a correctness gap |
 | CSV split resync | A quoted newline at a split boundary cannot be resynchronized from that split's bytes alone | Quoting forces a single split (the whole file is scanned when it is already resident; a remote file whose sample has no `"` but a later split does is rejected rather than mis-parsed) |
-| Text-format type inference is sampled | CSV/JSONL column types are sniffed from a leading sample (up to 256 KiB); a later value that does not fit raises a conversion error | Loud rather than silent. This used to write `NULL` for the offending row, which destroyed data invisibly — exactly the failure mode this section rules out. DuckDB instead re-sniffs and widens the column, so the same file reads there and errors here |
+| Text-format type inference is sampled | CSV/JSONL column types are sniffed from every complete record in a leading sample (up to 256 KiB, the bytes the first split step fetches anyway); a later value that does not fit raises a conversion error. A single-document `.json` is fully resident, so it infers from every element | Loud rather than silent. This used to write `NULL` for the offending row, which destroyed data invisibly — exactly the failure mode this section rules out. DuckDB instead re-sniffs and widens the column, so the same file reads there and errors here |
 | `CAST` of unparseable or out-of-range numeric/text input yields `NULL` | `CAST('abc' AS INTEGER)` and `CAST(3000000000 AS INTEGER)` are `NULL`, not errors — `CAST` and `TRY_CAST` are indistinguishable outside JSON (`docs/sql/types.md`) | The one place the engine is quieter than it should be, and a known gap rather than a choice: a strict variant needs a flag through the cast kernels *plus* a `LIMIT`/`Project` ordering change, so a row a `LIMIT` would have discarded can't fail the query |
 | No continuous fuzzing | Bounds/limits exist and are unit-tested, but no `cargo-fuzz` corpus runs in CI (§5, §14) | A real, tracked gap, not a design choice |
 | `LZO` / `BROTLI` codecs | Unsupported (`UnsupportedCodec`) | Fits the existing host-delegation framework (§6) if ever needed — would be a JS-side-only addition |
@@ -1007,14 +1056,22 @@ behavior rather than a silent wrong answer.
 Deliberately matched to DuckDB, since the two diverge easily and this needs
 to be explicit:
 
-- Float -> integer cast rounds to the **nearest even** (`1.5 -> 2`,
-  `4.5 -> 4`).
+- `DOUBLE`/`FLOAT` -> integer cast rounds to the **nearest even** (`1.5 -> 2`,
+  `4.5 -> 4`). A `DECIMAL` -> integer cast rounds **away from zero**, and
+  `4.5` written as a literal is a `DECIMAL` (as in DuckDB), so
+  `CAST(4.5 AS INTEGER)` is `5` while `CAST(4.5::DOUBLE AS INTEGER)` is `4`.
 - `DECIMAL` scale reduction rounds **away from zero** (`1.235 -> 1.24`), so
-  monetary calculations don't systematically under-round.
+  monetary calculations don't systematically under-round. `DOUBLE` ->
+  `DECIMAL` rounds `x * 10^s` like DuckDB while that product is below 2^53
+  (`1.005::DOUBLE` is a hair below 1.005, so it is `1.00` at scale 2), and
+  past that rescales the shortest round-trip digits exactly rather than
+  keeping the multiply's rounding error.
 - Integer division-by-zero and `MIN / -1` return **`NULL`, not an error**.
   Floats stay IEEE (`inf`/`NaN`).
 - Integer arithmetic overflow wraps. `SUM` alone accumulates in `i128` and
-  returns `ValueOutOfRange` on overflow of *that*.
+  returns `ValueOutOfRange` on overflow of *that*. `DECIMAL` has no wrapped
+  value, so a `DECIMAL(38)` result past 38 digits is `ValueOutOfRange` too,
+  as in DuckDB.
 - Grouping and join keys treat `-0.0`/`0.0` as identical and collapse all
   `NaN`s to one representative.
 - **`NaN` compares under the total order the sort and hash paths already
@@ -1098,10 +1155,17 @@ change a line of read-side code (this is the argument for why the opt-out is
 safe).
 
 **v1 limitation**: `export_all` is non-resumable. If `NEED_IO` happens
-mid-export, it fails with `IoFailed`. Usable only when all source data is
-already in memory (CLI usage, or a JS caller that pre-fetched the table
-fully). A resumable export ABI mirroring `ahiru_query_step` (something like
-`ahiru_export_step`) would be needed for the general case; not built.
+mid-export, it fails with `IoFailed`. A resumable export ABI mirroring
+`ahiru_query_step` (something like `ahiru_export_step`) would be needed for
+the general case; not built. `COPY` through `Session::prepare` gets a cruder
+form of it: before failing, the statement stashes the reads it was waiting on,
+and `prepare` returns them as `Prepared::NeedIo` instead of `IoFailed`. The
+host answers them and prepares again; the statement restarts from scratch with
+more of its input in memory and eventually completes. The cost is re-running
+the query once per missing split and holding all of its input on the wasm heap
+at once, so it suits modest inputs. The JS host hands the finished bytes to
+its `onCopy` option (`ahiru_copy_result`); without one, `COPY` fails with E409
+rather than silently returning nothing.
 
 `NEED_CODEC` is **not** part of that limitation, though it used to be
 treated as one. A codec request never means "bytes are missing": the
@@ -1164,7 +1228,9 @@ mechanism already used for CTEs and derived tables.
 statements that don't fit the Volcano streaming model (`Session::step`).
 They run to completion inside `Session::prepare` and return an affected-row
 count as a 1-row/1-column `Query` result (the same "pre-computed single
-batch" trick `SHOW TABLES`/`DESCRIBE` use, via `exec::Values`). Implemented
+batch" trick `SHOW TABLES`/`DESCRIBE` use, via `exec::Values`). The native
+CLI does not print that result, matching the DuckDB CLI, so a script's
+stdout carries only query results. Implemented
 in `src/ddl.rs`/`src/dml.rs`, both opt-in modules like `write`.
 
 Row-value evaluation (`INSERT ... VALUES`, `UPDATE ... SET`, `WHERE`) reuses
@@ -1177,15 +1243,17 @@ semantics matching DuckDB (each `SET` expression evaluates against the
 pre-update row).
 
 **`CREATE TABLE AS SELECT`/`INSERT ... SELECT` are also non-resumable**, for
-the same reason and the same constraint as `export_all`: a `NEED_IO`
-mid-execution fails with `IoFailed`; only usable when the source data is
-fully in memory already (see `src/ddl.rs::run_query_to_rows`). As on the
+the same reason as `export_all`: a `NEED_IO` mid-execution cannot suspend
+(see `src/ddl.rs::run_query_to_rows`). They use the same restart protocol as
+`COPY`: the reads are stashed and `prepare` reports them as `NeedIo`, so a host
+that answers and prepares again completes the statement. As on the
 export path, `NEED_CODEC` is serviced in place through
 `Session::set_codec_hook` rather than failing, so both statements work over
 a GZIP-compressed Parquet source.
 
-**Guard against writing to read-only tables**: `INSERT`/`UPDATE`/`DELETE`
-against a file-backed table return `ReadOnlyTable` (`dml::mem_index_writable`).
+**Guard against writing to read-only tables**: `INSERT`/`UPDATE`/`DELETE`,
+`ALTER TABLE` and `DROP TABLE` against a file-backed table return
+`ReadOnlyTable` (`Catalog::mem_index_writable`).
 `CREATE TABLE`/`CREATE VIEW` colliding with an existing file-table name
 return `DuplicateTable`.
 

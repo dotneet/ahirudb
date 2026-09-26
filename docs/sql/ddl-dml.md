@@ -37,6 +37,8 @@ error rather than silently doing nothing or touching the file on disk.
 INSERT INTO t VALUES (3);   -- error: ReadOnlyTable
 UPDATE t SET id = 9;        -- error: ReadOnlyTable
 DELETE FROM t;              -- error: ReadOnlyTable
+ALTER TABLE t ADD c INT;    -- error: ReadOnlyTable
+DROP TABLE t;               -- error: ReadOnlyTable (also with IF EXISTS)
 ```
 
 This split exists because a `Source`'s bytes are assumed immutable
@@ -64,7 +66,20 @@ INSERT INTO dst SELECT id, val FROM snap;
 ```
 
 A CTAS column whose expression is an untyped `NULL` (`SELECT NULL AS n`)
-is created as `INTEGER`, as in DuckDB.
+is created as `INTEGER`, as in DuckDB. As in DuckDB too, every CTAS column is
+nullable (a `NOT NULL` source column or a Parquet `REQUIRED` field describes
+the rows the query produced, not a constraint on the new table), and
+duplicate output names are renamed rather than rejected: the first keeps its
+name and later ones get `_1`, `_2`, ... (compared case-insensitively,
+skipping suffixes already taken):
+
+```sql
+CREATE TABLE j AS SELECT * FROM a JOIN b ON a.id = b.id;   -- id, x, id_1, y
+CREATE TABLE k AS SELECT 1 AS a, 2 AS a, 3 AS A;           -- a, a_1, A_2
+```
+
+`CREATE VIEW` names its columns the same way, and so do the CSV header and
+Parquet schema written by `COPY`.
 
 `IF NOT EXISTS` and `OR REPLACE` are both supported. A `CREATE TABLE` whose
 name collides with an existing **file-backed** table always fails
@@ -84,13 +99,32 @@ CREATE TABLE t (id INTEGER NOT NULL);
 INSERT INTO t VALUES (NULL);   -- error: TypeMismatch
 ```
 
+A column may have a `DEFAULT` (before or after `NOT NULL`). It fills a column
+an `INSERT` leaves out, the `DEFAULT` keyword in a `VALUES` row, and every
+column of `INSERT ... DEFAULT VALUES`:
+
+```sql
+CREATE TABLE d (a INTEGER DEFAULT 5 NOT NULL, b VARCHAR DEFAULT 'x', c INTEGER);
+INSERT INTO d (c) VALUES (1);           -- 5, 'x', 1
+INSERT INTO d VALUES (DEFAULT, 'y', 2); -- 5, 'y', 2
+INSERT INTO d DEFAULT VALUES;           -- 5, 'x', NULL
+```
+
+The default is a constant expression evaluated **once**, when the table is
+created, with the same strict conversion as `ADD COLUMN ... DEFAULT` below —
+so `DEFAULT now()` would store the creation time in every row, where DuckDB
+evaluates it per row (see [limitations.md](limitations.md)). Type names
+accept DuckDB's usual aliases (`VARCHAR(10)`, `INT8`, `DOUBLE PRECISION`,
+`DECIMAL(10)`, ... — see [types.md](types.md#cast-and-try_cast)); `DESCRIBE`
+shows a DECIMAL column with its parameters, `DECIMAL(10,2)`.
+
 ## ALTER TABLE
 
 ```sql
 ALTER TABLE t ADD COLUMN grade INTEGER DEFAULT 100;
 ALTER TABLE t ADD COLUMN note VARCHAR;         -- no DEFAULT -> existing rows get NULL
 
-ALTER TABLE t DROP COLUMN b;
+ALTER TABLE t DROP COLUMN b;   -- not the last one: that fails, as in DuckDB
 
 ALTER TABLE accounts RENAME COLUMN balance TO bal;
 ALTER TABLE accounts RENAME TO ledger;
@@ -119,7 +153,9 @@ DELETE FROM accounts WHERE balance = 0.00;
 `UPDATE ... SET` uses simultaneous-assignment semantics (matching DuckDB):
 every `SET` expression is evaluated against the row's values *before* the
 update, so `UPDATE t SET a = b, b = a` swaps the two columns rather than
-collapsing them to the same value.
+collapsing them to the same value. The `SET` expressions are evaluated only
+for the rows the `WHERE` clause selects, so `UPDATE t SET j = CAST(s AS JSON)
+WHERE s LIKE '[%'` is not tripped up by the rows holding other text.
 
 ### Type conversion is strict
 
@@ -183,9 +219,22 @@ COPY t TO 'out.csv';   -- shorthand for COPY (SELECT * FROM t) TO 'out.csv'
 ```
 
 `FORMAT` defaults to whatever `path`'s extension implies, and is
-case-insensitive when given explicitly. Only `.csv`, `.tsv`/`.tab`,
-`.jsonl`/`.ndjson`, `.json` and `.parquet` are recognised; **any other
-extension, or none at all, writes CSV** (as DuckDB does). The read side
+case-insensitive when given explicitly (`csv`, `tsv`, `json`/`jsonl`/`ndjson`
+— all three write newline-delimited JSON, as DuckDB's `FORMAT json` does —
+and `parquet`). Only `.csv`, `.tsv`/`.tab`, `.jsonl`/`.ndjson`, `.json` and
+`.parquet` are recognised; **any other extension, or none at all, writes
+CSV** (as DuckDB does).
+
+A trailing `.gz` names the compression, as in DuckDB: `out.csv.gz` is CSV
+(the format comes from the rest of the name) and the file is gzip-compressed.
+The core has no deflate encoder, so it only flags the result
+(`CopyResult::gzip`) and the host compresses; the native CLI pipes it
+through the system `gzip`, and the JS host compresses with `CompressionStream`
+before calling `onCopy`. `.zst` output is refused with `UnsupportedCodec`
+rather than written uncompressed, since there is no zstd encoder at all.
+Parquet compresses its own pages, so `out.parquet.gz`/`.zst` is written as a
+plain Parquet file, which is also what DuckDB does. The suffix is
+case-sensitive (`.GZ` is not compressed), again matching DuckDB. The read side
 guesses Parquet for an unknown extension instead, because there the file
 already exists and Parquet is the likelier thing to be opening; when
 *creating* a file, silently producing Parquet under a name like `report`
@@ -234,8 +283,16 @@ The full table is in the module doc of
 The engine core itself never touches a filesystem (it's `no_std`) — `COPY`
 runs the query to completion in memory and hands the resulting bytes plus
 the destination path back to the host, which performs the actual file
-write. In the native CLI this happens automatically; a JS host would do
-the equivalent via its own file-write API.
+write. In the native CLI this happens automatically. The JS host passes
+them to the `onCopy(path, bytes)` option of `AhiruDB.init()` (the wasm core
+must be built with `export`), and `query()` resolves to `[]` once the
+handler returns; without `onCopy`, `COPY ... TO` fails with E409 instead of
+silently doing nothing:
+
+```js
+const db = await AhiruDB.init({ wasmUrl, onCopy: (path, bytes) => save(path, bytes) });
+await db.query("COPY (SELECT * FROM trips) TO 'trips.csv'");
+```
 
 Writing over a file the same session has already read is safe in the CLI:
 after the write it re-reads every table backed by that path, so the next
@@ -250,6 +307,11 @@ worth knowing about:
 
 - A **`DECIMAL`** is written as a JSON *number* (`{"d":1.25}`), not as a
   quoted string. It reads back as `DOUBLE`, here and in DuckDB.
+- A **`JSON`** value is embedded as JSON, minified: whitespace between
+  tokens is dropped (string contents are kept), so a pretty-printed document
+  — `CAST('{\n "a": 1}' AS JSON)`, or a value read from a pretty-printed
+  `.json` file — stays on its record's line. DuckDB writes the same compact
+  form. A column name that appears twice is rejected (DuckDB fails too).
 - A **non-finite `DOUBLE`** is written as one of the quoted strings
   `"nan"`, `"inf"`, `"-inf"` (the `CAST(x AS VARCHAR)` spelling). JSON has
   no literal for these, and a bare `NaN` token would make the file
@@ -281,11 +343,15 @@ COPY (SELECT CAST('1.25' AS DECIMAL(5,2)) AS d, 'nan'::DOUBLE AS n FROM range(1)
 -- {"d":1.25,"n":"nan"}
 ```
 
-**Limitation:** `COPY`/CTAS/`INSERT ... SELECT` are non-resumable — if
-reading the source data would require pausing for I/O partway through
-(`NEED_IO`), the statement fails with `IoFailed` instead of suspending and
-resuming. They only work when the source data is already fully available in
-memory (typical CLI usage, or a JS caller that pre-fetched the table).
+**Limitation:** `COPY`/CTAS/`INSERT ... SELECT` cannot pause for I/O partway
+through (`NEED_IO`): they run to completion inside one engine call. Instead,
+the engine reports the bytes the statement was waiting on, the host fetches
+them, and the statement starts again from scratch; the JS host does this
+automatically, so these statements work over remote (range-fetched) tables.
+Each restart re-runs the query, and the whole input ends up on the wasm heap
+at once, so they suit modest inputs; for large results prefer streaming a
+`SELECT`. An embedder calling `Session::prepare` directly sees the reads as
+`Prepared::NeedIo` and must answer them and call `prepare` again.
 
 A delegated **codec** request (`NEED_CODEC`) is different, and no longer a
 failure: the write paths service it in place through the session's codec

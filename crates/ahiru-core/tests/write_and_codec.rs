@@ -271,15 +271,18 @@ fn jsonl_export_round_trips_through_this_engines_own_reader() {
 // Compensated float summation
 // ---------------------------------------------------------------------------
 
-// `duckdb -csv -c "SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(10))"` gives
+// `duckdb -csv -c "SELECT sum(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(10))"` gives
 // exactly 1.0; naive f64 accumulation gave 0.9999999999999999.
 #[test]
 fn sum_and_avg_over_doubles_are_compensated() {
     let mut s = Session::new();
-    assert_eq!(one_f64(&mut s, "SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(10))"), 1.0);
-    assert_eq!(one_f64(&mut s, "SELECT avg(x) FROM (SELECT 0.1 AS x FROM range(10))"), 0.1);
+    assert_eq!(one_f64(&mut s, "SELECT sum(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(10))"), 1.0);
+    assert_eq!(one_f64(&mut s, "SELECT avg(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(10))"), 0.1);
     // 1000 terms: the naive error grows with the row count.
-    assert_eq!(one_f64(&mut s, "SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(1000))"), 100.0);
+    assert_eq!(
+        one_f64(&mut s, "SELECT sum(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(1000))"),
+        100.0
+    );
 }
 
 #[test]
@@ -287,7 +290,7 @@ fn grouped_sum_over_doubles_is_compensated_per_group() {
     let mut s = Session::new();
     let (_, rows) = run(
         &mut s,
-        "SELECT g, sum(x) FROM (SELECT i % 2 AS g, 0.1 AS x FROM range(20) t(i)) \
+        "SELECT g, sum(x) FROM (SELECT i % 2 AS g, 0.1::DOUBLE AS x FROM range(20) t(i)) \
          GROUP BY g ORDER BY g",
     );
     assert_eq!(rows.len(), 2);
@@ -326,7 +329,7 @@ fn negative_zero_sum_keeps_its_sign() {
 fn sum_of_no_rows_is_still_null() {
     let mut s = Session::new();
     let (_, rows) =
-        run(&mut s, "SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(10)) WHERE x > 100");
+        run(&mut s, "SELECT sum(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(10)) WHERE x > 100");
     assert_eq!(rows[0][0], Value::Null);
 }
 

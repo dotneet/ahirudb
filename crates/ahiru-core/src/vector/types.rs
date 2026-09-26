@@ -118,7 +118,9 @@ impl Ty {
             TinyInt | UTinyInt => (3, 0),
             SmallInt | USmallInt => (5, 0),
             Int | UInt => (10, 0),
-            BigInt | UBigInt => (19, 0),
+            BigInt => (19, 0),
+            // 18446744073709551615 has 20 digits.
+            UBigInt => (20, 0),
             HugeInt => (38, 0),
             _ => return None,
         })
@@ -285,16 +287,21 @@ impl Ty {
         if let Some(t) = mixed_sign_int(a, b) {
             return Some(t);
         }
-        // Between numerics, widen. DECIMAL with floating point drops to DOUBLE.
+        // BOOLEAN is the bottom of the widening order: mixed with a number it becomes that
+        // number (`true = 1`, `true IN (1, 2)`, `coalesce(flag, 0)`), as in DuckDB. Arithmetic
+        // on a BOOLEAN stays an error (`plan::compile` checks the operands, not this type).
+        if a == Boolean && b.is_numeric() {
+            return Some(b);
+        }
+        if b == Boolean && a.is_numeric() {
+            return Some(a);
+        }
+        // Between numerics, widen. FLOAT with any integer or DECIMAL stays FLOAT, and
+        // only DOUBLE outranks it, as in DuckDB: `float_col = 1.1` compares in FLOAT
+        // (the DECIMAL literal rounds to the same f32 the column holds), where
+        // widening to DOUBLE compared `1.100000023841858` against `1.1` and never matched.
         if a.is_numeric() && b.is_numeric() {
-            let (lo, hi) = if a.rank() < b.rank() { (a, b) } else { (b, a) };
-            if matches!(lo, Decimal { .. }) && matches!(hi, Float | Double) {
-                return Some(Double);
-            }
-            if matches!(hi, Decimal { .. }) && matches!(lo, Float | Double) {
-                return Some(Double);
-            }
-            return Some(if hi == Float { Double } else { hi });
+            return Some(if a.rank() < b.rank() { b } else { a });
         }
         // Comparing DATE with TIMESTAMP settles on TIMESTAMP.
         if matches!((a, b), (Date, Timestamp) | (Timestamp, Date)) {
@@ -317,6 +324,31 @@ impl Ty {
             return Some(Blob);
         }
         None
+    }
+
+    /// The common type of values that are *merged* into one column rather than combined
+    /// arithmetically or compared: `COALESCE`, `CASE`, `greatest`/`least`, and the columns
+    /// of a set operation. Only a pair of DECIMALs differs from [`Ty::unify`], in two ways
+    /// (both DuckDB's): no carry digit is added, and when the integer digits plus the
+    /// larger scale exceed 38, the *scale* gives way rather than the integer digits.
+    /// `COALESCE(DECIMAL(38,0), DECIMAL(38,18))` is therefore `DECIMAL(38,0)`, where
+    /// `Ty::unify`'s `DECIMAL(38,18)` has room for 20 integer digits and turned every
+    /// larger value NULL. (Arithmetic and comparisons keep the larger scale, as DuckDB's
+    /// do, so they never round a fractional operand.) A DECIMAL merged with an integer
+    /// keeps its scale, again as in DuckDB.
+    pub fn unify_value(a: Ty, b: Ty) -> Option<Ty> {
+        let dec = |t: Ty| matches!(t, Ty::Decimal { .. });
+        match (a.as_decimal(), b.as_decimal()) {
+            (Some((p1, s1)), Some((p2, s2))) if dec(a) || dec(b) => {
+                let int = (p1 - s1).max(p2 - s2);
+                let mut scale = s1.max(s2);
+                if dec(a) && dec(b) {
+                    scale = scale.min(MAX_DECIMAL_PRECISION - int);
+                }
+                Some(Ty::decimal(int + scale, scale))
+            }
+            _ => Ty::unify(a, b),
+        }
     }
 
     /// The type name. Used by `DESCRIBE` and in result metadata.
@@ -347,6 +379,27 @@ impl Ty {
             Json => "JSON",
             Uuid => "UUID",
         }
+    }
+
+    /// The type name with its parameters, as `DESCRIBE` and `typeof` show it (and as
+    /// DuckDB does): `DECIMAL(10,2)` rather than the bare `DECIMAL` of [`Ty::name`].
+    /// Every other type has no parameters and renders exactly as `name()`.
+    pub fn full_name(self) -> String {
+        let mut s = String::from(self.name());
+        if let Ty::Decimal { precision, scale } = self {
+            let push = |s: &mut String, n: u8| {
+                if n >= 10 {
+                    s.push((b'0' + n / 10) as char);
+                }
+                s.push((b'0' + n % 10) as char);
+            };
+            s.push('(');
+            push(&mut s, precision);
+            s.push(',');
+            push(&mut s, scale);
+            s.push(')');
+        }
+        s
     }
 }
 
@@ -478,17 +531,51 @@ pub fn fmt_interval(months: i32, days: i32, micros: i64, out: &mut Vec<u8>) {
     }
 }
 
+/// What is statically known about the contents of a `Ty::Json` value.
+///
+/// A LIST or MAP has no type of its own here (it is JSON text, see `Ty::Json`), but where its
+/// element type is known before execution -- a Parquet `LIST<scalar>`/`MAP<scalar, scalar>`
+/// column, `string_split`, a list literal of one scalar type -- the binder carries it alongside
+/// so `xs[i]`, `m[k]` and `UNNEST` can hand the element back as that native type, as DuckDB does.
+/// `Any` is the conservative answer: the element stays `Ty::Json`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Shape {
+    #[default]
+    Any,
+    /// A list whose elements are all of this type (`Ty::Json` when they are themselves nested).
+    List(Ty),
+    /// A MAP (`[{"key":k,"value":v},...]`) with these key and value types.
+    Map(Ty, Ty),
+}
+
+impl Shape {
+    /// The native type of one element (a MAP's elements are its values), `Ty::Json` if unknown.
+    pub fn elem(self) -> Ty {
+        match self {
+            Shape::List(t) | Shape::Map(_, t) => t,
+            Shape::Any => Ty::Json,
+        }
+    }
+}
+
 /// One column of the output schema.
 #[derive(Clone)]
 pub struct Field {
     pub name: String,
     pub ty: Ty,
     pub nullable: bool,
+    /// Meaningful only when `ty` is `Ty::Json`.
+    pub shape: Shape,
 }
 
 impl Field {
     pub fn new(name: impl Into<String>, ty: Ty, nullable: bool) -> Self {
-        Field { name: name.into(), ty, nullable }
+        Field { name: name.into(), ty, nullable, shape: Shape::Any }
+    }
+
+    pub fn shaped(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
     }
 }
 
@@ -514,7 +601,11 @@ mod tests {
     fn unify_numeric() {
         assert_eq!(Ty::unify(Ty::Int, Ty::BigInt), Some(Ty::BigInt));
         assert_eq!(Ty::unify(Ty::Int, Ty::Double), Some(Ty::Double));
-        assert_eq!(Ty::unify(Ty::Float, Ty::Int), Some(Ty::Double));
+        // FLOAT with an integer or a DECIMAL stays FLOAT (DuckDB); only DOUBLE outranks it.
+        assert_eq!(Ty::unify(Ty::Float, Ty::Int), Some(Ty::Float));
+        assert_eq!(Ty::unify(Ty::HugeInt, Ty::Float), Some(Ty::Float));
+        assert_eq!(Ty::unify(Ty::Float, Ty::decimal(4, 1)), Some(Ty::Float));
+        assert_eq!(Ty::unify(Ty::Float, Ty::Double), Some(Ty::Double));
         assert_eq!(Ty::unify(Ty::Null, Ty::Varchar), Some(Ty::Varchar));
         assert_eq!(Ty::unify(Ty::Date, Ty::Timestamp), Some(Ty::Timestamp));
         assert_eq!(Ty::unify(Ty::Varchar, Ty::Int), None);
@@ -575,6 +666,25 @@ mod tests {
         // Addition and subtraction gain one digit of precision for the carry (as in DuckDB).
         assert_eq!(Ty::unify(a, b), Some(Ty::Decimal { precision: 13, scale: 4 }));
         assert_eq!(Ty::unify(a, Ty::Double), Some(Ty::Double));
+    }
+
+    // Values merged into one column (COALESCE/CASE/UNION/greatest) keep their integer
+    // digits and give up scale past 38 digits; arithmetic and comparisons keep the scale.
+    // The widths are DuckDB's (`typeof(coalesce(a, b))`).
+    #[test]
+    fn unify_value_decimal() {
+        let d = |p, s| Ty::Decimal { precision: p, scale: s };
+        assert_eq!(Ty::unify_value(d(38, 0), d(38, 18)), Some(d(38, 0)));
+        assert_eq!(Ty::unify(d(38, 0), d(38, 18)), Some(d(38, 18)));
+        assert_eq!(Ty::unify_value(d(36, 20), d(19, 0)), Some(d(38, 19)));
+        assert_eq!(Ty::unify_value(d(10, 2), d(12, 4)), Some(d(12, 4)));
+        // An integer side leaves the DECIMAL's scale alone.
+        assert_eq!(Ty::unify_value(d(36, 20), Ty::BigInt), Some(d(38, 20)));
+        assert_eq!(Ty::unify_value(d(4, 1), Ty::HugeInt), Some(d(38, 1)));
+        assert_eq!(Ty::unify_value(d(4, 1), Ty::UBigInt), Some(d(21, 1)));
+        // Everything else is `unify`.
+        assert_eq!(Ty::unify_value(Ty::Int, Ty::BigInt), Some(Ty::BigInt));
+        assert_eq!(Ty::unify_value(d(4, 1), Ty::Double), Some(Ty::Double));
     }
 
     #[test]

@@ -315,28 +315,48 @@ fn resolve_group_by_all(arena: &ExprArena, sel: &SelectStmt) -> Result<Vec<ExprI
 /// them (`SELECT a + sum(x) AS z ... HAVING z > 5`) has no column of its own and stays an
 /// error, as it was before.
 ///
-/// An input column of the same name wins over the alias, the same precedence
-/// `resolve_group_ref` uses for GROUP BY.
+/// Precedence follows DuckDB's HAVING binder: a name that is a grouping expression (or sits
+/// inside an aggregate) is the input column; otherwise a SELECT-list alias of that name wins,
+/// even over an input column of the same name, which could not be read ungrouped anyway
+/// (`SELECT k % 2 AS k2, sum(v) AS v ... GROUP BY k % 2 HAVING v > 8` filters on `sum(v)`).
+/// An *ambiguous* input name is left to input resolution, which reports it.
 ///
+/// Returns the column references bound to an alias, which `check_grouped` must let through.
 /// Must run after every grouping / aggregate / `GROUPING()` substitution has been pushed.
 fn add_having_alias_subs(
     arena: &ExprArena,
     scope: &Scope,
     sel: &SelectStmt,
+    group_exprs: &[ExprId],
+    agg_calls: &[ExprId],
     subs: &mut Vec<Substitution>,
-) -> Result<()> {
-    let Some(h) = sel.having else { return Ok(()) };
+) -> Result<Vec<ExprId>> {
+    let Some(h) = sel.having else { return Ok(Vec::new()) };
+    // The bare names outside every grouping expression and aggregate call: exactly the
+    // references `check_grouped` would otherwise reject or leave unresolved.
     let mut refs = Vec::new();
-    collect_colrefs(arena, h, &[], &mut refs, 0)?;
+    walk_pruned(
+        arena,
+        h,
+        &mut |e| {
+            if group_exprs.iter().any(|&g| expr_eq_in(arena, scope, g, e))
+                || agg_calls.iter().any(|&a| expr_eq(arena, a, e))
+            {
+                return Ok(true);
+            }
+            if let Expr::ColumnRef { qualifier: None, name } = arena.get(e) {
+                if !matches!(scope.resolve(None, name), Err(err) if err.code == Code::AmbiguousColumn)
+                {
+                    refs.push(e);
+                }
+                return Ok(true);
+            }
+            Ok(false)
+        },
+        0,
+    )?;
     let mut found: Vec<Substitution> = Vec::new();
-    for (rid, qual, name) in refs {
-        // An input column of the name wins, and an *ambiguous* one is an error rather than
-        // a fall-through to the alias (the rule `resolve_group_ref` uses for GROUP BY).
-        if qual.is_some()
-            || !matches!(scope.resolve(None, &name), Err(e) if e.code != Code::AmbiguousColumn)
-        {
-            continue;
-        }
+    for rid in refs {
         let target = resolve_select_ref(arena, sel, rid)?;
         if target == rid {
             continue;
@@ -352,8 +372,9 @@ fn add_having_alias_subs(
             found.push(Substitution { expr: rid, column: s.column, structural: false });
         }
     }
+    let ids = found.iter().map(|s| s.expr).collect();
     subs.extend(found);
-    Ok(())
+    Ok(ids)
 }
 
 /// Makes an expression spelled differently from its grouping expression resolve to the
@@ -463,6 +484,7 @@ pub(super) fn bind_select_in(
 
     let mut rels: Vec<Rel> = Vec::new();
     let tree = flatten_from(catalog, arena, params, from, &mut rels, ctes, 0)?;
+    tree.mark_outer_nullable(&mut rels, false);
     let scope_all = full_scope(&rels);
 
     // --- Collect the referenced columns (projection pushdown) ---------------
@@ -643,6 +665,11 @@ pub(super) fn bind_select_in(
 
     let scope = narrow_scope(&rels);
     let ranges = rel_ranges(&rels);
+    // What `*` / `t.*` / `COLUMNS(...)` expand over: the FROM clause's columns only. Scalar
+    // subqueries and quantified comparisons append helper columns to `scope` below, which
+    // must never leak into a star expansion. They are appended at the end, so an index into
+    // this scope is still an index into the widened one.
+    let star_scope = scope.clone();
 
     // --- Decomposing and pushing down WHERE ---------------------------------
     // With an outer join, applying a one-sided condition first would change the result of NULL
@@ -901,6 +928,9 @@ pub(super) fn bind_select_in(
     for c in semijoins {
         node = build_semijoin(catalog, arena, params, ctes, node, &scope, &subs, c)?;
     }
+    // Each subquery above stacked a join level onto `node` without nesting anything in the
+    // SQL text; check before anything recurses over (or clones) the tree.
+    check_plan_depth(&node)?;
 
     if !leftover.is_empty() {
         let pred = and_all(arena, &scope, params, &subs, &leftover)?;
@@ -985,9 +1015,10 @@ pub(super) fn bind_select_in(
     // Like `FILTER`/`QUALIFY`, it is picked up as a special expression that is neither an
     // aggregate nor an ordinary scalar expression. Because it expands the target column's JSON
     // array into as many rows as it has elements and duplicates the other columns, it "adds
-    // rows", so it is interposed before aggregation (right after FROM/WHERE, before GROUP BY).
-    // The semantics of aggregating over the expanded rows is not implemented, so it cannot be
-    // used together with aggregation. DuckDB's behavior for several `UNNEST`s in one SELECT list
+    // rows"; only its restrictions are checked here, and the expansion itself is interposed
+    // after the window functions and QUALIFY (see "UNNEST (the expansion)" below).
+    // Aggregating alongside it is not implemented, so it cannot be used together with
+    // aggregation. DuckDB's behavior for several `UNNEST`s in one SELECT list
     // (per-column zip, NULL padding when element counts differ) is too complex, so it is out of
     // scope: exactly one is allowed and the rest are explicitly rejected.
     let mut unnest_calls: Vec<ExprId> = Vec::new();
@@ -1018,22 +1049,6 @@ pub(super) fn bind_select_in(
             collect_aggregates(arena, item.expr, &mut agg_probe, 0)?;
         }
         ensure!(agg_probe.is_empty(), UnsupportedFeature);
-
-        let unnest_id = unnest_calls[0];
-        let arg = match arena.get(unnest_id) {
-            Expr::Unnest(a) => *a,
-            _ => err!(Internal),
-        };
-        let prog = compile(arena, &scope, params, arg)?;
-        ensure!(prog.result_ty == Ty::Json, TypeMismatch);
-        let elem_ty = narrow_unnest_elem_ty(arena, &scope, params, arg);
-        let elem_field = Field::new(default_name(arena, unnest_id), elem_ty, true);
-        let mut out_schema = scope.fields().to_vec();
-        out_schema.push(elem_field);
-        node =
-            Node::Unnest { input: Box::new(node), expr: prog, elem_ty, schema: out_schema.clone() };
-        scope = Scope::from_fields(out_schema);
-        subs.push(Substitution { expr: unnest_id, column: scope.len() - 1, structural: false });
     }
 
     // --- Aggregation --------------------------------------------------------
@@ -1106,7 +1121,9 @@ pub(super) fn bind_select_in(
         let mut out_fields = Vec::new();
         for (i, &g) in group_exprs.iter().enumerate() {
             let p = compile(arena, &scope, params, g)?;
-            out_fields.push(Field::new(group_name(arena, g, i), p.result_ty, true));
+            out_fields.push(
+                Field::new(group_name(arena, g, i), p.result_ty, true).shaped(p.result_shape),
+            );
             subs.push(Substitution { expr: g, column: i, structural: true });
             groups.push(p);
         }
@@ -1125,11 +1142,13 @@ pub(super) fn bind_select_in(
         for item in &sel.items {
             check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
-        if let Some(h) = sel.having {
-            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
-        }
         add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
-        add_having_alias_subs(arena, &scope, sel, &mut subs)?;
+        let mut having_ok =
+            add_having_alias_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
+        if let Some(h) = sel.having {
+            having_ok.extend_from_slice(&const_subs);
+            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &having_ok, 0)?;
+        }
 
         let agg_scope = Scope::from_fields(out_fields.clone());
         let having = match sel.having {
@@ -1186,7 +1205,10 @@ pub(super) fn bind_select_in(
 
         let mut out_fields: Vec<Field> = Vec::with_capacity(ngroups + agg_calls.len());
         for (i, &g) in group_exprs.iter().enumerate() {
-            out_fields.push(Field::new(group_name(arena, g, i), group_progs[i].result_ty, true));
+            let p = &group_progs[i];
+            out_fields.push(
+                Field::new(group_name(arena, g, i), p.result_ty, true).shaped(p.result_shape),
+            );
         }
 
         // Aggregates share the same input scope too, so they are built once and cloned per set.
@@ -1204,9 +1226,6 @@ pub(super) fn bind_select_in(
         // absent from one set is not an error (it is simply NULL in those rows, as in DuckDB).
         for item in &sel.items {
             check_grouped(arena, &scope, item.expr, &group_exprs, &agg_calls, &const_subs, 0)?;
-        }
-        if let Some(h) = sel.having {
-            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &const_subs, 0)?;
         }
         add_equivalent_group_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
 
@@ -1235,7 +1254,12 @@ pub(super) fn bind_select_in(
             out_fields.push(Field::new(default_name(arena, gc), Ty::BigInt, false));
             subs.push(Substitution { expr: gc, column: base_cols + k, structural: true });
         }
-        add_having_alias_subs(arena, &scope, sel, &mut subs)?;
+        let mut having_ok =
+            add_having_alias_subs(arena, &scope, sel, &group_exprs, &agg_calls, &mut subs)?;
+        if let Some(h) = sel.having {
+            having_ok.extend_from_slice(&const_subs);
+            check_grouped(arena, &scope, h, &group_exprs, &agg_calls, &having_ok, 0)?;
+        }
 
         // HAVING is evaluated against the final schema, once the grouping columns, aggregate
         // results, and GROUPING() constants are all present. It is not embedded into each set's
@@ -1321,18 +1345,28 @@ pub(super) fn bind_select_in(
             branches.push(branch);
         }
 
-        let mut iter = branches.into_iter();
-        // `sets` was never emptied (see the ensure! above), so at least one is always available.
-        let mut combined = iter.next().unwrap();
-        for b in iter {
-            combined = Node::SetOp {
-                left: Box::new(combined),
-                right: Box::new(b),
-                op: SetOpKind::Union,
-                all: true,
-                schema: out_fields.clone(),
-            };
+        // Bundled as a balanced tree of UNION ALLs, pairing neighbours level by level. The
+        // output order is the same as a left-deep chain's, but 256 sets (`CUBE` of 8 columns)
+        // cost 8 plan levels instead of 256 (see `MAX_PLAN_DEPTH`).
+        while branches.len() > 1 {
+            let mut next = Vec::with_capacity(branches.len().div_ceil(2));
+            let mut iter = branches.into_iter();
+            while let Some(l) = iter.next() {
+                next.push(match iter.next() {
+                    Some(r) => Node::SetOp {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        op: SetOpKind::Union,
+                        all: true,
+                        schema: out_fields.clone(),
+                    },
+                    None => l,
+                });
+            }
+            branches = next;
         }
+        // `sets` was never emptied (see the ensure! above), so at least one is always available.
+        let combined = branches.pop().unwrap();
         node = match having {
             Some(pred) => Node::Filter { input: Box::new(combined), pred },
             None => combined,
@@ -1431,6 +1465,36 @@ pub(super) fn bind_select_in(
         }
     }
 
+    // --- UNNEST (the expansion) ---------------------------------------------
+    // DuckDB plans a select-list UNNEST after the window functions and QUALIFY, so both see
+    // the rows *before* expansion (`SELECT UNNEST(xs), count(*) OVER ()` counts input rows),
+    // while the projection, DISTINCT, ORDER BY and LIMIT see the expanded rows.
+    if let Some(&unnest_id) = unnest_calls.first() {
+        if let Some(q) = sel.qualify {
+            // QUALIFY therefore filters here, against the input columns and window results.
+            // A SELECT-list alias does not exist yet at this point, so it does not resolve.
+            let pred = compile_predicate_with_subs(arena, &item_scope, params, &subs, q)?;
+            node = Node::Filter { input: Box::new(node), pred };
+        }
+        let arg = match arena.get(unnest_id) {
+            Expr::Unnest(a) => *a,
+            _ => err!(Internal),
+        };
+        let prog = compile(arena, &item_scope, params, arg)?;
+        ensure!(prog.result_ty == Ty::Json, TypeMismatch);
+        let elem_ty = narrow_unnest_elem_ty(arena, &item_scope, params, arg);
+        let elem_field = Field::new(default_name(arena, unnest_id), elem_ty, true);
+        let mut out_schema = node.schema().to_vec();
+        out_schema.push(elem_field.clone());
+        node = Node::Unnest { input: Box::new(node), expr: prog, elem_ty, schema: out_schema };
+        item_scope.push(None, elem_field);
+        subs.push(Substitution {
+            expr: unnest_id,
+            column: item_scope.len() - 1,
+            structural: false,
+        });
+    }
+
     // --- Projection ---------------------------------------------------------
     let mut exprs = Vec::new();
     let mut schema = Vec::new();
@@ -1445,8 +1509,9 @@ pub(super) fn bind_select_in(
                 // For a `COLUMNS(...)` item the select-item alias is a name
                 // *template* applied per expanded column, not a single output
                 // name — see `expr::regex::expand_name_template`.
+                let scope = &star_scope;
                 let expanded: Vec<(usize, Option<String>)> = match columns {
-                    Some(spec) => expand_columns(spec, &scope, item.alias.as_deref())?,
+                    Some(spec) => expand_columns(spec, scope, item.alias.as_deref())?,
                     None => {
                         let idx: Vec<usize> = match qualifier {
                             Some(q) => scope.indices_for_qualifier(q),
@@ -1510,11 +1575,13 @@ pub(super) fn bind_select_in(
                             // select item (`item_scope`, which may include aggregate and window
                             // output). The column name itself is left unchanged.
                             let p = compile_with_subs(arena, &item_scope, params, &subs, rexpr)?;
-                            schema.push(Field::new(out_name, p.result_ty, true));
+                            schema.push(
+                                Field::new(out_name, p.result_ty, true).shaped(p.result_shape),
+                            );
                             exprs.push(p);
                         }
                         None => {
-                            exprs.push(column_program(&scope, i)?);
+                            exprs.push(column_program(scope, i)?);
                             let mut field = scope.fields()[i].clone();
                             field.name = out_name;
                             schema.push(field);
@@ -1530,7 +1597,7 @@ pub(super) fn bind_select_in(
                 };
                 aliased.resize(schema.len(), false);
                 aliased.push(item.alias.is_some());
-                schema.push(Field::new(name, p.result_ty, true));
+                schema.push(Field::new(name, p.result_ty, true).shaped(p.result_shape));
                 exprs.push(p);
             }
         }
@@ -1561,7 +1628,9 @@ pub(super) fn bind_select_in(
     // columns are added here as hidden columns and dropped by the trailing
     // trim — the same mechanism ORDER BY uses for sort keys absent from SELECT.
     let mut qualify_subs: Vec<Substitution> = Vec::new();
-    if let Some(q) = sel.qualify {
+    // With a select-list UNNEST, QUALIFY was already applied before the expansion.
+    let qualify = sel.qualify.filter(|_| unnest_calls.is_empty());
+    if let Some(q) = qualify {
         let mut q_wins = Vec::new();
         collect_windows(arena, q, &mut q_wins, 0)?;
         for &w in &q_wins {
@@ -1586,7 +1655,7 @@ pub(super) fn bind_select_in(
         let mut q_refs = Vec::new();
         collect_colrefs(arena, q, &covered, &mut q_refs, 0)?;
         for (rid, qual, rname) in q_refs {
-            // A name resolves the way WHERE/HAVING resolve it: an input column first, and a
+            // A name resolves the way WHERE resolves it: an input column first, and a
             // SELECT-list alias only for a name the input does not have (DuckDB:
             // `SELECT a*1 AS b, rank() OVER (...) FROM t QUALIFY b = 3` filters on the input
             // `b`). An ambiguous input name is left to the input path, which reports it.
@@ -1697,7 +1766,7 @@ pub(super) fn bind_select_in(
     // the input's order (confirmed with DuckDB: without ORDER BY, arrival order is "the first row").
     let mut distinct_on_cols: Vec<usize> = Vec::with_capacity(sel.distinct_on.len());
     for &on_expr in &sel.distinct_on {
-        let col = match distinct_on_output_column(arena, sel, on_expr, &schema[..projected]) {
+        let col = match distinct_on_output_column(arena, sel, on_expr, &schema[..projected])? {
             Some(c) => c,
             None => {
                 let p = compile_with_subs(arena, &item_scope, params, &subs, on_expr)?;
@@ -1715,7 +1784,7 @@ pub(super) fn bind_select_in(
 
     // QUALIFY filters the projected rows. An unqualified name that the input does not have
     // resolves to an output column (an alias, or a `RENAME`d star column), matching DuckDB.
-    if let Some(q) = sel.qualify {
+    if let Some(q) = qualify {
         let pred = compile_predicate_with_subs(arena, &project_scope, params, &qualify_subs, q)?;
         node = Node::Filter { input: Box::new(node), pred };
     }

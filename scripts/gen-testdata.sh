@@ -157,6 +157,19 @@ COPY (SELECT i::INTEGER AS id, map([i, i + 1], ['v' || i, 'v' || (i + 1)]) AS m
       FROM range(0, 20) t(i))
 TO 'map_int_key.parquet' (FORMAT PARQUET);"
 
+# LISTs of assorted scalar leaves: how each leaf type renders inside the JSON text,
+# and that xs[i]/UNNEST hand it back as the element type (NaN/Infinity doubles,
+# BLOBs, strings needing escapes, DECIMAL, DATE, TIMESTAMP, BOOLEAN).
+duckdb -c "
+COPY (SELECT * FROM (VALUES
+    (1, [1.5, 'nan'::DOUBLE, 'inf'::DOUBLE, '-inf'::DOUBLE],
+        ['\x00\x01\xFF'::BLOB, 'abc'::BLOB], ['a', 'b\"c', 'd\\e'],
+        [1.50::DECIMAL(4,2), -0.50], [DATE '2024-01-02', NULL],
+        [TIMESTAMP '2024-01-02 03:04:05.5'], [true, false]),
+    (2, [], NULL, ['z'], [], [], [], [NULL])
+  ) AS t(id, ds, bs, ss, decs, dates, tss, flags))
+TO 'list_scalars.parquet' (FORMAT PARQUET);"
+
 # LIST<STRUCT<..., LIST<...>>>: three levels of nesting (array -> struct -> array).
 # list_of_struct/struct_with_list only combine two levels, so this checks that
 # Dremel assembly stacks repetition/definition levels correctly at three levels
@@ -329,6 +342,33 @@ pq.write_table(
     use_dictionary=False,
     compression="SNAPPY",
 )
+PY
+
+  # -0.0 in FLOAT/DOUBLE columns with Bloom filters. pyarrow hashes the bits of
+  # -0.0 as written (DuckDB normalizes to +0.0 first), so probing the filter with
+  # +0.0 for `d = 0.0` would wrongly report the value absent.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+vals = [-0.0 if i % 2 == 0 else 5.0 for i in range(10)]
+table = pa.table({"d": pa.array(vals, type=pa.float64()), "f": pa.array(vals, type=pa.float32())})
+pq.write_table(
+    table, "negzero_bloom.parquet",
+    bloom_filter_options={"d": {"ndv": 10, "fpp": 0.01}, "f": {"ndv": 10, "fpp": 0.01}},
+)
+PY
+
+  # Repeated column names (exactly and ignoring case). DuckDB refuses to write
+  # them; pyarrow writes them as asked. DuckDB reads them as a, a_1, A_2.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+table = pa.Table.from_arrays(
+    [pa.array([1, 2]), pa.array([3, 4]), pa.array([5, 6])], names=["a", "a", "A"]
+)
+pq.write_table(table, "dup_names.parquet")
 PY
 
   # A footer that does not fit the 64 KiB speculative tail fetch
@@ -557,6 +597,17 @@ else
   echo "!! pyarrow not found; skipping regeneration of pagetest.parquet / list_pagetest.parquet / nan_stats.parquet / footer_fit.parquet / footer_big.parquet / dict_mr.parquet / empty_rg_nested.parquet / float16.parquet" >&2
 fi
 
+# --- FLOAT statistics ------------------------------------------------------
+# 400 FLOAT rows, one value per 100-row RowGroup, so every RowGroup's min = max.
+# A DECIMAL or integer literal compares against a FLOAT column in FLOAT (`f = 1.1`
+# rounds the literal to the f32 the column holds), so a pruner has to round the
+# literal the same way before checking it against the statistics.
+duckdb -c "
+COPY (SELECT (CASE i // 100 WHEN 0 THEN 1.1 WHEN 1 THEN 0.1 WHEN 2 THEN 3.3
+              ELSE 16777216 END)::FLOAT AS f, i::INTEGER AS id
+      FROM range(0, 400) t(i))
+TO 'float_stats.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 100);"
+
 # --- INTERVAL (FIXED_LEN_BYTE_ARRAY(12)) ----------------------------------
 # Months/days/milliseconds as three unsigned 32-bit little-endian integers.
 # A plain INTEGER column sits next to it so "one unsupported column must not make
@@ -589,6 +640,12 @@ COPY (SELECT * FROM (VALUES
     (4, 'Dave', 'west'), (5, 'Erin', 'north'), (6, 'Frank', 'south')
   ) AS t(customer_id, name, region))
 TO 'customers.parquet' (FORMAT PARQUET);"
+
+# --- Third-party files ----------------------------------------------------
+# tests/data/parquet-testing/ holds files copied unmodified from
+# https://github.com/apache/parquet-testing (Apache-2.0; see the NOTICE there).
+# They cover writer quirks neither DuckDB nor pyarrow reproduces, so they are
+# not regenerated here.
 
 echo
 ls -la

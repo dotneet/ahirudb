@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::expr::kernels::{pow10_i128, MICROS_PER_DAY};
-use crate::vector::PhysType;
+use crate::vector::{PhysType, Vector};
 
 // --- Extracting pruning predicates -------------------------------------------
 
@@ -98,11 +98,13 @@ fn to_column_repr(value: &Value, lit_ty: Ty, col_ty: Ty) -> Option<Value> {
         return None;
     }
     if col_ty.phys() == PhysType::F64 {
-        return match value {
-            Value::F64(_) => Some(value.clone()),
-            // An integer literal against a FLOAT/DOUBLE column is widened to DOUBLE the
-            // same way by the comparison kernel, so the rounding matches.
-            _ if lit_ty.is_integer() => value.as_f64().map(Value::F64),
+        // The comparison kernel casts the literal to `unified` -- FLOAT for an integer or
+        // DECIMAL literal against a FLOAT column, DOUBLE otherwise -- so the literal goes
+        // through that very cast here, and rounds exactly as it does there.
+        let mut v = Vector::new(lit_ty);
+        v.push_value(value);
+        return match crate::expr::kernels::cast(lit_ty, unified, &v).ok()?.value_at(0) {
+            f @ Value::F64(_) => Some(f),
             _ => None,
         };
     }

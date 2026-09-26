@@ -589,7 +589,8 @@ impl Drop for Shell {
 }
 
 fn create_table_text(name: &str, cols: &[(String, String, bool)]) -> String {
-    let mut s = format!("CREATE TABLE {name}(\n");
+    // Quoted when needed, so the text replays for a name like `my tbl` or `order`.
+    let mut s = format!("CREATE TABLE {}(\n", crate::output::insert_identifier_part(name));
     for (i, (n, ty, nullable)) in cols.iter().enumerate() {
         s.push_str(&format!(
             "  \"{}\" {}{}{}\n",
