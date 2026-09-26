@@ -808,23 +808,23 @@ fn parse_special_f64(s: &[u8]) -> Option<f64> {
 /// once into the product and then a second time into the integer, so
 /// `CAST(<double> AS DECIMAL(38,1))` lost digits the value actually had: the double
 /// nearest `12345678901234567890.5` came out as `12345678901234566758.4`, off by more
-/// than a thousand. Instead the double is rendered as its shortest round-tripping
-/// decimal (the exact same text [`fmt_f64`] produces) and rescaled with the integer
-/// arithmetic the `VARCHAR -> DECIMAL` path already uses, so
-/// `CAST(x AS DECIMAL(p,s))` and `CAST(CAST(x AS VARCHAR) AS DECIMAL(p,s))` now agree
-/// by construction.
+/// than a thousand (DuckDB's answer, from that very multiply). Instead the double is
+/// rendered as its shortest round-tripping decimal (the exact same text [`fmt_f64`]
+/// produces) and rescaled with the integer arithmetic the `VARCHAR -> DECIMAL` path
+/// already uses.
+///
+/// That text is only used once the product has at least 2^53 in magnitude, though.
+/// Below that, `x * 10^scale` (with `scale <= 22`, so the power of ten is exact) keeps
+/// its whole integer part and the fraction the rounding looks at, and it is what DuckDB
+/// rounds: `1.005::DOUBLE` is really `1.00499999999999989...`, so the product is
+/// `100.49999999999999` and scale 2 gives `1.00` (the text `1.005` would give `1.01`),
+/// while `2.675 * 100` rounds to exactly `267.5` and gives `2.68`, both as in DuckDB.
 ///
 /// `half_away` selects the rounding rule for the digits that fall off the end:
 /// DECIMAL targets round half *away from zero* (`CAST(2.5 AS DECIMAL(3,0))` = 3,
 /// like DuckDB), while integer targets round half *to even*
-/// (`CAST(2.5 AS INTEGER)` = 2, also like DuckDB). It only makes a difference at
-/// `scale == 0`: above that, the text path below already rounds away from zero
-/// through `rescale_i128`, so `DECIMAL(3,0)` used to be the one scale that
-/// disagreed with every other scale of the same type.
-///
-/// An integer target at `scale == 0` keeps the direct `f_round` path: it is
-/// already exact, and it is what carries this engine's documented
-/// round-half-to-even rule for float-to-integer casts.
+/// (`CAST(2.5::DOUBLE AS INTEGER)` = 2, also like DuckDB). An integer target at
+/// `scale == 0` keeps the direct `f_round` path: it is already exact.
 fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> Option<i128> {
     if !x.is_finite() {
         return None;
@@ -834,6 +834,14 @@ fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> 
             return None;
         }
         return Some(f_round(x) as i128);
+    }
+    if scale <= 22 {
+        let y = x * pow10_f64(scale);
+        if y.abs() < 9_007_199_254_740_992.0 {
+            // Half away from zero; `y - t` is exact below 2^53.
+            let t = funcs::f_trunc(y);
+            return Some(if (y - t).abs() >= 0.5 { t + y.signum() } else { t } as i128);
+        }
     }
     buf.clear();
     crate::expr::float::write_f64_finite(buf, x);
@@ -2275,6 +2283,16 @@ mod tests {
         assert_eq!(f64_to_scaled_i128(3.5, 0, true, &mut buf), Some(4));
         assert_eq!(f64_to_scaled_i128(-2.5, 0, true, &mut buf), Some(-3));
         assert_eq!(f64_to_scaled_i128(0.5, 0, true, &mut buf), Some(1));
+        // Below 2^53 the product x * 10^scale is rounded, as in DuckDB: 1.005, 0.285
+        // and 1.015 are just below their decimal ties, 0.125 is exactly on it, and
+        // 2.675 * 100 rounds up onto 267.5 (duckdb: 1.00, 0.28, 0.13, 2.68, 1.01).
+        assert_eq!(f64_to_scaled_i128(1.005, 2, true, &mut buf), Some(100));
+        assert_eq!(f64_to_scaled_i128(-1.005, 2, true, &mut buf), Some(-100));
+        assert_eq!(f64_to_scaled_i128(0.285, 2, true, &mut buf), Some(28));
+        assert_eq!(f64_to_scaled_i128(0.125, 2, true, &mut buf), Some(13));
+        assert_eq!(f64_to_scaled_i128(-0.125, 2, true, &mut buf), Some(-13));
+        assert_eq!(f64_to_scaled_i128(2.675, 2, true, &mut buf), Some(268));
+        assert_eq!(f64_to_scaled_i128(1.015, 2, true, &mut buf), Some(101));
     }
 
     #[test]

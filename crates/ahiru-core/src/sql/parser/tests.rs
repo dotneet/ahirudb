@@ -59,6 +59,9 @@ fn r(a: &ExprArena, id: ExprId) -> String {
         ),
         Expr::Literal(v) => lit(v),
         Expr::IntervalLiteral(v) => format!("INTERVAL({}i128)", v),
+        Expr::TypedLiteral(v, Ty::Decimal { precision, scale }) => {
+            format!("{v:?}::DECIMAL({precision},{scale})")
+        }
         Expr::TypedLiteral(v, ty) => format!("{v:?}::{}", ty.name()),
         Expr::Param(n) => format!("?{}", n),
         Expr::ColumnRef { qualifier, name } => match qualifier {
@@ -950,10 +953,19 @@ fn integer_literal_widths() {
         ex("-170141183460469231731687303715884105728"),
         "-170141183460469231731687303715884105728i128"
     );
-    assert_eq!(code("SELECT 170141183460469231731687303715884105728"), Code::NumberOverflow as u16);
+    // Past HUGEINT an integer literal is a DOUBLE, as in DuckDB (which has a UHUGEINT
+    // step in between): `SELECT typeof(1000000000000000000000000000000000000000000)`.
     assert_eq!(
-        code("SELECT 99999999999999999999999999999999999999999"),
-        Code::NumberOverflow as u16
+        ex("170141183460469231731687303715884105728"),
+        "170141183460469230000000000000000000000f64"
+    );
+    assert_eq!(
+        ex("99999999999999999999999999999999999999999"),
+        "100000000000000000000000000000000000000000f64"
+    );
+    assert_eq!(
+        ex("-170141183460469231731687303715884105729"),
+        "-170141183460469230000000000000000000000f64"
     );
     // A unary minus folds, but against an expression it stays an ordinary operator.
     assert_eq!(ex("-(1)"), "(- 1i32)");
@@ -961,7 +973,19 @@ fn integer_literal_widths() {
 
 #[test]
 fn other_literals() {
-    assert_eq!(ex("1.5"), "1.5f64");
+    // A decimal point without an exponent is an exact DECIMAL whose width counts every
+    // digit written, as in DuckDB (`typeof(1.5)` is `DECIMAL(2,1)`, `typeof(0.000)` is
+    // `DECIMAL(4,3)`); an exponent, or more than 38 digits, makes a DOUBLE.
+    assert_eq!(ex("1.5"), "I64(15)::DECIMAL(2,1)");
+    assert_eq!(ex("0.000"), "I64(0)::DECIMAL(4,3)");
+    assert_eq!(
+        ex("1234567890123456789012345678901234567.8"),
+        "I128(12345678901234567890123456789012345678)::DECIMAL(38,1)"
+    );
+    assert_eq!(
+        ex("12345678901234567890123456789012345678.9"),
+        "12345678901234568000000000000000000000f64"
+    );
     assert_eq!(ex("1e3"), "1000f64");
     assert_eq!(ex("1.5e-2"), "0.015f64");
     assert_eq!(ex("TRUE"), "true");
@@ -3028,8 +3052,8 @@ fn underscore_digit_separators_in_numeric_literals() {
     assert_eq!(ex("1_000 + 1"), "(1000i32 + 1i32)");
     assert_eq!(ex("1_0_0"), "100i32");
     assert_eq!(ex("1_000_000"), "1000000i32");
-    assert_eq!(ex("1_000.5"), "1000.5f64");
-    assert_eq!(ex("1.0_5"), "1.05f64");
+    assert_eq!(ex("1_000.5"), "I64(10005)::DECIMAL(5,1)");
+    assert_eq!(ex("1.0_5"), "I64(105)::DECIMAL(3,2)");
     assert_eq!(ex("1e1_0"), "10000000000f64");
     // Leading, trailing, doubled, and point/exponent-adjacent underscores all
     // end the number, leaving an identifier behind -- exactly as in duckdb,
@@ -3047,10 +3071,10 @@ fn underscore_digit_separators_in_numeric_literals() {
 #[test]
 fn leading_dot_float_literals() {
     // duckdb: `SELECT .5` -> 0.5, `SELECT .5 + 1` -> 1.5. `5.` already worked.
-    assert_eq!(ex(".5"), "0.5f64");
-    assert_eq!(ex(".5 + 1"), "(0.5f64 + 1i32)");
+    assert_eq!(ex(".5"), "I64(5)::DECIMAL(1,1)");
+    assert_eq!(ex(".5 + 1"), "(I64(5)::DECIMAL(1,1) + 1i32)");
     assert_eq!(ex(".5e1"), "5f64");
-    assert_eq!(ex("5."), "5f64");
+    assert_eq!(ex("5."), "I64(5)::DECIMAL(1,0)");
     // A `.` not followed by a digit is still the qualification separator, and a
     // digit after a qualified name is still a syntax error (as in duckdb).
     assert_eq!(ex("t.c"), "t.c");

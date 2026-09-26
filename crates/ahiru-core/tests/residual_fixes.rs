@@ -138,8 +138,8 @@ fn unify_matches_duckdbs_decimal_result_types() {
     assert_eq!(Ty::unify(d(4, 1), Ty::HugeInt), Some(d(38, 1)));
     // Order must not matter.
     assert_eq!(Ty::unify(Ty::HugeInt, d(4, 1)), Some(d(38, 1)));
-    // Unsigned integers carry the same digit counts as their signed partners.
-    assert_eq!(Ty::unify(d(4, 1), Ty::UBigInt), Some(d(21, 1)));
+    // UBIGINT's maximum has one digit more than BIGINT's. duckdb: DECIMAL(22,1).
+    assert_eq!(Ty::unify(d(4, 1), Ty::UBigInt), Some(d(22, 1)));
     assert_eq!(Ty::unify(d(4, 1), Ty::TinyInt), Some(d(5, 1)));
 }
 
@@ -154,9 +154,10 @@ fn unify_still_widens_integers_and_floats_the_way_it_did() {
     // Two DECIMALs: align the scales and carry one digit. duckdb: DECIMAL(6,2).
     assert_eq!(Ty::unify(d(4, 1), d(5, 2)), Some(d(6, 2)));
     assert_eq!(Ty::unify(d(4, 1), d(4, 1)), Some(d(4, 1)));
-    // DECIMAL with floating point still drops to DOUBLE, in both orders.
+    // DECIMAL with floating point becomes that floating-point type, in both orders
+    // (duckdb: `typeof(1.5 + 1::FLOAT)` is FLOAT).
     assert_eq!(Ty::unify(d(4, 1), Ty::Double), Some(Ty::Double));
-    assert_eq!(Ty::unify(Ty::Float, d(4, 1)), Some(Ty::Double));
+    assert_eq!(Ty::unify(Ty::Float, d(4, 1)), Some(Ty::Float));
     // NULL still passes the other side through untouched.
     assert_eq!(Ty::unify(Ty::Null, d(4, 1)), Some(d(4, 1)));
 }
@@ -179,21 +180,21 @@ fn decimal_and_decimal_arithmetic_is_unchanged() {
 fn window_sum_over_doubles_is_compensated() {
     // duckdb: 1.0. Naive summation lands on 0.9999999999999999.
     assert_eq!(
-        double_of("SELECT sum(x) OVER () FROM (SELECT 0.1 AS x FROM range(10)) LIMIT 1"),
+        double_of("SELECT sum(x) OVER () FROM (SELECT 0.1::DOUBLE AS x FROM range(10)) LIMIT 1"),
         1.0
     );
     // The blocking aggregate over the identical rows must agree.
-    assert_eq!(double_of("SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(10))"), 1.0);
+    assert_eq!(double_of("SELECT sum(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(10))"), 1.0);
 }
 
 #[test]
 fn window_avg_over_doubles_is_compensated() {
     // duckdb: 0.1
     assert_eq!(
-        double_of("SELECT avg(x) OVER () FROM (SELECT 0.1 AS x FROM range(10)) LIMIT 1"),
+        double_of("SELECT avg(x) OVER () FROM (SELECT 0.1::DOUBLE AS x FROM range(10)) LIMIT 1"),
         0.1
     );
-    assert_eq!(double_of("SELECT avg(x) FROM (SELECT 0.1 AS x FROM range(10))"), 0.1);
+    assert_eq!(double_of("SELECT avg(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(10))"), 0.1);
 }
 
 /// The frame advances one peer group at a time and the accumulator is reused across
@@ -213,7 +214,7 @@ fn a_running_window_sum_stays_compensated_at_every_step() {
     let rows = run(
         &mut s,
         "SELECT sum(x) OVER (ORDER BY i) AS s \
-         FROM (SELECT i, 0.1 AS x FROM range(10) t(i)) ORDER BY s",
+         FROM (SELECT i, 0.1::DOUBLE AS x FROM range(10) t(i)) ORDER BY s",
     );
     let running: Vec<f64> = rows
         .iter()
@@ -225,7 +226,8 @@ fn a_running_window_sum_stays_compensated_at_every_step() {
     assert_eq!(running.len(), 10);
     for (i, got) in running.iter().enumerate() {
         let n = i + 1;
-        let blocking = double_of(&format!("SELECT sum(x) FROM (SELECT 0.1 AS x FROM range({n}))"));
+        let blocking =
+            double_of(&format!("SELECT sum(x) FROM (SELECT 0.1::DOUBLE AS x FROM range({n}))"));
         assert_eq!(*got, blocking, "running sum after {n} rows");
     }
     // The full frame is the headline case: 1.0, not the naive 0.9999999999999999.

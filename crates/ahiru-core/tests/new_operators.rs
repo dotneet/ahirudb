@@ -516,8 +516,8 @@ fn at_prefix_matches_abs_on_literals_and_table_data() {
         ]
     );
     let mut dual = session_with_dual();
-    let rows = run(&mut dual, "SELECT @(-5.5) FROM dual");
-    assert_eq!(rows, vec![vec![Value::F64(5.5)]]);
+    let rows = run(&mut dual, "SELECT @(-5.5e0), @(-5.5) = 5.5 FROM dual");
+    assert_eq!(rows, vec![vec![Value::F64(5.5), Value::Bool(true)]]);
 }
 
 // --- ! postfix factorial / factorial() --------------------------------------

@@ -895,8 +895,10 @@ fn json_encodable(t: Ty) -> bool {
 fn anyn(id: FuncId, args: &[Ty], lo: usize) -> Result<(FuncId, Vec<Ty>, Ty)> {
     ensure!(args.len() >= lo, WrongArgCount);
     let mut t = Ty::Null;
+    // `nullif` compares its arguments, so it keeps the comparison type; the rest merge values.
+    let unify = if id == F_NULLIF { Ty::unify } else { Ty::unify_value };
     for &a in args {
-        t = match Ty::unify(t, a) {
+        t = match unify(t, a) {
             Some(u) => u,
             None => err!(TypeMismatch),
         };

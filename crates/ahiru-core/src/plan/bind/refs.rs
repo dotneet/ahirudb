@@ -172,7 +172,10 @@ pub(super) fn numeric_ordinal_of(arena: &ExprArena, id: ExprId) -> Option<Numeri
             // Beyond i64 it cannot be a valid position either way.
             Err(_) => NumericTerm::Fractional,
         }),
-        Expr::Literal(Value::F64(_)) => Some(NumericTerm::Fractional),
+        // `1.5` is a DECIMAL literal (`sql::parser::types::decimal_literal`), `1e0` a DOUBLE.
+        Expr::Literal(Value::F64(_)) | Expr::TypedLiteral(_, Ty::Decimal { .. }) => {
+            Some(NumericTerm::Fractional)
+        }
         Expr::Unary { op: UnaryOp::Neg, arg } => match numeric_ordinal_of(arena, *arg)? {
             NumericTerm::Int(v) => Some(NumericTerm::Int(v.checked_neg()?)),
             NumericTerm::Fractional => Some(NumericTerm::Fractional),

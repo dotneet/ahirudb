@@ -124,10 +124,12 @@ fn underscore_separators_and_leading_dot_floats() {
     assert_eq!(one(&mut db, "SELECT 1_000 FROM t"), Value::I32(1000));
     assert_eq!(one(&mut db, "SELECT 1_000 + 1 FROM t"), Value::I32(1001));
     assert_eq!(one(&mut db, "SELECT 1_000_000 FROM t"), Value::I32(1_000_000));
-    assert_eq!(one(&mut db, "SELECT 1_000.5 FROM t"), Value::F64(1000.5));
+    // A literal with a decimal point is a DECIMAL, held as its scaled integer:
+    // 1000.5 is DECIMAL(5,1) 10005.
+    assert_eq!(one(&mut db, "SELECT 1_000.5 FROM t"), Value::I64(10005));
     // duckdb: `.5` -> 0.5, `.5 + 1` -> 1.5.
-    assert_eq!(one(&mut db, "SELECT .5 FROM t"), Value::F64(0.5));
-    assert_eq!(one(&mut db, "SELECT .5 + 1 FROM t"), Value::F64(1.5));
+    assert_eq!(one(&mut db, "SELECT .5 FROM t"), Value::I64(5));
+    assert_eq!(one(&mut db, "SELECT .5 + 1 FROM t"), Value::I64(15));
     // `LIMIT` goes through a separate integer reader, which skips separators too.
     assert_eq!(run(&mut db, "SELECT id FROM t LIMIT 1_000").len(), 1);
 }

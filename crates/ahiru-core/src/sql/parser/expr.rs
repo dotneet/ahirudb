@@ -1,7 +1,7 @@
 //! Expression parsing: Pratt precedence climbing, prefix/primary/postfix,
 //! CAST, CASE, window function calls, lambdas, and literal parsing helpers.
 use super::types::{
-    comparison_binop, float_literal, int_literal, is_lambda_func, lookup_interval_unit,
+    comparison_binop, decimal_literal, int_literal, is_lambda_func, lookup_interval_unit,
     lookup_type, parse_interval_text, parse_signed_int, temporal_literal_ty, unit_to_interval,
     unquote,
 };
@@ -720,9 +720,8 @@ impl<'a> Parser<'a> {
                 Expr::Literal(v)
             }
             Tok::Float(t) => {
-                let v = float_literal(t, pos)?;
                 self.bump()?;
-                Expr::Literal(v)
+                decimal_literal(t, pos)?
             }
             Tok::Str(s) => {
                 let v = Value::Bytes(unquote(s, b'\'').into_bytes());
