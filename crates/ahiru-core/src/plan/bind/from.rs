@@ -59,6 +59,25 @@ impl FromTree {
             }
         }
     }
+
+    /// Marks every column on the NULL-padded side of an outer join nullable (the right side of
+    /// a LEFT JOIN, the left of a RIGHT JOIN, both of a FULL JOIN). A `NOT NULL` column there
+    /// still produces NULLs, and `DESCRIBE`, the `NOT IN` anti-join choice and the writers all
+    /// read `Field::nullable`.
+    pub(super) fn mark_outer_nullable(&self, rels: &mut [Rel], padded: bool) {
+        match self {
+            FromTree::Rel(i) => {
+                if padded {
+                    rels[*i].all.iter_mut().for_each(|f| f.nullable = true);
+                }
+            }
+            FromTree::Join { left, right, kind, .. } => {
+                let full = *kind == JoinKind::Full;
+                left.mark_outer_nullable(rels, padded || full || *kind == JoinKind::Right);
+                right.mark_outer_nullable(rels, padded || full || *kind == JoinKind::Left);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -127,8 +146,8 @@ pub(super) fn flatten_from(
         // `format` is intentionally not consulted here — it only records
         // which surface syntax was used; this engine cannot re-dispatch
         // parsing at bind time (see `FromItem::File` doc for why).
-        FromItem::File { path, alias, .. } => {
-            let i = match catalog.index_of(path) {
+        FromItem::File { path, format, alias } => {
+            let i = match catalog.path_index_of(path, *format) {
                 Some(i) => i,
                 None => err!(TableNotFound),
             };
@@ -303,7 +322,10 @@ fn push_view_rel(
     view_ctes.view_depth = ctes.view_depth + 1;
     view_ctes.now_micros = ctes.now_micros;
     let plan = bind_query_in(catalog, &parsed.arena, &q, params, &mut view_ctes, None)?;
-    let all = plan.root.schema().to_vec();
+    let mut all = plan.root.schema().to_vec();
+    // A view's columns are named like a stored table's: duplicate output names become
+    // `a`, `a_1`, ... (DuckDB), so each one stays addressable instead of ambiguous.
+    Catalog::dedup_column_names(&mut all);
     rels.push(Rel {
         table: None,
         alias,
@@ -530,7 +552,7 @@ pub fn resolve_from(catalog: &Catalog, from: &FromItem) -> Result<usize> {
             Some(i) => Ok(i),
             None => err!(TableNotFound),
         },
-        FromItem::File { path, .. } => match catalog.index_of(path) {
+        FromItem::File { path, format, .. } => match catalog.path_index_of(path, *format) {
             Some(i) => Ok(i),
             None => err!(TableNotFound),
         },
@@ -727,7 +749,7 @@ fn referenced_tables_at(
             }
             err!(TableNotFound)
         }
-        FromItem::File { path, .. } => match catalog.index_of(path) {
+        FromItem::File { path, format, .. } => match catalog.path_index_of(path, *format) {
             Some(i) => {
                 push(i);
                 Ok(())

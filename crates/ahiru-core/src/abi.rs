@@ -13,8 +13,18 @@
 //! ```
 //!
 //! Strings are passed as a UTF-8 pointer plus length. Errors return only a code
-//! (`u32`), and message strings are assembled by the table on the JS side. That
-//! alone keeps roughly 20 KB of message strings out of the wasm.
+//! (`u32`, plus `ahiru_last_error_pos`), and message strings are assembled by the
+//! table on the JS side. That alone keeps roughly 20 KB of message strings out of
+//! the wasm.
+//!
+//! Table binding is driven by the engine, not by the host reading SQL text:
+//! the host declares every registration up front without I/O (`ahiru_register_as`
+//! with an unknown length), the engine asks for the length of the tables it
+//! actually resolves (a size request inside `NEED_IO`, answered by
+//! `ahiru_set_size`), and `ahiru_query_start` reports string-literal paths no
+//! table is registered under (`START_NEED_TABLES`). Bytes fetched for a query are
+//! dropped from the wasm heap when its last open query closes; the host's range
+//! cache serves them to the next one (DESIGN.md §6).
 
 use alloc::string::ToString;
 use core::cell::UnsafeCell;
@@ -30,6 +40,19 @@ pub const STATUS_DONE: i32 = 2;
 pub const STATUS_ERROR: i32 = 3;
 /// Asks the host to decompress a codec that is not built in.
 pub const STATUS_NEED_CODEC: i32 = 4;
+
+/// `ahiru_query_start`'s return value when the statement names a file path or URL
+/// (`FROM 'x.parquet'`, `parquet('https://…')`) that no table is registered under.
+/// The out buffer lists them (`encode_missing`); a host that registers them
+/// (`ahiru_register_as` with [`FORMAT_PATH`]) calls `ahiru_query_start` again.
+/// This lets the host bind exactly what the engine resolves instead of scanning
+/// the SQL text itself.
+pub const START_NEED_TABLES: i32 = -3;
+
+/// Flag bit in `ahiru_register_as`'s `format` argument: `name` is a path a SQL
+/// string literal referenced, registered case-sensitively
+/// (`Catalog::register_path`) instead of as an identifier.
+pub const FORMAT_PATH: u32 = 0x100;
 
 /// The magic placed at the head of the result buffer. Kept in sync with the JS-side decoder.
 const RESULT_MAGIC: u32 = 0x4148_5231; // "AHR1"
@@ -54,6 +77,9 @@ struct State {
     /// once more (the classic ABA problem).
     query_generations: Vec<u32>,
     last_error: u32,
+    /// `Error::pos` of the last error: a byte offset into the SQL for syntax
+    /// errors, `u32::MAX` when the error carries no position.
+    last_error_pos: u32,
     /// The buffer returned by `ahiru_result` / `ahiru_io_requests`.
     /// It must stay alive until the next call, hence living here.
     out: Vec<u8>,
@@ -120,6 +146,7 @@ fn state() -> &'static mut State {
             queries: Vec::new(),
             query_generations: Vec::new(),
             last_error: 0,
+            last_error_pos: u32::MAX,
             out: Vec::new(),
         });
     }
@@ -131,19 +158,35 @@ fn state() -> &'static mut State {
 }
 
 fn fail<T>(e: crate::error::Error, fallback: T) -> T {
-    state().last_error = e.code_u16() as u32;
+    let st = state();
+    st.last_error = e.code_u16() as u32;
+    st.last_error_pos = e.pos;
     fallback
 }
 
 /// Clears the previous error at each entry point. Without this, a stale code could
 /// be read after a successful call.
 fn clear_error() {
-    state().last_error = 0;
+    let st = state();
+    st.last_error = 0;
+    st.last_error_pos = u32::MAX;
 }
 
 fn fail_code<T>(code: crate::error::Code, fallback: T) -> T {
-    state().last_error = code as u16 as u32;
-    fallback
+    fail(crate::error::Error::new(code), fallback)
+}
+
+/// Drops the bytes fetched for session `index`'s host-served tables once none of
+/// its queries is open any more (`Source::release`): the host keeps its own
+/// range cache (DESIGN.md §6), and keeping them here grew the wasm heap with
+/// every column ever read until `memoryLimit` failed every later query.
+fn release_if_idle(st: &mut State, index: usize) {
+    if st.queries.iter().flatten().any(|q| q.session == index) {
+        return;
+    }
+    if let Some(Some(s)) = st.sessions.get_mut(index) {
+        s.release_fetched();
+    }
 }
 
 // --- Memory -----------------------------------------------------------------
@@ -323,7 +366,14 @@ pub unsafe extern "C" fn ahiru_register(
 ///
 /// Extension inference forces the table name to carry an extension (you would have to
 /// write `FROM "logs.csv"`). This entry point exists so the name and how it is read
-/// can be separated. `format` is 0=Auto, 1=Parquet, 2=Csv, 3=Tsv, 4=Jsonl, 5=Json.
+/// can be separated. `format` is 0=Auto, 1=Parquet, 2=Csv, 3=Tsv, 4=Jsonl, 5=Json,
+/// optionally OR-ed with [`FORMAT_PATH`] to register a path a SQL string literal
+/// named (case-sensitively) rather than an identifier.
+///
+/// `total_len` may be `u64::MAX` (`catalog::SIZE_UNKNOWN`): the table is then
+/// declared without I/O, and the first query that resolves it asks for the length
+/// with a size request (an I/O request at offset `u64::MAX` with length 0),
+/// answered by `ahiru_set_size`.
 ///
 /// # Safety
 /// `name` must point at `name_len` bytes of valid UTF-8.
@@ -341,13 +391,29 @@ pub unsafe extern "C" fn ahiru_register_as(
         Ok(s) => s,
         Err(_) => return fail_code(crate::error::Code::Internal, -1),
     };
-    let kind = match format_kind(format) {
+    let kind = match format_kind(format & !FORMAT_PATH) {
         Ok(k) => k,
         Err(e) => return fail(e, -1),
     };
+    let r = match session(h) {
+        Some(s) if format & FORMAT_PATH != 0 => s.register_remote_path(name, total_len, kind),
+        Some(s) => s.register_remote_as(name, total_len, kind),
+        None => return fail_code(crate::error::Code::Internal, -1),
+    };
+    match r {
+        Ok(i) => i as i32,
+        Err(e) => fail(e, -1),
+    }
+}
+
+/// Answers a size request (see `ahiru_register_as`): records `total_len` for a
+/// part declared with an unknown length. Returns 0, or -1 on error.
+#[no_mangle]
+pub extern "C" fn ahiru_set_size(h: i32, table: u32, part: u32, total_len: u64) -> i32 {
+    clear_error();
     match session(h) {
-        Some(s) => match s.register_remote_as(name, total_len, kind) {
-            Ok(i) => i as i32,
+        Some(s) => match s.set_size(table as usize, part as usize, total_len) {
+            Ok(()) => 0,
             Err(e) => fail(e, -1),
         },
         None => fail_code(crate::error::Code::Internal, -1),
@@ -487,7 +553,15 @@ pub unsafe extern "C" fn ahiru_query_start(
         Some(s) => s,
         None => return fail_code(crate::error::Code::Internal, -1),
     };
-    match s.prepare(sql, &params) {
+    let r = s.prepare(sql, &params);
+    // A path nobody registered is reported before anything else: the statement
+    // cannot succeed without it, and the host may be able to register it.
+    let missing = s.catalog.take_missing();
+    if !missing.is_empty() && !matches!(r, Ok(Prepared::Ready(_))) {
+        state().out = encode_missing(&missing);
+        return START_NEED_TABLES;
+    }
+    match r {
         Ok(Prepared::Ready(q)) => {
             let st = state();
             // Reuse the first closed slot instead of growing forever: a
@@ -529,7 +603,10 @@ pub unsafe extern "C" fn ahiru_query_start(
             st.out = encode_io(&io);
             -2
         }
-        Err(e) => fail(e, -1),
+        Err(e) => {
+            release_if_idle(state(), session_index);
+            fail(e, -1)
+        }
     }
 }
 
@@ -588,6 +665,7 @@ pub extern "C" fn ahiru_query_step(q: i32) -> i32 {
         Ok(QueryStep::Done) => STATUS_DONE,
         Err(e) => {
             st.last_error = e.code_u16() as u32;
+            st.last_error_pos = e.pos;
             STATUS_ERROR
         }
     };
@@ -606,7 +684,9 @@ pub extern "C" fn ahiru_query_close(q: i32) {
         return;
     }
     if let Some(slot) = st.queries.get_mut(index) {
-        *slot = None;
+        if let Some(closed) = slot.take() {
+            release_if_idle(st, closed.session);
+        }
     }
     if let Some(g) = st.query_generations.get_mut(index) {
         *g = next_query_generation(*g);
@@ -639,6 +719,55 @@ pub extern "C" fn ahiru_out_len() -> usize {
 #[no_mangle]
 pub extern "C" fn ahiru_last_error() -> u32 {
     state().last_error
+}
+
+/// Where the last error happened, when the error knows: a byte offset into the
+/// SQL text for syntax errors (an offset into the file for some data errors).
+/// `u32::MAX` when there is no position.
+#[no_mangle]
+pub extern "C" fn ahiru_last_error_pos() -> u32 {
+    state().last_error_pos
+}
+
+/// Moves a `COPY ... TO` result into the out buffer:
+/// `[path_len:u32][path][data]`. `ahiru-core` never touches a file system, so the
+/// host writes `data` to `path` itself. Returns the buffer length, 0 when the
+/// statement was not a `COPY`, or -1 for a bad handle.
+#[cfg(feature = "export")]
+#[no_mangle]
+pub extern "C" fn ahiru_copy_result(q: i32) -> isize {
+    clear_error();
+    let st = state();
+    let Some((index, gen)) = split_query_handle(q) else {
+        return fail_code(crate::error::Code::Internal, -1);
+    };
+    if st.query_generations.get(index).copied() != Some(gen) {
+        return fail_code(crate::error::Code::Internal, -1);
+    }
+    let copy = match st.queries.get_mut(index).and_then(|s| s.as_mut()) {
+        Some(slot) => slot.query.copy.take(),
+        None => return fail_code(crate::error::Code::Internal, -1),
+    };
+    let Some(c) = copy else { return 0 };
+    let mut out = Vec::with_capacity(4 + c.path.len() + c.data.len());
+    put_u32(&mut out, c.path.len() as u32);
+    out.extend_from_slice(c.path.as_bytes());
+    out.extend_from_slice(&c.data);
+    st.out = out;
+    st.out.len() as isize
+}
+
+/// How many in-memory tables and views (`ddl`) the session holds. A host that
+/// has to replace a trapped wasm instance uses it to tell whether doing so
+/// would silently lose state it cannot rebuild.
+#[cfg(feature = "ddl")]
+#[no_mangle]
+pub extern "C" fn ahiru_ddl_object_count(h: i32) -> i32 {
+    clear_error();
+    match session(h) {
+        Some(s) => (s.catalog.mem_names().count() + s.catalog.view_names().count()) as i32,
+        None => fail_code(crate::error::Code::Internal, -1),
+    }
 }
 
 /// How many bytes the heap currently holds.
@@ -759,6 +888,21 @@ fn decode_params(buf: &[u8]) -> Result<Vec<crate::vector::Value>> {
     // valid and can hide a host-side framing bug.
     ensure!(pos == buf.len(), BadThrift);
     Ok(out)
+}
+
+/// The paths `ahiru_query_start` could not find:
+/// `[count:u32]{ format:u32, path_len:u32, path_bytes }...`. `format` is the
+/// `format_kind` code the SQL asked for (`read_csv` gives Csv, a bare
+/// `'x.jsonl'` gives Jsonl, `parquet(...)` gives Parquet).
+fn encode_missing(missing: &[(String, crate::format::FormatKind)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, missing.len() as u32);
+    for (path, format) in missing {
+        put_u32(&mut out, *format as u32);
+        put_u32(&mut out, path.len() as u32);
+        out.extend_from_slice(path.as_bytes());
+    }
+    out
 }
 
 /// The list of I/O requests. `[count][{table,part,offset,len}...]`

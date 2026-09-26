@@ -56,6 +56,26 @@ SELECT epoch_ms(ts), epoch_us(ts), epoch_ns(ts) FROM t LIMIT 1;
 equivalent `date_part(...)` call. `week` uses ISO 8601 week numbering
 (`date_trunc('week', ...)` treats Monday as the start of the week).
 
+A `DATE` argument works over DuckDB's whole `DATE` range (years
+-5877641 to 5881580), not just the part a `TIMESTAMP` can hold:
+`year(DATE '300000-01-01')` is `300000`, and `dayname`, `last_day`,
+`date_diff` and `strftime` work there too.
+
+A `TIME` has only the time-of-day parts — `hour`, `minute`, `second`,
+`millisecond`, `microsecond`, `epoch` (`hour(TIME '10:20:30')` is 10);
+asking it for `year`, `day`, `dow`, ... is an error, as in DuckDB.
+
+An `INTERVAL` is split into its own fields with truncating division, as
+DuckDB does: `year` is months / 12 and `month` months % 12
+(`year(INTERVAL '30 months')` is 2, `month(...)` 6), `quarter` is
+`month / 3 + 1`, `decade`/`century`/`millennium` count whole years, `day`
+is the day field alone, `hour` is the whole hours of the time field (days
+are not folded in: `hour(INTERVAL '1 day 25 hours')` is 25), and `minute`,
+`second`, `millisecond`, `microsecond` count within the hour or minute like
+a clock. `epoch` counts a year as 365.25 days and a month as 30 days
+(`date_part('epoch', INTERVAL '1 year')` is 31557600). `dow`, `doy`,
+`week`, `isodow` and `isoyear` of an interval are errors.
+
 Part names are case-insensitive, a trailing `s` is ignored (`years` =
 `year`), and DuckDB's abbreviations are accepted:
 `y`/`yr`/`yrs`, `mon`/`mons`, `d`/`dayofmonth`, `h`/`hr`/`hrs`,
@@ -74,8 +94,13 @@ Part names are case-insensitive, a trailing `s` is ignored (`years` =
 | `millennium` | Same 1-based counting, so 2024 → 3 and year 0 → -1 |
 | `decade` | `year / 10`, truncating toward zero: 2021 → 202, -84 → -8, -9 → 0 |
 
-The same part names work with `date_trunc`/`date_diff`/`date_add`
-(`isodow` excepted — there is nothing to truncate or add there).
+The same part names work with `date_trunc` and `date_diff`. There, as in
+DuckDB, the day-level parts `dow`/`weekday`, `isodow` and `doy` mean a
+plain day (`date_diff('dow', DATE '2024-01-01', DATE '2024-01-10')` is 9,
+and `date_trunc('doy', ts)` truncates to the day), and `epoch` means a
+second. `date_add` takes the calendar units only (`year` through
+`microsecond`, `decade`, `century`, `millennium`), not `dow`, `doy`,
+`isodow`, `isoyear` or `epoch`.
 
 **`century`/`millennium` mean something different in `date_trunc` and
 `date_diff` than in `date_part`** — this is DuckDB's own inconsistency and
@@ -108,8 +133,9 @@ only — the engine carries no locale data.
 ## Truncating, formatting, parsing
 
 ```sql
-SELECT date_trunc('month', d) FROM t LIMIT 1;   -- always returns TIMESTAMP, even truncating a DATE
+SELECT date_trunc('month', d) FROM t LIMIT 1;   -- TIMESTAMP, even truncating a DATE (TIMESTAMPTZ for a TIMESTAMPTZ)
 SELECT strftime(d, '%Y-%m-%d') FROM t LIMIT 1;  -- only %Y %m %d %H %M %S %% are interpreted
+SELECT strftime('%Y-%m-%d', d) FROM t LIMIT 1;  -- the format may also come first, as in DuckDB
 SELECT to_date('2024-05-01');                   -- strict YYYY-MM-DD
 SELECT to_timestamp('2024-05-01 10:00:00');     -- YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]][zone]
 SELECT make_date(2024, 2, 29);                  -- 2024-02-29 (a DATE)
@@ -133,10 +159,13 @@ argument (fractional seconds) for the six-argument form is not provided;
 add an `INTERVAL` for those.
 
 **Text → `DATE`/`TIMESTAMP` casts** accept the same shapes as DuckDB:
-`YYYY-MM-DD`, optionally followed by `T` or one or more spaces and a
+`YYYY-MM-DD` — the separator may also be `/`, a space or `\`, as long as
+both are the same (`'2024/1/5'`, `'2024 01 05'`), and the year may have up
+to 7 digits — optionally followed by `T` or one or more spaces and a
 `HH:MM[:SS[.ffffff]]` time, optionally followed by a zone suffix (`Z`,
-`[+-]HH[[:]MM]`, or a separate ` UTC` word — the offset is only validated,
-never applied, because `TIMESTAMP` has no zone). A trailing `.` with no
+`±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS`, or a separate ` UTC` word — the
+offset is only validated, never applied, because `TIMESTAMP` has no zone;
+a `TIMESTAMPTZ` cast applies it). A trailing `.` with no
 digits after the seconds is accepted and means zero. A cast to `DATE`
 accepts a timestamp-shaped string and keeps only the date part, so an ISO
 timestamp column casts to `DATE` cleanly:
@@ -147,7 +176,8 @@ DuckDB's habit of ignoring arbitrary trailing text in a `DATE` cast
 
 `strftime` only understands `%Y`/`%m`/`%d`/`%H`/`%M`/`%S`/`%%` — it is not
 a full strftime implementation; unrecognized specifiers pass through as
-literal text rather than erroring. `to_timestamp` of a number is DuckDB's:
+literal text rather than erroring. `%Y` zero-pads a year to four digits but
+writes a year before 0 unpadded (`-44`), as DuckDB does. `to_timestamp` of a number is DuckDB's:
 epoch seconds to a `TIMESTAMPTZ`, rounded half to even to whole
 microseconds (`NULL` for `NaN`/infinity or out of range, where DuckDB
 raises). `to_timestamp` of a string is additionally a **string parser**
@@ -161,7 +191,13 @@ SELECT date_add('month', 1, d) FROM t LIMIT 1;   -- date_add(part, n, timestamp)
 SELECT date_diff('day', d, d + INTERVAL 5 DAY) FROM t LIMIT 1;
 SELECT last_day(d) FROM t LIMIT 1;               -- last day of the month, as a DATE
 SELECT CAST('2024-01-01' AS DATE) + INTERVAL 1 DAY;  -- ordinary +/- with an INTERVAL also works
+SELECT ts2 - ts1 FROM t LIMIT 1;                 -- TIMESTAMP - TIMESTAMP is an INTERVAL
+SELECT TIME '23:00' + INTERVAL 2 HOUR;           -- 01:00:00
+SELECT DATE '2024-01-01' + TIME '10:00';         -- 2024-01-01 10:00:00
 ```
+
+The full list of operators on dates, times and intervals is in
+[types.md](types.md#interval-arithmetic).
 
 `date_add(part, n, timestamp)` deliberately does **not** match DuckDB's
 `date_add(timestamp, INTERVAL ...)` signature — there's no scalar-function

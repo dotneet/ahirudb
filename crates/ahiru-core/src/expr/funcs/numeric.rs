@@ -1,5 +1,7 @@
 //! Integer output and floating-point output
-use super::datetime::{civil, date_add, date_diff, date_part, date_trunc, days_in_month};
+use super::datetime::{
+    arg_civil, date_add, date_diff, date_trunc, days_in_month, part_of, temporal_op, time_part,
+};
 use super::json::json_extract_or_whole;
 use super::string::{cp_count, find};
 use super::*;
@@ -10,7 +12,7 @@ use super::*;
 pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
     // Shorthands such as year(). The part number is embedded in the ID.
     if id >= F_PART_BASE {
-        return Ok(date_part((id - F_PART_BASE) as u8, a.int(0)));
+        return part_of(a, 0, (id - F_PART_BASE) as u8);
     }
     Ok(match id {
         F_LENGTH => Some(cp_count(a.bytes(0)) as i64),
@@ -129,12 +131,14 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
             found => found,
         },
         F_DATE_PART => match part_id(a.bytes(0)) {
-            Some(p) => date_part(p, a.int(1)),
+            Some(p) => part_of(a, 1, p)?,
             None => err!(TypeMismatch),
         },
         F_DATE_DIFF => match part_id(a.bytes(0)) {
-            Some(p) => date_diff(p, a.int(1), a.int(2))?,
-            None => err!(TypeMismatch),
+            Some(p) if a.ty(1) != Ty::Time || time_part(p) => {
+                date_diff(p, &arg_civil(a, 1), &arg_civil(a, 2))?
+            }
+            _ => err!(TypeMismatch),
         },
         F_DATE_TRUNC => match part_id(a.bytes(0)) {
             Some(p) => date_trunc(p, a.int(1))?,
@@ -144,10 +148,11 @@ pub(super) fn eval_int(id: FuncId, a: &A, res: Ty) -> Result<Option<i64>> {
             Some(p) => date_add(p, a.int(1), a.int(2))?,
             None => err!(TypeMismatch),
         },
+        F_TIME_ADD_IV | F_DATE_ADD_TIME => temporal_op(id, a).map(|v| v as i64),
         F_TO_DATE => parse_date(a.bytes(0)),
         F_TO_TIMESTAMP => parse_timestamp(a.bytes(0)),
         F_LAST_DAY => {
-            let c = civil(a.int(0));
+            let c = arg_civil(a, 0);
             Some(days_from_civil(c.y, c.mo, days_in_month(c.y, c.mo)))
         }
         F_JSON_ARRAY_LENGTH => {
@@ -173,6 +178,7 @@ pub(super) fn eval_i128(id: FuncId, a: &A, res: Ty) -> Result<Option<i128>> {
     Ok(match id {
         F_FACTORIAL => Some(factorial(a.int(0))?),
         F_GCD | F_LCM => gcd_lcm(id, a.i128(0), a.i128(1)),
+        F_TS_SUB | F_IV_MUL_F | F_IV_DIV_F => temporal_op(id, a),
         F_ABS_I => a.i128(0).checked_abs(),
         F_ROUND_I => {
             let d = if a.n() >= 2 { a.int(1) } else { 0 };

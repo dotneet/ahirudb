@@ -298,3 +298,69 @@ fn a_partition_key_that_is_also_a_real_column_keeps_the_files_own_column() {
     let rows = run_all("SELECT count(*) FROM t WHERE month = '02'", &mut sess);
     assert_eq!(rows, vec![vec![Value::I64(1)]]);
 }
+
+#[test]
+fn a_null_partition_value_is_sql_null() {
+    // DuckDB's `PARTITION_BY` writes a NULL key as `k=NULL`, and reads it back as SQL NULL.
+    // `NULL` carries no type evidence, so the integral siblings keep `k` numeric. (DuckDB 1.4.4
+    // widens `k` to VARCHAR here; the values are the same.)
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![
+            ("d/k=1/f.csv".into(), b"v\n1\n".to_vec()),
+            ("d/k=NULL/f.csv".into(), b"v\n2\n".to_vec()),
+            ("d/k=2/f.csv".into(), b"v\n3\n".to_vec()),
+        ],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT k, v FROM t ORDER BY v", &mut sess);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::I32(1), Value::I64(1)],
+            vec![Value::Null, Value::I64(2)],
+            vec![Value::I32(2), Value::I64(3)],
+        ]
+    );
+    let rows = run_all("SELECT v FROM t WHERE k IS NULL", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(2)]]);
+    // A comparison never matches the NULL partition (and prunes it).
+    let rows = run_all("SELECT count(*) FROM t WHERE k >= 1", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(2)]]);
+    let rows = run_all("SELECT count(*) FROM t WHERE k IN (1, 2)", &mut sess);
+    assert_eq!(rows, vec![vec![Value::I64(2)]]);
+
+    // A key that is NULL everywhere is a VARCHAR column of NULLs, as in DuckDB.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![("d/k=null/f.csv".into(), b"v\n1\n".to_vec())],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT k, typeof(k) FROM t", &mut sess);
+    assert_eq!(rows, vec![vec![Value::Null, Value::Bytes(b"VARCHAR".to_vec())]]);
+}
+
+#[test]
+fn an_empty_partition_value_is_the_empty_string() {
+    // `k=` used to be skipped, so its part had one column fewer than `k=a`'s and the table was
+    // rejected. DuckDB reads it as ''.
+    let mut sess = Session::new();
+    sess.register_multi_bytes(
+        "t",
+        vec![("d/k=/f.csv".into(), b"v\n1\n".to_vec()), ("d/k=a/f.csv".into(), b"v\n2\n".to_vec())],
+        FormatKind::Csv,
+    )
+    .unwrap();
+    let rows = run_all("SELECT k, v FROM t ORDER BY v", &mut sess);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Bytes(Vec::new()), Value::I64(1)],
+            vec![Value::Bytes(b"a".to_vec()), Value::I64(2)]
+        ]
+    );
+}

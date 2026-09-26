@@ -86,14 +86,20 @@ pub(crate) fn insert(
             for row_exprs in value_rows {
                 ensure!(row_exprs.len() == col_idx.len(), ColumnCountMismatch);
                 let mut row = defaults.clone();
-                for (&slot, &expr_id) in col_idx.iter().zip(row_exprs) {
-                    row[slot] =
-                        eval_value_strict(session, arena, expr_id, params, schema[slot].ty)?;
+                for (&slot, expr) in col_idx.iter().zip(row_exprs) {
+                    // `None` is the `DEFAULT` keyword: keep the default already in `row`.
+                    if let Some(e) = *expr {
+                        row[slot] = eval_value_strict(session, arena, e, params, schema[slot].ty)?;
+                    }
                 }
                 check_not_null(&schema, &row)?;
                 out.push(row);
             }
             out
+        }
+        InsertSource::DefaultValues => {
+            check_not_null(&schema, &defaults)?;
+            vec![defaults]
         }
         InsertSource::Query(q) => {
             let (src_schema, src_rows) = run_query_to_rows(session, arena, q, params)?;
@@ -178,18 +184,27 @@ pub(crate) fn update(
     let mut pos = 0;
     while pos < total {
         let end = (pos + BATCH_SIZE).min(total);
-        let batch = session.catalog.mem_get(idx).unwrap().batch(pos, end);
+        let mut batch = session.catalog.mem_get(idx).unwrap().batch(pos, end);
 
-        let mut mask = vec![false; end - pos];
-        match &pred {
+        // Narrow the batch to the matched rows *before* evaluating any SET
+        // expression. A row the WHERE clause excludes must never be evaluated:
+        // `SET j = CAST(s AS JSON) WHERE s LIKE '[%'` would otherwise fail on the
+        // rows holding non-JSON text and abort the whole statement (DuckDB only
+        // evaluates SET for the rows it updates). `matched[k]` is the batch-local
+        // index of the k-th row of the narrowed batch.
+        let matched: Vec<u32> = match &pred {
             Some(p) => {
                 let mut sel = Vec::new();
                 session.vm.eval_filter(p, &batch, &mut sel)?;
-                for i in sel {
-                    mask[i as usize] = true;
-                }
+                batch.sel = Some(sel.clone());
+                batch.materialize();
+                sel
             }
-            None => mask.iter_mut().for_each(|m| *m = true),
+            None => (0..(end - pos) as u32).collect(),
+        };
+        if matched.is_empty() {
+            pos = end;
+            continue;
         }
 
         // Each SET expression is evaluated in bulk against the "original" batch (the
@@ -201,10 +216,7 @@ pub(crate) fn update(
         }
         let mut raw_cols: Vec<Option<Vector>> = set_progs.iter().map(|_| None).collect();
 
-        for (local, &matched) in mask.iter().enumerate() {
-            if !matched {
-                continue;
-            }
+        for (local, &row) in matched.iter().enumerate() {
             let mut row_values = Vec::with_capacity(set_cols.len());
             for (k, &ci) in set_cols.iter().enumerate() {
                 let v = new_cols[k].value_at(local);
@@ -222,7 +234,7 @@ pub(crate) fn update(
                 }
                 row_values.push(v);
             }
-            planned.push((pos + local, row_values));
+            planned.push((pos + row as usize, row_values));
         }
         pos = end;
     }

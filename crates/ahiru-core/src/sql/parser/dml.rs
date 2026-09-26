@@ -21,13 +21,19 @@ impl<'a> Parser<'a> {
             }
             self.expect(Tok::RParen)?;
         }
-        let source = if self.eat_kw(Kw::Values)? {
+        let source = if self.eat_kw(Kw::Default)? {
+            self.expect_kw(Kw::Values)?;
+            ensure!(columns.is_empty(), UnexpectedToken, self.pos);
+            InsertSource::DefaultValues
+        } else if self.eat_kw(Kw::Values)? {
             let mut rows = Vec::new();
             loop {
                 self.expect(Tok::LParen)?;
                 let mut row = Vec::new();
                 loop {
-                    row.push(self.expr()?);
+                    // `DEFAULT` stands for the column's default value. It is a
+                    // reserved word, so it cannot start an ordinary expression.
+                    row.push(if self.eat_kw(Kw::Default)? { None } else { Some(self.expr()?) });
                     if !self.eat(Tok::Comma)? {
                         break;
                     }

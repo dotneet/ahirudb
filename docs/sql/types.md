@@ -27,13 +27,23 @@ never changes query results.
 | `JSON` | Dynamically-typed JSON document. Also how Parquet `LIST`/`MAP` values are exposed — see [data-sources.md](data-sources.md#nested-parquet-types) |
 | `UUID` | 16-byte UUID, displayed/parsed as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. See [UUID](#uuid) below |
 
+There is no nanosecond type. A Parquet `TIMESTAMP(NANOS)` column (DuckDB's
+`TIMESTAMP_NS`) reads as `TIMESTAMP` (`TIMESTAMPTZ` when adjusted to UTC),
+and `TIME(NANOS)` as `TIME`, with the sub-microsecond digits dropped —
+truncated toward zero, so `1969-12-31 23:59:59.999999999` reads as
+`1970-01-01 00:00:00`, and `typeof` says `TIMESTAMP` where DuckDB says
+`TIMESTAMP_NS`. Nothing reports the loss; see
+[limitations.md](limitations.md#partially-supported). (DuckDB itself reads
+`INT96` timestamps as microseconds, and the two agree there.)
+
 ## Integer promotion and mixed-type arithmetic
 
 Kernels only exist for 6 physical types, so logical types are promoted onto
 one of them:
 
-- `TINYINT`/`SMALLINT`/`INTEGER`/`DATE`/`TIME` share the 32-bit physical lane.
-- `BIGINT`/`TIMESTAMP`/`TIMESTAMPTZ`/`DECIMAL(p ≤ 18)` share the 64-bit lane.
+- `TINYINT`/`SMALLINT`/`INTEGER`/`DATE` share the 32-bit physical lane.
+- `BIGINT`/`TIME`/`TIMESTAMP`/`TIMESTAMPTZ`/`DECIMAL(p ≤ 18)` share the 64-bit
+  lane (a `TIME` is microseconds since midnight).
 - `HUGEINT`/`DECIMAL(p > 18)`/`INTERVAL` share the 128-bit lane.
 - `UUID` shares the same byte-buffer lane as `VARCHAR`/`BLOB`, but (like
   `JSON`) never implicitly converts to/from them — see [UUID](#uuid).
@@ -63,6 +73,11 @@ them in:
   `DECIMAL` in it: the `DECIMAL` rule below is checked first and wins. Nor
   does it decide a signed/unsigned pair — the two share a rank there, and
   the rule above is checked first.
+- `BOOLEAN` combined with any number becomes that number, as in DuckDB:
+  `true = 1` and `true IN (1, 2)` are true, and `coalesce(flag, 0)` and
+  `CASE ... THEN true ELSE 1 END` are `INTEGER`. Arithmetic on a `BOOLEAN`
+  (`true + 1`) is still a type error. (DuckDB rejects `coalesce(true,
+  1.5::DOUBLE)`; here it is a `DOUBLE`.)
 - A `DECIMAL` combined with another `DECIMAL` — or with an **integer**,
   which counts as a `DECIMAL` of scale 0 — unifies to a `DECIMAL` wide
   enough for both: the new precision is
@@ -82,9 +97,8 @@ them in:
   SELECT CAST('7.5' AS DECIMAL(4,1)) + 1::HUGEINT;   -- 8.5
   ```
 
-  `typeof` here reports a bare `DECIMAL` without the precision and scale,
-  so it cannot be used to observe the unified width the way DuckDB's
-  `typeof` can.
+  `typeof` reports the unified width as DuckDB's does
+  (`typeof(CAST('7.5' AS DECIMAL(4,1)) + 1::BIGINT)` is `DECIMAL(21,1)`).
 
   Values that are *merged* into one column rather than combined —
   `COALESCE`, `CASE`, `greatest`/`least` and the columns of a
@@ -258,33 +272,44 @@ direction still works here, where DuckDB rejects it: `CAST(DATE
 '1970-01-02' AS BIGINT)` is the raw day count `1` (a `TIMESTAMP` gives
 microseconds).
 
+`CAST(<timestamp> AS TIME)` keeps the time of day
+(`CAST(TIMESTAMP '2024-01-01 10:20:30.5' AS TIME)` is `10:20:30.5`), and
+text cast to `TIME` may carry a zone suffix, which is ignored
+(`'12:00:00+05'::TIME` is `12:00:00`), both as in DuckDB.
+
 Accepted `CAST` type-name spellings (case-insensitive):
 
 ```
-BOOLEAN | BOOL
-TINYINT
-SMALLINT
-INT | INTEGER
-BIGINT
-HUGEINT
-UTINYINT
-USMALLINT
-UINTEGER
-UBIGINT
-FLOAT | REAL
-DOUBLE
-DECIMAL | NUMERIC        -- bare form = DECIMAL(18, 3)
-DECIMAL(p, s) | NUMERIC(p, s)
-VARCHAR | TEXT | STRING | CHAR
-BLOB | BYTEA
+BOOLEAN | BOOL | LOGICAL
+TINYINT | INT1
+SMALLINT | INT2 | INT16 | SHORT
+INT | INTEGER | INT4 | INT32 | SIGNED
+BIGINT | INT8 | INT64 | LONG
+HUGEINT | INT128
+UTINYINT | UINT8
+USMALLINT | UINT16
+UINTEGER | UINT32
+UBIGINT | UINT64
+FLOAT | REAL | FLOAT4 | FLOAT(n), n <= 24
+DOUBLE | FLOAT8 | DOUBLE PRECISION | FLOAT(n), n > 24
+DECIMAL | NUMERIC | DEC   -- bare form = DECIMAL(18, 3)
+DECIMAL(p, s) | NUMERIC(p, s) | DEC(p, s)
+DECIMAL(p) | NUMERIC(p)  -- = DECIMAL(p, 0)
+VARCHAR | TEXT | STRING | CHAR | CHARACTER | BPCHAR | NCHAR | NVARCHAR
+  | CHARACTER VARYING    -- each also with a length, VARCHAR(10); the length is not enforced
+BLOB | BYTEA | BINARY | VARBINARY
 DATE
-TIME
-TIMESTAMP | DATETIME
+TIME | TIME WITHOUT TIME ZONE
+TIMESTAMP | DATETIME | TIMESTAMP WITHOUT TIME ZONE
 TIMESTAMPTZ | TIMESTAMP WITH TIME ZONE
 JSON
-UUID
+UUID | GUID
 INTERVAL
 ```
+
+These are the spellings DuckDB accepts for the same types, and the same names
+work in `CREATE TABLE` column definitions. `DESCRIBE` and `typeof()` report the
+canonical name, with a DECIMAL's parameters spelled out: `DECIMAL(10,2)`.
 
 `INTERVAL` is nameable in a type position, and casts round-trip through
 text in both directions:
@@ -360,7 +385,12 @@ it needs to be explicit:
   range a `DATE` can hold would be a fictitious calendar date rather than a
   wrapped integer, so the result is `NULL` (`DATE '2024-01-01' + 2147480000`
   → `NULL`). DuckDB raises `Date out of range` for the same inputs; `NULL` is
-  this engine's usual answer for an undefined value.
+  this engine's usual answer for an undefined value. The same goes for
+  `INTERVAL` arithmetic: a field-wise `+`, `-` or `*` whose month, day or
+  microsecond field would overflow (`INTERVAL '1 day' * 3000000000`), a
+  multiplier outside `INTEGER`, `TIMESTAMP ± INTERVAL` leaving the
+  `TIMESTAMP` range and a `TIMESTAMP - TIMESTAMP` difference that does not
+  fit are all `NULL` (DuckDB raises); none of them wraps.
 - `-0.0` and `0.0` are treated as identical for grouping/join keys; all
   `NaN` values collapse to one representative for grouping purposes.
 - **`NaN` compares under a total order, not under IEEE rules** (matching
@@ -455,9 +485,35 @@ SELECT INTERVAL 1 DAY;
 SELECT CAST('2024-01-01' AS DATE) + INTERVAL 1 DAY;   -- 2024-01-02
 ```
 
-Accepted units (singular or plural): `YEAR(S)`, `MONTH(S)`, `DAY(S)`,
-`HOUR(S)`, `MINUTE(S)`, `SECOND(S)`, `MILLISECOND(S)`, `MICROSECOND(S)`.
-Other DuckDB shorthand units (`mon`, `y`, `wk`, ...) are not recognized.
+
+The text of an interval — in a literal or in `CAST(... AS INTERVAL)` — is
+read the way DuckDB reads it:
+
+- Terms `<n> <unit>`, where `<n>` may be negative or fractional and the
+  space before the unit is optional (`'1h'`, `'1 day1 hour'`). The unit is
+  any `date_part` spelling of `millennium`, `century`, `decade`, `year`,
+  `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`,
+  `millisecond` or `microsecond`, singular, plural or abbreviated (`y`,
+  `mon`, `d`, `h`, `m` = minute, `s`, `ms`, `us`, `millennia`, ... — see
+  [functions-datetime.md](functions-datetime.md#extracting-fields)); `wk`
+  is not one of them. Repeated units add up (`'1 month 1 month'` is
+  `2 months`).
+- Optionally a trailing time component `HH:MM[:SS[.ffffff]]` (hours are not
+  wrapped at 24; minutes and seconds must be below 60).
+- Optionally a final `ago`, which negates the whole interval
+  (`'1 day 2 hours ago'` is `-1 day -02:00:00`), and an optional leading
+  `@`.
+- A bare decimal is seconds (`'1.5'` is `00:00:01.5`).
+
+A **fraction** cascades into the next smaller field only, truncated there,
+using 1 year = 12 months, 1 month = 30 days and 1 day = 24 hours:
+`'1.5 days'` is `1 day 12:00:00`, but `'1.25 months'` is `1 month 7 days`
+(the remaining half day is dropped) and `'1.3 years'` is
+`1 year 3 months`. A fraction of a quarter or a week cascades one field
+further (`'1.5 quarters'` is `4 months 15 days`).
+
+The `INTERVAL <n> <unit>` and `INTERVAL '<n>' <unit>` forms take the same
+unit words, with a whole number.
 
 An interval is stored as one packed value combining a month count, a day
 count, and a microsecond count (kept separate internally because "1 month"
@@ -468,12 +524,32 @@ moved). Displaying one back out looks like:
 1 year 2 months 3 days 01:02:03
 ```
 
-**Comparing** two intervals flattens those three components with DuckDB's
-fixed conversions — **1 month = 30 days** and **1 day = 24 hours** — and
-compares the resulting microsecond spans. There is no anchor date in a
-comparison, so there is nothing to ask how long "one month" really is; only
-adding an interval to a `DATE`/`TIMESTAMP` uses real calendar arithmetic.
-The normalization applies everywhere a value is compared or keyed:
+### Interval arithmetic
+
+| Expression | Result |
+|---|---|
+| `DATE`/`TIMESTAMP` `±` `INTERVAL` | `TIMESTAMP` (calendar arithmetic; a month added to Jan 31 lands on the month's last day) |
+| `TIMESTAMPTZ` `±` `INTERVAL` | `TIMESTAMPTZ` |
+| `TIMESTAMP - TIMESTAMP` (either side may be a `DATE` or `TIMESTAMPTZ`) | `INTERVAL` of whole days plus the rest, both truncated toward zero: `-61 days -10:00:00` |
+| `DATE - DATE` | `BIGINT` day count |
+| `TIME ± INTERVAL` | `TIME`; only the time-of-day part of the interval moves the clock, which wraps at midnight (`TIME '23:00' + INTERVAL 2 HOUR` is `01:00:00`) |
+| `DATE + TIME` | `TIMESTAMP` |
+| `INTERVAL ± INTERVAL`, `INTERVAL * integer` | `INTERVAL`, field by field, never carrying between fields |
+| `INTERVAL * DOUBLE`, `INTERVAL / number` | `INTERVAL`; a fractional month cascades into days (30 per month) and a fractional day into microseconds, each rounded to a microsecond, as PostgreSQL and DuckDB do (`INTERVAL '1 month' / 7` is `4 days 06:51:25.6896`). Dividing by zero is `NULL` |
+
+A result that leaves its type's range is `NULL` rather than an error (see
+[Rounding and floating-point conventions](#rounding-and-floating-point-conventions)).
+
+### Comparing intervals
+
+**Comparing** two intervals follows DuckDB's normalization: whole days are
+carried out of the microseconds and whole 30-day months out of the days
+(1 day = 24 hours, 1 month = 30 days), and the normalized
+`(months, days, microseconds)` are compared in that order. There is no
+anchor date in a comparison, so there is nothing to ask how long "one
+month" really is; only adding an interval to a `DATE`/`TIMESTAMP` uses real
+calendar arithmetic. The normalization applies everywhere a value is
+compared or keyed:
 
 ```sql
 SELECT INTERVAL 1 DAY = INTERVAL 24 HOUR;        -- true
@@ -486,9 +562,19 @@ SELECT INTERVAL '90 minutes'
 -- 23:00:00 < 1 day < 25:00:00
 ```
 
-`=`, `<>`, `<`, `<=`, `>`, `>=` and `BETWEEN` all use that same flattened
-span, so an interval comparison agrees with `ORDER BY` on an interval
-column.
+The carries truncate toward zero, so each one keeps its own field's sign,
+and an interval whose fields have **mixed signs** is not simply its total
+length — again exactly as in DuckDB:
+
+```sql
+SELECT INTERVAL '2 months -45 days' < INTERVAL '16 days';   -- false: (1 month, -15 days) vs (16 days)
+SELECT INTERVAL '-1 day 1 hour' = INTERVAL '-23 hours';     -- false
+```
+
+`=`, `<>`, `<`, `<=`, `>`, `>=` and `BETWEEN` all use that same
+normalization, so an interval comparison agrees with `ORDER BY` on an
+interval column.
+
 
 ## UUID
 
@@ -530,14 +616,17 @@ logical-type flag is set, and plain `TIMESTAMP` otherwise (files written
 via the legacy `ConvertedType` annotation, which has no such flag, always
 read back as `TIMESTAMP`).
 
-`CAST(... AS TIMESTAMPTZ)` from text accepts an optional timezone offset
-suffix — `Z`, `+HH`, `+HH:MM`, `-HH`, or `-HH:MM` — and normalizes to UTC.
+`CAST(... AS TIMESTAMPTZ)` from text accepts the same text as a
+`TIMESTAMP` cast, including an optional timezone offset suffix — `Z`,
+`±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS`, or a separate ` UTC` — and
+normalizes to UTC. Each offset field is exactly two digits but, as in
+DuckDB, not range-checked (`+25` is 25 hours).
 **There is no session timezone concept in this engine**, so a literal with
 no offset is simply assumed to already be UTC (unlike DuckDB, which applies
 its configured session timezone). Comparing/mixing `DATE` or `TIMESTAMP`
 with `TIMESTAMPTZ` widens to `TIMESTAMPTZ` rather than erroring (see
 [Integer promotion and mixed-type arithmetic](#integer-promotion-and-mixed-type-arithmetic)
 above). Displaying a `TIMESTAMPTZ` always appends a `+00` suffix, since the
-value is always UTC.
-
-with zero-valued components omitted.
+value is always UTC. Adding or subtracting an `INTERVAL` keeps a
+`TIMESTAMPTZ` a `TIMESTAMPTZ` (`now() - INTERVAL 1 DAY`), as does
+`date_trunc`.

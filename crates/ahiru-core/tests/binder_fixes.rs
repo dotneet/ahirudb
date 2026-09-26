@@ -260,7 +260,8 @@ fn a_qualified_predicate_on_an_unnest_column_binds() {
         &mut s,
         "SELECT u.x FROM t, UNNEST([1,2,3]) AS u(x) WHERE u.x > 1 AND t.id = 0 ORDER BY 1",
     );
-    assert_eq!(rows, vec![vec![Value::I64(2)], vec![Value::I64(3)]]);
+    // `UNNEST([1,2,3])` is INTEGER, as in DuckDB.
+    assert_eq!(rows, vec![vec![Value::I32(2)], vec![Value::I32(3)]]);
 }
 
 /// The unqualified spelling keeps working, and so does a query that filters on
@@ -270,7 +271,7 @@ fn unqualified_and_unselected_unnest_predicates_still_work() {
     let mut s = session_with_basic();
     let rows =
         run(&mut s, "SELECT x FROM t, UNNEST([1,2,3]) AS u(x) WHERE x > 2 AND t.id = 0 ORDER BY 1");
-    assert_eq!(rows, vec![vec![Value::I64(3)]]);
+    assert_eq!(rows, vec![vec![Value::I32(3)]]);
     let rows =
         run(&mut s, "SELECT t.id FROM t, UNNEST([1,2,3]) AS u(x) WHERE u.x > 2 AND t.id = 0");
     assert_eq!(rows, vec![vec![Value::I32(0)]]);

@@ -14,6 +14,14 @@ separate, statically-typed `LIST`/`ARRAY`/`MAP` physical type; functions
 named `list_*`/`map_*`/`array_*` (matching DuckDB's naming) all operate on
 `JSON` values underneath.
 
+Where a list's **element type** is known before the query runs — a Parquet
+`LIST<scalar>` or `MAP<scalar, scalar>` column, `string_split(...)`, a list
+literal whose elements share one scalar type, or `list_sort`/`list_slice`/
+`list_filter`/... of one of those — the binder remembers it, and a subscript
+(`xs[i]`, `m[k]`) or `UNNEST` hands the element back as that type, as DuckDB
+does. Anything else (a `JSON` column read from a JSON/JSONL file, a list of
+lists, a list built from mixed types) keeps its elements as `JSON`.
+
 ## Path operators
 
 ```sql
@@ -34,6 +42,18 @@ SELECT '{"0":5}' -> 0;    -- NULL   (an integer never means an object key)
 SELECT '{"0":5}' -> '0';  -- 5      (a string path still does)
 ```
 
+A **string** path takes DuckDB's three forms, told apart by its first
+character:
+
+```sql
+SELECT '{"a":{"b":1}}' -> '$.a.b';   -- 1      JSONPath ($, .key, ."quoted key", [N], [-N])
+SELECT '{"a":{"b":1}}' -> '/a/b';    -- 1      JSON Pointer (RFC 6901; ~1 is '/', ~0 is '~')
+SELECT '[1,[2,3]]' -> '/1/0';        -- 2      a pointer token indexes an array (0-based, no sign)
+SELECT '{"a":{"b":1}}' -> 'a.b';     -- NULL   anything else is ONE key, taken whole...
+SELECT '{"a.b":7}' -> 'a.b';         -- 7      ...so this is the key "a.b"
+SELECT '{"a":1}' -> '';              -- {"a":1} (an empty path is the whole document)
+```
+
 ## Extraction
 
 ```sql
@@ -50,6 +70,9 @@ SELECT json_type('"x"');       -- 'VARCHAR'
 SELECT json_type('true');      -- 'BOOLEAN'
 SELECT json_type('null');      -- 'NULL'
 SELECT json_type('1.5');       -- 'DOUBLE'
+SELECT json_type('1');         -- 'UBIGINT' (a non-negative integer that fits 64 bits)
+SELECT json_type('-1');        -- 'BIGINT'  (a negative one)
+SELECT json_type('-12345678901234567890');  -- 'DOUBLE' (does not fit 64 bits)
 
 SELECT json_array_length('[1,2,3]');  -- 3
 SELECT json_array_length('{"a":1}');  -- 0  (non-array input -> 0, not an error, matching DuckDB)
@@ -72,27 +95,48 @@ SELECT [1, 2, 3];                            -- '[1,2,3]'  (array-literal sugar 
 SELECT json_object('id', id, 'flag', flag) FROM t WHERE id IN (0, 1) ORDER BY id;
 ```
 
-`to_json` accepts `NULL`/`BOOLEAN`/numeric/`DECIMAL`/`VARCHAR`/`DATE`/
-`TIME`/`TIMESTAMP`/`JSON`; `BLOB` and `INTERVAL` are not JSON-encodable and
-raise a type error.
+`to_json` accepts `NULL`/`BOOLEAN`/numeric/`DECIMAL`/`VARCHAR`/`BLOB`/`DATE`/
+`TIME`/`TIMESTAMP`/`JSON`; `INTERVAL` is not JSON-encodable and raises a type
+error. The spellings follow DuckDB's `to_json`:
+
+```sql
+SELECT to_json('nan'::DOUBLE);               -- NaN        (also Infinity, -Infinity)
+SELECT to_json('\x00\xFF'::BLOB);            -- '"\\x00\\xFF"' (the BLOB's VARCHAR form, as a string)
+SELECT to_json(CAST('-0.50' AS DECIMAL(4,2)));  -- -0.5  (precision <= 15: written as a DOUBLE)
+SELECT to_json(1.50::DECIMAL(16,2));         -- 1.50       (wider: its exact text)
+```
+
+`NaN`/`Infinity`/`-Infinity` are not standard JSON, but DuckDB writes and
+reads them, and so does ahirudb — a `DOUBLE` list holding them (a Parquet
+`LIST<DOUBLE>` column, `[1.0, 'nan'::DOUBLE]`) keeps them, and `UNNEST`/`[i]`
+give the same `DOUBLE` back.
 
 ## Accessing list/map elements
 
 ```sql
-SELECT list_extract('[10,20,30]', 1);    -- '10'  (1-based, like DuckDB)
-SELECT list_extract('[10,20,30]', -1);   -- '30'  (negative index from the end)
-SELECT list_extract('[10,20,30]', 0);    -- NULL  (index 0 is invalid)
+SELECT [10, 20, 30][1];                  -- 10    (1-based, like DuckDB; an INTEGER)
+SELECT [10, 20, 30][-1];                 -- 30    (negative index from the end)
+SELECT [10, 20, 30][0];                  -- NULL  (index 0 is invalid)
+SELECT [1, NULL, 3][2] IS NULL;          -- true  (a NULL element is SQL NULL)
+SELECT string_split('a,b', ',')[1] || 'x';  -- 'ax' (a VARCHAR, not the quoted JSON "a")
+SELECT list_extract('[10,20,30]', 1);    -- '10'  (a JSON value: its element type is unknown)
 
-SELECT map_extract('{"a":1,"b":2}', 'a'); -- '1'
-SELECT map_extract('{"a":1}', 'z');       -- NULL  (missing key -> NULL, not an error)
-
--- Parquet MAP columns are stored as a JSON array of {key,value} pairs;
--- map_extract looks those up the same way:
---   m = '[{"key":"a","value":1},{"key":"b","value":2}]'
-SELECT map_extract(m, 'a');               -- '1'
+-- A subscript on a MAP is a key lookup that returns the value (DuckDB 1.4);
+-- map_extract returns DuckDB 1.4's one-element list instead.
+--   m is a Parquet MAP(VARCHAR, BIGINT) column, here {a=1, b=2}
+SELECT m['b'];                            -- 2     (a BIGINT)
+SELECT m['z'];                            -- NULL  (missing key)
+SELECT map_extract(m, 'b');               -- '[2]'
+SELECT map_extract(m, 'z');               -- '[]'
+SELECT map_extract_value(m, 'b');         -- 2     (the same as m['b'])
+--   on a MAP(BIGINT, VARCHAR) column, an integer subscript is still a key: m[2]
+SELECT map_extract('{"a":1,"b":2}', 'a'); -- '[1]' (a JSON object works as a map too)
 ```
 
-`array_extract` is an alias for `list_extract`.
+`array_extract` is an alias for `list_extract`. A subscript is a key lookup
+when the base is a Parquet `MAP` column or the subscript is a string, and a
+list position otherwise. Parquet `MAP` columns are stored as a JSON array of
+`{"key":...,"value":...}` pairs.
 
 ## Searching and reordering lists
 
@@ -100,7 +144,11 @@ SELECT map_extract(m, 'a');               -- '1'
 SELECT array_length([1, 2, 3]);              -- 3   (alias: list_length, json_array_length)
 SELECT list_contains([1, 2, 3], 2);          -- true
 SELECT list_position(['a', 'b'], 'b');       -- 2   (1-based; NULL when absent, like DuckDB)
+SELECT list_contains([1.0, 2.0], 2);         -- true  (numbers compare by value)
 SELECT list_sort([3, 1, 2]);                 -- '[1,2,3]'
+SELECT list_sort([3, NULL, 1], 'DESC');      -- '[3,1,null]'  (NULLs last by default)
+SELECT list_sort([3, NULL, 1], 'ASC', 'NULLS FIRST');  -- '[null,1,3]'
+SELECT list_reverse_sort([3, NULL, 1]);      -- '[3,1,null]'
 SELECT list_distinct([1, 2, 1, 3]);          -- '[1,2,3]'  (keeps first-occurrence order)
 SELECT list_reverse([1, 2, 3]);              -- '[3,2,1]'
 ```
@@ -110,21 +158,22 @@ SELECT list_reverse([1, 2, 3]);              -- '[3,2,1]'
 | `array_length(l)` | `list_length`, `json_array_length` |
 | `list_contains(l, x)` | `array_contains`, `list_has`, `array_has` |
 | `list_position(l, x)` | `list_indexof`, `array_position`, `array_indexof` |
-| `list_sort(l)` | `array_sort` |
+| `list_sort(l [, 'ASC'\|'DESC' [, 'NULLS FIRST'\|'NULLS LAST']])` | `array_sort` |
+| `list_reverse_sort(l [, 'NULLS FIRST'\|'NULLS LAST'])` | `array_reverse_sort` |
 | `list_distinct(l)` | `array_distinct` |
 | `list_reverse(l)` | `array_reverse` |
 
 `list_contains`/`list_position` serialize the search value to JSON text and
-compare it byte-wise against each element — the same equality `JSON` values
-already use here (see
-[limitations.md](limitations.md#partially-supported)). Both
-return `NULL` when the first argument is not an array at all.
+compare it with each element by value: numbers numerically (so `2`, `2.0` and
+`2::DECIMAL(3,1)` are all equal, as DuckDB's implicit cast to the element type
+makes them), strings by their text, lists and structs element by element.
+Both return `NULL` when the first argument is not an array at all.
 
-`list_sort` has to impose an order on an untyped representation, so it
-ranks elements by kind first — numbers < strings < booleans < arrays <
-objects < `null` — then numerically within numbers and by raw bytes
-otherwise. On a homogeneous list (the usual case) that is the ordinary
-sort; on a mixed list it is defined but engine-specific.
+`list_sort` orders the elements the way DuckDB orders the typed values:
+numbers numerically (exactly, beyond 2^53 too), strings by their bytes,
+lists and structs element by element. On a list that mixes kinds (only
+possible with `JSON` data) the order between kinds is defined but
+engine-specific.
 
 Note `list_unique` is deliberately **not** an alias for `list_distinct`: in
 DuckDB it returns the *count* of distinct elements, and it is not

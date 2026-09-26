@@ -44,6 +44,16 @@ A string literal anywhere else stays a string. This is what keeps an
 ordinary `'/'` or `'.'` in a comparison or a `split_part` call from walking
 the filesystem.
 
+A path in table position is **case-sensitive**, whatever the file system:
+`FROM 'Data.csv'` and `FROM 'data.csv'` (or two URLs that differ in case) are
+two tables, each read from the file its own spelling names. A table
+*identifier* is not: `FROM trips`, `FROM TRIPS` and `FROM "Trips"` all find a
+table registered as `trips` (only ASCII letters fold, as in DuckDB).
+
+The JS host auto-registers the same forms (`FROM 'https://…'`,
+`parquet('…')`, `read_csv('…')`, ...) on first use; its `sqlUrlPolicy` option
+sees each such path before anything is fetched (see `js/README.md`).
+
 Paths in table position are glob patterns. A backslash escapes a glob
 metacharacter, so the literal file `star*.csv` is nameable:
 
@@ -54,9 +64,10 @@ SELECT * FROM 'star*.csv';    -- every file matching star*.csv
 
 ## Text-format type inference
 
-CSV/TSV column types are sniffed from a leading sample of the file (up to
-256 KiB), JSON/JSONL types from the values actually seen. What the sniffer
-does with an ambiguous or mixed column:
+CSV/TSV and JSONL column types are sniffed from every complete record in a
+leading sample of the file (up to 256 KiB); a single-document `.json` file
+is resident as a whole, so its types come from every element. What the
+sniffer does with an ambiguous or mixed column:
 
 | Input | Inferred | Why |
 |---|---|---|
@@ -70,8 +81,8 @@ The sample is the leading 256 KiB, grown (up to 1 MiB, the longest record
 the readers accept) when that does not contain one complete record — so a
 CSV header, or a first JSONL line, longer than 256 KiB still reads.
 
-A value **outside** the sample that doesn't fit the inferred type raises a
-conversion error rather than becoming `NULL` — see
+In a CSV/TSV or JSONL file, a value **outside** the sample that doesn't fit
+the inferred type raises a conversion error rather than becoming `NULL` — see
 [limitations.md](limitations.md#partially-supported), where the divergence
 from DuckDB (which re-sniffs and widens) is spelled out.
 
@@ -81,11 +92,9 @@ each one has in hand:
 
 - **`.json`** (one document) has the whole document resident and walks
   every element anyway, so *every* element contributes its keys: the column
-  set is always complete, no matter how late a key first appears. Only the
-  types of the columns the sample settled on stay frozen (which is what
-  produces the conversion error above). A column discovered past the sample
-  has no sample evidence at all, so its type widens over every element it
-  appears in.
+  set is always complete, no matter how late a key first appears, and every
+  element contributes to the column types too, so a late value widens its
+  column instead of failing the read.
 - **JSONL/NDJSON** is read split by split, and the schema has to be fixed
   before the first split is read, so a complete key set is not knowable up
   front. A key with no column is reported as a `ColumnNotFound` error
@@ -127,6 +136,12 @@ detected the way DuckDB's sniffer does it:
 A header whose names look exactly like the data (every name a number, say)
 is therefore read as a data row, as it is in DuckDB.
 
+Header names are cleaned up as DuckDB does it: spaces around a name are
+trimmed (`a, b ,c` names `a`, `b`, `c`; tabs are kept), an empty name
+becomes `columnN` (its 0-based position), and a name repeated ignoring case
+becomes `a_1`, `a_2`, ... (`a,a,A` names `a`, `a_1`, `A_2`). Parquet column
+names that repeat — pyarrow writes them if asked — are renamed the same way.
+
 ### Padding
 
 Spaces around a value do not stop it from being typed: `1, 2` infers
@@ -151,7 +166,9 @@ The reader never silently discards part of a record:
 
 - A row with **more** fields than the header is a parse error, as it is in
   DuckDB. Dropping the surplus hid the usual cause — an unquoted delimiter
-  inside a value, which shifts every following field.
+  inside a value, which shifts every following field. The exception is a
+  trailing delimiter: a single empty extra field (`1,2,` under `a,b`) is
+  dropped, as DuckDB reads such files.
 - Any byte between a **closing quote** and the next delimiter or line
   terminator is a parse error too (`"x"junk,1`), again matching DuckDB —
   except padding spaces and tabs (see [Padding](#padding)).
@@ -192,7 +209,13 @@ SELECT sum(json) AS total FROM t;   -- against a file containing [1, 2, 3]
 - A `.json` file holding one value per line — which is what
   `COPY ... TO 'x.json'` writes, as DuckDB does — is detected and read as
   JSONL, split by split. A single document (a top-level array or object) is
-  read as before.
+  read as before. Several objects one after another that are *not* one per
+  line — the pretty-printed stream `jq` writes, or `{...} {...}` on one line
+  — are one row each too, as in DuckDB (read as one document, not split by
+  split).
+- An empty (0-byte) CSV/TSV, JSONL or JSON file is an empty table, and in a
+  multi-file table an empty file is simply skipped, as DuckDB does, rather
+  than failing the whole table for having no columns.
 - Nesting depth is not limited: a deeply nested value reads (as `JSON` or
   raw-JSON text), and skipping one in a column the query doesn't select
   costs nothing but the scan.
@@ -249,7 +272,7 @@ on top of whatever the file itself contains:
 --   tests/data/hive/year=2024/month=02/part.parquet
 --   tests/data/hive/year=2025/month=01/part.parquet
 SELECT count(*) FROM t;                                  -- all partitions, 1000 rows
-SELECT count(*) FROM t WHERE year = 2024 AND month = 1;   -- 300 rows, one partition pruned in
+SELECT count(*) FROM t WHERE year = 2024 AND month = '01'; -- 300 rows, one partition pruned in
 ```
 
 Partition columns come from the file *path*, so they appear however the
@@ -262,8 +285,17 @@ partition: `k=1`/`k=2` gives an `INTEGER` virtual column, and `k=1`/`k=abc`
 gives `VARCHAR`, because the partitions disagree and the union has to
 widen. A zero-padded value stays `VARCHAR` (`k=007`/`k=42` is a `VARCHAR`
 column holding `007` and `42`), the same rule the CSV sniffer uses — so
-`007` keeps its padding rather than being flattened to `7`. Typing the key
-once means a predicate on it compares the same way in every partition.
+`007` keeps its padding rather than being flattened to `7` (which is why the
+example above compares `month` with the string `'01'`). Typing the key once
+means a predicate on it compares the same way in every partition.
+
+A value of `NULL` (any case — what DuckDB's `PARTITION_BY` writes for a
+NULL key) is SQL `NULL`, and an empty value (`k=`) is the empty string, as
+in DuckDB. A `NULL` partition says nothing about the key's type, so
+`k=1`/`k=NULL` stays an `INTEGER` column (DuckDB 1.4.4 widens it to
+`VARCHAR`; the values are the same); a key that is `NULL` everywhere is
+`VARCHAR`. `__HIVE_DEFAULT_PARTITION__` is an ordinary string, as it is in
+DuckDB.
 
 If a partition key **also names a real column inside the file**, the file's
 column wins and no virtual column is synthesized for that part — Hive and
@@ -321,9 +353,18 @@ Parquet's nested types (`STRUCT`, `LIST`, `MAP`) don't map onto SQL columns
   SELECT id, m FROM t;   -- m: '[{"key":"a","value":0},{"key":"b","value":0}]'
   ```
 
-  Leaves render as `to_json` does in DuckDB: numbers as numbers, dates,
-  timestamps, UUIDs and `INTERVAL`s as strings (`["02:00:00","1 day"]`),
-  and a `JSON` leaf as the document it holds.
+  Leaves render as `to_json` does in DuckDB: numbers as numbers
+  (non-finite doubles as `NaN`/`Infinity`/`-Infinity`, a `DECIMAL` of
+  precision 15 or less as a double: `1.5`, not `1.50`), dates, timestamps,
+  UUIDs and `INTERVAL`s as strings (`["02:00:00","1 day"]`), a `BLOB` as a
+  string of its VARCHAR form (`["\\x00\\x01\\xFF","abc"]`), and a `JSON` leaf
+  as the document it holds.
+
+  The element type is not lost: for a `LIST` of a plain scalar type, and a
+  `MAP` of scalar keys and values, `xs[i]`, `m[k]` and `UNNEST(xs)` return
+  the element as its Parquet type (`INTEGER`, `VARCHAR`, `DECIMAL(4,2)`,
+  `BLOB`, ...), as they do in DuckDB — see
+  [functions-json.md](functions-json.md#accessing-listmap-elements).
 
 - **A column with the `JSON` logical type is a `JSON` column**, not
   `VARCHAR`, so the JSON functions apply to it directly and

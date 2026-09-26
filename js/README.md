@@ -24,7 +24,7 @@ const db = await AhiruDB.init({
 });
 
 // register() does no I/O. Fetching the total length and reading the footer
-// are both deferred until the first query.
+// are both deferred until the first query that actually reads the table.
 db.register('trips', 'https://example.com/trips.parquet'); // HTTP Range
 db.register('local', bytes);                               // Uint8Array / ArrayBuffer
 db.register('picked', fileFromInputElement);               // Blob / File
@@ -78,11 +78,27 @@ await it.return();  // required when driving the iterator by hand
 the slot, and closes that query. An abandoned iterator resumed after `close()`
 throws rather than stepping a handle that is no longer valid.
 
-Writing `FROM parquet('https://…/a.parquet')` automatically registers that path
-as a table of the same name (this is a contract of `resolve_from` in
-`plan/bind.rs`). That's the entry point for Parquet specifically; CSV / JSONL
-must be registered first via `register(name, src, { format })` and then
-referenced by their plain identifier.
+### Table names and paths
+
+A registered name is an SQL identifier: `FROM trips`, `FROM TRIPS` and
+`FROM "Trips"` all find `register('trips', …)`, and registering `'Trips'`
+later replaces it. Only ASCII letters fold, as in the engine (and DuckDB):
+`'Ärger'` and `'ärger'` are two tables.
+
+A path in a string literal — `FROM 'https://…/a.parquet'`,
+`parquet('…')`, `read_parquet('…')`, `read_csv('…')`, `read_json('…')` — is
+registered automatically, as a table named by that exact string, the first
+time a statement reads it. Paths are **case-sensitive**:
+`parquet('https://h/Data.parquet')` and `parquet('https://h/data.parquet')`
+are two different URLs. `read_csv` / `read_json` pick CSV / JSON(L) for an
+extensionless path; otherwise the extension decides.
+
+Which tables a statement uses is decided by the engine, not by scanning the
+SQL text: registering a table does no I/O, and a table is sized (a `HEAD`
+for a URL) and read only when a statement actually resolves it — directly,
+or through a view. A registered name that merely appears as a column, alias,
+comment or string value costs nothing. `SHOW TABLES` lists every
+registration.
 
 ### Format
 
@@ -115,10 +131,42 @@ the feature raises E409.
 ### Parameters
 
 Accepted types: `null` / `boolean` / `number` / `bigint` / `string` / `Uint8Array`.
-Safe integers and `bigint` are sent as I64; other `number` values as F64.
+Safe integers and `bigint` are sent as I64 (BIGINT); other `number` values as F64.
 `Date` is not accepted (implicitly converting to microseconds would hide
-off-by-a-magnitude bugs). To compare against a TIMESTAMP, pass
-`BigInt(d.getTime()) * 1000n`.
+off-by-a-magnitude bugs). A BIGINT does not compare with a TIMESTAMP (E404), so
+to compare against one, bind microseconds and convert in SQL, or bind an ISO
+string and cast it:
+
+```js
+await db.query('SELECT * FROM t WHERE ts > make_timestamp(?)', [BigInt(d.getTime()) * 1000n]);
+await db.query('SELECT * FROM t WHERE ts > ?::TIMESTAMP', [d.toISOString()]);
+```
+
+The number of values must match the number of placeholders: too many is
+E406, like too few.
+
+### COPY ... TO
+
+The engine never writes files. With a wasm core built with the `export`
+feature, `COPY (SELECT …) TO 'out.csv'` runs the query and hands the encoded
+bytes to the `onCopy` option; `query()` resolves to `[]` once it returns.
+Without `onCopy` the statement fails with E409 instead of silently doing
+nothing.
+
+```js
+const db = await AhiruDB.init({
+  wasmUrl: '/ahiru-core-export.wasm',
+  onCopy: async (path, bytes) => { await writeSomewhere(path, bytes); },
+});
+await db.query("COPY (SELECT * FROM trips WHERE fare > 100) TO 'big.parquet'");
+```
+
+`COPY`, `CREATE TABLE … AS SELECT` and `INSERT … SELECT` run to completion
+inside a single engine call, so they cannot pause for I/O partway. When they
+need bytes the engine reports them, the host fetches them and starts the
+statement again; each attempt gets further, until everything it reads is in
+the wasm heap at once. Fine for modest inputs; for large ones prefer
+streaming `SELECT` results.
 
 ## Value mapping
 
@@ -163,6 +211,18 @@ along with a list of `{table, offset, len}`, and the host is expected to:
    If the same request repeats with zero bytes gained, that's treated as a
    livelock and raises `E504`.
 
+A request can also be a **size request** (offset `2^64-1`, length 0): the
+engine is about to read a table it has not been told the length of. The host
+calls the source's `size()` (a `HEAD` for a URL, in parallel for several
+tables) and answers with `ahiru_set_size`.
+
+Fetched bytes live in the wasm heap only while a query runs: when it
+finishes, the engine drops them, and the next query asks again — which the
+range cache below answers without touching the network. So `heapUsed` stays
+near the size of what one query needs, not everything ever read, and
+`memoryLimit` bounds a single query. With `cache: 'none'`, repeating a query
+repeats its fetches.
+
 ### Codec delegation
 
 ZSTD is decompressed by the core itself by default (feature `zstd`, ~13 KB —
@@ -182,11 +242,14 @@ When the engine hits a codec it doesn't handle internally, it returns
 - **Anything else** (BROTLI, etc.) … E201, "unsupported compression codec".
 
 The compressed block was already fetched by the preceding `NEED_IO`, so
-**decompression never re-fetches it**. To make that possible, a per-table
-cache of already-fetched bytes is kept (bounded by `cacheSize`; oldest entries
-are evicted first and re-fetched from source if needed again). If a range that
-was never fetched is requested, the host does not silently fetch it — that's
-treated as an engine-side inconsistency and raises E900.
+decompression does not normally re-fetch it. To make that possible, a per-table
+copy of already-fetched bytes is kept (bounded by `cacheSize`; oldest entries
+are evicted first). A block whose copy was evicted is sliced out of the
+coalesced range that contained it if the range cache still holds that range;
+only when neither has it is it fetched again (with `cache: 'none'`, or a cache
+too small to keep it). If a range that was never fetched is requested, the host
+does not silently fetch it — that's treated as an engine-side inconsistency and
+raises E900.
 
 The cache key is an exact match on `(source, offset, len)`. `"memory"` is a
 capacity-bounded LRU (64 MiB by default, adjustable via `cacheSize`). Passing
@@ -234,11 +297,25 @@ in `errors.js`. That alone keeps roughly 20 KB of strings out of wasm
 try {
   await db.query('SELECT FROM');
 } catch (e) {
-  e.code;    // 301
-  e.message; // "[E301] unexpected token"
-  e.sql;     // the SQL that was being executed
+  e.code;     // 301
+  e.message;  // "[E301] unexpected token"
+  e.sql;      // the SQL that was being executed
+  e.position; // 7 -- where the engine located it, when it knows (a byte
+              // offset into the UTF-8 SQL for syntax errors)
 }
 ```
+
+### When the engine traps
+
+A pathological query can crash the wasm engine itself (a WebAssembly
+*trap*: native stack exhaustion from extreme nesting, or an internal panic).
+A trapped instance cannot be trusted again, so that query fails with E900
+("the wasm engine trapped …", the original `RuntimeError` as `cause`) and
+the host swaps in a fresh instance of the same module before the next call:
+registrations are declared again and cached bytes reused, so later queries
+work as before. The exception is a database holding in-memory tables or
+views created by SQL, which a fresh instance would silently lose: it stays
+unusable (every call throws E900) and must be recreated.
 
 `errors.js` mirrors `Code` and `message()` from
 `crates/ahiru-core/src/error.rs`, so **always update both together**. If they
@@ -258,7 +335,7 @@ Two codes are raised by this host rather than by wasm and are worth calling out:
 ## Security
 
 **Running untrusted SQL against a Node process with network access is not
-safe.** `parquet('URL')` / `read_csv('URL')` (and `register(name, url)`) make
+safe.** `FROM 'URL'` / `parquet('URL')` / `read_csv('URL')` (and `register(name, url)`) make
 plain HEAD and `Range` HTTP requests from wherever the JS host runs. There is
 no URL allowlist and no way to disable URL sources. In a browser this is
 constrained by CORS and same-origin policy the same as any other `fetch`; in
@@ -276,12 +353,17 @@ access to internal services:
   instead of registering URLs at all, so the host never makes an HTTP request
   on the engine's behalf, or
 - Set `sqlUrlPolicy: false` (or a synchronous/asynchronous callback that
-  allowlists the URL's origin) when constructing the database. The callback is
-  used only for HTTP(S) URLs discovered in SQL file-function calls and receives
-  `(url, { functionName, sql })`; explicit `register(name, url)` calls remain
-  the caller's responsibility. When a policy is configured, SQL-discovered
-  URLs also use `redirect: "error"`, so an allowed origin cannot redirect the
-  fetch to a different host behind the callback's decision.
+  allowlists the URL's origin) when constructing the database. The callback
+  sees **every** path a SQL string literal names that is not a registered
+  table — any scheme, relative and protocol-relative (`//host/x`) paths
+  included — resolved the way `fetch()` would resolve it (against
+  `document.baseURI` / `location.href` in a browser; verbatim where there is
+  no base, so a callback should reject what it cannot parse). It receives
+  `(url, { functionName, sql })` before anything is registered or fetched;
+  explicit `register(name, url)` calls remain the caller's responsibility.
+  When a policy is configured, SQL-discovered URLs also use
+  `redirect: "error"`, so an allowed origin cannot redirect the fetch to a
+  different host behind the callback's decision.
 
 The default remains permissive for compatibility with the documented
 `parquet('URL')` shorthand. For untrusted SQL, explicitly set the policy to
@@ -316,6 +398,6 @@ available, the corresponding tests are skipped.
 
 - BROTLI / LZO / framed LZ4 are not decompressed (E201 names the codec). The
   delegation hook lives in the core, so adding support only requires a JS-side change.
-- `parquet('...')` is the only SQL table function. There's no syntax for
-  referencing CSV / JSONL directly by path — register them first and look them
-  up by name.
+- The reader functions take one argument, the path: named options
+  (`delim=`, `header=`, ...) and globs are not supported. Register the source
+  with an explicit `format` when the extension does not say it.

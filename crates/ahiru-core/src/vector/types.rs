@@ -287,6 +287,15 @@ impl Ty {
         if let Some(t) = mixed_sign_int(a, b) {
             return Some(t);
         }
+        // BOOLEAN is the bottom of the widening order: mixed with a number it becomes that
+        // number (`true = 1`, `true IN (1, 2)`, `coalesce(flag, 0)`), as in DuckDB. Arithmetic
+        // on a BOOLEAN stays an error (`plan::compile` checks the operands, not this type).
+        if a == Boolean && b.is_numeric() {
+            return Some(b);
+        }
+        if b == Boolean && a.is_numeric() {
+            return Some(a);
+        }
         // Between numerics, widen. FLOAT with any integer or DECIMAL stays FLOAT, and
         // only DOUBLE outranks it, as in DuckDB: `float_col = 1.1` compares in FLOAT
         // (the DECIMAL literal rounds to the same f32 the column holds), where
@@ -370,6 +379,27 @@ impl Ty {
             Json => "JSON",
             Uuid => "UUID",
         }
+    }
+
+    /// The type name with its parameters, as `DESCRIBE` and `typeof` show it (and as
+    /// DuckDB does): `DECIMAL(10,2)` rather than the bare `DECIMAL` of [`Ty::name`].
+    /// Every other type has no parameters and renders exactly as `name()`.
+    pub fn full_name(self) -> String {
+        let mut s = String::from(self.name());
+        if let Ty::Decimal { precision, scale } = self {
+            let push = |s: &mut String, n: u8| {
+                if n >= 10 {
+                    s.push((b'0' + n / 10) as char);
+                }
+                s.push((b'0' + n % 10) as char);
+            };
+            s.push('(');
+            push(&mut s, precision);
+            s.push(',');
+            push(&mut s, scale);
+            s.push(')');
+        }
+        s
     }
 }
 
@@ -501,17 +531,51 @@ pub fn fmt_interval(months: i32, days: i32, micros: i64, out: &mut Vec<u8>) {
     }
 }
 
+/// What is statically known about the contents of a `Ty::Json` value.
+///
+/// A LIST or MAP has no type of its own here (it is JSON text, see `Ty::Json`), but where its
+/// element type is known before execution -- a Parquet `LIST<scalar>`/`MAP<scalar, scalar>`
+/// column, `string_split`, a list literal of one scalar type -- the binder carries it alongside
+/// so `xs[i]`, `m[k]` and `UNNEST` can hand the element back as that native type, as DuckDB does.
+/// `Any` is the conservative answer: the element stays `Ty::Json`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Shape {
+    #[default]
+    Any,
+    /// A list whose elements are all of this type (`Ty::Json` when they are themselves nested).
+    List(Ty),
+    /// A MAP (`[{"key":k,"value":v},...]`) with these key and value types.
+    Map(Ty, Ty),
+}
+
+impl Shape {
+    /// The native type of one element (a MAP's elements are its values), `Ty::Json` if unknown.
+    pub fn elem(self) -> Ty {
+        match self {
+            Shape::List(t) | Shape::Map(_, t) => t,
+            Shape::Any => Ty::Json,
+        }
+    }
+}
+
 /// One column of the output schema.
 #[derive(Clone)]
 pub struct Field {
     pub name: String,
     pub ty: Ty,
     pub nullable: bool,
+    /// Meaningful only when `ty` is `Ty::Json`.
+    pub shape: Shape,
 }
 
 impl Field {
     pub fn new(name: impl Into<String>, ty: Ty, nullable: bool) -> Self {
-        Field { name: name.into(), ty, nullable }
+        Field { name: name.into(), ty, nullable, shape: Shape::Any }
+    }
+
+    pub fn shaped(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
     }
 }
 

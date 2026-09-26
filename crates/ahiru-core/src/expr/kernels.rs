@@ -1506,7 +1506,7 @@ pub fn try_cast(from: Ty, to: Ty, a: &Vector) -> Result<Vector> {
 /// Writes a BLOB's text form: printable ASCII stays as it is, everything else -- the
 /// backslash included, so the escape is unambiguous -- becomes an uppercase `\xHH`.
 /// This is the spelling DuckDB's `BLOB -> VARCHAR` cast produces.
-fn escape_blob(bytes: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn escape_blob(bytes: &[u8], out: &mut Vec<u8>) {
     for &b in bytes {
         if (0x20..0x7f).contains(&b) && b != b'\\' {
             out.push(b);
@@ -1650,6 +1650,15 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
             ensure!(!from.is_temporal(), InvalidCast);
             for i in 0..n {
                 store_i128(&mut data, (load_i128(src, i) != 0) as i128);
+            }
+        }
+        (Fam::Int, Fam::Int)
+            if to == Ty::Time && matches!(from, Ty::Timestamp | Ty::Timestamptz) =>
+        {
+            // The time of day, floored so a timestamp before the epoch keeps its clock time
+            // (`CAST(TIMESTAMP '2024-01-01 10:20:30.5' AS TIME)` is `10:20:30.5`, as in DuckDB).
+            for i in 0..n {
+                store_i128(&mut data, load_i128(src, i).rem_euclid(MICROS_PER_DAY));
             }
         }
         (Fam::Int, Fam::Int) => {
@@ -1934,7 +1943,30 @@ pub fn ts_add_interval(a: &Vector, b: &Vector) -> Result<Vector> {
             }
         }
     }
-    Ok(finish(Ty::Timestamp, Data::I64(out), combine_validity(a, sa, b, sb, n), bad))
+    Ok(finish(a.ty(), Data::I64(out), combine_validity(a, sa, b, sb, n), bad))
+}
+
+/// Builds an INTERVAL vector row by row from a field-wise operation. A row whose result does not
+/// fit its fields is NULL -- DuckDB raises an out-of-range error there, and a wrapped value
+/// (`INTERVAL '1 day' * 3000000000` used to print `-1294967296 days`) would be a silently
+/// wrong answer; NULL is this engine's answer for an undefined value (docs/sql/types.md).
+fn interval_rows(
+    n: usize,
+    validity: Option<Bitmap>,
+    f: impl Fn(usize) -> Option<(i32, i32, i64)>,
+) -> Vector {
+    let mut out = Vec::with_capacity(n);
+    let mut bad = None;
+    for i in 0..n {
+        match f(i) {
+            Some((m, d, u)) => out.push(pack_interval(m, d, u)),
+            None => {
+                out.push(0);
+                funcs::set_null(&mut bad, i, n);
+            }
+        }
+    }
+    finish(Ty::Interval, Data::I128(out), validity, bad)
 }
 
 /// INTERVAL +- INTERVAL. Field-wise addition (no carrying; DuckDB likewise leaves
@@ -1943,41 +1975,36 @@ pub fn interval_add(a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I128, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
     let (av, bv) = (a.i128s(), b.i128s());
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
+    Ok(interval_rows(n, combine_validity(a, sa, b, sb, n), |i| {
         let (m1, d1, u1) = unpack_interval(av[i * sa]);
         let (m2, d2, u2) = unpack_interval(bv[i * sb]);
-        out.push(pack_interval(m1.wrapping_add(m2), d1.wrapping_add(d2), u1.wrapping_add(u2)));
-    }
-    Ok(finish(Ty::Interval, Data::I128(out), combine_validity(a, sa, b, sb, n), None))
+        Some((m1.checked_add(m2)?, d1.checked_add(d2)?, u1.checked_add(u2)?))
+    }))
 }
 
 /// Negating an INTERVAL. Done field-wise (negating the raw 128-bit two's complement would break
 /// across field boundaries and cannot be used).
 pub fn interval_neg(a: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128, TypeMismatch);
-    let mut out = Vec::with_capacity(a.len());
-    for &packed in a.i128s() {
-        let (m, d, u) = unpack_interval(packed);
-        out.push(pack_interval(m.wrapping_neg(), d.wrapping_neg(), u.wrapping_neg()));
-    }
-    Ok(finish(Ty::Interval, Data::I128(out), a.validity().cloned(), None))
+    let av = a.i128s();
+    Ok(interval_rows(av.len(), a.validity().cloned(), |i| {
+        let (m, d, u) = unpack_interval(av[i]);
+        Some((m.checked_neg()?, d.checked_neg()?, u.checked_neg()?))
+    }))
 }
 
-/// INTERVAL * BIGINT. Field-wise multiplication (no carrying; the same as DuckDB).
+/// INTERVAL * BIGINT. Field-wise multiplication (no carrying; the same as DuckDB). As in DuckDB
+/// the multiplier itself has to fit an INTEGER, even for an interval of microseconds only.
 pub fn interval_mul(a: &Vector, b: &Vector) -> Result<Vector> {
     ensure!(a.data().phys() == PhysType::I128 && b.data().phys() == PhysType::I64, TypeMismatch);
     let (n, sa, sb) = strides2(a.len(), b.len())?;
     let (av, bv) = (a.i128s(), b.i64s());
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
+    Ok(interval_rows(n, combine_validity(a, sa, b, sb, n), |i| {
         let (m, d, u) = unpack_interval(av[i * sa]);
         let k = bv[i * sb];
-        let m = (m as i64).wrapping_mul(k) as i32;
-        let d = (d as i64).wrapping_mul(k) as i32;
-        out.push(pack_interval(m, d, u.wrapping_mul(k)));
-    }
-    Ok(finish(Ty::Interval, Data::I128(out), combine_validity(a, sa, b, sb, n), None))
+        let k32 = i32::try_from(k).ok()?;
+        Some((m.checked_mul(k32)?, d.checked_mul(k32)?, u.checked_mul(k)?))
+    }))
 }
 
 #[cfg(test)]
@@ -2260,47 +2287,29 @@ mod tests {
         assert_eq!(unpack_interval(r.i128s()[0]), (2, 6, 7_200_000_000));
     }
 
-    // The design decision "integers wrap; overflow does not panic" (see the `int_arith!` comment at
-    // the top of this file) applies consistently to INTERVAL's field-wise operations too.
-    // The wrapping behavior at this boundary is pinned down here.
+    // A field-wise INTERVAL result that does not fit its field is NULL rather than a wrapped
+    // value (DuckDB raises an out-of-range error for all of these).
     #[test]
-    fn interval_neg_of_i32_min_stays_negative_due_to_two_s_complement_wraparound() {
-        // i32::MIN.wrapping_neg() == i32::MIN (a positive i32::MAX+1 is not representable).
-        // The same intended wrapping behavior as the ordinary integer Neg kernel.
-        let a = ivec(&[(i32::MIN, i32::MIN, i64::MIN)]);
-        let r = interval_neg(&a).unwrap();
-        assert_eq!(unpack_interval(r.i128s()[0]), (i32::MIN, i32::MIN, i64::MIN));
-    }
+    fn interval_ops_make_an_overflowing_row_null() {
+        let big = ivec(&[(i32::MIN, 0, 0), (1, 2, 3)]);
+        let r = interval_neg(&big).unwrap();
+        assert!(!r.is_valid(0));
+        assert_eq!(unpack_interval(r.i128s()[1]), (-1, -2, -3));
 
-    #[test]
-    fn interval_add_wraps_on_months_and_days_overflow() {
-        let a = ivec(&[(i32::MAX, i32::MAX, 0)]);
-        let b = ivec(&[(1, 1, 0)]);
-        let r = interval_add(&a, &b).unwrap();
-        assert_eq!(unpack_interval(r.i128s()[0]), (i32::MIN, i32::MIN, 0));
-    }
+        let r = interval_add(&ivec(&[(0, i32::MAX, 0)]), &ivec(&[(0, 1, 0)])).unwrap();
+        assert!(!r.is_valid(0));
 
-    #[test]
-    fn interval_mul_wraps_without_double_truncation_of_the_multiplier() {
-        // The multiplication happens at i64 intermediate precision and is then truncated to i32
-        // (`(m as i64).wrapping_mul(k) as i32`). k itself is not truncated to i32 before
-        // multiplying, so even for large k the low 32 bits of the final result are consistently the
-        // same value (there is no double truncation).
-        let a = ivec(&[(1_000_000, 0, 0)]);
-        let mut k = Vector::new(Ty::BigInt);
-        k.push_value(&crate::vector::Value::I64(10_000));
-        let r = interval_mul(&a, &k).unwrap();
-        let expect_months = ((1_000_000i64).wrapping_mul(10_000) as i32, 0, 0);
-        assert_eq!(unpack_interval(r.i128s()[0]), expect_months);
-    }
-
-    #[test]
-    fn interval_mul_wraps_on_micros_overflow() {
-        let a = ivec(&[(0, 0, i64::MAX)]);
-        let mut k = Vector::new(Ty::BigInt);
-        k.push_value(&crate::vector::Value::I64(2));
-        let r = interval_mul(&a, &k).unwrap();
-        assert_eq!(unpack_interval(r.i128s()[0]), (0, 0, i64::MAX.wrapping_mul(2)));
+        let mul = |iv: (i32, i32, i64), k: i64| {
+            let mut kv = Vector::new(Ty::BigInt);
+            kv.push_value(&crate::vector::Value::I64(k));
+            interval_mul(&ivec(&[iv]), &kv).unwrap()
+        };
+        assert!(!mul((0, 1, 0), 3_000_000_000).is_valid(0));
+        // The multiplier has to fit an INTEGER even when every field would (DuckDB).
+        assert!(!mul((0, 0, 1), 3_000_000_000).is_valid(0));
+        assert!(!mul((0, 0, i64::MAX), 2).is_valid(0));
+        assert!(!mul((1_000_000, 0, 0), 10_000).is_valid(0));
+        assert_eq!(unpack_interval(mul((1, 2, 3), -2).i128s()[0]), (-2, -4, -6));
     }
 
     #[test]

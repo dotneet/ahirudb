@@ -406,12 +406,18 @@ rejected, because `b` then appears in the select list without being
 grouped or aggregated. `SELECT b AS a FROM t ORDER BY a` sorts by `b`,
 because there `a` is the alias.
 
-**`HAVING`** follows the `GROUP BY` rule — an input column of the name wins —
-but a name the input doesn't have may be a select-list alias, as in DuckDB:
+**`HAVING`** may name a select-list alias, as in DuckDB:
 
 ```sql
 SELECT flag, sum(id) AS s FROM t GROUP BY flag HAVING s > 100 ORDER BY 1;
 ```
+
+A name that is a grouping column (or sits inside an aggregate call) is the
+input column. Otherwise the alias wins — even over an input column of the
+same name, since an ungrouped input column could not be read there anyway:
+in `SELECT k % 2 AS k2, sum(v) AS v FROM t GROUP BY k % 2 HAVING v > 8` the
+`v` is `sum(v)`, while in `SELECT v, sum(k) AS v FROM t GROUP BY v HAVING
+v > 4` it is the grouped input `v`. This matches DuckDB.
 
 The alias has to name something the aggregate already produces: a grouping
 expression, an aggregate call, or a `GROUPING()` call. An alias on an
@@ -523,7 +529,7 @@ or `LIMIT`/aggregation instead of relying on `OVER (... ROWS BETWEEN ...)`.
 
 `QUALIFY` filters on the *result* of a window function without needing to
 wrap the query in a subquery. It is evaluated **after** the select list, but
-a bare name resolves the way it does in `WHERE`/`HAVING`, as in DuckDB: an
+a bare name resolves the way it does in `WHERE`, as in DuckDB: an
 input column of that name wins, and only a name the input doesn't have
 falls back to an output name (a select-list alias such as `rn` below, or a
 `* RENAME`d column). So in `SELECT a * 1 AS b, rank() OVER (...) FROM t
@@ -592,6 +598,11 @@ UNPIVOT t ON q1, q2, q3, q4 INTO NAME quarter VALUE amt ORDER BY id, quarter;
 UNPIVOT t ON amount ORDER BY region, category;
 ```
 
+As in DuckDB, a NULL value produces no row: `UNPIVOT` keeps only the non-NULL
+values of the unpivoted columns. DuckDB's `INCLUDE NULLS` exists only on its
+SQL-standard `FROM t UNPIVOT (...)` form, which is not supported (see
+[limitations.md](limitations.md#partially-supported)).
+
 ## UNNEST
 
 `UNNEST` expands a `JSON`-array-valued expression (a Parquet `LIST` column,
@@ -612,18 +623,29 @@ SELECT t.id, y.x FROM t, UNNEST(t.xs) AS y(x) WHERE t.id < 5;
 SELECT a.v, b.v FROM range(1), UNNEST(list_value(1, 2)) AS a(v), UNNEST(list_value(10, 20)) AS b(v);
 ```
 
-If every element of the array is the same scalar type, `UNNEST` restores
-that native type (`BIGINT`, `VARCHAR`, `BOOLEAN`, ...) rather than leaving
-the result as `JSON` text; a mixed-type array stays `JSON`. A `NULL` or
-empty array produces zero rows (not a row with a `NULL` value).
+A select-list `UNNEST` expands the rows **after** window functions and
+`QUALIFY`, and before `DISTINCT`, `ORDER BY` and `LIMIT`, as in DuckDB: in
+`SELECT id, UNNEST(xs), count(*) OVER () FROM t WHERE id < 2` the count is
+2 (the input rows), not the number of expanded rows. `QUALIFY` therefore
+cannot refer to the `UNNEST` output, nor (unlike DuckDB) to any other
+select-list alias of such a query — see
+[limitations.md](limitations.md#partially-supported).
 
-The restored type is wide enough for every element, so an integer past
-`BIGINT` comes back as `HUGEINT` (`UNNEST([1, 9223372036854775808])` yields
-`1` and `9223372036854775808`, as in DuckDB) rather than turning into
-`NULL`. One known gap: arrays travel as JSON text, and JSON has no way to
-spell infinity or NaN, so a non-finite `DOUBLE` element written into an
-array literal (`UNNEST([1.5, 1e400])`) becomes `NULL` — DuckDB, which has a
-real `LIST` type, keeps `inf` there.
+When the array's element type is known before the query runs, `UNNEST`
+returns the elements as that type, as DuckDB does: a Parquet `LIST<scalar>`
+column (`INTEGER[]` gives `INTEGER`, `VARCHAR[]` gives unquoted `VARCHAR`,
+`DOUBLE[]`/`DECIMAL`/`DATE`/`TIMESTAMP`/`BLOB`/... likewise),
+`string_split(...)`, a list literal whose elements share one scalar type, and
+the list functions that keep their input's elements (`list_sort`,
+`list_slice`, `list_filter`, ...). Anything else — a `JSON` value read from a
+JSON/JSONL file, a list of lists, a mixed-type literal — stays `JSON`. A
+`NULL` or empty array produces zero rows (not a row with a `NULL` value).
+
+A literal's element type is the common type of its elements, so an integer
+past `BIGINT` comes back as `HUGEINT` (`UNNEST([1, 9223372036854775808])`
+yields `1` and `9223372036854775808`, as in DuckDB), and non-finite `DOUBLE`
+elements survive the JSON text as `NaN`/`Infinity`/`-Infinity`
+(`UNNEST([1.5, 1e400])` yields `1.5` and `inf`).
 
 ## Table functions: generate_series / range
 

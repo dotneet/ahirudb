@@ -66,6 +66,12 @@ user-visible effect.
   rebuild their output column list while being desugared, so the shorthand
   is rejected rather than silently resolved against the wrong columns. Use
   an explicit `ORDER BY` list there.
+- **`QUALIFY` next to a select-list `UNNEST` sees no select-list aliases.**
+  The expansion happens after `QUALIFY` (as in DuckDB), so the filter runs
+  against the input columns and window results only; DuckDB also accepts a
+  reference to another item's alias there (`SELECT id + 1 AS j, UNNEST(xs)
+  ... QUALIFY j = 2`), which here fails with `column not found`. Repeat the
+  expression instead.
 - **`PIVOT ... ON x`** requires an explicit `IN (...)` value list.
   DuckDB's auto-detect-distinct-values form (`PIVOT t ON x USING agg(y)`
   with no `IN`) is not supported — enumerate the pivot values yourself.
@@ -74,7 +80,10 @@ user-visible effect.
   `USING sum(a), avg(b)` aggregates aren't supported.
 - **`UNPIVOT`** supports only single-column-at-a-time unpivoting; DuckDB's
   `UNPIVOT ... ON (a, b), (c, d)` (unpivoting several columns into several
-  value columns at once) isn't supported.
+  value columns at once) isn't supported. Neither is the SQL-standard
+  `FROM t UNPIVOT [INCLUDE NULLS] (v FOR n IN (...))` form, so there is no
+  way to keep the rows whose value is NULL (the `UNPIVOT` statement drops
+  them, as DuckDB's does).
 - **Star expressions**: `COLUMNS(*)`, `COLUMNS('regex')`,
   `COLUMNS(['a','b'])` and the `AS '\1'` capture-group renaming form all
   work (see [queries.md](queries.md#columns)), but four DuckDB star-expression
@@ -110,11 +119,18 @@ user-visible effect.
   DuckDB's and is matched on purpose.
 - **Text → `DATE` casts reject trailing junk that DuckDB ignores.** A
   timestamp-shaped string is accepted and the time part dropped
-  (`'2024-01-01T10:00:00'::DATE` is `2024-01-01`), but DuckDB also accepts
-  *any* trailing text after the date (`'2024-01-01x'::DATE` is
-  `2024-01-01` there); here that is `NULL`, so genuinely malformed input
-  is still visible. Named time zones other than `UTC` are rejected on a
-  `TIMESTAMP` cast, matching DuckDB without the ICU extension.
+  (`'2024-01-01T10:00:00'::DATE` is `2024-01-01`), and so are DuckDB's
+  other date separators (`'2024/1/5'`, `'2024 01 05'`), but DuckDB also
+  accepts *any* trailing text after the date (`'2024-01-01x'::DATE` is
+  `2024-01-01` there, and so is `'2024-01-01 BC'`); here that is `NULL`,
+  so genuinely malformed input is still visible. Named time zones other
+  than `UTC` are rejected on a `TIMESTAMP` cast, matching DuckDB without
+  the ICU extension.
+- **Two corners of INTERVAL text differ from DuckDB's parser**, both where
+  DuckDB's own behavior is inconsistent: a bare integer (`'5'::INTERVAL`)
+  is 5 seconds here, while DuckDB rejects `'5'` but reads `'5 '` (with a
+  trailing space) and `'1.5'` as seconds; and a trailing number with no
+  unit (`'1 day 2'`) is an error here, while DuckDB silently drops the `2`.
 - **`quantile`/`percentile_cont`** are the *continuous* (interpolated)
   quantile in all spellings. DuckDB's `quantile` is the discrete version,
   and its `quantile_disc` isn't implemented. A list-valued fraction
@@ -135,10 +151,16 @@ user-visible effect.
 - **LIST/MAP values have no dedicated physical type** — they're
   represented as `JSON` text under the hood (see
   [data-sources.md](data-sources.md#nested-parquet-types)). This is usually
-  invisible, but it means, for example, that list elements need an explicit
+  invisible — a subscript (`xs[i]`, `m[k]`) or `UNNEST` returns the element
+  as its native type whenever that type is known statically (a Parquet
+  `LIST<scalar>`/`MAP` column, `string_split`, a one-type list literal) — but
+  a lambda parameter is always `JSON`, so a numeric element needs an explicit
   `CAST(... AS VARCHAR)` / `CAST(... AS INTEGER)` round-trip before doing
-  arithmetic on them inside a lambda (`list_transform(xs, x -> CAST(CAST(x
-  AS VARCHAR) AS INTEGER) + 1)`). It also changes what `||` means — see
+  arithmetic on it inside a lambda (`list_transform(xs, x -> CAST(CAST(x AS
+  VARCHAR) AS INTEGER) + 1)`), and an element of a nested list (`xss[1][2]`)
+  or of a `JSON` value read from a JSON/JSONL file stays `JSON`. `array_agg`
+  returns its list as `VARCHAR` text, so `array_agg(x)[1]` is `JSON` too. It
+  also changes what `||` means — see
   [JSON is also the list type](#json-is-also-the-list-type) below.
 - **JSON equality is byte-comparison**, not semantic comparison — two JSON
   documents that differ only in whitespace (`'{"a": 1}'` vs `'{"a":1}'`)
@@ -210,6 +232,12 @@ user-visible effect.
   `unsupported SQL feature`. Table-*qualified* columns do work
   (`UPDATE t SET b = 1 WHERE t.a = 1`) — it is only the alias binding and
   the correlated/uncorrelated subquery that are missing.
+- **Column `DEFAULT`s are constants, evaluated once.** `CREATE TABLE t (a
+  INTEGER DEFAULT 5)`, `INSERT ... VALUES (DEFAULT)` and `INSERT ... DEFAULT
+  VALUES` work, but the default expression is evaluated when the column is
+  created, not per inserted row, so `DEFAULT now()` stores the creation time
+  in every row (DuckDB re-evaluates it), and it may not reference sequences
+  or other columns. `UPDATE t SET a = DEFAULT` is a syntax error.
 - **Text parts whose sniffed schemas disagree widen to `VARCHAR`; Parquet
   parts stay strict.** Registering `a.csv` (whose column `a` sniffs as
   `BIGINT`) together with `b.csv` (whose `a` holds text and sniffs as
@@ -222,10 +250,21 @@ user-visible effect.
   `TypeMismatch` — there the schema is authoritative, and a silent widening
   would be hiding a mistake rather than tolerating one. See
   [data-sources.md](data-sources.md#text-format-type-inference).
+- **Nanosecond timestamps lose their sub-microsecond digits.** A Parquet
+  `TIMESTAMP(NANOS)`/`TIME(NANOS)` column (DuckDB's `TIMESTAMP_NS`) reads as
+  the microsecond `TIMESTAMP`/`TIME`, truncating toward zero, without a
+  warning — so two values 1 ns apart can compare equal, and `-1 ns` reads as
+  the epoch. DuckDB keeps `TIMESTAMP_NS`. See
+  [types.md](types.md#logical-types).
+- **The CSV delimiter is not sniffed.** It comes from the extension alone:
+  `.csv` is comma-separated and `.tsv` tab-separated, so a `;`- or
+  `|`-separated `.csv` file reads as a single column. DuckDB sniffs the
+  delimiter (and quote/escape characters) from the file.
 - **A value outside the inference sample that doesn't fit the inferred type
   is an error, not a `NULL`.** If a CSV column sniffs as an integer from
-  its first 256 KiB and row 60,001 holds `notanumber`, the query fails with
-  `invalid cast`. DuckDB re-sniffs and widens the column instead, so the
+  its first 256 KiB and a row past those 256 KiB holds `notanumber` (every
+  complete record inside them takes part in the sniffing), the query fails
+  with `invalid cast`. DuckDB re-sniffs and widens the column instead, so the
   same file counts fine there. Erroring is the deliberate choice: silently
   nulling the row destroyed data, and this engine would rather fail loudly.
   Cast the column explicitly (`CAST(... AS VARCHAR)` at the source, or a
@@ -257,6 +296,14 @@ user-visible effect.
     are `Box` chains whose *drop* alone recurses once per link, so the cap
     stays low. Nest them differently (union in batches through a CTE) if you
     generate SQL that hits it.
+  - *Plan depth* is capped at 256 operator levels. Some constructs stack
+    plan levels without nesting anything in the SQL text: a chain of CTEs
+    each reading the previous one (`WITH c1 AS (... FROM c0), c2 AS (...
+    FROM c1), ...`), views expanding to such chains, or hundreds of
+    `IN (SELECT ...)` / `EXISTS` / `> ANY (...)` conjuncts. Building and
+    running a plan recurses once per level, so a plan past the cap is
+    rejected with `expression nesting too deep` (a plain CTE chain of about
+    250 links is the practical maximum). DuckDB has no such limit.
 - **`printf('%f', ...)` prints the value's full exact binary expansion**,
   as C's `printf` does. `printf('%f', 1e300)` therefore prints all 301
   integer digits of the `DOUBLE` nearest `1e300`, where DuckDB prints the
@@ -336,7 +383,10 @@ rows already mutated. Concretely:
   then appends the whole batch to the table in one step.
 - `UPDATE` evaluates every `SET` expression and NOT-NULL-checks every
   matched row across the whole statement first, then writes all the
-  validated values in one step.
+  validated values in one step. Rows the `WHERE` clause excludes are never
+  evaluated, so an expression that would fail on them (`CAST(s AS JSON)`
+  over non-JSON text, an overflowing `factorial(n)`) does not abort the
+  statement — as in DuckDB.
 - `DELETE` computes the full "rows to keep" list first, then replaces the
   table's row list in one step.
 

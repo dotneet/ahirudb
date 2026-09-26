@@ -162,7 +162,10 @@ const F_JSON_EXTRACT: FuncId = 80;
 const F_JSON_EXTRACT_STRING: FuncId = 81;
 const F_JSON_TYPE: FuncId = 82;
 const F_TO_JSON: FuncId = 83;
-const F_LIST_EXTRACT: FuncId = 84;
+// `list_extract` is `pub(crate)` along with its siblings below because
+// `plan::compile::Compiler::subscript` emits them directly: which one applies
+// depends on the base's `Shape`, which `resolve` does not see.
+pub(crate) const F_LIST_EXTRACT: FuncId = 84;
 const F_MAP_EXTRACT: FuncId = 85;
 const F_JSON_OBJECT: FuncId = 86;
 const F_JSON_ARRAY: FuncId = 87;
@@ -214,6 +217,12 @@ const F_CHR: FuncId = 99;
 // to 200.
 const F_JSON_EXTRACT_IDX: FuncId = 100;
 const F_JSON_EXTRACT_STRING_IDX: FuncId = 101;
+const F_LIST_REVERSE_SORT: FuncId = 106;
+/// `list_extract` returning the element as text (see `Compiler::subscript`).
+pub(crate) const F_LIST_EXTRACT_TEXT: FuncId = 107;
+/// `m[k]` / `map_extract_value`: a MAP's value for a key, as JSON / as text.
+pub(crate) const F_MAP_VALUE: FuncId = 108;
+pub(crate) const F_MAP_VALUE_TEXT: FuncId = 109;
 const F_DAYNAME: FuncId = 110;
 const F_MONTHNAME: FuncId = 111;
 const F_HEX: FuncId = 112;
@@ -252,6 +261,18 @@ const F_LOG_BASE: FuncId = 151;
 const F_CBRT: FuncId = 152;
 const F_RADIANS: FuncId = 153;
 const F_DEGREES: FuncId = 154;
+
+// Date/time operators. `plan::compile` emits all but `F_STRFTIME_FMT` directly for the
+// operator forms that are not a plain kernel: `TIMESTAMP - TIMESTAMP` (an INTERVAL),
+// `TIME + INTERVAL` (`-` negates the interval first), `DATE + TIME`, and `INTERVAL * / number`
+// with a non-integer (or any divisor). 180-189 is kept for this group.
+/// `strftime(format, value)`: DuckDB accepts the arguments in either order.
+const F_STRFTIME_FMT: FuncId = 180;
+pub(crate) const F_TS_SUB: FuncId = 181;
+pub(crate) const F_TIME_ADD_IV: FuncId = 182;
+pub(crate) const F_DATE_ADD_TIME: FuncId = 183;
+pub(crate) const F_IV_MUL_F: FuncId = 184;
+pub(crate) const F_IV_DIV_F: FuncId = 185;
 
 /// Shorthands such as `year()`. The part number is embedded in the ID, joining the same
 /// extraction function as `date_part` (separate IDs per function, but one body).
@@ -662,7 +683,10 @@ pub fn resolve_const(
             ensure!(json_encodable(args[1]), TypeMismatch);
             Ok((F_LIST_POSITION, vec![Json, args[1]], BigInt))
         }
-        "list_sort" | "array_sort" => fixed(F_LIST_SORT, &[Json], n, 1, Json),
+        "list_sort" | "array_sort" => fixed(F_LIST_SORT, &[Json, Varchar, Varchar], n, 1, Json),
+        "list_reverse_sort" | "array_reverse_sort" => {
+            fixed(F_LIST_REVERSE_SORT, &[Json, Varchar], n, 1, Json)
+        }
         // Note `list_unique` is deliberately *not* an alias here: in DuckDB it returns the
         // *count* of distinct elements, not the deduplicated list.
         "list_distinct" | "array_distinct" => fixed(F_LIST_DISTINCT, &[Json], n, 1, Json),
@@ -720,39 +744,66 @@ pub fn resolve_const(
             ensure!(n == 2, WrongArgCount);
             anyn(F_COALESCE, args, 2)
         }
+        // The result keeps the first argument's type, as in DuckDB (`nullif(DATE, TIMESTAMP)`
+        // is a DATE); `json::nullif` compares the two in their common type itself.
         "nullif" => {
             ensure!(n == 2, WrongArgCount);
-            anyn(F_NULLIF, args, 2)
+            let (_, _, t) = anyn(F_NULLIF, args, 2)?;
+            let keep = |a: Ty| if a == Null { t } else { a };
+            Ok((F_NULLIF, vec![keep(args[0]), keep(args[1])], keep(args[0])))
         }
 
         // --- Date and time ---------------------------------------------------
         // The internal representations are DATE = days (I32) / TIMESTAMP = microseconds (I64) / TIME = microseconds (I64).
-        // Arguments settle on TIMESTAMP, so both DATE columns and VARCHAR literals can be passed
-        // straight through via the caller's `Cast`.
+        // Arguments settle on TIMESTAMP (see `dt_arg`), so VARCHAR literals can be passed
+        // straight through via the caller's `Cast`; DATE stays a day count, so dates past
+        // TIMESTAMP's range still work.
         //
         // Note: DuckDB 1.4's `date_trunc` returns DATE or TIMESTAMP depending on the part, but
         // `resolve` cannot see the part's **value** (only types arrive), so it always returns
-        // TIMESTAMP. For the same reason `date_part('epoch', ..)` returns BIGINT (seconds,
-        // truncated) rather than DOUBLE.
-        "date_trunc" | "datetrunc" => fixed(F_DATE_TRUNC, &[Varchar, Timestamp], n, 2, Timestamp),
+        // TIMESTAMP (TIMESTAMPTZ for a TIMESTAMPTZ argument, as in DuckDB). For the same reason
+        // `date_part('epoch', ..)` returns BIGINT (seconds, truncated) rather than DOUBLE.
+        "date_trunc" | "datetrunc" => {
+            ensure!(n == 2, WrongArgCount);
+            let t = if args[1] == Timestamptz { Timestamptz } else { Timestamp };
+            Ok((F_DATE_TRUNC, vec![Varchar, t], t))
+        }
         "date_part" | "datepart" | "extract" => {
-            fixed(F_DATE_PART, &[Varchar, Timestamp], n, 2, BigInt)
+            ensure!(n == 2, WrongArgCount);
+            Ok((F_DATE_PART, vec![Varchar, dt_arg(args[1], &[Time, Interval])], BigInt))
         }
         // `date_sub` is deliberately not an alias of this: DuckDB's `date_sub` counts *complete*
         // partitions where `date_diff` counts boundaries crossed, so the two disagree over a
         // partial unit (`date_diff('day', '..23:00', '..01:00')` is 1, `date_sub` is 0).
         "date_diff" | "datediff" => {
-            fixed(F_DATE_DIFF, &[Varchar, Timestamp, Timestamp], n, 3, BigInt)
+            ensure!(n == 3, WrongArgCount);
+            let (a, b) = (dt_arg(args[1], &[Time]), dt_arg(args[2], &[Time]));
+            ensure!((a == Time) == (b == Time), TypeMismatch);
+            Ok((F_DATE_DIFF, vec![Varchar, a, b], BigInt))
         }
         // DuckDB's `date_add` takes an INTERVAL, but this implementation has no INTERVAL type.
         // As a deliberate incompatibility it takes three arguments, `date_add(part, n, ts)`.
         "date_add" => fixed(F_DATE_ADD, &[Varchar, BigInt, Timestamp], n, 3, Timestamp),
-        "last_day" => fixed(F_LAST_DAY, &[Timestamp], n, 1, Date),
-        "strftime" => fixed(F_STRFTIME, &[Timestamp, Varchar], n, 2, Varchar),
+        "last_day" => {
+            ensure!(n == 1, WrongArgCount);
+            Ok((F_LAST_DAY, vec![dt_arg(args[0], &[])], Date))
+        }
+        // DuckDB takes the format first as well: `strftime('%Y', DATE '2024-01-05')`.
+        "strftime" => {
+            ensure!(n == 2, WrongArgCount);
+            if args[0] == Varchar && matches!(args[1], Date | Timestamp | Timestamptz) {
+                Ok((F_STRFTIME_FMT, vec![Varchar, dt_arg(args[1], &[])], Varchar))
+            } else {
+                Ok((F_STRFTIME, vec![dt_arg(args[0], &[]), Varchar], Varchar))
+            }
+        }
         // English names, matching DuckDB's output exactly (`Monday`, `January`, ...).
         // No locale support -- the engine carries no locale data at all.
-        "dayname" => fixed(F_DAYNAME, &[Timestamp], n, 1, Varchar),
-        "monthname" => fixed(F_MONTHNAME, &[Timestamp], n, 1, Varchar),
+        "dayname" | "monthname" => {
+            ensure!(n == 1, WrongArgCount);
+            let id = if lower == "dayname" { F_DAYNAME } else { F_MONTHNAME };
+            Ok((id, vec![dt_arg(args[0], &[])], Varchar))
+        }
         "make_date" => fixed(F_MAKE_DATE, &[BigInt, BigInt, BigInt], n, 3, Date),
         // `make_timestamp(microseconds)`: the count since the epoch *is* the TIMESTAMP's
         // physical value, so it is `epoch_us`'s identity body with a TIMESTAMP result.
@@ -789,24 +840,24 @@ pub fn resolve_const(
         }
         "to_date" => fixed(F_TO_DATE, &[Varchar], n, 1, Date),
         "to_timestamp" => fixed(F_TO_TIMESTAMP, &[Varchar], n, 1, Timestamp),
-        "year" => shorthand(P_YEAR, n),
-        "quarter" => shorthand(P_QUARTER, n),
-        "month" => shorthand(P_MONTH, n),
-        "week" => shorthand(P_WEEK, n),
-        "day" | "dayofmonth" => shorthand(P_DAY, n),
-        "hour" => shorthand(P_HOUR, n),
-        "minute" => shorthand(P_MINUTE, n),
-        "second" => shorthand(P_SECOND, n),
-        "dayofweek" => shorthand(P_DOW, n),
-        "dayofyear" => shorthand(P_DOY, n),
-        "epoch" => shorthand(P_EPOCH, n),
-        "millisecond" => shorthand(P_MILLISECOND, n),
-        "microsecond" => shorthand(P_MICROSECOND, n),
-        "isodow" => shorthand(P_ISODOW, n),
-        "century" => shorthand(P_CENTURY, n),
-        "decade" => shorthand(P_DECADE, n),
-        "millennium" => shorthand(P_MILLENNIUM, n),
-        "isoyear" => shorthand(P_ISOYEAR, n),
+        "year" => shorthand(P_YEAR, args),
+        "quarter" => shorthand(P_QUARTER, args),
+        "month" => shorthand(P_MONTH, args),
+        "week" => shorthand(P_WEEK, args),
+        "day" | "dayofmonth" => shorthand(P_DAY, args),
+        "hour" => shorthand(P_HOUR, args),
+        "minute" => shorthand(P_MINUTE, args),
+        "second" => shorthand(P_SECOND, args),
+        "dayofweek" => shorthand(P_DOW, args),
+        "dayofyear" => shorthand(P_DOY, args),
+        "epoch" => shorthand(P_EPOCH, args),
+        "millisecond" => shorthand(P_MILLISECOND, args),
+        "microsecond" => shorthand(P_MICROSECOND, args),
+        "isodow" => shorthand(P_ISODOW, args),
+        "century" => shorthand(P_CENTURY, args),
+        "decade" => shorthand(P_DECADE, args),
+        "millennium" => shorthand(P_MILLENNIUM, args),
+        "isoyear" => shorthand(P_ISOYEAR, args),
 
         // Not implemented, since there is no clock (see the comments at the top of the module).
         _ => err!(FunctionNotFound),
@@ -889,12 +940,12 @@ fn num1_whole(
 }
 
 /// Whether the type is writable as a value of `to_json`/`json_array`/`json_object`.
-/// Supported are NULL/BOOLEAN/integers/floating point/DECIMAL/VARCHAR/DATE/TIME/TIMESTAMP/JSON
-/// (embedded as is). BLOB and INTERVAL are unsupported (they have no natural JSON representation,
-/// so like CAST they are rejected with `TypeMismatch`).
+/// Supported are NULL/BOOLEAN/integers/floating point/DECIMAL/VARCHAR/BLOB/DATE/TIME/TIMESTAMP/
+/// JSON (embedded as is). INTERVAL is unsupported (like CAST it is rejected with
+/// `TypeMismatch`).
 fn json_encodable(t: Ty) -> bool {
     use Ty::*;
-    t.is_numeric() || matches!(t, Null | Boolean | Varchar | Date | Time | Timestamp | Json)
+    t.is_numeric() || matches!(t, Null | Boolean | Varchar | Blob | Date | Time | Timestamp | Json)
 }
 
 /// A variadic any-type function. Every argument settles on a common type.
@@ -917,9 +968,27 @@ fn anyn(id: FuncId, args: &[Ty], lo: usize) -> Result<(FuncId, Vec<Ty>, Ty)> {
 }
 
 /// Shorthands such as `year(ts)`. The part is embedded in the ID.
-fn shorthand(part: u8, n: usize) -> Result<(FuncId, Vec<Ty>, Ty)> {
-    ensure!(n == 1, WrongArgCount);
-    Ok((F_PART_BASE + part as FuncId, vec![Ty::Timestamp], Ty::BigInt))
+///
+/// A TIME or INTERVAL argument is kept as it is, and a part it does not have (`year(TIME
+/// ...)`, `dayofweek(INTERVAL ...)`) is rejected here, as DuckDB rejects it at bind time.
+fn shorthand(part: u8, args: &[Ty]) -> Result<(FuncId, Vec<Ty>, Ty)> {
+    ensure!(args.len() == 1, WrongArgCount);
+    let t = dt_arg(args[0], &[Ty::Time, Ty::Interval]);
+    ensure!(t != Ty::Time || datetime::time_part(part), TypeMismatch);
+    ensure!(t != Ty::Interval || datetime::interval_part(part, 0).is_ok(), TypeMismatch);
+    Ok((F_PART_BASE + part as FuncId, vec![t], Ty::BigInt))
+}
+
+/// The type a date function reads its date/time argument as. DATE and TIMESTAMPTZ are kept
+/// (`datetime::arg_civil` reads a DATE's day count directly, so dates past TIMESTAMP's range
+/// work), as is any type in `keep`; everything else settles on TIMESTAMP through the caller's
+/// cast, which also rejects a number (`year(1500)` is an error, as in DuckDB).
+fn dt_arg(t: Ty, keep: &[Ty]) -> Ty {
+    if matches!(t, Ty::Date | Ty::Timestamptz) || keep.contains(&t) {
+        t
+    } else {
+        Ty::Timestamp
+    }
 }
 
 // =========================================================================
@@ -1216,6 +1285,11 @@ impl<'b> A<'_, 'b> {
         self.v.len()
     }
 
+    /// The logical type of argument `k` (`Null` when absent).
+    fn ty(&self, k: usize) -> Ty {
+        self.v.get(k).map_or(Ty::Null, |v| v.ty())
+    }
+
     #[inline]
     fn at(&self, k: usize) -> Option<(&'b Vector, usize)> {
         match (self.v.get(k), self.s.get(k)) {
@@ -1313,8 +1387,9 @@ use string::eval_str;
 // so that path keeps resolving — only the implementation moved, not the
 // public name/path.
 pub(crate) use datetime::{
-    add_interval_to_ts, days_from_civil, fmt_date, fmt_time, fmt_timestamp, fmt_timestamptz,
-    fmt_uuid, parse_date, parse_time, parse_timestamp, parse_timestamptz, parse_uuid,
+    add_interval_to_ts, add_interval_unit, days_from_civil, fmt_date, fmt_time, fmt_timestamp,
+    fmt_timestamptz, fmt_uuid, parse_date, parse_time, parse_timestamp, parse_timestamptz,
+    parse_uuid,
 };
 // This one is used only from `write::csv`/`write::jsonl`. `write` itself exists only with
 // `export`, and the csv/jsonl inside it are gated further by their own features, so it is
@@ -1322,5 +1397,6 @@ pub(crate) use datetime::{
 // unused).
 #[cfg(all(feature = "export", any(feature = "csv", feature = "jsonl")))]
 pub(crate) use datetime::civil_from_days;
+pub(crate) use json::{write_json_f64, write_json_int};
 pub use lambda::call_lambda;
 pub(crate) use numeric::{f_abs, f_trunc};

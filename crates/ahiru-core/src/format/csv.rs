@@ -53,9 +53,6 @@ const SAMPLE_BYTES: u64 = 256 * 1024;
 /// record the reader accepts anyway, so nothing is gained by asking for more.
 const MAX_SAMPLE_BYTES: u64 = TEXT_MAX_RECORD;
 
-/// The maximum number of rows used for type inference. The sample bytes may run out first.
-const SAMPLE_ROWS: usize = 1000;
-
 /// The initial row capacity of a column buffer. The input is untrusted, so the allocation is not
 /// sized from an estimated row count (so a huge allocation cannot be planted).
 const ROW_CAP: usize = 256;
@@ -312,7 +309,9 @@ impl TableFormat for CsvFormat {
             let blank_is_row = Self::blank_line_is_a_row(cands.len());
             let mut sc = Scanner::new(rest, self.delimiter).with_cr_term(self.cr_term);
             let mut rows = 0;
-            'sample: while rows < SAMPLE_ROWS && !sc.at_end() {
+            // Every complete record in the sample takes part: it is in hand already, and a row cap
+            // would let a short-row file hide most of its sample from the inference.
+            'sample: while !sc.at_end() {
                 if !blank_is_row && sc.skip_blank_line() {
                     continue;
                 }
@@ -486,6 +485,7 @@ impl TableFormat for CsvFormat {
                 continue;
             }
             let mut fi = 0;
+            let mut trailing_delim;
             loop {
                 let f = match sc.field() {
                     Ok(f) => f,
@@ -502,6 +502,7 @@ impl TableFormat for CsvFormat {
                     }
                 } // Columns outside the projection are not converted. Only the scan is done.
                 fi += 1;
+                trailing_delim = fi == ncols + 1 && !f.quoted && f.start == f.end;
                 if f.term != Term::Field {
                     // If the buffer runs out without meeting a line terminator: at end of file that
                     // is the final record; otherwise the overread was insufficient.
@@ -513,7 +514,9 @@ impl TableFormat for CsvFormat {
             // quietly truncate: dropping the surplus loses data the file plainly contains, and the
             // usual cause (an unquoted delimiter inside a value) shifts every following field too.
             // DuckDB rejects such a row as well, unless `ignore_errors` is asked for explicitly.
-            ensure!(fi <= ncols, SyntaxError, sc.pos());
+            // The one exception is a single empty field after a trailing delimiter (`1,2,` under
+            // `a,b`): nothing is lost by dropping it, and DuckDB reads such files the same way.
+            ensure!(fi <= ncols || (fi == ncols + 1 && trailing_delim), SyntaxError, sc.pos());
             // A row with too few fields has the rest set to NULL (DuckDB's `null_padding`).
             for c in fi..ncols {
                 if let Some(Some(slot)) = slot_of.get(c) {
@@ -558,26 +561,23 @@ fn finish(cols: Vec<ColBuf>, uniq: &[usize], projection: &[usize]) -> Result<Vec
 
 /// Decides the column names from the header.
 ///
-/// Empty, non-UTF-8, and duplicate names are replaced with `columnN`. Leaving duplicates would
-/// make it impossible to decide which one a column reference means, so they are always made unique.
+/// As in DuckDB, surrounding spaces are trimmed (`a, b ,c` names `a`, `b`, `c`), an empty or
+/// non-UTF-8 name becomes `columnN`, and a repeated name (ignoring case) becomes `a_1`, `a_2`, ...
+/// Leaving duplicates would make it impossible to decide which one a column reference means.
 fn column_names(raw: &[Vec<u8>]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    for (i, r) in raw.iter().enumerate() {
-        let mut name = match core::str::from_utf8(r) {
-            Ok(s) if !s.is_empty() => s.to_owned(),
-            _ => generated_name(i),
-        };
-        if out.iter().any(|p| eq_ascii_ci(p.as_bytes(), name.as_bytes())) {
-            name = generated_name(i);
-        }
-        // In case a generated name collides again (an earlier column was literally "column3", say).
-        // The length grows each time, so it always terminates.
-        while out.iter().any(|p| eq_ascii_ci(p.as_bytes(), name.as_bytes())) {
-            name.push('_');
-        }
-        out.push(name);
-    }
-    out
+    let names: Vec<String> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let start = r.iter().position(|&b| b != b' ').unwrap_or(r.len());
+            let end = r.iter().rposition(|&b| b != b' ').map_or(start, |e| e + 1);
+            match core::str::from_utf8(&r[start..end]) {
+                Ok(s) if !s.is_empty() => s.to_owned(),
+                _ => generated_name(i),
+            }
+        })
+        .collect();
+    crate::format::unique_column_names(&names)
 }
 
 /// Decides whether the first record is a header, the way DuckDB's sniffer does.
@@ -1456,14 +1456,16 @@ mod tests {
     #[test]
     fn header_names_are_made_unique() {
         let (f, _) = open(b"a,,a,B,column2\n1,2,3,4,5\n", b',');
-        // Empty -> column1; a duplicate (ignoring case) -> column2. The fifth column collides with
-        // the "column2" generated before it, so it becomes column4.
-        assert_eq!(names(&f), vec!["a", "column1", "column2", "B", "column4"]);
-        // When generated names collide with one another, a `_` is added to make them unique.
+        // As in DuckDB: empty -> column1; a duplicate (ignoring case) -> a_1.
+        assert_eq!(names(&f), vec!["a", "column1", "a_1", "B", "column2"]);
         let (g, _) = open(b"x,column1,x\n1,2,3\n", b',');
-        assert_eq!(names(&g), vec!["x", "column1", "column2"]);
-        let (h, _) = open(b"column2,a,a\n1,2,3\n", b',');
-        assert_eq!(names(&h), vec!["column2", "a", "column2_"]);
+        assert_eq!(names(&g), vec!["x", "column1", "x_1"]);
+        // A generated name that collides with a real one is suffixed the same way.
+        let (h, _) = open(b"column1,,a\n1,2,3\n", b',');
+        assert_eq!(names(&h), vec!["column1", "column1_1", "a"]);
+        // Spaces around a name are trimmed (tabs are not); a spaces-only name is empty.
+        let (p, _) = open(b"a, b ,\"  c\",\td , \n1,2,3,4,5\n", b',');
+        assert_eq!(names(&p), vec!["a", "b", "c", "\td", "column4"]);
     }
 
     #[test]
@@ -1710,11 +1712,22 @@ mod tests {
     }
 
     #[test]
-    fn inference_uses_only_the_first_rows() {
-        // The first SAMPLE_ROWS rows are integers, with strings mixed in afterwards.
+    fn inference_uses_the_whole_leading_sample() {
+        // A string at row 1200 of a small file is inside the sample and widens the column (a
+        // 1000-row cap used to miss it and fail the read with InvalidCast).
         let mut s = String::from("c\n");
-        for i in 0..SAMPLE_ROWS {
+        for i in 0..1200 {
             s.push_str(&std::format!("{i}\n"));
+        }
+        s.push_str("oops\n");
+        let (f, src) = open(s.as_bytes(), b',');
+        assert_eq!(types(&f), vec![Ty::Varchar]);
+        assert_eq!(read_all(&f, &src, &[0])[0][1200], Value::Bytes(b"oops".to_vec()));
+
+        // Past the leading SAMPLE_BYTES, the rows are integers, with a string mixed in afterwards.
+        let mut s = String::from("c\n");
+        while s.len() <= SAMPLE_BYTES as usize {
+            s.push_str("1234567\n");
         }
         s.push_str("oops\n");
         let (f, src) = open(s.as_bytes(), b',');
@@ -2153,6 +2166,22 @@ mod tests {
         // `(1, 2)`. duckdb rejects such a row (its sniffer refuses the file outright).
         let (f, src) = open(b"a,b\n1,2,3\n", b',');
         assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
+        // Two surplus fields, or a quoted empty one, are still more than a trailing delimiter.
+        let (f, src) = open(b"a,b\n1,2,,\n", b',');
+        assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
+        let (f, src) = open(b"a,b\n1,2,\"\"\n", b',');
+        assert_eq!(code_of(f.read_split(&src, 0, &[0, 1])), Some(Code::SyntaxError));
+    }
+
+    #[test]
+    fn a_trailing_delimiter_on_data_rows_is_ignored() {
+        // duckdb reads `a,b\n1,2,\n3,4,\n` as two rows of two columns.
+        let (f, src) = open(b"a,b\n1,2,\n3,4,\n", b',');
+        let got = read_all(&f, &src, &[0, 1]);
+        assert_eq!(got[0], vec![Value::I64(1), Value::I64(3)]);
+        assert_eq!(got[1], vec![Value::I64(2), Value::I64(4)]);
+        let (f, src) = open(b"a\n1,\n2,\n", b',');
+        assert_eq!(read_all(&f, &src, &[0])[0], vec![Value::I64(1), Value::I64(2)]);
     }
 
     #[test]
@@ -2164,7 +2193,7 @@ mod tests {
         let row = "1,true,2024-01-01,2024-01-01 00:00:00\n";
         for col in 0..4 {
             let mut s = String::from(head);
-            for _ in 0..SAMPLE_ROWS {
+            while s.len() <= SAMPLE_BYTES as usize {
                 s.push_str(row);
             }
             // One bad cell in one column at a time.

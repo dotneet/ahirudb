@@ -116,28 +116,34 @@ pub(super) fn order_output_column(
 }
 
 /// Returns the column number if a `DISTINCT ON` expression points at an output column (by
-/// alias match or structural match). The version of `order_output_column` without ordinals
-/// (DISTINCT ON has no ordinal form such as `ON (1)`).
+/// ordinal, alias match or structural match).
+///
+/// Like ORDER BY, `DISTINCT ON (1)` names the first output column, and an ordinal outside
+/// `1..=schema.len()` or a non-integer literal is an error (DuckDB: "ORDER term out of
+/// range"), never a constant key that would collapse the result to one row.
 pub(super) fn distinct_on_output_column(
     arena: &ExprArena,
     sel: &SelectStmt,
     on_expr: ExprId,
     schema: &[Field],
-) -> Option<usize> {
+) -> Result<Option<usize>> {
+    if let Some(n) = numeric_ordinal_of(arena, on_expr) {
+        return Ok(Some(ordinal_index(n, schema.len())?));
+    }
     if let Expr::ColumnRef { qualifier: None, name } = arena.get(on_expr) {
         if let Some(i) = schema.iter().position(|f| eq_ascii_ci(f.name.as_bytes(), name.as_bytes()))
         {
-            return Some(i);
+            return Ok(Some(i));
         }
     }
     if !sel.items.iter().any(|it| matches!(arena.get(it.expr), Expr::Star { .. })) {
         for (col, item) in sel.items.iter().enumerate() {
             if expr_eq(arena, item.expr, on_expr) && col < schema.len() {
-                return Some(col);
+                return Ok(Some(col));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Returns the value if it is a positive integer literal.

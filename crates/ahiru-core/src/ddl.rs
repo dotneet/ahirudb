@@ -16,7 +16,7 @@
 
 use crate::error::Code;
 use crate::exec::{build, ExecContext, Step};
-use crate::plan::bind::{bind_query_at, referenced_in_query};
+use crate::plan::bind::bind_query_at;
 use crate::plan::compile::{cast_program, compile};
 use crate::plan::Scope;
 use crate::prelude::*;
@@ -38,6 +38,7 @@ pub(crate) fn create_table(
     if if_not_exists && !or_replace && table_name_exists(session, name) {
         return Ok(Prepared::Ready(count_result(0)));
     }
+    let mut defaults = Vec::new();
     let (schema, rows) = match as_select {
         Some(q) => {
             let (mut schema, rows) = run_query_to_rows(session, arena, q, params)?;
@@ -47,14 +48,32 @@ pub(crate) fn create_table(
             // COPY treated the column as always-NULL. DuckDB types such a column
             // INTEGER; do the same. Every existing row holds `Value::Null` there, so
             // no data needs converting.
+            //
+            // Every CTAS column is nullable, as in DuckDB: a query's nullability (a
+            // NOT NULL source column, a Parquet REQUIRED field, the preserved side of
+            // an outer join) describes the rows it produced, not a constraint the new
+            // table should enforce on later INSERTs.
             for f in &mut schema {
                 if f.ty == Ty::Null {
                     f.ty = Ty::Int;
                 }
+                f.nullable = true;
             }
+            // Duplicate output names (`SELECT * FROM a JOIN b ON a.id = b.id`) are
+            // renamed `id_1`, ... rather than rejected, again as DuckDB does.
+            crate::catalog::Catalog::dedup_column_names(&mut schema);
             (schema, rows)
         }
         None => {
+            // `DEFAULT expr` is evaluated once, here, with the same strict conversion
+            // as `ADD COLUMN ... DEFAULT` -- before the table exists, so a bad default
+            // leaves nothing behind.
+            for c in columns {
+                defaults.push(match c.default {
+                    Some(e) => eval_value_strict(session, arena, e, params, c.ty)?,
+                    None => Value::Null,
+                });
+            }
             let schema =
                 columns.iter().map(|c| Field::new(c.name.clone(), c.ty, c.nullable)).collect();
             (schema, Vec::new())
@@ -62,7 +81,11 @@ pub(crate) fn create_table(
     };
     let n = rows.len();
     let idx = session.catalog.mem_create(name, schema, or_replace)?;
-    session.catalog.mem_get_mut(idx).unwrap().rows = rows;
+    let mt = session.catalog.mem_get_mut(idx).unwrap();
+    mt.rows = rows;
+    if !defaults.is_empty() {
+        mt.defaults = defaults;
+    }
     Ok(Prepared::Ready(count_result(n as i64)))
 }
 
@@ -264,7 +287,10 @@ pub(crate) fn drop_view(session: &mut Session, name: &str, if_exists: bool) -> R
 ///
 /// **Not resumable across the host boundary**: this runs to completion inside
 /// `Session::prepare`, so a `NEED_IO` (bytes that were never fetched) gives
-/// `IoFailed`. A `NEED_CODEC` is different — the compressed bytes are already
+/// `IoFailed`. The reads it was waiting on are stashed on the session first,
+/// and `Session::prepare` hands them to the host as `Prepared::NeedIo`, so a
+/// host that answers them and prepares again gets further each time (the
+/// statement restarts from scratch). A `NEED_CODEC` is different — the compressed bytes are already
 /// in memory and only need inflating, so it is serviced in place through the
 /// session's [`Session::set_codec_hook`] hook, the same way the host services
 /// it between two `step` calls. Without a hook registered it is reported as
@@ -276,16 +302,10 @@ pub(crate) fn run_query_to_rows(
     params: &[Value],
 ) -> Result<(Vec<Field>, Vec<Vec<Value>>)> {
     // Resolve file-backed table schemas first. Anything missing gives IoFailed, since
-    // this is not resumable (a simplified version of what `resolve_query` does in
-    // `Session::prepare`).
-    let mut tables = Vec::new();
-    referenced_in_query(&session.catalog, arena, q, &mut tables, 0)?;
-    for t in tables {
-        if let Some(table) = session.catalog.get_mut(t) {
-            if table.resolve()?.is_err() {
-                err!(IoFailed);
-            }
-        }
+    // this is not resumable; the reads go to the session for `prepare` to report.
+    if let Some(io) = session.resolve_query(arena, q)? {
+        session.stash_io(io);
+        err!(IoFailed);
     }
     let plan = bind_query_at(&session.catalog, arena, q, params, session.now_micros)?;
     let schema = plan.root.schema().to_vec();
@@ -302,6 +322,7 @@ pub(crate) fn run_query_to_rows(
         // Ends the `&mut session` borrow held by `ctx` so the codec arm below
         // can hand the requests back to the session.
         let pending = core::mem::take(&mut ctx.codec);
+        let io = core::mem::take(&mut ctx.io);
         match step {
             Step::Ready(mut b) => {
                 b.materialize();
@@ -309,7 +330,10 @@ pub(crate) fn run_query_to_rows(
                     rows.push(b.cols.iter().map(|c| c.value_at(r)).collect());
                 }
             }
-            Step::NeedIo => err!(IoFailed),
+            Step::NeedIo => {
+                session.stash_io(io);
+                err!(IoFailed)
+            }
             Step::NeedCodec => session.service_codec(&pending)?,
             Step::Done => break,
         }

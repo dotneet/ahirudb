@@ -12,7 +12,7 @@ use crate::plan::{AggKind, Scope};
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{BinaryOp, Expr, ExprArena, ExprId, UnaryOp};
-use crate::vector::{Field, Ty, Value};
+use crate::vector::{Field, Shape, Ty, Value};
 
 /// The expression nesting limit. The parser limits it too; this is a second layer of defense.
 const MAX_DEPTH: u32 = 64;
@@ -42,6 +42,11 @@ pub struct Compiler<'a> {
     subs: &'a [Substitution],
     prog: Program,
     depth: u32,
+    /// The `Shape` of the expression `expr` compiled last.
+    shape: Shape,
+    /// Written by the arm of `expr_inner` that knows its result's shape; `expr` moves it into
+    /// `shape` (so an arm that says nothing yields `Shape::Any`, never an operand's shape).
+    pending: Shape,
 }
 
 /// Compiles a single expression.
@@ -57,10 +62,20 @@ pub fn compile_with_subs(
     subs: &[Substitution],
     id: ExprId,
 ) -> Result<Program> {
-    let mut c = Compiler { arena, scope, params, subs, prog: Program::new(), depth: 0 };
+    let mut c = Compiler {
+        arena,
+        scope,
+        params,
+        subs,
+        prog: Program::new(),
+        depth: 0,
+        shape: Shape::Any,
+        pending: Shape::Any,
+    };
     let (reg, ty) = c.expr(id)?;
     c.prog.result = reg;
     c.prog.result_ty = ty;
+    c.prog.result_shape = c.shape;
     Ok(c.prog)
 }
 
@@ -105,8 +120,8 @@ fn boolean_null_program() -> Program {
 
 /// A program that just returns the input columns unchanged. Used by `SELECT *` and join keys.
 pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
-    let ty = match scope.fields().get(i) {
-        Some(f) => f.ty,
+    let (ty, shape) = match scope.fields().get(i) {
+        Some(f) => (f.ty, f.shape),
         None => err!(Internal),
     };
     let mut p = Program::new();
@@ -114,6 +129,7 @@ pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
     p.push(Instr::with_aux(OpCode::LoadCol, ty.phys(), dst, 0, 0, i as u16));
     p.result = dst;
     p.result_ty = ty;
+    p.result_shape = shape;
     Ok(p)
 }
 
@@ -203,12 +219,47 @@ enum IntervalOp {
     IntervalMul {
         swap: bool,
     },
+    /// A call to one of `funcs`' temporal operator functions, with the operands cast to
+    /// `args` (after swapping them when `swap`, and negating the right one when `negate_b`).
+    Call {
+        func: funcs::FuncId,
+        swap: bool,
+        negate_b: bool,
+        args: (Ty, Ty),
+        res: Ty,
+    },
 }
 
 fn interval_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<IntervalOp> {
     use BinaryOp::*;
-    let temporal = |t: Ty| matches!(t, Ty::Date | Ty::Timestamp);
+    let temporal = |t: Ty| matches!(t, Ty::Date | Ty::Timestamp | Ty::Timestamptz);
+    let call = |func, swap, negate_b, args, res| {
+        Some(IntervalOp::Call { func, swap, negate_b, args, res })
+    };
+    let (iv, time) = (Ty::Interval, Ty::Time);
+    let fractional = |t: Ty| matches!(t, Ty::Float | Ty::Double | Ty::Decimal { .. });
     match (op, lt, rt) {
+        // `TIMESTAMP - TIMESTAMP` is an INTERVAL (DuckDB); a DATE on either side is widened,
+        // but `DATE - DATE` stays the day count `date_arith` returns.
+        (Sub, l, r) if temporal(l) && temporal(r) && (l, r) != (Ty::Date, Ty::Date) => {
+            let t = Ty::unify(l, r)?;
+            call(funcs::F_TS_SUB, false, false, (t, t), iv)
+        }
+        (Add, Ty::Time, Ty::Interval) => call(funcs::F_TIME_ADD_IV, false, false, (time, iv), time),
+        (Add, Ty::Interval, Ty::Time) => call(funcs::F_TIME_ADD_IV, true, false, (time, iv), time),
+        (Sub, Ty::Time, Ty::Interval) => call(funcs::F_TIME_ADD_IV, false, true, (time, iv), time),
+        (Add, Ty::Date, Ty::Time) | (Add, Ty::Time, Ty::Date) => {
+            call(funcs::F_DATE_ADD_TIME, lt == time, false, (Ty::Date, time), Ty::Timestamp)
+        }
+        (Mul, Ty::Interval, r) if fractional(r) => {
+            call(funcs::F_IV_MUL_F, false, false, (iv, Ty::Double), iv)
+        }
+        (Mul, l, Ty::Interval) if fractional(l) => {
+            call(funcs::F_IV_MUL_F, true, false, (iv, Ty::Double), iv)
+        }
+        (Div, Ty::Interval, r) if r.is_numeric() => {
+            call(funcs::F_IV_DIV_F, false, false, (iv, Ty::Double), iv)
+        }
         (Add, l, Ty::Interval) if temporal(l) => {
             Some(IntervalOp::TsInterval { swap: false, negate_b: false })
         }
@@ -490,6 +541,42 @@ fn expr_eq_at(arena: &ExprArena, scope: Option<&Scope>, a: ExprId, b: ExprId, de
     }
 }
 
+/// The `Shape` of a scalar function's result, given its (lower-case) name and its arguments'.
+fn result_shape(name: &str, tys: &[Ty], shapes: &[Shape]) -> Shape {
+    let first = shapes.first().copied().unwrap_or_default();
+    match name {
+        "string_split" | "str_split" | "string_to_array" | "split" => Shape::List(Ty::Varchar),
+        // A list literal: the arguments' common type, when they are all plain scalars.
+        "list_value" | "json_array" => {
+            let mut acc = Ty::Null;
+            for &t in tys {
+                match Ty::unify(acc, t) {
+                    Some(u) if u != Ty::Json => acc = u,
+                    _ => return Shape::Any,
+                }
+            }
+            if acc == Ty::Null {
+                Shape::Any
+            } else {
+                Shape::List(acc)
+            }
+        }
+        "list_sort" | "array_sort" | "list_reverse_sort" | "array_reverse_sort"
+        | "list_distinct" | "array_distinct" | "list_reverse" | "array_reverse" | "list_slice"
+        | "array_slice" => first,
+        "list_concat" | "list_cat" | "array_concat" | "array_cat"
+            if shapes.iter().all(|&s| s == first) =>
+        {
+            first
+        }
+        "map_extract" => match first {
+            Shape::Map(_, v) => Shape::List(v),
+            _ => Shape::Any,
+        },
+        _ => Shape::Any,
+    }
+}
+
 /// Whether this function name may take a lambda (the same fixed set as
 /// `sql::parser::is_lambda_func`. The parser reads `->` as a lambda only in the argument
 /// positions of these names, and after binding the same check dispatches to `Compiler::lambda_call` here).
@@ -517,10 +604,13 @@ impl<'a> Compiler<'a> {
             subs: self.subs,
             prog: Program::new(),
             depth: self.depth,
+            shape: Shape::Any,
+            pending: Shape::Any,
         };
         let (reg, ty) = c.expr(id)?;
         c.prog.result = reg;
         c.prog.result_ty = ty;
+        c.prog.result_shape = c.shape;
         Ok(c.prog)
     }
 
@@ -617,8 +707,10 @@ impl<'a> Compiler<'a> {
             IntervalOp::TsInterval { swap, negate_b } => {
                 let (ts_r, ts_t, iv_r) = if swap { (rr, rt, lr) } else { (lr, lt, rr) };
                 // DATE is moved to TIMESTAMP first. DuckDB also returns TIMESTAMP for
-                // DATE +- INTERVAL (since an INTERVAL may carry time components).
-                let ts_r = self.coerce(ts_r, ts_t, Ty::Timestamp)?;
+                // DATE +- INTERVAL (since an INTERVAL may carry time components). A
+                // TIMESTAMPTZ stays one (the kernel keeps its operand's type).
+                let res = if ts_t == Ty::Timestamptz { ts_t } else { Ty::Timestamp };
+                let ts_r = self.coerce(ts_r, ts_t, res)?;
                 let iv_r = if negate_b {
                     self.emit(OpCode::IntervalNeg, Ty::Interval, iv_r, 0)
                 } else {
@@ -632,7 +724,20 @@ impl<'a> Compiler<'a> {
                     ts_r,
                     iv_r,
                 ));
-                Ok((dst, Ty::Timestamp))
+                Ok((dst, res))
+            }
+            IntervalOp::Call { func, swap, negate_b, args: (ta, tb), res } => {
+                let ((a, at), (b, bt)) =
+                    if swap { ((rr, rt), (lr, lt)) } else { ((lr, lt), (rr, rt)) };
+                let a = self.coerce(a, at, ta)?;
+                let mut b = self.coerce(b, bt, tb)?;
+                if negate_b {
+                    b = self.emit(OpCode::IntervalNeg, Ty::Interval, b, 0);
+                }
+                let aux = self.prog.add_call(func, vec![a, b], res);
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+                Ok((dst, res))
             }
             IntervalOp::IntervalInterval { negate_b } => {
                 let b =
@@ -668,6 +773,7 @@ impl<'a> Compiler<'a> {
         ensure!(self.depth <= MAX_DEPTH, ExpressionTooDeep);
         let r = self.expr_inner(id);
         self.depth -= 1;
+        self.shape = core::mem::take(&mut self.pending);
         r
     }
 
@@ -797,6 +903,7 @@ impl<'a> Compiler<'a> {
         }
         let mut regs = Vec::with_capacity(args.len());
         let mut tys = Vec::with_capacity(args.len());
+        let mut shapes = Vec::with_capacity(args.len());
         // `coalesce`/`ifnull` evaluate a later argument only for the rows every earlier argument
         // left NULL (`coalesce(1, factorial(i))` must not raise). When no later argument can
         // raise, the ordinary call below is equivalent and stays the fast path.
@@ -812,6 +919,7 @@ impl<'a> Compiler<'a> {
                 return self.guarded_coalesce(name, progs);
             }
             for p in progs {
+                shapes.push(p.result_shape);
                 let (r, t) = self.inline(p);
                 regs.push(r);
                 tys.push(t);
@@ -821,6 +929,7 @@ impl<'a> Compiler<'a> {
                 let (r, t) = self.expr(*a)?;
                 regs.push(r);
                 tys.push(t);
+                shapes.push(self.shape);
             }
         }
         // `typeof` is decided entirely by the argument's static type, which is known right here,
@@ -829,12 +938,17 @@ impl<'a> Compiler<'a> {
         // propagates a NULL argument to the result.
         if eq_ascii_ci(name.as_bytes(), b"typeof") {
             ensure!(tys.len() == 1, WrongArgCount);
-            let v = Value::Bytes(tys[0].name().as_bytes().to_vec());
+            let v = Value::Bytes(tys[0].full_name().into_bytes());
             return Ok((self.konst(Ty::Varchar, v), Ty::Varchar));
         }
         // A few signatures' *result type* depends on an argument's value, not just its type
         // (`round(<decimal>, d)`'s result scale is `min(s, max(d, 0))`, as in DuckDB), so
         // literal integer arguments are passed along.
+        let lower = name.to_ascii_lowercase();
+        let l = lower.as_str();
+        if matches!(l, "list_extract" | "array_extract" | "map_extract_value") && tys.len() == 2 {
+            return self.subscript(l == "map_extract_value", &regs, &tys, shapes[0]);
+        }
         let consts: Vec<Option<i64>> = args.iter().map(|a| self.const_int(*a)).collect();
         let (id, want, res) = crate::expr::funcs::resolve_const(name, &tys, &consts)?;
         ensure!(want.len() == regs.len(), WrongArgCount);
@@ -844,7 +958,46 @@ impl<'a> Compiler<'a> {
         let aux = self.prog.add_call(id, regs, res);
         let dst = self.prog.alloc_reg();
         self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+        self.pending = result_shape(l, &tys, &shapes);
         Ok((dst, res))
+    }
+
+    /// `xs[i]` / `list_extract(xs, i)` and `m[k]` / `map_extract_value(m, k)`.
+    ///
+    /// On a MAP (a Parquet MAP column, or any base subscripted with a string key) the subscript
+    /// is a key lookup returning the value, as in DuckDB 1.4; otherwise it is a 1-based list
+    /// position. Where the element type is statically known (`Shape`), the element comes back
+    /// as that native type -- extracted as text (`F_*_TEXT`: a JSON string unquoted, anything
+    /// else verbatim, JSON `null` as SQL NULL) and cast from VARCHAR -- so
+    /// `string_split('a,b', ',')[1] = 'a'` and `sum(xs[2])` work as they do in DuckDB.
+    fn subscript(
+        &mut self,
+        map: bool,
+        regs: &[Reg],
+        tys: &[Ty],
+        shape: Shape,
+    ) -> Result<(Reg, Ty)> {
+        let map = map
+            || matches!(shape, Shape::Map(..))
+            || (shape == Shape::Any && matches!(tys[1], Ty::Varchar));
+        let elem = match shape.elem() {
+            Ty::Null => Ty::Json,
+            t => t,
+        };
+        let text = elem != Ty::Json;
+        let (id, key) = match (map, text) {
+            (true, false) => (funcs::F_MAP_VALUE, Ty::Varchar),
+            (true, true) => (funcs::F_MAP_VALUE_TEXT, Ty::Varchar),
+            (false, false) => (funcs::F_LIST_EXTRACT, Ty::BigInt),
+            (false, true) => (funcs::F_LIST_EXTRACT_TEXT, Ty::BigInt),
+        };
+        let base = self.coerce(regs[0], tys[0], Ty::Json)?;
+        let k = self.coerce(regs[1], tys[1], key)?;
+        let res = if text { Ty::Varchar } else { Ty::Json };
+        let aux = self.prog.add_call(id, vec![base, k], res);
+        let dst = self.prog.alloc_reg();
+        self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+        Ok((self.coerce(dst, res, elem)?, elem))
     }
 
     /// `coalesce(a, b, ...)` / `ifnull(a, b)` lowered to a chain of `Coalesce` instructions in
@@ -887,13 +1040,12 @@ impl<'a> Compiler<'a> {
     /// `ColumnNotFound`), because the body is always compiled in an isolated `Scope`
     /// containing only the parameters.
     ///
-    /// The parameters' type is always `Ty::Json` (the same as `list_extract`'s result; array
-    /// elements are all represented as dynamically typed JSON values). In this engine
-    /// `Ty::Json` does not `Ty::unify` with any other type (see the `vector::types` docs), so
-    /// doing arithmetic or comparison on a parameter in the body requires an explicit
-    /// conversion through VARCHAR, as in `CAST(CAST(x AS VARCHAR) AS INTEGER)` (the same as
-    /// the existing limitation on `list_extract`'s result, not a lambda-specific
-    /// constraint).
+    /// The parameters' type is always `Ty::Json` (array elements are all represented as
+    /// dynamically typed JSON values; unlike `Compiler::subscript`, the list's `Shape` is not
+    /// used to type them). In this engine `Ty::Json` does not `Ty::unify` with any other type
+    /// (see the `vector::types` docs), so doing arithmetic or comparison on a parameter in the
+    /// body requires an explicit conversion through VARCHAR, as in
+    /// `CAST(CAST(x AS VARCHAR) AS INTEGER)`.
     fn lambda_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
         let is_reduce = eq_ascii_ci(name.as_bytes(), b"list_reduce");
         let func = if eq_ascii_ci(name.as_bytes(), b"list_transform") {
@@ -909,6 +1061,7 @@ impl<'a> Compiler<'a> {
 
         // The first argument (the list) is compiled in the outer scope as usual.
         let (list_reg, list_ty) = self.expr(args[0])?;
+        let list_shape = self.shape;
         ensure!(matches!(list_ty, Ty::Json | Ty::Null), TypeMismatch);
         let list_reg =
             if list_ty == Ty::Null { self.konst(Ty::Json, Value::Null) } else { list_reg };
@@ -950,6 +1103,9 @@ impl<'a> Compiler<'a> {
         let aux = self.prog.add_lambda_call(func, call_args, result_ty, li);
         let dst = self.prog.alloc_reg();
         self.prog.push(Instr::with_aux(OpCode::Call, result_ty.phys(), dst, 0, 0, aux));
+        if func == funcs::F_LIST_FILTER {
+            self.pending = list_shape;
+        }
         Ok((dst, result_ty))
     }
 
@@ -960,7 +1116,10 @@ impl<'a> Compiler<'a> {
 
     fn load_col(&mut self, i: usize) -> Result<(Reg, Ty)> {
         let ty = match self.scope.fields().get(i) {
-            Some(f) => f.ty,
+            Some(f) => {
+                self.pending = f.shape;
+                f.ty
+            }
             None => err!(Internal),
         };
         ensure!(i <= u16::MAX as usize, LimitExceeded);
@@ -1168,7 +1327,9 @@ impl<'a> Compiler<'a> {
             return Ok((dst, Ty::Boolean));
         }
 
-        ensure!(t.is_numeric() || t == Ty::Null, TypeMismatch);
+        // A BOOLEAN unifies with a number for comparisons, but `true + 1` is an error (DuckDB).
+        let boolean = lt == Ty::Boolean || rt == Ty::Boolean;
+        ensure!((t.is_numeric() || t == Ty::Null) && !boolean, TypeMismatch);
         let code = match op {
             BinaryOp::Add => OpCode::Add,
             BinaryOp::Sub => OpCode::Sub,

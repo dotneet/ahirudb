@@ -51,6 +51,21 @@ const MAX_FROM_DEPTH: u32 = 64;
 const MAX_REF_DEPTH: u32 = 4 * MAX_FROM_DEPTH;
 /// The expression nesting limit.
 const MAX_EXPR_DEPTH: u32 = 64;
+/// The plan-tree depth limit (`Node::depth`).
+///
+/// Building, executing, cloning and dropping a plan all recurse once per node level, and
+/// the syntactic limits above do not bound that depth on their own: a chain of CTEs each
+/// reading the previous one, a view expanding to such a chain, or hundreds of
+/// `IN (SELECT ...)` conjuncts each stack another level without nesting anything in the
+/// SQL text. On the 1 MiB wasm stack such a plan trapped at roughly 800 levels; this keeps
+/// a wide margin below that and fails with `ExpressionTooDeep` instead.
+const MAX_PLAN_DEPTH: u32 = 256;
+
+/// Rejects a plan deeper than `MAX_PLAN_DEPTH` (see there).
+fn check_plan_depth(node: &Node) -> Result<()> {
+    ensure!(node.depth(MAX_PLAN_DEPTH) < MAX_PLAN_DEPTH, ExpressionTooDeep);
+    Ok(())
+}
 
 pub fn bind(catalog: &Catalog, parsed: &Parsed, params: &[Value]) -> Result<Plan> {
     match &parsed.stmt {
@@ -109,7 +124,12 @@ fn bind_query_in(
     }
     let result = bind_query_body(catalog, arena, q, params, ctes, outer_scope);
     ctes.truncate(cte_start);
-    result
+    // Every query block -- top level, derived table, subquery, CTE body, view body -- is
+    // checked as it is finished, so a plan is never nested into a deeper one (or cloned for
+    // another CTE reference) once it is already too deep.
+    let plan = result?;
+    check_plan_depth(&plan.root)?;
+    Ok(plan)
 }
 
 /// Binds the body and trailing clauses after `bind_query_in` has installed the
