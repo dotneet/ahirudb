@@ -112,6 +112,14 @@ pub struct Session {
     /// the same reasoning as the other defensive-parsing choices: if the time is
     /// unknown, return a conspicuously broken value rather than quietly lying.
     pub(crate) now_micros: i64,
+    /// The reads a one-shot statement (`COPY`, CTAS, `INSERT ... SELECT`) was
+    /// waiting on when it gave up with `IoFailed`. Those statements run to
+    /// completion inside `prepare`, so they cannot pause for I/O; `prepare` turns
+    /// the failure into `Prepared::NeedIo` with these reads instead, and a host
+    /// that answers them and calls `prepare` again gets further each time
+    /// (see [`Session::stash_io`]).
+    #[cfg(any(feature = "ddl", feature = "export"))]
+    pending_io: Vec<IoRequest>,
 }
 
 impl Session {
@@ -122,7 +130,16 @@ impl Session {
             #[cfg(any(feature = "ddl", feature = "export"))]
             codec_hook: None,
             now_micros: 0,
+            #[cfg(any(feature = "ddl", feature = "export"))]
+            pending_io: Vec::new(),
         }
+    }
+
+    /// Remembers the reads a one-shot statement is about to fail on (see
+    /// `pending_io`). Called right before such a statement returns `IoFailed`.
+    #[cfg(any(feature = "ddl", feature = "export"))]
+    pub(crate) fn stash_io(&mut self, io: Vec<IoRequest>) {
+        self.pending_io = io;
     }
 
     /// Registers the host decompressor described by [`CodecHook`].
@@ -199,6 +216,33 @@ impl Session {
         kind: FormatKind,
     ) -> Result<usize> {
         self.catalog.register(name, Source::remote(total_len), kind)
+    }
+
+    /// Registers a host-served table under a path a SQL string literal named
+    /// (case-sensitive; see `Catalog::register_path`). No I/O happens.
+    pub fn register_remote_path(
+        &mut self,
+        path: &str,
+        total_len: u64,
+        kind: FormatKind,
+    ) -> Result<usize> {
+        self.catalog.register_path(path, Source::remote(total_len), kind)
+    }
+
+    /// Answers a size request (`IoRequest` with offset `catalog::SIZE_REQUEST`)
+    /// for a table declared with `catalog::SIZE_UNKNOWN`.
+    pub fn set_size(&mut self, table: usize, part: usize, total_len: u64) -> Result<()> {
+        match self.catalog.get_mut(table) {
+            Some(t) => t.set_size(part, total_len),
+            None => err!(TableNotFound),
+        }
+    }
+
+    /// Drops the raw bytes fetched for host-served tables. The host calls this
+    /// (through the ABI) once no query is running; the next query asks for what
+    /// it needs again, which the host answers from its own range cache.
+    pub fn release_fetched(&mut self) {
+        self.catalog.release();
     }
 
     /// Registers several files as one logical table by handing over their bytes.
@@ -282,7 +326,37 @@ impl Session {
 
     /// Lowers SQL into a plan. Requests byte ranges and returns if a schema is unresolved.
     pub fn prepare(&mut self, sql: &str, params: &[Value]) -> Result<Prepared> {
+        // Both are per-statement: a path miss or a stashed read left over from an
+        // earlier statement must not be reported for this one.
+        drop(self.catalog.take_missing());
+        #[cfg(any(feature = "ddl", feature = "export"))]
+        self.pending_io.clear();
+        let r = self.prepare_stmt(sql, params);
+        #[cfg(any(feature = "ddl", feature = "export"))]
+        if let Err(e) = &r {
+            if e.code == crate::error::Code::IoFailed && !self.pending_io.is_empty() {
+                return Ok(Prepared::NeedIo(core::mem::take(&mut self.pending_io)));
+            }
+        }
+        r
+    }
+
+    fn prepare_stmt(&mut self, sql: &str, params: &[Value]) -> Result<Prepared> {
         let mut parsed = parse(sql)?;
+        // Placeholders are numbered by appearance, so the highest index + 1 is the
+        // number of values the statement takes. Too few is caught where a
+        // placeholder is compiled (`WrongArgCount`); too many was silently ignored,
+        // which hides a caller binding its values to the wrong statement.
+        let used = parsed
+            .arena
+            .iter_mut()
+            .filter_map(|e| match e {
+                crate::sql::ast::Expr::Param(i) => Some(*i as usize + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        ensure!(params.len() <= used, WrongArgCount);
         // `CURRENT_DATE`/`CURRENT_TIMESTAMP`/`now()` and friends are replaced with
         // constants before binding (see `sql::now`). This also matches the SQL standard's
         // contract of evaluating them exactly once per query.
@@ -406,6 +480,9 @@ impl Session {
         params: &[Value],
     ) -> Result<Prepared> {
         if let Some(io) = self.resolve_query(arena, q)? {
+            // `COPY` drives this directly and turns `NeedIo` into `IoFailed`.
+            #[cfg(feature = "export")]
+            self.stash_io(io.clone());
             return Ok(Prepared::NeedIo(io));
         }
         let plan = bind_query_at(&self.catalog, arena, q, params, self.now_micros)?;
@@ -423,7 +500,7 @@ impl Session {
     /// operations, or multi-file tables). To keep it to one round trip per table, the
     /// ranges every part of that table needs are bundled at `Table::resolve` before being
     /// collected (see the docs on `catalog::Table::resolve`).
-    fn resolve_query(
+    pub(crate) fn resolve_query(
         &mut self,
         arena: &crate::sql::ast::ExprArena,
         q: &crate::sql::ast::QueryStmt,
@@ -480,10 +557,18 @@ impl Session {
             io: Vec::new(),
             codec: Vec::new(),
         };
-        match q.root.next(&mut ctx)? {
+        let step = q.root.next(&mut ctx)?;
+        let (io, codec) = (ctx.io, ctx.codec);
+        match step {
             Step::Ready(b) => Ok(QueryStep::Batch(b)),
-            Step::NeedIo => Ok(QueryStep::NeedIo(ctx.io)),
-            Step::NeedCodec => Ok(QueryStep::NeedCodec(ctx.codec)),
+            Step::NeedIo => {
+                // `COPY` steps through here and gives up with `IoFailed`; keep
+                // the reads so `prepare` can hand them to the host instead.
+                #[cfg(feature = "export")]
+                self.stash_io(io.clone());
+                Ok(QueryStep::NeedIo(io))
+            }
+            Step::NeedCodec => Ok(QueryStep::NeedCodec(codec)),
             Step::Done => Ok(QueryStep::Done),
         }
     }
@@ -526,8 +611,8 @@ impl Session {
                 }
                 err!(TableNotFound)
             }
-            FromItem::File { path, .. } => {
-                let i = match self.catalog.index_of(path) {
+            FromItem::File { path, format, .. } => {
+                let i = match self.catalog.path_index_of(path, *format) {
                     Some(i) => i,
                     None => err!(TableNotFound),
                 };
@@ -647,5 +732,101 @@ mod tests {
         );
         // A valid in-file range remains accepted after rejected deliveries.
         assert!(session.provide(table, 0, 9, vec![1]).is_ok());
+    }
+
+    #[test]
+    fn extra_parameters_are_rejected_like_missing_ones() {
+        let mut s = Session::new();
+        let one = [Value::I64(1)];
+        let two = [Value::I64(1), Value::I64(2)];
+        assert!(s.prepare("SELECT ? FROM range(1)", &one).is_ok());
+        assert_eq!(code_of(s.prepare("SELECT ? FROM range(1)", &two)), Some(Code::WrongArgCount));
+        assert_eq!(code_of(s.prepare("SELECT 1 FROM range(1)", &one)), Some(Code::WrongArgCount));
+        assert_eq!(
+            code_of(s.prepare("SELECT ?, ? FROM range(1)", &one)),
+            Some(Code::WrongArgCount)
+        );
+        assert!(s.prepare("SELECT 1 FROM range(1)", &[]).is_ok());
+    }
+
+    /// Answers every `NeedIo` from `bytes` (sizes included) until `prepare` is ready.
+    #[cfg(feature = "csv")]
+    fn prepare_serving(s: &mut Session, sql: &str, bytes: &[u8]) -> (Query, usize) {
+        let mut rounds = 0;
+        loop {
+            match s.prepare(sql, &[]).unwrap() {
+                Prepared::Ready(q) => return (q, rounds),
+                Prepared::NeedIo(io) => {
+                    for r in io {
+                        if r.offset == crate::catalog::SIZE_REQUEST {
+                            s.set_size(r.table, r.part, bytes.len() as u64).unwrap();
+                        } else {
+                            let (o, l) = (r.offset as usize, r.len as usize);
+                            s.provide(r.table, r.part, r.offset, bytes[o..o + l].to_vec()).unwrap();
+                        }
+                    }
+                }
+            }
+            rounds += 1;
+            assert!(rounds < 20, "no progress");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "csv")]
+    fn a_table_declared_without_a_size_asks_for_it_then_reads() {
+        let csv = b"id\n1\n2\n";
+        let mut s = Session::new();
+        s.register_remote_as("t.csv", crate::catalog::SIZE_UNKNOWN, FormatKind::Auto).unwrap();
+        let (mut q, rounds) = prepare_serving(&mut s, "SELECT sum(id) FROM \"t.csv\"", csv);
+        assert!(rounds >= 2, "a size round and a sample round");
+        let mut total = 0;
+        loop {
+            match s.step(&mut q).unwrap() {
+                QueryStep::Batch(b) => total += b.num_rows(),
+                QueryStep::NeedIo(io) => {
+                    for r in io {
+                        let (o, l) = (r.offset as usize, r.len as usize);
+                        s.provide(r.table, r.part, r.offset, csv[o..o + l].to_vec()).unwrap();
+                    }
+                }
+                QueryStep::NeedCodec(_) => panic!("csv has no codec"),
+                QueryStep::Done => break,
+            }
+        }
+        assert_eq!(total, 1);
+
+        // Releasing the fetched bytes keeps the resolved schema, and the next
+        // query simply asks for the data again.
+        s.release_fetched();
+        let (mut q, _) = prepare_serving(&mut s, "SELECT id FROM \"t.csv\"", csv);
+        assert!(matches!(s.step(&mut q).unwrap(), QueryStep::NeedIo(_)));
+    }
+
+    #[test]
+    #[cfg(all(feature = "csv", feature = "ddl"))]
+    fn create_table_as_over_a_remote_table_reports_its_reads_instead_of_failing() {
+        let csv = b"id\n1\n2\n3\n";
+        let mut s = Session::new();
+        s.register_remote_as("t.csv", csv.len() as u64, FormatKind::Auto).unwrap();
+        let (_, rounds) =
+            prepare_serving(&mut s, "CREATE TABLE m AS SELECT id FROM \"t.csv\"", csv);
+        assert!(rounds >= 1);
+        let m = s.catalog.mem_index_of("m").unwrap();
+        assert_eq!(s.catalog.mem_get(m).unwrap().rows.len(), 3);
+    }
+
+    #[test]
+    fn a_missing_path_is_remembered_for_the_host() {
+        let mut s = Session::new();
+        let r = s.prepare("SELECT * FROM parquet('http://h/Data.parquet')", &[]);
+        assert_eq!(code_of(r), Some(Code::TableNotFound));
+        let missing = s.catalog.take_missing();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "http://h/Data.parquet");
+        assert!(missing[0].1 == FormatKind::Parquet);
+        // A later statement starts with a clean list.
+        assert!(s.prepare("SELECT 1 FROM range(1)", &[]).is_ok());
+        assert!(s.catalog.take_missing().is_empty());
     }
 }

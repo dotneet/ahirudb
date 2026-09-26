@@ -21,6 +21,16 @@ use crate::vector::{Field, Ty};
 /// valid pages, not just the per-page cap in `parquet::codec`.
 pub const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 
+/// `Source::total_len` of a host-served source whose length the host has not
+/// reported yet. Registration does no I/O, so a host may declare a table before
+/// knowing its size; `Table::resolve` then asks for the size first (a
+/// [`SIZE_REQUEST`] read) instead of a byte range.
+pub const SIZE_UNKNOWN: u64 = u64::MAX;
+
+/// The offset of the pseudo read `Table::resolve` returns (with length 0) to ask
+/// the host for a part's total length. No real range starts at `u64::MAX`.
+pub const SIZE_REQUEST: u64 = u64::MAX;
+
 /// The set of byte ranges fetched so far.
 pub struct Source {
     pub total_len: u64,
@@ -29,17 +39,42 @@ pub struct Source {
     /// Pages the host decompressed for us. The key is the compressed page body's
     /// `(offset in file, length)` (codec delegation, DESIGN.md §6).
     decoded: Vec<((u64, u32), Vec<u8>)>,
+    /// Whether the host can serve these bytes again (`remote`), which is what
+    /// makes `release` safe. A `from_bytes` source is the only copy there is.
+    remote: bool,
 }
 
 impl Source {
     /// The whole file is in memory.
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Source { total_len: bytes.len() as u64, chunks: vec![(0, bytes)], decoded: Vec::new() }
+        Source {
+            total_len: bytes.len() as u64,
+            chunks: vec![(0, bytes)],
+            decoded: Vec::new(),
+            remote: false,
+        }
     }
 
-    /// The host holds it and it is read via range fetching.
+    /// The host holds it and it is read via range fetching. `total_len` may be
+    /// [`SIZE_UNKNOWN`] until the host reports it.
     pub fn remote(total_len: u64) -> Self {
-        Source { total_len, chunks: Vec::new(), decoded: Vec::new() }
+        Source { total_len, chunks: Vec::new(), decoded: Vec::new(), remote: true }
+    }
+
+    /// Drops every fetched byte of a host-served source.
+    ///
+    /// The range cache lives in the host (DESIGN.md §6), so keeping raw bytes
+    /// here after a query only duplicates it on the wasm heap -- and without this
+    /// they were kept for the lifetime of the registration, until `memoryLimit`
+    /// failed every later query. Formats keep what they parsed at `resolve`
+    /// (footer, schema, split layout), and every split asks for its bytes again
+    /// through `NEED_IO`, so a later query simply re-requests them. Only call this
+    /// between queries: a split being decoded reads its bytes from here.
+    pub fn release(&mut self) {
+        if self.remote {
+            self.chunks = Vec::new();
+            self.decoded = Vec::new();
+        }
     }
 
     /// Returns the slice for `[off, off+len)` if it has been fetched.
@@ -175,6 +210,10 @@ pub struct Table {
     pub parts: Vec<TablePart>,
     /// The unified schema, fixed once every part is resolved. `None` while unresolved.
     schema: Option<Vec<Field>>,
+    /// Registered through [`Catalog::register_path`]: the name is a file path or
+    /// URL a SQL string literal referenced, so it only ever matches exactly (see
+    /// [`Catalog::path_index_of`]).
+    path: bool,
 }
 
 /// Per-part I/O still needed before `Table::resolve` can finish: `(part index,
@@ -193,6 +232,12 @@ impl Table {
     pub fn resolve(&mut self) -> Result<core::result::Result<(), PendingPartReads>> {
         let mut need = Vec::new();
         for (i, part) in self.parts.iter_mut().enumerate() {
+            // A part declared before its length was known asks for the length
+            // first; the format cannot even locate its footer without it.
+            if part.source.total_len == SIZE_UNKNOWN {
+                need.push((i, SIZE_REQUEST, 0));
+                continue;
+            }
             match part.format.resolve(&part.source)? {
                 Ok(()) => {}
                 Err((offset, len)) => need.push((i, offset, len)),
@@ -222,6 +267,27 @@ impl Table {
     /// The total number of splits across all parts. Used for little more than progress reporting.
     pub fn num_splits(&self) -> usize {
         self.parts.iter().map(|p| p.format.num_splits()).sum()
+    }
+
+    /// Records the length the host reported for a part declared with
+    /// [`SIZE_UNKNOWN`]. Repeating the same length is accepted; changing a
+    /// known length (or reporting the sentinel itself) is not.
+    pub fn set_size(&mut self, part: usize, total_len: u64) -> Result<()> {
+        let src = match self.parts.get_mut(part) {
+            Some(p) => &mut p.source,
+            None => err!(TableNotFound),
+        };
+        ensure!(total_len != SIZE_UNKNOWN, ValueOutOfRange);
+        ensure!(src.total_len == SIZE_UNKNOWN || src.total_len == total_len, ValueOutOfRange);
+        src.total_len = total_len;
+        Ok(())
+    }
+
+    /// Drops the raw bytes of every host-served part (see [`Source::release`]).
+    pub fn release(&mut self) {
+        for p in &mut self.parts {
+            p.source.release();
+        }
     }
 }
 
@@ -391,10 +457,17 @@ pub struct Catalog {
     /// would make `catalog` depend on `sql::ast`, which is avoided.
     #[cfg(feature = "ddl")]
     views: Vec<(String, String)>,
+    /// Paths a SQL string literal (`FROM 'x.parquet'`, `parquet('https://…')`)
+    /// referenced that no table is registered under, with the format the SQL
+    /// asked for. A host that registers such paths on demand (the JS host) reads
+    /// them after a failed `prepare` instead of scanning the SQL text itself.
+    /// A `Cell` because lookups happen through `&Catalog` in the binder.
+    missing: core::cell::Cell<Vec<(String, FormatKind)>>,
 }
 
 /// A case-insensitive linear search by name. The lookup rule shared by
-/// `index_of`/`mem_index_of`/`view_index_of` (identical across tables and views).
+/// `mem_index_of`/`view_index_of` (identical across in-memory tables and views).
+#[cfg(feature = "ddl")]
 fn find_ci_index<'a>(mut names: impl Iterator<Item = &'a str>, target: &str) -> Option<usize> {
     names.position(|n| eq_ascii_ci(n.as_bytes(), target.as_bytes()))
 }
@@ -407,10 +480,12 @@ impl Catalog {
             mem: Vec::new(),
             #[cfg(feature = "ddl")]
             views: Vec::new(),
+            missing: core::cell::Cell::new(Vec::new()),
         }
     }
 
-    /// Registers a single-file table. An existing table of the same name is replaced
+    /// Registers a single-file table. An existing table of the same name
+    /// (ASCII-case-insensitively, see [`Catalog::register_multi`]) is replaced
     /// (re-registration is not an error).
     ///
     /// No I/O happens at this point. Schema resolution is deferred to the first query.
@@ -420,12 +495,42 @@ impl Catalog {
         self.register_multi(name, vec![part])
     }
 
+    /// Registers a table under a file path or URL that a SQL string literal
+    /// referenced (`FROM 'x.parquet'`, `parquet('https://…')`).
+    ///
+    /// Paths are case-sensitive (`Data.parquet` and `data.parquet` are two files
+    /// on most file systems and certainly two URLs), so unlike [`Catalog::register`]
+    /// this replaces only a table of exactly the same name, and the table is only
+    /// ever found again by that exact spelling from a string literal.
+    pub fn register_path(&mut self, name: &str, source: Source, kind: FormatKind) -> Result<usize> {
+        let fmt = format::make(kind, name)?;
+        let part = TablePart { path: name.into(), source, format: fmt };
+        let slot = self.tables.iter().position(|t| t.name == name);
+        self.put_table(name, vec![part], slot, true)
+    }
+
     /// Registers several files as one logical table.
     ///
     /// Assumes the caller (`session.rs`) has already assembled each part's format
     /// (including wrapping for Hive partition columns). `catalog` merely bundles them
     /// as given and needs no knowledge that `format::partitioned` exists.
-    pub fn register_multi(&mut self, name: &str, mut parts: Vec<TablePart>) -> Result<usize> {
+    ///
+    /// `name` is an identifier: it replaces a table of exactly the same name, or
+    /// else one that matches ASCII-case-insensitively (like DuckDB's catalog), but
+    /// never a table registered by [`Catalog::register_path`] under a different
+    /// spelling -- a path that only differs in case is a different file.
+    pub fn register_multi(&mut self, name: &str, parts: Vec<TablePart>) -> Result<usize> {
+        let slot = self.lookup(name, false);
+        self.put_table(name, parts, slot, false)
+    }
+
+    fn put_table(
+        &mut self,
+        name: &str,
+        mut parts: Vec<TablePart>,
+        slot: Option<usize>,
+        path: bool,
+    ) -> Result<usize> {
         ensure!(!parts.is_empty(), Internal);
         unify_hive_key_types(&mut parts);
         // A file table must not silently shadow an in-memory table or view of
@@ -436,8 +541,8 @@ impl Catalog {
             ensure!(self.mem_index_of(name).is_none(), DuplicateTable);
             ensure!(self.view_index_of(name).is_none(), DuplicateTable);
         }
-        let t = Table { name: name.into(), parts, schema: None };
-        Ok(match self.index_of(name) {
+        let t = Table { name: name.into(), parts, schema: None, path };
+        Ok(match slot {
             Some(i) => {
                 self.tables[i] = t;
                 i
@@ -449,8 +554,54 @@ impl Catalog {
         })
     }
 
+    /// Exact match first, then an ASCII-case-insensitive one. `ci_paths` says
+    /// whether tables registered as paths may match case-insensitively too.
+    fn lookup(&self, name: &str, ci_paths: bool) -> Option<usize> {
+        self.tables.iter().position(|t| t.name == name).or_else(|| {
+            self.tables.iter().position(|t| {
+                (ci_paths || !t.path) && eq_ascii_ci(t.name.as_bytes(), name.as_bytes())
+            })
+        })
+    }
+
+    /// Looks up a table by identifier (`FROM trips`, `FROM "Data.parquet"`).
+    /// Identifiers are ASCII-case-insensitive; an exact spelling wins when
+    /// several tables differ only in case.
     pub fn index_of(&self, name: &str) -> Option<usize> {
-        find_ci_index(self.tables.iter().map(|t| t.name.as_str()), name)
+        self.lookup(name, true)
+    }
+
+    /// Looks up the table a SQL string literal names (`FROM 'x.parquet'`,
+    /// `parquet('https://…')`).
+    ///
+    /// Tables registered from such literals ([`Catalog::register_path`]) match
+    /// only exactly: `parquet('http://h/Data.parquet')` and
+    /// `parquet('http://h/data.parquet')` are different URLs. A name the host
+    /// registered as an identifier keeps matching case-insensitively, as it
+    /// always has. A miss is remembered (with the format the SQL asked for) so
+    /// the host can register the path and retry; see [`Catalog::take_missing`].
+    pub fn path_index_of(&self, path: &str, format: FormatKind) -> Option<usize> {
+        let found = self.lookup(path, false);
+        if found.is_none() {
+            let mut missing = self.missing.take();
+            if !missing.iter().any(|(p, _)| p == path) {
+                missing.push((path.into(), format));
+            }
+            self.missing.set(missing);
+        }
+        found
+    }
+
+    /// Takes the paths [`Catalog::path_index_of`] could not find since the last call.
+    pub fn take_missing(&self) -> Vec<(String, FormatKind)> {
+        self.missing.take()
+    }
+
+    /// Drops the raw bytes of every host-served table (see [`Source::release`]).
+    pub fn release(&mut self) {
+        for t in &mut self.tables {
+            t.release();
+        }
     }
 
     pub fn get(&self, i: usize) -> Option<&Table> {
@@ -797,6 +948,74 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(c.len(), 1);
         assert_eq!(c.index_of("TRIPS"), Some(0));
+    }
+
+    #[test]
+    fn paths_from_sql_literals_are_case_sensitive() {
+        let mut c = Catalog::new();
+        let upper =
+            c.register_path("http://h/Data.parquet", Source::remote(10), FormatKind::Parquet);
+        let lower =
+            c.register_path("http://h/data.parquet", Source::remote(10), FormatKind::Parquet);
+        let (upper, lower) = (upper.unwrap(), lower.unwrap());
+        assert_ne!(upper, lower, "two URLs that differ in case are two tables");
+        assert_eq!(c.path_index_of("http://h/Data.parquet", FormatKind::Parquet), Some(upper));
+        assert_eq!(c.path_index_of("http://h/data.parquet", FormatKind::Parquet), Some(lower));
+        assert!(c.take_missing().is_empty());
+        // A third spelling matches neither path table and is reported as missing.
+        assert_eq!(c.path_index_of("http://h/DATA.parquet", FormatKind::Csv), None);
+        let missing = c.take_missing();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "http://h/DATA.parquet");
+        assert!(missing[0].1 == FormatKind::Csv);
+        assert!(c.take_missing().is_empty(), "take_missing drains the list");
+        // An identifier registration does not clobber a path table of another case.
+        let ident = c.register("HTTP://H/DATA.PARQUET", Source::remote(10), FormatKind::Parquet);
+        assert_eq!(c.len(), 3);
+        assert_ne!(ident.unwrap(), upper);
+    }
+
+    #[test]
+    fn identifiers_stay_case_insensitive_and_prefer_an_exact_spelling() {
+        let mut c = Catalog::new();
+        let t = c.register("Logs.csv", Source::remote(10), FormatKind::Csv).unwrap();
+        // A table registered by identifier keeps matching from a string literal
+        // case-insensitively, as it always has.
+        assert_eq!(c.path_index_of("logs.CSV", FormatKind::Csv), Some(t));
+        assert_eq!(c.index_of("LOGS.CSV"), Some(t));
+        let p = c.register_path("logs.csv", Source::remote(10), FormatKind::Csv).unwrap();
+        assert_ne!(t, p);
+        assert_eq!(c.index_of("logs.csv"), Some(p), "the exact spelling wins");
+        assert_eq!(c.index_of("Logs.csv"), Some(t));
+    }
+
+    #[test]
+    fn unknown_size_is_requested_before_anything_else() {
+        let mut c = Catalog::new();
+        let i = c.register("t", Source::remote(SIZE_UNKNOWN), FormatKind::Parquet).unwrap();
+        let t = c.get_mut(i).unwrap();
+        assert_eq!(t.resolve().unwrap().err(), Some(vec![(0, SIZE_REQUEST, 0)]));
+        assert!(t.set_size(0, SIZE_UNKNOWN).is_err());
+        t.set_size(0, 100).unwrap();
+        t.set_size(0, 100).unwrap();
+        assert_eq!(code_of(t.set_size(0, 200)), Some(crate::error::Code::ValueOutOfRange));
+        assert_eq!(code_of(t.set_size(1, 100)), Some(crate::error::Code::TableNotFound));
+        // With the length known, the format asks for its footer instead.
+        let need = t.resolve().unwrap().err().unwrap();
+        assert_ne!(need[0].1, SIZE_REQUEST);
+    }
+
+    #[test]
+    fn release_drops_host_served_bytes_but_never_the_only_copy() {
+        let mut remote = Source::remote(4);
+        remote.insert(0, vec![1, 2, 3, 4]);
+        remote.release();
+        assert_eq!(remote.get(0, 4), None);
+        assert_eq!(remote.missing(0, 4), Some((0, 4)));
+
+        let mut local = Source::from_bytes(vec![1, 2, 3, 4]);
+        local.release();
+        assert_eq!(local.get(0, 4), Some(&[1u8, 2, 3, 4][..]));
     }
 
     // --- A mock TableFormat for multi-file tests ------------------------------

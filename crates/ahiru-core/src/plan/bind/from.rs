@@ -127,8 +127,8 @@ pub(super) fn flatten_from(
         // `format` is intentionally not consulted here — it only records
         // which surface syntax was used; this engine cannot re-dispatch
         // parsing at bind time (see `FromItem::File` doc for why).
-        FromItem::File { path, alias, .. } => {
-            let i = match catalog.index_of(path) {
+        FromItem::File { path, format, alias } => {
+            let i = match catalog.path_index_of(path, *format) {
                 Some(i) => i,
                 None => err!(TableNotFound),
             };
@@ -530,7 +530,7 @@ pub fn resolve_from(catalog: &Catalog, from: &FromItem) -> Result<usize> {
             Some(i) => Ok(i),
             None => err!(TableNotFound),
         },
-        FromItem::File { path, .. } => match catalog.index_of(path) {
+        FromItem::File { path, format, .. } => match catalog.path_index_of(path, *format) {
             Some(i) => Ok(i),
             None => err!(TableNotFound),
         },
@@ -727,7 +727,7 @@ fn referenced_tables_at(
             }
             err!(TableNotFound)
         }
-        FromItem::File { path, .. } => match catalog.index_of(path) {
+        FromItem::File { path, format, .. } => match catalog.path_index_of(path, *format) {
             Some(i) => {
                 push(i);
                 Ok(())

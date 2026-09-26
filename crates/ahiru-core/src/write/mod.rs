@@ -19,6 +19,12 @@
 //! an ABI shaped like `ahiru_query_step` for the write side too; that is
 //! deferred past v1.
 //!
+//! `COPY` through `Session::prepare` gets a cruder form of it: the reads the
+//! statement was waiting on are stashed on the session, and `prepare` returns
+//! them as `Prepared::NeedIo` instead of `IoFailed`. A host that answers them
+//! and prepares again restarts the statement with more of the data in memory,
+//! until it completes (the JS host does exactly this).
+//!
 //! `NEED_CODEC` is **not** part of that limitation, even though it used to be
 //! treated as one. A codec request never means "bytes are missing": the
 //! compressed bytes were already delivered by the preceding `NEED_IO`, and
@@ -437,12 +443,32 @@ mod tests {
         assert_eq!(crate::error::code_of(r), Some(crate::error::Code::UnsupportedFeature));
     }
 
+    /// `COPY` cannot pause mid-statement, but `prepare` reports the reads it
+    /// was waiting on instead of a bare `IoFailed`, so a host that answers them
+    /// and prepares again makes progress (the statement restarts from scratch).
     #[test]
     #[cfg(feature = "csv")]
-    fn copy_need_io_fails_clearly_for_unresolved_remote_table() {
+    fn copy_reports_the_reads_an_unresolved_remote_table_needs() {
         let mut s = Session::new();
-        s.register_remote("t", 100).unwrap();
-        let r = s.prepare("COPY (SELECT * FROM t) TO 'out.csv'", &[]);
-        assert_eq!(crate::error::code_of(r), Some(crate::error::Code::IoFailed));
+        let csv = b"id\n1\n2\n".to_vec();
+        s.register_remote("t.csv", csv.len() as u64).unwrap();
+        let sql = "COPY (SELECT * FROM \"t.csv\") TO 'out.csv'";
+        let mut rounds = 0;
+        let copy = loop {
+            match s.prepare(sql, &[]).unwrap() {
+                Prepared::Ready(mut q) => break q.copy.take().expect("no COPY result"),
+                Prepared::NeedIo(io) => {
+                    assert!(!io.is_empty());
+                    for r in io {
+                        let (o, l) = (r.offset as usize, r.len as usize);
+                        s.provide(r.table, r.part, r.offset, csv[o..o + l].to_vec()).unwrap();
+                    }
+                }
+            }
+            rounds += 1;
+            assert!(rounds < 10, "no progress");
+        };
+        assert!(rounds >= 1, "the remote table should have needed I/O");
+        assert_eq!(String::from_utf8(copy.data).unwrap(), "id\n1\n2\n");
     }
 }
