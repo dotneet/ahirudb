@@ -250,7 +250,8 @@ fn clone_from_item(f: &FromItem) -> Result<FromItem> {
 ///
 /// For each target column it builds one `SELECT` that "passes through everything but the
 /// target column, emits the target column's name as a string literal into `name_col`, and its
-/// value into `value_col`", and bundles them all with `UNION ALL`. `from_schema` is the
+/// value into `value_col`" for the rows where that value is not NULL, and bundles them all
+/// with `UNION ALL`. `from_schema` is the
 /// target table's column list (used to decide the passed-through "non-target columns"; no real data is read).
 pub fn desugar_unpivot(
     arena: &mut ExprArena,
@@ -288,26 +289,39 @@ pub fn desugar_unpivot(
         items.push(SelectItem { expr: name_lit, alias: Some(name_col.clone()) });
         let val_ref = arena.push(Expr::ColumnRef { qualifier: None, name: name.clone() });
         items.push(SelectItem { expr: val_ref, alias: Some(value_col.clone()) });
+        // DuckDB's `UNPIVOT` drops the rows whose value is NULL (its statement form has no
+        // `INCLUDE NULLS`), so each branch keeps only the non-NULL values of its column.
+        let arg = arena.push(Expr::ColumnRef { qualifier: None, name: name.clone() });
+        let filter = Some(arena.push(Expr::IsNull { arg, negated: true }));
 
-        let sel = SelectStmt { items, from: Some(clone_from_item(&from)?), ..SelectStmt::empty() };
+        let from = Some(clone_from_item(&from)?);
+        let sel = SelectStmt { items, from, filter, ..SelectStmt::empty() };
         branches.push(SetExpr::Select(Box::new(sel)));
     }
 
-    // Bundled into a left-associative `UNION ALL` chain. The same idea as GROUPING SETS
-    // bundling several `Node::Aggregate` with `Node::SetOp` (see the module docs).
-    let mut iter = branches.into_iter();
-    let mut body = match iter.next() {
+    // Bundled into a balanced tree of `UNION ALL`s, pairing neighbours level by level (the
+    // same idea as GROUPING SETS bundling several `Node::Aggregate` with `Node::SetOp`). A
+    // left-deep chain would cost one plan level per column (see `MAX_PLAN_DEPTH`).
+    while branches.len() > 1 {
+        let mut next = Vec::with_capacity(branches.len().div_ceil(2));
+        let mut iter = branches.into_iter();
+        while let Some(l) = iter.next() {
+            next.push(match iter.next() {
+                Some(r) => SetExpr::SetOp {
+                    op: SetOp::Union,
+                    all: true,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+                None => l,
+            });
+        }
+        branches = next;
+    }
+    let body = match branches.pop() {
         Some(b) => b,
         None => err!(Internal), // cannot happen unless columns is empty
     };
-    for b in iter {
-        body = SetExpr::SetOp {
-            op: SetOp::Union,
-            all: true,
-            left: Box::new(body),
-            right: Box::new(b),
-        };
-    }
 
     Ok(QueryStmt { ctes: Vec::new(), body, order_by, order_by_all: None, limit, offset })
 }

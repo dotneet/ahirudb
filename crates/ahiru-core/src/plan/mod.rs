@@ -549,6 +549,37 @@ impl Node {
             | Node::AssertMaxOneRow { input, .. } => input.schema(),
         }
     }
+
+    /// The depth of the plan tree rooted here, saturating at `cap`.
+    ///
+    /// Never recurses more than `cap` levels, so it is safe to call on a tree too deep for
+    /// the rest of the engine (building, executing, cloning), which all recurse once per
+    /// level. The binder uses it to reject such a tree up front (`plan::bind`).
+    pub fn depth(&self, cap: u32) -> u32 {
+        if cap <= 1 {
+            return cap;
+        }
+        let d = |n: &Node| n.depth(cap - 1);
+        1 + match self {
+            Node::Scan(_) | Node::WorkingTable { .. } | Node::GenerateSeries { .. } => 0,
+            #[cfg(feature = "ddl")]
+            Node::MemScan(_) => 0,
+            Node::Join { left, right, .. } | Node::SetOp { left, right, .. } => {
+                d(left).max(d(right))
+            }
+            Node::RecursiveCte { anchor, recursive_term, .. } => d(anchor).max(d(recursive_term)),
+            Node::Filter { input, .. }
+            | Node::Project { input, .. }
+            | Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Window { input, .. }
+            | Node::Limit { input, .. }
+            | Node::DistinctOn { input, .. }
+            | Node::Unnest { input, .. }
+            | Node::Sample { input, .. }
+            | Node::AssertMaxOneRow { input, .. } => d(input),
+        }
+    }
 }
 
 pub struct Plan {

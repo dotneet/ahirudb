@@ -819,6 +819,47 @@ e2e!(
     ]
 );
 
+e2e_multi!(
+    star_hides_binder_helper_columns,
+    ["tests/data/small_a.parquet", "tests/data/small_b.parquet"],
+    [
+        "SELECT *, (SELECT max(w) FROM t2) AS m FROM t ORDER BY 1",
+        "SELECT * FROM t WHERE v > (SELECT avg(v) FROM t) ORDER BY 1",
+        "SELECT * FROM t WHERE k > ANY (SELECT k FROM t2) ORDER BY 1",
+        "SELECT COLUMNS(*) FROM t WHERE k > ALL (SELECT k - 3 FROM t2) ORDER BY ALL",
+        "SELECT * FROM (SELECT * FROM t WHERE v > (SELECT avg(v) FROM t)) \
+         UNION ALL SELECT * FROM t ORDER BY 1, 2",
+        // HAVING: an alias beats an ungrouped input column of the same name.
+        "SELECT k % 2 AS k2, sum(v) AS v FROM t GROUP BY k % 2 HAVING v > 8",
+        "SELECT v, sum(k) AS v FROM t GROUP BY v HAVING v > 4 ORDER BY 1",
+    ]
+);
+
+e2e!(
+    select_list_unnest_after_windows,
+    "tests/data/list1.parquet",
+    [
+        "SELECT id, UNNEST(xs) AS x, count(*) OVER () AS n FROM t WHERE id < 2 ORDER BY 1, 2",
+        "SELECT id, UNNEST(xs) AS x FROM t QUALIFY row_number() OVER (ORDER BY id) = 2 ORDER BY 2",
+        "SELECT * EXCLUDE (xs), UNNEST(xs) AS u FROM t WHERE id < 2 ORDER BY 1, 2",
+    ]
+);
+
+e2e!(
+    distinct_on_ordinal,
+    "tests/data/pivot_small.parquet",
+    [
+        "SELECT DISTINCT ON (1) region, amount FROM t ORDER BY 1, 2",
+        "SELECT DISTINCT ON (2) * FROM t ORDER BY 2 DESC, 1",
+    ]
+);
+
+e2e!(
+    unpivot_drops_nulls,
+    "tests/data/basic.parquet",
+    ["UNPIVOT t ON big INTO NAME n VALUE v ORDER BY v NULLS FIRST LIMIT 3"]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // Rewriting the t inside `t2` or `text` would break the SQL being compared.

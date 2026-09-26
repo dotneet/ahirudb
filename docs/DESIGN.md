@@ -583,7 +583,11 @@ UPDATE t SET col = expr, ... [WHERE ...]   DELETE FROM t [WHERE ...]  -- feature
 - Tokenizer: hand-written; keywords resolve through a lookup table.
 - Parser: expressions via Pratt (precedence climbing), statements via
   recursive descent, with a bounded recursion depth (avoids stack
-  exhaustion on adversarial input).
+  exhaustion on adversarial input). Syntactic depth does not bound the
+  *plan* depth (a long CTE chain nests nothing in the text), so the binder
+  also rejects a plan tree deeper than 256 operators (`MAX_PLAN_DEPTH` in
+  `plan::bind`) before anything recurses over it: on wasm a stack overflow
+  is a trap, not an error.
 - The AST lives in an arena, referenced by `u32` index (`ExprId`), not
   `Box`/`Rc` — cuts both allocation count and code size.
 - Most new syntax (`WINDOW`, `PIVOT`/`UNPIVOT`, `EXCLUDE`/`REPLACE`,
