@@ -895,12 +895,12 @@ fn num1_whole(
 }
 
 /// Whether the type is writable as a value of `to_json`/`json_array`/`json_object`.
-/// Supported are NULL/BOOLEAN/integers/floating point/DECIMAL/VARCHAR/DATE/TIME/TIMESTAMP/JSON
-/// (embedded as is). BLOB and INTERVAL are unsupported (they have no natural JSON representation,
-/// so like CAST they are rejected with `TypeMismatch`).
+/// Supported are NULL/BOOLEAN/integers/floating point/DECIMAL/VARCHAR/BLOB/DATE/TIME/TIMESTAMP/
+/// JSON (embedded as is). INTERVAL is unsupported (like CAST it is rejected with
+/// `TypeMismatch`).
 fn json_encodable(t: Ty) -> bool {
     use Ty::*;
-    t.is_numeric() || matches!(t, Null | Boolean | Varchar | Date | Time | Timestamp | Json)
+    t.is_numeric() || matches!(t, Null | Boolean | Varchar | Blob | Date | Time | Timestamp | Json)
 }
 
 /// A variadic any-type function. Every argument settles on a common type.
@@ -1326,5 +1326,6 @@ pub(crate) use datetime::{
 // unused).
 #[cfg(all(feature = "export", any(feature = "csv", feature = "jsonl")))]
 pub(crate) use datetime::civil_from_days;
+pub(crate) use json::{write_json_f64, write_json_int};
 pub use lambda::call_lambda;
 pub(crate) use numeric::{f_abs, f_trunc};

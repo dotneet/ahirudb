@@ -126,13 +126,6 @@ fn hex_digit(n: u8) -> u8 {
     }
 }
 
-fn hex_encode(bytes: &[u8], out: &mut Vec<u8>) {
-    for &b in bytes {
-        out.push(hex_digit(b >> 4));
-        out.push(hex_digit(b & 0xF));
-    }
-}
-
 /// Convert a leaf's `Value` into its JSON representation according to its
 /// logical type. Number formatting is delegated to `expr::kernels`, and
 /// date/time to the existing `expr::funcs` implementations (using the same
@@ -163,13 +156,10 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
         },
         Value::I128(x) => int_like_to_json(ty, x),
         Value::F64(x) => {
+            // `NaN`/`Infinity`/`-Infinity` for the non-finite values, as DuckDB's `to_json`
+            // writes them, so `UNNEST`/`xs[i]` read them back as the same DOUBLE.
             let mut b = Vec::new();
-            if x.is_finite() {
-                kernels::fmt_f64(x, &mut b);
-            } else {
-                // JSON has no NaN/Infinity. DuckDB's to_json collapses these to NULL too.
-                b.extend_from_slice(b"null");
-            }
+            funcs::write_json_f64(x, &mut b);
             JsonValue::Num(b)
         }
         Value::Bytes(b) => match ty {
@@ -186,10 +176,11 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
                 }
                 JsonValue::Str(h)
             }
-            // BLOB has no direct JSON equivalent, so it becomes a hex string.
+            // BLOB becomes a string of its VARCHAR form (`\xHH` escapes), as DuckDB's `to_json`
+            // renders it; `CAST(<that text> AS BLOB)` reads it back.
             _ => {
                 let mut h = Vec::new();
-                hex_encode(&b, &mut h);
+                kernels::escape_blob(&b, &mut h);
                 JsonValue::Str(h)
             }
         },
@@ -198,9 +189,9 @@ fn leaf_value_to_json(ty: Ty, v: Value) -> JsonValue {
 
 fn int_like_to_json(ty: Ty, x: i128) -> JsonValue {
     match ty {
-        Ty::Decimal { scale, .. } => {
+        Ty::Decimal { .. } => {
             let mut b = Vec::new();
-            kernels::fmt_int(x.unsigned_abs(), x < 0, scale, &mut b);
+            funcs::write_json_int(ty, x, &mut b);
             JsonValue::Num(b)
         }
         Ty::Date => {

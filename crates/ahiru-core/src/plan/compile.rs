@@ -989,13 +989,12 @@ impl<'a> Compiler<'a> {
     /// `ColumnNotFound`), because the body is always compiled in an isolated `Scope`
     /// containing only the parameters.
     ///
-    /// The parameters' type is always `Ty::Json` (the same as `list_extract`'s result; array
-    /// elements are all represented as dynamically typed JSON values). In this engine
-    /// `Ty::Json` does not `Ty::unify` with any other type (see the `vector::types` docs), so
-    /// doing arithmetic or comparison on a parameter in the body requires an explicit
-    /// conversion through VARCHAR, as in `CAST(CAST(x AS VARCHAR) AS INTEGER)` (the same as
-    /// the existing limitation on `list_extract`'s result, not a lambda-specific
-    /// constraint).
+    /// The parameters' type is always `Ty::Json` (array elements are all represented as
+    /// dynamically typed JSON values; unlike `Compiler::subscript`, the list's `Shape` is not
+    /// used to type them). In this engine `Ty::Json` does not `Ty::unify` with any other type
+    /// (see the `vector::types` docs), so doing arithmetic or comparison on a parameter in the
+    /// body requires an explicit conversion through VARCHAR, as in
+    /// `CAST(CAST(x AS VARCHAR) AS INTEGER)`.
     fn lambda_call(&mut self, name: &str, args: &[ExprId]) -> Result<(Reg, Ty)> {
         let is_reduce = eq_ascii_ci(name.as_bytes(), b"list_reduce");
         let func = if eq_ascii_ci(name.as_bytes(), b"list_transform") {

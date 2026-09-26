@@ -1170,8 +1170,13 @@ fn json_type_matches_duckdb_strings() {
         ("true", "BOOLEAN"),
         ("null", "NULL"),
         ("1.5", "DOUBLE"),
-        ("1", "BIGINT"),
+        // duckdb: a non-negative integer is UBIGINT, a negative one BIGINT, and one that
+        // overflows 64 bits DOUBLE.
+        ("1", "UBIGINT"),
         ("-1", "BIGINT"),
+        ("18446744073709551615", "UBIGINT"),
+        ("-12345678901234567890", "DOUBLE"),
+        ("NaN", "DOUBLE"),
     ];
     for (doc, want) in cases {
         let d = vj(&[Some(doc)]);
@@ -1439,8 +1444,8 @@ fn malformed_json_source_is_an_error_not_a_silent_null() {
 fn json_resolve_errors() {
     assert_eq!(code_of(resolve("json_extract", &[Ty::Json])), Some(Code::WrongArgCount));
     assert_eq!(code_of(resolve("to_json", &[])), Some(Code::WrongArgCount));
-    // BLOB/INTERVAL are outside the scope of to_json/json_array.
-    assert_eq!(code_of(resolve("to_json", &[Ty::Blob])), Some(Code::TypeMismatch));
+    // INTERVAL is outside the scope of to_json/json_array (BLOB is in: DuckDB writes its text).
+    assert!(resolve("to_json", &[Ty::Blob]).is_ok());
     assert_eq!(code_of(resolve("to_json", &[Ty::Interval])), Some(Code::TypeMismatch));
     assert_eq!(
         code_of(resolve("json_object", &[Ty::Varchar])),
