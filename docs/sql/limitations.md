@@ -135,10 +135,16 @@ user-visible effect.
 - **LIST/MAP values have no dedicated physical type** — they're
   represented as `JSON` text under the hood (see
   [data-sources.md](data-sources.md#nested-parquet-types)). This is usually
-  invisible, but it means, for example, that list elements need an explicit
+  invisible — a subscript (`xs[i]`, `m[k]`) or `UNNEST` returns the element
+  as its native type whenever that type is known statically (a Parquet
+  `LIST<scalar>`/`MAP` column, `string_split`, a one-type list literal) — but
+  a lambda parameter is always `JSON`, so a numeric element needs an explicit
   `CAST(... AS VARCHAR)` / `CAST(... AS INTEGER)` round-trip before doing
-  arithmetic on them inside a lambda (`list_transform(xs, x -> CAST(CAST(x
-  AS VARCHAR) AS INTEGER) + 1)`). It also changes what `||` means — see
+  arithmetic on it inside a lambda (`list_transform(xs, x -> CAST(CAST(x AS
+  VARCHAR) AS INTEGER) + 1)`), and an element of a nested list (`xss[1][2]`)
+  or of a `JSON` value read from a JSON/JSONL file stays `JSON`. `array_agg`
+  returns its list as `VARCHAR` text, so `array_agg(x)[1]` is `JSON` too. It
+  also changes what `||` means — see
   [JSON is also the list type](#json-is-also-the-list-type) below.
 - **JSON equality is byte-comparison**, not semantic comparison — two JSON
   documents that differ only in whitespace (`'{"a": 1}'` vs `'{"a":1}'`)
