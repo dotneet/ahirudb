@@ -60,12 +60,12 @@ fn ctas_reads_a_gzip_compressed_parquet_source() {
         "CREATE TABLE g AS SELECT * FROM '{src}'; \
          SELECT count(*), count(DISTINCT id) FROM g"
     ));
-    let mut values =
-        text.lines().filter(|l| !l.is_empty() && !l.starts_with('(')).skip(1).step_by(2);
-    // The CTAS statement's own result is the number of rows it stored, and the
-    // follow-up query confirms the values themselves survived, not just the count.
-    assert_eq!(values.next(), Some(EXPECTED_ROWS.to_string().as_str()), "{text}");
-    assert_eq!(values.next(), Some(format!("{EXPECTED_ROWS},{EXPECTED_ROWS}").as_str()), "{text}");
+    // The CTAS itself prints nothing (as in the DuckDB CLI); the follow-up query
+    // confirms the rows and their values survived, not just the count.
+    let mut lines = text.lines().filter(|l| !l.is_empty() && !l.starts_with('('));
+    lines.next().expect("header");
+    assert_eq!(lines.next(), Some(format!("{EXPECTED_ROWS},{EXPECTED_ROWS}").as_str()), "{text}");
+    assert_eq!(lines.next(), None, "{text}");
 }
 
 #[test]

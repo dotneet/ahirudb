@@ -305,6 +305,13 @@ impl<'a> Writer<'a> {
                     // type when the generated INSERT statement is replayed.
                     let text = crate::render::render(v, *ty, "NULL");
                     format!("'{}'", text.replace('\'', "''"))
+                } else if matches!(ty, Ty::Decimal { .. }) {
+                    // A bare `1.25` is a DOUBLE literal here, so replaying it would
+                    // round a wide DECIMAL (`DECIMAL(38,10)`) through a float. The
+                    // quoted text cast to the exact type is read back digit for digit
+                    // by both this engine and DuckDB.
+                    let text = crate::render::render(v, *ty, "NULL");
+                    format!("'{text}'::{}", ty.full_name())
                 } else if *ty == Ty::Boolean || crate::render::is_numeric(*ty) {
                     crate::render::render(v, *ty, "NULL")
                 } else {
@@ -405,7 +412,7 @@ impl<'a> Writer<'a> {
         let mut col_width: Vec<usize> = names.iter().map(|n| str_width(n)).collect();
         if duck {
             for (w, ty) in col_width.iter_mut().zip(&self.types) {
-                *w = (*w).max(str_width(&ty.name().to_ascii_lowercase()));
+                *w = (*w).max(str_width(&ty.full_name().to_ascii_lowercase()));
             }
         }
         for row in &display_rows {
@@ -488,7 +495,7 @@ impl<'a> Writer<'a> {
                     let right = crate::render::is_numeric(self.types[*i]);
                     header.push_str(&pad_cell(&names[*i], w, right));
                     type_line.push_str(&pad_cell(
-                        &self.types[*i].name().to_ascii_lowercase(),
+                        &self.types[*i].full_name().to_ascii_lowercase(),
                         w,
                         right,
                     ));
@@ -550,7 +557,9 @@ fn insert_target(name: &str) -> String {
     name.split('.').map(insert_identifier_part).collect::<Vec<_>>().join(".")
 }
 
-fn insert_identifier_part(part: &str) -> String {
+/// `part` as a SQL identifier: bare when it is a plain, non-reserved name, and
+/// double-quoted (with embedded `"` doubled) otherwise. Also used by `.schema`.
+pub(crate) fn insert_identifier_part(part: &str) -> String {
     let mut chars = part.chars();
     let simple = chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
@@ -694,7 +703,11 @@ fn json_cell_value(v: &Value, ty: Ty) -> String {
     }
     let text = crate::render::render(v, ty, "null");
     if ty == Ty::Json && looks_like_json(&text) {
-        return text;
+        // Minified, so a pretty-printed value cannot split a `-jsonlines` record
+        // (or a `-json` array element) over several lines.
+        let mut out = Vec::with_capacity(text.len());
+        ahiru_core::json::minify_into(text.as_bytes(), &mut out);
+        return String::from_utf8(out).unwrap_or(text);
     }
     let mut out = String::new();
     json_escape_into(&text, &mut out);

@@ -194,7 +194,7 @@ fn cmd_schema(path: &str) -> R<()> {
         println!(
             "  [{i}] {:<24} {:<12} {}",
             f.name,
-            f.ty.name(),
+            f.ty.full_name(),
             if f.nullable { "NULL" } else { "NOT NULL" }
         );
     }
