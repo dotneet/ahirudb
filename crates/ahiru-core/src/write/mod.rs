@@ -148,11 +148,18 @@ fn export_query(
     query: &QueryStmt,
     params: &[Value],
     sink: &mut dyn TableSink,
+    dedup_names: bool,
 ) -> Result<Vec<u8>> {
     let mut q = match session.prepare_query(arena, query, params)? {
         Prepared::Ready(q) => q,
         Prepared::NeedIo(_) => err!(IoFailed),
     };
+    // A CSV header or Parquet schema with two columns of the same name is written as
+    // `a`, `a_1`, ... like DuckDB. JSONL keeps them, so its sink rejects the duplicate
+    // key (DuckDB fails there too) instead of silently renaming an object key.
+    if dedup_names {
+        crate::catalog::Catalog::dedup_column_names(&mut q.schema);
+    }
     sink.begin(&q.schema)?;
     loop {
         match session.step(&mut q)? {
@@ -175,7 +182,7 @@ fn export_query(
 
 /// Execution body for `Stmt::Copy`. Called from `Session::prepare`.
 ///
-/// The format comes from an explicit `FORMAT csv|jsonl|json|parquet` when
+/// The format comes from an explicit `FORMAT csv|jsonl|json|ndjson|parquet` when
 /// given, and otherwise from the extension of `path` via
 /// `format::FormatKind::detect`. Which formats can actually be written
 /// depends on the enabled features (`csv`, `jsonl`, `export-parquet`);
@@ -192,30 +199,43 @@ pub(crate) fn copy(
     format: Option<&str>,
     params: &[Value],
 ) -> Result<Prepared> {
-    let fmt = resolve_format(path, format)?;
+    // As in DuckDB, a `.gz`/`.zst` suffix names the compression, and the format comes
+    // from what precedes it (`out.csv.gz` is gzipped CSV). Parquet compresses its pages
+    // itself, so DuckDB writes a plain Parquet file under such a name; so does this.
+    let (base, gzip, zstd) = match (path.strip_suffix(".gz"), path.strip_suffix(".zst")) {
+        (Some(b), _) => (b, true, false),
+        (_, Some(b)) => (b, false, true),
+        _ => (path, false, false),
+    };
+    let fmt = resolve_format(base, format)?;
+    #[cfg(feature = "export-parquet")]
+    let (gzip, zstd) = if fmt == ExportFormat::Parquet { (false, false) } else { (gzip, zstd) };
+    // There is no zstd encoder anywhere (host included), and writing uncompressed
+    // bytes under a `.zst` name would leave a file no reader can open.
+    ensure!(!zstd, UnsupportedCodec);
     let data = match fmt {
         #[cfg(feature = "csv")]
         ExportFormat::Csv => {
             let mut sink = csv::CsvSink::new();
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, true)?
         }
         #[cfg(feature = "csv")]
         ExportFormat::Tsv => {
             let mut sink = csv::CsvSink::with_delimiter(b'\t');
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, true)?
         }
         #[cfg(feature = "jsonl")]
         ExportFormat::Jsonl => {
             let mut sink = jsonl::JsonlSink::new();
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, false)?
         }
         #[cfg(feature = "export-parquet")]
         ExportFormat::Parquet => {
             let mut sink = parquet::ParquetSink::new();
-            export_query(session, arena, query, params, &mut sink)?
+            export_query(session, arena, query, params, &mut sink, true)?
         }
     };
-    Ok(Prepared::Ready(Query::copy_result(path.to_owned(), data)))
+    Ok(Prepared::Ready(Query::copy_result(path.to_owned(), data, gzip)))
 }
 
 /// Resolves `format` if given, otherwise infers it from `path`'s extension.
@@ -284,7 +304,10 @@ fn format_by_name(name: &str) -> Result<ExportFormat> {
         return Ok(ExportFormat::Tsv);
     }
     #[cfg(feature = "jsonl")]
-    if eq_ascii_ci(name.as_bytes(), b"jsonl") || eq_ascii_ci(name.as_bytes(), b"json") {
+    if eq_ascii_ci(name.as_bytes(), b"jsonl")
+        || eq_ascii_ci(name.as_bytes(), b"json")
+        || eq_ascii_ci(name.as_bytes(), b"ndjson")
+    {
         return Ok(ExportFormat::Jsonl);
     }
     #[cfg(feature = "export-parquet")]

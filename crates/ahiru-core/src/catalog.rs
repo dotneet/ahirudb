@@ -359,7 +359,7 @@ impl MemTable {
     /// It only ever builds from in-memory data, so waiting on a split (`NeedIo`) as with
     /// `Source` cannot happen in principle.
     pub fn batch(&self, start: usize, end: usize) -> crate::vector::Batch {
-        // With zero columns (right after `ALTER TABLE ... DROP COLUMN` removes the last
+        // With zero columns (defensive: `DROP COLUMN` now refuses to remove the last
         // one) `cols` is empty and `Batch::new` cannot track the row count
         // (`num_rows()` consults `empty_rows` -- 0 by default -- when `cols.first()` is
         // absent, silently misreporting the real row count as 0). In that case
@@ -512,6 +512,47 @@ impl Catalog {
         })
     }
 
+    /// Renames duplicate column names the way DuckDB does when a query result becomes a
+    /// stored relation (`CREATE TABLE AS`, `CREATE VIEW`, `COPY ... TO` CSV/Parquet): the
+    /// first occurrence keeps its name and each later one gets `_1`, `_2`, ... appended,
+    /// skipping any suffix that is already taken. Names compare case-insensitively, so
+    /// `a, a, A, a_1` becomes `a, a_1, A_2, a_1_1` (DuckDB's `DeduplicateColumns`).
+    #[cfg(any(feature = "ddl", feature = "export"))]
+    pub(crate) fn dedup_column_names(schema: &mut [Field]) {
+        // (name, next suffix to try); a linear scan, since column lists are short.
+        let mut seen: Vec<(String, usize)> = Vec::with_capacity(schema.len());
+        let find = |seen: &Vec<(String, usize)>, n: &str| {
+            seen.iter().position(|(s, _)| eq_ascii_ci(s.as_bytes(), n.as_bytes()))
+        };
+        for f in schema.iter_mut() {
+            let Some(base) = find(&seen, &f.name) else {
+                seen.push((f.name.clone(), 1));
+                continue;
+            };
+            let name = loop {
+                let mut cand = f.name.clone();
+                cand.push('_');
+                let mut digits = [0u8; 20];
+                let (mut n, mut i) = (seen[base].1, digits.len());
+                loop {
+                    i -= 1;
+                    digits[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                digits[i..].iter().for_each(|&d| cand.push(d as char));
+                if find(&seen, &cand).is_none() {
+                    break cand;
+                }
+                seen[base].1 += 1;
+            };
+            seen.push((name.clone(), 1));
+            f.name = name;
+        }
+    }
+
     /// `CREATE TABLE t (...)` / `CREATE TABLE t AS SELECT ...`.
     /// With `replace`, an existing in-memory table of the same name is silently replaced.
     #[cfg(feature = "ddl")]
@@ -539,17 +580,13 @@ impl Catalog {
         }
     }
 
-    /// `DROP TABLE t`. File-backed tables are out of scope (being read-only, they always
-    /// give `TableNotFound`).
+    /// `DROP TABLE t`. A file-backed table is read-only and gives `ReadOnlyTable`
+    /// (the same rule as DML and `ALTER TABLE`); an unknown name gives `TableNotFound`.
     #[cfg(feature = "ddl")]
     pub fn mem_drop(&mut self, name: &str) -> Result<()> {
-        match self.mem_index_of(name) {
-            Some(i) => {
-                self.mem[i] = None;
-                Ok(())
-            }
-            None => err!(TableNotFound),
-        }
+        let i = self.mem_index_writable(name)?;
+        self.mem[i] = None;
+        Ok(())
     }
 
     /// Confirms the name refers to a writable in-memory table and returns its index.
@@ -588,7 +625,8 @@ impl Catalog {
         Ok(())
     }
 
-    /// `ALTER TABLE t DROP COLUMN col`. A missing column gives `ColumnNotFound`.
+    /// `ALTER TABLE t DROP COLUMN col`. A missing column gives `ColumnNotFound`, and
+    /// dropping the only remaining column gives `UnsupportedFeature`.
     #[cfg(feature = "ddl")]
     pub fn mem_drop_column(&mut self, idx: usize, col_name: &str) -> Result<()> {
         let mt = match self.mem_get_mut(idx) {
@@ -603,6 +641,10 @@ impl Catalog {
             Some(p) => p,
             None => err!(ColumnNotFound),
         };
+        // DuckDB refuses to drop the last column ("table only has one column
+        // remaining"); a zero-column table cannot be selected from or inserted into
+        // in any useful way, so the same statement is rejected here.
+        ensure!(mt.schema.len() > 1, UnsupportedFeature);
         mt.schema.remove(pos);
         mt.defaults.remove(pos);
         for row in &mut mt.rows {
@@ -1178,18 +1220,19 @@ mod tests {
 
     #[cfg(feature = "ddl")]
     #[test]
-    fn mem_drop_column_removes_slot_from_every_row_down_to_zero_columns() {
+    fn mem_drop_column_removes_slot_from_every_row_but_keeps_the_last_column() {
         let (mut c, i) = mem_catalog_with_two_rows();
         c.mem_drop_column(i, "b").unwrap();
         assert_eq!(c.mem_get(i).unwrap().schema.len(), 1);
         assert_schema_and_rows_stay_in_sync(&c, i);
 
-        // Even the last remaining column can be dropped (unlike DuckDB, no constraint is
-        // imposed, since this is not columnar).
-        c.mem_drop_column(i, "a").unwrap();
-        let mt = c.mem_get(i).unwrap();
-        assert_eq!(mt.schema.len(), 0);
-        assert!(mt.rows.iter().all(|r| r.is_empty()));
+        // The last remaining column cannot be dropped (as in DuckDB), and the failed
+        // attempt leaves the table untouched.
+        assert_eq!(
+            code_of(c.mem_drop_column(i, "a")),
+            Some(crate::error::Code::UnsupportedFeature)
+        );
+        assert_eq!(c.mem_get(i).unwrap().schema.len(), 1);
         assert_schema_and_rows_stay_in_sync(&c, i);
 
         // A column that does not exist.

@@ -766,6 +766,9 @@ pub struct ColumnDef {
     pub name: String,
     pub ty: Ty,
     pub nullable: bool,
+    /// `DEFAULT expr`: a constant expression, evaluated once when the column is
+    /// created (not per inserted row; see docs/sql/ddl-dml.md).
+    pub default: Option<ExprId>,
 }
 
 /// The concrete operation of `ALTER TABLE t <action>`.
@@ -786,7 +789,10 @@ pub enum AlterTableAction {
 #[cfg(feature = "dml")]
 pub enum InsertSource {
     /// `VALUES (a, b), (c, d), ...`. Each row is a list of expressions (the column count is validated during checking).
-    Values(Vec<Vec<ExprId>>),
+    /// `None` is the `DEFAULT` keyword in that position: the column's default value.
+    Values(Vec<Vec<Option<ExprId>>>),
+    /// `DEFAULT VALUES`: one row holding every column's default.
+    DefaultValues,
     /// Streamed straight in from `SELECT ...`.
     Query(Box<QueryStmt>),
 }

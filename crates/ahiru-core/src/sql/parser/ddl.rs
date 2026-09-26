@@ -48,15 +48,23 @@ impl<'a> Parser<'a> {
     fn column_def(&mut self) -> Result<ColumnDef> {
         let name = self.ident()?;
         let ty = self.type_name()?;
-        let nullable = if self.eat_kw(Kw::Not)? {
-            self.expect_kw(Kw::Null)?;
-            false
-        } else {
-            // An explicit `NULL` means the same as the default, so it is read and discarded.
-            self.eat_kw(Kw::Null)?;
-            true
-        };
-        Ok(ColumnDef { name, ty, nullable })
+        // `NOT NULL`, `NULL` and `DEFAULT expr`, in any order (as in DuckDB). An
+        // explicit `NULL` means the same as the default, so it is read and discarded.
+        let (mut nullable, mut default) = (true, None);
+        loop {
+            if self.eat_kw(Kw::Not)? {
+                self.expect_kw(Kw::Null)?;
+                nullable = false;
+            } else if self.eat_kw(Kw::Default)? {
+                // Read above the predicate level (PostgreSQL's `b_expr`, which DuckDB
+                // uses here too), so `DEFAULT 5 NOT NULL` does not take `NOT` for the
+                // start of `NOT IN`/`NOT LIKE`.
+                default = Some(self.expr_bp(BP_PRED + 1)?);
+            } else if !self.eat_kw(Kw::Null)? {
+                break;
+            }
+        }
+        Ok(ColumnDef { name, ty, nullable, default })
     }
 
     #[cfg(feature = "ddl")]
@@ -133,12 +141,11 @@ impl<'a> Parser<'a> {
         let action = if self.eat_kw(Kw::Add)? {
             self.eat_kw(Kw::Column)?;
             let col = self.column_def()?;
-            let default = if self.eat_kw(Kw::Default)? { Some(self.expr()?) } else { None };
             AlterTableAction::AddColumn {
                 name: col.name,
                 ty: col.ty,
                 nullable: col.nullable,
-                default,
+                default: col.default,
             }
         } else if self.eat_kw(Kw::Drop)? {
             self.eat_kw(Kw::Column)?;

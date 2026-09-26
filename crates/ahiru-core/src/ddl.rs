@@ -38,6 +38,7 @@ pub(crate) fn create_table(
     if if_not_exists && !or_replace && table_name_exists(session, name) {
         return Ok(Prepared::Ready(count_result(0)));
     }
+    let mut defaults = Vec::new();
     let (schema, rows) = match as_select {
         Some(q) => {
             let (mut schema, rows) = run_query_to_rows(session, arena, q, params)?;
@@ -47,14 +48,32 @@ pub(crate) fn create_table(
             // COPY treated the column as always-NULL. DuckDB types such a column
             // INTEGER; do the same. Every existing row holds `Value::Null` there, so
             // no data needs converting.
+            //
+            // Every CTAS column is nullable, as in DuckDB: a query's nullability (a
+            // NOT NULL source column, a Parquet REQUIRED field, the preserved side of
+            // an outer join) describes the rows it produced, not a constraint the new
+            // table should enforce on later INSERTs.
             for f in &mut schema {
                 if f.ty == Ty::Null {
                     f.ty = Ty::Int;
                 }
+                f.nullable = true;
             }
+            // Duplicate output names (`SELECT * FROM a JOIN b ON a.id = b.id`) are
+            // renamed `id_1`, ... rather than rejected, again as DuckDB does.
+            crate::catalog::Catalog::dedup_column_names(&mut schema);
             (schema, rows)
         }
         None => {
+            // `DEFAULT expr` is evaluated once, here, with the same strict conversion
+            // as `ADD COLUMN ... DEFAULT` -- before the table exists, so a bad default
+            // leaves nothing behind.
+            for c in columns {
+                defaults.push(match c.default {
+                    Some(e) => eval_value_strict(session, arena, e, params, c.ty)?,
+                    None => Value::Null,
+                });
+            }
             let schema =
                 columns.iter().map(|c| Field::new(c.name.clone(), c.ty, c.nullable)).collect();
             (schema, Vec::new())
@@ -62,7 +81,11 @@ pub(crate) fn create_table(
     };
     let n = rows.len();
     let idx = session.catalog.mem_create(name, schema, or_replace)?;
-    session.catalog.mem_get_mut(idx).unwrap().rows = rows;
+    let mt = session.catalog.mem_get_mut(idx).unwrap();
+    mt.rows = rows;
+    if !defaults.is_empty() {
+        mt.defaults = defaults;
+    }
     Ok(Prepared::Ready(count_result(n as i64)))
 }
 

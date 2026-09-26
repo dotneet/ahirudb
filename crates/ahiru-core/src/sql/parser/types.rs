@@ -226,6 +226,34 @@ static TYPES: &[(&[u8], Ty)] = &[
     // `CREATE TABLE t AS SELECT INTERVAL '1 day' AS x ...` produced the type
     // perfectly well.
     (b"interval", Ty::Interval),
+    // Aliases DuckDB accepts (`typeof(CAST(NULL AS int8))` = BIGINT, ...). Common in
+    // DDL copied from PostgreSQL/MySQL/SQL Server schemas.
+    (b"int1", Ty::TinyInt),
+    (b"int2", Ty::SmallInt),
+    (b"short", Ty::SmallInt),
+    (b"int4", Ty::Int),
+    (b"signed", Ty::Int),
+    (b"int8", Ty::BigInt),
+    (b"long", Ty::BigInt),
+    (b"int16", Ty::SmallInt),
+    (b"int32", Ty::Int),
+    (b"int64", Ty::BigInt),
+    (b"int128", Ty::HugeInt),
+    (b"uint8", Ty::UTinyInt),
+    (b"uint16", Ty::USmallInt),
+    (b"uint32", Ty::UInt),
+    (b"uint64", Ty::UBigInt),
+    (b"float4", Ty::Float),
+    (b"float8", Ty::Double),
+    (b"dec", Ty::Decimal { precision: 18, scale: 3 }),
+    (b"character", Ty::Varchar),
+    (b"bpchar", Ty::Varchar),
+    (b"nchar", Ty::Varchar),
+    (b"nvarchar", Ty::Varchar),
+    (b"binary", Ty::Blob),
+    (b"varbinary", Ty::Blob),
+    (b"logical", Ty::Boolean),
+    (b"guid", Ty::Uuid),
 ];
 
 /// Type names that may prefix a single-quoted string as a **typed literal**

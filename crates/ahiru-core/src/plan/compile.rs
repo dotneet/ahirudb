@@ -828,7 +828,7 @@ impl<'a> Compiler<'a> {
         // propagates a NULL argument to the result.
         if eq_ascii_ci(name.as_bytes(), b"typeof") {
             ensure!(tys.len() == 1, WrongArgCount);
-            let v = Value::Bytes(tys[0].name().as_bytes().to_vec());
+            let v = Value::Bytes(tys[0].full_name().into_bytes());
             return Ok((self.konst(Ty::Varchar, v), Ty::Varchar));
         }
         // A few signatures' *result type* depends on an argument's value, not just its type

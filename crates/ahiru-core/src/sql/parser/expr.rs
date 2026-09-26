@@ -1495,11 +1495,39 @@ impl<'a> Parser<'a> {
         self.bump()?;
         if matches!(ty, Ty::Decimal { .. }) && self.eat(Tok::LParen)? {
             let p = self.uint()?;
-            self.expect(Tok::Comma)?;
-            let s = self.uint()?;
+            // `DECIMAL(p)` is `DECIMAL(p,0)`, as in DuckDB.
+            let s = if self.eat(Tok::Comma)? { self.uint()? } else { 0 };
             self.expect(Tok::RParen)?;
             ensure!((1..=38).contains(&p) && s <= p, InvalidCast, pos);
             return Ok(Ty::Decimal { precision: p as u8, scale: s as u8 });
+        }
+        // A single modifier that DuckDB accepts and this engine has no use for: the
+        // length of `VARCHAR(10)`/`CHAR(3)` (not enforced by DuckDB either), and the
+        // mantissa bits of `FLOAT(n)`, which pick DOUBLE above 24 as in DuckDB.
+        if matches!(ty, Ty::Varchar | Ty::Float) && self.eat(Tok::LParen)? {
+            let n = self.uint()?;
+            self.expect(Tok::RParen)?;
+            return Ok(if ty == Ty::Float && n > 24 { Ty::Double } else { ty });
+        }
+        // Two-word spellings: `DOUBLE PRECISION`, `CHARACTER VARYING[(n)]`, and the
+        // explicit `TIMESTAMP`/`TIME WITHOUT TIME ZONE` (the default anyway).
+        if (ty == Ty::Double && self.is_soft_kw(b"precision"))
+            || (eq_ascii_ci(name.as_bytes(), b"character") && self.is_soft_kw(b"varying"))
+        {
+            self.bump()?;
+            if ty == Ty::Varchar && self.eat(Tok::LParen)? {
+                self.uint()?;
+                self.expect(Tok::RParen)?;
+            }
+            return Ok(ty);
+        }
+        if matches!(ty, Ty::Timestamp | Ty::Time) && self.is_soft_kw(b"without") {
+            self.bump()?;
+            ensure!(self.is_soft_kw(b"time"), InvalidCast, pos);
+            self.bump()?;
+            ensure!(self.is_soft_kw(b"zone"), InvalidCast, pos);
+            self.bump()?;
+            return Ok(ty);
         }
         // The standard SQL spelling `TIMESTAMP WITH TIME ZONE`. The single word
         // `timestamptz` (the `TYPES` table) is the everyday shorthand; this is the

@@ -22,6 +22,11 @@ use crate::vector::{Batch, Field, Ty, Value, Vector};
 pub struct CopyResult {
     pub path: String,
     pub data: Vec<u8>,
+    /// `path` ends in `.gz`, so the host must gzip-compress `data` before writing it
+    /// (DuckDB picks the compression from the file name the same way). The core has
+    /// no deflate encoder; the format of `data` was chosen from the name without the
+    /// `.gz` (`out.csv.gz` is CSV).
+    pub gzip: bool,
 }
 
 /// A prepared query.
@@ -52,11 +57,11 @@ impl Query {
     /// Builds a `Query` that merely holds a `COPY` result.
     /// Called from `write::copy`.
     #[cfg(feature = "export")]
-    pub(crate) fn copy_result(path: String, data: Vec<u8>) -> Self {
+    pub(crate) fn copy_result(path: String, data: Vec<u8>, gzip: bool) -> Self {
         Query {
             root: Box::new(Values::new(Batch::new(Vec::new()))),
             schema: Vec::new(),
-            copy: Some(CopyResult { path, data }),
+            copy: Some(CopyResult { path, data, gzip }),
         }
     }
 }
@@ -577,7 +582,10 @@ impl Session {
             return Ok(Err(io));
         }
         let plan = bind_query_at(&self.catalog, &parsed.arena, q, &[], self.now_micros)?;
-        Ok(Ok(plan.root.schema().to_vec()))
+        // The same names `SELECT * FROM v` exposes (see `push_view_rel`).
+        let mut schema = plan.root.schema().to_vec();
+        crate::catalog::Catalog::dedup_column_names(&mut schema);
+        Ok(Ok(schema))
     }
 }
 
@@ -603,7 +611,7 @@ fn describe_result(fields: &[Field]) -> Query {
     let mut nulls = Vector::with_capacity(Ty::Varchar, fields.len());
     for f in fields {
         names.push_value(&Value::Bytes(f.name.as_bytes().to_vec()));
-        types.push_value(&Value::Bytes(f.ty.name().as_bytes().to_vec()));
+        types.push_value(&Value::Bytes(f.ty.full_name().into_bytes()));
         nulls.push_value(&Value::Bytes(if f.nullable { b"YES".to_vec() } else { b"NO".to_vec() }));
     }
     let schema = vec![
