@@ -170,37 +170,42 @@ pub(super) fn concat_ws_build(args: &[&Vector], ty: Ty) -> Result<Vector> {
 // LIST functions over the JSON representation
 // =========================================================================
 
-/// Serializes one row of a `list_contains`/`list_position` search value into JSON text, so it
-/// can be compared byte-wise against the array's element spans.
-fn search_text(a: &A, out: &mut Vec<u8>) {
-    if let Some((v, j)) = a.at(1) {
-        write_json_scalar(v, j, out);
-    }
-}
-
 /// The 1-based index of `needle` in the array, or 0 when absent. `None` when the argument is
 /// not an array at all (the caller turns that into SQL NULL, matching duckdb's behavior for
 /// `list_position` on a non-list).
+///
+/// The needle is serialized to JSON text and compared with `crate::json::cmp_element`, so
+/// numbers compare by value (`list_contains([1.0, 2.0], 2)`, as DuckDB's implicit cast to
+/// the element type gives) and strings by their decoded text.
 pub(super) fn list_find(a: &A) -> Result<Option<i64>> {
     let mut needle = Vec::new();
-    search_text(a, &mut needle);
+    if let Some((v, j)) = a.at(1) {
+        write_json_scalar(v, j, &mut needle);
+    }
     let doc = a.bytes(0);
     let elems = match crate::json::array_elements(doc)? {
         Some(e) => e,
         None => return Ok(None),
     };
     for (k, (span, _)) in elems.iter().enumerate() {
-        if *span == needle.as_slice() {
+        if crate::json::cmp_element(span, &needle)?.is_eq() {
             return Ok(Some(k as i64 + 1));
         }
     }
     Ok(Some(0))
 }
 
-/// `list_sort` / `list_distinct` / `list_reverse`. All three only reorder or drop whole element
-/// spans, so one body covers them: parse once, permute the spans, re-emit.
-pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Result<bool> {
-    let elems = match crate::json::array_elements(doc)? {
+/// `list_sort` / `list_reverse_sort` / `list_distinct` / `list_reverse`. All of them only
+/// reorder or drop whole element spans, so one body covers them: parse once, permute the
+/// spans, re-emit.
+///
+/// The sorts order elements with `crate::json::cmp_element` (the order of the typed values:
+/// numbers by value, strings by decoded bytes, lists and structs element-wise) and take
+/// DuckDB's optional arguments: `list_sort(l, 'ASC'|'DESC', 'NULLS FIRST'|'NULLS LAST')` and
+/// `list_reverse_sort(l, 'NULLS FIRST'|'NULLS LAST')`. NULLs go last by default either way,
+/// as in DuckDB (`list_reverse_sort([3, NULL, 1])` is `[3, 1, NULL]`).
+pub(super) fn list_rearrange(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
+    let elems = match crate::json::array_elements(a.bytes(0))? {
         Some(e) => e,
         // Not an array -> NULL, the same judgment as `list_find`.
         None => return Ok(false),
@@ -208,7 +213,46 @@ pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Resul
     let mut order: Vec<usize> = (0..elems.len()).collect();
     match id {
         F_LIST_REVERSE => order.reverse(),
-        F_LIST_SORT => order.sort_by(|&x, &y| cmp_elem(elems[x], elems[y])),
+        F_LIST_SORT | F_LIST_REVERSE_SORT => {
+            let opt = |k: usize, want: &[u8]| -> Result<bool> {
+                if a.n() <= k {
+                    return Ok(false);
+                }
+                let s = a.bytes(k);
+                if crate::rt::hash::eq_ascii_ci(s, want) {
+                    return Ok(true);
+                }
+                // The other spelling of the same option.
+                let other: &[u8] = match want {
+                    b"DESC" => b"ASC",
+                    _ => b"NULLS LAST",
+                };
+                ensure!(crate::rt::hash::eq_ascii_ci(s, other), UnsupportedFeature);
+                Ok(false)
+            };
+            let rev = id == F_LIST_REVERSE_SORT;
+            let desc = rev || opt(1, b"DESC")?;
+            let nulls_first = opt(if rev { 1 } else { 2 }, b"NULLS FIRST")?;
+            let null = |k: usize| elems[k].1 == crate::json::Kind::Null;
+            order.sort_by(|&x, &y| match (null(x), null(y)) {
+                (false, false) => {
+                    let o = crate::json::cmp_element(elems[x].0, elems[y].0)
+                        .unwrap_or_else(|_| elems[x].0.cmp(elems[y].0));
+                    if desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                }
+                (nx, ny) => {
+                    if nulls_first {
+                        ny.cmp(&nx)
+                    } else {
+                        nx.cmp(&ny)
+                    }
+                }
+            });
+        }
         // Keeps first-occurrence order (duckdb's `list_distinct` does not promise an order, and
         // this way the function needs no comparator). SQL NULL list elements are not retained,
         // matching DuckDB's `list_distinct([NULL, 1, NULL]) = [1]`.
@@ -225,31 +269,6 @@ pub(super) fn list_rearrange(id: FuncId, doc: &[u8], out: &mut Vec<u8>) -> Resul
     }
     out.push(b']');
     Ok(true)
-}
-
-/// The ordering `list_sort` uses. JSON is untyped, so elements are ranked by kind first
-/// (numbers < strings < booleans < arrays < objects, with `null` last like duckdb's default
-/// `NULLS LAST`), then within a kind: numbers numerically, everything else by raw span bytes.
-fn cmp_elem(a: crate::json::Elem, b: crate::json::Elem) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
-    let rank = |k: crate::json::Kind| match k {
-        crate::json::Kind::Num => 0u8,
-        crate::json::Kind::Str => 1,
-        crate::json::Kind::Bool => 2,
-        crate::json::Kind::Array => 3,
-        crate::json::Kind::Object => 4,
-        crate::json::Kind::Null => 5,
-    };
-    match rank(a.1).cmp(&rank(b.1)) {
-        Ordering::Equal => {}
-        o => return o,
-    }
-    if a.1 == crate::json::Kind::Num {
-        if let (Some(x), Some(y)) = (crate::json::parse_f64(a.0), crate::json::parse_f64(b.0)) {
-            return ord_f64(x, y);
-        }
-    }
-    a.0.cmp(b.0)
 }
 
 // =========================================================================

@@ -282,8 +282,8 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
             out.extend_from_slice(name);
         }
         F_STRING_SPLIT => string_split(a.bytes(0), a.bytes(1), out),
-        F_LIST_SORT | F_LIST_DISTINCT | F_LIST_REVERSE => {
-            return super::json::list_rearrange(id, a.bytes(0), out);
+        F_LIST_SORT | F_LIST_REVERSE_SORT | F_LIST_DISTINCT | F_LIST_REVERSE => {
+            return super::json::list_rearrange(id, a, out);
         }
         F_REVERSE => {
             let s = a.bytes(0);

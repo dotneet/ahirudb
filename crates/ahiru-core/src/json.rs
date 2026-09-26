@@ -621,14 +621,13 @@ pub(crate) fn list_slice(doc: &[u8], start: i64, end: i64) -> Result<Option<(usi
     if count == 0 {
         return Ok(Some((empty_at, empty_at)));
     }
-    // Normalize to a 1-based inclusive interval before clamping. 0 is treated as 1
-    // (confirmed by `duckdb -c "select [1,2,3,4,5][0:2]"` returning the same `[1, 2]`
-    // as `[1,2,3,4,5][1:2]`). Negatives use `saturating_add` to avoid overflow
-    // (guarding against huge negative indices from untrusted input).
+    // Normalize to a 1-based inclusive interval before clamping. A start of 0 is treated
+    // as 1 but an end of 0 as 0, i.e. before the first element (confirmed by `duckdb -c
+    // "select [1,2,3,4,5][0:2], [1,2,3][2:0], list_slice([1,2,3], 0, 0)"` -> `[1, 2]`, `[]`,
+    // `[]`). Negatives use `saturating_add` to avoid overflow (guarding against huge
+    // negative indices from untrusted input).
     let norm = |v: i64| -> i64 {
-        if v == 0 {
-            1
-        } else if v < 0 {
+        if v < 0 {
             count.saturating_add(v).saturating_add(1)
         } else {
             v
@@ -757,8 +756,13 @@ pub(crate) fn array_elements(doc: &[u8]) -> Result<Option<Vec<Elem<'_>>>> {
 
 /// A JSON number token as an `i64`. With a decimal point or exponent, or out of range,
 /// gives `None` (the caller turns it into SQL NULL). The same judgment as
-/// `format::jsonl::parse_i64`, but placed on the `json` side specifically for UNNEST's native type recovery.
+/// `format::jsonl::parse_i64`.
 pub(crate) fn parse_i64(s: &[u8]) -> Option<i64> {
+    parse_i128(s)?.try_into().ok()
+}
+
+/// A JSON integer token (digits with an optional `-`) as an `i128`; `None` otherwise.
+pub(crate) fn parse_i128(s: &[u8]) -> Option<i128> {
     let (neg, ds) = match s.first() {
         Some(b'-') => (true, &s[1..]),
         _ => (false, s),
@@ -766,13 +770,13 @@ pub(crate) fn parse_i64(s: &[u8]) -> Option<i64> {
     if ds.is_empty() {
         return None;
     }
-    // Accumulate on the negative side. That avoids special-casing i64::MIN.
-    let mut acc: i64 = 0;
+    // Accumulate on the negative side. That avoids special-casing i128::MIN.
+    let mut acc: i128 = 0;
     for &c in ds {
         if !c.is_ascii_digit() {
             return None;
         }
-        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i64)?;
+        acc = acc.checked_mul(10)?.checked_sub((c - b'0') as i128)?;
     }
     if neg {
         Some(acc)
@@ -876,25 +880,48 @@ fn cmp_array(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering> {
     }
 }
 
-/// Steps past the `,` after an element; stays on the closing `]`.
+/// Member-wise comparison of two objects (DuckDB compares STRUCTs field by field, in order);
+/// `a` and `b` both start with `{`. The keys are not compared.
+fn cmp_object(a: &[u8], b: &[u8]) -> Result<core::cmp::Ordering> {
+    let (mut i, mut j) = (skip_ws(a, 1), skip_ws(b, 1));
+    loop {
+        let (ea, eb) = (byte_at(a, i)? == b'}', byte_at(b, j)? == b'}');
+        if ea || eb {
+            return Ok(eb.cmp(&ea));
+        }
+        let (vi, vj) = (skip_ws(a, skip_member_key(a, i)?), skip_ws(b, skip_member_key(b, j)?));
+        let (ie, je) = (skip_value(a, vi)?, skip_value(b, vj)?);
+        let o = cmp_element(&a[vi..ie], &b[vj..je])?;
+        if o.is_ne() {
+            return Ok(o);
+        }
+        i = next_element(a, ie)?;
+        j = next_element(b, je)?;
+    }
+}
+
+/// Steps past the `,` after an element or member; stays on the closing `]`/`}`.
 fn next_element(b: &[u8], i: usize) -> Result<usize> {
     let i = skip_ws(b, i);
     match byte_at(b, i)? {
         b',' => Ok(skip_ws(b, i + 1)),
-        b']' => Ok(i),
+        b']' | b'}' => Ok(i),
         _ => err!(SyntaxError, i),
     }
 }
 
-/// Compares two array elements (non-empty spans already validated by `skip_value`).
-fn cmp_element(x: &[u8], y: &[u8]) -> Result<core::cmp::Ordering> {
+/// Compares two list elements (non-empty spans already validated by `skip_value`) the way
+/// DuckDB orders the typed values they stand for. Also the equality `list_contains`/
+/// `list_position` use, so `2` finds `2.0`.
+pub(crate) fn cmp_element(x: &[u8], y: &[u8]) -> Result<core::cmp::Ordering> {
     use core::cmp::Ordering;
     Ok(match (kind_of(x[0]), kind_of(y[0])) {
         (Kind::Null, Kind::Null) => Ordering::Equal,
         (Kind::Null, _) => Ordering::Greater,
         (_, Kind::Null) => Ordering::Less,
         (Kind::Array, Kind::Array) => cmp_array(x, y)?,
-        (Kind::Num, Kind::Num) => match (parse_i64(x), parse_i64(y)) {
+        (Kind::Object, Kind::Object) => cmp_object(x, y)?,
+        (Kind::Num, Kind::Num) => match (parse_i128(x), parse_i128(y)) {
             (Some(p), Some(q)) => p.cmp(&q),
             _ => match (parse_f64(x), parse_f64(y)) {
                 (Some(p), Some(q)) => crate::exec::rowkey::ord_f64(p, q),

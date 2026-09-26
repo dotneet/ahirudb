@@ -217,6 +217,7 @@ const F_CHR: FuncId = 99;
 // to 200.
 const F_JSON_EXTRACT_IDX: FuncId = 100;
 const F_JSON_EXTRACT_STRING_IDX: FuncId = 101;
+const F_LIST_REVERSE_SORT: FuncId = 106;
 /// `list_extract` returning the element as text (see `Compiler::subscript`).
 pub(crate) const F_LIST_EXTRACT_TEXT: FuncId = 107;
 /// `m[k]` / `map_extract_value`: a MAP's value for a key, as JSON / as text.
@@ -664,7 +665,10 @@ pub fn resolve_const(
             ensure!(json_encodable(args[1]), TypeMismatch);
             Ok((F_LIST_POSITION, vec![Json, args[1]], BigInt))
         }
-        "list_sort" | "array_sort" => fixed(F_LIST_SORT, &[Json], n, 1, Json),
+        "list_sort" | "array_sort" => fixed(F_LIST_SORT, &[Json, Varchar, Varchar], n, 1, Json),
+        "list_reverse_sort" | "array_reverse_sort" => {
+            fixed(F_LIST_REVERSE_SORT, &[Json, Varchar], n, 1, Json)
+        }
         // Note `list_unique` is deliberately *not* an alias here: in DuckDB it returns the
         // *count* of distinct elements, not the deduplicated list.
         "list_distinct" | "array_distinct" => fixed(F_LIST_DISTINCT, &[Json], n, 1, Json),
