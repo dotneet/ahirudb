@@ -1,9 +1,8 @@
 //! Expression parsing: Pratt precedence climbing, prefix/primary/postfix,
 //! CAST, CASE, window function calls, lambdas, and literal parsing helpers.
 use super::types::{
-    comparison_binop, float_literal, int_literal, is_lambda_func, lookup_interval_unit,
-    lookup_type, parse_interval_text, parse_signed_int, temporal_literal_ty, unit_to_interval,
-    unquote,
+    comparison_binop, float_literal, int_literal, is_lambda_func, lookup_type, parse_interval_text,
+    parse_signed_int, temporal_literal_ty, unit_to_interval, unquote,
 };
 use super::*;
 use crate::expr::funcs;
@@ -933,12 +932,12 @@ impl<'a> Parser<'a> {
                 // is the `INTERVAL '3' DAY` form.
                 let t2 = lx.next_token()?.tok;
                 if let (Some(n), Tok::Ident(u)) = (parse_signed_int(&text), t2) {
-                    if let Some(unit) = lookup_interval_unit(u.as_bytes()) {
-                        let pos = self.pos;
+                    let pos = self.pos;
+                    if let Some(packed) = unit_to_interval(u, n, pos) {
+                        let packed = packed?;
                         self.bump()?; // INTERVAL
                         self.bump()?; // the string
                         self.bump()?; // the unit word
-                        let packed = unit_to_interval(unit, n, pos)?;
                         return Ok(self.arena.push(Expr::IntervalLiteral(packed)));
                     }
                 }
@@ -956,15 +955,15 @@ impl<'a> Parser<'a> {
                 let Tok::Ident(u) = t2 else {
                     return self.name_ref();
                 };
-                let Some(unit) = lookup_interval_unit(u.as_bytes()) else {
-                    return self.name_ref();
-                };
                 let pos = self.pos;
                 let Some(n) = parse_signed_int(text) else { err!(NumberOverflow, pos) };
+                let Some(packed) = unit_to_interval(u, n, pos) else {
+                    return self.name_ref();
+                };
+                let packed = packed?;
                 self.bump()?; // INTERVAL
                 self.bump()?; // the number
                 self.bump()?; // the unit word
-                let packed = unit_to_interval(unit, n, pos)?;
                 Ok(self.arena.push(Expr::IntervalLiteral(packed)))
             }
             _ => self.name_ref(),

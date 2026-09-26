@@ -1,5 +1,5 @@
 //! Strings (Bytes output)
-use super::datetime::{date_part, strftime};
+use super::datetime::{arg_civil, date_part, strftime};
 use super::json::{json_extract_or_whole, write_json_scalar};
 use super::*;
 
@@ -261,7 +261,7 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                     b"Friday",
                     b"Saturday",
                 ];
-                D[date_part(P_DOW, a.int(0)).unwrap_or(0).clamp(0, 6) as usize]
+                D[date_part(P_DOW, &arg_civil(a, 0)).unwrap_or(0).clamp(0, 6) as usize]
             } else {
                 const M: [&[u8]; 12] = [
                     b"January",
@@ -277,7 +277,7 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                     b"November",
                     b"December",
                 ];
-                M[date_part(P_MONTH, a.int(0)).unwrap_or(1).clamp(1, 12) as usize - 1]
+                M[date_part(P_MONTH, &arg_civil(a, 0)).unwrap_or(1).clamp(1, 12) as usize - 1]
             };
             out.extend_from_slice(name);
         }
@@ -359,7 +359,8 @@ pub(super) fn eval_str(id: FuncId, a: &A, out: &mut Vec<u8>) -> Result<bool> {
                 out.extend_from_slice(s);
             }
         }
-        F_STRFTIME => strftime(a.int(0), a.bytes(1), out),
+        F_STRFTIME => strftime(&arg_civil(a, 0), a.bytes(1), out),
+        F_STRFTIME_FMT => strftime(&arg_civil(a, 1), a.bytes(0), out),
         F_JSON_EXTRACT => {
             return match crate::json::extract(a.bytes(0), a.bytes(1))? {
                 Some((span, _)) => {

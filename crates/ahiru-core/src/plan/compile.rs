@@ -202,12 +202,47 @@ enum IntervalOp {
     IntervalMul {
         swap: bool,
     },
+    /// A call to one of `funcs`' temporal operator functions, with the operands cast to
+    /// `args` (after swapping them when `swap`, and negating the right one when `negate_b`).
+    Call {
+        func: funcs::FuncId,
+        swap: bool,
+        negate_b: bool,
+        args: (Ty, Ty),
+        res: Ty,
+    },
 }
 
 fn interval_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Option<IntervalOp> {
     use BinaryOp::*;
-    let temporal = |t: Ty| matches!(t, Ty::Date | Ty::Timestamp);
+    let temporal = |t: Ty| matches!(t, Ty::Date | Ty::Timestamp | Ty::Timestamptz);
+    let call = |func, swap, negate_b, args, res| {
+        Some(IntervalOp::Call { func, swap, negate_b, args, res })
+    };
+    let (iv, time) = (Ty::Interval, Ty::Time);
+    let fractional = |t: Ty| matches!(t, Ty::Float | Ty::Double | Ty::Decimal { .. });
     match (op, lt, rt) {
+        // `TIMESTAMP - TIMESTAMP` is an INTERVAL (DuckDB); a DATE on either side is widened,
+        // but `DATE - DATE` stays the day count `date_arith` returns.
+        (Sub, l, r) if temporal(l) && temporal(r) && (l, r) != (Ty::Date, Ty::Date) => {
+            let t = Ty::unify(l, r)?;
+            call(funcs::F_TS_SUB, false, false, (t, t), iv)
+        }
+        (Add, Ty::Time, Ty::Interval) => call(funcs::F_TIME_ADD_IV, false, false, (time, iv), time),
+        (Add, Ty::Interval, Ty::Time) => call(funcs::F_TIME_ADD_IV, true, false, (time, iv), time),
+        (Sub, Ty::Time, Ty::Interval) => call(funcs::F_TIME_ADD_IV, false, true, (time, iv), time),
+        (Add, Ty::Date, Ty::Time) | (Add, Ty::Time, Ty::Date) => {
+            call(funcs::F_DATE_ADD_TIME, lt == time, false, (Ty::Date, time), Ty::Timestamp)
+        }
+        (Mul, Ty::Interval, r) if fractional(r) => {
+            call(funcs::F_IV_MUL_F, false, false, (iv, Ty::Double), iv)
+        }
+        (Mul, l, Ty::Interval) if fractional(l) => {
+            call(funcs::F_IV_MUL_F, true, false, (iv, Ty::Double), iv)
+        }
+        (Div, Ty::Interval, r) if r.is_numeric() => {
+            call(funcs::F_IV_DIV_F, false, false, (iv, Ty::Double), iv)
+        }
         (Add, l, Ty::Interval) if temporal(l) => {
             Some(IntervalOp::TsInterval { swap: false, negate_b: false })
         }
@@ -616,8 +651,10 @@ impl<'a> Compiler<'a> {
             IntervalOp::TsInterval { swap, negate_b } => {
                 let (ts_r, ts_t, iv_r) = if swap { (rr, rt, lr) } else { (lr, lt, rr) };
                 // DATE is moved to TIMESTAMP first. DuckDB also returns TIMESTAMP for
-                // DATE +- INTERVAL (since an INTERVAL may carry time components).
-                let ts_r = self.coerce(ts_r, ts_t, Ty::Timestamp)?;
+                // DATE +- INTERVAL (since an INTERVAL may carry time components). A
+                // TIMESTAMPTZ stays one (the kernel keeps its operand's type).
+                let res = if ts_t == Ty::Timestamptz { ts_t } else { Ty::Timestamp };
+                let ts_r = self.coerce(ts_r, ts_t, res)?;
                 let iv_r = if negate_b {
                     self.emit(OpCode::IntervalNeg, Ty::Interval, iv_r, 0)
                 } else {
@@ -631,7 +668,20 @@ impl<'a> Compiler<'a> {
                     ts_r,
                     iv_r,
                 ));
-                Ok((dst, Ty::Timestamp))
+                Ok((dst, res))
+            }
+            IntervalOp::Call { func, swap, negate_b, args: (ta, tb), res } => {
+                let ((a, at), (b, bt)) =
+                    if swap { ((rr, rt), (lr, lt)) } else { ((lr, lt), (rr, rt)) };
+                let a = self.coerce(a, at, ta)?;
+                let mut b = self.coerce(b, bt, tb)?;
+                if negate_b {
+                    b = self.emit(OpCode::IntervalNeg, Ty::Interval, b, 0);
+                }
+                let aux = self.prog.add_call(func, vec![a, b], res);
+                let dst = self.prog.alloc_reg();
+                self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+                Ok((dst, res))
             }
             IntervalOp::IntervalInterval { negate_b } => {
                 let b =
@@ -1167,7 +1217,9 @@ impl<'a> Compiler<'a> {
             return Ok((dst, Ty::Boolean));
         }
 
-        ensure!(t.is_numeric() || t == Ty::Null, TypeMismatch);
+        // A BOOLEAN unifies with a number for comparisons, but `true + 1` is an error (DuckDB).
+        let boolean = lt == Ty::Boolean || rt == Ty::Boolean;
+        ensure!((t.is_numeric() || t == Ty::Null) && !boolean, TypeMismatch);
         let code = match op {
             BinaryOp::Add => OpCode::Add,
             BinaryOp::Sub => OpCode::Sub,

@@ -1503,8 +1503,16 @@ fn resolve_coerces_argument_types() {
     assert_eq!(resolve("sign", &[dec]).unwrap().2, Ty::BigInt);
     assert_eq!(resolve("sign", &[Ty::HugeInt]).unwrap().2, Ty::BigInt);
     assert_eq!(resolve("length", &[Ty::Varchar]).unwrap().2, Ty::BigInt);
-    // Date-time functions settle on TIMESTAMP (DATE columns and VARCHARs both arrive via a Cast).
-    assert_eq!(resolve("year", &[Ty::Date]).unwrap().1, vec![Ty::Timestamp]);
+    // Date-time functions settle on TIMESTAMP (a VARCHAR arrives via a Cast), but a DATE stays
+    // a day count so dates past TIMESTAMP's range still work.
+    assert_eq!(resolve("year", &[Ty::Varchar]).unwrap().1, vec![Ty::Timestamp]);
+    assert_eq!(resolve("year", &[Ty::Date]).unwrap().1, vec![Ty::Date]);
+    assert_eq!(resolve("hour", &[Ty::Time]).unwrap().1, vec![Ty::Time]);
+    assert!(resolve("year", &[Ty::Time]).is_err());
+    assert!(resolve("dayofweek", &[Ty::Interval]).is_err());
+    assert_eq!(resolve("date_trunc", &[Ty::Varchar, Ty::Timestamptz]).unwrap().2, Ty::Timestamptz);
+    // `nullif` keeps its first argument's type (DuckDB).
+    assert_eq!(resolve("nullif", &[Ty::Date, Ty::Timestamp]).unwrap().2, Ty::Date);
     assert_eq!(
         resolve("date_trunc", &[Ty::Varchar, Ty::Date]).unwrap().1,
         vec![Ty::Varchar, Ty::Timestamp]

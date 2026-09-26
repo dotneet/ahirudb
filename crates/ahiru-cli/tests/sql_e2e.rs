@@ -860,6 +860,40 @@ e2e!(
     ["UNPIVOT t ON big INTO NAME n VALUE v ORDER BY v NULLS FIRST LIMIT 3"]
 );
 
+// Date/time/interval operators, parts and text forms. TIMESTAMPTZ is left out: DuckDB renders
+// it in the machine's session time zone, which this engine does not have.
+e2e!(
+    datetime_and_interval_semantics,
+    "tests/data/basic.parquet",
+    [
+        "SELECT TIMESTAMP '2024-01-01' - TIMESTAMP '2024-03-02 10:00:00', \
+         DATE '2024-01-02' - TIMESTAMP '2024-01-01 01:00' FROM t LIMIT 1",
+        "SELECT CAST(TIMESTAMP '1960-01-01 10:20:30.5' AS TIME), hour(TIME '10:20:30'), \
+         millisecond(TIME '10:20:30.5'), date_part('epoch', TIME '10:20:30') FROM t LIMIT 1",
+        "SELECT TIME '23:00' + INTERVAL 2 HOUR, TIME '01:00' - INTERVAL '1 day 2 hours', \
+         DATE '2024-01-01' + TIME '10:00' FROM t LIMIT 1",
+        "SELECT year(INTERVAL '30 months'), date_part('quarter', INTERVAL '-7 months'), \
+         date_part('hour', INTERVAL '1 day 25 hours'), date_part('epoch', INTERVAL '13 months') \
+         FROM t LIMIT 1",
+        "SELECT INTERVAL '1 month 1 day 1 hour' / 7, INTERVAL '1 month' * 1.3, \
+         INTERVAL '1 day' / 0 FROM t LIMIT 1",
+        "SELECT date_diff('dow', DATE '2024-01-01', DATE '2024-01-10'), \
+         date_trunc('epoch', TIMESTAMP '2024-01-03 10:00:01.5') FROM t LIMIT 1",
+        "SELECT year(DATE '300000-01-01'), dayname(DATE '300000-01-01'), \
+         last_day(DATE '300000-02-01'), date_diff('hour', DATE '300000-01-01', DATE '300001-01-01') \
+         FROM t LIMIT 1",
+        "SELECT strftime('%Y-%m-%d', DATE '2024-01-05'), strftime(TIMESTAMP '-0044-01-05', '%Y') \
+         FROM t LIMIT 1",
+        "SELECT TRY_CAST('2024/1/5' AS DATE), TRY_CAST('2024 01 05 10:00' AS TIMESTAMP), \
+         TRY_CAST('2024/01-05' AS DATE) FROM t LIMIT 1",
+        "SELECT CAST('1.25 months' AS INTERVAL), CAST('1h' AS INTERVAL), \
+         CAST('1 day 2 hours ago' AS INTERVAL), CAST('1.5 quarters' AS INTERVAL) FROM t LIMIT 1",
+        "SELECT INTERVAL '2 months -45 days' < INTERVAL '16 days', \
+         INTERVAL '-1 day 1 hour' = INTERVAL '-23 hours' FROM t LIMIT 1",
+        "SELECT true = 1, true IN (1, 2), coalesce(NULL::BOOLEAN, 0) FROM t LIMIT 1",
+    ]
+);
+
 #[test]
 fn table_name_replacement_respects_word_boundaries() {
     // Rewriting the t inside `t2` or `text` would break the SQL being compared.
