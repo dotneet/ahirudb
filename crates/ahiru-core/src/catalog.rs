@@ -325,10 +325,12 @@ fn unify_hive_key_types(parts: &mut [TablePart]) {
             .hive_keys()
             .iter()
             .map(|(name, raw)| {
-                acc.iter()
+                let ty = acc
+                    .iter()
                     .find(|(n, _)| eq_ascii_ci(n.as_bytes(), name.as_bytes()))
                     .map(|(_, t)| *t)
-                    .unwrap_or_else(|| format::partitioned::hive_value_ty(raw))
+                    .unwrap_or_else(|| format::partitioned::hive_value_ty(raw));
+                format::partitioned::settle_hive_ty(ty)
             })
             .collect();
         part.format.set_hive_types(&types);

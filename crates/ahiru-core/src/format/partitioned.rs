@@ -35,7 +35,7 @@ pub struct PartitionedFormat {
 
 impl PartitionedFormat {
     pub fn new(inner: Box<dyn TableFormat>, keys: Vec<(String, String)>) -> Self {
-        let types = keys.iter().map(|(_, v)| hive_value_ty(v)).collect();
+        let types = keys.iter().map(|(_, v)| settle_hive_ty(hive_value_ty(v))).collect();
         PartitionedFormat { inner, keys, types, schema: Vec::new(), visible: Vec::new() }
     }
 
@@ -43,8 +43,8 @@ impl PartitionedFormat {
     /// Returns empty when nothing is found (= not Hive partitioned).
     ///
     /// A URL's query string and fragment are dropped beforehand, as in `FormatKind::detect`.
-    /// A segment with an empty `key` or `value` is ignored (so a merely decorative directory name
-    /// containing an `=` is not misdetected).
+    /// A segment with an empty `key` is ignored. An empty value (`k=`) is kept as the empty
+    /// string, as DuckDB reads it.
     pub fn parse_hive_path(path: &str) -> Vec<(String, String)> {
         let path = crate::format::strip_url_query(path);
         let segs: Vec<&str> = path.split('/').collect();
@@ -56,7 +56,7 @@ impl PartitionedFormat {
         for seg in &segs[..segs.len() - 1] {
             let Some(eq) = seg.find('=') else { continue };
             let (k, v) = (&seg[..eq], &seg[eq + 1..]);
-            if k.is_empty() || v.is_empty() {
+            if k.is_empty() {
                 continue;
             }
             out.push((k.to_string(), percent_decode(v)));
@@ -120,8 +120,9 @@ impl PartitionedFormat {
                     });
                 }
             } else {
+                // A NULL partition value satisfies no comparison, so any pruner rules it out.
                 let v = self.value_of(col - inner_n);
-                if !range_may_match(p, &v, &v) {
+                if v == Value::Null || !range_may_match(p, &v, &v) {
                     return (inner_proj, inner_pruners, true);
                 }
             }
@@ -178,7 +179,14 @@ fn hex_val(b: u8) -> Option<u8> {
 /// across every part of the table before anything is read, so a key that is `k=1` under one
 /// directory and `k=x` under another comes out VARCHAR everywhere rather than making the table
 /// unreadable.
+///
+/// `NULL` (any case -- what DuckDB's `PARTITION_BY` writes for a NULL key) is the SQL NULL and
+/// types as `Ty::Null`, which carries no evidence: it unifies with whatever the other partitions
+/// say, and `settle_hive_ty` turns a key that is NULL everywhere into VARCHAR.
 pub(crate) fn hive_value_ty(s: &str) -> Ty {
+    if is_hive_null(s) {
+        return Ty::Null;
+    }
     let digits_only = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let zero_padded = s.len() > 1 && s.starts_with('0');
     if digits_only && !zero_padded {
@@ -189,9 +197,26 @@ pub(crate) fn hive_value_ty(s: &str) -> Ty {
     Ty::Varchar
 }
 
+fn is_hive_null(s: &str) -> bool {
+    s.eq_ignore_ascii_case("null")
+}
+
+/// The column type for a key whose values' readings unified to `ty`: a key with no value but
+/// `NULL` still needs a concrete type, and DuckDB gives it VARCHAR.
+pub(crate) fn settle_hive_ty(ty: Ty) -> Ty {
+    if ty == Ty::Null {
+        Ty::Varchar
+    } else {
+        ty
+    }
+}
+
 /// Builds the constant for a partition value under an already-settled column type.
 /// A value that does not fit the type falls back to its text, which cannot lose information.
 fn typed_value(s: &str, ty: Ty) -> Value {
+    if is_hive_null(s) {
+        return Value::Null;
+    }
     match ty {
         Ty::Int => match s.parse::<i32>() {
             Ok(v) => Value::I32(v),
@@ -221,7 +246,7 @@ impl TableFormat for PartitionedFormat {
             let mut schema = self.inner.schema().to_vec();
             let inner_n = schema.len();
             let mut visible = Vec::with_capacity(self.keys.len());
-            for (i, (name, _)) in self.keys.iter().enumerate() {
+            for (i, (name, raw)) in self.keys.iter().enumerate() {
                 let same =
                     |f: &Field| crate::rt::hash::eq_ascii_ci(f.name.as_bytes(), name.as_bytes());
                 // A partition key that also names a real column of the file is dropped:
@@ -237,7 +262,7 @@ impl TableFormat for PartitionedFormat {
                 // before.
                 ensure!(!schema[inner_n..].iter().any(same), DuplicateColumn);
                 let ty = self.types.get(i).copied().unwrap_or(Ty::Varchar);
-                schema.push(Field::new(name.clone(), ty, false));
+                schema.push(Field::new(name.clone(), ty, is_hive_null(raw)));
                 visible.push(i);
             }
             self.schema = schema;
@@ -401,6 +426,15 @@ mod tests {
         assert_eq!(hive_value_ty("true"), Ty::Varchar);
         assert_eq!(hive_value_ty("-1"), Ty::Varchar);
         assert_eq!(hive_value_ty(""), Ty::Varchar);
+        assert_eq!(hive_value_ty("NULL"), Ty::Null);
+        assert_eq!(hive_value_ty("null"), Ty::Null);
+    }
+
+    #[test]
+    fn an_empty_partition_value_is_kept() {
+        // DuckDB reads `k=` as the empty string rather than ignoring the segment.
+        let cols = PartitionedFormat::parse_hive_path("data/k=/=x/part.parquet");
+        assert_eq!(cols, vec![("k".to_string(), String::new())]);
     }
 
     #[test]

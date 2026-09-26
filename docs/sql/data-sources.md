@@ -249,7 +249,7 @@ on top of whatever the file itself contains:
 --   tests/data/hive/year=2024/month=02/part.parquet
 --   tests/data/hive/year=2025/month=01/part.parquet
 SELECT count(*) FROM t;                                  -- all partitions, 1000 rows
-SELECT count(*) FROM t WHERE year = 2024 AND month = 1;   -- 300 rows, one partition pruned in
+SELECT count(*) FROM t WHERE year = 2024 AND month = '01'; -- 300 rows, one partition pruned in
 ```
 
 Partition columns come from the file *path*, so they appear however the
@@ -262,8 +262,17 @@ partition: `k=1`/`k=2` gives an `INTEGER` virtual column, and `k=1`/`k=abc`
 gives `VARCHAR`, because the partitions disagree and the union has to
 widen. A zero-padded value stays `VARCHAR` (`k=007`/`k=42` is a `VARCHAR`
 column holding `007` and `42`), the same rule the CSV sniffer uses — so
-`007` keeps its padding rather than being flattened to `7`. Typing the key
-once means a predicate on it compares the same way in every partition.
+`007` keeps its padding rather than being flattened to `7` (which is why the
+example above compares `month` with the string `'01'`). Typing the key once
+means a predicate on it compares the same way in every partition.
+
+A value of `NULL` (any case — what DuckDB's `PARTITION_BY` writes for a
+NULL key) is SQL `NULL`, and an empty value (`k=`) is the empty string, as
+in DuckDB. A `NULL` partition says nothing about the key's type, so
+`k=1`/`k=NULL` stays an `INTEGER` column (DuckDB 1.4.4 widens it to
+`VARCHAR`; the values are the same); a key that is `NULL` everywhere is
+`VARCHAR`. `__HIVE_DEFAULT_PARTITION__` is an ordinary string, as it is in
+DuckDB.
 
 If a partition key **also names a real column inside the file**, the file's
 column wins and no virtual column is synthesized for that part — Hive and
