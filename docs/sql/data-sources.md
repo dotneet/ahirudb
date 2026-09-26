@@ -200,7 +200,13 @@ SELECT sum(json) AS total FROM t;   -- against a file containing [1, 2, 3]
 - A `.json` file holding one value per line — which is what
   `COPY ... TO 'x.json'` writes, as DuckDB does — is detected and read as
   JSONL, split by split. A single document (a top-level array or object) is
-  read as before.
+  read as before. Several objects one after another that are *not* one per
+  line — the pretty-printed stream `jq` writes, or `{...} {...}` on one line
+  — are one row each too, as in DuckDB (read as one document, not split by
+  split).
+- An empty (0-byte) CSV/TSV, JSONL or JSON file is an empty table, and in a
+  multi-file table an empty file is simply skipped, as DuckDB does, rather
+  than failing the whole table for having no columns.
 - Nesting depth is not limited: a deeply nested value reads (as `JSON` or
   raw-JSON text), and skipping one in a column the query doesn't select
   costs nothing but the scan.

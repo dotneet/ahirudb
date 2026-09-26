@@ -256,9 +256,16 @@ impl Table {
 /// CSV part, a column whose every cell was empty) is not a disagreement to widen but an absence of
 /// opinion: the other parts' type simply wins. Without that, one placeholder or header-only file in
 /// a glob turned an integer column into VARCHAR for the whole table -- DuckDB keeps the `BIGINT`.
+///
+/// An **empty** part (a 0-byte text file: no columns of its own and nothing to read) takes no part
+/// at all, as in DuckDB, which unions the other files. `exec::Scan` already skips a part with no
+/// splits, so it is never asked for a column it does not have.
 fn unify_schema(parts: &[TablePart]) -> Result<Vec<Field>> {
-    let mut iter = parts.iter();
-    let first = match iter.next() {
+    let void = |p: &&TablePart| {
+        p.format.num_splits() == 0 && p.format.schema().len() == p.format.hive_keys().len()
+    };
+    let mut iter = parts.iter().filter(|p| !void(p));
+    let first = match iter.next().or(parts.first()) {
         Some(p) => p,
         None => return Ok(Vec::new()),
     };

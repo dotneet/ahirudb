@@ -553,3 +553,36 @@ fn ndjson_lines_that_are_not_objects_read_as_a_raw_json_column() {
     let rows = run_all("SELECT json FROM t", &mut sess);
     assert_eq!(rows, vec![vec![s("1")], vec![s("[1,2]")], vec![s("\"s\"")]]);
 }
+
+#[test]
+fn an_empty_file_is_an_empty_table_and_an_empty_part_is_skipped() {
+    // A 0-byte `.json` used to fail with E100; DuckDB reads zero rows. And one empty file in a
+    // glob made the parts disagree on the column set, failing the whole table; DuckDB unions
+    // the rest.
+    let cases: [(FormatKind, &[u8]); 3] = [
+        (FormatKind::Csv, b"a,b\n1,2\n"),
+        (FormatKind::Jsonl, b"{\"a\":1,\"b\":2}\n"),
+        (FormatKind::Json, b"[{\"a\":1,\"b\":2}]"),
+    ];
+    for (kind, data) in cases {
+        let mut sess = Session::new();
+        sess.register_bytes_as("e", Vec::new(), kind).unwrap();
+        assert_eq!(run_all("SELECT count(*) FROM e", &mut sess), [[Value::I64(0)]], "{kind:?}");
+        for files in [vec![Vec::new(), data.to_vec()], vec![data.to_vec(), Vec::new()]] {
+            let parts = files.into_iter().enumerate().map(|(i, d)| (format!("p{i}"), d)).collect();
+            sess.register_multi_bytes("t", parts, kind).unwrap();
+            let rows = run_all("SELECT a, b FROM t", &mut sess);
+            assert_eq!(rows, [[Value::I64(1), Value::I64(2)]], "{kind:?}");
+        }
+    }
+}
+
+#[test]
+fn concatenated_pretty_printed_json_objects_are_rows() {
+    // What `jq` writes: several multi-line objects one after another. DuckDB reads one row each.
+    let mut sess = Session::new();
+    let text = b"{\n  \"a\": 1,\n  \"b\": \"x\"\n}\n{\n  \"a\": 2,\n  \"b\": \"y\"\n}\n";
+    sess.register_bytes_as("t", text.to_vec(), FormatKind::Json).unwrap();
+    let rows = run_all("SELECT a, b FROM t ORDER BY a", &mut sess);
+    assert_eq!(rows, [[Value::I64(1), s("x")], [Value::I64(2), s("y")]]);
+}

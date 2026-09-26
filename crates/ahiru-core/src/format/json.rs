@@ -20,9 +20,10 @@
 //!   whose objects carry **no keys at all** (`[{}, {}]`) takes the same shape, with each object
 //!   itself as that column's value: a table with no columns cannot report a row count, so
 //!   `count(*)` used to read 0 and `SELECT *` used to be a syntax error.
-//! - An empty file (0 bytes) has no top-level value and gives `UnexpectedEof`. Unlike JSONL's
-//!   "an empty file is an empty table", this premises reading one JSON document, so empty is a
-//!   syntax violation to begin with.
+//! - Several top-level values in a row (`{...} {...}`, or the pretty-printed objects `jq`
+//!   writes, each spanning several lines) are one row each, as in DuckDB.
+//! - An empty (or whitespace-only) file is an empty table, as it is for JSONL and in DuckDB --
+//!   it is handed to the JSONL reader, so it contributes no columns to a multi-file table.
 //!
 //! ## A non-streaming design (a v1 limitation)
 //!
@@ -157,16 +158,16 @@ impl JsonFormat {
 }
 
 /// Whether `b` (a prefix of the file, or all of it) starts like newline-delimited JSON: its first
-/// top-level value is complete and followed, after a line break, by more content.
+/// top-level value is complete, on one line, and followed, after a line break, by more content.
 ///
 /// A single document never has anything but whitespace after its top-level value, so this cannot
-/// misfire on one. A first value that does not end within `b` gives `false`; `resolve` asks again
-/// once the whole file is in hand.
+/// misfire on one; nor on pretty-printed values, which span lines. A first value that does not
+/// end within `b` gives `false`; `resolve` asks again once the whole file is in hand.
 fn looks_like_ndjson(b: &[u8]) -> bool {
     let i = skip_ws(b, skip_bom(b));
     let Ok(end) = skip_value(b, i) else { return false };
     let next = skip_ws(b, end);
-    next < b.len() && b[end..next].contains(&b'\n')
+    next < b.len() && b[end..next].contains(&b'\n') && !b[i..end].contains(&b'\n')
 }
 
 impl Default for JsonFormat {
@@ -183,9 +184,9 @@ impl TableFormat for JsonFormat {
         if self.resolved {
             return Ok(Ok(()));
         }
-        // An empty file has no top-level value and so is invalid as JSON to begin with
-        // (unlike JSONL, this premises reading "one JSON document").
-        ensure!(src.total_len > 0, UnexpectedEof);
+        if src.total_len == 0 {
+            return self.resolve_as_ndjson(src);
+        }
         // A leading sample first, to tell a newline-delimited file (read by `format::jsonl`,
         // split by split) from a single document (which needs the whole file) before committing
         // to fetching all of it.
@@ -194,7 +195,8 @@ impl TableFormat for JsonFormat {
             Some(b) => b,
             None => return Ok(Err((0, n))),
         };
-        if looks_like_ndjson(head) {
+        let blank = n == src.total_len && skip_ws(head, skip_bom(head)) == head.len();
+        if blank || looks_like_ndjson(head) {
             return self.resolve_as_ndjson(src);
         }
         ensure!(src.total_len <= MAX_JSON_BYTES, Oom);
@@ -290,27 +292,10 @@ impl TableFormat for JsonFormat {
         let mut key = Vec::new();
         let mut val = Vec::new();
 
-        let i0 = skip_ws(buf, skip_bom(buf));
-        if byte_at(buf, i0)? == b'[' {
-            let mut it = Elements::new(buf, i0)?;
-            while let Some((s, e)) = it.next()? {
-                process_row(
-                    &buf[s..e],
-                    &names,
-                    self.raw_json,
-                    &mut slots,
-                    &mut builders,
-                    &mut key,
-                    &mut val,
-                )?;
-            }
-            // Only whitespace may remain after the array's closing bracket.
-            ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
-        } else {
-            let end = skip_value(buf, i0)?;
-            ensure!(skip_ws(buf, end) == buf.len(), SyntaxError, end);
+        let mut it = Elements::new(buf, skip_ws(buf, skip_bom(buf)))?;
+        while let Some((s, e)) = it.next()? {
             process_row(
-                &buf[i0..end],
+                &buf[s..e],
                 &names,
                 self.raw_json,
                 &mut slots,
@@ -319,6 +304,8 @@ impl TableFormat for JsonFormat {
                 &mut val,
             )?;
         }
+        // Only whitespace may remain after the array's closing bracket.
+        ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
 
         Ok(builders.into_iter().map(|b| b.finish()).collect())
     }
@@ -347,38 +334,28 @@ type Resolved = (Vec<String>, Vec<Field>, u64, bool, Vec<bool>);
 /// check anyway, so there is no extra cost). Only the widen computation is limited to the sample.
 fn parse_schema(buf: &[u8]) -> Result<Resolved> {
     let i = skip_ws(buf, skip_bom(buf));
-    let c = byte_at(buf, i)?;
 
     let mut names: Vec<String> = Vec::new();
     let mut infs: Vec<Inf> = Vec::new();
     let mut key = Vec::new();
     let mut row_count: u64 = 0;
 
-    if c == b'[' {
-        // The number of columns the sample settled on. `None` while still inside the
-        // sample. Past it, those columns' types are frozen, but *every* element still
-        // contributes its keys: the whole document is resident and already walked for
-        // the syntax check, and a key that first appears past the sample would
-        // otherwise vanish from the schema entirely -- an entire column of data
-        // dropped without a word, which `docs/DESIGN.md` §15 rules out.
-        let mut frozen: Option<usize> = None;
-        let mut it = Elements::new(buf, i)?;
-        while let Some((s, e)) = it.next()? {
-            row_count += 1;
-            if frozen.is_none() && row_count as usize > SAMPLE_ELEMENTS {
-                frozen = Some(names.len());
-            }
-            accumulate_row(&buf[s..e], &mut names, &mut infs, &mut key, frozen.unwrap_or(0))?;
+    // The number of columns the sample settled on. `None` while still inside the
+    // sample. Past it, those columns' types are frozen, but *every* element still
+    // contributes its keys: the whole document is resident and already walked for
+    // the syntax check, and a key that first appears past the sample would
+    // otherwise vanish from the schema entirely -- an entire column of data
+    // dropped without a word, which `docs/DESIGN.md` §15 rules out.
+    let mut frozen: Option<usize> = None;
+    let mut it = Elements::new(buf, i)?;
+    while let Some((s, e)) = it.next()? {
+        row_count += 1;
+        if frozen.is_none() && row_count as usize > SAMPLE_ELEMENTS {
+            frozen = Some(names.len());
         }
-        ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
-    } else {
-        // The top level is not an array: a single object, or a bare scalar.
-        // Both are treated as "one row" (see the module docs).
-        let end = skip_value(buf, i)?;
-        ensure!(skip_ws(buf, end) == buf.len(), SyntaxError, end);
-        row_count = 1;
-        accumulate_row(&buf[i..end], &mut names, &mut infs, &mut key, 0)?;
+        accumulate_row(&buf[s..e], &mut names, &mut infs, &mut key, frozen.unwrap_or(0))?;
     }
+    ensure!(skip_ws(buf, it.i) == buf.len(), SyntaxError, it.i);
 
     // No column came out of the document at all: an empty array, or elements that are all `{}`.
     // Matching duckdb's one JSON-typed column named `"json"` is both easier to handle than a
@@ -804,21 +781,26 @@ impl<'a> Members<'a> {
     }
 }
 
-/// Returns a top-level array's elements in order. Each element's `(start, end)` byte positions
-/// (the value's own span, excluding surrounding whitespace and commas).
+/// Returns the rows of a document in order: a top-level array's elements, or else each of the
+/// whitespace-separated top-level values (one object, or several concatenated ones). Each row's
+/// `(start, end)` byte positions (the value's own span, excluding surrounding whitespace and commas).
 struct Elements<'a> {
     b: &'a [u8],
-    /// The next position to read. After the iteration ends it points just past the `]`.
+    /// The next position to read. After the iteration ends it points just past the `]` (or at the
+    /// end of the input for concatenated values).
     i: usize,
     started: bool,
     done: bool,
+    /// Concatenated top-level values rather than an array.
+    concat: bool,
 }
 
 impl<'a> Elements<'a> {
-    /// `at` is the position of the `[`.
+    /// `at` is the position of the first top-level value (the `[` of an array).
     fn new(b: &'a [u8], at: usize) -> Result<Self> {
-        ensure!(byte_at(b, at)? == b'[', SyntaxError, at);
-        Ok(Elements { b, i: at + 1, started: false, done: false })
+        let concat = byte_at(b, at)? != b'[';
+        let i = if concat { at } else { at + 1 };
+        Ok(Elements { b, i, started: false, done: false, concat })
     }
 
     fn next(&mut self) -> Result<Option<(usize, usize)>> {
@@ -827,6 +809,15 @@ impl<'a> Elements<'a> {
         }
         let b = self.b;
         let mut i = skip_ws(b, self.i);
+        if self.concat {
+            if i >= b.len() {
+                self.done = true;
+                self.i = i;
+                return Ok(None);
+            }
+            self.i = skip_value(b, i)?;
+            return Ok(Some((i, self.i)));
+        }
         let mut c = byte_at(b, i)?;
         if c == b']' {
             self.done = true;
@@ -1476,10 +1467,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_is_rejected() {
-        let src = Source::from_bytes(Vec::new());
-        let mut f = JsonFormat::new();
-        assert_eq!(code_of(f.resolve(&src)), Some(Code::UnexpectedEof));
+    fn an_empty_file_is_an_empty_table() {
+        // DuckDB reads an empty (or whitespace-only) `.json` file as zero rows.
+        for text in ["", " \n\n"] {
+            let (_, got) = read_every_split(text);
+            assert!(got.iter().all(|c| c.is_empty()), "{text:?}");
+        }
     }
 
     #[test]
@@ -1598,12 +1591,22 @@ mod tests {
         let (_, got) = read_every_split(&text);
         assert_eq!(got[0], vec![s(&long), s("y")]);
 
-        // A single document is unaffected, including one followed by trailing newlines, and two
-        // values on one line are still a syntax error rather than silently NDJSON.
+        // A single document is unaffected, including one followed by trailing newlines.
         let (names, got) = read_every_split("[{\"a\":1},\n{\"a\":2}]\n\n");
         assert_eq!(names, ["a"]);
         assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)]);
-        assert_eq!(resolve_err("{\"a\":1} {\"a\":2}"), Some(Code::SyntaxError));
+    }
+
+    #[test]
+    fn concatenated_top_level_values_are_one_row_each() {
+        // Two values on one line, and the pretty-printed objects `jq` writes (a newline inside
+        // the first value, so not NDJSON). DuckDB reads both as two rows.
+        for text in ["{\"a\":1} {\"a\":2}", "{\n  \"a\": 1\n}\n{\n  \"a\": 2\n}\n"] {
+            let (names, got) = read_every_split(text);
+            assert_eq!(names, ["a"], "{text}");
+            assert_eq!(got[0], vec![Value::I64(1), Value::I64(2)], "{text}");
+        }
+        assert_eq!(resolve_err("{\"a\":1} x"), Some(Code::SyntaxError));
     }
 
     #[test]
