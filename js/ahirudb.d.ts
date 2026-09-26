@@ -40,7 +40,12 @@ export type AhiruValue = boolean | number | bigint | string | Uint8Array | Ahiru
 
 export type Row = Record<string, AhiruValue>;
 
-/** A parameter that can be passed to a query. Pass TIMESTAMP as BigInt microseconds. */
+/**
+ * A parameter that can be passed to a query. A bigint binds as BIGINT, so compare
+ * a TIMESTAMP against `make_timestamp(?)` (microseconds) or bind an ISO string
+ * and write `?::TIMESTAMP`. Passing more values than the statement has
+ * placeholders is an error (E406), like passing fewer.
+ */
 export type AhiruParam =
   | null
   | undefined
@@ -159,24 +164,42 @@ export interface InitOptions {
   /** The fetch used by URL sources. Defaults to globalThis.fetch. */
   fetch?: typeof globalThis.fetch;
   /**
-   * Optional gate for HTTP(S) URLs discovered in SQL file-function calls such as
-   * `parquet('https://...')`. It receives `(url, { functionName, sql })` and may
-   * return a boolean or Promise<boolean>. `false` disables SQL URL auto-registration.
-   * Explicit `register(name, url)` calls are unaffected.
+   * Optional gate for every path a SQL statement names in a string literal that is
+   * not a registered table (`FROM 'x.parquet'`, `parquet('https://...')`,
+   * `read_csv('...')`) -- whatever its scheme, relative or protocol-relative
+   * included. It receives `(url, { functionName, sql })`, where `url` is the path
+   * resolved the way `fetch()` would resolve it (against `document.baseURI` /
+   * `location.href` when present, verbatim otherwise) and `functionName` is the
+   * reader family (`'parquet'`, `'read_csv'` or `'read_json'`; a bare `FROM 'x.csv'`
+   * reports the family its extension implies). It may return a boolean or
+   * Promise<boolean> and is consulted before anything is registered or fetched.
+   * `false` disables SQL path auto-registration. Explicit `register(name, url)`
+   * calls are unaffected.
    */
   sqlUrlPolicy?:
     | false
     | ((url: string, context: { functionName: string; sql: string }) => boolean | Promise<boolean>);
+  /**
+   * Receives the output of `COPY ... TO 'path'` (wasm cores built with `export`).
+   * The engine never writes files itself; it hands the encoded bytes and the
+   * target path here, and `query()` resolves to `[]` once this returns. Without
+   * it, `COPY ... TO` fails with E409 rather than silently doing nothing.
+   */
+  onCopy?: (path: string, bytes: Uint8Array) => void | Promise<void>;
 }
 
 export declare class AhiruDB {
   static init(options?: InitOptions): Promise<AhiruDB>;
 
   /**
-   * Registers a table. No I/O happens (it is deferred until the first query).
+   * Registers a table. No I/O happens (it is deferred until the first query that reads it).
    *
    * If `format` is given it is used (`ahiru_register_as`) and the name needs no extension.
    * Otherwise the engine infers it from the extension of the registered name.
+   * The name is an SQL identifier: it replaces an earlier registration whose name
+   * differs only in ASCII case. Registration errors (a name `CREATE TABLE` already
+   * took, a format the wasm build lacks) are thrown here, or by the next query when
+   * the call is made while a query is running.
    */
   register(name: string, source: TableSource, options?: { format?: FormatName }): this;
 
@@ -202,7 +225,15 @@ export declare class AhiruError extends Error {
   readonly reason: string;
   readonly sql?: string;
   readonly detail?: string;
-  constructor(code: number, options?: { sql?: string; detail?: string; cause?: unknown });
+  /**
+   * Where the engine located the error, when it knows: for SQL errors (3xx) a
+   * byte offset into the UTF-8 encoding of `sql`; for data errors, a file offset.
+   */
+  readonly position?: number;
+  constructor(
+    code: number,
+    options?: { sql?: string; detail?: string; cause?: unknown; position?: number },
+  );
 }
 
 export declare const Code: Readonly<Record<string, number>>;
@@ -250,7 +281,16 @@ export declare function unpackInterval(packed: bigint | number): AhiruInterval;
  */
 export declare function decodeIoRequests(
   bytes: Uint8Array,
-): { table: number; part: number; offset: number; len: number }[];
+): (
+  | { table: number; part: number; offset: number; len: number }
+  /** A size request for a table declared before its length was known. */
+  | { table: number; part: number; size: true }
+)[];
+/**
+ * Decodes the `START_NEED_TABLES` list: string-literal paths a statement named that
+ * no table is registered under, with the `format_kind` code the SQL asked for.
+ */
+export declare function decodeMissingTables(bytes: Uint8Array): { format: number; path: string }[];
 export declare function decodeCodecRequests(
   bytes: Uint8Array,
 ): { table: number; part: number; codec: number; offset: number; len: number; outLen: number }[];

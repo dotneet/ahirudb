@@ -44,6 +44,16 @@ A string literal anywhere else stays a string. This is what keeps an
 ordinary `'/'` or `'.'` in a comparison or a `split_part` call from walking
 the filesystem.
 
+A path in table position is **case-sensitive**, whatever the file system:
+`FROM 'Data.csv'` and `FROM 'data.csv'` (or two URLs that differ in case) are
+two tables, each read from the file its own spelling names. A table
+*identifier* is not: `FROM trips`, `FROM TRIPS` and `FROM "Trips"` all find a
+table registered as `trips` (only ASCII letters fold, as in DuckDB).
+
+The JS host auto-registers the same forms (`FROM 'https://…'`,
+`parquet('…')`, `read_csv('…')`, ...) on first use; its `sqlUrlPolicy` option
+sees each such path before anything is fetched (see `js/README.md`).
+
 Paths in table position are glob patterns. A backslash escapes a glob
 metacharacter, so the literal file `star*.csv` is nameable:
 

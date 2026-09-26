@@ -16,7 +16,7 @@
 
 use crate::error::Code;
 use crate::exec::{build, ExecContext, Step};
-use crate::plan::bind::{bind_query_at, referenced_in_query};
+use crate::plan::bind::bind_query_at;
 use crate::plan::compile::{cast_program, compile};
 use crate::plan::Scope;
 use crate::prelude::*;
@@ -287,7 +287,10 @@ pub(crate) fn drop_view(session: &mut Session, name: &str, if_exists: bool) -> R
 ///
 /// **Not resumable across the host boundary**: this runs to completion inside
 /// `Session::prepare`, so a `NEED_IO` (bytes that were never fetched) gives
-/// `IoFailed`. A `NEED_CODEC` is different — the compressed bytes are already
+/// `IoFailed`. The reads it was waiting on are stashed on the session first,
+/// and `Session::prepare` hands them to the host as `Prepared::NeedIo`, so a
+/// host that answers them and prepares again gets further each time (the
+/// statement restarts from scratch). A `NEED_CODEC` is different — the compressed bytes are already
 /// in memory and only need inflating, so it is serviced in place through the
 /// session's [`Session::set_codec_hook`] hook, the same way the host services
 /// it between two `step` calls. Without a hook registered it is reported as
@@ -299,16 +302,10 @@ pub(crate) fn run_query_to_rows(
     params: &[Value],
 ) -> Result<(Vec<Field>, Vec<Vec<Value>>)> {
     // Resolve file-backed table schemas first. Anything missing gives IoFailed, since
-    // this is not resumable (a simplified version of what `resolve_query` does in
-    // `Session::prepare`).
-    let mut tables = Vec::new();
-    referenced_in_query(&session.catalog, arena, q, &mut tables, 0)?;
-    for t in tables {
-        if let Some(table) = session.catalog.get_mut(t) {
-            if table.resolve()?.is_err() {
-                err!(IoFailed);
-            }
-        }
+    // this is not resumable; the reads go to the session for `prepare` to report.
+    if let Some(io) = session.resolve_query(arena, q)? {
+        session.stash_io(io);
+        err!(IoFailed);
     }
     let plan = bind_query_at(&session.catalog, arena, q, params, session.now_micros)?;
     let schema = plan.root.schema().to_vec();
@@ -325,6 +322,7 @@ pub(crate) fn run_query_to_rows(
         // Ends the `&mut session` borrow held by `ctx` so the codec arm below
         // can hand the requests back to the session.
         let pending = core::mem::take(&mut ctx.codec);
+        let io = core::mem::take(&mut ctx.io);
         match step {
             Step::Ready(mut b) => {
                 b.materialize();
@@ -332,7 +330,10 @@ pub(crate) fn run_query_to_rows(
                     rows.push(b.cols.iter().map(|c| c.value_at(r)).collect());
                 }
             }
-            Step::NeedIo => err!(IoFailed),
+            Step::NeedIo => {
+                session.stash_io(io);
+                err!(IoFailed)
+            }
             Step::NeedCodec => session.service_codec(&pending)?,
             Step::Done => break,
         }

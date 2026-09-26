@@ -119,9 +119,13 @@ export function errorMessage(code) {
  *
  * `code` is the number from error.rs; `message` is built from the table above.
  * Extra context (the SQL being run, host-side notes) is optional.
+ *
+ * `position` is set when the engine reports where the error happened
+ * (`Error::pos` in error.rs): for SQL errors (3xx) a **byte** offset into the
+ * UTF-8 encoding of `sql`; for data errors, an offset in the file.
  */
 export class AhiruError extends Error {
-  constructor(code, { sql, detail, cause } = {}) {
+  constructor(code, { sql, detail, cause, position } = {}) {
     const base = errorMessage(code);
     super(detail ? `[E${code}] ${base}: ${detail}` : `[E${code}] ${base}`, { cause });
     this.name = 'AhiruError';
@@ -130,5 +134,6 @@ export class AhiruError extends Error {
     this.reason = base;
     if (sql !== undefined) this.sql = sql;
     if (detail !== undefined) this.detail = detail;
+    if (position !== undefined) this.position = position;
   }
 }
