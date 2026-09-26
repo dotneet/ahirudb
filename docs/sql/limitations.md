@@ -110,11 +110,18 @@ user-visible effect.
   DuckDB's and is matched on purpose.
 - **Text → `DATE` casts reject trailing junk that DuckDB ignores.** A
   timestamp-shaped string is accepted and the time part dropped
-  (`'2024-01-01T10:00:00'::DATE` is `2024-01-01`), but DuckDB also accepts
-  *any* trailing text after the date (`'2024-01-01x'::DATE` is
-  `2024-01-01` there); here that is `NULL`, so genuinely malformed input
-  is still visible. Named time zones other than `UTC` are rejected on a
-  `TIMESTAMP` cast, matching DuckDB without the ICU extension.
+  (`'2024-01-01T10:00:00'::DATE` is `2024-01-01`), and so are DuckDB's
+  other date separators (`'2024/1/5'`, `'2024 01 05'`), but DuckDB also
+  accepts *any* trailing text after the date (`'2024-01-01x'::DATE` is
+  `2024-01-01` there, and so is `'2024-01-01 BC'`); here that is `NULL`,
+  so genuinely malformed input is still visible. Named time zones other
+  than `UTC` are rejected on a `TIMESTAMP` cast, matching DuckDB without
+  the ICU extension.
+- **Two corners of INTERVAL text differ from DuckDB's parser**, both where
+  DuckDB's own behavior is inconsistent: a bare integer (`'5'::INTERVAL`)
+  is 5 seconds here, while DuckDB rejects `'5'` but reads `'5 '` (with a
+  trailing space) and `'1.5'` as seconds; and a trailing number with no
+  unit (`'1 day 2'`) is an error here, while DuckDB silently drops the `2`.
 - **`quantile`/`percentile_cont`** are the *continuous* (interpolated)
   quantile in all spellings. DuckDB's `quantile` is the discrete version,
   and its `quantile_disc` isn't implemented. A list-valued fraction
