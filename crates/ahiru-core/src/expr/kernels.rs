@@ -870,7 +870,7 @@ fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> 
     crate::expr::float::write_f64_finite(buf, x);
     // A shortest-round-trip rendering never has more than 17 significant digits, so
     // `parse_dec` can always hold the mantissa and never reports it inexact.
-    let (m, e, _) = parse_dec(buf)?;
+    let (m, e, _, _) = parse_dec(buf)?;
     let k = e + scale as i32;
     if k >= 0 {
         pow10_i128(k as u32).and_then(|p| m.checked_mul(p))
@@ -896,6 +896,9 @@ fn f64_to_scaled_i128(x: f64, scale: u8, half_away: bool, buf: &mut Vec<u8>) -> 
 /// `parse_special_f64` runs first because it accepts spellings `FromStr` does not
 /// (`+nan`, `-nan`) and because it fixes the sign of `-nan`, which is otherwise lost.
 fn parse_f64(s: &[u8]) -> Option<f64> {
+    if s.contains(&b'_') {
+        return parse_f64(&strip_separators(s)?);
+    }
     if let Some(v) = parse_special_f64(s) {
         return Some(v);
     }
@@ -910,21 +913,61 @@ fn parse_f64(s: &[u8]) -> Option<f64> {
 /// `'1.00000005960464477539062500001'` is above the midpoint between `1.0` and the next
 /// `f32`, yet its nearest double *is* that midpoint, which then ties to even and gave
 /// `1.0` instead of `1.0000001192092896`. (`f32`'s `FromStr` is already linked, by
-/// `expr::float`'s shortest-digit round-trip check.) A finite value beyond the `FLOAT`
-/// range is NULL, as in [`narrow_f64`].
+/// `expr::float`'s shortest-digit round-trip check.) Text beyond the `FLOAT` range is
+/// infinite, as in DuckDB (`'1e39'::FLOAT` is `inf`), unlike a `DOUBLE` value too large
+/// for `FLOAT`, which [`narrow_f64`] turns NULL.
 fn parse_float(s: &[u8], to: Ty) -> Option<f64> {
     if to != Ty::Float {
         return parse_f64(s);
+    }
+    if s.contains(&b'_') {
+        return parse_float(&strip_separators(s)?, to);
     }
     if let Some(v) = parse_special_f64(s) {
         return Some(v as f32 as f64);
     }
     let f = core::str::from_utf8(trim_space(s)).ok()?.parse::<f32>().ok()?;
-    if f.is_infinite() {
-        None
-    } else {
-        Some(f as f64)
+    Some(f as f64)
+}
+
+/// Drops the `_` digit separators DuckDB accepts in numeric text (`'1_000'`,
+/// `'1.5e1_0'`), so the rest can be parsed as usual. As in a numeric literal, a
+/// separator must sit between two digits; `None` for one that does not (`'1__0'`,
+/// `'1_.5'`, `'_1'`).
+fn strip_separators(s: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len());
+    for (i, &c) in s.iter().enumerate() {
+        if c != b'_' {
+            out.push(c);
+        } else if i == 0
+            || !s[i - 1].is_ascii_digit()
+            || !s.get(i + 1).is_some_and(u8::is_ascii_digit)
+        {
+            return None;
+        }
     }
+    Some(out)
+}
+
+/// `0x1F` / `0b101`: the hexadecimal and binary spellings DuckDB accepts when casting
+/// text to an integer type other than `HUGEINT`. The digits are an unsigned 64-bit
+/// magnitude with no sign and no surrounding whitespace, and may carry `_` separators
+/// between digits (`'0x1_0'` is 16). `None` when the text is not one of these.
+fn parse_radix(s: &[u8]) -> Option<i128> {
+    let (radix, digits) = match s {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', b'b' | b'B', rest @ ..] => (2, rest),
+        _ => return None,
+    };
+    let digit = |c: u8| (c as char).to_digit(radix);
+    let mut v: u64 = 0;
+    for (i, &c) in digits.iter().enumerate() {
+        if c == b'_' && i > 0 && digits.get(i + 1).and_then(|&d| digit(d)).is_some() {
+            continue;
+        }
+        v = v.checked_mul(radix as u64)?.checked_add(digit(c)? as u64)?;
+    }
+    (!digits.is_empty()).then_some(v as i128)
 }
 
 /// Applies the target floating-point width.
@@ -1226,6 +1269,7 @@ pub fn fmt_f32(x: f64, out: &mut Vec<u8>) {
 }
 
 /// Reads a decimal number as `mant * 10^exp`. `None` (= NULL) if it cannot be read.
+/// `_` separators between digits are accepted, as in DuckDB ([`strip_separators`]).
 ///
 /// The third return value is "whether integer digits were dropped because they did not fit the
 /// mantissa". When they were, `mant * 10^exp` is a rounded version of the original, so integer
@@ -1233,10 +1277,21 @@ pub fn fmt_f32(x: f64, out: &mut Vec<u8>) {
 /// `CAST('...105727' AS HUGEINT)` into `...105720`). Floating point has only mantissa precision to
 /// begin with, so it can ignore this.
 ///
+/// The fourth is "whether the fractional digits dropped for the same reason amount to at
+/// least half a unit of the mantissa's last digit". A caller that keeps every mantissa
+/// digit (the target scale is the mantissa's own) rounds the magnitude up by one on it,
+/// so `'...99.99999999999999999995'` still rounds up at 38 digits. A caller that rounds
+/// at a coarser position must not: its own half-away rounding of the mantissa is
+/// already exact, since digits below the mantissa's last one can never turn a remainder
+/// under one half into a tie.
+///
 /// The mantissa is **accumulated on the negative side**. `i128::MIN`'s magnitude is not
 /// representable as a positive `i128`, so accumulating positively would make exactly the lower
 /// bound (`-170141183460469231731687303715884105728`) unreadable.
-fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
+fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool, bool)> {
+    if s.contains(&b'_') {
+        return parse_dec(&strip_separators(s)?);
+    }
     let s = trim_space(s);
     let mut i = 0usize;
     let mut neg = false;
@@ -1248,6 +1303,8 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
     let mut mant: i128 = 0;
     let mut exp: i32 = 0;
     let mut inexact = false;
+    // `None` until a fractional digit is dropped; then whether that first one was >= 5.
+    let mut round_up: Option<bool> = None;
     let mut seen = false;
     while i < s.len() && s[i].is_ascii_digit() {
         seen = true;
@@ -1269,9 +1326,14 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
             let d = (s[i] - b'0') as i128;
             // Dropping trailing fractional digits does not change the value as an integer, so
             // inexact is not set here (it does not affect the integer cast's result).
-            if let Some(m) = mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
-                mant = m;
-                exp -= 1;
+            match mant.checked_mul(10).and_then(|m| m.checked_sub(d)) {
+                Some(m) if round_up.is_none() => {
+                    mant = m;
+                    exp -= 1;
+                }
+                _ => {
+                    round_up.get_or_insert(d >= 5);
+                }
             }
             i += 1;
         }
@@ -1318,15 +1380,18 @@ fn parse_dec(s: &[u8]) -> Option<(i128, i32, bool)> {
             }
         }
     };
-    Some((mant, exp, inexact))
+    Some((mant, exp, inexact, round_up == Some(true)))
 }
 
+/// Text to BOOLEAN accepts exactly DuckDB's spellings: the words below in any case, and
+/// `1`/`0`. Other numbers are not "non-zero means true" here -- `'2'` and `'0.4'` are not
+/// booleans (NULL; DuckDB raises) -- and surrounding whitespace is not trimmed either.
 fn parse_bool(s: &[u8]) -> Option<bool> {
     let eq =
         |w: &[u8]| s.len() == w.len() && s.iter().zip(w).all(|(a, b)| a.to_ascii_lowercase() == *b);
-    if eq(b"true") || eq(b"t") || eq(b"yes") || eq(b"y") {
+    if eq(b"true") || eq(b"t") || eq(b"yes") || eq(b"y") || eq(b"1") {
         Some(true)
-    } else if eq(b"false") || eq(b"f") || eq(b"no") || eq(b"n") {
+    } else if eq(b"false") || eq(b"f") || eq(b"no") || eq(b"n") || eq(b"0") {
         Some(false)
     } else {
         None
@@ -1789,29 +1854,29 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
         }
         (Fam::Str, Fam::Int) => {
             let scale = dec_scale(to) as i32;
-            let is_bool = to == Ty::Boolean;
+            let radix_ok = to.is_integer() && to != Ty::HugeInt;
             let sv = a.bytes();
             for i in 0..n {
                 let b = sv.get(i);
-                let mut ok = false;
-                if is_bool {
-                    if let Some(v) = parse_bool(b) {
-                        ok = store_i128_typed(&mut data, to, v as i128);
-                    }
-                }
-                if !ok {
-                    // For BOOLEAN too, anything but 'true'/'false' is read as a number and counts as true when non-zero.
-                    ok = match parse_dec(b) {
-                        Some((m, e, inexact)) => {
+                let y = if to == Ty::Boolean {
+                    parse_bool(b).map(|v| v as i128)
+                } else if let Some(v) = parse_radix(b).filter(|_| radix_ok) {
+                    Some(v)
+                } else {
+                    match parse_dec(b) {
+                        // If integer digits were dropped, only a rounded value exists.
+                        // It is treated like out of range and becomes NULL (returning the
+                        // rounded value would silently mangle the digits). DuckDB errors
+                        // under CAST and gives NULL under TRY_CAST. This engine always
+                        // takes the NULL side.
+                        Some((_, _, true, _)) | None => None,
+                        Some((m, e, false, up)) => {
                             let k = e + scale;
-                            // If integer digits were dropped, only a rounded value exists.
-                            // It is treated like out of range and becomes NULL (returning the rounded
-                            // value would silently mangle the digits). DuckDB errors under CAST and
-                            // gives NULL under TRY_CAST. This engine always takes the NULL side.
-                            let y = if inexact {
-                                None
-                            } else if k >= 0 {
-                                pow10_i128(k as u32).and_then(|p| m.checked_mul(p))
+                            if k >= 0 {
+                                // Every mantissa digit is kept, so a dropped tail of at
+                                // least one half rounds the magnitude up here.
+                                let m = if up { m.checked_add(m.signum()) } else { Some(m) };
+                                m.zip(pow10_i128(k as u32)).and_then(|(m, p)| m.checked_mul(p))
                             } else if -k > 38 {
                                 Some(0)
                             } else {
@@ -1820,21 +1885,17 @@ fn cast_impl(from: Ty, to: Ty, a: &Vector, lenient: bool) -> Result<Vector> {
                                 // `CAST('1.5' AS INTEGER)` must not truncate
                                 // to 1).
                                 pow10_i128((-k) as u32).and_then(|p| rescale_i128(m, 1, p, false))
-                            };
-                            match y {
-                                Some(y) => store_i128_typed(&mut data, to, y),
-                                None => {
-                                    push_default(&mut data);
-                                    false
-                                }
                             }
                         }
-                        None => {
-                            push_default(&mut data);
-                            false
-                        }
-                    };
-                }
+                    }
+                };
+                let ok = match y {
+                    Some(y) => store_i128_typed(&mut data, to, y),
+                    None => {
+                        push_default(&mut data);
+                        false
+                    }
+                };
                 if !ok {
                     funcs::set_null(&mut bad, i, n);
                 }
@@ -2097,15 +2158,21 @@ mod tests {
 
     #[test]
     fn parse_dec_forms() {
-        assert_eq!(parse_dec(b"123"), Some((123, 0, false)));
-        assert_eq!(parse_dec(b" -12.5 "), Some((-125, -1, false)));
-        assert_eq!(parse_dec(b"+1e3"), Some((1, 3, false)));
-        assert_eq!(parse_dec(b".5"), Some((5, -1, false)));
-        assert_eq!(parse_dec(b"1E-2"), Some((1, -2, false)));
+        assert_eq!(parse_dec(b"123"), Some((123, 0, false, false)));
+        assert_eq!(parse_dec(b" -12.5 "), Some((-125, -1, false, false)));
+        assert_eq!(parse_dec(b"+1e3"), Some((1, 3, false, false)));
+        assert_eq!(parse_dec(b".5"), Some((5, -1, false, false)));
+        assert_eq!(parse_dec(b"1E-2"), Some((1, -2, false, false)));
         assert_eq!(parse_dec(b""), None);
         assert_eq!(parse_dec(b"abc"), None);
         assert_eq!(parse_dec(b"1.2.3"), None);
         assert_eq!(parse_dec(b"1e"), None);
+        // `_` separators between digits, as in DuckDB.
+        assert_eq!(parse_dec(b"1_000.2_5"), Some((100025, -2, false, false)));
+        assert_eq!(parse_dec(b"1e1_0"), Some((1, 10, false, false)));
+        assert_eq!(parse_dec(b"1__0"), None);
+        assert_eq!(parse_dec(b"1_.5"), None);
+        assert_eq!(parse_dec(b"_1"), None);
     }
 
     /// The i128 extremes. Since the mantissa accumulates on the negative side, even the exact lower
@@ -2114,26 +2181,34 @@ mod tests {
     fn parse_dec_i128_boundaries() {
         assert_eq!(
             parse_dec(b"170141183460469231731687303715884105727"),
-            Some((i128::MAX, 0, false))
+            Some((i128::MAX, 0, false, false))
         );
         assert_eq!(
             parse_dec(b"-170141183460469231731687303715884105728"),
-            Some((i128::MIN, 0, false))
+            Some((i128::MIN, 0, false, false))
         );
         // Upper + 1 / lower - 1 do not fit the mantissa. A rounded value comes back, but inexact is
         // set and the integer cast side consults it and gives NULL.
-        let (_, _, inexact) = parse_dec(b"170141183460469231731687303715884105728").unwrap();
+        let (_, _, inexact, _) = parse_dec(b"170141183460469231731687303715884105728").unwrap();
         assert!(inexact);
-        let (_, _, inexact) = parse_dec(b"-170141183460469231731687303715884105729").unwrap();
+        let (_, _, inexact, _) = parse_dec(b"-170141183460469231731687303715884105729").unwrap();
         assert!(inexact);
         // Up to 38 digits it was exact all along.
         assert_eq!(
             parse_dec(b"12345678901234567890123456789012345678"),
-            Some((12345678901234567890123456789012345678, 0, false))
+            Some((12345678901234567890123456789012345678, 0, false, false))
         );
         // Dropping the fractional part does not affect the value as an integer, so it is not inexact.
         let long_frac = b"1.000000000000000000000000000000000000000000000005";
-        assert_eq!(parse_dec(long_frac).map(|(_, _, x)| x), Some(false));
+        assert_eq!(parse_dec(long_frac).map(|(_, _, x, _)| x), Some(false));
+        // The first dropped fractional digit decides whether a caller keeping every
+        // mantissa digit rounds up.
+        let (m, e, _, up) = parse_dec(b"8999999999999999999.99999999999999999995").unwrap();
+        assert_eq!((m, e, up), (89999999999999999999999999999999999999, -19, true));
+        let (_, _, _, up) = parse_dec(b"8999999999999999999.99999999999999999994").unwrap();
+        assert!(!up);
+        let (_, _, _, up) = parse_dec(b"8999999999999999999.99999999999999999949").unwrap();
+        assert!(up);
     }
 
     // --- INTERVAL -------------------------------------------------------------
@@ -2450,7 +2525,8 @@ mod tests {
         let out = cast(Ty::Varchar, Ty::Float, &txt(&["1.00000005960464477539062500001"])).unwrap();
         assert_eq!(out.f64s()[0], 1.000_000_119_209_289_6);
         let out = cast(Ty::Varchar, Ty::Float, &txt(&["1e39", " -inf ", "3.4028235e38"])).unwrap();
-        assert!(!out.is_valid(0), "a finite value past FLOAT's range is NULL");
+        // Text past FLOAT's range is infinite, as in DuckDB (`'1e39'::FLOAT` is `inf`).
+        assert_eq!(out.f64s()[0], f64::INFINITY);
         assert_eq!(out.f64s()[1], f64::NEG_INFINITY);
         assert_eq!(out.f64s()[2], f32::MAX as f64);
         // A wide DECIMAL goes the same single-rounding way.
