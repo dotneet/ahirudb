@@ -291,7 +291,10 @@ fn unify_setop_schema(l: &[Field], r: &[Field]) -> Result<Vec<Field>> {
     ensure!(l.len() == r.len(), TypeMismatch);
     let mut out = Vec::with_capacity(l.len());
     for (a, b) in l.iter().zip(r) {
-        let ty = crate::vector::Ty::unify_or_mismatch(a.ty, b.ty)?;
+        let ty = match crate::vector::Ty::unify_value(a.ty, b.ty) {
+            Some(t) => t,
+            None => err!(TypeMismatch),
+        };
         // Names come from the left (per the SQL standard).
         out.push(Field::new(a.name.clone(), ty, a.nullable || b.nullable));
     }

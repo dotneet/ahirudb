@@ -226,11 +226,15 @@ fn abs_and_sign_of_negative_zero_are_positive_zero() {
     let mut sess = session_with_basic();
     // duckdb: abs(-0.0) -> 0.0, sign(-0.0) -> 0. `-0.0 < 0.0` is false, so the comparison-based
     // forms returned the negative zero unchanged and it printed as `-0`.
-    assert_eq!(one(&mut sess, "1.0 / abs(-0.0) > 0"), Value::Bool(true));
-    assert_eq!(one(&mut sess, "1.0 / sign(-0.0) > 0"), Value::Bool(true));
-    assert_eq!(one(&mut sess, "abs(-0.0) = 0 AND sign(-0.0) = 0"), Value::Bool(true));
-    assert_eq!(one(&mut sess, "abs(-2.5)"), Value::F64(2.5));
-    assert_eq!(one(&mut sess, "sign(-5.0)"), Value::F64(-1.0));
+    // (`-0.0` alone is an exact DECIMAL zero, which has no sign; `::DOUBLE` makes it a float.)
+    assert_eq!(one(&mut sess, "1.0 / abs(-0.0::DOUBLE) > 0"), Value::Bool(true));
+    assert_eq!(one(&mut sess, "1.0 / sign(-0.0::DOUBLE) > 0"), Value::Bool(true));
+    assert_eq!(
+        one(&mut sess, "abs(-0.0::DOUBLE) = 0 AND sign(-0.0::DOUBLE) = 0"),
+        Value::Bool(true)
+    );
+    assert_eq!(one(&mut sess, "abs(-2.5::DOUBLE)"), Value::F64(2.5));
+    assert_eq!(one(&mut sess, "sign(-5.0::DOUBLE)"), Value::F64(-1.0));
 }
 
 // --- hex ----------------------------------------------------------------------

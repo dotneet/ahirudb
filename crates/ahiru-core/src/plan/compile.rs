@@ -180,9 +180,10 @@ fn decimal_arith(op: BinaryOp, lt: Ty, rt: Ty) -> Result<Option<(Ty, Ty, Ty)>> {
     if !matches!(lt, Ty::Decimal { .. }) && !matches!(rt, Ty::Decimal { .. }) {
         return Ok(None);
     }
-    // With floating point mixed in, fall to DOUBLE (as in DuckDB).
-    if matches!(lt, Ty::Float | Ty::Double) || matches!(rt, Ty::Float | Ty::Double) {
-        return Ok(Some((Ty::Double, Ty::Double, Ty::Double)));
+    // With floating point mixed in, compute in that floating-point type (as in DuckDB,
+    // `DECIMAL * FLOAT` is a FLOAT).
+    if let Some(t @ (Ty::Float | Ty::Double)) = Ty::unify(lt, rt) {
+        return Ok(Some((t, t, t)));
     }
     let (Some((p1, s1)), Some((p2, s2))) = (lt.as_decimal(), rt.as_decimal()) else {
         return Ok(None);
@@ -1426,7 +1427,10 @@ impl<'a> Compiler<'a> {
                 parts.push(self.sub_program(c)?);
             }
             let p = self.sub_program(v)?;
-            result_ty = Ty::unify_or_mismatch(result_ty, p.result_ty)?;
+            result_ty = match Ty::unify_value(result_ty, p.result_ty) {
+                Some(t) => t,
+                None => err!(TypeMismatch),
+            };
             parts.push(p);
         }
         // The first condition is reached by every row, so it never needs guarding.

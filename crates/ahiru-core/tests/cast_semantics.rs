@@ -4,9 +4,9 @@
 //! comment says otherwise. Two places where this engine deliberately differs
 //! from DuckDB are called out at the point they appear:
 //!
-//!   - An undecorated decimal literal (`0.1`, `9007199254740993.0`) is a
-//!     `DOUBLE` here and a `DECIMAL` in DuckDB, so the DuckDB reference values
-//!     below always cast explicitly to `DOUBLE` where that matters.
+//!   - (No longer a divergence:) an undecorated decimal literal (`0.1`,
+//!     `9007199254740993.0`) is an exact `DECIMAL` here as in DuckDB, so the
+//!     tests below cast explicitly to `DOUBLE` where a float is what they test.
 //!   - Unsigned integer arithmetic **wraps inside the unsigned domain** here;
 //!     DuckDB raises an out-of-range error instead. See `wrap_narrow` in
 //!     `expr::kernels` for why wrapping was chosen.
@@ -126,11 +126,11 @@ fn double_to_varchar_is_shortest_round_trip() {
     let mut s = session_with_basic();
     // Previously "9007199254740990" / "1234567890123460": a 15-digit
     // approximation mangled integral doubles inside f64's exact range.
-    // (The literal is a DOUBLE here, so the value is the nearest double,
-    // 9007199254740992; DuckDB's DECIMAL literal keeps ...993.)
-    assert_eq!(text(&mut s, "9007199254740993.0"), "9007199254740992.0");
-    assert_eq!(text(&mut s, "1234567890123456.0"), "1234567890123456.0");
-    assert_eq!(text(&mut s, "0.1 + 0.2"), "0.30000000000000004");
+    // (`9007199254740993.0` is an exact DECIMAL literal; as a DOUBLE it is the
+    // nearest double, 9007199254740992.)
+    assert_eq!(text(&mut s, "9007199254740993.0::DOUBLE"), "9007199254740992.0");
+    assert_eq!(text(&mut s, "1234567890123456.0::DOUBLE"), "1234567890123456.0");
+    assert_eq!(text(&mut s, "0.1::DOUBLE + 0.2::DOUBLE"), "0.30000000000000004");
     // Fixed vs exponential notation, and the exponent spelling, match DuckDB.
     assert_eq!(text(&mut s, "CAST(100 AS DOUBLE)"), "100.0");
     assert_eq!(text(&mut s, "1e30"), "1e+30");
@@ -143,10 +143,10 @@ fn double_to_varchar_is_shortest_round_trip() {
 fn double_survives_a_varchar_round_trip() {
     let mut s = session_with_basic();
     for expr in [
-        "0.1 + 0.2",
+        "0.1::DOUBLE + 0.2::DOUBLE",
         "1.7976931348623157e308",
         "-1.7976931348623157e308",
-        "9007199254740993.0",
+        "9007199254740993.0::DOUBLE",
         "1e-300",
         "CAST(0 AS DOUBLE)",
         "1.0 / 3.0",
@@ -187,20 +187,31 @@ fn double_to_decimal_does_not_scale_in_floating_point() {
     // shortest round-trip rendering carries. (DuckDB prints
     // 12345678901234566758.4 here, from the very same f64 multiply.)
     assert_eq!(
-        text(&mut s, "CAST(12345678901234567890.5 AS DECIMAL(38,1))"),
+        text(&mut s, "CAST(12345678901234567890.5::DOUBLE AS DECIMAL(38,1))"),
         "12345678901234567000.0"
     );
-    // Casting through text gives the same answer, by construction.
+    // Casting through text gives the same answer there.
     assert_eq!(
         one(
             &mut s,
-            "CAST(12345678901234567890.5 AS DECIMAL(38,1)) \
-             = CAST(CAST(12345678901234567890.5 AS VARCHAR) AS DECIMAL(38,1))"
+            "CAST(12345678901234567890.5::DOUBLE AS DECIMAL(38,1)) \
+             = CAST(CAST(12345678901234567890.5::DOUBLE AS VARCHAR) AS DECIMAL(38,1))"
         ),
         Value::Bool(true)
     );
+    // (The literal itself is an exact DECIMAL and keeps every digit.)
+    assert_eq!(
+        text(&mut s, "CAST(12345678901234567890.5 AS DECIMAL(38,1))"),
+        "12345678901234567890.5"
+    );
     // Ordinary cases are unchanged and match DuckDB.
-    assert_eq!(text(&mut s, "CAST(1.5 AS DECIMAL(4,1))"), "1.5");
+    assert_eq!(text(&mut s, "CAST(1.5::DOUBLE AS DECIMAL(4,1))"), "1.5");
+    // Below 2^53 the rounding follows the double's value rather than its shortest
+    // text, which sits on a decimal tie here (duckdb: 1.00, 0.28, 2.68, 5).
+    assert_eq!(text(&mut s, "CAST(1.005::DOUBLE AS DECIMAL(10,2))"), "1.00");
+    assert_eq!(text(&mut s, "CAST(0.285::DOUBLE AS DECIMAL(10,2))"), "0.28");
+    assert_eq!(text(&mut s, "CAST(2.675::DOUBLE AS DECIMAL(10,2))"), "2.68");
+    assert_eq!(text(&mut s, "CAST(4.5::DOUBLE AS DECIMAL(3,0))"), "5");
     assert_eq!(
         text(&mut s, "CAST(CAST(0.1 AS DOUBLE) AS DECIMAL(38,20))"),
         "0.10000000000000000000"
@@ -375,7 +386,9 @@ fn double_to_float_overflow_is_null_not_infinity() {
     assert_eq!(one(&mut s, "TRY_CAST(1e39 AS FLOAT)"), Value::Null);
     assert_eq!(one(&mut s, "CAST(1e308 AS FLOAT)"), Value::Null);
     assert_eq!(one(&mut s, "CAST(-1e308 AS FLOAT)"), Value::Null);
-    assert_eq!(one(&mut s, "CAST('1e39' AS FLOAT)"), Value::Null);
+    // Text is different: it rounds straight to FLOAT, and past its range that is
+    // infinite, as in DuckDB.
+    assert_eq!(f64_of(&one(&mut s, "CAST('1e39' AS FLOAT)")), f64::INFINITY);
     // An infinity that was already in the input still passes through.
     assert!(f64_of(&one(&mut s, "CAST(CAST('inf' AS DOUBLE) AS FLOAT)")).is_infinite());
     assert!(f64_of(&one(&mut s, "CAST('-inf' AS FLOAT)")).is_infinite());

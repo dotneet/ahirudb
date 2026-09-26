@@ -119,12 +119,18 @@ pub(super) fn unquote(raw: &str, q: u8) -> String {
     out
 }
 
-/// An integer literal. Picks the smallest type that fits (I32 -> I64 -> I128).
+/// An integer literal. Picks the smallest type that fits (I32 -> I64 -> I128), and
+/// falls back to a `DOUBLE` past `HUGEINT`, as DuckDB does (it has a `UHUGEINT` step
+/// in between that this engine does not).
 ///
 /// `text` comes straight from the lexer and may carry `_` digit separators
 /// (`1_000`); the lexer has already validated their placement, so they are simply
 /// skipped here rather than re-checked.
 pub(super) fn int_literal(text: &str, negative: bool, pos: usize) -> Result<Value> {
+    let too_big = || match float_literal(text, pos)? {
+        Value::F64(f) if negative => Ok(Value::F64(-f)),
+        v => Ok(v),
+    };
     let mut mag: u128 = 0;
     for &d in text.as_bytes() {
         if d == b'_' {
@@ -132,12 +138,14 @@ pub(super) fn int_literal(text: &str, negative: bool, pos: usize) -> Result<Valu
         }
         mag = match mag.checked_mul(10).and_then(|v| v.checked_add((d - b'0') as u128)) {
             Some(v) => v,
-            None => err!(NumberOverflow, pos),
+            None => return too_big(),
         };
     }
     // i128::MIN has an absolute value one greater than i128::MAX. The limit depends on the sign.
     let limit = if negative { 1u128 << 127 } else { (1u128 << 127) - 1 };
-    ensure!(mag <= limit, NumberOverflow, pos);
+    if mag > limit {
+        return too_big();
+    }
     let v = if negative { (mag as i128).wrapping_neg() } else { mag as i128 };
     // INTEGER is chosen by the unsigned magnitude, as DuckDB does, so
     // `-2147483648` is BIGINT (its magnitude does not fit INTEGER) and
@@ -168,6 +176,35 @@ pub(super) fn float_literal(text: &str, pos: usize) -> Result<Value> {
         Ok(v) => Ok(Value::F64(v)),
         Err(_) => err!(NumberOverflow, pos),
     }
+}
+
+/// A literal with a decimal point, typed the way DuckDB types it: without an exponent
+/// and with at most 38 digits it is an exact `DECIMAL(w, s)`, `w` being the number of
+/// digits written (leading zeros included: `0.5` is `DECIMAL(2,1)`, `.5` is
+/// `DECIMAL(1,1)`) and `s` the number after the point. Anything else -- an exponent
+/// (`1e3`, `1.5e3`) or more than 38 digits -- is a `DOUBLE` ([`float_literal`]).
+///
+/// Being exact is what makes `0.1 + 0.2 = 0.3` true, `CAST(4.5 AS INTEGER)` 5 (a
+/// DECIMAL rounds half away from zero, a DOUBLE half to even) and a
+/// `123456789012345678901234567.89::DECIMAL(38,2)` keep every digit, as in DuckDB.
+pub(super) fn decimal_literal(text: &str, pos: usize) -> Result<Expr> {
+    let mut raw: i128 = 0;
+    let (mut width, mut scale, mut frac) = (0u8, 0u8, false);
+    for &c in text.as_bytes() {
+        match c {
+            b'_' => {}
+            b'.' => frac = true,
+            b'0'..=b'9' if width < 38 => {
+                width += 1;
+                scale += frac as u8;
+                raw = raw * 10 + (c - b'0') as i128;
+            }
+            _ => return Ok(Expr::Literal(float_literal(text, pos)?)),
+        }
+    }
+    let ty = Ty::decimal(width.max(1), scale);
+    let v = if width <= 18 { Value::I64(raw as i64) } else { Value::I128(raw) };
+    Ok(Expr::TypedLiteral(v, ty))
 }
 
 /// The method name of `USING SAMPLE`/`TABLESAMPLE`. `None` when it does not match
