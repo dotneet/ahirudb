@@ -285,6 +285,15 @@ impl Ty {
         if let Some(t) = mixed_sign_int(a, b) {
             return Some(t);
         }
+        // BOOLEAN is the bottom of the widening order: mixed with a number it becomes that
+        // number (`true = 1`, `true IN (1, 2)`, `coalesce(flag, 0)`), as in DuckDB. Arithmetic
+        // on a BOOLEAN stays an error (`plan::compile` checks the operands, not this type).
+        if a == Boolean && b.is_numeric() {
+            return Some(b);
+        }
+        if b == Boolean && a.is_numeric() {
+            return Some(a);
+        }
         // Between numerics, widen. DECIMAL with floating point drops to DOUBLE.
         if a.is_numeric() && b.is_numeric() {
             let (lo, hi) = if a.rank() < b.rank() { (a, b) } else { (b, a) };

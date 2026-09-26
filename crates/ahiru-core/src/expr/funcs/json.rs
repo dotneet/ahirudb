@@ -35,7 +35,12 @@ pub(super) fn fold_null(args: &[&Vector], ty: Ty) -> Result<Vector> {
 /// (`nullif(1, NULL)` is 1).
 pub(super) fn nullif(args: &[&Vector], ty: Ty) -> Result<Vector> {
     ensure!(args.len() == 2, WrongArgCount);
-    let eq = kernels::compare(OpCode::Eq, ty.phys(), args[0], args[1])?;
+    // The arguments keep their own types (the result is the first one's), so they are compared
+    // in their common type.
+    let (t0, t1) = (args[0].ty(), args[1].ty());
+    let t = Ty::unify_or_mismatch(t0, t1)?;
+    let (l, r) = (kernels::cast(t0, t, args[0])?, kernels::cast(t1, t, args[1])?);
+    let eq = kernels::compare(OpCode::Eq, t.phys(), &l, &r)?;
     // A length-1 NULL applies to every row with stride 0. There is no need to build one per row.
     let mut nul = Vector::new(ty);
     nul.push_null();

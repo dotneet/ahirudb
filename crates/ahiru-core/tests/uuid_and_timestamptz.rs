@@ -290,9 +290,15 @@ fn malformed_timestamptz_text_becomes_null_not_an_error() {
 }
 
 #[test]
-fn timestamptz_out_of_range_offset_is_rejected() {
+fn timestamptz_offset_fields_are_two_digits_but_not_range_checked() {
+    // DuckDB applies an offset of `+25` (or `+99`) as written; it only insists on two digits.
     let mut db = session_with_dual();
-    let rows = run(&mut db, "SELECT CAST('2024-01-01 12:00:00+25' AS TIMESTAMPTZ) FROM dual");
+    let rows = run(
+        &mut db,
+        "SELECT CAST(CAST('2024-01-01 12:00:00+25' AS TIMESTAMPTZ) AS VARCHAR) FROM dual",
+    );
+    assert_eq!(rows, vec![vec![Value::Bytes(b"2023-12-31 11:00:00+00".to_vec())]]);
+    let rows = run(&mut db, "SELECT CAST('2024-01-01 12:00:00+5' AS TIMESTAMPTZ) FROM dual");
     assert_eq!(rows, vec![vec![Value::Null]]);
 }
 

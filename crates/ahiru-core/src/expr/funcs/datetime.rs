@@ -44,9 +44,78 @@ pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// Decomposes a TIMESTAMP (microseconds) into a calendar date. To avoid an
 /// off-by-one-day error before the epoch, every division uses floor division (`div_euclid`).
 pub(super) fn civil(us: i64) -> Civil {
-    let days = us.div_euclid(US_PER_DAY);
+    civil_at(us.div_euclid(US_PER_DAY), us.rem_euclid(US_PER_DAY))
+}
+
+/// A calendar day from a day count and a time of day. A DATE argument is decomposed from its
+/// day count directly, so dates beyond TIMESTAMP's range (DuckDB's DATE reaches year 5881580,
+/// TIMESTAMP only about 294247) still answer `year()`, `dayname()` and friends.
+pub(super) fn civil_at(days: i64, tod: i64) -> Civil {
     let (y, mo, d) = civil_from_days(days);
-    Civil { y, mo, d, tod: us.rem_euclid(US_PER_DAY), days }
+    Civil { y, mo, d, tod, days }
+}
+
+/// Argument `k` of a date function as a `Civil`. `resolve` leaves DATE and TIME arguments
+/// uncast (see `dt_arg` there), so the physical value is a day count or a time of day for
+/// those, and microseconds since the epoch for TIMESTAMP/TIMESTAMPTZ.
+pub(super) fn arg_civil(a: &A, k: usize) -> Civil {
+    let v = a.int(k);
+    match a.ty(k) {
+        Ty::Date => civil_at(v, 0),
+        Ty::Time => civil_at(0, v),
+        _ => civil(v),
+    }
+}
+
+impl Civil {
+    /// Microseconds since the epoch, widened so a far-off DATE cannot overflow.
+    fn micros(&self) -> i128 {
+        self.days as i128 * US_PER_DAY as i128 + self.tod as i128
+    }
+}
+
+/// `date_part` of argument `k`: an INTERVAL is split into its own fields, and a TIME only
+/// has the time-of-day parts (DuckDB rejects `year(TIME ...)` and `dow` of an INTERVAL).
+pub(super) fn part_of(a: &A, k: usize, p: u8) -> Result<Option<i64>> {
+    match a.ty(k) {
+        Ty::Interval => interval_part(p, a.i128(k)),
+        Ty::Time if !time_part(p) => err!(TypeMismatch),
+        _ => Ok(date_part(p, &arg_civil(a, k))),
+    }
+}
+
+/// The parts a TIME has.
+pub(super) fn time_part(p: u8) -> bool {
+    matches!(p, P_HOUR | P_MINUTE | P_SECOND | P_MILLISECOND | P_MICROSECOND | P_EPOCH)
+}
+
+/// `date_part` of an INTERVAL, field by field and with truncating division, as DuckDB does:
+/// `year` is `months / 12`, `hour` is the whole hours in the microsecond field (days are not
+/// folded in), and `second`/`millisecond`/`microsecond` all count within the current minute.
+pub(super) fn interval_part(p: u8, v: i128) -> Result<Option<i64>> {
+    let (m, d, u) = crate::vector::unpack_interval(v);
+    let (m, d) = (m as i64, d as i64);
+    Ok(Some(match p {
+        P_YEAR => m / 12,
+        P_QUARTER => m % 12 / 3 + 1,
+        P_MONTH => m % 12,
+        P_DAY => d,
+        P_DECADE => m / 120,
+        P_CENTURY => m / 1_200,
+        P_MILLENNIUM => m / 12_000,
+        P_HOUR => u / US_PER_HOUR,
+        P_MINUTE => u % US_PER_HOUR / US_PER_MIN,
+        P_SECOND => u % US_PER_MIN / US_PER_SEC,
+        P_MILLISECOND => u % US_PER_MIN / 1_000,
+        P_MICROSECOND => u % US_PER_MIN,
+        // A year counts 365.25 days and a month 30, DuckDB's convention. The result is whole
+        // seconds, floored, like the TIMESTAMP `epoch` here (DuckDB returns a DOUBLE).
+        P_EPOCH => {
+            let secs = (m / 12) as i128 * 31_557_600 + ((m % 12) * 30 + d) as i128 * 86_400;
+            (secs * US_PER_SEC as i128 + u as i128).div_euclid(US_PER_SEC as i128) as i64
+        }
+        _ => err!(TypeMismatch),
+    }))
 }
 
 fn is_leap(y: i64) -> bool {
@@ -109,8 +178,7 @@ fn one_based(y: i64, span: i64) -> i64 {
 }
 
 /// The body of `date_part` / `year()` and friends.
-pub(super) fn date_part(p: u8, us: i64) -> Option<i64> {
-    let c = civil(us);
+pub(super) fn date_part(p: u8, c: &Civil) -> Option<i64> {
     Some(match p {
         P_YEAR => c.y,
         P_QUARTER => (c.mo as i64 + 2) / 3,
@@ -144,7 +212,7 @@ pub(super) fn date_part(p: u8, us: i64) -> Option<i64> {
         P_MILLENNIUM => one_based(c.y, 1000),
         P_ISOYEAR => iso_year(c.days),
         // DuckDB returns a DOUBLE including fractional seconds; here it is BIGINT seconds (floored).
-        _ => us.div_euclid(US_PER_SEC),
+        _ => c.days * 86_400 + c.tod / US_PER_SEC,
     })
 }
 
@@ -166,6 +234,9 @@ pub(super) fn date_trunc(p: u8, us: i64) -> Result<Option<i64>> {
         P_SECOND => unit(US_PER_SEC),
         P_MILLISECOND => unit(1_000),
         P_MICROSECOND => Some(us),
+        // The day-level parts truncate to the day, and `epoch` to the second (DuckDB).
+        P_DOW | P_DOY | P_ISODOW => day(c.days),
+        P_EPOCH => unit(US_PER_SEC),
         // Toward zero like the century and millennium below, again as DuckDB does
         // (`date_trunc('decade', DATE '-0084-07-27')` is year -80, not -90).
         P_DECADE => day(days_from_civil(c.y / 10 * 10, 1, 1)),
@@ -183,16 +254,21 @@ pub(super) fn date_trunc(p: u8, us: i64) -> Result<Option<i64>> {
 
 /// `date_diff`. Like DuckDB it counts "how many boundaries were crossed"
 /// (`date_diff('day', '..23:00', '..01:00')` is 1).
-pub(super) fn date_diff(p: u8, a: i64, b: i64) -> Result<Option<i64>> {
-    let (ca, cb) = (civil(a), civil(b));
-    let unit = |u: i64| b.div_euclid(u) - a.div_euclid(u);
+///
+/// The units below a day are counted on `i128` microseconds, so two DATEs beyond TIMESTAMP's
+/// range still compare (`date_diff('hour', DATE '300000-01-01', DATE '300001-01-01')`).
+pub(super) fn date_diff(p: u8, ca: &Civil, cb: &Civil) -> Result<Option<i64>> {
+    let (a, b) = (ca.micros(), cb.micros());
+    let unit = |u: i64| (b.div_euclid(u as i128) - a.div_euclid(u as i128)) as i64;
     Ok(Some(match p {
         P_YEAR => cb.y - ca.y,
         P_QUARTER => (cb.y * 4 + (cb.mo as i64 - 1) / 3) - (ca.y * 4 + (ca.mo as i64 - 1) / 3),
         P_MONTH => (cb.y * 12 + cb.mo as i64) - (ca.y * 12 + ca.mo as i64),
         // A week difference is a day difference divided by 7 (DuckDB uses this definition too).
         P_WEEK => (cb.days - ca.days) / 7,
-        P_DAY => cb.days - ca.days,
+        // DuckDB counts the day-level parts as plain days
+        // (`date_diff('dow', DATE '2024-01-01', DATE '2024-01-10')` is 9).
+        P_DAY | P_DOW | P_DOY | P_ISODOW => cb.days - ca.days,
         P_HOUR => unit(US_PER_HOUR),
         P_MINUTE => unit(US_PER_MIN),
         P_SECOND => unit(US_PER_SEC),
@@ -202,9 +278,9 @@ pub(super) fn date_diff(p: u8, a: i64, b: i64) -> Result<Option<i64>> {
         // can overflow i64 (`date_diff('microsecond', TIMESTAMP '-290000-01-01', TIMESTAMP
         // '290000-01-01')` used to wrap to a negative number). DuckDB raises an Out of Range
         // error for the same call.
-        P_MICROSECOND => match b.checked_sub(a) {
-            Some(v) => v,
-            None => err!(ValueOutOfRange),
+        P_MICROSECOND => match i64::try_from(b - a) {
+            Ok(v) => v,
+            Err(_) => err!(ValueOutOfRange),
         },
         // Truncating toward zero, like `date_trunc` and DuckDB: years -9 to 9 are all one
         // decade, so `date_diff('decade', DATE '-0005-06-01', DATE '0005-06-01')` is 0.
@@ -265,6 +341,107 @@ pub(crate) fn add_interval_to_ts(us: i64, months: i32, days: i32, micros: i64) -
     let total_days = days_from_civil(y, mo, d).checked_add(days as i64)?;
     let ts = total_days.checked_mul(US_PER_DAY)?.checked_add(c.tod)?;
     ts.checked_add(micros)
+}
+
+/// Adds `n` units plus `frac` millionths of a unit (`frac` carries `n`'s sign) of the interval
+/// unit named `word` (any `date_part` spelling: `h`, `mons`, `millennia`, ...) into `acc`, which
+/// is `[months, days, micros]`. This is DuckDB's `Interval::FromCString` per-unit rule: a
+/// fraction cascades into the next smaller field only, truncated there, so `'1.25 months'` is
+/// `1 month 7 days` (the remaining half day is dropped) and `'1.3 years'` is `1 year 3 months`;
+/// a fraction of a quarter or a week cascades one field further, and a fraction of a
+/// microsecond rounds half away from zero.
+///
+/// `SyntaxError` for a word that is not an interval unit (`dow`, `epoch`, ...), and
+/// `NumberOverflow` when a field overflows.
+pub(crate) fn add_interval_unit(word: &[u8], n: i64, frac: i64, acc: &mut [i64; 3]) -> Result<()> {
+    const MIL: i64 = 1_000_000;
+    let Some(p) = part_id(word) else { err!(SyntaxError) };
+    // (field, units of that field per unit, units of the next field per unit of this one).
+    let (field, mul, next) = match p {
+        P_MILLENNIUM => (0, 12_000, 0),
+        P_CENTURY => (0, 1_200, 0),
+        P_DECADE => (0, 120, 0),
+        P_YEAR => (0, 12, 0),
+        P_QUARTER => (0, 3, 30),
+        P_MONTH => (0, 1, 30),
+        P_WEEK => (1, 7, US_PER_DAY),
+        P_DAY => (1, 1, US_PER_DAY),
+        P_HOUR => (2, US_PER_HOUR, 0),
+        P_MINUTE => (2, US_PER_MIN, 0),
+        P_SECOND => (2, US_PER_SEC, 0),
+        P_MILLISECOND => (2, 1_000, 0),
+        P_MICROSECOND => (2, 1, 0),
+        _ => err!(SyntaxError),
+    };
+    let (n, frac) = if p == P_MICROSECOND { (n + frac * 2 / MIL, 0) } else { (n, frac) };
+    let whole = n.checked_mul(mul).and_then(|v| v.checked_add(frac * mul / MIL));
+    let Some(v) = whole.and_then(|v| acc[field].checked_add(v)) else { err!(NumberOverflow) };
+    acc[field] = v;
+    if next != 0 {
+        let Some(v) = acc[field + 1].checked_add(frac * mul % MIL * next / MIL) else {
+            err!(NumberOverflow)
+        };
+        acc[field + 1] = v;
+    }
+    Ok(())
+}
+
+/// The operator forms `plan::compile` lowers to function calls. A result that leaves its type's
+/// range is NULL, where DuckDB raises (this engine's convention for an undefined value).
+///
+/// - `F_TS_SUB`: `TIMESTAMP - TIMESTAMP`, an INTERVAL of whole days plus the remaining
+///   microseconds, both truncated toward zero (`-61 days -10:00:00`), as DuckDB builds it.
+/// - `F_TIME_ADD_IV`: `TIME + INTERVAL`. Only the time-of-day part of the microseconds field
+///   moves the clock, which then wraps around midnight; months and days are ignored (DuckDB).
+/// - `F_DATE_ADD_TIME`: `DATE + TIME`, a TIMESTAMP.
+/// - `F_IV_MUL_F` / `F_IV_DIV_F`: `INTERVAL * DOUBLE` and `INTERVAL / number`. DuckDB divides by
+///   multiplying with `1.0 / n` (a zero divisor is NULL), and both go through PostgreSQL's
+///   `interval_mul`, which cascades a fractional month into days (30 per month) and a fractional
+///   day into microseconds, rounding each cascade to a microsecond: `INTERVAL '1 month' / 7` is
+///   `4 days 06:51:25.6896`.
+pub(super) fn temporal_op(id: FuncId, a: &A) -> Option<i128> {
+    use crate::vector::{pack_interval, unpack_interval};
+    Some(match id {
+        F_TS_SUB => {
+            let d = a.int(0).checked_sub(a.int(1))?;
+            pack_interval(0, (d / US_PER_DAY) as i32, d % US_PER_DAY)
+        }
+        F_TIME_ADD_IV => {
+            let (_, _, u) = unpack_interval(a.i128(1));
+            (a.int(0) + u % US_PER_DAY).rem_euclid(US_PER_DAY) as i128
+        }
+        F_DATE_ADD_TIME => a.int(0).checked_mul(US_PER_DAY)?.checked_add(a.int(1))? as i128,
+        _ => {
+            let mut f = a.flt(1);
+            if id == F_IV_DIV_F {
+                if f == 0.0 {
+                    return None;
+                }
+                f = 1.0 / f;
+            }
+            let (m, d, u) = unpack_interval(a.i128(0));
+            let fits = |x: f64| (i32::MIN as f64..=i32::MAX as f64).contains(&x);
+            let (mf, df) = (m as f64 * f, d as f64 * f);
+            if !fits(mf) || !fits(df) {
+                return None;
+            }
+            let (rm, mut rd) = (mf as i32, df as i32);
+            let round_us = |x: f64| crate::expr::kernels::f_round(x * 1e6) / 1e6;
+            let month_rem = round_us((mf - rm as f64) * 30.0);
+            let day_rem = month_rem as i32;
+            let mut sec_rem = round_us((df - rd as f64 + month_rem - day_rem as f64) * 86_400.0);
+            if f_abs(sec_rem) >= 86_400.0 {
+                let k = (sec_rem / 86_400.0) as i32;
+                rd = rd.checked_add(k)?;
+                sec_rem -= k as f64 * 86_400.0;
+            }
+            let um = crate::expr::kernels::f_round(u as f64 * f + sec_rem * 1e6);
+            if !(-9.223_372_036_854_775e18..9.223_372_036_854_775e18).contains(&um) {
+                return None;
+            }
+            pack_interval(rm, rd.checked_add(day_rem)?, um as i64)
+        }
+    })
 }
 
 // =========================================================================
@@ -340,8 +517,7 @@ pub(crate) fn fmt_timestamp(us: i64, out: &mut Vec<u8>) {
 }
 
 /// Only `%Y %m %d %H %M %S %%` are interpreted. An unknown specifier is emitted verbatim, `%` and all.
-pub(super) fn strftime(us: i64, f: &[u8], out: &mut Vec<u8>) {
-    let c = civil(us);
+pub(super) fn strftime(c: &Civil, f: &[u8], out: &mut Vec<u8>) {
     let mut i = 0usize;
     while i < f.len() {
         if f[i] != b'%' || i + 1 >= f.len() {
@@ -351,7 +527,8 @@ pub(super) fn strftime(us: i64, f: &[u8], out: &mut Vec<u8>) {
         }
         i += 1;
         match f[i] {
-            b'Y' => pad(c.y, 4, out),
+            // A year before 0 is not zero-padded: DuckDB writes `-44`, not `-0044`.
+            b'Y' => pad(c.y, if c.y < 0 { 0 } else { 4 }, out),
             b'm' => pad(c.mo as i64, 2, out),
             b'd' => pad(c.d as i64, 2, out),
             b'H' => pad(c.tod / US_PER_HOUR, 2, out),
@@ -385,15 +562,21 @@ fn scan(s: &[u8], i: usize, lo: usize, hi: usize) -> Option<(i64, usize)> {
 }
 
 /// Reads `YYYY-MM-DD`. The position read up to is returned as well (for use from TIMESTAMP).
+///
+/// Like DuckDB, the separator may also be `/`, a space or `\`, as long as both separators are
+/// the same one (`'2024/1/5'` and `'2024 01 05'` are dates, `'2024/01-05'` is not). The year
+/// takes up to 7 digits, enough for DuckDB's last DATE (`5881580-07-10`); a value past the
+/// DATE range is caught by the caller's range check.
 fn scan_date(s: &[u8]) -> Option<(i64, usize)> {
     let neg = s.first() == Some(&b'-');
     let i = usize::from(neg);
-    let (y, i) = scan(s, i, 1, 6)?;
-    if s.get(i) != Some(&b'-') {
+    let (y, i) = scan(s, i, 1, 7)?;
+    let sep = *s.get(i)?;
+    if !matches!(sep, b'-' | b'/' | b' ' | b'\\') {
         return None;
     }
     let (m, i) = scan(s, i + 1, 1, 2)?;
-    if s.get(i) != Some(&b'-') {
+    if s.get(i) != Some(&sep) {
         return None;
     }
     let (d, i) = scan(s, i + 1, 1, 2)?;
@@ -402,7 +585,8 @@ fn scan_date(s: &[u8]) -> Option<(i64, usize)> {
     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m as u32) as i64 {
         return None;
     }
-    Some((days_from_civil(y, m as u32, d as u32), i))
+    let days = days_from_civil(y, m as u32, d as u32);
+    (DATE_MIN_DAYS..=DATE_MAX_DAYS).contains(&days).then_some((days, i))
 }
 
 /// Reads `HH:MM[:SS[.ffffff]]`.
@@ -457,38 +641,42 @@ pub(crate) fn parse_date(s: &[u8]) -> Option<i64> {
     // Only a well-formed time tail is accepted. DuckDB itself ignores *any* trailing text here
     // (even `'2024-01-01x'::DATE` gives `2024-01-01`); this stays stricter on purpose, so that
     // genuinely malformed input still becomes NULL -- see `docs/sql/limitations.md`.
-    let (_, j) = scan_time_tail(s, i)?;
-    if j == s.len() {
-        Some(d)
-    } else {
-        None
-    }
+    scan_time_tail(s, i).map(|_| d)
 }
 
 /// VARCHAR -> TIMESTAMP. `YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]][zone]`.
-/// A date alone counts as midnight.
+/// A date alone counts as midnight. A zone suffix is accepted but not applied: DuckDB keeps
+/// the wall-clock fields of a *without-time-zone* value unchanged.
 pub(crate) fn parse_timestamp(s: &[u8]) -> Option<i64> {
+    parse_ts(s, false)
+}
+
+/// VARCHAR -> TIMESTAMPTZ. The same text as `parse_timestamp`, but the zone offset is
+/// subtracted to normalize "that locale's wall-clock time" into a UTC instant (for example
+/// `12:00+09` is `03:00` in UTC). No offset counts as UTC (there is no session time zone; the
+/// same simplification as `CURRENT_TIMESTAMP` in `sql::now`).
+pub(crate) fn parse_timestamptz(s: &[u8]) -> Option<i64> {
+    parse_ts(s, true)
+}
+
+fn parse_ts(s: &[u8], apply_zone: bool) -> Option<i64> {
     let s = crate::expr::kernels::trim_space(s);
     let (d, i) = scan_date(s)?;
     let base = d.checked_mul(US_PER_DAY)?;
     if i == s.len() {
         return Some(base);
     }
-    let (t, j) = scan_time_tail(s, i)?;
-    if j == s.len() {
-        base.checked_add(t)
-    } else {
-        None
-    }
+    let (t, zone) = scan_time_tail(s, i)?;
+    base.checked_add(t)?.checked_sub(if apply_zone { zone } else { 0 })
 }
 
-/// Reads the `[ T]HH:MM[:SS[.ffffff]][zone]` tail that follows a date, with `i` at the separator.
-/// Returns the time of day in microseconds and the position just past the tail.
+/// Reads the `[ T]HH:MM[:SS[.ffffff]][zone]` tail that follows a date, with `i` at the separator,
+/// up to the end of `s`. Returns the time of day and the zone offset, both in microseconds.
 ///
 /// DuckDB allows more than one space between the date and the time
 /// (`'2024-01-01  10:00:00'::TIMESTAMP` is valid), so the run of spaces is consumed as one
 /// separator.
-fn scan_time_tail(s: &[u8], i: usize) -> Option<(i64, usize)> {
+fn scan_time_tail(s: &[u8], i: usize) -> Option<(i64, i64)> {
     let mut j = i;
     match s.get(j) {
         Some(b'T' | b't') => j += 1,
@@ -500,48 +688,50 @@ fn scan_time_tail(s: &[u8], i: usize) -> Option<(i64, usize)> {
         _ => return None,
     }
     let (t, k) = scan_time(s, j)?;
-    Some((t, scan_ignored_timestamp_offset(s, k)?))
+    Some((t, scan_zone(s, k)?))
 }
 
-/// Reads the (possibly absent) zone suffix DuckDB accepts when casting text to plain
-/// `TIMESTAMP`: nothing at all, `Z`, `[+-]HH`, `[+-]HHMM`, `[+-]HH:MM`, or a separate ` UTC`
-/// word. Returns the position just past it.
+/// Reads the (possibly absent) zone suffix DuckDB accepts after a time, which must end the
+/// text: nothing at all, `Z`, `[+-]HH`, `[+-]HHMM`, `[+-]HH:MM`, `[+-]HH:MM:SS`, or a separate
+/// ` UTC` word. Returns the offset in microseconds (east is positive).
 ///
-/// The offset is deliberately only read lexically, never applied: DuckDB accepts an ISO-8601
-/// zone on a *without-time-zone* value but keeps the wall-clock fields unchanged (the offset is
-/// meaningful only for TIMESTAMPTZ). It also accepts two-digit fields through `99`, so requiring
-/// real clock ranges would reject text DuckDB accepts even though the fields are never used.
-/// `UTC` is the only zone *name* accepted, matching DuckDB, which rejects ` GMT` and every other
-/// named zone unless the ICU extension is loaded.
-fn scan_ignored_timestamp_offset(s: &[u8], i: usize) -> Option<usize> {
-    match s.get(i) {
-        None => Some(i),
-        Some(b'Z') => Some(i + 1),
-        Some(b'+' | b'-') => {
-            let (_, j) = scan(s, i + 1, 2, 2)?;
+/// Every field is exactly two digits but not range-checked, as in DuckDB (`+99` and `+05:60`
+/// are accepted there too). `UTC` is the only zone *name* accepted, matching DuckDB, which
+/// rejects ` GMT` and every other named zone unless the ICU extension is loaded.
+fn scan_zone(s: &[u8], i: usize) -> Option<i64> {
+    let (secs, end) = match s.get(i) {
+        None => (0, i),
+        Some(b'Z') => (0, i + 1),
+        Some(&sign @ (b'+' | b'-')) => {
+            let (h, mut j) = scan(s, i + 1, 2, 2)?;
+            let mut secs = h * 3600;
             if s.get(j) == Some(&b':') {
-                let (_, k) = scan(s, j + 1, 2, 2)?;
-                Some(k)
-            } else if j + 2 <= s.len() && s[j..j + 2].iter().all(u8::is_ascii_digit) {
-                Some(j + 2)
-            } else {
-                Some(j)
+                let (m, k) = scan(s, j + 1, 2, 2)?;
+                secs += m * 60;
+                j = k;
+                if s.get(j) == Some(&b':') {
+                    let (x, k) = scan(s, j + 1, 2, 2)?;
+                    secs += x;
+                    j = k;
+                }
+            } else if let Some((m, k)) = scan(s, j, 2, 2) {
+                secs += m * 60;
+                j = k;
             }
+            (if sign == b'-' { -secs } else { secs }, j)
         }
-        Some(b' ') if s[i + 1..].eq_ignore_ascii_case(b"UTC") => Some(s.len()),
-        _ => None,
-    }
+        Some(b' ') if s[i + 1..].eq_ignore_ascii_case(b"UTC") => (0, s.len()),
+        _ => return None,
+    };
+    (end == s.len()).then_some(secs * US_PER_SEC)
 }
 
-/// VARCHAR -> TIME.
+/// VARCHAR -> TIME. A zone suffix is accepted and ignored, as DuckDB does for a plain TIME
+/// (`'12:00:00+05'::TIME` is `12:00:00`).
 pub(crate) fn parse_time(s: &[u8]) -> Option<i64> {
     let s = crate::expr::kernels::trim_space(s);
     let (t, i) = scan_time(s, 0)?;
-    if i == s.len() {
-        Some(t)
-    } else {
-        None
-    }
+    scan_zone(s, i).map(|_| t)
 }
 
 /// `YYYY-MM-DD HH:MM:SS[.ffffff]+00`. The physical representation is the same UTC microseconds as
@@ -551,52 +741,6 @@ pub(crate) fn parse_time(s: &[u8]) -> Option<i64> {
 pub(crate) fn fmt_timestamptz(us: i64, out: &mut Vec<u8>) {
     fmt_timestamp(us, out);
     out.extend_from_slice(b"+00");
-}
-
-/// Reads a `[+-]HH[:MM]` or `Z` time zone offset.
-/// Returns the offset in microseconds (east is positive). `None` if unreadable
-/// (the caller falls back to "no offset" = treating it as UTC).
-fn scan_offset(s: &[u8], i: usize) -> Option<(i64, usize)> {
-    match s.get(i) {
-        Some(b'Z') | Some(b'z') => Some((0, i + 1)),
-        Some(&sign @ (b'+' | b'-')) => {
-            let (h, j) = scan(s, i + 1, 1, 2)?;
-            let (m, j) = if s.get(j) == Some(&b':') { scan(s, j + 1, 2, 2)? } else { (0, j) };
-            if h > 23 || m > 59 {
-                return None;
-            }
-            let micros = (h * 3600 + m * 60) * 1_000_000;
-            Some((if sign == b'-' { -micros } else { micros }, j))
-        }
-        _ => None,
-    }
-}
-
-/// VARCHAR -> TIMESTAMPTZ. The date and time parts take the same form as `parse_timestamp`
-/// (`YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]]`), optionally followed by a time zone offset
-/// (`Z` or `[+-]HH[:MM]`). No offset counts as UTC (there is no session time zone; the same
-/// simplification as `CURRENT_TIMESTAMP` in `sql::now`). The offset is subtracted to normalize
-/// "that locale's wall-clock time" into a UTC instant (for example `12:00+09` is `03:00` in UTC).
-pub(crate) fn parse_timestamptz(s: &[u8]) -> Option<i64> {
-    let s = crate::expr::kernels::trim_space(s);
-    let (d, i) = scan_date(s)?;
-    let base = d.checked_mul(US_PER_DAY)?;
-    if i == s.len() {
-        return Some(base);
-    }
-    if s[i] != b' ' && s[i] != b'T' && s[i] != b't' {
-        return None;
-    }
-    let (t, j) = scan_time(s, i + 1)?;
-    let local = base.checked_add(t)?;
-    if j == s.len() {
-        return Some(local);
-    }
-    let (offset, k) = scan_offset(s, j)?;
-    if k != s.len() {
-        return None;
-    }
-    local.checked_sub(offset)
 }
 
 fn hex_digit(n: u8) -> u8 {

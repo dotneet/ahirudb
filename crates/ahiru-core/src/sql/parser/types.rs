@@ -273,54 +273,10 @@ pub(super) fn lookup_type(name: &[u8]) -> Option<Ty> {
 }
 
 // --- INTERVAL literals -------------------------------------------------------
-// The 8 units listed in DESIGN.md §7 (year, month, day, hour, minute, second,
-// millisecond, microsecond) plus `week`, in both singular and plural. DuckDB's other
-// abbreviations (`mon`/`y`/`wk` and so on) are out of scope (a smaller table keeps code size down).
-
-#[derive(Clone, Copy)]
-pub(super) enum IntervalUnit {
-    Year,
-    Month,
-    Week,
-    Day,
-    Hour,
-    Minute,
-    Second,
-    Millisecond,
-    Microsecond,
-}
-
-static INTERVAL_UNITS: &[(&[u8], IntervalUnit)] = &[
-    (b"year", IntervalUnit::Year),
-    (b"years", IntervalUnit::Year),
-    (b"month", IntervalUnit::Month),
-    (b"months", IntervalUnit::Month),
-    // A week is exactly 7 days, and that is how DuckDB stores it too
-    // (`INTERVAL '3 weeks'` -> `21 days`); no new field is needed.
-    (b"week", IntervalUnit::Week),
-    (b"weeks", IntervalUnit::Week),
-    (b"day", IntervalUnit::Day),
-    (b"days", IntervalUnit::Day),
-    (b"hour", IntervalUnit::Hour),
-    (b"hours", IntervalUnit::Hour),
-    (b"minute", IntervalUnit::Minute),
-    (b"minutes", IntervalUnit::Minute),
-    (b"second", IntervalUnit::Second),
-    (b"seconds", IntervalUnit::Second),
-    (b"millisecond", IntervalUnit::Millisecond),
-    (b"milliseconds", IntervalUnit::Millisecond),
-    (b"microsecond", IntervalUnit::Microsecond),
-    (b"microseconds", IntervalUnit::Microsecond),
-];
-
-pub(super) fn lookup_interval_unit(name: &[u8]) -> Option<IntervalUnit> {
-    for &(n, u) in INTERVAL_UNITS {
-        if eq_ascii_ci(n, name) {
-            return Some(u);
-        }
-    }
-    None
-}
+// The unit words are every `date_part` spelling that names an interval unit (`year`, `mons`,
+// `h`, `millennia`, ...); `expr::funcs::add_interval_unit` resolves them and applies DuckDB's
+// per-unit rules, so the literal, `CAST(... AS INTERVAL)` and the `INTERVAL n unit` form
+// all accept the same words.
 
 /// A signed decimal integer. Surrounding whitespace is allowed (for the numeric pieces of `INTERVAL`).
 pub(super) fn parse_signed_int(s: &str) -> Option<i64> {
@@ -350,107 +306,23 @@ pub(super) fn parse_signed_int(s: &str) -> Option<i64> {
     }
 }
 
-/// Adds one unit's worth into the `(months, days, micros)` accumulator.
-fn add_interval_unit(
-    u: IntervalUnit,
-    n: i64,
-    months: &mut i64,
-    days: &mut i64,
-    micros: &mut i64,
-    pos: usize,
-) -> Result<()> {
-    add_scaled_unit(u, n as i128, 1, months, days, micros, pos)
-}
-
-/// Checked `i128` arithmetic that reports overflow as `NumberOverflow` at `pos`.
-fn ck(v: Option<i128>, pos: usize) -> Result<i128> {
-    match v {
-        Some(x) => Ok(x),
-        None => err!(NumberOverflow, pos),
-    }
-}
-
-/// Adds `num / den` of one unit into the `(months, days, micros)` accumulator.
-///
-/// `den` is always a power of ten (see `parse_decimal_amount`), so `num / den` is
-/// the exact decimal amount the user wrote; passing `den = 1` is the whole-number
-/// case. Each field keeps only its integer part and cascades the remainder into the
-/// next smaller one, using the same fixed conversions PostgreSQL and DuckDB use
-/// (1 year = 12 months, 1 month = 30 days, 1 day = 24 hours). Verified against the
-/// `duckdb` CLI:
-///   `1.25 years` -> 1 year 3 months        `0.5 months` -> 15 days
-///   `1.5 days`   -> 1 day 12:00:00         `1.5 weeks`  -> 10 days 12:00:00
-///   `1.5 hours`  -> 01:30:00               `1.5 seconds` -> 00:00:01.5
-fn add_scaled_unit(
-    u: IntervalUnit,
-    num: i128,
-    den: i128,
-    months: &mut i64,
-    days: &mut i64,
-    micros: &mut i64,
-    pos: usize,
-) -> Result<()> {
-    const US_PER_SEC: i128 = 1_000_000;
-    const US_PER_DAY: i128 = 24 * 60 * 60 * US_PER_SEC;
-    // How much of each field one whole unit is worth.
-    let (per_month, per_day, per_micro): (i128, i128, i128) = match u {
-        IntervalUnit::Year => (12, 0, 0),
-        IntervalUnit::Month => (1, 0, 0),
-        IntervalUnit::Week => (0, 7, 0),
-        IntervalUnit::Day => (0, 1, 0),
-        IntervalUnit::Hour => (0, 0, 60 * 60 * US_PER_SEC),
-        IntervalUnit::Minute => (0, 0, 60 * US_PER_SEC),
-        IntervalUnit::Second => (0, 0, US_PER_SEC),
-        IntervalUnit::Millisecond => (0, 0, 1_000),
-        IntervalUnit::Microsecond => (0, 0, 1),
-    };
-    // Every intermediate is kept as a numerator over the shared `den`, so nothing is
-    // rounded until a field's integer part is taken. `%` truncates toward zero in
-    // Rust, which is what a negative amount wants (`-1.5 days` -> -1 day -12:00:00).
-    let m_num = ck(num.checked_mul(per_month), pos)?;
-    let d_num = ck(
-        ck(num.checked_mul(per_day), pos)?.checked_add(ck((m_num % den).checked_mul(30), pos)?),
-        pos,
-    )?;
-    let u_num = ck(
-        ck(num.checked_mul(per_micro), pos)?
-            .checked_add(ck((d_num % den).checked_mul(US_PER_DAY), pos)?),
-        pos,
-    )?;
-    add(months, m_num / den, pos)?;
-    add(days, d_num / den, pos)?;
-    add(micros, u_num / den, pos)
-}
-
-/// Adds an `i128` delta into an `i64` accumulator, reporting overflow at `pos`.
-fn add(acc: &mut i64, delta: i128, pos: usize) -> Result<()> {
-    match i64::try_from(delta).ok().and_then(|d| acc.checked_add(d)) {
-        Some(v) => {
-            *acc = v;
-            Ok(())
-        }
-        None => err!(NumberOverflow, pos),
-    }
-}
-
 /// Packs after confirming that `months`/`days` fit in `i32`.
-fn pack_interval_checked(months: i64, days: i64, micros: i64, pos: usize) -> Result<i128> {
-    let m = match i32::try_from(months) {
-        Ok(v) => v,
-        Err(_) => err!(NumberOverflow, pos),
-    };
-    let d = match i32::try_from(days) {
-        Ok(v) => v,
-        Err(_) => err!(NumberOverflow, pos),
-    };
-    Ok(crate::vector::pack_interval(m, d, micros))
+fn pack_interval_checked(acc: [i64; 3], pos: usize) -> Result<i128> {
+    match (i32::try_from(acc[0]), i32::try_from(acc[1])) {
+        (Ok(m), Ok(d)) => Ok(crate::vector::pack_interval(m, d, acc[2])),
+        _ => err!(NumberOverflow, pos),
+    }
 }
 
-/// One `n UNIT` worth of INTERVAL.
-pub(super) fn unit_to_interval(u: IntervalUnit, n: i64, pos: usize) -> Result<i128> {
-    let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
-    add_interval_unit(u, n, &mut months, &mut days, &mut micros, pos)?;
-    pack_interval_checked(months, days, micros, pos)
+/// `n unit` as an INTERVAL (the `INTERVAL 3 DAY` / `INTERVAL '3' DAY` forms). `None` when
+/// `unit` is not an interval unit, so the caller can fall back to another reading.
+pub(super) fn unit_to_interval(unit: &str, n: i64, pos: usize) -> Option<Result<i128>> {
+    let mut acc = [0i64; 3];
+    match crate::expr::funcs::add_interval_unit(unit.as_bytes(), n, 0, &mut acc) {
+        Ok(()) => Some(pack_interval_checked(acc, pos)),
+        Err(e) if e.code == Code::SyntaxError => None,
+        Err(e) => Some(Err(Error::at(e.code, pos))),
+    }
 }
 
 /// A run of ASCII digits as an `i64`. Empty input, or any non-digit, is `None`.
@@ -469,56 +341,17 @@ fn digits_i64(s: &str) -> Option<i64> {
     Some(v)
 }
 
-/// A signed decimal amount, as the exact rational `num / den` where `den` is a power
-/// of ten (`"1.5"` -> `(15, 10)`, `"-2"` -> `(-2, 1)`). This is what lets
-/// `INTERVAL '1.5 days'` be exact without any floating point.
-fn parse_decimal_amount(s: &str) -> Option<(i128, i128)> {
-    let b = s.as_bytes();
-    let (neg, rest) = match b.first()? {
-        b'-' => (true, &b[1..]),
-        b'+' => (false, &b[1..]),
-        _ => (false, b),
-    };
-    let (mut num, mut den, mut seen, mut in_frac) = (0i128, 1i128, false, false);
-    for &c in rest {
-        if c == b'.' {
-            if in_frac {
-                return None;
-            }
-            in_frac = true;
-            continue;
-        }
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        num = num.checked_mul(10)?.checked_add((c - b'0') as i128)?;
-        if in_frac {
-            den = den.checked_mul(10)?;
-        }
-        seen = true;
-    }
-    if !seen {
-        return None;
-    }
-    Some(if neg { (-num, den) } else { (num, den) })
-}
-
-/// A bare time component, `[+|-]HH:MM[:SS[.frac]]`, in microseconds.
+/// A bare time component, `HH:MM[:SS[.frac]]`, in microseconds.
 ///
 /// This is the shape an interval *prints* as, so accepting it is what makes an
 /// interval this engine emitted readable back in. DuckDB accepts it inside any
-/// INTERVAL string, on its own (`'1:30:00'`, `'01:02'`, `'01:02:03.5'`) or mixed with
-/// unit terms (`'1 day 01:02:03'`, `'-2 days -03:04:05'`). The hour field is not
-/// wrapped at 24 (`'100:00:00'` is 100 hours), and the fraction is truncated at
-/// microsecond resolution.
+/// INTERVAL string, on its own (`'1:30:00'`, `'01:02'`, `'01:02:03.5'`) or after unit
+/// terms (`'1 day 01:02:03'`, `'-2 days -03:04:05'`). The hour field is not wrapped at 24
+/// (`'100:00:00'` is 100 hours), but minutes and seconds must be below 60, and the
+/// fraction is truncated at microsecond resolution.
 fn parse_time_component(s: &str) -> Option<i64> {
     const US_PER_SEC: i64 = 1_000_000;
-    let (neg, rest) = match s.as_bytes().first()? {
-        b'-' => (true, &s[1..]),
-        b'+' => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let mut it = rest.split(':');
+    let mut it = s.trim_end().split(':');
     let hours = digits_i64(it.next()?)?;
     let minutes = digits_i64(it.next()?)?;
     let (secs, frac_us) = match it.next() {
@@ -541,49 +374,94 @@ fn parse_time_component(s: &str) -> Option<i64> {
                     }
                     us += (c - b'0') as i64 * scale;
                     scale /= 10;
-                    if scale == 0 {
-                        break;
-                    }
                 }
             }
             (digits_i64(whole)?, us)
         }
     };
-    if it.next().is_some() {
+    if it.next().is_some() || minutes >= 60 || secs >= 60 {
         return None;
     }
-    let total = hours
+    hours
         .checked_mul(60 * 60 * US_PER_SEC)?
-        .checked_add(minutes.checked_mul(60 * US_PER_SEC)?)?
-        .checked_add(secs.checked_mul(US_PER_SEC)?)?
-        .checked_add(frac_us)?;
-    Some(if neg { -total } else { total })
+        .checked_add(minutes * 60 * US_PER_SEC + secs * US_PER_SEC + frac_us)
 }
 
-/// The compound form `'<n> <unit> [<n> <unit> ...] [HH:MM[:SS[.frac]]]'`. Terms are
-/// simply added, so repeated units accumulate (DuckDB likewise treats `'1 month 1
-/// month'` as `2 months`), and any term may be fractional or a bare time component.
+/// INTERVAL text, as DuckDB's `Interval::FromCString` reads it: an optional `@`, then terms
+/// `[-]<n>[.<frac>] <unit>` (the space before the unit is optional: `'1h'`, `'1 day1 hour'`),
+/// optionally a trailing `HH:MM[:SS[.frac]]` time component (a `-` before it negates the
+/// microseconds accumulated so far, as in DuckDB), and optionally a final `ago` that negates
+/// everything (`'1 day ago'` is `-1 day`). A bare number is seconds (`'1.5'`). Repeated units
+/// accumulate (`'1 month 1 month'` is `2 months`). See `add_interval_unit` for how a fraction
+/// cascades.
 pub(crate) fn parse_interval_text(text: &str, pos: usize) -> Result<i128> {
-    let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
+    let s = text.as_bytes();
+    let space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n');
+    let mut acc = [0i64; 3];
     let mut any = false;
-    let mut it = text.split_ascii_whitespace();
-    while let Some(tok) = it.next() {
-        // A time component carries its units in its own shape, so unlike every other
-        // term it is not followed by a unit word.
-        if tok.as_bytes().contains(&b':') {
-            let Some(us) = parse_time_component(tok) else { err!(SyntaxError, pos) };
-            add(&mut micros, us as i128, pos)?;
-            any = true;
-            continue;
+    let mut i = usize::from(s.first() == Some(&b'@'));
+    loop {
+        while s.get(i).is_some_and(space) {
+            i += 1;
         }
-        let Some((num, den)) = parse_decimal_amount(tok) else { err!(SyntaxError, pos) };
-        let Some(unit_tok) = it.next() else { err!(SyntaxError, pos) };
-        let Some(unit) = lookup_interval_unit(unit_tok.as_bytes()) else { err!(SyntaxError, pos) };
-        add_scaled_unit(unit, num, den, &mut months, &mut days, &mut micros, pos)?;
+        let Some(&c) = s.get(i) else { break };
+        if c == b'a' || c == b'A' {
+            let ago = s.len() - i >= 3 && s[i + 1..i + 3].eq_ignore_ascii_case(b"go");
+            ensure!(ago && s[i + 3..].iter().all(space), SyntaxError, pos);
+            acc = [-acc[0], -acc[1], -acc[2]];
+            break;
+        }
+        let neg = c == b'-';
+        let start = i + usize::from(neg);
+        let mut j = start;
+        while s.get(j).is_some_and(u8::is_ascii_digit) {
+            j += 1;
+        }
+        if s.get(j) == Some(&b':') {
+            // The time component runs to the end of the text.
+            let Some(t) = parse_time_component(&text[start..]) else { err!(SyntaxError, pos) };
+            let Some(u) = acc[2].checked_add(t) else { err!(NumberOverflow, pos) };
+            acc[2] = if neg { -u } else { u };
+            any = true;
+            break;
+        }
+        ensure!(j > start, SyntaxError, pos);
+        let Some(mut n) = digits_i64(&text[start..j]) else { err!(NumberOverflow, pos) };
+        let mut frac = 0i64;
+        if s.get(j) == Some(&b'.') {
+            j += 1;
+            let mut mult = 100_000;
+            while let Some(d) = s.get(j).filter(|d| d.is_ascii_digit()) {
+                frac += (d - b'0') as i64 * mult;
+                mult /= 10;
+                j += 1;
+            }
+        }
+        if neg {
+            (n, frac) = (-n, -frac);
+        }
+        while s.get(j).is_some_and(space) {
+            j += 1;
+        }
+        let w = j;
+        while s.get(j).is_some_and(u8::is_ascii_alphabetic) {
+            j += 1;
+        }
+        // A bare number is seconds, but only as the whole text.
+        let unit = if j == w {
+            ensure!(!any && j == s.len(), SyntaxError, pos);
+            "second"
+        } else {
+            &text[w..j]
+        };
+        if let Err(e) = crate::expr::funcs::add_interval_unit(unit.as_bytes(), n, frac, &mut acc) {
+            return Err(Error::at(e.code, pos));
+        }
         any = true;
+        i = j;
     }
     ensure!(any, SyntaxError, pos);
-    pack_interval_checked(months, days, micros, pos)
+    pack_interval_checked(acc, pos)
 }
 
 #[cfg(test)]
