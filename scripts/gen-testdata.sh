@@ -331,6 +331,33 @@ pq.write_table(
 )
 PY
 
+  # -0.0 in FLOAT/DOUBLE columns with Bloom filters. pyarrow hashes the bits of
+  # -0.0 as written (DuckDB normalizes to +0.0 first), so probing the filter with
+  # +0.0 for `d = 0.0` would wrongly report the value absent.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+vals = [-0.0 if i % 2 == 0 else 5.0 for i in range(10)]
+table = pa.table({"d": pa.array(vals, type=pa.float64()), "f": pa.array(vals, type=pa.float32())})
+pq.write_table(
+    table, "negzero_bloom.parquet",
+    bloom_filter_options={"d": {"ndv": 10, "fpp": 0.01}, "f": {"ndv": 10, "fpp": 0.01}},
+)
+PY
+
+  # Repeated column names (exactly and ignoring case). DuckDB refuses to write
+  # them; pyarrow writes them as asked. DuckDB reads them as a, a_1, A_2.
+  python3 - <<'PY'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+table = pa.Table.from_arrays(
+    [pa.array([1, 2]), pa.array([3, 4]), pa.array([5, 6])], names=["a", "a", "A"]
+)
+pq.write_table(table, "dup_names.parquet")
+PY
+
   # A footer that does not fit the 64 KiB speculative tail fetch
   # (`parquet::file::FOOTER_PROBE`). `format::parquet::resolve` has to notice and
   # refetch the exact footer range instead of probing the same tail again.
@@ -589,6 +616,12 @@ COPY (SELECT * FROM (VALUES
     (4, 'Dave', 'west'), (5, 'Erin', 'north'), (6, 'Frank', 'south')
   ) AS t(customer_id, name, region))
 TO 'customers.parquet' (FORMAT PARQUET);"
+
+# --- Third-party files ----------------------------------------------------
+# tests/data/parquet-testing/ holds files copied unmodified from
+# https://github.com/apache/parquet-testing (Apache-2.0; see the NOTICE there).
+# They cover writer quirks neither DuckDB nor pyarrow reproduces, so they are
+# not regenerated here.
 
 echo
 ls -la

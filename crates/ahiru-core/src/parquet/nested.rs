@@ -292,12 +292,20 @@ fn read_nested_page_v1(
     let page = reader::decompress(meta.codec, raw, hdr.uncompressed_page_size, raw_off, cache)?;
     let mut off = 0usize;
 
-    ensure!(dp.repetition_level_encoding == Encoding::Rle, UnsupportedEncoding);
+    // A level stream whose max level is 0 is not written at all, so its declared
+    // encoding (Impala writes BIT_PACKED) is irrelevant -- as in the flat reader.
+    ensure!(
+        max_rep_level == 0 || dp.repetition_level_encoding == Encoding::Rle,
+        UnsupportedEncoding
+    );
     ensure!(off <= page.len(), UnexpectedEof, off);
     let (rep_levels, used) = read_levels_v1(&page[off..], n, max_rep_level)?;
     off += used;
 
-    ensure!(dp.definition_level_encoding == Encoding::Rle, UnsupportedEncoding);
+    ensure!(
+        max_def_level == 0 || dp.definition_level_encoding == Encoding::Rle,
+        UnsupportedEncoding
+    );
     ensure!(off <= page.len(), UnexpectedEof, off);
     let (def_levels, used2) = read_levels_v1(&page[off..], n, max_def_level)?;
     off += used2;
@@ -552,15 +560,16 @@ fn consume_boundary(node: &NestedNode, cursors: &mut [LeafCursor]) {
     }
 }
 
-/// Render the "present" contents of a non-REPEATED node. If it has exactly
-/// one child and that child is itself REPEATED (a LIST/MAP wrapper group),
-/// delegate straight through without creating a name (otherwise we'd get an
-/// extra layer of nesting like `{"list": [...]}`).
+/// Render the "present" contents of a non-REPEATED node. A LIST/MAP wrapper
+/// group (`node.unwrap`) delegates straight through to its repeated child
+/// without creating a name (otherwise we'd get an extra layer of nesting like
+/// `{"list": [...]}`). An unannotated group is a STRUCT even when its only
+/// child is repeated: `{"phone": [...]}`, as DuckDB and pyarrow read it.
 fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
         NestedContent::Leaf(idx) => take_leaf_value(*idx, cursors),
         NestedContent::Group(children) => {
-            if children.len() == 1 && children[0].repetition == Repetition::Repeated {
+            if node.unwrap {
                 return assemble(&children[0], cursors);
             }
             let mut obj = Vec::with_capacity(children.len());
@@ -572,17 +581,16 @@ fn render_present(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonV
     }
 }
 
-/// Render "one element's worth" of a REPEATED node. If it has exactly one
-/// child (the intermediate group of 3-level/2-level encoding, or the element
-/// of a LIST<STRUCT>), use that child directly as the element (unlike
-/// `render_present`, this doesn't care whether it's REPEATED -- the sole
-/// child of a repeated node is always passed through unwrapped). If it has
-/// two or more children (e.g. a MAP's key/value), it becomes a named object.
+/// Render "one element's worth" of a REPEATED node. When the LIST rules make
+/// its one child the element (`node.unwrap`: the intermediate group of the
+/// 3-level encoding), that child is used directly. Otherwise the repeated
+/// group itself is the element and becomes a named object (a MAP's
+/// key/value, a legacy `array` group, a bare repeated group).
 fn render_element(node: &NestedNode, cursors: &mut [LeafCursor]) -> Result<JsonValue> {
     match &node.content {
         NestedContent::Leaf(idx) => take_leaf_value(*idx, cursors),
         NestedContent::Group(children) => {
-            if children.len() == 1 {
+            if node.unwrap {
                 return assemble(&children[0], cursors);
             }
             let mut obj = Vec::with_capacity(children.len());

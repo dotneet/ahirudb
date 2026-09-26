@@ -82,6 +82,12 @@ pub struct NestedNode {
     /// this node (any leaf under this node gives the same answer for this node's
     /// presence and repeat count).
     pub rep_leaf: usize,
+    /// Whether rendering passes straight through this group to its single child.
+    /// Set on a LIST/MAP-annotated group (whose repeated child is the list itself),
+    /// and on that repeated child when the Parquet spec's LIST backward-compatibility
+    /// rules make its one field the element. Any other group, including one whose
+    /// only child happens to be repeated, renders as an object of its fields.
+    pub unwrap: bool,
 }
 
 pub enum NestedContent {
@@ -332,6 +338,17 @@ fn build_nested_node(
             children.push(child);
             p = next;
         }
+        let unwrap =
+            list_or_map(e) && children.len() == 1 && children[0].repetition == Repetition::Repeated;
+        if unwrap && is_list(e) {
+            // LIST backward-compatibility rules: the repeated field is itself the element when
+            // it has several fields or is named `array` / `<list name>_tuple`; otherwise its
+            // one field is.
+            let r = &mut children[0];
+            let one_field = matches!(&r.content, NestedContent::Group(g) if g.len() == 1);
+            let tuple = r.name.strip_suffix("_tuple") == Some(e.name.as_str());
+            r.unwrap = one_field && r.name != "array" && !tuple;
+        }
         // A group with zero children (nchildren == 0 never reaches here) can't
         // happen, but the situation where `first()` is `None` (a corrupted schema
         // where nchildren > 0 yet no children were consumed) is already rejected
@@ -345,6 +362,7 @@ fn build_nested_node(
                 rep_depth,
                 content: NestedContent::Group(children),
                 rep_leaf,
+                unwrap,
             },
             p,
         ))
@@ -374,10 +392,21 @@ fn build_nested_node(
                 rep_depth,
                 content: NestedContent::Leaf(leaf_index),
                 rep_leaf: leaf_index,
+                unwrap: false,
             },
             pos + 1,
         ))
     }
+}
+
+fn is_list(e: &SchemaElement) -> bool {
+    e.converted_type == Some(ConvertedType::List) || matches!(e.logical, Some(LogicalType::List))
+}
+
+fn list_or_map(e: &SchemaElement) -> bool {
+    is_list(e)
+        || matches!(e.converted_type, Some(ConvertedType::Map | ConvertedType::MapKeyValue))
+        || matches!(e.logical, Some(LogicalType::Map))
 }
 
 /// Turns a single leaf element into a `ColumnDesc`. `max_def_level` is passed in
@@ -789,6 +818,46 @@ mod tests {
         assert_eq!(s.columns[0].phys_cols, vec![0]);
         let node = s.columns[0].nested.as_ref().unwrap();
         assert_eq!(node.repetition, Repetition::Repeated);
+    }
+
+    /// Which groups render through to their single child follows the Parquet spec's
+    /// LIST backward-compatibility rules; an unannotated group never does.
+    #[test]
+    fn list_backward_compatibility_rules_pick_the_element() {
+        fn group(name: &str, rep: Repetition, n: i32, ct: Option<ConvertedType>) -> SchemaElement {
+            let mut e = elem(name, None, rep);
+            e.num_children = Some(n);
+            e.converted_type = ct;
+            e
+        }
+        let leaf = |name: &str| elem(name, Some(PType::Int32), Repetition::Required);
+        // `(outer group, repeated group name)` -> (outer unwraps, repeated group unwraps)
+        let list = Some(ConvertedType::List);
+        let cases = [
+            ("l", list, "list", true, true), // standard 3-level: the one field is the element
+            ("l", list, "array", true, false), // legacy: the repeated group is the element
+            ("l", list, "l_tuple", true, false),
+            ("l", None, "list", false, false), // unannotated: a STRUCT with a list field
+        ];
+        for (outer, ct, rname, outer_unwraps, rep_unwraps) in cases {
+            let md = FileMetaData {
+                version: 2,
+                schema: vec![
+                    root(1),
+                    group(outer, Repetition::Optional, 1, ct),
+                    group(rname, Repetition::Repeated, 1, None),
+                    leaf("x"),
+                ],
+                num_rows: 0,
+                row_groups: Vec::new(),
+                created_by: None,
+            };
+            let s = resolve_schema(&md).unwrap();
+            let node = s.columns[0].nested.as_ref().unwrap();
+            assert_eq!(node.unwrap, outer_unwraps, "{rname}");
+            let NestedContent::Group(children) = &node.content else { panic!() };
+            assert_eq!(children[0].unwrap, rep_unwraps, "{rname}");
+        }
     }
 
     // --- End-to-end verification through real files (DuckDB output) ------------

@@ -27,6 +27,15 @@ never changes query results.
 | `JSON` | Dynamically-typed JSON document. Also how Parquet `LIST`/`MAP` values are exposed — see [data-sources.md](data-sources.md#nested-parquet-types) |
 | `UUID` | 16-byte UUID, displayed/parsed as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. See [UUID](#uuid) below |
 
+There is no nanosecond type. A Parquet `TIMESTAMP(NANOS)` column (DuckDB's
+`TIMESTAMP_NS`) reads as `TIMESTAMP` (`TIMESTAMPTZ` when adjusted to UTC),
+and `TIME(NANOS)` as `TIME`, with the sub-microsecond digits dropped —
+truncated toward zero, so `1969-12-31 23:59:59.999999999` reads as
+`1970-01-01 00:00:00`, and `typeof` says `TIMESTAMP` where DuckDB says
+`TIMESTAMP_NS`. Nothing reports the loss; see
+[limitations.md](limitations.md#partially-supported). (DuckDB itself reads
+`INT96` timestamps as microseconds, and the two agree there.)
+
 ## Integer promotion and mixed-type arithmetic
 
 Kernels only exist for 6 physical types, so logical types are promoted onto
