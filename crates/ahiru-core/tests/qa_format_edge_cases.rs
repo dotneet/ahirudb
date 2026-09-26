@@ -113,7 +113,7 @@ fn crlf_and_lf_records_mixed_in_the_same_file_are_both_accepted() {
 
 #[test]
 fn csv_values_outside_the_sampled_type_are_a_conversion_error_not_a_silent_null() {
-    // The inferred type comes from the first SAMPLE_ROWS rows only
+    // The inferred type comes from the leading 256 KiB only
     // (`format::csv`'s module doc), so a later row can genuinely fall
     // outside it. Such a value used to be turned into NULL, which quietly
     // dropped data the file plainly contains and made `count(n)` disagree
@@ -121,8 +121,8 @@ fn csv_values_outside_the_sampled_type_are_a_conversion_error_not_a_silent_null(
     // `docs/DESIGN.md` §15 says the engine never produces. It is now
     // `InvalidCast`, which is what DuckDB reports for the same file.
     let mut csv = String::from("n\n");
-    for i in 0..1001 {
-        csv.push_str(&format!("{i}\n"));
+    while csv.len() <= 256 * 1024 {
+        csv.push_str("1234567\n");
     }
     csv.push_str("not_a_number\n");
     let mut sess = Session::new();
@@ -442,26 +442,33 @@ fn json_booleans_mixed_with_numbers_keep_both_values() {
 }
 
 #[test]
-fn json_values_outside_the_sampled_type_are_a_conversion_error() {
-    // The `.json` reader silently nulled a value that did not fit the type
-    // inferred from the leading elements, dropping data the file plainly
-    // contains. `format::csv` / `format::jsonl` and duckdb all report a
-    // conversion error, and so does this now.
-    let mut text = String::from("[");
-    for i in 0..1001 {
-        if i > 0 {
-            text.push(',');
-        }
-        text.push_str("{\"a\":1}");
+fn a_late_value_widens_the_column_inside_the_sample() {
+    // Inference used to stop after 1000 rows / lines / elements although the docs promise the
+    // leading 256 KiB, so a 13 KB file with a string at row 1200 failed with InvalidCast, and a
+    // JSONL key first seen at line 1200 made even `count(*)` fail with ColumnNotFound. DuckDB
+    // reads all of them.
+    let mut csv = String::from("n\n");
+    let mut jsonl = String::new();
+    let mut json = String::from("[");
+    for i in 0..1200 {
+        csv.push_str(&format!("{i}\n"));
+        jsonl.push_str("{\"a\":1}\n");
+        json.push_str("{\"a\":1},");
     }
-    text.push_str(",{\"a\":\"x\"}]");
-    let mut sess = Session::new();
-    sess.register_bytes_as("t", text.into_bytes(), FormatKind::Json).unwrap();
-    let mut q = match sess.prepare("SELECT count(a) FROM t", &[]).unwrap() {
-        Prepared::Ready(q) => q,
-        Prepared::NeedIo(_) => panic!("in-memory bytes never need IO"),
-    };
-    assert_eq!(code_of(sess.step(&mut q)), Some(Code::InvalidCast));
+    csv.push_str("x\n");
+    jsonl.push_str("{\"a\":\"x\",\"b\":2}\n");
+    json.push_str("{\"a\":\"x\"}]");
+    let cases = [
+        (csv, FormatKind::Csv, "n"),
+        (jsonl, FormatKind::Jsonl, "a"),
+        (json, FormatKind::Json, "a"),
+    ];
+    for (text, kind, col) in cases {
+        let mut sess = Session::new();
+        sess.register_bytes_as("t", text.into_bytes(), kind).unwrap();
+        let rows = run_all(&format!("SELECT count(*), count({col}) FROM t"), &mut sess);
+        assert_eq!(rows, [[Value::I64(1201), Value::I64(1201)]], "{kind:?}");
+    }
 }
 
 #[test]
@@ -522,7 +529,7 @@ fn jsonl_values_outside_the_sampled_type_are_a_conversion_error() {
     // Same rule as CSV: inference sees a bounded leading sample, and a later line holding a value
     // the inferred type cannot express is `InvalidCast` rather than a silently NULLed row.
     let mut jsonl = String::new();
-    for _ in 0..1001 {
+    while jsonl.len() <= 256 * 1024 {
         jsonl.push_str("{\"a\":1}\n");
     }
     jsonl.push_str("{\"a\":2.5}\n");

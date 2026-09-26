@@ -54,9 +54,10 @@ SELECT * FROM 'star*.csv';    -- every file matching star*.csv
 
 ## Text-format type inference
 
-CSV/TSV column types are sniffed from a leading sample of the file (up to
-256 KiB), JSON/JSONL types from the values actually seen. What the sniffer
-does with an ambiguous or mixed column:
+CSV/TSV and JSONL column types are sniffed from every complete record in a
+leading sample of the file (up to 256 KiB); a single-document `.json` file
+is resident as a whole, so its types come from every element. What the
+sniffer does with an ambiguous or mixed column:
 
 | Input | Inferred | Why |
 |---|---|---|
@@ -70,8 +71,8 @@ The sample is the leading 256 KiB, grown (up to 1 MiB, the longest record
 the readers accept) when that does not contain one complete record — so a
 CSV header, or a first JSONL line, longer than 256 KiB still reads.
 
-A value **outside** the sample that doesn't fit the inferred type raises a
-conversion error rather than becoming `NULL` — see
+In a CSV/TSV or JSONL file, a value **outside** the sample that doesn't fit
+the inferred type raises a conversion error rather than becoming `NULL` — see
 [limitations.md](limitations.md#partially-supported), where the divergence
 from DuckDB (which re-sniffs and widens) is spelled out.
 
@@ -81,11 +82,9 @@ each one has in hand:
 
 - **`.json`** (one document) has the whole document resident and walks
   every element anyway, so *every* element contributes its keys: the column
-  set is always complete, no matter how late a key first appears. Only the
-  types of the columns the sample settled on stay frozen (which is what
-  produces the conversion error above). A column discovered past the sample
-  has no sample evidence at all, so its type widens over every element it
-  appears in.
+  set is always complete, no matter how late a key first appears, and every
+  element contributes to the column types too, so a late value widens its
+  column instead of failing the read.
 - **JSONL/NDJSON** is read split by split, and the schema has to be fixed
   before the first split is read, so a complete key set is not knowable up
   front. A key with no column is reported as a `ColumnNotFound` error

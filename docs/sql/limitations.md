@@ -222,10 +222,21 @@ user-visible effect.
   `TypeMismatch` — there the schema is authoritative, and a silent widening
   would be hiding a mistake rather than tolerating one. See
   [data-sources.md](data-sources.md#text-format-type-inference).
+- **Nanosecond timestamps lose their sub-microsecond digits.** A Parquet
+  `TIMESTAMP(NANOS)`/`TIME(NANOS)` column (DuckDB's `TIMESTAMP_NS`) reads as
+  the microsecond `TIMESTAMP`/`TIME`, truncating toward zero, without a
+  warning — so two values 1 ns apart can compare equal, and `-1 ns` reads as
+  the epoch. DuckDB keeps `TIMESTAMP_NS`. See
+  [types.md](types.md#logical-types).
+- **The CSV delimiter is not sniffed.** It comes from the extension alone:
+  `.csv` is comma-separated and `.tsv` tab-separated, so a `;`- or
+  `|`-separated `.csv` file reads as a single column. DuckDB sniffs the
+  delimiter (and quote/escape characters) from the file.
 - **A value outside the inference sample that doesn't fit the inferred type
   is an error, not a `NULL`.** If a CSV column sniffs as an integer from
-  its first 256 KiB and row 60,001 holds `notanumber`, the query fails with
-  `invalid cast`. DuckDB re-sniffs and widens the column instead, so the
+  its first 256 KiB and a row past those 256 KiB holds `notanumber` (every
+  complete record inside them takes part in the sniffing), the query fails
+  with `invalid cast`. DuckDB re-sniffs and widens the column instead, so the
   same file counts fine there. Erroring is the deliberate choice: silently
   nulling the row destroyed data, and this engine would rather fail loudly.
   Cast the column explicitly (`CAST(... AS VARCHAR)` at the source, or a

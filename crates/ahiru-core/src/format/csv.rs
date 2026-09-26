@@ -53,9 +53,6 @@ const SAMPLE_BYTES: u64 = 256 * 1024;
 /// record the reader accepts anyway, so nothing is gained by asking for more.
 const MAX_SAMPLE_BYTES: u64 = TEXT_MAX_RECORD;
 
-/// The maximum number of rows used for type inference. The sample bytes may run out first.
-const SAMPLE_ROWS: usize = 1000;
-
 /// The initial row capacity of a column buffer. The input is untrusted, so the allocation is not
 /// sized from an estimated row count (so a huge allocation cannot be planted).
 const ROW_CAP: usize = 256;
@@ -312,7 +309,9 @@ impl TableFormat for CsvFormat {
             let blank_is_row = Self::blank_line_is_a_row(cands.len());
             let mut sc = Scanner::new(rest, self.delimiter).with_cr_term(self.cr_term);
             let mut rows = 0;
-            'sample: while rows < SAMPLE_ROWS && !sc.at_end() {
+            // Every complete record in the sample takes part: it is in hand already, and a row cap
+            // would let a short-row file hide most of its sample from the inference.
+            'sample: while !sc.at_end() {
                 if !blank_is_row && sc.skip_blank_line() {
                     continue;
                 }
@@ -1713,11 +1712,22 @@ mod tests {
     }
 
     #[test]
-    fn inference_uses_only_the_first_rows() {
-        // The first SAMPLE_ROWS rows are integers, with strings mixed in afterwards.
+    fn inference_uses_the_whole_leading_sample() {
+        // A string at row 1200 of a small file is inside the sample and widens the column (a
+        // 1000-row cap used to miss it and fail the read with InvalidCast).
         let mut s = String::from("c\n");
-        for i in 0..SAMPLE_ROWS {
+        for i in 0..1200 {
             s.push_str(&std::format!("{i}\n"));
+        }
+        s.push_str("oops\n");
+        let (f, src) = open(s.as_bytes(), b',');
+        assert_eq!(types(&f), vec![Ty::Varchar]);
+        assert_eq!(read_all(&f, &src, &[0])[0][1200], Value::Bytes(b"oops".to_vec()));
+
+        // Past the leading SAMPLE_BYTES, the rows are integers, with a string mixed in afterwards.
+        let mut s = String::from("c\n");
+        while s.len() <= SAMPLE_BYTES as usize {
+            s.push_str("1234567\n");
         }
         s.push_str("oops\n");
         let (f, src) = open(s.as_bytes(), b',');
@@ -2183,7 +2193,7 @@ mod tests {
         let row = "1,true,2024-01-01,2024-01-01 00:00:00\n";
         for col in 0..4 {
             let mut s = String::from(head);
-            for _ in 0..SAMPLE_ROWS {
+            while s.len() <= SAMPLE_BYTES as usize {
                 s.push_str(row);
             }
             // One bad cell in one column at a time.
