@@ -10,7 +10,7 @@ pub mod types;
 pub mod value;
 
 pub use bitmap::Bitmap;
-pub use types::{fmt_interval, pack_interval, unpack_interval, Field, PhysType, Ty};
+pub use types::{fmt_interval, pack_interval, unpack_interval, Field, PhysType, Shape, Ty};
 pub use value::Value;
 
 use crate::prelude::*;

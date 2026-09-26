@@ -1106,7 +1106,9 @@ pub(super) fn bind_select_in(
         let mut out_fields = Vec::new();
         for (i, &g) in group_exprs.iter().enumerate() {
             let p = compile(arena, &scope, params, g)?;
-            out_fields.push(Field::new(group_name(arena, g, i), p.result_ty, true));
+            out_fields.push(
+                Field::new(group_name(arena, g, i), p.result_ty, true).shaped(p.result_shape),
+            );
             subs.push(Substitution { expr: g, column: i, structural: true });
             groups.push(p);
         }
@@ -1186,7 +1188,10 @@ pub(super) fn bind_select_in(
 
         let mut out_fields: Vec<Field> = Vec::with_capacity(ngroups + agg_calls.len());
         for (i, &g) in group_exprs.iter().enumerate() {
-            out_fields.push(Field::new(group_name(arena, g, i), group_progs[i].result_ty, true));
+            let p = &group_progs[i];
+            out_fields.push(
+                Field::new(group_name(arena, g, i), p.result_ty, true).shaped(p.result_shape),
+            );
         }
 
         // Aggregates share the same input scope too, so they are built once and cloned per set.
@@ -1510,7 +1515,9 @@ pub(super) fn bind_select_in(
                             // select item (`item_scope`, which may include aggregate and window
                             // output). The column name itself is left unchanged.
                             let p = compile_with_subs(arena, &item_scope, params, &subs, rexpr)?;
-                            schema.push(Field::new(out_name, p.result_ty, true));
+                            schema.push(
+                                Field::new(out_name, p.result_ty, true).shaped(p.result_shape),
+                            );
                             exprs.push(p);
                         }
                         None => {
@@ -1530,7 +1537,7 @@ pub(super) fn bind_select_in(
                 };
                 aliased.resize(schema.len(), false);
                 aliased.push(item.alias.is_some());
-                schema.push(Field::new(name, p.result_ty, true));
+                schema.push(Field::new(name, p.result_ty, true).shaped(p.result_shape));
                 exprs.push(p);
             }
         }

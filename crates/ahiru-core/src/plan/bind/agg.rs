@@ -172,72 +172,19 @@ pub(super) fn collect_unnests(
 /// In this engine arrays and objects are all unified as `Ty::Json` (JSON text), and the
 /// element type cannot be known without seeing the real data (see the
 /// `vector::types::Ty::Json` docs). But a query's output column types must be settled at
-/// bind time (before execution), so this narrows only when a native type can be determined
-/// "safely" without reading the data.
-///
-/// The one case decidable without data is when `UNNEST`'s target is a direct call to
-/// `json_array(...)`/`list_value(...)` (the equivalent of DuckDB's list literal; this engine
-/// has no array literal syntax such as `[1,2,3]`, so this is how you write the equivalent of
-/// `duckdb -c "SELECT UNNEST([1,2,3])"`): each argument's **compile-time type** is known, so
-/// whether every argument settles on the same non-JSON scalar type without nesting can be
-/// decided without reading a single row.
-///
-/// Everything else (the ordinary case of UNNESTing a table's JSON column itself) cannot be
-/// decided without reading real data, so `Ty::Json` is returned unchanged (per the task's
-/// requirement, no narrowing is needed in that case).
+/// bind time (before execution), so this narrows only when the argument's element type is
+/// known statically -- its `Shape` (see `vector::Shape`): a Parquet `LIST<scalar>` column,
+/// `string_split(...)`, a list literal of one scalar type, and the list functions that keep
+/// their input's elements. Anything else (a JSON column read from JSON/JSONL, a nested list)
+/// stays `Ty::Json`.
 pub(super) fn narrow_unnest_elem_ty(
     arena: &ExprArena,
     scope: &Scope,
     params: &[Value],
     arg: ExprId,
 ) -> Ty {
-    let (name, args) = match arena.get(arg) {
-        Expr::Function { name, args, distinct: false, star: false, filter: None } => (name, args),
-        _ => return Ty::Json,
-    };
-    let is_array_ctor =
-        eq_ascii_ci(name.as_bytes(), b"json_array") || eq_ascii_ci(name.as_bytes(), b"list_value");
-    if !is_array_ctor || args.is_empty() {
-        return Ty::Json;
-    }
-    let mut common: Option<Ty> = None;
-    for &a in args {
-        let ty = match compile(arena, scope, params, a) {
-            Ok(p) => p.result_ty,
-            Err(_) => return Ty::Json,
-        };
-        // If the argument is itself JSON (possibly containing arrays or objects), the premise
-        // that elements are "scalars without nesting" collapses, so give up.
-        if ty == Ty::Json {
-            return Ty::Json;
-        }
-        common = Some(match common {
-            None => ty,
-            Some(c) => match Ty::unify(c, ty) {
-                Some(u) => u,
-                None => return Ty::Json,
-            },
-        });
-    }
-    match common {
-        // The unified integer type has to survive: collapsing everything to BIGINT made
-        // `unnest([1, 9223372036854775808])` produce NULL for the second element, because the
-        // value does not fit i64. HUGEINT and UBIGINT both need the 128-bit column
-        // (duckdb answers HUGEINT here too).
-        Some(t) if t.is_integer() => {
-            if matches!(t, Ty::HugeInt | Ty::UBigInt) {
-                Ty::HugeInt
-            } else {
-                Ty::BigInt
-            }
-        }
-        Some(Ty::Float) | Some(Ty::Double) => Ty::Double,
-        Some(Ty::Varchar) => Ty::Varchar,
-        Some(Ty::Boolean) => Ty::Boolean,
-        // Recovery through JSON text is not implemented for DECIMAL/DATE/TIME/TIMESTAMP/NULL
-        // and the like (out of scope. Round-tripping them while preserving precision and
-        // formatting would require a dedicated JSON serialization convention for this engine,
-        // so the scope was narrowed).
+    match compile(arena, scope, params, arg).map(|p| p.result_shape) {
+        Ok(crate::vector::Shape::List(t)) if t != Ty::Null => t,
         _ => Ty::Json,
     }
 }

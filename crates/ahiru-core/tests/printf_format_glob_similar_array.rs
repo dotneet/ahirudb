@@ -64,11 +64,9 @@ fn array_literal_is_sugar_for_list_value() {
     let mut sess = session_with_basic();
     // duckdb: [1,2,3] = list_value(1,2,3) -> true
     assert_eq!(one(&mut sess, "[1, 2, 3] = list_value(1, 2, 3)"), Value::Bool(true));
-    // duckdb: [1,2,3][1] -> 1 (1-based; confirmed via list_extract).
-    // `list_extract`'s result is designed to return Ty::Json (raw JSON text), so the
-    // expected value is also the text "10" (see the module-top doc on `list_extract` and the
-    // `list_extract_is_one_based_with_negative_from_end` unit test in `funcs.rs`).
-    assert_eq!(one(&mut sess, "list_extract([10, 20, 30], 1)"), s("10"));
+    // duckdb: [1,2,3][1] -> 1 (1-based; confirmed via list_extract). The literal's element
+    // type is INTEGER, so the element comes back as one (as in DuckDB).
+    assert_eq!(one(&mut sess, "list_extract([10, 20, 30], 1)"), Value::I32(10));
     // duckdb: [] is a valid expression (an empty array). json_array_length([]) = 0.
     assert_eq!(one(&mut sess, "json_array_length([])"), Value::I64(0));
     // Mixed types are also allowed (same as `list_value`/`json_array`).

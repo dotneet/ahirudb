@@ -47,7 +47,7 @@ pub mod vm;
 pub(crate) mod float;
 
 use crate::prelude::*;
-use crate::vector::{PhysType, Ty, Value};
+use crate::vector::{PhysType, Shape, Ty, Value};
 
 /// A register number.
 pub type Reg = u16;
@@ -233,6 +233,8 @@ pub struct Program {
     pub result: Reg,
     /// The result's logical type.
     pub result_ty: Ty,
+    /// What is known about a `Ty::Json` result's elements (see `vector::Shape`).
+    pub result_shape: Shape,
 }
 
 impl Program {
@@ -248,6 +250,7 @@ impl Program {
             overflow: false,
             result: 0,
             result_ty: Ty::Null,
+            result_shape: Shape::Any,
         }
     }
 

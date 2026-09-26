@@ -162,7 +162,10 @@ const F_JSON_EXTRACT: FuncId = 80;
 const F_JSON_EXTRACT_STRING: FuncId = 81;
 const F_JSON_TYPE: FuncId = 82;
 const F_TO_JSON: FuncId = 83;
-const F_LIST_EXTRACT: FuncId = 84;
+// `list_extract` is `pub(crate)` along with its siblings below because
+// `plan::compile::Compiler::subscript` emits them directly: which one applies
+// depends on the base's `Shape`, which `resolve` does not see.
+pub(crate) const F_LIST_EXTRACT: FuncId = 84;
 const F_MAP_EXTRACT: FuncId = 85;
 const F_JSON_OBJECT: FuncId = 86;
 const F_JSON_ARRAY: FuncId = 87;
@@ -214,6 +217,11 @@ const F_CHR: FuncId = 99;
 // to 200.
 const F_JSON_EXTRACT_IDX: FuncId = 100;
 const F_JSON_EXTRACT_STRING_IDX: FuncId = 101;
+/// `list_extract` returning the element as text (see `Compiler::subscript`).
+pub(crate) const F_LIST_EXTRACT_TEXT: FuncId = 107;
+/// `m[k]` / `map_extract_value`: a MAP's value for a key, as JSON / as text.
+pub(crate) const F_MAP_VALUE: FuncId = 108;
+pub(crate) const F_MAP_VALUE_TEXT: FuncId = 109;
 const F_DAYNAME: FuncId = 110;
 const F_MONTHNAME: FuncId = 111;
 const F_HEX: FuncId = 112;

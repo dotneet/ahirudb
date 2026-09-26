@@ -12,7 +12,7 @@ use crate::plan::{AggKind, Scope};
 use crate::prelude::*;
 use crate::rt::hash::eq_ascii_ci;
 use crate::sql::ast::{BinaryOp, Expr, ExprArena, ExprId, UnaryOp};
-use crate::vector::{Field, Ty, Value};
+use crate::vector::{Field, Shape, Ty, Value};
 
 /// The expression nesting limit. The parser limits it too; this is a second layer of defense.
 const MAX_DEPTH: u32 = 64;
@@ -42,6 +42,11 @@ pub struct Compiler<'a> {
     subs: &'a [Substitution],
     prog: Program,
     depth: u32,
+    /// The `Shape` of the expression `expr` compiled last.
+    shape: Shape,
+    /// Written by the arm of `expr_inner` that knows its result's shape; `expr` moves it into
+    /// `shape` (so an arm that says nothing yields `Shape::Any`, never an operand's shape).
+    pending: Shape,
 }
 
 /// Compiles a single expression.
@@ -57,10 +62,20 @@ pub fn compile_with_subs(
     subs: &[Substitution],
     id: ExprId,
 ) -> Result<Program> {
-    let mut c = Compiler { arena, scope, params, subs, prog: Program::new(), depth: 0 };
+    let mut c = Compiler {
+        arena,
+        scope,
+        params,
+        subs,
+        prog: Program::new(),
+        depth: 0,
+        shape: Shape::Any,
+        pending: Shape::Any,
+    };
     let (reg, ty) = c.expr(id)?;
     c.prog.result = reg;
     c.prog.result_ty = ty;
+    c.prog.result_shape = c.shape;
     Ok(c.prog)
 }
 
@@ -105,8 +120,8 @@ fn boolean_null_program() -> Program {
 
 /// A program that just returns the input columns unchanged. Used by `SELECT *` and join keys.
 pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
-    let ty = match scope.fields().get(i) {
-        Some(f) => f.ty,
+    let (ty, shape) = match scope.fields().get(i) {
+        Some(f) => (f.ty, f.shape),
         None => err!(Internal),
     };
     let mut p = Program::new();
@@ -114,6 +129,7 @@ pub fn column_program(scope: &Scope, i: usize) -> Result<Program> {
     p.push(Instr::with_aux(OpCode::LoadCol, ty.phys(), dst, 0, 0, i as u16));
     p.result = dst;
     p.result_ty = ty;
+    p.result_shape = shape;
     Ok(p)
 }
 
@@ -489,6 +505,42 @@ fn expr_eq_at(arena: &ExprArena, scope: Option<&Scope>, a: ExprId, b: ExprId, de
     }
 }
 
+/// The `Shape` of a scalar function's result, given its (lower-case) name and its arguments'.
+fn result_shape(name: &str, tys: &[Ty], shapes: &[Shape]) -> Shape {
+    let first = shapes.first().copied().unwrap_or_default();
+    match name {
+        "string_split" | "str_split" | "string_to_array" | "split" => Shape::List(Ty::Varchar),
+        // A list literal: the arguments' common type, when they are all plain scalars.
+        "list_value" | "json_array" => {
+            let mut acc = Ty::Null;
+            for &t in tys {
+                match Ty::unify(acc, t) {
+                    Some(u) if u != Ty::Json => acc = u,
+                    _ => return Shape::Any,
+                }
+            }
+            if acc == Ty::Null {
+                Shape::Any
+            } else {
+                Shape::List(acc)
+            }
+        }
+        "list_sort" | "array_sort" | "list_reverse_sort" | "array_reverse_sort"
+        | "list_distinct" | "array_distinct" | "list_reverse" | "array_reverse" | "list_slice"
+        | "array_slice" => first,
+        "list_concat" | "list_cat" | "array_concat" | "array_cat"
+            if shapes.iter().all(|&s| s == first) =>
+        {
+            first
+        }
+        "map_extract" => match first {
+            Shape::Map(_, v) => Shape::List(v),
+            _ => Shape::Any,
+        },
+        _ => Shape::Any,
+    }
+}
+
 /// Whether this function name may take a lambda (the same fixed set as
 /// `sql::parser::is_lambda_func`. The parser reads `->` as a lambda only in the argument
 /// positions of these names, and after binding the same check dispatches to `Compiler::lambda_call` here).
@@ -516,10 +568,13 @@ impl<'a> Compiler<'a> {
             subs: self.subs,
             prog: Program::new(),
             depth: self.depth,
+            shape: Shape::Any,
+            pending: Shape::Any,
         };
         let (reg, ty) = c.expr(id)?;
         c.prog.result = reg;
         c.prog.result_ty = ty;
+        c.prog.result_shape = c.shape;
         Ok(c.prog)
     }
 
@@ -667,6 +722,7 @@ impl<'a> Compiler<'a> {
         ensure!(self.depth <= MAX_DEPTH, ExpressionTooDeep);
         let r = self.expr_inner(id);
         self.depth -= 1;
+        self.shape = core::mem::take(&mut self.pending);
         r
     }
 
@@ -796,6 +852,7 @@ impl<'a> Compiler<'a> {
         }
         let mut regs = Vec::with_capacity(args.len());
         let mut tys = Vec::with_capacity(args.len());
+        let mut shapes = Vec::with_capacity(args.len());
         // `coalesce`/`ifnull` evaluate a later argument only for the rows every earlier argument
         // left NULL (`coalesce(1, factorial(i))` must not raise). When no later argument can
         // raise, the ordinary call below is equivalent and stays the fast path.
@@ -811,6 +868,7 @@ impl<'a> Compiler<'a> {
                 return self.guarded_coalesce(name, progs);
             }
             for p in progs {
+                shapes.push(p.result_shape);
                 let (r, t) = self.inline(p);
                 regs.push(r);
                 tys.push(t);
@@ -820,6 +878,7 @@ impl<'a> Compiler<'a> {
                 let (r, t) = self.expr(*a)?;
                 regs.push(r);
                 tys.push(t);
+                shapes.push(self.shape);
             }
         }
         // `typeof` is decided entirely by the argument's static type, which is known right here,
@@ -834,6 +893,11 @@ impl<'a> Compiler<'a> {
         // A few signatures' *result type* depends on an argument's value, not just its type
         // (`round(<decimal>, d)`'s result scale is `min(s, max(d, 0))`, as in DuckDB), so
         // literal integer arguments are passed along.
+        let lower = name.to_ascii_lowercase();
+        let l = lower.as_str();
+        if matches!(l, "list_extract" | "array_extract" | "map_extract_value") && tys.len() == 2 {
+            return self.subscript(l == "map_extract_value", &regs, &tys, shapes[0]);
+        }
         let consts: Vec<Option<i64>> = args.iter().map(|a| self.const_int(*a)).collect();
         let (id, want, res) = crate::expr::funcs::resolve_const(name, &tys, &consts)?;
         ensure!(want.len() == regs.len(), WrongArgCount);
@@ -843,7 +907,46 @@ impl<'a> Compiler<'a> {
         let aux = self.prog.add_call(id, regs, res);
         let dst = self.prog.alloc_reg();
         self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+        self.pending = result_shape(l, &tys, &shapes);
         Ok((dst, res))
+    }
+
+    /// `xs[i]` / `list_extract(xs, i)` and `m[k]` / `map_extract_value(m, k)`.
+    ///
+    /// On a MAP (a Parquet MAP column, or any base subscripted with a string key) the subscript
+    /// is a key lookup returning the value, as in DuckDB 1.4; otherwise it is a 1-based list
+    /// position. Where the element type is statically known (`Shape`), the element comes back
+    /// as that native type -- extracted as text (`F_*_TEXT`: a JSON string unquoted, anything
+    /// else verbatim, JSON `null` as SQL NULL) and cast from VARCHAR -- so
+    /// `string_split('a,b', ',')[1] = 'a'` and `sum(xs[2])` work as they do in DuckDB.
+    fn subscript(
+        &mut self,
+        map: bool,
+        regs: &[Reg],
+        tys: &[Ty],
+        shape: Shape,
+    ) -> Result<(Reg, Ty)> {
+        let map = map
+            || matches!(shape, Shape::Map(..))
+            || (shape == Shape::Any && matches!(tys[1], Ty::Varchar));
+        let elem = match shape.elem() {
+            Ty::Null => Ty::Json,
+            t => t,
+        };
+        let text = elem != Ty::Json;
+        let (id, key) = match (map, text) {
+            (true, false) => (funcs::F_MAP_VALUE, Ty::Varchar),
+            (true, true) => (funcs::F_MAP_VALUE_TEXT, Ty::Varchar),
+            (false, false) => (funcs::F_LIST_EXTRACT, Ty::BigInt),
+            (false, true) => (funcs::F_LIST_EXTRACT_TEXT, Ty::BigInt),
+        };
+        let base = self.coerce(regs[0], tys[0], Ty::Json)?;
+        let k = self.coerce(regs[1], tys[1], key)?;
+        let res = if text { Ty::Varchar } else { Ty::Json };
+        let aux = self.prog.add_call(id, vec![base, k], res);
+        let dst = self.prog.alloc_reg();
+        self.prog.push(Instr::with_aux(OpCode::Call, res.phys(), dst, 0, 0, aux));
+        Ok((self.coerce(dst, res, elem)?, elem))
     }
 
     /// `coalesce(a, b, ...)` / `ifnull(a, b)` lowered to a chain of `Coalesce` instructions in
@@ -908,6 +1011,7 @@ impl<'a> Compiler<'a> {
 
         // The first argument (the list) is compiled in the outer scope as usual.
         let (list_reg, list_ty) = self.expr(args[0])?;
+        let list_shape = self.shape;
         ensure!(matches!(list_ty, Ty::Json | Ty::Null), TypeMismatch);
         let list_reg =
             if list_ty == Ty::Null { self.konst(Ty::Json, Value::Null) } else { list_reg };
@@ -949,6 +1053,9 @@ impl<'a> Compiler<'a> {
         let aux = self.prog.add_lambda_call(func, call_args, result_ty, li);
         let dst = self.prog.alloc_reg();
         self.prog.push(Instr::with_aux(OpCode::Call, result_ty.phys(), dst, 0, 0, aux));
+        if func == funcs::F_LIST_FILTER {
+            self.pending = list_shape;
+        }
         Ok((dst, result_ty))
     }
 
@@ -959,7 +1066,10 @@ impl<'a> Compiler<'a> {
 
     fn load_col(&mut self, i: usize) -> Result<(Reg, Ty)> {
         let ty = match self.scope.fields().get(i) {
-            Some(f) => f.ty,
+            Some(f) => {
+                self.pending = f.shape;
+                f.ty
+            }
             None => err!(Internal),
         };
         ensure!(i <= u16::MAX as usize, LimitExceeded);

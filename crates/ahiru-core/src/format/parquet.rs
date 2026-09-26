@@ -267,8 +267,12 @@ impl TableFormat for ParquetFormat {
                 }
             }
         };
-        self.schema =
-            f.schema.columns.iter().map(|c| Field::new(c.name.clone(), c.ty, c.nullable)).collect();
+        self.schema = f
+            .schema
+            .columns
+            .iter()
+            .map(|c| Field::new(c.name.clone(), c.ty, c.nullable).shaped(c.shape()))
+            .collect();
         self.file = Some(f);
         Ok(Ok(()))
     }

@@ -31,7 +31,7 @@
 use crate::parquet::meta::{ColumnMetaData, FileMetaData, SchemaElement};
 use crate::parquet::*;
 use crate::prelude::*;
-use crate::vector::Ty;
+use crate::vector::{Shape, Ty};
 
 /// Depth limit when recursively walking the schema tree. A defense against a
 /// corrupted/malicious file exhausting the stack (the same idea as `MAX_DEPTH` in
@@ -128,6 +128,45 @@ pub struct ColumnDesc {
 
 pub struct ParquetSchema {
     pub columns: Vec<ColumnDesc>,
+}
+
+impl ColumnDesc {
+    /// The element type of a nested column, read off the same structure `reader::nested`
+    /// renders from (`render_present`/`render_element`): a list of one plain leaf is
+    /// `List(leaf type)`, a repeated group of exactly a `key` and a `value` leaf is a MAP, and
+    /// any deeper nesting keeps its elements as `Ty::Json`.
+    pub fn shape(&self) -> Shape {
+        let Some(root) = self.nested.as_deref() else {
+            return Shape::Any;
+        };
+        let leaf = |n: &NestedNode| match n.content {
+            NestedContent::Leaf(i) if n.repetition != Repetition::Repeated => {
+                self.leaves.get(i).map(|l| l.ty)
+            }
+            _ => None,
+        };
+        let arr = match &root.content {
+            _ if root.repetition == Repetition::Repeated => root,
+            NestedContent::Group(c) if c.len() == 1 && c[0].repetition == Repetition::Repeated => {
+                &c[0]
+            }
+            _ => return Shape::Any,
+        };
+        match &arr.content {
+            NestedContent::Leaf(i) => Shape::List(self.leaves.get(*i).map_or(Ty::Json, |l| l.ty)),
+            NestedContent::Group(c) if c.len() == 1 => Shape::List(leaf(&c[0]).unwrap_or(Ty::Json)),
+            NestedContent::Group(c)
+                if c.len() == 2 && c[0].name == "key" && c[1].name == "value" =>
+            {
+                match (leaf(&c[0]), leaf(&c[1])) {
+                    (Some(k), Some(v)) => Shape::Map(k, v),
+                    (Some(k), None) => Shape::Map(k, Ty::Json),
+                    _ => Shape::List(Ty::Json),
+                }
+            }
+            _ => Shape::List(Ty::Json),
+        }
+    }
 }
 
 impl ParquetSchema {

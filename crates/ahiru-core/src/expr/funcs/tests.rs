@@ -1344,13 +1344,17 @@ fn list_concat_rejects_malformed_json_instead_of_truncating() {
 }
 
 #[test]
-fn map_extract_looks_up_a_key_or_returns_null() {
+fn map_extract_returns_a_list_of_the_value_or_an_empty_list() {
+    // duckdb 1.4: map_extract(m, 'b') -> [0], a missing key -> [] (`m['b']` is the bare value).
     let m = vj(&[Some(r#"{"a":1,"b":2}"#)]);
     assert_eq!(
         str_at(&run("map_extract", &[&m, &vs(&[Some("a")])]).unwrap(), 0).as_deref(),
-        Some("1")
+        Some("[1]")
     );
-    assert_eq!(str_at(&run("map_extract", &[&m, &vs(&[Some("z")])]).unwrap(), 0), None);
+    assert_eq!(
+        str_at(&run("map_extract", &[&m, &vs(&[Some("z")])]).unwrap(), 0).as_deref(),
+        Some("[]")
+    );
 }
 
 #[test]
