@@ -422,29 +422,27 @@ that scenario — the session itself doesn't survive it either.
 These match DuckDB's behavior deliberately, since the two diverge easily
 and query results can be surprising if you're expecting different rules.
 See [types.md](types.md#rounding-and-floating-point-conventions) for the
-full list — briefly: float→integer casts round to nearest-even, casts to
-`DECIMAL` round away from zero at every scale, integer arithmetic overflow wraps
-rather than erroring (except `SUM` and `factorial`/`!`, see
+full list — briefly: `DOUBLE`→integer casts round to nearest-even, `DECIMAL`
+(including a literal like `4.5`)→integer casts and casts to `DECIMAL` round away
+from zero, integer arithmetic overflow wraps rather than erroring (except `SUM`,
+`DECIMAL` arithmetic and `factorial`/`!`, see
 [functions-numeric.md](functions-numeric.md#factorial)), and division by
 zero returns `NULL` rather than raising an error.
 
 The one deliberate divergence is **float summation**. `SUM`/`AVG` over
 `DOUBLE` use Neumaier compensated summation, so they recover the low-order
 bits a plain running accumulator drops (`sum([1e100, 1.0, -1e100])` is
-`1.0` here and `0.0` in DuckDB). The cost is that the compensated result is
-the correctly rounded value of the *exact* sum — with ties going to even
-when the exact sum lands exactly between two doubles, as it does for
-`n = 3` and `n = 6` below — while DuckDB's accumulated error happens to
-land on the neighboring double, which prints as the shorter literal:
+`1.0` here and `0.0` in DuckDB). The compensated result is the correctly
+rounded value of the *exact* sum, with ties going to even. On everyday data
+the two engines agree -- and a decimal literal is an exact `DECIMAL` in both,
+so summing it is exact:
 
 ```sql
-SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(3));  -- 0.30000000000000004 here, 0.3 in DuckDB
-SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(6));  -- 0.6000000000000001  here, 0.6 in DuckDB
-SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(7));  -- 0.7000000000000001  here, 0.7 in DuckDB
+SELECT sum(x) FROM (SELECT 0.1 AS x FROM range(3));          -- 0.3 (DECIMAL), both engines
+SELECT sum(x) FROM (SELECT 0.1::DOUBLE AS x FROM range(3));  -- 0.30000000000000004, both engines
 ```
 
-Both engines are within a ulp of the true sum; neither is wrong. What
-matters here is that the value is now the same whichever path computes it:
+What matters here is that the value is the same whichever path computes it:
 the blocking aggregate and the window form (`sum(x) OVER ()`) use the same
 compensated accumulator and agree on every case above, so a query's answer
 does not change when a `GROUP BY` is rewritten as a window.

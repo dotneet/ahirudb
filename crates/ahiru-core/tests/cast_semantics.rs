@@ -4,9 +4,9 @@
 //! comment says otherwise. Two places where this engine deliberately differs
 //! from DuckDB are called out at the point they appear:
 //!
-//!   - An undecorated decimal literal (`0.1`, `9007199254740993.0`) is a
-//!     `DOUBLE` here and a `DECIMAL` in DuckDB, so the DuckDB reference values
-//!     below always cast explicitly to `DOUBLE` where that matters.
+//!   - (No longer a divergence:) an undecorated decimal literal (`0.1`,
+//!     `9007199254740993.0`) is an exact `DECIMAL` here as in DuckDB, so the
+//!     tests below cast explicitly to `DOUBLE` where a float is what they test.
 //!   - Unsigned integer arithmetic **wraps inside the unsigned domain** here;
 //!     DuckDB raises an out-of-range error instead. See `wrap_narrow` in
 //!     `expr::kernels` for why wrapping was chosen.

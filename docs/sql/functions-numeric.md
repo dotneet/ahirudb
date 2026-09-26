@@ -42,7 +42,7 @@ SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 | `abs(x)` / `@x` (prefix) | Integer overflow case (`abs(i64::MIN)`) returns `NULL` rather than overflowing. Never returns a negative zero: `1 / abs(-0.0)` is positive infinity, not negative |
 | `sign(x)` | Returns -1/0/1; `NaN` passes through. Never returns a negative zero — `sign(-0.0)` is `+0.0` (DuckDB returns integer `0`). On a non-float argument the result is `BIGINT` (DuckDB narrows it to `TINYINT`) |
 | `ceil(x)` / `ceiling(x)`, `floor(x)`, `trunc(x)` | No-op (identity) on integer input. On `DECIMAL(p, s)` the result is a `DECIMAL(p, 0)`, as in DuckDB. On a float they keep the sign of a zero result, so `ceil(-0.3::DOUBLE)` is `-0.0` (DuckDB likewise) |
-| `round(x[, d])` | `d` > 0 rounds to `d` decimal places (half-away-from-zero); `d` < 0 rounds to a power of ten; `d` on an integer input with `d ≥ 0` is a no-op. On a `DECIMAL(p, s)` the result is a `DECIMAL(p, min(s, max(d, 0)))` when `d` is a literal, and a `DECIMAL(p, s)` when it is not (see the note below) |
+| `round(x[, d])` | `d` > 0 rounds to `d` decimal places (half-away-from-zero); `d` < 0 rounds to a power of ten; `d` on an integer input with `d ≥ 0` is a no-op. On a `DOUBLE` it is DuckDB's formula, `round(x * 10^d) / 10^d` with a correctly rounded `10^d`, including its fallback when that overflows: `x` itself for `d ≥ 0` (`round(1.23e-310, 312)`), `0` for `d < 0` (`round(1.5e300, -400)`, `round('inf'::DOUBLE, -2)`). On a `DECIMAL(p, s)` the result is a `DECIMAL(p, min(s, max(d, 0)))` when `d` is a literal, and a `DECIMAL(p, s)` when it is not (see the note below) |
 | `mod(a, b)` | Integer: `b = 0` or `MIN_VALUE % -1` returns `NULL` (no error/panic). Float: plain `%` |
 | `sqrt(x)` | Negative input returns `NULL` (DuckDB errors instead — an intentional divergence, matching this engine's general "prefer NULL over erroring mid-scan" policy) |
 | `exp(x)` | — |
@@ -54,8 +54,8 @@ SELECT isnan(0.0 / 0.0);  -- true   (also isinf / isfinite)
 | `pow(x, y)` / `power(x, y)` | IEEE 754's special cases apply: `pow(1, y)` and `pow(x, 0)` are `1` even when the other operand is `NaN`. A negative base with an integer exponent keeps its sign at any magnitude (`pow(-2, 1025)` is `-inf`, `pow(-2, 2000)` is `+inf`); with a non-integer exponent it is `NaN`, except for an infinite base, where IEEE gives `pow(-inf, y)` the value of `pow(inf, y)` (`pow(-inf, 0.5)` is `inf`) |
 | `pi()` | Folded to a constant at plan time (there is no zero-argument call path at runtime) |
 | `radians(x)`, `degrees(x)` | Degree ↔ radian conversion |
-| `gcd(a, b)` / `greatest_common_divisor` | Always non-negative; `gcd(0, 0)` = 0 |
-| `lcm(a, b)` / `least_common_multiple` | Always non-negative; a value that overflows `BIGINT` → `NULL` |
+| `gcd(a, b)` / `greatest_common_divisor` | Always non-negative; `gcd(0, 0)` = 0. `BIGINT`, or `HUGEINT` when an argument is a `HUGEINT` or `UBIGINT` (as in DuckDB): `gcd(18446744073709551615::UBIGINT, 5)` is `5` |
+| `lcm(a, b)` / `least_common_multiple` | Always non-negative; same `BIGINT`/`HUGEINT` choice as `gcd`; a value that overflows the result type → `NULL` (DuckDB raises) |
 | `bit_count(x)` | Population count of the 64-bit two's-complement pattern |
 | `xor(a, b)` | Bitwise XOR (the function spelling; DuckDB's `#` operator is not implemented) |
 | `isnan(x)`, `isinf(x)`, `isfinite(x)` | Float predicates; `NULL` in, `NULL` out |

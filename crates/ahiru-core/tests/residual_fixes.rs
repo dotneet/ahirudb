@@ -203,11 +203,9 @@ fn window_avg_over_doubles_is_compensated() {
 ///
 /// The invariant asserted is "the running window sum after `n` rows equals the blocking
 /// `sum` over those same `n` rows", which is exactly what the fix is for. Pinning literal
-/// decimals here would be pinning something else: the engine's compensated total for
-/// three 0.1s lands on the exact midpoint between two doubles and rounds to even
-/// (0.30000000000000004), while DuckDB answers 0.3 -- a pre-existing difference in
-/// `exec::agg`'s summation that this fix neither introduces nor is scoped to remove. What
-/// the fix does guarantee is that both of this engine's paths now say the same thing.
+/// decimals here would be pinning something else (the compensated total for three
+/// `0.1::DOUBLE`s is 0.30000000000000004, as in DuckDB). What the fix guarantees is that
+/// both of this engine's paths say the same thing.
 #[test]
 fn a_running_window_sum_stays_compensated_at_every_step() {
     let mut s = session_with_basic();

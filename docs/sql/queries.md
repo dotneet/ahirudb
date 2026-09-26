@@ -119,8 +119,9 @@ SELECT 3 IS TRUE, NULL IS TRUE, NULL IS NOT TRUE;   -- true, false, true
 SELECT a, b FROM t WHERE a IS DISTINCT FROM b;
 
 -- :: cast shorthand for CAST(... AS ...). Binds tighter than unary
--- operators: -1::VARCHAR is -(1::VARCHAR), i.e. '-1', not (-1)::VARCHAR
--- misread as negating text.
+-- operators, even in front of a number, as in DuckDB 1.4: -5::UTINYINT is
+-- -(5::UTINYINT), i.e. 251 (UTINYINT arithmetic wraps), and -1::VARCHAR is
+-- a type error (text cannot be negated). A bare -5 is still one literal.
 SELECT '42'::INTEGER, (1 + 2)::VARCHAR;
 
 -- ^ / ** (power, always returns DOUBLE; left-associative: 2^3^2 = 64, not

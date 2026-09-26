@@ -1007,14 +1007,22 @@ behavior rather than a silent wrong answer.
 Deliberately matched to DuckDB, since the two diverge easily and this needs
 to be explicit:
 
-- Float -> integer cast rounds to the **nearest even** (`1.5 -> 2`,
-  `4.5 -> 4`).
+- `DOUBLE`/`FLOAT` -> integer cast rounds to the **nearest even** (`1.5 -> 2`,
+  `4.5 -> 4`). A `DECIMAL` -> integer cast rounds **away from zero**, and
+  `4.5` written as a literal is a `DECIMAL` (as in DuckDB), so
+  `CAST(4.5 AS INTEGER)` is `5` while `CAST(4.5::DOUBLE AS INTEGER)` is `4`.
 - `DECIMAL` scale reduction rounds **away from zero** (`1.235 -> 1.24`), so
-  monetary calculations don't systematically under-round.
+  monetary calculations don't systematically under-round. `DOUBLE` ->
+  `DECIMAL` rounds `x * 10^s` like DuckDB while that product is below 2^53
+  (`1.005::DOUBLE` is a hair below 1.005, so it is `1.00` at scale 2), and
+  past that rescales the shortest round-trip digits exactly rather than
+  keeping the multiply's rounding error.
 - Integer division-by-zero and `MIN / -1` return **`NULL`, not an error**.
   Floats stay IEEE (`inf`/`NaN`).
 - Integer arithmetic overflow wraps. `SUM` alone accumulates in `i128` and
-  returns `ValueOutOfRange` on overflow of *that*.
+  returns `ValueOutOfRange` on overflow of *that*. `DECIMAL` has no wrapped
+  value, so a `DECIMAL(38)` result past 38 digits is `ValueOutOfRange` too,
+  as in DuckDB.
 - Grouping and join keys treat `-0.0`/`0.0` as identical and collapse all
   `NaN`s to one representative.
 - **`NaN` compares under the total order the sort and hash paths already
