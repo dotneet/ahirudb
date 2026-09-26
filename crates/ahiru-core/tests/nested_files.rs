@@ -350,3 +350,48 @@ fn interval_and_json_leaves_render_as_duckdb_does() {
     let rows = run_sql(&mut sess, "SELECT typeof(j), j->>'a' FROM t");
     assert_eq!(rows, vec![vec![Value::Bytes(b"JSON".to_vec()), Value::Bytes(b"1".to_vec())]]);
 }
+
+/// parquet-testing's `repeated_no_annotation.parquet` (Apache-2.0, see
+/// `tests/data/parquet-testing/NOTICE`): `phoneNumbers` is an *unannotated* optional group
+/// whose only child is `repeated group phone`. Only a LIST/MAP-annotated group passes
+/// through to its repeated child, so this is a STRUCT with a `phone` list, as DuckDB
+/// (`STRUCT(phone STRUCT(number BIGINT, kind VARCHAR)[])`) and pyarrow read it.
+#[test]
+fn an_unannotated_group_around_a_repeated_field_keeps_its_level() {
+    let (_, cols) = read_all(data("parquet-testing/repeated_no_annotation.parquet"), &[1]);
+    let got: Vec<Option<String>> =
+        (0..cols[0].len()).map(|i| json_str(&cols[0].value_at(i))).collect();
+    let phones = r#"{"phone":[{"number":1111111111,"kind":"home"},{"number":2222222222,"kind":null},{"number":3333333333,"kind":"mobile"}]}"#;
+    assert_eq!(
+        got,
+        [
+            None,
+            None,
+            Some(r#"{"phone":[]}"#.into()),
+            Some(r#"{"phone":[{"number":5555555555,"kind":null}]}"#.into()),
+            Some(r#"{"phone":[{"number":1111111111,"kind":"home"}]}"#.into()),
+            Some(phones.into()),
+        ]
+    );
+}
+
+/// parquet-testing's `nonnullable.impala.parquet` declares BIT_PACKED for the level streams
+/// of its REQUIRED leaves. Those streams have max level 0 and are not written at all, so the
+/// declared encoding is irrelevant; it used to fail the nested reader with E200.
+#[test]
+fn bit_packed_level_encoding_with_max_level_zero_is_ignored() {
+    let mut sess = Session::new();
+    let bytes = data("parquet-testing/nonnullable.impala.parquet");
+    sess.register_bytes_as("t", bytes, FormatKind::Parquet).unwrap();
+    let rows = run_sql(&mut sess, "SELECT ID, Int_Array, int_array_array, nested_Struct FROM t");
+    let s = |v: &str| Value::Bytes(v.as_bytes().to_vec());
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::I64(8),
+            s("[-1]"),
+            s("[[-1,-2],[]]"),
+            s(r#"{"a":-1,"B":[-1],"c":{"D":[[{"e":-1,"f":"nonnullable"}]]},"G":[]}"#),
+        ]]
+    );
+}

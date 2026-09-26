@@ -605,6 +605,12 @@ COPY (SELECT * FROM (VALUES
   ) AS t(customer_id, name, region))
 TO 'customers.parquet' (FORMAT PARQUET);"
 
+# --- Third-party files ----------------------------------------------------
+# tests/data/parquet-testing/ holds files copied unmodified from
+# https://github.com/apache/parquet-testing (Apache-2.0; see the NOTICE there).
+# They cover writer quirks neither DuckDB nor pyarrow reproduces, so they are
+# not regenerated here.
+
 echo
 ls -la
 echo
