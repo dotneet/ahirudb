@@ -162,7 +162,15 @@ impl Engine {
         for p in &paths {
             files.push((p.to_string_lossy().into_owned(), read_file(p)?));
         }
-        let a = self.s.register_multi_bytes(name, files.clone(), FormatKind::Auto)?;
+        // A name that is the spec itself came from a SQL string literal
+        // (`autoregister`, or `invalidate_path` refreshing one): the engine looks
+        // those up case-sensitively, so they are registered as paths. An alias
+        // (`t`, `name=...`) is an identifier.
+        let a = if name == spec {
+            self.s.register_multi_bytes_path(name, files.clone(), FormatKind::Auto)?
+        } else {
+            self.s.register_multi_bytes(name, files.clone(), FormatKind::Auto)?
+        };
         for (p, (_, bytes)) in files.iter().enumerate() {
             self.sources.insert((a, p), bytes.clone());
         }
@@ -170,7 +178,7 @@ impl Engine {
         if let [(lit, bytes)] = files.as_slice() {
             // A single file is also reachable under its own path text (`parquet('...')`).
             if lit != name {
-                let b = self.s.register_multi_bytes(
+                let b = self.s.register_multi_bytes_path(
                     lit,
                     vec![(lit.clone(), bytes.clone())],
                     FormatKind::Auto,

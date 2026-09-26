@@ -261,7 +261,21 @@ impl Session {
     ) -> Result<usize> {
         let files: Vec<(String, Source)> =
             files.into_iter().map(|(p, b)| (p, Source::from_bytes(b))).collect();
-        self.register_multi(name, files, kind)
+        self.register_multi(name, files, kind, false)
+    }
+
+    /// [`Session::register_multi_bytes`] for a table named by the path a SQL
+    /// string literal wrote (`FROM 'data/*.csv'`): registered and looked up
+    /// case-sensitively, like every string-literal path (`Catalog::register_path`).
+    pub fn register_multi_bytes_path(
+        &mut self,
+        path: &str,
+        files: Vec<(String, Vec<u8>)>,
+        kind: FormatKind,
+    ) -> Result<usize> {
+        let files: Vec<(String, Source)> =
+            files.into_iter().map(|(p, b)| (p, Source::from_bytes(b))).collect();
+        self.register_multi(path, files, kind, true)
     }
 
     /// Registers several files as one logical table, served by the host's range fetching.
@@ -274,7 +288,7 @@ impl Session {
     ) -> Result<usize> {
         let files: Vec<(String, Source)> =
             files.into_iter().map(|(p, len)| (p, Source::remote(len))).collect();
-        self.register_multi(name, files, kind)
+        self.register_multi(name, files, kind, false)
     }
 
     fn register_multi(
@@ -282,6 +296,7 @@ impl Session {
         name: &str,
         files: Vec<(String, Source)>,
         kind: FormatKind,
+        as_path: bool,
     ) -> Result<usize> {
         ensure!(!files.is_empty(), Internal);
         let mut parts = Vec::with_capacity(files.len());
@@ -295,7 +310,11 @@ impl Session {
             };
             parts.push(TablePart { path, source, format });
         }
-        self.catalog.register_multi(name, parts)
+        if as_path {
+            self.catalog.register_multi_path(name, parts)
+        } else {
+            self.catalog.register_multi(name, parts)
+        }
     }
 
     /// Hands over the bytes requested by `NeedIo`.

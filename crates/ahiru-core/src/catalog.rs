@@ -505,8 +505,14 @@ impl Catalog {
     pub fn register_path(&mut self, name: &str, source: Source, kind: FormatKind) -> Result<usize> {
         let fmt = format::make(kind, name)?;
         let part = TablePart { path: name.into(), source, format: fmt };
+        self.register_multi_path(name, vec![part])
+    }
+
+    /// The multi-part form of [`Catalog::register_path`]: a glob or directory
+    /// written as a SQL string literal (the native CLI registers those).
+    pub fn register_multi_path(&mut self, name: &str, parts: Vec<TablePart>) -> Result<usize> {
         let slot = self.tables.iter().position(|t| t.name == name);
-        self.put_table(name, vec![part], slot, true)
+        self.put_table(name, parts, slot, true)
     }
 
     /// Registers several files as one logical table.

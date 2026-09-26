@@ -1036,3 +1036,35 @@ fn a_non_utf8_argument_is_an_argument_error_not_a_panic() {
     assert!(stderr.contains("not valid UTF-8"), "stderr: {stderr}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");
 }
+
+/// String-literal paths are looked up case-sensitively. On a case-insensitive
+/// file system (macOS, Windows) `'Case.csv'` and `'case.csv'` name one file and
+/// both spellings must read it; on a case-sensitive one they are two files and
+/// each must read its own -- the case-folding catalog used to hand the second
+/// spelling the first file's table.
+#[test]
+fn string_literal_paths_that_differ_in_case() {
+    let dir = std::env::temp_dir().join(format!("ahiru_cli_case_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let upper = dir.join("Case.csv");
+    let lower = dir.join("case.csv");
+    std::fs::write(&upper, "a\n1\n").unwrap();
+    let insensitive = lower.exists();
+    if !insensitive {
+        std::fs::write(&lower, "a\n2\n").unwrap();
+    }
+    let r = run(&[
+        "-csv",
+        "-noheader",
+        "-c",
+        &format!("SELECT a FROM '{}'", upper.display()),
+        "-c",
+        &format!("SELECT a FROM '{}'", lower.display()),
+        "-c",
+        &format!("SELECT a FROM '{}'", upper.display()),
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(r.ok, "{}", r.stderr);
+    let expected = if insensitive { "1\n1\n1\n" } else { "1\n2\n1\n" };
+    assert_eq!(r.stdout, expected);
+}
