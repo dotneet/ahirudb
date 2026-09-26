@@ -1168,7 +1168,9 @@ mechanism already used for CTEs and derived tables.
 statements that don't fit the Volcano streaming model (`Session::step`).
 They run to completion inside `Session::prepare` and return an affected-row
 count as a 1-row/1-column `Query` result (the same "pre-computed single
-batch" trick `SHOW TABLES`/`DESCRIBE` use, via `exec::Values`). Implemented
+batch" trick `SHOW TABLES`/`DESCRIBE` use, via `exec::Values`). The native
+CLI does not print that result, matching the DuckDB CLI, so a script's
+stdout carries only query results. Implemented
 in `src/ddl.rs`/`src/dml.rs`, both opt-in modules like `write`.
 
 Row-value evaluation (`INSERT ... VALUES`, `UPDATE ... SET`, `WHERE`) reuses
@@ -1188,8 +1190,9 @@ export path, `NEED_CODEC` is serviced in place through
 `Session::set_codec_hook` rather than failing, so both statements work over
 a GZIP-compressed Parquet source.
 
-**Guard against writing to read-only tables**: `INSERT`/`UPDATE`/`DELETE`
-against a file-backed table return `ReadOnlyTable` (`dml::mem_index_writable`).
+**Guard against writing to read-only tables**: `INSERT`/`UPDATE`/`DELETE`,
+`ALTER TABLE` and `DROP TABLE` against a file-backed table return
+`ReadOnlyTable` (`Catalog::mem_index_writable`).
 `CREATE TABLE`/`CREATE VIEW` colliding with an existing file-table name
 return `DuplicateTable`.
 

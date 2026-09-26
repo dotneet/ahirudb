@@ -322,7 +322,10 @@ fn push_view_rel(
     view_ctes.view_depth = ctes.view_depth + 1;
     view_ctes.now_micros = ctes.now_micros;
     let plan = bind_query_in(catalog, &parsed.arena, &q, params, &mut view_ctes, None)?;
-    let all = plan.root.schema().to_vec();
+    let mut all = plan.root.schema().to_vec();
+    // A view's columns are named like a stored table's: duplicate output names become
+    // `a`, `a_1`, ... (DuckDB), so each one stays addressable instead of ambiguous.
+    Catalog::dedup_column_names(&mut all);
     rels.push(Rel {
         table: None,
         alias,

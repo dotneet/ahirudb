@@ -283,8 +283,11 @@ impl Engine {
         // the `Query` (see the `ahiru_core::write` module docs and
         // `ahiru_core::session::Query::copy_result`).
         if let Some(c) = q.copy.take() {
-            let n = c.data.len();
-            std::fs::write(&c.path, &c.data)?;
+            // `out.csv.gz`: the core picked the format from the name without `.gz` and
+            // leaves the compression to the host, which has a gzip to hand.
+            let data = if c.gzip { gzip(&c.data)? } else { c.data };
+            let n = data.len();
+            std::fs::write(&c.path, &data)?;
             // The file on disk changed underneath any table already reading it.
             self.invalidate_path(Path::new(&c.path));
             return Ok(Outcome {
@@ -292,6 +295,24 @@ impl Engine {
                 copied: Some((c.path.clone(), n)),
                 elapsed: start.elapsed(),
             });
+        }
+
+        // DDL/DML: the core reports the affected row count as a one-row `count`
+        // result. The DuckDB CLI prints nothing for these statements in any output
+        // mode, and printing the count would make machine-readable output unusable
+        // (`-json -c "CREATE ...; INSERT ...; SELECT ..."` emitted three JSON arrays
+        // on stdout). Keep stdout for query results only; the count still reaches
+        // the caller as `Outcome::rows`.
+        if write_statement_keyword(sql).is_some() {
+            let mut rows = 0usize;
+            while let QueryStep::Batch(mut b) = self.s.step(&mut q)? {
+                b.materialize();
+                let first = b.cols.first().filter(|c| !c.is_empty());
+                if let Some(n) = first.and_then(|c| c.value_at(0).as_i64()) {
+                    rows = n as usize;
+                }
+            }
+            return Ok(Outcome { rows, copied: None, elapsed: start.elapsed() });
         }
 
         let types: Vec<Ty> = q.schema.iter().map(|f| f.ty).collect();
@@ -329,8 +350,11 @@ impl Engine {
     }
 
     /// Column names and types of `table`, for `.schema` and `SUMMARIZE`.
+    ///
+    /// `table` is a registered name, not SQL, so it is quoted as an identifier:
+    /// `order` or `my tbl` would otherwise not parse after `DESCRIBE`.
     pub fn columns(&mut self, table: &str) -> R<Vec<(String, String, bool)>> {
-        self.describe_columns(table)
+        self.describe_columns(&format!("\"{}\"", table.replace('"', "\"\"")))
     }
 
     /// Column names and types of an arbitrary `FROM` item, via `DESCRIBE`.
@@ -783,10 +807,21 @@ fn decompress_host(
 }
 
 fn gunzip(src: &[u8]) -> R<Vec<u8>> {
+    run_gzip("-dc", src)
+}
+
+/// Gzip-compresses `src`, for `COPY ... TO 'x.csv.gz'` (the core leaves the
+/// compression to the host; see `CopyResult::gzip`).
+fn gzip(src: &[u8]) -> R<Vec<u8>> {
+    run_gzip("-c", src)
+}
+
+/// Pipes `src` through the system `gzip` with `flag` and returns its stdout.
+fn run_gzip(flag: &str, src: &[u8]) -> R<Vec<u8>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut c = Command::new("gzip")
-        .arg("-dc")
+        .arg(flag)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

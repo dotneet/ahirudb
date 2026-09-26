@@ -210,30 +210,36 @@ microseconds).
 Accepted `CAST` type-name spellings (case-insensitive):
 
 ```
-BOOLEAN | BOOL
-TINYINT
-SMALLINT
-INT | INTEGER
-BIGINT
-HUGEINT
-UTINYINT
-USMALLINT
-UINTEGER
-UBIGINT
-FLOAT | REAL
-DOUBLE
-DECIMAL | NUMERIC        -- bare form = DECIMAL(18, 3)
-DECIMAL(p, s) | NUMERIC(p, s)
-VARCHAR | TEXT | STRING | CHAR
-BLOB | BYTEA
+BOOLEAN | BOOL | LOGICAL
+TINYINT | INT1
+SMALLINT | INT2 | INT16 | SHORT
+INT | INTEGER | INT4 | INT32 | SIGNED
+BIGINT | INT8 | INT64 | LONG
+HUGEINT | INT128
+UTINYINT | UINT8
+USMALLINT | UINT16
+UINTEGER | UINT32
+UBIGINT | UINT64
+FLOAT | REAL | FLOAT4 | FLOAT(n), n <= 24
+DOUBLE | FLOAT8 | DOUBLE PRECISION | FLOAT(n), n > 24
+DECIMAL | NUMERIC | DEC   -- bare form = DECIMAL(18, 3)
+DECIMAL(p, s) | NUMERIC(p, s) | DEC(p, s)
+DECIMAL(p) | NUMERIC(p)  -- = DECIMAL(p, 0)
+VARCHAR | TEXT | STRING | CHAR | CHARACTER | BPCHAR | NCHAR | NVARCHAR
+  | CHARACTER VARYING    -- each also with a length, VARCHAR(10); the length is not enforced
+BLOB | BYTEA | BINARY | VARBINARY
 DATE
-TIME
-TIMESTAMP | DATETIME
+TIME | TIME WITHOUT TIME ZONE
+TIMESTAMP | DATETIME | TIMESTAMP WITHOUT TIME ZONE
 TIMESTAMPTZ | TIMESTAMP WITH TIME ZONE
 JSON
-UUID
+UUID | GUID
 INTERVAL
 ```
+
+These are the spellings DuckDB accepts for the same types, and the same names
+work in `CREATE TABLE` column definitions. `DESCRIBE` and `typeof()` report the
+canonical name, with a DECIMAL's parameters spelled out: `DECIMAL(10,2)`.
 
 `INTERVAL` is nameable in a type position, and casts round-trip through
 text in both directions:

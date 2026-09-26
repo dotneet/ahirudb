@@ -371,6 +371,38 @@ pub(crate) fn validate(doc: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Appends `doc` to `out` with the whitespace between tokens removed, so that a
+/// pretty-printed `JSON` value (`CAST('{\n "a": 1}' AS JSON)`, or a value read from a
+/// pretty-printed file) fits on one line of an NDJSON file or a `-jsonlines` row --
+/// the same compact form DuckDB writes. String contents are copied verbatim, except
+/// that a raw control byte inside a string (not valid JSON, but tolerated by lenient
+/// sources) is written as a `\u00XX` escape so it cannot break the line either.
+/// Nothing is validated; the input is assumed to be JSON text.
+pub fn minify_into(doc: &[u8], out: &mut Vec<u8>) {
+    let (mut in_str, mut esc) = (false, false);
+    for &c in doc {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            } else if c < 0x20 {
+                out.extend_from_slice(b"\\u00");
+                out.push(b"0123456789abcdef"[(c >> 4) as usize]);
+                out.push(b"0123456789abcdef"[(c & 15) as usize]);
+                continue;
+            }
+        } else if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+            continue;
+        } else if c == b'"' {
+            in_str = true;
+        }
+        out.push(c);
+    }
+}
+
 // =========================================================================
 // Paths
 // =========================================================================
@@ -978,6 +1010,17 @@ pub(crate) fn write_json_string(s: &[u8], out: &mut Vec<u8>) {
 mod tests {
     use super::*;
     use crate::error::{code_of, Code};
+
+    #[test]
+    fn minify_drops_whitespace_between_tokens_only() {
+        let mut out = Vec::new();
+        minify_into(b" {\n  \"a b\" : [1,\t2],\r\n \"s\": \" x \\\" y \" }\n", &mut out);
+        assert_eq!(out, b"{\"a b\":[1,2],\"s\":\" x \\\" y \"}");
+        // A raw control byte inside a string is escaped rather than copied.
+        out.clear();
+        minify_into(b"[\"a\nb\"]", &mut out);
+        assert_eq!(out, b"[\"a\\u000ab\"]");
+    }
 
     fn ext<'a>(doc: &'a str, path: &str) -> Option<(&'a str, Kind)> {
         extract(doc.as_bytes(), path.as_bytes())

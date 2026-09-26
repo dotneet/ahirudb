@@ -348,6 +348,27 @@ impl Ty {
             Uuid => "UUID",
         }
     }
+
+    /// The type name with its parameters, as `DESCRIBE` and `typeof` show it (and as
+    /// DuckDB does): `DECIMAL(10,2)` rather than the bare `DECIMAL` of [`Ty::name`].
+    /// Every other type has no parameters and renders exactly as `name()`.
+    pub fn full_name(self) -> String {
+        let mut s = String::from(self.name());
+        if let Ty::Decimal { precision, scale } = self {
+            let push = |s: &mut String, n: u8| {
+                if n >= 10 {
+                    s.push((b'0' + n / 10) as char);
+                }
+                s.push((b'0' + n % 10) as char);
+            };
+            s.push('(');
+            push(&mut s, precision);
+            s.push(',');
+            push(&mut s, scale);
+            s.push(')');
+        }
+        s
+    }
 }
 
 /// Packs `months` (i32) into the top 32 bits, `days` (i32) into the next 32, and
