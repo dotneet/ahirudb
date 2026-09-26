@@ -210,6 +210,12 @@ user-visible effect.
   `unsupported SQL feature`. Table-*qualified* columns do work
   (`UPDATE t SET b = 1 WHERE t.a = 1`) — it is only the alias binding and
   the correlated/uncorrelated subquery that are missing.
+- **Column `DEFAULT`s are constants, evaluated once.** `CREATE TABLE t (a
+  INTEGER DEFAULT 5)`, `INSERT ... VALUES (DEFAULT)` and `INSERT ... DEFAULT
+  VALUES` work, but the default expression is evaluated when the column is
+  created, not per inserted row, so `DEFAULT now()` stores the creation time
+  in every row (DuckDB re-evaluates it), and it may not reference sequences
+  or other columns. `UPDATE t SET a = DEFAULT` is a syntax error.
 - **Text parts whose sniffed schemas disagree widen to `VARCHAR`; Parquet
   parts stay strict.** Registering `a.csv` (whose column `a` sniffs as
   `BIGINT`) together with `b.csv` (whose `a` holds text and sniffs as
@@ -336,7 +342,10 @@ rows already mutated. Concretely:
   then appends the whole batch to the table in one step.
 - `UPDATE` evaluates every `SET` expression and NOT-NULL-checks every
   matched row across the whole statement first, then writes all the
-  validated values in one step.
+  validated values in one step. Rows the `WHERE` clause excludes are never
+  evaluated, so an expression that would fail on them (`CAST(s AS JSON)`
+  over non-JSON text, an overflowing `factorial(n)`) does not abort the
+  statement — as in DuckDB.
 - `DELETE` computes the full "rows to keep" list first, then replaces the
   table's row list in one step.
 
